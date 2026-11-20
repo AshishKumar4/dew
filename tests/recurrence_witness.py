@@ -26,7 +26,6 @@ Each enclosure is `interval_certificates`' outward interval arithmetic under the
 module adds each log decay's base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensated
 scan, `recurrence_algebra.prefix`), then the kernel's own roundings of its differences."""
 
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -512,8 +511,8 @@ def interpreted_lane() -> Lane:
     from certified import lane
 
     exp2 = jax.jit(jnp.exp2)
-    return Lane(exp2_reach(lambda x: launched(exp2, (np.asarray(x, np.float32),), "XLA's exp2")[0]),
-                lane().flushes, mainloop.block_of(mainloop.issued()[0]))
+    reached = exp2_reach(lambda x: launched(exp2, (np.asarray(x, np.float32),), "XLA's exp2", records=False))
+    return Lane(reached, lane().flushes, mainloop.block_of(mainloop.issued()[0]))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -594,41 +593,23 @@ class Run:
                     point(self.entered(n, head)) if carry is None else carry)
 
 
-_PREPARED: dict[tuple[str, str], tuple] = {}
-"""Each program a GPU tier part's prepare compiled (`launched`), by the store's directory and the program's
-label: the zeros its prepare gives and its launches, which a later call of that program, over the same
-operands or others of their shapes, takes in any cell of the part, as the store compiles a label once
-(`CompiledTruths.compile_site`); its run executes the one program at each call's own operands."""
-
-
-def launched(program, operands: tuple, role: str):
+def launched(program, operands: tuple, role: str, *, records: bool = True):
     """`program` (a jitted function) over `operands` as a GPU tier runs it, compiled in its prepare and
-    executed in its run (`reference_error.ahead_arm`, a label a program: the role, which names every option
-    the program closes over, the device assumed and the operands' shapes and dtypes, never their values, which
-    a prepare's placeholders change), and the launches its trace takes (`tuning.seen`), traced alone, which
-    computes nothing, in the store's target where a run executes a prepared program, so they are the executed
-    program's: its prepare computed every launch eagerly on a compile-only device (row 8497). A prepare
-    compiles each label once (`_PREPARED`), where a call's options left out of its label, one program twice,
-    or an operand a placeholder gave refused a second call or missed its truth at run."""
+    executed in its run, where `records` with the launches the program it ran took (`reference_error.
+    ahead_arm`'s `launched`: its prepare's trace's, its run's record's, outside a part its one lowering's,
+    which lowers and compiles it afresh at each call there: a call that reads none asks none), a label a
+    program: the role, which names every option the program closes over, the device assumed and the
+    operands' shapes and dtypes, never their values, which a prepare's placeholders change (rows 8497,
+    9550): a second call at one program in a prepare reuses its first (`ahead_arm`'s), a call's options
+    left out of its label a program of its own, refused."""
     import jax
     from reference_error import ahead_arm
-    from truths_ahead import COMPILED
 
-    from dew.nn.kernels import generation, tuning
+    from dew.nn.kernels import generation
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in jax.tree.leaves(operands))
     label = f"recurrence witness, {role}, {generation.assumption()}, {shapes}"
-    store = COMPILED.get()
-    prepared = None if store is None or not store.prepare else (str(store.directory), label)
-    if prepared in _PREPARED:
-        return _PREPARED[prepared]
-    with (store.tracing() if store is not None and not store.prepare else contextlib.nullcontext(),
-          tuning.seen() as launches):
-        program.trace(*operands)
-    found = ahead_arm(program, label)(*operands), launches
-    if prepared is not None:
-        _PREPARED[prepared] = found
-    return found
+    return ahead_arm(program, label, launched=records)(*operands)
 
 
 def _through(operands: tuple, starts, last: int) -> tuple:
@@ -784,8 +765,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
         tiles = tiles if trained and not walked else tiles.forward or tiles
-        # The fused walk where the forward runs one (`chunk_forward.walks_once`): an mma.sync family's
-        # inference forward runs its states and output launches, whose records it keeps.
+        # The fused walk where the forward runs one (`chunk_forward.walks_once`; mma.sync's runs launches).
         walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False)
         chunk = tiles.chunk
 
@@ -797,7 +777,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
             interpret=generation.backend() != "gpu"))
 
         def kept(*x, starts):
-            return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}")[0]
+            return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
+                            records=False)
 
         kept_o, kept_final, (a, (w, h, c, _)) = kept(*operands, starts=starts)
         for native, own in ((o, kept_o), (final, kept_final)):
@@ -1421,8 +1402,8 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
-        (grads, saved, extra), _ = launched(jax.jit(kept), operands,
-                                            f"kept backward of seed {seed}{named}, delta {delta}")
+        grads, saved, extra = launched(jax.jit(kept), operands,
+                                       f"kept backward of seed {seed}{named}, delta {delta}", records=False)
     for mine, theirs in zip(grads[:6], native, strict=True):
         assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
             "the certify build is the production program"

@@ -100,13 +100,6 @@ def test_a_bf16_gradient_over_one_sequence_is_as_exact_as_its_reference():
     memories kept."""
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=24)
-@interpreted_gradient('a ragged length', 'bf16', 'recomputed')
-def test_a_recomputed_ragged_bf16_gradient_is_as_exact_as_its_reference():
-    """`the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in bf16, its forward's memories
-    recomputed under a remat rung (`recomputing`)."""
-
-
 @pytest.mark.check1_shards(seeds=128, per_task=16)
 @interpreted_gradient('a decay a key dimension', 'bf16', 'kept')
 def test_a_bf16_gradient_under_a_decay_a_key_dimension_is_as_exact_as_its_reference():
@@ -254,15 +247,13 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
                     truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
 
-def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
-    """Kimi delta attention's gradient through the template (interpreted off a GPU) under the remat rung that
-    recomputes the forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse
-    the forward kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories
-    give, whose check 1 against recorded fla holds both
-    (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+@pytest.mark.parametrize('case', ['a ragged length', 'a decay a key dimension'])
+def test_a_recomputed_gradient_trains_as_its_kept_forward(case):
+    """The gradient through the template (interpreted off a GPU) under the remat rung that recomputes the
+    forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse the forward
+    kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories give, whose
+    check 1 against recorded fla holds both (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
     from fla_sites import LEAVES, ruled, sites
-
-    case = 'a decay a key dimension'
     on = on_the_mainloop(case_hooks(case), case, jnp.bfloat16)
     arrays = sites()[recorded_site(case, jnp.bfloat16)].arrays(0)
 
@@ -417,3 +408,20 @@ def test_a_saved_fp32_gradient_under_the_highest_precision_runs_the_numbers_its_
     with generation.assumed("sm90"), jax.default_matmul_precision("highest"):
         lowered = lowered_for(lambda arrays: ruled(saved, arrays), (abstract,), "sm90")
     assert any(call.name.startswith("recurrence_values_back") for call in kernel_calls(lowered, unrun=True))
+
+
+def test_mosaic_held_prices_backward_launches_when_reverse_is_true():
+    """`Mosaic.held(ba, config, reverse=True)` checks every launch `launches(..., backward=True)` compiles
+    against its own consumer register budget, while `reverse=False` checks `_forwards` alone (row 6740)."""
+    hooks = case_hooks("one sequence")
+    (sample,) = draw(jnp.bfloat16, 0, **geometry("one sequence"))
+    ba = template_call(sample, hooks)
+    target = generation.gpu_target("sm100")
+    family = bundles.of("sm100", jnp.bfloat16)
+    with generation.assumed(target):
+        tiles = template.MOSAIC.derived(ba, target)
+        assert tiles is not None
+        assert template.MOSAIC.held(ba, tiles, reverse=False) == template.MOSAIC._launches_hold(
+            template.MOSAIC._forwards(ba, tiles, target), family)
+        assert template.MOSAIC.held(ba, tiles, reverse=True) == template.MOSAIC._launches_hold(
+            template.MOSAIC.launches(ba, tiles, target, backward=True), family)

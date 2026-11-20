@@ -475,16 +475,19 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(self.launch_target())
         return resources.facts().thread_registers if family is None else family.registers(1)
 
-    def held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> bool:
-        """Whether every forward launch's consumer threads hold their registers at its own roles' budget
+    def held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, *, reverse: bool = False) -> bool:
+        """Whether every launch's consumer threads hold their registers at its own roles' budget
         (`Family.registers` at `Launch.consumers`: a walk of `Tiles.walkers` roles holds less a role than a
         launch of one) and a multiprocessor holds a program of it (`Launch.resident`): the forwards' at the
-        tiles each runs at (`_forwards`)."""
+        tiles each runs at (`_forwards`) when `not reverse`, or the launches reverse-mode certification
+        compiles (`launches(..., backward=True)`) when `reverse` (row 6740)."""
         target = self.launch_target()
         family = bundle(target, _dtype(ba))
         if family is None:
-            return super().held(ba, config)
-        return self._launches_hold(self._forwards(ba, config, target), family)
+            return super().held(ba, config, reverse=reverse)
+        launches = (self.launches(ba, config, target, backward=True) if reverse
+                    else self._forwards(ba, config, target))
+        return self._launches_hold(launches, family)
 
     def _launches_hold(self, launches: tuple[mainloop.Launch, ...], family: mosaic.Family) -> bool:
         """Whether `launches`' consumer threads hold their registers and a multiprocessor a program of each

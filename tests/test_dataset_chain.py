@@ -1822,3 +1822,39 @@ def test_stats_reads_with_the_loading_its_chain_states(tmp_path):
     plain = Memory(rows("a", 16)).named("sample").read("indexed")
     assert mapped_in(plain) == {os.getpid()}
     assert os.getpid() not in mapped_in(plain.loading(Loading(workers=2)))
+
+
+def group_firsts(columns: dict[str, list]) -> dict[str, list]:
+    """A batched step that keeps its rows, each row given its group's first `i`: what it makes of a row
+    depends on the group it is read in."""
+    return {"group": [columns["i"][0]] * len(columns["i"])}
+
+
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(read):
+    """A batched map that keeps its rows groups the order's own consecutive records, so its rows are the
+    same read by one share or by two, each share's rows a part of the one read's, and the read stays a
+    global order (row 9007: grouped after the share cut, each share grouped its own records, and the read
+    was cut per share)."""
+    chain = Memory(rows("a", 24)).map(group_firsts, batched=True, batch_size=4).batch(2)
+
+    def read_by(partition: DataPartition) -> list[tuple[int, int]]:
+        data = compile(chain, read=read, loading=READ)
+        assert data.plan is not None and data.plan.lowering == "global"
+        reader = data.train(partition)
+        try:
+            # An epoch's twelve steps, each share's part of each step's two rows.
+            batches = [next(reader) for _ in range(24 // 2)]
+        finally:
+            reader.close()
+        ids = [int(i) for batch in batches for i in np.asarray(batch["i"]).ravel()]
+        groups = [int(group) for batch in batches for group in np.asarray(batch["group"]).ravel()]
+        assert len(ids) == len(groups) == 24 // partition.count, (len(ids), np.shape(batches[0]["i"]))
+        return list(zip(ids, groups, strict=True))
+
+    whole = read_by(DataPartition())
+    grouped = whole == [(index, index // 4 * 4) for index in range(24)]
+    assert grouped, (len(whole), [pair for pair in whole if pair[1] != pair[0] // 4 * 4][:4])
+    shares = sorted(read_by(DataPartition(0, 2)) + read_by(DataPartition(1, 2)))
+    alike = shares == whole
+    assert alike, (len(shares), [pair for pair in shares if pair not in whole][:4])

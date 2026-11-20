@@ -639,3 +639,23 @@ def test_the_recurrence_matrix_holds_on_this_tpu():
     from gpu_flow import cells_of, run_cells
 
     run_cells(cells_of(recurrence_matrix.a_recurrences_training_step_on_a_tpu_is_on_par))
+
+
+def test_tpu_ssd_jvp_combines_read_and_decay_without_carry_overflow():
+    """Base review e488dc198 F2: `_chunk_scan` JVP reuses `_chunk_forward` so `B0 = 2^100`, `C0 = 2^-100`,
+    `dx0 = 2^30`, `a1 = -20 ln 2` yields finite read tangent `2^30` and final-state tangent `2^110` without
+    materializing a `2^130` fp32 carry."""
+    from dew.nn.kernels.ssd import _chunk_scan
+
+    x = jnp.zeros((1, 64, 1, 16), jnp.float32)
+    dx = x.at[0, 0, 0, 0].set(np.float32(2.0 ** 30))
+    b = jnp.zeros((1, 64, 1, 16), jnp.float32).at[0, 0, 0, 0].set(np.float32(2.0 ** 100))
+    c = jnp.zeros((1, 64, 1, 16), jnp.float32).at[0, 0, 0, 0].set(np.float32(2.0 ** -100))
+    a = jnp.zeros((1, 64, 1), jnp.float32).at[0, 1, 0].set(np.float32(-20.0 * np.log(2.0)))
+    st = jnp.zeros((1, 1, 16, 16), jnp.float32)
+    _, (dy, dfinal) = jax.jvp(lambda x_: _chunk_scan(x_, b, c, a, st, None, 64, "tpu", 0), (x,), (dx,))
+    assert np.isfinite(np.asarray(dy)).all() and np.isfinite(np.asarray(dfinal)).all()
+    np.testing.assert_array_equal(np.asarray(dy[0, 0, 0, 0]), np.float32(2.0 ** 30))
+    np.testing.assert_array_equal(np.asarray(dy[0, 1:, 0, 0]), np.zeros(63, np.float32))
+    want = jnp.exp(a[0, 1, 0]) * b[0, 0, 0, 0] * dx[0, 0, 0, 0]
+    np.testing.assert_array_equal(np.asarray(dfinal[0, 0, 0, 0]), np.asarray(want))

@@ -276,15 +276,14 @@ SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools
           "src/dew/_cleanup.py", "tools/armada/split.py", "tools/armada/executed.py",
           "tools/armada/followed.py", "tools/armada/lifetime.py", "tools/armada/watched.py",
           "tools/armada/progress.py")
-"""The files every test file's key covers whole, a Python module by its code (`code_of`), beside every
-lock (a GPU node builds its environment from its CUDA lock), the environment's own inputs, which
-.armada.json names (`environment_files`), and .armada.json's parts a test process sees (`armada_seen`):
-what every test process runs or reads,
-the session it runs in, the process group it runs as and the plugins loaded into it among them. The
-plan's own code (this file) runs outside the tests, so a change to it reruns none of them; nor does
-the durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a
-group's key covers its own file's entries alone (`cache_key`); nor does a fixture or a package's data,
-which is the input of the files whose runs opened it, however they opened it (executed.py's `Opens`)."""
+"""The files every test file's key covers whole, a Python module by its code (`code_of`), beside its
+environment's locks (`shared`), the environment's own inputs, which .armada.json names (`environment_files`),
+and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads, the
+session it runs in, the process group it runs as and the plugins loaded into it among them. The plan's own
+code (this file) runs outside the tests, so a change to it reruns none of them; nor does the durations record
+(`session.DURATIONS`), which only a split file's groups are cut from, so a group's key covers its own file's
+entries alone (`cache_key`); nor does a fixture or a package's data, which is the input of the files whose
+runs opened it, however they opened it (executed.py's `Opens`)."""
 WHOLE_GPU = "0.75"
 """The share of a GPU a lane given the whole of it hands its files (`gpu_lane`): what JAX's client
 preallocates where no XLA_PYTHON_CLIENT_MEM_FRACTION is set."""
@@ -318,17 +317,18 @@ def environment_files() -> list[str]:
                    if name})
 
 
-def shared(python: str) -> str:
-    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
+def shared(python: str, locks: tuple[str, ...] = ()) -> str:
+    """The hash of what every test file's run shares: `python`, the `SHARED` files, `locks` beside the
+    environment's own (a GPU lane's every lock, `lane_inputs`; a CPU task's lock is its environment's),
     .armada.json's parts a test process sees (`armada_seen`), and the names of tests/'s conftest.py and
     __init__.py files and of src/'s own entries, whose arrival can change what an import finds (a conftest.py
     or a top-level package that shadows another), and of every data file under tests/ but its fixtures and
     under src/ (an existence probe before the recorder starts). A module within a package under src/ is its
     importers' input alone, with its package's other modules (`inputs`), a helper module under tests/ the
     input of each run that imported a module of its name (followed.py's `shadowing`), a test module no other
-    file's, and a fixture is its openers', listers' and probers' (executed.py's `Opens`,
-    followed.py's `PROBES`): so a train that loses a head runs again only what that head's files reached
-    (owner, 2026-10-27: 8 fixtures changed reran all 485 tasks of train 222's second round)."""
+    file's, and a fixture is its openers', listers' and probers' (executed.py's `Opens`, followed.py's
+    `PROBES`): so a train that loses a head runs again only what that head's files reached (owner, 2026-10-27:
+    8 fixtures changed reran all 485 tasks of train 222's second round)."""
     digest = hashlib.sha256(python.encode())
     # A conftest.py, which pytest loads by its path for every test beside and below it, and a package's
     # __init__.py; a helper module is the input of each run that imported a module of its name, which it
@@ -351,7 +351,7 @@ def shared(python: str) -> str:
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
-    for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
+    for name in sorted({*SHARED, *locks, *environment_files(), "src"}):
         digest.update(name.encode() + (code_of(name) if name.endswith(".py") else digests.contents(name)))
     return digest.hexdigest()
 
@@ -360,7 +360,8 @@ def lane_inputs(python: str) -> str:
     """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
     and this file, which sets the environment, share and deadline each file runs under on a GPU, where a
     CPU task's are the session's."""
-    return hashlib.sha256((shared(python) + code_of(__file__).hex()).encode()).hexdigest()
+    locks = tuple(map(str, Path("locks").glob("*.txt")))
+    return hashlib.sha256((shared(python, locks) + code_of(__file__).hex()).encode()).hexdigest()
 
 
 @dataclasses.dataclass
@@ -778,17 +779,14 @@ def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
-    """Each file's seconds on armada under `python`: its median, which armada
-    sums over a split file's groups (`task`), or its tests' sum in
-    tests/test_durations.json where that is more: each test's record is its
-    least time (`durations`), so a sum past the median may mean the measured
-    runs predate the file's current tests, and the sum is a floor on what it
-    takes. base/kernels' route census, 1,576 tests recorded at 2,654 s in a
-    file main ran in 6 s, was packed by that median with six other files into
-    one task, which ran past its deadline (train 18). Else the recorded sum, scaled by
-    how much slower armada ran the files measured both ways, and never below it, a floor as
-    a measured file's is (a test's cold time outweighs a warm run's measure); else None,
-    for a file nothing has timed."""
+    """Each file's seconds on armada under `python`: its median, which armada sums over a split file's groups
+    (`task`), or its tests' sum in tests/test_durations.json where that is more: each test's record is its
+    least time (`durations`), so a sum past the median may mean the measured runs predate the file's current
+    tests, and the sum is a floor on what it takes. base/kernels' route census, 1,576 tests recorded at 2,654
+    s in a file main ran in 6 s, was packed by that median with six other files into one task, which ran past
+    its deadline (train 18). Else the recorded sum, scaled by how much slower armada ran the files measured
+    both ways, and never below it, a floor as a measured file's is (a test's cold time outweighs a warm run's
+    measure); else None, for a file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     # A file armada holds no timing of weighs its rows' sum at the cut they name (`measured_cut`), which is
     # what its timing would say: armada keeps a plan's rows from run to run, and drops the file timings a run
@@ -830,19 +828,20 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
 
 PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/", ".github/",
           "kernels/", "stubs/", "licenses/", "images/", ".thresh/")
-"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a
-notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A native
-kernel package's sources (kernels/), which the environment installs as a built wheel, never as these
-files, a type stub, a license, an image and thresh's annotations are placed alike: each is the input of
-the files whose runs read it, of none where none does. A change elsewhere is placed by none, and runs
-the whole suite (`policy`): a workflow change reran every file while no record placed it (the
-maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows reused), and a change to
-a kernel package's wrapper ran train 537's whole suite on both Pythons."""
-PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md", "MANIFEST.in")
-"""The checkout's own files at its root that tests read as a page is read, and the changelog, which
-no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
-it turned the cache off for every train holding such a head, which then ran its whole suite on every
-round (train 149: 30 task-hours, twice)."""
+"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a notebook
+or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A native kernel package's
+sources (kernels/), which the environment installs as a built wheel, never as these files, a type stub, a
+license, an image and thresh's annotations are placed alike: each is the input of the files whose runs read
+it, of none where none does. A change elsewhere is placed by none, and runs the whole suite (`policy`): a
+workflow change reran every file while no record placed it (the maintainer, 2026-10-28: 5 of 10 trains ran
+with the cache off, 0.75% of rows reused), and a change to a kernel package's wrapper ran train 537's whole
+suite on both Pythons."""
+PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md", "MANIFEST.in",
+                ".gitattributes")
+"""The checkout's own files at its root that tests read as a page is read, and the changelog, which no test
+reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none, it turned the
+cache off for every train holding such a head, which then ran its whole suite on every round (train 149: 30
+task-hours, twice)."""
 
 
 def policy(base: str) -> str:
@@ -864,8 +863,9 @@ def policy(base: str) -> str:
         if armada_seen(None if before is None else before.decode()) == armada_seen(
                 armada.read_text() if armada.is_file() else None):
             changed.remove(".armada.json")  # where and when tasks run, never what a test sees
-    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json",
-             ".python-version"}
+    whole = {*SHARED, *environment_files(), ".armada.json", ".python-version"}
+    # A lock the environment is not built from is a GPU lane's alone (`lane_inputs`): it reruns no CPU file.
+    changed = [name for name in changed if not name.startswith("locks/") or name in whole]
     # A SHARED module whose code `base` holds as it is (a docstring's or a comment's edit) keys every row as
     # it did (`code_of`, `shared`), so it leaves the cache on (Main, 2026-11-07: 12 of the queue's last 20
     # train runs ran cold on harness edits).

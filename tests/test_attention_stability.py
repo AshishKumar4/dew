@@ -1087,26 +1087,30 @@ def _held_empty(family: Family, found, label: str) -> None:
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
+def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int, check=None) -> None:
     """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever the
-    float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is. A reference computing
-    in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4` gives a
-    key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1). The truth runs
-    on the host's CPU device, as the lane runs float64 references (tests/lane_environment.py): a family's
-    draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2 (MAINGPU-0243234e8's
-    part 2 on an H100: 25 truths, 182 s)."""
+    float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is, and where `check` is
+    given, `check(result, seed)` holds on the already-computed output of every draw (row 9041). A reference
+    computing in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4`
+    gives a key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1). The
+    truth runs on the host's CPU device, as the lane runs float64 references (tests/lane_environment.py): a
+    family's draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2
+    (MAINGPU-0243234e8's part 2 on an H100: 25 truths, 182 s)."""
     truth_of = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
     for seed in range(seeds):
         inputs = draw(seed)
         with jax.enable_x64(new_val=True):
             truth = jax.tree.leaves(truth_of(*widened(jax.device_get(inputs))))
-        found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
+        result = dew_fn(*inputs)
+        found = jax.tree_util.tree_leaves_with_path(result)
         for (path, mine), wide in zip(found, truth, strict=True):
             mine = np.asarray(mine)
             rounded = np.asarray(wide, np.float64).astype(mine.dtype)
             lost = np.isfinite(rounded.astype(np.float32)) & ~np.isfinite(mine.astype(np.float32))
             assert not lost.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(lost.sum())} "
                                     "values not finite where the truth's rounded to their dtype are")
+        if check is not None:
+            check(result, seed)
 
 
 GPU_ONLY = {
@@ -1159,8 +1163,8 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
     truth = with_gradients(_reference(family, anchored=True))
     label = f"{mainloop_name} default {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
-    assert_finite(differentiated, truth, draw, label, seeds=seeds)
-    _held_empty(family, differentiated(*draw(0)), label)
+    assert_finite(differentiated, truth, draw, label, seeds=seeds,
+                  check=lambda found, seed: _held_empty(family, found, f"{label} seed {seed}"))
 
 
 @pytest.mark.parametrize("family", [name for name in TEMPLATE_FAMILIES if _drawn_first(name)[3] is None])
@@ -1177,8 +1181,11 @@ def test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_ed
         return template.reference(query, key, value, _spans(family_spec, query, key), _dropping(query))
 
     for name, mainloop in _mainloops(family_spec, {}, dropping=True).items():
-        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw,
-                      f"{name} dropping {family_spec.dtype}", seeds=seeds)
+        drop_label = f"{name} dropping {family_spec.dtype}"
+        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw, drop_label,
+                      seeds=seeds,
+                      check=lambda found, seed, lbl=drop_label: _held_empty(
+                          family_spec, found, f"{lbl} seed {seed}"))
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
@@ -1187,6 +1194,34 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     (`algebra.SCALED_WALK`) and under the fold's guard (`algebra.walked`), finite in the default form over
     every family (`default_is_finite`)."""
     default_is_finite(family, "portable")
+
+
+def test_assert_finite_checks_empty_rows_on_every_draw():
+    """Row 9041: a finite nonzero output or dQ in an empty row after seed zero fails `assert_finite`'s
+    per-draw check without running `dew_fn` a second time."""
+    empty = np.array([[True, False]])
+    family = Family(draw=lambda s: (jnp.zeros((1, 2, 1, 1)),), keep=np.zeros((1, 1, 2, 1), bool), empty=empty)
+    calls = 0
+
+    def dew_fn(x):
+        nonlocal calls
+        calls += 1
+        out = jnp.zeros((1, 2, 1, 1), jnp.float32)
+        dq = jnp.where(jnp.asarray(empty)[:, :, None, None], x, 0.0)
+        return (out, dq)
+
+    def truth_fn(x):
+        del x
+        zeros = jnp.zeros((1, 2, 1, 1), jnp.float64)
+        return (zeros, zeros)
+
+    def draw(seed):
+        return (jnp.asarray(float(seed), jnp.float32),)
+
+    with pytest.raises(AssertionError):
+        assert_finite(dew_fn, truth_fn, draw, "probe", seeds=3,
+                      check=lambda found, seed: _held_empty(family, found, f"probe seed {seed}"))
+    assert calls == 2
 
 
 @pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")

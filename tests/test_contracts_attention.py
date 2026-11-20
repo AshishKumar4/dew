@@ -172,8 +172,10 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
         """A seed's query, pages, sinks, directions and cotangent at unit scale (the mesh order's check 1)."""
         return drawn(([2660, seed], [2661, seed], [2662, seed]), 1.0)
 
+    # Declared seed count so prepared GPU-tier runs (`test_gpu_attention.py`'s `template_paged` cell) never
+    # call `seeds_for` under `COMPILED` (row 9656).
     assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge} {kernel}",
-                    truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None)
+                    truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None, seeds=8)
 
 
 @pytest.mark.parametrize("edge", EDGES)

@@ -2318,3 +2318,71 @@ def test_rwkv6_through_the_chunked_op_is_as_exact_as_fla(site):
 
     the_template_is_as_exact_as_fla(lambda operands: chunk(RWKV6, operands), site, OWN_LEAVES,
                                     label=f"RWKV6 through the chunked op against fla, {site}")
+
+
+def _unit_turn_grad(q, k, v, do, state, *, turn=None):
+    """Run `turned.turn_gradient` with unit decay/gate and zero final cotangent for P0 witnesses."""
+    from dew.nn.kernels.templates.recurrence import turned
+
+    length = q.shape[1]
+    g = jnp.zeros((1, length, 1), jnp.float32)
+    b = jnp.ones((1, length, 1), jnp.float32)
+    t = jnp.zeros((1, length, 1, 1), jnp.float32) if turn is None else turn
+    return turned.turn_gradient(q, k, v, do, g, b, state, jnp.zeros_like(state), t, None,
+                                scale=1.0, group=1, pairs=1)
+
+
+def test_turned_gradient_p0_regressions_f1_f2_f3():
+    """Regressions for turned-frame base-review P0s (d80c85a37 F1/F2/F3, 1cf389a60 F1, e488dc198 F1):
+    carry zero-reset tangent (-1), deferred scale restoration across both own-chunk and cross-chunk cross
+    products, and float64 turn angle precision under x64."""
+    from dew.nn.kernels.templates.recurrence import turned
+
+    # d80c85a37 F1: carry reset at zero peak preserves tangent -1.0 (not -0.5)
+    big = np.float32(2.0 ** 126)
+    z129 = jnp.zeros((1, 129, 1, 2), jnp.float32)
+    k129 = z129.at[0, 0, 0, 0].set(-big)
+    v129 = jnp.zeros((1, 129, 1, 1), jnp.float32).at[0, 0, 0, 0].set(1.0)
+    do129 = jnp.zeros((1, 129, 1, 1), jnp.float32)
+    g129 = jnp.zeros((1, 129, 1), jnp.float32)
+    b129 = jnp.ones((1, 129, 1), jnp.float32)
+    t129 = jnp.zeros((1, 129, 1, 1), jnp.float32)
+    s129 = jnp.array([[[[big], [np.float32(0.0)]]]], jnp.float32)
+    ds129 = jnp.array([[[[np.float32(1.0)], [np.float32(0.0)]]]], jnp.float32)
+    df129 = jnp.array([[[[np.float32(0.0)], [np.float32(1.0)]]]], jnp.float32)
+    _, jvp129 = jax.jvp(
+        lambda st: turned.turn_gradient(z129, k129, v129, do129, g129, b129, st, df129, t129, None,
+                                        scale=1.0, group=1, pairs=1),
+        (s129,), (ds129,))
+    np.testing.assert_array_equal(np.asarray(jvp129[0, 128, 0, 0]), np.float32(-1.0))
+
+    # d80c85a37 F2 & e488dc198 F1: own-chunk _halves defers inv_q restore until after _crossed
+    z2 = jnp.zeros((1, 1, 2, 1), jnp.float32)
+    v2 = jnp.array([[[[1.0]], [[0.0]]]], jnp.float32)
+    for k_vals, do_val, want in (
+        ([0.0, np.float32(2.0 ** -126)], np.float32(2.0 ** 127), np.float32(2.0 ** 127)),
+        ([np.float32(2.0), np.float32(2.0 ** -126)], np.float32(2.0 ** 126), np.float32(2.0 ** 126)),
+    ):
+        q = jnp.array([[[[0.0, 0.0]], [[np.float32(2.0 ** 126), 0.0]]]], jnp.float32)
+        k = jnp.array([[[k_vals], [[0.0, 0.0]]]], jnp.float32)
+        do = jnp.array([[[[0.0]], [[do_val]]]], jnp.float32)
+        grad = _unit_turn_grad(q, k, v2, do, z2)
+        assert np.isfinite(np.asarray(grad)).all()
+        np.testing.assert_array_equal(np.asarray(grad[0, 1, 0, 0]), want)
+
+    # 1cf389a60 F1: cross-chunk _scaled_einsum defers post-scale until after _crossed
+    q4 = jnp.array([[[[np.float32(2.0 ** 126), np.float32(2.0 ** -100)]]]], jnp.float32)
+    st4 = jnp.array([[[[np.float32(2.0)], [np.float32(2.0 ** -126)]]]], jnp.float32)
+    grad4 = _unit_turn_grad(q4, jnp.zeros((1, 1, 1, 2), jnp.float32), jnp.zeros((1, 1, 1, 1), jnp.float32),
+                            jnp.array([[[[np.float32(2.0 ** 126)]]]], jnp.float32), st4)
+    assert np.isfinite(np.asarray(grad4)).all()
+    np.testing.assert_array_equal(np.asarray(grad4[0, 0, 0, 0]), np.float32(2.0 ** 126))
+
+    # d80c85a37 F3: float64 turn pi/2 - 1e-9 preserves positive gradient sign under x64
+    with jax.enable_x64(new_val=True):
+        q3 = jnp.array([[[[0.0, 0.0]], [[1.0, 0.0]]]], jnp.float32)
+        k3 = jnp.array([[[[0.0, 1.0]], [[0.0, 0.0]]]], jnp.float32)
+        do3 = jnp.array([[[[0.0]], [[1.0]]]], jnp.float32)
+        t3 = jnp.array([[[[0.0]], [[np.pi / 2.0 - 1e-9]]]], jnp.float64)
+        grad3 = _unit_turn_grad(q3, k3, v2, do3, z2, turn=t3)
+        assert float(grad3[0, 1, 0, 0]) > 0.0

@@ -1194,7 +1194,7 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     import kernel_compile as kc
 
     assert report.disassembler() is not None
-    unread = report.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, 1024, sass=None)
+    unread = report.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, "mosaic_gpu", 1024, sass=None)
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None

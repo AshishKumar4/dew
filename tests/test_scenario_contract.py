@@ -26,3 +26,22 @@ def test_a_covering_set_meets_every_pair_of_values_and_takes_each_value_once_at_
     assert all({cell[name] for cell in cells} == set(axes[name]) for name in axes)
     assert covering(axes) == cells
 
+
+
+def test_a_covering_set_over_what_a_flow_admits_meets_every_pair_an_admitted_cell_holds():
+    """Where a scenario's flow admits some combinations alone (a block-diffusion LM reads the stream's
+    windows, a masked one packed or padded documents), none of its cells is one the flow refuses, and every
+    two values of two axes that an admitted combination holds meet in some cell."""
+    axes = {"objective": ("masked", "block"), "rows": ("padded", "packed", "windows"), "devices": (1, 2),
+            "precision": ("32-true", "bf16-mixed")}
+
+    def admits(cell: dict) -> bool:
+        return (cell["objective"] == "block") == (cell["rows"] == "windows")
+
+    cells = covering(axes, admits)
+    assert cells and all(admits(cell) for cell in cells)
+    admitted = [cell for values in itertools.product(*axes.values())
+                for cell in [dict(zip(axes, values, strict=True))] if admits(cell)]
+    for one, other in itertools.combinations(axes, 2):
+        assert ({(cell[one], cell[other]) for cell in cells}
+                == {(cell[one], cell[other]) for cell in admitted}), (one, other)

@@ -53,6 +53,47 @@ def diffusion_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, flo
     return compilation_cache_counts()
 
 
+DIFFUSION_RL = {"flow_grpo": {"clip_range": 0.2, "beta": 0.0}}
+"""The flow RL methods an online post-training cell trains a diffusion policy by
+(tests/test_scenario_runs.py), each with its objective's settings as tests/test_diffusion_run_sources.py's
+runs name them. DiffusionNFT's run records a guidance its objective does not take and refuses to train, so
+it joins with row 9668's fix."""
+
+
+def diffusion_rl_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, float]:
+    """A tiny DiT trained over 8-pixel images by the cell's flow RL method (`DIFFUSION_RL`) at the cell's
+    settings: each step a rollout of two of the policy's samples of each image over three time points, scored
+    by their PSNR against it (`FlowRolloutConfig`), and the policy's update on them; its model's dtype left
+    for the run's precision to derive (`diffusion_trained`'s run), trained in this process in `phase`
+    (`Phase`). Its process's persistent-cache counts."""
+    from test_quantization import RES, RUN_BATCH, diffusion_run
+
+    from dew.config import ObjectiveConfig
+    from dew.config.diffusion import FlowRolloutConfig
+    from dew.diffusion.presets import Flow
+    from dew.sampling import Euler
+    from dew.telemetry.instrumentation import compilation_cache_counts
+
+    phase = Phase(**phase)
+    phase.entered()
+    trainer = {"precision": numerics_of(cell["precision"]), "log_every": 1,
+               "mesh": MeshSpec(fsdp=cell["devices"]), "layout": Layout(min_shard=64)}
+    config = diffusion_run(Path(root) / "runs", RUN_BATCH, **trainer)
+    fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
+    method = cell["method"]
+    config = dataclasses.replace(
+        config, model=dataclasses.replace(config.model, fields=fields), preset=Flow(),
+        objective=ObjectiveConfig(method, {**DIFFUSION_RL[method], "solver": Euler(), "steps": 2}),
+        rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3, train_steps=2),
+        trainer=dataclasses.replace(config.trainer, steps=STEPS, checkpoint_final=True))
+    config = config.assigned([f"{path}={value}" for path, value in phase.settings().items()])
+    objective = config.build()
+    images = np.random.RandomState(0).randint(0, 256, (4 * RUN_BATCH, RES, RES, 3), np.uint8)
+    config.train(objective, Memory([{"image": image} for image in images]).batch(RUN_BATCH), name=phase.name,
+                 rollout=config.rollout.build(objective))
+    return compilation_cache_counts()
+
+
 def jepa_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, float]:
     """A JEPA encoder trained over images read as the cell reads, its modules computing in the cell's dtype,
     its mesh its devices' fsdp split, in this process in `phase` (`Phase`): every step's gradient finite;
@@ -97,22 +138,35 @@ def jepa_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, float]:
     return compilation_cache_counts()
 
 
-def gguf_loaded(root: Path):
-    """The llama of the GGUF file under `root` (`gguf_written`), loaded (`Pretrained.load`)."""
+GGUF = ("Q8_0", "Q4_0")
+"""The GGUF encodings a quantized interchange cell writes its llama in (tests/test_scenario_runs.py's
+`quantized_written`)."""
+CODECS = Path(__file__).resolve().parent / "fixtures" / "codecs"
+"""The quantized checkpoints a quantized interchange cell loads as their formats' authors wrote them, by their
+directories here (tests/test_codec_checkpoints.py's)."""
+
+
+def quantized_loaded(form: str, root: Path):
+    """Format `form`'s quantized checkpoint loaded (`Pretrained.load`), its weights decoded into float32
+    masters: the GGUF file of that encoding written under `root` (`GGUF`), or the codec checkpoint of that
+    name (`CODECS`)."""
     from dew.interop import Pretrained
 
-    return Pretrained.load(root, dtype="float32", attention_impl="reference", gguf_file="model.gguf")
+    held = {"dtype": "float32", "attention_impl": "reference"}
+    if form in GGUF:
+        return Pretrained.load(root, gguf_file="model.gguf", **held)
+    return Pretrained.load(CODECS / form, **held)
 
 
-def gguf_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, float]:
-    """A GGUF file's llama trained on from its dequantized weights, in this process in `phase` (`Phase`):
-    every step's gradient finite. Its process's persistent-cache counts."""
+def quantized_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, float]:
+    """The cell's quantized checkpoint (`quantized_loaded`) trained on from its decoded weights, in this
+    process in `phase` (`Phase`): every step's gradient finite. Its process's persistent-cache counts."""
     from dew.objectives.lm import LMObjective
     from dew.telemetry.instrumentation import compilation_cache_counts
 
     phase = Phase(**phase)
     phase.entered()
-    source = gguf_loaded(Path(root))
+    source = quantized_loaded(cell["format"], Path(root))
     tracker = RecordingTracker()
     trainer = Trainer(LMObjective(source.model, 8, variables=jax.device_get(source.variables)),
                       optax.adam(1e-3), key=jax.random.key(0), tracker=tracker, data_resume=phase.data_resume,
@@ -120,5 +174,5 @@ def gguf_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, float]:
     rows = np.random.default_rng(1).integers(3, 30, (8, 9)).astype(np.int32)
     trainer.fit(Memory([{"text": row} for row in rows]).batch(8), steps=STEPS, log_every=1, stop=phase.stop,
                 resume=phase.resume)
-    assert_steps_finite(tracker.scalars, f"a {cell['format']} GGUF's llama")
+    assert_steps_finite(tracker.scalars, f"a {cell['format']} checkpoint")
     return compilation_cache_counts()

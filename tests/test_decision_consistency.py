@@ -583,3 +583,42 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
     head_work = backbone.logits_flops(np.maximum(plain.real_lengths(batch) - 1, 0))
     assert weighted.model_flops(None, batch) == plain.model_flops(None, batch) + again + head_work
     assert weighted.training_flops(None, batch) > plain.training_flops(None, batch)
+
+
+def test_a_decision_run_training_an_exit_gate_steps_at_one_pass_of_a_sampled_count():
+    """A decision run training a looped backbone's exit gate (`exit_entropy`) under a sampled pass count
+    (`SampledPasses`) whose law draws one pass plans and steps (row 9691: the step of one pass held no
+    `exit_ce` or `exit_entropy`, other than its cap's, and planning refused it): at one pass the loss's
+    metrics are its cap's tree, `exit_ce` the one pass's label loss and `exit_entropy` none, one pass
+    exiting surely."""
+    import optax
+    from test_decision_objective import EXAMPLES
+
+    from dew.nn.backbones.decoder_stack import Loop
+    from dew.training import Trainer
+    from dew.training.phase_passes import SampledPasses
+
+    backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len, loop=Loop(steps=3, exit_gate=True))
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+
+    def gated(model):
+        return DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=head,
+                                 exit_entropy=0.1)
+
+    capped, once = gated(backbone), gated(backbone.with_passes(1))
+    reader = decision_rows([NEGATED, NEGATED], None, objective=capped.data(), tokens=LAYOUT.max_len)
+    [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
+    variables = capped.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(1), None)
+    loss, aux = once.loss(variables, batch, step)
+    _, capped_aux = capped.loss(variables, batch, step)
+    assert jax.tree.structure(aux.metrics) == jax.tree.structure(capped_aux.metrics)
+    assert [(leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(aux.metrics)] == [
+        (leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(capped_aux.metrics)]
+    assert float(aux.metrics["exit_ce"]) == float(loss.mean()[0])
+    assert float(aux.metrics["exit_entropy"]) == 0.0
+    data = decision_rows(EXAMPLES, 8, objective=capped.data())
+    # A law of mean 1.2 over at most three passes draws one pass at most of its steps.
+    law = SampledPasses(mean=1.2, dispersion=0.5, cap=3)
+    trainer = Trainer(capped, optax.adam(1e-3), key=0, sampled_passes=law)
+    assert int(trainer.fit(data, steps=3, log_every=100).step) == 3
