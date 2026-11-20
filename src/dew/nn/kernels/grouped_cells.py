@@ -30,7 +30,7 @@ class Kind(NamedTuple):
     fp8: bool = False
     gathered: bool = False
     scattered: bool = False
-    matrix: tuple[int, int] | None = None
+    matrix: tuple | None = None
     formed: bool = False
     """Whether its left operand is formed by a prologue the kernel runs tile by tile (a norm's normalization
     the algebra's recognition fused into the product, `fused_gemm`), its call one that reads the rows the
@@ -40,7 +40,8 @@ class Kind(NamedTuple):
     """Whether it is several products in one launch: matrices side by side (`gmm_call`'s `beside`, a layer's
     query, key and value), or their input gradient's products chained over their joined depths (`chained`),
     a cell of its own, which no one product's receipt times (head review of 4ddd0d7ea F1: the ordinary
-    products' cells stood for them)."""
+    products' cells stood for them); its `matrix` their geometry where a receipt timed them (`TOGETHER`: the
+    launch's form, the shared extent and each product's width in the launch's order)."""
 
     def __str__(self) -> str:
         parts = (('fp8',) * self.fp8 + ('gathered',) * self.gathered + ('scattered',) * self.scattered
@@ -60,11 +61,11 @@ class Timed(NamedTuple):
     key's cells, timed at 24,576 tokens, took a fine-tune's key and value products at 2,048, whose 216
     template launches a step ran 6.57 ms, the step's dense products 1.75 ms slower than cuBLAS's alone)."""
 
-    matrices: frozenset[tuple[int, int]]
+    matrices: frozenset[tuple]
     fewest: int
     most: int
 
-    def holds(self, matrix: tuple[int, int], rows: int) -> bool:
+    def holds(self, matrix: tuple, rows: int) -> bool:
         """Whether a product of `matrix` over `rows` tokens is one these receipts timed."""
         return matrix in self.matrices and self.fewest <= rows <= self.most
 
@@ -100,11 +101,39 @@ every other product its kind's. The
 receipts timed 24,576 tokens (M-EM-36, M-EM-52, em35d); the 4B step's 49,152 (four rows) held the same
 cells at parity with cuBLASLt (M-EM-54, interleaved in one session: 3,418.7 against 3,416.9 ms)."""
 
-M_EM_73 = ("M-EM-73-gh200 (a GH200, base/kernels b1ab251ac, CUPTI medians of 5 rounds): three projections' "
-           "input gradient chained in one launch against XLA's (cuBLAS's) three products, 0.80x at "
-           "Qwen3.5-4B's 4 x 3072 rows and 0.87x at Llama-3.1-8B's, and 0.837x the template's three "
-           "products each added in the next's epilogue at the 8B's (0.815 against 0.974 ms); 1.32x XLA's at "
-           "Qwen3.5-4B's 1 x 2048, provisional (n=5, spreads to 26%)")
+QKV_8B_4B = (('chained', 4096, (1024, 1024, 4096)), ('chained', 2560, (1024, 1024, 8192)))
+"""Llama-3.1-8B's and Qwen3.5-4B's query, key and value input gradient as M-EM-73 timed it chained: the
+launch's form, the features, and its products' widths in the launch's order (the value's, the key's, the
+query's: the reverse pass's, `gemm._one_launch`; the 4B's query doubled by its output gate)."""
+
+M_EM_73 = ("M-EM-73-gh200 (a GH200, base/kernels b1ab251ac, CUPTI medians of 5 rounds): the query, key "
+           "and value's bf16 input gradient chained in one launch 0.80x XLA's (cuBLAS's) three products at "
+           "Llama-3.1-8B's 4 x 3072 rows and 0.87x at Qwen3.5-4B's, 0.837x the template's three products "
+           "each added in the next's epilogue at the 8B's (0.815 against 0.974 ms); 1.32x XLA's at the 4B's "
+           "1 x 2048, provisional (n=5, spreads to 26%)")
+
+class Together(NamedTuple):
+    """A receipt of products in one launch (`Kind.together`) and the kernel it timed winning: of what family
+    and what they make (`made`), their operands' `dtype`, the geometries and rows it timed (`timed`), the
+    kernel (`winner`, a grouped selector's kernel by name) and the receipt (`evidence`): the one record a
+    call's cell (`grouped_matmul.grouped_case`) and its declared route (`grouped_matmul.DECLARED`) both read
+    (base review 760be77fe F6)."""
+
+    family: str
+    made: Made
+    dtype: str
+    timed: Timed
+    winner: str
+    evidence: str
+
+
+TOGETHER = (Together('wgmma', Made.INPUT_GRADIENT, 'bfloat16',
+                     Timed(frozenset(QKV_8B_4B), 4 * 3072, 4 * 3072), 'mosaic', M_EM_73),)
+"""The products in one launch receipts timed a kernel winning (`Together`): a call of them a cell of its own,
+keyed by its geometry (its `matrix`), which the declared cells run on the winner (`grouped_matmul.DECLARED`);
+outside them (the 4B's 1 x 2048, where the chain lost; fp16, untimed) each product its own call
+(`grouped_matmul._grouped_preferred`)."""
+
 
 M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
            "at run, 24,576 tokens)")

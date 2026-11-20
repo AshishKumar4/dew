@@ -80,6 +80,7 @@ from dew.sampling.text import (
     Transforms,
     decoded_rows,
     generate,
+    refuse_redrawn,
     row_texts,
     with_ids_of,
 )
@@ -915,6 +916,11 @@ class TextSettings(TaskSettings):
     sampling: Sampling
     prefix: int | Literal["prompt"] | None = None
     """The prefix run's blocks a served prompt takes (`TextGeneration.prefix`); None serves causally."""
+    adaptation: JSON = dataclasses.field(default=None, metadata={ADDED: True})
+    """How the run's continuum level steps in context, its `InContext`'s record (`LMObjective.adaptation`
+    and the padding id its loss counts no target of, `dew.registry.to_record`), which its task's generation
+    steps as its training forward does (`InContextDecoder`, row 9066); None where it steps none, as runs
+    before it."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1326,6 +1332,7 @@ class TextGeneration(_NativeTextTask):
     def __post_init__(self) -> None:
         super().__post_init__()
         refuse_prefix(self.model, self.prefix, longest=cache_ceiling(self.model))
+        refuse_redrawn(self.model, self.strategy)
         if self.sampling.stop:
             self._listing()
 
@@ -1426,6 +1433,12 @@ class TextGeneration(_NativeTextTask):
         """The task `settings` describe over `model` and `variables`, reading text through
         `processor`: the previews' policy and budget become its defaults. A live objective
         (`LMObjective.build_task`) and a saved run (`from_saved`) build it alike."""
+        if settings.adaptation is not None:
+            from dew.objectives.lm.adaptation import InContext, InContextDecoder
+            from dew.registry import from_record
+
+            in_context = from_record(InContext, settings.adaptation)
+            model = InContextDecoder(model, in_context.adaptation, pad_id=in_context.pad_id)
         return cls(model, variables, processor, sampling=settings.sampling,
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 

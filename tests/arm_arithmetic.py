@@ -3,10 +3,14 @@
 computes on (`float64_host`), its inputs (`widened`) and its compiled program (`Truth`)."""
 
 import contextlib
+import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import eval_jaxpr
+from jax.extend import core as jcore
 from jax.extend.core import primitives
 
 from dew.nn import programs
@@ -165,6 +169,87 @@ def summed_as_run():
     return contextlib.nullcontext()
 
 
+AS_WRITTEN = {"cpu": "algsimp,constant_folding,reduction-splitter,multi_output_fusion",
+              "gpu": "algsimp,constant_folding,multi_output_fusion,horizontal-loop-fusion,"
+                     "horizontal-input-fusion",
+              "tpu": "algsimp,constant_folding,multi_output_fusion"}
+"""XLA's passes a reference's twin compiles without (`as_written`), by backend: its algebraic simplifier,
+which rewrites (A/B)/C as A/(B*C) and divides by a broadcast through its reciprocal; its constant folding,
+which computes at compile time what the program computes when it runs (and, without the simplifier,
+XLA:CPU's raises SIGFPE on an operation of no elements: an MXFP8 step over an empty group); and a
+reduction's split, which reorders its sum. With them a reference carries the rewrite Dew's arm, compiled by
+the same XLA, carries too, and check 1 holds the two on par wherever both are wrong (a merge of +-2^127 and a
+least normal: 3.6e30 where the truth is 1.2e-38, row 6909). A fusion's one effect on a value, summing a
+product unrounded beside another term (a fused multiply-add: so equal and opposite terms do not cancel), is
+held by its products' barriers (`products_held`), the fusions kept: a twin compiled without them ran every
+operation as a kernel of its own, a delta net's nvfp4 gradient's 1,929 s and past 10 GiB where main's
+reference ran in 42 s (test_joined, train 1099). The GPU's names are its passes', read on the GPU tier; the
+TPU's, the open pipeline's, on the TPU tier."""
+
+UNFUSED = {"cpu": "fusion,cpu-instruction-fusion",
+           "gpu": "fusion,priority-fusion",
+           "tpu": "fusion"}
+"""The fusion passes a twin also compiles without where the gate cannot hold its products (`as_written`'s
+`held`: an arm running Dew's own programs, whose compile point compiles them, `arm_forms._with_options`)."""
+
+PRODUCTS = frozenset({jax.lax.mul_p, jax.lax.square_p, jax.lax.integer_pow_p})
+"""The operations whose float result a fusion may sum unrounded beside another term (a fused multiply-add):
+XLA:CPU contracts every product a fused addition reads, which none of its options turns off (armada,
+2026-11-20: `xla_cpu_enable_fast_math` and the `xla_cpu_fast_math_honor_*` options each left a fused
+`a * b + c` contracted, as a `reduce_precision` to the product's own format and an added zero did, both
+elided); a product behind an optimization barrier stays rounded, its readers a fusion of their own."""
+
+
+def as_written(platform: str | None = None, *, held: bool = True) -> dict:
+    """The compiler options that compile a program as written on `platform` (`AS_WRITTEN`; where none is
+    named, the platform the context places a call on, `generation.placed_platform`: a GPU tier part's prepare
+    places its programs on its compile-only GPU; a device's `platform` where a program runs on one): each of
+    its operations as it is, none rewritten with another; its fusions kept where its products are `held`
+    (`products_held`), else compiled without them too (`UNFUSED`)."""
+    from dew.nn.kernels.generation import placed_platform
+
+    platform = platform or placed_platform()
+    backend = "gpu" if platform in ("cuda", "rocm", "gpu") else platform
+    passes = AS_WRITTEN[backend] if held else f"{AS_WRITTEN[backend]},{UNFUSED[backend]}"
+    return {"xla_disable_hlo_passes": passes}
+
+
+def products_held(fn):
+    """`fn` computing as it traces, each float product (`PRODUCTS`) its program and the programs within it
+    compute (a call's, a loop's, a branch's) behind an optimization barrier, so a fusion sums none unrounded
+    beside another term: what a twin as written compiles, its fusions kept (`AS_WRITTEN`)."""
+    @functools.wraps(fn)
+    def held(*inputs, **options):
+        closed, shapes = jax.make_jaxpr(functools.partial(fn, **options), return_shape=True)(*inputs)
+        return jax.tree.unflatten(jax.tree.structure(shapes), eval_jaxpr(
+            _products_held(closed.jaxpr), closed.consts, *jax.tree.leaves(inputs)))
+    return held
+
+
+def _products_held(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`jaxpr` with each float product's result (`PRODUCTS`) read through an optimization barrier, at every
+    depth (`dew.nn.programs.with_bodies`); a native kernel's body, which XLA never sees, as it is
+    (`programs.opaque`); `jaxpr` itself where it computes no product."""
+    equations, changed = [], False
+    for equation in jaxpr.eqns:
+        if not programs.opaque(equation):
+            params = programs.with_bodies(equation.params, _products_held)
+            if any(params[name] is not value for name, value in equation.params.items()):
+                equation, changed = equation.replace(params=params), True
+        floats = [var for var in equation.outvars if not isinstance(var, jcore.DropVar)
+                  and jnp.issubdtype(var.aval.dtype, jnp.floating)]
+        if equation.primitive in PRODUCTS and floats:
+            (made,) = equation.outvars
+            product = jcore.Var(made.aval)
+            equations += [equation.replace(outvars=[product]),
+                          jcore.new_jaxpr_eqn([product], [made], jax.lax.optimization_barrier_p, {},
+                                              jcore.no_effects, equation.source_info)]
+            changed = True
+            continue
+        equations.append(equation)
+    return jaxpr.replace(eqns=equations) if changed else jaxpr
+
+
 def unrewritten(fn):
     """`fn` run with the algebra pass off (`Unrewritten`), the one scope of every reference arm
     (`reference_error._compiled`) and float64 truth (`reference_error._truth_program`, `Truth`) the gate
@@ -212,6 +297,39 @@ class Unrewritten:
         return staged
 
 
+class Written:
+    """`fn` compiled by `compile` (`jax.jit`, or an arm's pairing's: `arm_forms.without_ynn`) as written
+    (`as_written`) for the platform each call runs on (`_platform_of`: where its inputs lie, a GPU-committed
+    draw's under a CPU default included), once a platform: an accuracy claim's reference as written
+    (`arm_forms._written_twin`). Its `lower` and `trace` are the program an uncommitted call runs, for the
+    platform the context places a call on."""
+
+    def __init__(self, fn, compile: Callable = jax.jit):
+        self.fn, self.compile, self._made = fn, compile, {}
+
+    def program(self, platform: str):
+        if platform not in self._made:
+            self._made[platform] = self.compile(products_held(self.fn), compiler_options=as_written(platform))
+        return self._made[platform]
+
+    def __call__(self, *inputs, **options):
+        return self.program(_platform_of(inputs))(*inputs, **options)
+
+    @property
+    def placed(self):
+        """Its program for the platform the context places a call on (`generation.placed_platform`)."""
+        from dew.nn.kernels.generation import placed_platform
+
+        return self.program(placed_platform())
+
+    def lower(self, *inputs, **options):
+        return self.placed.lower(*inputs, **options)
+
+    @property
+    def trace(self):
+        return self.placed.trace
+
+
 class Truth:
     """A check's float64 truth as the gate runs it (`reference_error._truth_program`): its own function
     jitted, which every site of it shares, run unrewritten (`unrewritten`), compiled from its first call and
@@ -234,3 +352,14 @@ class Truth:
     def trace(self):
         """Its program's trace (JAX's `jit(...).trace`), the one its calls run."""
         return self.run.trace
+
+
+def _platform_of(inputs) -> str:
+    """The platform a call on `inputs` runs on: their committed arrays' devices' (a GPU's for a draw an
+    accelerator holds), else the one the context places a call on (`generation.placed_platform`)."""
+    from dew.nn.kernels.generation import placed_platform
+
+    platforms = {device.platform for leaf in jax.tree.leaves(inputs)
+                 if isinstance(leaf, jax.Array) and getattr(leaf, "committed", False)
+                 for device in leaf.devices()}
+    return platforms.pop() if len(platforms) == 1 else placed_platform()

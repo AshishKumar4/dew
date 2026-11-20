@@ -122,6 +122,7 @@ def gradient(model, variables, tokens, cotangent, **apply) -> dict:
 dtypes = pytest.mark.parametrize("dtype", DTYPES)
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_token_models_reads_and_cache_invariance_match_its_forward(name):
     """A token model's `logits`, `logits_from_hidden` and `output_table` contraction agree bit for bit
@@ -148,6 +149,7 @@ def test_a_token_models_reads_and_cache_invariance_match_its_forward(name):
             same(written_c["cache"], cache)
             same(beside, without)
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
 def test_a_decoders_gradients_through_its_logits_match_its_forwards(name):
     """A decoder's gradients through `logits` match its forward's, bit for bit, each run eagerly as the
@@ -169,6 +171,7 @@ def _text(variables):
 
 
 @dtypes
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", OWN)
 def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name, dtype):
     """The encoder the canvas shares its tree with, run over the whole
@@ -204,6 +207,7 @@ def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name
     assert not all(np.array_equal(np.asarray(after), np.asarray(before)) for after, before in pairs)
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", OWN)
 def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name):
     """The published SFT's model reads each layer's scalar as a parameter,
@@ -284,6 +288,7 @@ MEDIA = [name for name in CHECKPOINTS
 for, beside the reference's own encoding of them."""
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", MEDIA)
 def test_media_reach_the_logits_through_the_fused_reads(name):
     """The processor's request, images placed as the writer placed them (one
@@ -573,6 +578,7 @@ def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
                                quantized_arms.rounds)
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_model_at_a_cache_capacity_computes_the_models_logits(name):
     """The resized model reads the same variables to the model's logits, both in one program, bit for
@@ -591,6 +597,7 @@ def _decodes(name: str) -> bool:
     return name in OWN or len(path) == 2 or path[2][4]
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if _decodes(name)])
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
     """A causal model decodes into a cache of `CAPACITY` slots and draws the same tokens as at its own over
@@ -632,6 +639,7 @@ def _packed(variables, groups) -> dict:
     return {**variables, "params": unflatten_dict(params)}
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
 def test_packed_projections_score_as_the_model_does(name):
     """Every group a decoder declares packs while preserving its declared group widths; a causal decoder's

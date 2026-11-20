@@ -481,7 +481,9 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     paged, sources, parts = walk.paged, walk.sources, walk.parts
     walks = None if flags is None else flags
     blocks = _column_blocks(v, hooked, at.columns)
-    split = len(blocks) > 1 and hooks.output_mod is not None
+    plan = forward_block_plan(v.shape[-1], at.columns, out_dtype, has_output_mod=hooks.output_mod is not None,
+                              training=False)
+    split = plan.split
     # A scaled launch's keys' magnitudes the call's (`_largest`) but a cache walk's, which its value slots
     # give (a masked or paged walk's, or one over a cache's rows or codes, whose rows its views gather).
     if form.headroom and not walk.masked and paged is None and sources is None and hooked.scales is None:
@@ -501,7 +503,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         decides=walk.decides, tmem_columns=walk.tmem_columns,
                         products=block_products,
                         table=paged, sources=sources,
-                        out_dtype=jnp.float32 if split else out_dtype, walks=walks,
+                        out_dtype=plan.out_dtype, walks=walks,
                         shared_by=len(blocks),
                         column_width=(values.shape[-1] if into is not None and first is not None
                                       else None), flags=stated and len(blocks) == 1, **in_place)
@@ -525,18 +527,38 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     """The inference walk's outputs from its launches' (`_inference_walk`'s `finished`), unpadded to the
     call's `queries` and value `width`: the output, and with `rows` its finished maxima and denominators, an
     anchor key of none and the output as the split sums. A split launch's are its slices along the query
-    axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its rows `[B, H, S, Q]`, each slice's maxima and
-    denominators its own, which XLA merges (`attention_decode`)."""
+    axis (`_launch`'s `splits`) as its launch wrote them, padded: `[B, S, Qp, H, Dvp]`, and its maxima and
+    denominators stacked, `[2, B, H, S, Qp]`, each slice's its own, which its caller merges where they lie
+    (`merged.merged_split`)."""
     out, *rows_of = walked
     if splits > 1:
-        out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])[:, :, :queries, :, :width]
-        maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :queries] for array in rows_of[0])
-        return out, maximum, total
+        stacked = rows_of[0]
+        return (out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
+                stacked.reshape(*stacked.shape[:3], splits, -1))
     out = out[:, :queries, :, :width]
     if not rows:
         return out
     maximum, total = (array[:, :, :queries] for array in rows_of[0])
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
+
+
+class BlockPlan(NamedTuple):
+    """How a forward value-column block runs (`forward_block_plan`): whether an inference call splits its
+    output hook into XLA past the block launches (`split`), the block launch's `out_dtype`, and whether an
+    output hook runs inside the kernel (`output_hook`). Shared by legality, residency, and emission
+    (row 9542)."""
+    split: bool
+    out_dtype: object
+    output_hook: bool
+
+
+def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
+                       training: bool) -> BlockPlan:
+    """Derive hook placement and block `out_dtype` from the call's value-column partition (`value_columns`):
+    an inference call whose columns split into multiple blocks runs its `output_mod` in XLA past the launches
+    and emits fp32 per block (row 9542)."""
+    split = not training and has_output_mod and value_columns(total_v, columns) < total_v
+    return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split)
 
 
 def column_slices(total: int, columns: int | None, *, whole: bool = True) -> list[tuple[int | None, int]]:

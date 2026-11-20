@@ -120,8 +120,8 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         # Its result at the dtype the product makes (`terms.Product.made`, JAX's own rule: a bfloat16 by a
         # float16 product is bfloat16, which NumPy's promotion refused, base review 0b8b7ed98 F1).
         mode, passes = _mode(params.get("precision"), *product.operands)
-        return Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize),
-                    **{_MODES[mode]: 2.0 * elements * length * passes})
+        moving = Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize))
+        return moving + _moded(mode, 2.0 * elements * length * passes)
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.unary)) is not None:
@@ -163,6 +163,11 @@ _MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "
 """The `Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes; IEEE fp32 is
 the CUDA cores')."""
 
+
+def _moded(mode: str, flops: float) -> Work:
+    """`flops` of a product's `mode`, in the `Work` field its mode's are told in (`_MODES`)."""
+    return dataclasses.replace(Work(), **{_MODES[mode]: flops})
+
 TPU_PASSES = {"DEFAULT": 1, "HIGH": 3, "HIGHEST": 6}
 """The bfloat16 passes a TPU's matrix units multiply fp32 operands in, by precision (`jax.lax.Precision`'s own
 statement: "On TPU: performs float32 computations in bfloat16", "in 3 bfloat16 passes", "in 6 bfloat16")."""
@@ -202,8 +207,8 @@ def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=j
     kept on chip, written and read (`work`'s products): a chunk form's products (`dew.algebra.linear_scan`, at
     the precision they run at), Dew's fp32 products."""
     mode, passes = _mode(precision, dtype, dtype)
-    return Work(kernels=float(count), kept_bytes=kept(rows * columns * count, np.dtype(dtype).itemsize),
-                **{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
+    held = Work(kernels=float(count), kept_bytes=kept(rows * columns * count, np.dtype(dtype).itemsize))
+    return held + _moded(mode, 2.0 * rows * depth * columns * count * passes)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -331,7 +336,8 @@ class Walk:
         return tuple(kernel_cost.units(done, kernel_cost.rates(self.facts, device=False))[0])
 
     def spanned(self, done: Work) -> float:
-        return kernel_cost.spanned(done, kernel_cost.step_latency(self.facts, device=False))[0]
+        # The walk's longest dependent path, the peak its greedy price reads too (`templates.cost.path`).
+        return kernel_cost.path(done, self.facts)
 
     def __call__(self, done: Work) -> float:
         return kernel_cost.walked(done, self.facts)

@@ -465,13 +465,16 @@ def converts(dtype) -> bool:
             or generation.fp8_tensor_cores(generation.gpu_target().generation))
 
 
+step_index = derivatives.marked(derivatives.WalkStep(), lambda index: index)
+"""A walk step's index through its mark (`derivatives.WalkStep`), the identity inlined as it lowers: the one
+marker every kernel's walk takes its steps by (`stepped`; the decode merge's chunks, `merged._chunks`)."""
+
+
 def stepped(segments) -> tuple:
     """A walk's `segments`, each `(step, lo, hi)`, each step taking its index through a marked call of a walk
-    step (`derivatives.WalkStep`): the one place a family's walk states its steps, which a count of its work
-    by emission reads (`emission`), whatever loop or rotation holds a step. The mark is its index's identity,
-    inlined as it lowers."""
-    marked = derivatives.marked(derivatives.WalkStep(), lambda index: index)
-    return tuple((functools.partial(_marked_step, step, marked), lo, hi) for step, lo, hi in segments)
+    step (`step_index`): the one place a family's walk states its steps, which a count of its work by
+    emission reads (`emission`), whatever loop or rotation holds a step."""
+    return tuple((functools.partial(_marked_step, step, step_index), lo, hi) for step, lo, hi in segments)
 
 
 def _marked_step(step: Callable, marked: Callable, index, *rest):

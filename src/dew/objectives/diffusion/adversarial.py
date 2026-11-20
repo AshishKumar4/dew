@@ -38,7 +38,7 @@ from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
 from dew.nn.inspection import INSPECTED
 from dew.nn.norms import l2_normalized
-from dew.nn.precision import accumulated, divided
+from dew.nn.precision import accumulated, at_least_fp32, divided
 from dew.nn.protocols import Lacks
 from dew.nn.sharding import rows_taken
 from dew.objectives.base import TEACHER, Aux, Objective, Step
@@ -247,16 +247,17 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         given = jax.tree.map(lambda value: value[:1], self.encode(state["encoders"]))
         x = jnp.zeros((1, *self.latent_shape))
         features = jax.eval_shape(lambda: self._features(state[TEACHER], x, jnp.ones((1,)), given))
-        condition = self._condition(jnp.ones((1,)), given)
+        condition = self._condition(jnp.ones((1,)), given, at_least_fp32(x.dtype))
         heads = self.heads.init(jax.random.fold_in(key, 3), [jnp.zeros(f.shape, f.dtype) for f in features],
                                 condition, update=False, batch={})
         return {"params": {DISCRIMINATOR: heads["params"]}, SPECTRAL: heads[SPECTRAL]}
 
-    def _condition(self, time: jax.Array, conditions) -> jax.Array:
-        """The heads' condition: the noise level's sinusoidal embedding and,
-        where the model reads text, its pooled states."""
-        parts = [sinusoidal_time(time, self.time_features, dtype=jnp.float32)]
-        parts += [masked_mean(value.hidden, value.mask).astype(jnp.float32)
+    def _condition(self, time: jax.Array, conditions, dtype) -> jax.Array:
+        """The heads' condition at `dtype`, the step's (float32 at least): the noise level's sinusoidal
+        embedding and, where the model reads text, its pooled states (row 9782: float32 whatever the step's
+        precision, so a float64 truth ran the heads in float32)."""
+        parts = [sinusoidal_time(time, self.time_features, dtype=dtype)]
+        parts += [masked_mean(value.hidden, value.mask).astype(dtype)
                   for value in conditions.values() if isinstance(value, TextContext)]
         return jnp.concatenate(parts, axis=-1)
 
@@ -279,7 +280,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
             side = math.isqrt(tokens.shape[1])
             if side * side != tokens.shape[1]:
                 raise ValueError(f"LADD's 2D heads read a square token grid, not {tokens.shape[1]} tokens")
-            grids.append(tokens.reshape(tokens.shape[0], side, side, tokens.shape[-1]).astype(jnp.float32))
+            grids.append(tokens.reshape(tokens.shape[0], side, side, tokens.shape[-1]).astype(
+                at_least_fp32(tokens.dtype)))
         return grids
 
     def loss(self, variables, batch, step: Step):
@@ -294,8 +296,11 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         indices = step.sample("student times", lambda key: jax.random.randint(key, (), 0, steps, jnp.int32),
                               rows=count)
         t = rows_taken(jnp.asarray(self.student_times), indices)
-        # Float32 draws, as the step's others are, at any precision.
-        noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
+        # Float32 draws, as the step's others are, at any precision, read at the step's: its samples' and its
+        # student's parameters' widest, float32 at least.
+        dtype = at_least_fp32(jnp.result_type(samples, *jax.tree.leaves(variables["params"])))
+        noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32,
+                            rows=count).astype(dtype)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
         # The student's call opens what the step sows (`Step.sown`), the forward the loss trains.
@@ -306,9 +311,10 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
 
         mean, std = self.renoise_times
         level = logistic(mean + std * step.sample("renoise times", jax.random.normal, (),
-                                                        dtype=jnp.float32, rows=count))
+                                                        dtype=jnp.float32, rows=count).astype(dtype))
         rates = broadcast_rates(schedule, level, samples)
-        renoise = step.sample("renoise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
+        renoise = step.sample("renoise", jax.random.normal, samples.shape[1:], dtype=jnp.float32,
+                              rows=count).astype(dtype)
         teacher = jax.lax.stop_gradient(variables[TEACHER])
 
         def renoised(x):
@@ -318,7 +324,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         fake = self._features(teacher, renoised(clean), level, conditions)
         # The discriminator's pass reads the same features without the student's gradient.
         held = jax.tree.map(jax.lax.stop_gradient, fake)
-        condition = jax.lax.stop_gradient(self._condition(schedule.model_time(level), conditions))
+        condition = jax.lax.stop_gradient(self._condition(schedule.model_time(level), conditions,
+                                                          jnp.result_type(dtype, *real)))
         heads = variables["params"][DISCRIMINATOR]
 
         def score(head_params, spectral, features, *, update=False):

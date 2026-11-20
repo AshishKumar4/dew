@@ -21,7 +21,7 @@ from flax import linen as nn
 from jax.experimental import checkify
 from map_judge import marked_seeds
 from model_support import Digits, decoder, serving_task as task
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, dew_path
 from serving_support import (
     Served,
     assert_same_draws,
@@ -418,7 +418,7 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
 
     wide = float64_twin(model)
     assert_as_exact(lambda variables, packed, tokens: logits(model, packed, tokens),
-                    lambda variables, packed, tokens: logits(model, variables, tokens), draw,
+                    dew_path(lambda variables, packed, tokens: logits(model, variables, tokens)), draw,
                     f"{case} packed projections", seeds=PACKED_SEEDS[case],
                     truth_fn=lambda variables, packed, tokens: logits(wide, variables, tokens))
 
