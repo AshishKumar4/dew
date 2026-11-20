@@ -715,8 +715,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                            # Its sums hold the reach: no state beside a walk of no headroom (`refused`).
                            units=sums_units(hooks.drop, headroom=algebra.headroom(weights),
                                                     initial=hooks.initial is not None),
-                           largest=algebra.largest_of(weights, drops=hooks.drop is not None,
-                                                      resumes=hooks.initial is not None))
+                           largest=algebra.largest_of(weights, hooks))
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:

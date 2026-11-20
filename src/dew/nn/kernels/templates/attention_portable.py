@@ -230,8 +230,7 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
                            dropped=1.0 if hooks.drop is None else hooks.drop.bound,
                            units=sums_units(hooks.drop, headroom=headroom,
                                                     initial=hooks.initial is not None),
-                           largest=algebra.largest_of(value.dtype, drops=hooks.drop is not None,
-                                                      resumes=hooks.initial is not None))
+                           largest=algebra.largest_of(value.dtype, hooks))
     # A quantized call's weights round at each row's maximum, which its training walk finds first
     # (`attention_program.walk`), its residuals let go where the call keeps none.
     if not residuals and hooks.rounds is None:

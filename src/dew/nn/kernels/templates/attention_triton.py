@@ -434,7 +434,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, scale,
                                self.score_mod, self.natural, headroom, initial,
                                compensated=algebra.compensates(value.dtype), prescale=power,
-                               largest=algebra.largest_of(value.dtype, drops=False, resumes=initial))
+                               # A state the op does not tell from a sink's (`Initial.valueless`): unheld.
+                               largest=None if initial else algebra.largest_of(value.dtype, Hooks()))
         kernel = functools.partial(
             _forward_kernel, score_kinds=self.score_kinds, output_kinds=self.output_kinds, initial=initial,
             residuals=residuals, output_mod=self.output_mod, block_k=block_k, interpret=interpret)

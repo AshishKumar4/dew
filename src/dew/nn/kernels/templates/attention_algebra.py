@@ -45,6 +45,7 @@ from dew.nn.kernels.templates.attention import (
     REFERENCE_PRECISION,
     Capped,
     Draw,
+    Hooks,
     Initial,
     coded,
     dropped_reach,
@@ -252,11 +253,14 @@ def finite(x: jax.Array) -> jax.Array:
     return jnp.abs(x) < jnp.inf
 
 
-def largest_of(value_dtype: DTypeLike, *, drops: bool, resumes: bool) -> DTypeLike | None:
-    """`Forward.largest` of a call over values of `value_dtype`: the values' dtype where it drops none and
-    resumes no state, so its output is a mean of them; else None (a resumed partial's mean may pass the
-    values' largest, and a sink is a state the walk takes alike)."""
-    return None if drops or resumes else value_dtype
+def largest_of(value_dtype: DTypeLike, hooks: Hooks) -> DTypeLike | None:
+    """`Forward.largest` of a call over values of `value_dtype` under `hooks`: the values' dtype where its
+    output is a mean of them, of zeros beside them where it starts from a valueless state (a sink's,
+    `Initial.valueless`; the base review of 545370f65, F2); else None: a dropping call's (its multiplier's),
+    a resumed partial's (whose mean may pass the values' largest), and a quantized call's, whose codes'
+    product is no mean (`Hooks.rounds`: 127 x 1024 held at 65504, of 545370f65, F1)."""
+    stated = hooks.initial is None or hooks.initial.valueless
+    return value_dtype if hooks.drop is None and hooks.rounds is None and stated else None
 
 
 def infinite(x: jax.Array) -> jax.Array:

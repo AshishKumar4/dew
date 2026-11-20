@@ -1213,14 +1213,16 @@ MAINLOOPS = ("portable", *(("mosaic",) if INTERPRETED else ()))
 interpreted as an H100 runs it (a GPU runs it in `_mainloops`' Mosaic arms)."""
 
 
+@pytest.mark.parametrize("sink", [None, -20.0], ids=["no sink", "a sink"])
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 @pytest.mark.parametrize("mainloop", MAINLOOPS)
-def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training):
+def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, sink):
     """One fp16 query over a key at logit 0 and 1000 at a logit whose weight, 0.50035, narrows up to 0.5005
-    for its product, every value fp16's largest: the output, their mean, is 65504, on par with the reference
-    (check 1) on both walks, where the narrowed weights over their unrounded sum put it at 65522, inf in
-    fp16 (row 9519). Each key's logit is two fp16 entries of it, their sum in fp32 log(0.50035) at the
-    call's scale, 1/8."""
+    for its product, every value fp16's largest, beside a `sink` or none: the output, their mean (and the
+    sink's zero), is 65504, on par with the reference (check 1) on both walks, where the narrowed weights
+    over their unrounded sum put it at 65522, inf in fp16 (row 9519; beside a sink of -20, the base review of
+    545370f65, F2). Each key's logit is two fp16 entries of it, their sum in fp32 log(0.50035) at the call's
+    scale, 1/8."""
     keys, width = 1001, 64
     logit = np.float32(8 * np.log(0.50035))
     high = np.float16(logit)
@@ -1229,19 +1231,43 @@ def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training):
            .at[0, 1:, 0, 1].set(np.float16(logit - np.float32(high))))
     value = jnp.full((1, keys, 1, width), jnp.finfo(jnp.float16).max, jnp.float16)
     spans = template.spans(1, keys, 1)
+    hooks = template.Hooks(initial=None if sink is None
+                           else template.sinks(jnp.asarray([sink], jnp.float32), 1, 1, width))
 
     def ours(query, key, value):
         if mainloop == "portable":
             out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                                  template.Hooks(), residuals=training)
+                                                  hooks, residuals=training)
         else:
             kept = template.Kept.SPLIT if training else template.Kept.NONE
             with generation.assumed("sm90"):
-                out = attention_mosaic.forward(query, key, value, spans, None, interpret=True, residuals=kept)
+                out = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
+                                               residuals=kept)
         return out[0] if training else out
 
-    assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans),
+    assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans, hooks),
                     lambda seed: (query, key, value), "an fp16 mean at fp16's largest", seeds=FEWEST_SEEDS)
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+def test_a_quantized_calls_codes_past_fp16s_largest_are_no_mean(training):
+    """One fp16 key at logit 0 and value 1024 under a quantized model's weights (`Hooks.rounds` 127.5, the
+    key's code 127) and an output hook taking the output by 1/128: the output is 127 x 1024 / 128, 1016, on
+    par with the reference (check 1), the codes' product no mean of the values, so none held at fp16's
+    largest (the base review of 545370f65, F1: held, 511.75)."""
+    query = jnp.zeros((1, 1, 1, 64), jnp.float16)
+    key = jnp.zeros((1, 1, 1, 64), jnp.float16)
+    value = jnp.full((1, 1, 1, 64), 1024, jnp.float16)
+    spans = template.spans(1, 1, 1)
+    hooks = template.Hooks(output_mod=lambda out: out / 128, rounds=127.5)
+
+    def ours(query, key, value):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks, residuals=training)
+        return out[0] if training else out
+
+    assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans, hooks),
+                    lambda seed: (query, key, value), "a quantized call's codes", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])

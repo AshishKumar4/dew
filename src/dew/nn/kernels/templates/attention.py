@@ -715,12 +715,13 @@ class Param:
 class Initial:
     """Where each query's online softmax starts: its running maximum `m` `[B, H, Q]` (natural log), its
     unnormalized denominator `total` `[B, H, Q]` and numerator `acc` `[B, H, Q, Dv]`, fp32 or wider.
-    Sinks are `m` the head's sink, `total` one and `acc` zero (`sinks`); a resumed partial is its own
-    state."""
+    Sinks are `m` the head's sink, `total` one and `acc` zero (`sinks`), `valueless`: the output a mean of
+    the values and zeros (`attention_algebra.largest_of`); a resumed partial is its own state."""
 
     m: jax.Array
     total: jax.Array
     acc: jax.Array
+    valueless: bool = dataclasses.field(default=False, metadata={"static": True})
 
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
@@ -728,7 +729,7 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     dtype (`at_least_fp32`), each head's gradient its rows' terms summed once rounded (`_spread_sinks`)."""
     wide = at_least_fp32(values.dtype)
     m = _spread_sinks((batch, values.shape[0], queries))(values.astype(wide))
-    return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
+    return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide), valueless=True)
 
 
 @functools.cache
@@ -1314,7 +1315,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
-        if hooks.initial is None:
+        if hooks.initial is None or hooks.initial.valueless:
             normalized = held_mean(normalized, acc, value.dtype)
     else:
         # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's z
