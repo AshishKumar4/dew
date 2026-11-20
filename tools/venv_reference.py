@@ -42,6 +42,8 @@ PINS = RELEASES.RELEASES
 PIPELINES = PINS["diffusers-pipelines"]
 MODELOPT = PINS["modelopt"]["nvidia-modelopt"]
 MAXTEXT = PINS["maxtext"]["maxtext"]
+VLLM = PINS["vllm"]["vllm"]
+TORCHAUDIO = PINS["torchaudio"]["torchaudio"]
 NATIVE_PIPELINES = (f"huggingface/diffusers {PIPELINES['diffusers']} with huggingface/transformers "
                     f"{PIPELINES['transformers']}")
 """The diffusers-pipelines cohort (tools/reference_releases.py) the saved tiny pipelines' own calls run in,
@@ -56,9 +58,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                        "reference": "ggml-org/llama.cpp 7fe450e19305b828c199d602c23a8337aaa1f03b (v0.5.0)",
                        "license": "MIT", "host": True, "outputs": True, "judged": True},
          "vllm-replay": {"test": "test_engine_replay", "worker": "vllm_replay_worker.py", "device": "cuda",
-                         "reference": ("vllm-project/vllm 0.30.0 (its CUDA 12.9 build) with "
+                         "reference": (f"vllm-project/vllm {VLLM} (its CUDA 12.9 build) with "
                                        "huggingface/transformers 5.16.1"),
-                         "license": "Apache-2.0", "distribution": ("vllm", "0.30.0+cu129"), "host": True,
+                         "license": "Apache-2.0", "distribution": ("vllm", f"{VLLM}+cu129"), "host": True,
                          "outputs": True},
          "laya": {"test": "test_decision_laya", "worker": "laya_worker.py",
                   "reference": f"NandhaKishorM/laya {RELEASES.commit('laya', 'laya')}",
@@ -90,8 +92,8 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                              "99ad4ac234efe8de52ce157120f72856e836d09f",
                                 "license": "MIT"},
          "mimo-mel": {"test": "test_mimo_audio", "arms": "mel", "worker": "torchaudio_mel_worker.py",
-                      "reference": "pytorch/audio 2.11.0 MelSpectrogram", "license": "BSD-2-Clause",
-                      "distribution": ("torchaudio", "2.11.0+cpu"), "host": True, "outputs": True},
+                      "reference": f"pytorch/audio {TORCHAUDIO} MelSpectrogram", "license": "BSD-2-Clause",
+                      "distribution": ("torchaudio", f"{TORCHAUDIO}+cpu"), "host": True, "outputs": True},
          **{"flaxdiff-" + case.replace("/", "-"): {
              "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
              "reference": f"AshishKumar4/FlaxDiff {RELEASES.commit('flaxdiff-trainer', 'flaxdiff')}",
