@@ -326,10 +326,10 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
     # - q64/v192 (padded 256, columns=192 -> blocks 192 and 64): both 192 and 64 tail place Q in TMEM.
     # - q64/v320 (padded 320, columns=192 -> blocks 192 and 128): 192 copies Q (1 CTA/SM), 128 tail omits Q
     #   (96 KiB SMEM -> 2 CTAs/SM, 256 -> 288 TMEM cols would drop residency 2 -> 1).
-    q64 = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
-    k64 = jnp.ones((1, 256, 1, 64), jnp.bfloat16)
+    q64 = jnp.ones((1, 128, 1, 64), jnp.float16)
+    k64 = jnp.ones((1, 256, 1, 64), jnp.float16)
     for v_width, expected_blocks in ((192, {192: True, 64: True}), (320, {192: True, 128: False})):
-        v_arr = jnp.ones((1, 256, 1, v_width), jnp.bfloat16)
+        v_arr = jnp.ones((1, 256, 1, v_width), jnp.float16)
         with generation.assumed("sm100"), _pinned(dataclasses.replace(ROWS_TILES, columns=192)):
             tail_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
                 q, k, v, spans, natural=True, interpret=False))(q64, k64, v_arr).jaxpr
