@@ -32,6 +32,7 @@ from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import (
+    at_least_fp32,
     compensated_add,
     compensated_sum,
     exact_float32,
@@ -72,13 +73,31 @@ def portable_einsum(subscripts: str, *operands):
 
 def suffix_sums(x: jax.Array) -> jax.Array:
     """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a
-    chunk's tokens), in float32: a product with the chunk's upper triangle of ones (`portable_einsum`, its
-    ones exact in every form a product splits `x` into), one dot. As a reversed cumulative sum, XLA's GPU
-    reduce-window summed each position's window apart: Kimi delta attention's decay gradient's, the one
-    cumulative sum its training traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114)."""
-    size = x.shape[-2]
-    upper = jnp.triu(jnp.ones((size, size), jnp.float32))
-    return portable_einsum('ij,...jt->...it', upper, x.astype(jnp.float32))
+    chunk's tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle
+    of ones (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot. As a
+    reversed cumulative sum, XLA's GPU reduce-window summed each position's window apart: Kimi delta
+    attention's decay gradient's, the one cumulative sum its training traces, took 0.336 ms of its 5.806 ms
+    on a B200 (M-JS-114)."""
+    return _triangle_sums(x, 0)
+
+
+def sums_before(x: jax.Array) -> jax.Array:
+    """Each position's sum over its chunk's positions before it, along `x`'s second-last axis (`suffix_sums`'
+    exclusive prefix twin): a product with the strict lower triangle, each sum of the earlier terms alone,
+    where an inclusive sum less its own term lost a small sum beside a large term to its rounding (a chunk's
+    last writer's whole weight beside its earlier ones' exp(-30) each, Mamba-3's turns' gradient's worst
+    row 3.75 from float64 over its size)."""
+    return _triangle_sums(x, -1)
+
+
+def _triangle_sums(x: jax.Array, diagonal: int) -> jax.Array:
+    """`x` `[..., C, T]`'s sums along its second-last axis over a triangle of ones: the upper one from
+    `diagonal` on (0, `suffix_sums`), else the lower one through it (-1, `sums_before`); in at least float32,
+    the triangle's ones exact in every form a product splits `x` into (`portable_einsum`)."""
+    size, dtype = x.shape[-2], at_least_fp32(x.dtype)
+    ones = jnp.ones((size, size), dtype)
+    triangle = jnp.triu(ones, diagonal) if diagonal >= 0 else jnp.tril(ones, diagonal)
+    return portable_einsum('ij,...jt->...it', triangle, x.astype(dtype))
 
 
 LOG2_E = math.log2(math.e)
