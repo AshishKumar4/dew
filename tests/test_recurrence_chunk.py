@@ -869,24 +869,28 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
 
     def drawn(seed):
         operands, seeded = entered_draw(hooks, seed, entries=True)
-        operands = entering_documents(transitioned(hooks, operands, seed))
         tangent = jax.random.normal(jax.random.key(seed + 31), operands.value.shape, operands.value.dtype)
-        return operands, seeded, tangent
+        return transitioned(hooks, operands, seed), seeded, tangent
 
-    def whole(operands, cotangents, tangent):
-        def along(value):
-            return run(dataclasses.replace(operands, value=value))
+    def arm(place):
+        # Its documents laid within the arm, the operands differentiated those the draw gives (as
+        # `assert_forked_on_par`'s), the whole call placed as `place` places it.
+        def ran(operands):
+            return run(place(entering_documents(operands)))
 
-        return with_gradients(run)(operands, cotangents), jax.jvp(along, (operands.value,), (tangent,))[1]
+        def both(operands, cotangents, tangent):
+            def along(value):
+                return ran(dataclasses.replace(operands, value=value))
 
-    def split(operands, cotangents, tangent):
-        return whole(jax.tree.map(lambda x: jax.device_put(x, rows), operands), cotangents, tangent)
+            return with_gradients(ran)(operands, cotangents), jax.jvp(along, (operands.value,), (tangent,))[1]
 
+        return both
+
+    split = arm(lambda operands: jax.tree.map(lambda x: jax.device_put(x, rows), operands))
     with jax.set_mesh(mesh):
-        assert_as_exact(jax.jit(split), jax.jit(whole), drawn, f'forked {hooks} on an explicit row axis',
-                        seeds=FEWEST_SEEDS)
-        operands, cotangents, tangent = drawn(0)
-        out = jax.jit(split)(operands, cotangents, tangent)[0][0][0]
+        assert_as_exact(jax.jit(split), jax.jit(arm(lambda operands: operands)), drawn,
+                        f'forked {hooks} on an explicit row axis', seeds=FEWEST_SEEDS)
+        out = jax.jit(split)(*drawn(0))[0][0][0]
     assert jax.typeof(out).sharding.spec[0] == 'data'
 
 
