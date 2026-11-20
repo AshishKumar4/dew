@@ -36,7 +36,7 @@ from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
-from dew.nn.precision import compensated_add, correctly_rounded_divide_p
+from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
              primitives.reduce_scatter_p: "axis_name"}
@@ -57,6 +57,17 @@ SCATTERS = {jax.lax.scatter_p: jax.lax.scatter, jax.lax.scatter_add_p: jax.lax.s
             jax.lax.scatter_max_p: jax.lax.scatter_max}
 """The scatters by primitive, each of whose equations holds its combining computation in its operands' dtype,
 which a float64 evaluation of a float32 program builds again (`TapRule.primitive`)."""
+
+@functools.cache
+def compensating() -> frozenset:
+    """The combining computations of Dew's compensated sums, each a double-float pair's: `compensated_add`,
+    and the one `compensated_sum`'s reduction combines by, read from its own trace, so a renamed combine is
+    still known by its object."""
+    traced = jax.make_jaxpr(lambda x: compensated_sum(x, (0,)))(jax.ShapeDtypeStruct((2,), jnp.float32))
+    combines = {equation.params["computation"] for equation in programs.equations(traced.jaxpr)
+                if equation.primitive is jax.lax.reduce_p}
+    return frozenset({compensated_add, *combines})
+
 
 SCALES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 """Each function's compiled rounding scale (`rounding_scale`) of a static program, by its arguments' tree,
@@ -237,7 +248,7 @@ def _weight(equation, params, operands, value):
         return FUNCTIONS[primitive] * magnitude
     if primitive is jax.lax.integer_pow_p:
         return max(abs(int(params["y"])) - 1, 1) * magnitude
-    if primitive is jax.lax.reduce_p and params["computation"] is compensated_add:
+    if primitive is jax.lax.reduce_p and params["computation"] in compensating():
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
         # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
         # the pair's halves by it, as the high half's rounding moves the low half by as much.
