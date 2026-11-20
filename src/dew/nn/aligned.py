@@ -1,7 +1,10 @@
-"""An aligned sum (`aligned_sum`): the exact sum of exact products, rounded once to nearest, ties to even,
-its tangent and transpose each formed as its value is, and its transpose term by term (`aligned_cotangents`)
-for a backward that takes no autodiff. Integer arithmetic on its factors' bits (`dew.nn.float_bits`), so a
-Pallas TPU kernel forms it in place; `dew.nn.precision` re-exports `aligned_sum`."""
+"""The aligned sum of exact products and its cotangents.
+
+`aligned_sum` returns the exact sum of its terms' exact products, rounded once to nearest, ties to even. Its
+tangent and transpose are formed as its value is. `aligned_cotangents` returns the cotangents its transpose
+gives each factor, for a backward that takes no autodiff. Both run integer arithmetic on the factors' bits
+(`dew.nn.float_bits`), so a Pallas TPU kernel forms them in place. `dew.nn.precision` re-exports
+`aligned_sum`."""
 
 from __future__ import annotations
 
@@ -18,8 +21,6 @@ from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.float_bits import float_bits, split_bits, widened_exactly
-
-__all__ = ["aligned_cotangents", "aligned_sum"]
 
 
 def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
@@ -43,7 +44,19 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
 def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Array:
     """`aligned_sum` of `terms`, each product summed over its `spec` entry's axis (kept) and, where it gives
     `(held, shape)`, broadcast to `held` and reshaped to `shape` (a gradient's term in its factor's)."""
+    _, factors, shape, spec = _laid_out(terms, spec)
+    from dew.nn.kernels.launches import interpreting
+
+    # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
+    return (_aligned_value if interpreting() is False else _aligned)(shape, spec, *factors)
+
+
+def _laid_out(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> tuple[list, list, tuple, tuple]:
+    """`terms`' distinct factors (one array several terms share, by identity, once, in order of first
+    appearance) as given and widened exactly to their sum's type, each term's factors' places among them and
+    `spec` with each term's axes normalized: what `aligned_sum` and its transpose read."""
     dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
+    originals = []
     # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned.
     factors, places, shape = [], {}, []
     for term in terms:
@@ -51,20 +64,18 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Arr
         for factor in term:
             if id(factor) not in places:
                 places[id(factor)] = len(factors)
+                originals.append(factor)
                 # Its tangent the cast's, a subnormal kept where XLA:CPU's cast flushes it (row 8966).
                 factors.append(widened_exactly(factor, dtype))
             indices.append(places[id(factor)])
         shape.append(tuple(indices))
-    from dew.nn.kernels.launches import interpreting
-
     # Each term's axes checked and made one sorted tuple of nonnegative axes once, as numpy normalizes them
     # (an AxisError, a ValueError, for one out of range or repeated), for its value and transpose alike
     # (rows 8837, 8974).
     ranks = [max(map(np.ndim, term)) for term in terms]
     spec = tuple((axis if axis is None else _normalized_axes(axis, rank), laid)
                  for rank, (axis, laid) in zip(ranks, spec, strict=True))
-    # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
-    return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), spec, *factors)
+    return originals, factors, tuple(shape), spec
 
 
 def _normalized_axes(axis: int | Sequence[int], rank: int) -> tuple[int, ...]:
@@ -339,23 +350,54 @@ def _cotangent_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.A
 
 
 def aligned_cotangents(terms: Sequence[Sequence[jax.Array]], cotangent: jax.Array,
-                       axis: int | tuple[int, ...] | None = None) -> list[tuple[jax.Array, ...]]:
-    """The cotangents `jax.vjp` of `aligned_sum(terms, axis)` gives each factor of each term at `cotangent`,
-    term by term: each the cotangent times its term's other factors, summed aligned in the factor's shape
-    and cast to its type (`_cotangent_term`), as `aligned_sum`'s own transpose forms it, so a Pallas TPU
-    backward forms an entry write's cotangents in place, with no autodiff (row 8666). A factor several terms
-    share takes one cotangent from each; `jax.vjp`'s for it is their sum."""
-    cotangents = []
-    for term in terms:
-        rank = max(map(np.ndim, term))
-        axes = None if axis is None else _normalized_axes(axis, rank)
-        factors = [jnp.asarray(factor) for factor in term]
-        summed = []
-        for spot, factor in enumerate(factors):
-            products, laid = _cotangent_term(factors, spot, axes, cotangent, factor.shape)
-            summed.append(_aligned_terms([products], (laid,)).astype(factor.dtype))
-        cotangents.append(tuple(summed))
-    return cotangents
+                       axis: int | tuple[int, ...] | None = None) -> list[jax.Array | np.ndarray]:
+    """The cotangent `jax.vjp` of `aligned_sum(terms, axis)` gives each distinct factor at `cotangent`, in
+    order of first appearance: a factor several terms share (one array, by identity) takes one, its terms'
+    products summed together aligned before they round, as the transpose sums them
+    (`_factor_cotangents`). Each is in its factor's type and placement, an integer factor's `float0`. A
+    backward that takes no autodiff (a Pallas TPU kernel's) forms an entry write's cotangents so (row 8666).
+    """
+    originals, factors, shape, spec = _laid_out(terms, ((axis, None),) * len(terms))
+    # The cotangent in the sum's type, as reverse mode hands the transpose its output's cotangent.
+    given = jnp.asarray(cotangent, jnp.result_type(*factors))
+    pulled = _factor_cotangents(shape, spec, factors, given, tuple(range(len(factors))))
+    return [_cast_back(gradient, jax.typeof(jnp.asarray(original)))
+            for original, gradient in zip(originals, pulled, strict=True)]
+
+
+def _cast_back(gradient: jax.Array, held: ShapedArray) -> jax.Array | np.ndarray:
+    """A widened factor's cotangent in its own factor's type `held`, as the widening's transpose returns it
+    (the cast's, its weakness kept); an integer factor's `float0`."""
+    if not jnp.issubdtype(held.dtype, jnp.inexact):
+        return np.zeros(held.shape, jax.dtypes.float0)
+    (back,) = jax.linear_transpose(lambda moving: moving.astype(held.dtype),
+                                   jax.ShapeDtypeStruct(held.shape, held.dtype, weak_type=held.weak_type))(
+                                       gradient)
+    return back
+
+
+def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors, cotangent: jax.Array,
+                       live: tuple[int, ...]) -> list[jax.Array]:
+    """Each `live` factor's cotangent of the aligned sum of `shape`'s terms of `factors` at `cotangent`: each
+    of the factor's places a term of one aligned sum in its shape (`_transposed_term`), the cotangent inside
+    its products, so an overflowing partial sum or one bit-formed is none, in the factor's type and
+    placement."""
+    gradients = []
+    for place in live:
+        factor = factors[place]
+        terms, laid = [], []
+        for index, term in enumerate(shape):
+            axis, value = spec[index]
+            given = cotangent if value is None else cotangent.reshape(value[0])
+            for spot, at in enumerate(term):
+                if at == place:
+                    others = [factors[other] for other in term]
+                    products, held = _cotangent_term(others, spot, axis, given, factor.shape)
+                    terms.append(products)
+                    laid.append(held)
+        gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype),
+                                    jax.typeof(factor)))
+    return gradients
 
 
 def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents, value,
@@ -376,24 +418,7 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
         return _placed_as(_aligned_terms(moved, laid), value)
 
     def pulled(factors, cotangent):
-        gradients = []
-        for place in live:
-            factor = factors[place]
-            # Each of the factor's places a term of one aligned sum in its shape (`_transposed_term`), the
-            # cotangent inside its products, so an overflowing partial sum or one bit-formed is none.
-            terms, laid = [], []
-            for index, term in enumerate(shape):
-                axis, value = spec[index]
-                given = cotangent if value is None else cotangent.reshape(value[0])
-                for spot, at in enumerate(term):
-                    if at == place:
-                        others = [factors[other] for other in term]
-                        products, held = _cotangent_term(others, spot, axis, given, factor.shape)
-                        terms.append(products)
-                        laid.append(held)
-            gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype),
-                                        jax.typeof(factor)))
-        return gradients
+        return _factor_cotangents(shape, spec, factors, cotangent, live)
 
     return generation.linear_map(applied, pulled, list(primals), list(tangents),
                                  out_aval=value.to_tangent_aval(), traced_tangent=True)
