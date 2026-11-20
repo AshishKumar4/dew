@@ -164,15 +164,16 @@ class Chunk(recurrence.Gated):
 
 
 def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, starts, firsts):
-    """A call erasing with vectors of its own (`recurrence.Hooks.erase` 'untied') as two tokens of the delta
-    rule's algebra a token, each of one rank-one write corrected along its own vector (`_delta_forms`'
-    `corrected_by`, `D h + beta k (v + c^T D h)^T`): the first the token's decay and its erase, keys `a`,
-    values zero, gate `beta` and reader `c = -b`; the second no decay and its write, keys `k`, values `v`,
-    gate `beta`, no correction; its query on the second, a packed document from its first. The erase vectors
-    each key head's over its value heads.
+    """A call erasing with vectors of its own (`recurrence.Hooks.erase` 'untied' or 'additive') as two tokens
+    of the delta rule's algebra a token, each of one rank-one write corrected along its own vector
+    (`_delta_forms`' `corrected_by`): the first the token's decay and its erase, keys `a`, values zero and
+    reader `c = -b`, gate `beta` reading the decayed state (untied: `D h + beta a (-b^T D h)^T`) or one
+    reading the state the token enters (additive, RWKV7's: `D h - a (b^T h)^T`, `corrected_by` 'before');
+    the second no decay and its write, keys `k`, values `v`, gate `beta`, no correction; its query on the
+    second, a packed document from its first. The erase vectors each key head's over its value heads.
     `(query, key, value, g, beta, correction, starts, firsts)`, laid `[B, 2S, ...]`, its second token's
     output the call's; a call of the keys' own erase as given, no correction."""
-    if hooks.erase != 'untied':
+    if hooks.erase not in ('untied', 'additive'):
         return query, key, value, g, beta, None, starts, firsts
     heads = value.shape[2]
     a, b = (jnp.repeat(given[name], heads // given[name].shape[2], axis=2).astype(g.dtype)
@@ -187,7 +188,8 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     keys = jnp.repeat(key, group, axis=2).astype(g.dtype)
     queries = jnp.repeat(query, group, axis=2)
     return (laid(jnp.zeros_like(queries), queries), laid(a, keys), laid(jnp.zeros_like(value), value),
-            laid(g, jnp.zeros_like(g)), laid(beta, beta),
+            laid(g, jnp.zeros_like(g)),
+            laid(jnp.ones_like(beta) if hooks.erase == 'additive' else beta, beta),
             laid(reader, zero_keys), None if starts is None else laid(starts, jnp.zeros_like(starts)),
             None if firsts is None else firsts * 2)
 
@@ -259,12 +261,6 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     product's own range is fla's: a term whose factors meet a decay past the least normal one at a time
     reads zero as fla's does. A call names a kernel through `generation.chosen`
     alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
-    if hooks.erase == 'additive':
-        # RWKV7's erase reads the memory before its decay, `-a (b^T S)`, which the algebra's corrections of
-        # the decayed memory read only lifted, `(b exp(-g))^T (D S)`, its decay entering twice and its
-        # gradient by it cancelling (a decay's gradient of 2^-27 read zero; row 9029's head review): a token
-        # at a time until the algebra corrects the memory before its decay (row 9670).
-        return _token_loop(hooks, operands, dtype=dtype)
     given, query, key, value, g, beta, scale, dtype, work = _prologue_of(hooks, operands, dtype)
     state, starts, firsts = operands.state, operands.starts, operands.firsts
     query, key, value, g, beta, correction, starts, firsts = _erases_laid(hooks, query, key, value, g, beta,
@@ -729,7 +725,7 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
                  scale: float, delta: bool, dtype=None, bound: float | None = None,
                  forked: Forked | None = None, reads: Reads = 'after', own=None, group: int = 1,
-                 correction=None, across=None, values_read: bool = False):
+                 correction=None, correction_before: bool = False, across=None, values_read: bool = False):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -766,7 +762,8 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     facts = (("delta", delta), ("scale", scale), ("per_key", g.ndim == 4), ("width", width),
              ("columns", columns), ("work", jnp.dtype(work)), ("reset", starts is not None), ("bound", bound),
              ("reads", reads), ("own", own is not None), ("group", group),
-             ("corrected_by", correction is not None), ("across", across is not None),
+             ("corrected_by", None if correction is None else 'before' if correction_before else 'after'),
+             ("across", across is not None),
              ("values_read", values_read))
     held = 0 if forked is None else forked.held
     # Each token's read's width: the memory's values', or its keys' read along its values (`values_read`).
@@ -819,11 +816,12 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
 @functools.lru_cache(maxsize=FORMS_HELD)
 def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, columns: int, work: jnp.dtype,
                  reset: bool, bound: float | None, reads: Reads = 'after', own: bool = False, group: int = 1,
-                 corrected_by: bool = False, across: bool = False, values_read: bool = False):
+                 corrected_by: str | None = None, across: bool = False, values_read: bool = False):
     """The delta rule's (or a plain linear recurrence's, without `delta`) chunk forms (`scan.derive_scan`) for
     these facts, every one its declaration reads: the update `h = D h - beta k (k^T D h) + beta k v^T` (`D h
     + beta k v^T` without the delta rule; `D h + beta k (v + c^T D h)^T` with a correction reader `c` of its
-    own, `corrected_by`: an erase of its own's laid tokens, `_erases_laid`; `D h E + beta k v^T` with a decay
+    own, `corrected_by` 'after', or `D h + beta k (v + c^T h)^T`, 'before', reading the state the token
+    enters: an erase of its own's laid tokens, `_erases_laid`; `D h E + beta k v^T` with a decay
     `E = exp(e)` along the values, `across`: two-sided GLA's) of a `[width, columns]` state in
     `work`, `D = exp(g)` a head's or each key's (`per_key`), read `scale q^T h` (`scale h q` along its values,
     `values_read`: Oja's rule's transposed state; of the state entering the token where `reads` is 'before',
@@ -842,7 +840,8 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
         decayed = jnp.exp(g).reshape(-1, 1) * h
         if e is not None:
             decayed = decayed * jnp.exp(e)[None, :]
-        written = v + c @ decayed if c is not None else v - k @ decayed if delta else v
+        read = h if corrected_by == 'before' else decayed
+        written = v + c @ read if c is not None else v - k @ decayed if delta else v
         return decayed + beta * k[:, None] * written[None, :]
 
     def readout(h, q, k, v, g, beta, own=None, c=None, e=None):
@@ -921,66 +920,6 @@ def table_stored(table, slot, memory):
         return table
     at = jnp.maximum(slot - 1, 0)
     return table.at[at].set(jnp.where(slot > 0, memory.astype(table.dtype), table[at]))
-
-
-_ROWS = frozenset(field.name for field in dataclasses.fields(recurrence.Step) if field.metadata.get('rows'))
-"""A decode token's operands that are a row's (`recurrence.ROW`): a chunked call's a token each."""
-
-
-def _token_loop(hooks: recurrence.Hooks, operands: Chunk, *, dtype=None):
-    """The chunked op's `(output, final memory)` a token at a time through the decode step's reference
-    (`recurrence.step_reference`), each token's operands its own and the call's shared ones every token's: a
-    packed document's first token entering a zero memory, a forked call's each its table slot's
-    (`_opened`), its last leaving its final in its stored slot (`table_stored`). The route of a call no
-    chunk form takes (an additive erase, `chunk`'s), its derivative the
-    loop's own; the output in `dtype` (the operands' where None), the memory in at least fp32."""
-    given = _read_checked(hooks, operands)
-    rows, length, heads, columns = given['value'].shape
-    width = given['key'].shape[-1]
-    work = at_least_fp32(jnp.result_type(given['query'], given['key'], given['value']))
-    out_dtype = jnp.result_type(given['query'], given['key'], given['value']) if dtype is None else dtype
-    # The operands the hooks read split as a decode token's are (`recurrence.ROW`): a row's a token each.
-    state = given.pop('state', None)
-    timed = {name: jnp.moveaxis(x, 1, 0) for name, x in given.items() if name in _ROWS}
-    fixed = {name: x for name, x in given.items() if name not in _ROWS}
-    starts = (jnp.zeros((rows, length), bool) if operands.starts is None
-              else jnp.asarray(operands.starts, bool))
-    forked = None if operands.loads is None else Forked.of(operands, starts, operands.firsts, work)
-    varying = (*given.values(), state, starts, *jax.tree.leaves(forked))
-    # A forked call's table gives its memories (`Forked.of` refuses one that gives none).
-    if forked is None or state is None:
-        # A zero memory placed as the rows are (an Explicit axis's, `rows_like`), as the token's write is.
-        entering = (rows_like(jnp.zeros((rows, heads, width, columns), work), given['value']) if state is None
-                    else state.astype(work))
-        h = varying_like(entering, *varying)
-        table = table_given = entry = adds = None
-        loads, stores, begun = (jnp.zeros((length, rows), jnp.int32) - 1,) * 3
-    else:
-        table_given = jnp.moveaxis(state.astype(work), 2, 1)
-        table = varying_like(rows_like(jnp.zeros((rows, heads, forked.held, width, columns), work),
-                                       given['value']), *varying)
-        h = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), given['value']), *varying)
-        loads, stores, begun = (x.T for x in forked.tokens(length))
-        entry = None if forked.entry is None else _headed_entry(forked.entry, heads)
-        adds = forked.adds
-    # A row's heads each take up their own memory, the row's slots and document alike.
-    opened = jax.vmap(jax.vmap(_opened, in_axes=(0, 0, None, None, 0, None)), in_axes=(0, 0, 0, 0, 0, 0))
-    stored = jax.vmap(jax.vmap(table_stored, in_axes=(0, None, 0)), in_axes=(0, 0, 0))
-
-    def step(carry, token):
-        h, table = carry
-        sliced, start, load, store, document = token
-        h = jnp.where(start[:, None, None, None], 0.0, h)
-        if table is not None:
-            taken = opened(table_given, table, load, adds, entry, document)
-            h = jnp.where((load >= 0)[:, None, None, None], taken.astype(h.dtype), h)
-        out, _, h = recurrence.step_reference(hooks, recurrence.Step(h, **sliced, **fixed), dtype=out_dtype)
-        if table is not None:
-            table = stored(table, store, h)
-        return (h, table), out
-
-    (final, _), out = jax.lax.scan(step, (h, table), (timed, starts.T, loads, stores, begun))
-    return jnp.moveaxis(out, 0, 1), final
 
 
 def chunk_gated_oja_rule(query, key, value, gv, beta, state=None, starts=None, *, scale: float | None = None,
@@ -1345,7 +1284,8 @@ def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta,
         return out, jnp.swapaxes(final, -1, -2)
     return xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
                         delta=hooks.delta, dtype=dtype, bound=hooks.inverse_bound, forked=forked,
-                        reads=hooks.reads, own=own, group=group, correction=correction, across=across)
+                        reads=hooks.reads, own=own, group=group, correction=correction,
+                        correction_before=hooks.erase == 'additive', across=across)
 
 
 def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
