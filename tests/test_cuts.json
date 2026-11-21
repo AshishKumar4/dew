@@ -740,9 +740,9 @@
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[lm]"
 ],
 "tests/test_contracts_algebra.py": [
-"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[its first orders, nested and scanned]",
-"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[its forward derivatives of the gradient]",
-"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[its gradient's gradient]"
+"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[its first orders and its gradient's gradient]",
+"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[its gradient's forward derivatives]",
+"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[its other orders]"
 ],
 "tests/test_contracts_attention.py": [
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-first orders]",
