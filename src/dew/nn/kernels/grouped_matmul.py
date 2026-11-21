@@ -853,9 +853,15 @@ class MosaicGmm(_Mosaic):
                                        scattered=ba.arguments.get('scatter') is not None)
         # The tile no deeper and no wider than the call (`mosaic_gpu.gmm`'s refusal): a last tile partial,
         # never a first; a width never padded (matrices side by side', `_padded_extents`) never partial.
-        columns = pricing.tile_columns(tile, pricing.family_of(tile, dtype))
+        tiled = pricing.family_of(tile, dtype)
+        columns = pricing.tile_columns(tile, tiled)
         within = (tile.block_k <= extents['depth'], columns <= extents.get('width', columns))
-        depth_partial, width_partial = (each and run and fits for each, run, fits
+        # A partial axis's blocks move untiled at the array's true extents (Mosaic GPU's `_untile_partial`),
+        # each copy's rows then a dimension of its box: a tile of more rows than one copy moves
+        # (`Family.copy_extent`) runs the call padded (an H100's 384 x 64 forward of the 200-deep, 136-wide
+        # call, whose untiled (384, 64) copy TMA refuses).
+        copies = tiled.copy_extent is None or tile.block_m <= tiled.copy_extent
+        depth_partial, width_partial = (each and run and fits and copies for each, run, fits
                                         in zip(admitted, runs, within, strict=True))
         return depth_partial, width_partial
 
