@@ -284,7 +284,7 @@ def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(acc
     in two column halves, within the A100's block as its model sizes it, spilling nothing, lowered and
     compiled for an sm80 on this CPU."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    from kernel_compile import KernelCase, compile_mosaic_kernels, mosaic_failures
 
     op, ba, _ = _gated_backward("sm80", 256, accurate)
     with generation.assumed("sm80"):
