@@ -1499,7 +1499,8 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     spilling fails."""
     from kernel_compile import inherited, mosaic_failures, reports
 
-    within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
+    within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0,
+              "cap": 168}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
@@ -1524,7 +1525,8 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
     assert set(c["unread"]) == {"shared bytes", "tensor memory columns", "binary", "registers", "spills"}
-    assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
+    # Each at the cap its compile states (`compile_mosaic_kernels`'), which these records skip.
+    assert len(mosaic_failures([{**record, "kernels": [{**each, "cap": 255} for each in (a, b, c)]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):
         reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=512)])

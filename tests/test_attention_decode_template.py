@@ -591,11 +591,10 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
 
 QUANTIZED = [(device, page, stored) for stored in ("int8", "float8_e4m3fn")
              for device, page in (("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 16),
-                                  ("sm80", 128))
-             if stored == "int8" or device == "sm90"]
+                                  ("sm80", 128))]
 """The quantized decode's devices, layouts and codes: dense, pages of 16 keys several to a key tile, their
-rows gathered (`Transport.gathers_rows`), and on an A100 of whole key tiles; FP8 codes where the device
-converts them (`mosaic.converts`, sm_89 on)."""
+rows gathered (`Transport.gathers_rows`), and on an A100 of whole key tiles; both int8 and FP8 on every GPU
+(`mosaic.converts`, row 8549)."""
 
 
 @INTERPRETS

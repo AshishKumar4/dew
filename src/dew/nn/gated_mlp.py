@@ -34,7 +34,7 @@ from dew.nn.kernels import gemm, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.kernels.templates.gemm.hooks import hook_lowers
-from dew.nn.sharding import on_shards, seen_whole
+from dew.nn.sharding import automatic_axes, on_shards
 
 FUSION_ROW = 'ledger 1958'
 """The row tracking the fused MLP's reach: a projection it does not reproduce, and its receipts."""
@@ -42,12 +42,12 @@ FUSION_ROW = 'ledger 1958'
 
 @dataclasses.dataclass(frozen=True)
 class GatedCase:
-    """A gated MLP's three projections (gate, up, down) as the fused MLP's selector reads them
-    (`GATED_MLP`): their `joined.Projections`, whether they agree in dtype, precision and promotion
-    (`uniform`), whether any adds a bias (`biased`), the rows the products multiply in the dtype they run at
-    (`rows`, flattened, `fused_products`'), the gate's and the down projection's kernels in it (`kernels`,
-    None where a projection holds none), whether the rows and kernels are seen whole (`whole`, `seen_whole`)
-    and the products' `precision`."""
+    """A gated MLP's three projections (gate, up, down) as the fused MLP's selector reads them (`GATED_MLP`):
+    their `joined.Projections`, whether they agree in dtype, precision and promotion (`uniform`), whether any
+    adds a bias (`biased`), the rows the products multiply in the dtype they run at (`rows`, flattened,
+    `fused_products`'), the gate's and the down projection's kernels in it (`kernels`, None where a projection
+    holds none), whether a launch sees the rows and kernels whole (`whole`: no automatic mesh axis splits
+    them) and the products' `precision`."""
 
     projections: Projections
     uniform: bool
@@ -138,8 +138,7 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
         rows=jax.ShapeDtypeStruct(rows, dtype),
         kernels=None if kernels is None else (jax.ShapeDtypeStruct(kernels[0].shape, dtype),
                                               jax.ShapeDtypeStruct(kernels[2].shape, dtype)),
-        whole=placement is not None or (seen_whole(x)
-                                        and all(seen_whole(kernel) for kernel in kernels or ())),
+        whole=placement is not None or not automatic_axes(),
         precision=gate.precision, hook=activations.gated_hook(activation, limit))
 
 

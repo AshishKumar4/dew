@@ -15,6 +15,8 @@
   the seeds it needs (test_chunked_cross_entropy).
 - A Dense layer's float64 terms on a GPU host are its inputs' placement's own, CPU or GPU, in either order
   (test_float64_terms).
+- A multiply-add marked to round alone rounds each step, as precision's unbarriered transforms take it
+  (test_no_contract).
 """
 
 import functools
@@ -27,6 +29,7 @@ import test_float64_terms as float64_terms_tests
 import test_fp8_base as fp8_base
 import test_lowering as lowering
 import test_moe_precision as moe_precision
+import test_no_contract as no_contract
 import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
 from gpu_flow import Cell, covering, isolated, run_cells, when
@@ -62,6 +65,8 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
         Cell("a power of two's scaling rounds a subnormal result once on a GPU",
              precision_policy.power2_rounds_a_subnormal_result_once, fault=OWN),
         Cell("a flow's scaling rounds a subnormal result once on a GPU", _flow_scaling, fault=OWN),
+        Cell("a multiply-add marked to round alone rounds each step on a GPU",
+             no_contract.a_marked_multiply_add_rounds_each_step, fault=OWN),
         *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",
                functools.partial(precision_policy.compensated_primitives_hold_under_jit, shape), fault=OWN)
           for shape in precision_policy.COMPENSATED_SHAPES),

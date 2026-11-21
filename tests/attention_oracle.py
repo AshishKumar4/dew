@@ -268,7 +268,9 @@ def attention_on_par(fused, reference, draw, label: str, *, keep=None, softcap=N
     logit gradient of float64 zero, which a fused kernel forms from its rounded output. A sink's gradient
     is a logit's beside the keys. Without, `truth` is the truth and each row is
     sized by its final sums' terms (a call whose keys this file does not lay out, every query keeping
-    many). A packed call's tokens, one run `[T, H, D]`, are read as a batch of one."""
+    many). The terms are a program of the draw's widened inputs (`traced_attention_terms`), which a GPU tier
+    part's prepare traces and compiles ahead as it does the truth (row 7359). A packed call's tokens, one
+    run `[T, H, D]`, are read as a batch of one."""
     def batched(fn):
         def run(*arrays):
             if arrays[0].ndim == 4:
@@ -292,7 +294,7 @@ def attention_on_par(fused, reference, draw, label: str, *, keep=None, softcap=N
     def terms(*inputs):
         query, key, value, *rest = inputs
         sinks = rest[0] if len(rest) == 2 else None
-        return split(tuple(batched(lambda q, k, v, s, dy: attention_terms(
+        return split(tuple(batched(lambda q, k, v, s, dy: traced_attention_terms(
             q, k, v, dy, keep, sinks=s, softcap=softcap))(query, key, value, sinks, rest[-1])))
 
     assert_as_exact(jax.jit(program(fused)), jax.jit(program(reference)), draw, label, seeds=seeds,

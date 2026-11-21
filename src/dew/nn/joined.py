@@ -38,8 +38,8 @@ from dew.nn.precision import biased, float32_dot_general
 from .kernels import gemm, generation
 from .kernels.generation import INHERENT, Choice, device_generation
 from .kernels.projections import kernel_path, mapped_shards, recipe_takes, shard_placement
-from .kernels.selection import Kernel, Op, Requirement, forced, select
-from .sharding import on_shards, seen_whole
+from .kernels.selection import Kernel, KernelRefused, Op, Requirement, forced, select
+from .sharding import automatic_axes, on_shards
 
 
 @dataclasses.dataclass(frozen=True)
@@ -341,6 +341,9 @@ class BesidePlan:
     named: bool = False
     """Whether the call names the side-by-side product (`qkv` `joined`): its launches the template's where
     legal, whatever a receipt measured (`_launching`; base review 760be77fe F2)."""
+    forward: generation.Route | None = None
+    """The forward's route the selector admitted them by (`gemm.side_by_side`'s, `BesideCase.route`), which
+    their product runs and reports (`gemm`'s `selected`; base review b68fc2382 F5)."""
 
     def __call__(self) -> tuple[jax.Array, ...]:
         return beside_dense(self)
@@ -364,11 +367,13 @@ class BesideCase:
     their widths and promote by dtype alone (`agreed`); whether they give one input and kernels of its one
     dtype (`uniform`); whether any one's 16-bit product rounds once with its fp32 bias (`widened`: XLA's
     widened product, `dense._rounds_once`, which no launch takes); and whether a launch takes their product
-    side by side (`launched`: `gemm.side_by_side`, of a device's own rows where a mesh splits them alone,
-    `plan`), its forward and its input gradient independent choices (`gemm.side_by_side`)."""
+    side by side (`route`: `gemm.side_by_side`'s forward route, of a device's own rows where a mesh splits
+    them alone, `plan`), its forward and its input gradient independent choices (`gemm.side_by_side`)."""
 
     def __init__(self, projections: Sequence[Dense], x: jax.Array):
         self.projections, self.x = projections, x
+        self.refused: KernelRefused | None = None
+        """Why a kernel the call names refuses their forward side by side (`route`), where one does."""
 
     @functools.cached_property
     def found(self) -> Projections:
@@ -410,7 +415,7 @@ class BesideCase:
                        strict=True))
 
     @functools.cached_property
-    def launched(self) -> bool:
+    def route(self) -> generation.Route | None:
         inputs, kernels = self.plan.operands.inputs[0], self.plan.operands.kernels
         placement = self.plan.placement
         rows = (placement[2] if placement is not None
@@ -419,9 +424,15 @@ class BesideCase:
         # Seen whole where a placement maps the rows, else where the rows and every kernel are, as `gemm`'s
         # forward and input gradient read them (head review of b68fc2382: replicated rows by a varying kernel
         # in a shard_map took no compound launch there).
-        whole = placement is not None or all(map(seen_whole, (inputs, *kernels)))
+        whole = placement is not None or not automatic_axes()
         with _launching(self.plan.named):
-            return gemm.side_by_side(rows, matrices, inputs.dtype, self.plan.precision, whole=whole)
+            try:
+                return gemm.side_by_side(rows, matrices, inputs.dtype, self.plan.precision, whole=whole)
+            except KernelRefused as refused:
+                # A kernel the call names refusing their forward side by side: they run apart, the refusal
+                # the selector's reason (`BESIDE_SUPPORTS`' `launched`).
+                self.refused = refused
+                return None
 
 
 BESIDE_SUPPORTS: tuple[Requirement[BesideCase], ...] = (
@@ -443,9 +454,10 @@ BESIDE_SUPPORTS: tuple[Requirement[BesideCase], ...] = (
                 lambda case: (f"grouped_matmul {forced(Choice.GROUPED_MATMUL)!r} is named beside qkv "
                               "'joined', whose product runs the grouped GEMM template's launches"),
                 row=INHERENT),
-    Requirement('launched', lambda case: case.launched,
-                "no launch takes the projections' product side by side, its forward or its input gradient "
-                "(`gemm.side_by_side`)", row=INHERENT),
+    Requirement('launched', lambda case: case.route is not None,
+                lambda case: ("no launch takes the projections' product side by side, its forward or its "
+                              "input gradient (`gemm.side_by_side`)"
+                              + ("" if case.refused is None else f": {case.refused}")), row=INHERENT),
 )
 """What one side-by-side launch needs to stand in for the projections' own calls
 (`projection_requirements`), what its columns share, and, last, a launch that takes it (head review of
@@ -453,7 +465,7 @@ BESIDE_SUPPORTS: tuple[Requirement[BesideCase], ...] = (
 
 BESIDE = Op(Choice.QKV, (Kernel[BesideCase]('joined', BESIDE_SUPPORTS), Kernel('apart', (), generic=True)))
 """The side-by-side product's selector: the projections side by side where every requirement holds, a launch
-taking that product the last (`BesideCase.launched`), else each its own call."""
+taking that product the last (`BesideCase.route`), else each its own call."""
 
 
 def side_by_side(projections: Sequence[nn.Module], x: jax.Array) -> BesidePlan | None:
@@ -463,24 +475,26 @@ def side_by_side(projections: Sequence[nn.Module], x: jax.Array) -> BesidePlan |
     if len(projections) < 2 or projections[0].is_initializing() or not _dense(projections):
         return None
     case = BesideCase(projections, x)
-    return case.plan if select(BESIDE, case).kernel == 'joined' else None
+    if select(BESIDE, case).kernel != 'joined':
+        return None
+    return dataclasses.replace(case.plan, forward=case.route)
 
 
 def beside_dense(plan: BesidePlan) -> tuple[jax.Array, ...]:
     """The projections' outputs `plan` admitted, each its own, from one `gemm` of their columns side by side
-    (`gemm.gemm`'s `beside`): its forward one launch where the grouped selector takes it so, else each
-    product its own call (Hopper's measured route: the forward apart, the input gradient one chained launch,
-    `grouped_matmul._grouped_preferred`); each bias added past its product as a Dense adds it
-    (`precision.biased`). Where a mesh splits the rows alone, each device's rows are their own call
-    (`_mapped`, `plan.placement`), as the selector asked of them. A named side-by-side product runs the
-    template's launches, its pullback too (`_launching`, `GROUPED.bound`)."""
+    (`gemm.gemm`'s `beside`): its forward one launch where the grouped selector took it so as it admitted
+    them (`plan.forward`, run as decided), else each product its own call (Hopper's measured route: the
+    forward apart, the input gradient one chained launch, `grouped_matmul._grouped_preferred`); each bias
+    added past its product as a Dense adds it (`precision.biased`). Where a mesh splits the rows alone, each
+    device's rows are their own call (`_mapped`, `plan.placement`), as the selector asked of them. A named
+    side-by-side product runs the template's launches, its pullback too (`_launching`, `GROUPED.bound`)."""
     operands = plan.operands
 
     def side_by_side(inputs, *kernels):
         rows = inputs.reshape(-1, inputs.shape[-1])
         with _launching(plan.named):
             outs = gemm.gemm(rows, kernels[0], beside=kernels[1:], out_dtype=inputs.dtype,
-                             precision=plan.precision)
+                             precision=plan.precision, selected=plan.forward)
         return tuple(out.reshape(*inputs.shape[:-1], out.shape[-1]) for out in outs)
 
     placement = None if plan.placement is None else plan.placement[:2]

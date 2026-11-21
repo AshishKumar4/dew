@@ -168,8 +168,10 @@ _FREE = frozenset({
     gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
     lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
-    lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p, ad_util.stop_gradient_p})
+    lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p, ad_util.stop_gradient_p, jax_core.pvary_p,
+    jax_core.reduced_vary_cast_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
+a value's type cast along manual mesh axes (to vary, or from reduced: no value changes),
 indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
 every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
 which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no
@@ -182,16 +184,15 @@ _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 _COPIES = frozenset({gpu.copy_gmem_to_smem_p, gpu.copy_smem_to_gmem_p})
 """Copies between device and shared memory (`_copied`)."""
 
-def _folded(equation, values: list) -> list:
-    """`equation` over its concrete integer and boolean scalar operands, each at its atom's dtype, as its
-    primitive computes it on the GPU (`programs.scalar_folded`): a width's wrap, a quotient's truncation and a
-    remainder's sign the program's own; unknown where it computes none, a quotient or remainder by zero or of
-    the least integer by -1 among them, which the GPU leaves undefined (LLVM's `sdiv` and `srem`, which Mosaic
-    GPU's integer division lowers to), and where Mosaic GPU types it otherwise than XLA (`_typed_alike`)."""
+def _folded(equation, operands: list) -> list:
+    """`equation` over its concrete integer and boolean scalar operands, each admitted at its atom's dtype
+    (`programs.admitted`), as its primitive computes it on the GPU (`programs.scalar_folded`): a width's wrap,
+    a quotient's truncation and a remainder's sign the program's own; unknown where it computes none, a
+    quotient or remainder by zero or of the least integer by -1 among them, which the GPU leaves undefined
+    (LLVM's `sdiv` and `srem`, which Mosaic GPU's integer division lowers to), and where Mosaic GPU types it
+    otherwise than XLA (`_typed_alike`)."""
     if not _typed_alike(equation):
         return [None]
-    operands = [np.asarray(value, dtype=atom.aval.dtype)[()]
-                for value, atom in zip(values, equation.invars, strict=True)]
     if equation.primitive in (lax.div_p, lax.rem_p) and _undefined(*operands):
         return [None]
     if equation.primitive in _SHIFTS and not 0 <= int(operands[1]) < jnp.iinfo(operands[0].dtype).bits:
@@ -485,17 +486,17 @@ class _Counting:
         self.waited(equation)
         if primitive is lax.axis_index_p:
             return [self.place(params["axis_name"])]
-        if (primitive in programs.SCALAR_FOLDED and values
-                and all(_scalar(value) for value in values)):
+        if (primitive in programs.SCALAR_FOLDED and values and (operands := programs.admitted(
+                values, [atom.aval.dtype for atom in equation.invars])) is not None):
             if primitive is lax.convert_element_type_p:
                 self.add(Work(conversions=1))
-            return _folded(equation, values)
+            return _folded(equation, operands)
         if (placed := _placed(primitive, values)) is not None:
             return [placed]
         if primitive is pallas.multiple_of_p:
             # A divisibility hint: its operand's value, nothing computed.
             return [values[0]]
-        if (primitive is lax.select_n_p and _scalar(values[0])
+        if (primitive is lax.select_n_p and programs.integral_scalar(values[0])
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
         if primitive in _OPERATIONS:
@@ -660,7 +661,7 @@ class _Counting:
         takes a conditional), its steps' marks likewise; the walks its branches hold one walk, a step of it
         the most of each unit any branch's walks take a step (their mean, `Role.step`)."""
         index, operands = values[0], values[1:]
-        if _scalar(index):
+        if programs.integral_scalar(index):
             return self.run(branches[int(index)], operands)
         trials = []
         for branch in branches:
@@ -697,7 +698,7 @@ def _placed(primitive, values: list):
     if len(values) != 2 or not any(isinstance(value, _Place) for value in values):
         return None
     place, other = values if isinstance(values[0], _Place) else values[::-1]
-    if not (_scalar(other) or isinstance(other, _Same)):
+    if not (programs.integral_scalar(other) or isinstance(other, _Same)):
         return None
     if primitive is lax.add_p and other == 1:
         return dataclasses.replace(place, plus=place.plus + 1)
@@ -766,15 +767,6 @@ def _envelope(works) -> Work:
     return Work(**{field.name: max(getattr(work, field.name) for work in works)
                    for field in dataclasses.fields(Work) if field.name != "chains"},
                 chains=sum(works, Work()).chains)
-
-
-def _scalar(value) -> bool:
-    """Whether `value` is a concrete integer or boolean scalar, what a warpgroup's index arithmetic holds:
-    a Python integer or boolean, or a NumPy scalar of an integer or boolean dtype (JAX's 4-bit integers among
-    them). A float is none: its predicate's branches are unknown, each counted
-    (`programs.scalar_folded`)."""
-    return isinstance(value, int) or (isinstance(value, np.generic) and any(
-        jnp.issubdtype(value.dtype, kind) for kind in (jnp.integer, jnp.bool_)))
 
 
 def built_with(cost: pl.CostEstimate | Stated | None) -> pl.CostEstimate | None:

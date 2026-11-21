@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, allocator_limit, device_memory, stated_share
+from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
@@ -684,14 +684,13 @@ def programs_need(device, programs: Iterable[tuple[CompiledMemory | None, int, i
     first call builds, admitted as the planner admits a step (`memory.admission`, `memory.needed`) and read
     as the limit that GPU's pool holds (`allocator_limit` at its stated share). None for a device of no GPU
     pool (a TPU's, whose topology states its own) and where a program states no memory."""
-    from dew.training.memory import admission, needed
+    from dew.training.memory import admission, least_limit
 
     programs = list(programs)
     stated = [(memory, held, built) for memory, held, built in programs if memory is not None]
     if device.platform != "gpu" or not programs or len(stated) < len(programs):
         return None
-    return max(allocator_limit(needed(device, *admission(memory, held, built)), stated_share(device))
-               for memory, held, built in stated)
+    return least_limit(device, [admission(memory, held, built) for memory, held, built in stated])
 
 
 @dataclasses.dataclass(frozen=True)

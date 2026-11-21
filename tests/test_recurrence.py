@@ -15,7 +15,7 @@ from generation_support import COMPILES_ON_CPU
 from reference_error import assert_as_exact
 from test_recurrence_chunk import ROUTES, on_route
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import generation, recurrence
 from dew.nn.precision import FP32_SUMS
 
 ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 3, 2, 4, 128, 128, 4
@@ -498,3 +498,31 @@ def test_a_decode_step_holds_its_registers_at_the_residency_it_plans(target, row
     assert not mosaic_failures([record]), mosaic_failures([record])
     (kernel,) = [kernel for kernel in record['kernels'] if 'recurrence_step' in kernel['kernel']]
     assert kernel['spilled'] == 0, kernel
+
+
+@COMPILES_ON_CPU
+def test_the_gated_delta_nets_forward_lowers_for_an_h100_with_x64_on():
+    """The 27B gated delta net's forward (`chunk_gated_delta_rule`: 16 key and 48 value heads 128 wide, bf16,
+    one row of 256 tokens, the template named) lowered for a compile-only H100 with `jax_enable_x64` on, as a
+    user's process may run: the template takes it, its launches' bodies tracing their index arithmetic in 32
+    bits, which Mosaic GPU's lowering reads (a barrier's phase), where x64's 64-bit integers failed it (row
+    10121: a GH200's eager call)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule
+
+    rows, length, key_heads, value_heads, width = 1, 256, 16, 48, 128
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    operands = (bf16((rows, length, key_heads, width)), bf16((rows, length, key_heads, width)),
+                bf16((rows, length, value_heads, width)),
+                jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
+                bf16((rows, length, value_heads)))
+
+    def forward(query, key, value, decay, beta):
+        return chunk_gated_delta_rule(query, key, value, decay, beta, None, chunk_size=64, write_bound=1.0)
+
+    with (jax.enable_x64(new_val=True), generation.chosen(gated_delta_rule='mosaic_gpu'),
+          generation.routes() as routes):
+        lowered_for(forward, operands, 'sm90')
+    assert ('gated_delta_rule', 'mosaic_gpu') in {(route.choice, route.kernel) for route in routes}, routes
+
