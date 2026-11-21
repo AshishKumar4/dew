@@ -213,15 +213,19 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
                 return stream_tile(slots, name, call.given).value().astype(jnp.float32)
 
             prefix = tuple(stream_tile(slots, name, gates).value() for name in ("highs", "lows"))
-            formed = [intra_rows(call, name, operand, beta_ref.at[h, span]) for name in products]
             shifted = shifted_keys(call, shifts, operand("keys"), prefix)
             if call.interpret:
-                found = algebra.key_diagonal_bands(formed, shifted, unit_keys=call.unit_keys)
+                found = algebra.key_diagonal_bands(
+                    [intra_rows(call, name, operand, beta_ref.at[h, span]) for name in products], shifted,
+                    unit_keys=call.unit_keys)
                 bands = tuple(band + more for band, more in zip(bands, found, strict=True))
             else:
-                # Natively, each thread its own pairs' words (`own_bands`), the bands summed in shared memory.
-                for o, value in enumerate(formed):
-                    plgpu.store(rows.at[o], value, optimized=False)
+                # Natively, each output's rows formed and stored in turn, after the keys' and decays' (no
+                # tile of them live across another's forming), then each thread its own pairs' words
+                # (`own_bands`), the bands summed in shared memory.
+                for o, name in enumerate(products):
+                    plgpu.store(rows.at[o], intra_rows(call, name, operand, beta_ref.at[h, span]),
+                                optimized=False)
                 mosaic.synced(call.interpret)
                 own_bands(rows, shifts, summed, unit_keys=call.unit_keys)
 
@@ -296,9 +300,10 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
     the lanes' index."""
     chunk = call.chunk
     if not call.interpret:
-        # Natively the bands summed in shared memory (`own_bands`), a thread holding its two rows' runs of
-        # each output, the pair's decay and a step's keys and factors.
-        return Held(phases=([f32(chunk, block)] * 6, [f32(chunk, block)] * (outputs + 2),
+        # Natively the bands summed in shared memory (`own_bands`): the keys' and decays' forming, then an
+        # output's rows formed (its operand, its write strengths and the rows), then a thread's step of its
+        # own pairs (a run of the row, the keys, the factors and the pair's decay).
+        return Held(phases=([f32(chunk, block)] * 6, [f32(chunk, block)] * 3, [f32(chunk, block)] * 2,
                             [f32(chunk, algebra.SUB)] * 2))
     return Held(carried=[f32(chunk, algebra.SUB)] * outputs, phases=(
         [f32(chunk, block)] * 6,
