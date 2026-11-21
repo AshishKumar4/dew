@@ -269,6 +269,11 @@ def _stepped(family: mosaic.Family, axes_of: tuple, stepping: str) -> tuple[tupl
     return stepped, read, fixed
 
 
+APPROX_MATH = False
+"""Whether a GEMM launch compiles its special functions in the hardware's approximate forms
+(`mosaic.Family.kernel`'s `approx_math`): never, a product's prologue and epilogue held to their accurate
+forms (`emission.ACCURATE_FORMS`, which a fused region's price counts them in, `fused_gemm.priced`)."""
+
 MOVES = True
 """Dew: whether a GEMM launch's schedule moves registers between its roles (`mosaic.Family.kernel`'s
 `moves`): always, until its register models match ptxas at no move (row 5704: at the entry share ptxas
@@ -607,7 +612,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     operands = _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scatter, joined,
                              beside_matrices, (chained_operands, when, into))
     kernel = family.kernel(body, out_type=out_type, grid=(multiprocessors // pair,), grid_names=("programs",),
-                           consumers=consumers + rewritten, interpret=interpret, approx_math=False,
+                           consumers=consumers + rewritten, interpret=interpret, approx_math=APPROX_MATH,
                            name=GMM if when is None else GUARDED_GMM, cluster=pair, resident=tiles.programs,
                            scalars=0 if dense else 1, model_flops=None if when is None else 0,  # replay: 0
                            registers=registers, producer=tiles.producers.of(GMM), shared=shared, moves=MOVES,
@@ -2139,7 +2144,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     out_type = _tgmm_declared(lhs, rhs, groups[0], (g, m, n), out_dtype, k_major)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors // pair,), grid_names=("programs",),
-                           consumers=consumers + rewritten, interpret=interpret, approx_math=False,
+                           consumers=consumers + rewritten, interpret=interpret, approx_math=APPROX_MATH,
                            name=TGMM, cluster=pair, registers=registers, producer=tiles.producers.of(TGMM),
                            shared=shared, moves=MOVES, resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
