@@ -261,9 +261,12 @@ def _significand(side) -> int:
 
     if isinstance(side, ir.FloatTF32Type):
         return 11
-    for dtype in map(np.dtype, dtypes._float_types):
-        if mlir.dtype_to_ir_type(dtype) == side:
-            return _digits(dtype)
+    # In the type's own context: a compile's checks read a program's dots outside any of theirs
+    # (`report.triton_wrong`, a GPU target's compile).
+    with side.context:
+        for dtype in map(np.dtype, dtypes._float_types):
+            if mlir.dtype_to_ir_type(dtype) == side:
+                return _digits(dtype)
     raise ValueError(f"no float dtype lowers to the dot algorithm's precision type {side}")
 
 

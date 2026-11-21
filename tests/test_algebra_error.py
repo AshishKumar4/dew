@@ -208,6 +208,21 @@ def test_an_algorithm_at_least_another_is_as_exact_as_it():
                             seeds=8, truth_fn=_product(jax.lax.DotAlgorithmPreset.F64_F64_F64))
 
 
+def test_a_program_naming_a_dot_algorithm_compiles_for_a_gpu():
+    """A program whose product names a dot algorithm compiles through Dew's compile point for a GPU on this
+    CPU, as a prepare compiles it (`generation.assumed`, a compile-only device): the compile's own checks
+    read the algorithm's arithmetic (`report.triton_wrong`, `programs.algorithm_arithmetic`) outside any MLIR
+    context of theirs, its precision types' digits read in the attribute's own (row 5473)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.options import owned_program
+
+    gpu = generation.compile_only_gpus("sm90", 1)[0]
+    operand = jax.ShapeDtypeStruct((256, 256), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(gpu))
+    split = functools.partial(jnp.dot, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6)
+    with generation.assumed("sm90"):
+        owned_program(split).compiled(operand, operand)
+
+
 def cancelled(seed):
     """Terms near a hundred million, a term of unit size, and the first's negation: a sum whose large terms
     cancel exactly, leaving the small one, which float32 rounds away beside the large."""
