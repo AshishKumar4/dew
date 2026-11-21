@@ -37,7 +37,7 @@ import functools
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +45,7 @@ import numpy as np
 import scipy.linalg
 from flax import linen as nn, struct
 from jax.sharding import PartitionSpec as P
+from typing_extensions import TypeIs
 
 from dew.batch import prefix_sum
 from dew.mesh import LayoutRefused, logical_spec, mesh_axes
@@ -66,6 +67,15 @@ _log = logging.getLogger(__name__)
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""
+PagedKernel = Literal["template", "triton", "tpu"]
+"""The paged decode kernels `KVStore.paged_kernel` returns and `KVStore.decode` runs."""
+_PAGED_KERNELS: frozenset[str] = frozenset(get_args(PagedKernel))
+
+
+def _is_paged_kernel(kernel: str) -> TypeIs[PagedKernel]:
+    """Narrow a selector's kernel name to `PagedKernel` against its declared literal members."""
+    return kernel in _PAGED_KERNELS
+
 
 TABLE = "page_table"
 """A paged cache's per-row page table, `[rows, capacity // page_size]`."""
@@ -1096,14 +1106,16 @@ class KVStore:
                          arithmetic=arithmetic, named=named, rows=query.shape[0], queries=1,
                          keys=self._slots(), windowed=windowed, sinks=sinks)
 
-    def paged_kernel(self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
-                     windowed: bool = False, sinks: bool = False) -> str | None:
+    def paged_kernel(
+        self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
+        windowed: bool = False, sinks: bool = False,
+    ) -> PagedKernel | None:
         """The paged kernel the selector gives a decode step's query over this pool (`PAGED`, over its one
         `case`), reported as the step's route, which `decode` runs; None where no paged kernel takes it and
         the layer reads the gathered rows itself."""
         kernel = select(PAGED, self.case(query, softcap=softcap, arithmetic=arithmetic, named=named,
                                          windowed=windowed, sinks=sinks)).kernel
-        return None if kernel == 'gathered' else kernel
+        return kernel if _is_paged_kernel(kernel) else None
 
     def _value_width(self) -> int:
         """The width the pool stores each value at (the keys' where the values are the keys)."""
@@ -1115,8 +1127,9 @@ class KVStore:
             return self._get(TABLE).shape[1] * self.layout.page_size
         return self._get(self.payloads[0][0]).shape[1]
 
-    def decode(self, query: jax.Array, lengths: jax.Array, kernel: str, softcap: float | None,
-               starts: jax.Array | None = None, sinks: jax.Array | None = None) -> jax.Array:
+    def decode(self, query: jax.Array, lengths: jax.Array, kernel: PagedKernel,
+               softcap: float | None, starts: jax.Array | None = None,
+               sinks: jax.Array | None = None) -> jax.Array:
         """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row,
         from `starts` `[rows]` where given (a window's first slot, which the GPU's kernel reads), with
         `sinks` `[heads]` where the layer has them (the GPU's kernel applies them).

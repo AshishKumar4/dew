@@ -1026,15 +1026,6 @@ class StepCompiler[L, E]:
         several (row 7884)."""
         sampled, planned = self.phase_passes.sampled, cap.planned
         assert sampled is not None and planned is not None, "a sampled count's cap compiled on the devices"
-        # A window that pools its microbatches by their mean holds their gradient's sum and its mass
-        # (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that replays
-        # them holds their batches instead.
-        window = planned.candidate.prepared.window
-        if window is not None and window.mass is None:
-            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
-                             "its update replays each microbatch at the count that closes it: a pass count "
-                             "drawn per microbatch takes them one microbatch an update (split and "
-                             "accumulation 1), until replays run each at its own (row 7884)")
         plans, flops = {sampled.cap: planned}, {sampled.cap: cap.step_flops}
         for count, each in self.admitted_counts(holder, stepping, planned, state, batch):
             plans[count], flops[count] = each.released(), self._flops(each)
@@ -1058,6 +1049,21 @@ class StepCompiler[L, E]:
         own), else compiled here, as the run says."""
         sampled = self.phase_passes.sampled
         assert sampled is not None, "a run that draws its pass count per microbatch"
+        # Refused here, where a run and a build ahead (`compile_ahead`) both admit the counts: a window that
+        # pools its microbatches by their mean holds their gradient's sum and its mass
+        # (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that replays
+        # them holds their batches instead.
+        window = cap.candidate.prepared.window
+        if window is not None and window.mass is None:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
+                             "its update replays each microbatch at the count that closes it: a pass count "
+                             "drawn per microbatch takes them one microbatch an update (split and "
+                             "accumulation 1), until replays run each at its own (row 7884)")
+        if window is not None and window.batch_statistics is not None and cap.split > 1 and sampled.cap > 1:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics of a step's whole batch "
+                             "(`batch_statistics`) are computed at its first part, by that part's count, and "
+                             "read by every part: a pass count drawn per microbatch reads them one part a "
+                             "step (split 1), until each part's count computes its own (row 10770's audit)")
         counts, family, self.counts_ahead = range(1, sampled.cap), self.counts_ahead, None
         if family is None:
             _log.info("the run draws its pass count per microbatch: it compiles the steps of counts %s at "

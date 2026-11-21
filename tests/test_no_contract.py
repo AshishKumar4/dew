@@ -116,3 +116,37 @@ def a_marked_multiply_add_rounds_each_step():
     fused = (a.astype(np.float64) * b + c).astype(np.float32)
     assert np.any(fused != stepped), "no draw tells a fused multiply-add from its steps"
     np.testing.assert_array_equal(found.view(np.uint32), stepped.view(np.uint32))
+
+
+def test_a_compiled_tpu_kernels_error_free_transforms_hold_their_operands_behind_a_barrier():
+    """`two_sum` and `two_product` in a compiled Pallas TPU kernel's body, traced for an assumed v5p, hold
+    their operands behind an optimization barrier, as every other kernel body's do, and the launch lowers on
+    any host to a Mosaic kernel: the fork's Mosaic lowering takes the barrier from post111 (its operands as
+    they are, Mosaic keeping a multiply and an add apart), where the body read them unbarriered before it did
+    (row 7954)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import AbstractDevice, AbstractMesh, AxisType
+    from reference_error import equations
+
+    from dew.nn.kernels import launches
+    from dew.nn.kernels.generation import TARGETS, assumed
+    from dew.nn.kernels.lowered import custom_calls
+    from dew.nn.precision import two_product, two_sum
+
+    def body(x_ref, y_ref, out_ref):
+        high, low = two_sum(*two_product(x_ref[...], y_ref[...]))
+        out_ref[...] = high + low
+
+    spec = pl.BlockSpec((8, 128), lambda: (0, 0), memory_space=pltpu.VMEM)
+    call = launches.pallas_call(body, grid=(), in_specs=[spec, spec], out_specs=spec,
+                                out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32), interpret=False,
+                                name="error_free_transforms")
+    tile = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+    device = AbstractDevice(device_kind=TARGETS["v5p"].device_kind, num_cores=None, platform="tpu")
+    mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
+        traced = jax.jit(call).trace(tile, tile)
+        lowered = traced.lower(lowering_platforms=("tpu",))
+    assert any(found.target == "tpu_custom_call" for found in custom_calls(lowered))
+    assert any(equation.primitive is jax.lax.optimization_barrier_p for equation in equations(traced.jaxpr))

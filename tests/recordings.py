@@ -8,8 +8,9 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import drawn_on_the_host
 from arm_forms import as_recorded
-from reference_error import SIZING_FROM, drawn_on_the_host, input_digest
+from reference_error import SIZING_FROM, input_digest
 
 from dew.parity_stages import REDRAW, staged_units
 

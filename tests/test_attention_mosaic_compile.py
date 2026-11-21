@@ -8,6 +8,7 @@ score hook's lowering. The mainloop's values are tests/test_attention_mosaic.py'
 
 import dataclasses
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -908,6 +909,28 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert certified(warm) == certified(cold)
 
 
+@COMPILES_ON_CPU
+def test_a_launchs_stored_verdict_is_not_read_where_another_nvcc_wheel_is_installed(tmp_path):
+    """A launch certified by one process is certified again by the next where the installed CUDA nvcc wheels
+    differ (another wheel's metadata on its path, its kernels' IR the same): the wheels name the ptxas that
+    judges a kernel's spills and serialized products (`report._assemblers`), so neither the launch's own key
+    nor its lowered kernels' key reads a verdict judged under other wheels back (row 10782: the lowered key
+    named none). The child changes wheel metadata alone, not the ptxas binary or the provider XLA selects;
+    that a fingerprint of wheels is no whole compiler identity is row 7309's."""
+    from process_support import REPO_ROOT, fresh, keeping_picks
+
+    moved = tmp_path / "site"
+    (moved / "nvidia_cuda_nvcc_cu12-99.0.dist-info").mkdir(parents=True)
+    (moved / "nvidia_cuda_nvcc_cu12-99.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: nvidia-cuda-nvcc-cu12\nVersion: 99.0\n")
+    path = os.pathsep.join((str(REPO_ROOT / "src"), str(REPO_ROOT / "tests"), str(moved)))
+    cold = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
+    reassembled = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks(),
+                        variables={"PYTHONPATH": path})
+    assert cold and not any(stored for _, stored, _ in cold), cold
+    assert reassembled and not any(stored for _, stored, _ in reassembled), reassembled
+
+
 EDITED_FORWARD = """
 import jax
 import dew._cache
@@ -949,48 +972,54 @@ def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_t
             == sorted((op, sorted(modules.items())) for op, _, modules in cold))
 
 
+CERTIFIED_PROGRAM = """
+import json
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels import generation
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.templates import report
+
+tokens, heads, kv_heads, width = 1600, 4, 2, 128
+device = compile_only_gpus("sm90")[0]
+placed = NamedSharding(Mesh([device], ("x",)), PartitionSpec())
+query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16, sharding=placed)
+key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16, sharding=placed)
+
+def loss(query, key, value):
+    attended = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
+    return jnp.sum(attended.astype(jnp.float32))
+
+with generation.assumed("sm90"), report.certifying(device), report.refusals():
+    owned_program(jax.grad(loss, argnums=(0, 1, 2))).compiled(query, key, key)
+print(json.dumps([[found.op, found.stored, bool(found.refused),
+                   {name: module for name, (module, _) in found.kernels.items()}]
+                  for found in report.certifications()]))
+"""
+"""A training step compiled through Dew's compile point (`OuterProgram.compiled`) in a process of its own,
+each attention launch certified on a compile-only H100."""
+
+
 @COMPILES_ON_CPU
-def test_a_programs_launches_compile_beside_its_trace():
+def test_a_programs_launches_compile_beside_its_trace(tmp_path):
     """A training step compiled through Dew's compile point (`OuterProgram.compiled`) certifies its
-    attention launches beside its trace (`report.certifying_aside`): each launch's compile runs on a thread
-    of its own while the trace goes on, as JAX's compile events say of the thread that ran them, the
-    program's own compile on the caller's; its launches certified, none refused."""
-    import threading
+    attention launches beside its trace (`report.certifying_aside`) on a cold isolated store and reads
+    stored verdicts on a warm repeat without refusing any launch (row 10802)."""
+    from process_support import fresh, keeping_picks
 
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+    def certified(found: list) -> list:
+        return sorted((op, sorted(modules.items())) for op, _, _, modules in found)
 
-    from dew.nn.kernels.generation import compile_only_gpus
-    from dew.nn.kernels.options import owned_program
-
-    compiled_on: list[str] = []
-
-    def heard(event: str, seconds: float, **_) -> None:
-        if event == "/jax/core/compile/backend_compile_duration":
-            compiled_on.append(threading.current_thread().name)
-
-    tokens, heads, kv_heads, width = 1600, 4, 2, 128
-    device = compile_only_gpus("sm90")[0]
-    placed = NamedSharding(Mesh([device], ("x",)), PartitionSpec())
-    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16, sharding=placed)
-    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16, sharding=placed)
-
-    def loss(query, key, value):
-        attended = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
-        return jnp.sum(attended.astype(jnp.float32))
-
-    before = len(report.certifications())
-    jax.monitoring.register_event_duration_secs_listener(heard)
-    try:
-        with generation.assumed("sm90"), report.certifying(device), report.refusals():
-            owned_program(jax.grad(loss, argnums=(0, 1, 2))).compiled(query, key, key)
-    finally:
-        jax.monitoring.unregister_event_duration_listener(heard)
-    certified = report.certifications()[before:]
-    assert certified and not any(certification.refused for certification in certified), certified
-    aside = [name for name in compiled_on if name.startswith("dew-certify")]
-    compiled_here = [certification for certification in certified if not certification.stored]
-    assert len(aside) == len(compiled_here) > 0, compiled_on
-    assert compiled_on.count(threading.current_thread().name) == 1, compiled_on
+    cold = fresh(CERTIFIED_PROGRAM, cache_dir=tmp_path, flags=keeping_picks())
+    warm = fresh(CERTIFIED_PROGRAM, cache_dir=tmp_path, flags=keeping_picks())
+    assert cold and not any(refused for _, _, refused, _ in cold), cold
+    assert not any(stored for _, stored, _, _ in cold), cold
+    assert warm and all(stored for _, stored, _, _ in warm), warm
+    assert not any(refused for _, _, refused, _ in warm), warm
+    assert certified(warm) == certified(cold)
 
 
 @COMPILES_ON_CPU
@@ -1590,13 +1619,14 @@ def test_launch_seconds_prices_wave_quantization_and_residency():
 
 
 def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
-    """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) and default 16-bit dot preset
-    (`_jax_nn_algorithm`) through `dew.algebra.error.product_precision` (row 5473)."""
-    from dew.nn import attention
+    """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) through
+    `dew.algebra.error.product_precision` (row 5473), and its default 16-bit dot preset
+    (`_jax_nn_algorithm`) from JAX's own algorithms (`dew.nn.programs.own_preset`, row 10808)."""
+    from dew.nn import programs
     from dew.nn.kernels.templates import attention_algebra as algebra
 
     with generation.assumed("sm90"):
         assert algebra.bf16_part_count(accurate=True) == 3
         assert algebra.bf16_part_count(accurate=False) == 1
-        assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-        assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
+        assert programs.own_preset(jnp.bfloat16) == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+        assert programs.own_preset(jnp.float16) == jax.lax.DotAlgorithmPreset.F16_F16_F32

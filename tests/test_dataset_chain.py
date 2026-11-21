@@ -1860,6 +1860,27 @@ def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(re
     assert alike, (len(shares), [pair for pair in shares if pair not in whole][:4])
 
 
+@pytest.mark.parametrize("workers", [1, 2])
+def test_a_batched_map_that_keeps_its_rows_reads_alike_through_a_worker_process(workers):
+    """A batched map that keeps its rows, read by an indexed read through worker processes (Grain's
+    `mp_prefetch`, which pickles the dataset graph to them): each worker makes and holds its own groups,
+    two workers each a group's rows of their own batches, so the rows are the in-process read's (row 10781:
+    the groups' lock and cached futures failed to pickle before the first batch)."""
+    chain = Memory(rows("a", 24)).map(group_firsts, batched=True, batch_size=4).batch(2)
+
+    def read_with(loading: Loading) -> list[tuple[int, int]]:
+        reader = compile(chain, read="indexed", loading=loading).train(DataPartition())
+        try:
+            batches = [next(reader) for _ in range(24 // 2)]
+        finally:
+            reader.close()
+        return [(int(i), int(group)) for batch in batches
+                for i, group in zip(np.asarray(batch["i"]).ravel(), np.asarray(batch["group"]).ravel(),
+                                    strict=True)]
+
+    assert read_with(Loading(workers=workers, threads=1, read_buffer=1)) == read_with(READ)
+
+
 GROUPS_MADE: list[int] = []
 """Each group a `counted_group_firsts` step made, by its first `i`."""
 

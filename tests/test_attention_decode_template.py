@@ -997,6 +997,15 @@ def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumer
     assert split.flops * steps[1] == unsplit.flops * steps[0]
 
 
+def test_a_launchs_costed_work_holds_the_integer_work_its_emission_counts():
+    """A causal forward's launch traced for an H100 (`_split_work`) counts the integer work its emission
+    issues (its mask's comparisons and index arithmetic, `cost.Work.integer_operations`) in its costed work,
+    as every other unit its emission counts: its launch's work had dropped them, pricing them at none in the
+    decode and the forward consumer's choice (row 10793)."""
+    work = _split_work("causal", 256, 256, 2, "wgmma", 1)
+    assert work.integer_operations > 0, work
+
+
 def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
     """A decode step of 256 rows of one query, 8 heads over 2 key heads 128 wide in bf16, on an H100 over
     4096 keys (`attention_decode.priced_step`): its programs, 512, pass the multiprocessors' count, so no

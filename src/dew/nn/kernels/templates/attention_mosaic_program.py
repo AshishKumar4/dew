@@ -495,25 +495,28 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
 
 
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
-                 products: tuple | None = None, over_rings: bool = False) -> resources.Scope:
+                 products: tuple | None = None, over_rings: bool = False,
+                 values: tuple[dict, tuple] | None = None) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
     walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
     where its `products` take one (`Family.product_held`, its tensor memory's addresses
-    `Issuer.product_addresses`), with the algebra's reductions' scratch where it `reduces` (a launch reducing
-    its scores, weights or cotangents across warps) and its `reducing_warpgroups`' scratch
-    (`resources.Scope`)."""
+    `Issuer.product_addresses`), its issuer's scratch values where `values` are given
+    (`Issuer.value_scratch`: TPU VMEM live tiles, row 10771), with the algebra's reductions' scratch where it
+    `reduces` (a launch reducing its scores, weights or cotangents across warps) and its
+    `reducing_warpgroups`' scratch (`resources.Scope`)."""
     scoped, streams, *after = allocations
     after_walks = tuple(after[0]) if after else ()
+    scratch = () if values is None else family.value_scratch(*values)
     if after_walk.uses_over_rings(family, after_walks, over_rings=over_rings):
         added, rest, _ = after_walk.over_rings_plan(streams, after_walks)
         held, walks = family.lifetimes(rest)
-        return resources.Scope(program=(scoped, *family.product_held(products), *added, *held),
+        return resources.Scope(program=(scoped, *family.product_held(products), *scratch, *added, *held),
                                walks=walks, after=(), reduces=reduces,
                                reducing_warpgroups=reducing_warpgroups,
                                addresses=family.product_addresses(products))
     held, walks = family.lifetimes(streams)
     tiles = tuple((tile.shape, tile.dtype) for tile in after_walks)
-    return resources.Scope(program=(scoped, *family.product_held(products), *held),
+    return resources.Scope(program=(scoped, *family.product_held(products), *scratch, *held),
                            walks=walks, after=tiles, reduces=reduces,
                            reducing_warpgroups=reducing_warpgroups,
                            addresses=family.product_addresses(products))
@@ -530,14 +533,15 @@ def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
 
 def walked_unit(family: mosaic.Family, dtype, parts: int = 1) -> int:
     """The row granule a walked tile steps by on `family` for `dtype` (`walked_extents`, `whole_tiles`):
-    a placed family's `walked_rows`, a parted fp32 wgmma forward's 64-byte swizzle columns (32 bf16 keys so
-    width 256's three parts fit Hopper's 232,448-byte block, row 6508), else `Family.column_unit`."""
+    a placed family's `walked_rows`, a parted fp32 wgmma forward's 64-byte swizzle columns over its staged
+    bf16 parts (32 keys so width 256's three parts fit Hopper's 232,448-byte block, rows 6508, 10773), else
+    `Family.column_unit`."""
     if family.places_on_role:
         return family.walked_rows
+    staged = jnp.bfloat16 if parts > 1 else dtype
     if parts > 1 and not scopes_products(family):
-        return min(family.column_unit(dtype), swizzling.swizzle_columns(dtype, 64))
-    return family.column_unit(dtype)
-
+        return min(family.column_unit(staged), swizzling.swizzle_columns(staged, 64))
+    return family.column_unit(staged)
 
 def walked_extents(family: mosaic.Family, dtype, extent: int, *, parts: int = 1) -> tuple[int, ...]:
     """A walked tile's extents on `family`, largest first: whole multiples of `walked_unit`, within
@@ -594,7 +598,7 @@ def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles", *, parts:
     key block (`placed.KEYS`)."""
     held, walked = held_walked(family, tiles)
     rows = held == family.rows if family.places_on_role else held % family.rows == 0
-    unit = (min(family.walked_rows, walked_unit(family, jnp.bfloat16, parts))
+    unit = (min(family.walked_rows, walked_unit(family, jnp.float32, parts))
             if parts > 1 else family.walked_rows)
     return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
             and rows and walked % unit == 0)
@@ -1586,14 +1590,21 @@ class _Program[T: (Tiles, BackwardTiles)]:
         assert spans.q_lo is not None and spans.q_hi is not None, "a key block's walk reads its readers"
         return at(spans.q_lo, block), at(spans.q_hi, block), seen_whole
 
-    def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
+    def segmented(self, step: Callable, run: tuple[jax.Array | None, jax.Array] | None, lo, hi) -> tuple:
         """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its
         whole tiles run unbroken (`run`, `whole_run`), those one segment of their own, unmasked, and the
         tiles around them masked, so no step chooses at run time, whose two branches' registers join
-        (FlashAttention 3's masked and unmasked iterations); else one segment choosing a tile at a time."""
+        (FlashAttention 3's masked and unmasked iterations); where `run[0]` is None (`forward_whole_run`),
+        the unmasked run starts at `lo` so only two segments emit; else one segment choosing a tile at a
+        time."""
         if run is None:
             return ((step, lo, hi),)
-        start, end = (jnp.clip(bound, lo, hi) for bound in run)
+        raw_start, raw_end = run
+        end = jnp.clip(raw_end, lo, hi)
+        if raw_start is None:
+            return ((functools.partial(step, masked=False), lo, end),
+                    (functools.partial(step, masked=True), end, hi))
+        start = jnp.clip(raw_start, lo, hi)
         return ((functools.partial(step, masked=True), lo, start),
                 (functools.partial(step, masked=False), start, end),
                 (functools.partial(step, masked=True), end, hi))
@@ -1605,6 +1616,14 @@ class _Program[T: (Tiles, BackwardTiles)]:
         edge's is whole (ET-SEGS-h100: the run its own segment, 2% slower a full launch at width 64, 7%
         faster a causal one at Qwen3-8B's)."""
         return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
+
+    def forward_whole_run(self, first, spans: _Spans | None) -> tuple[None, jax.Array] | None:
+        """The key tiles `[0, whole_end)` a causal forward/dQ query block from `first` sees whole (`reach`),
+        one unbroken run from `lo` for `segmented`; None for non-causal or spans calls (rows 10790, 4839)."""
+        if spans is not None or not self.causal:
+            return None
+        walked = self.walked(first)
+        return None, jnp.where(self.padded(first), jnp.int32(0), self.whole(first, walked))
 
     def _first_reader(self, k_first, q_steps: int) -> jax.Array:
         """The first query tile that sees the key block from `k_first` (`first_reader`)."""

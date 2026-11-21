@@ -319,32 +319,37 @@ def test_a_gpu_parts_prepare_skips_what_its_run_skips_by_backend(monkeypatch):
     conftest.pytest_runtest_setup(_Marked())
 
 
-def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch):
-    """In a GPU tier part's prepare, an assertion a test makes once every site and arm it began finished
-    checks the zeros its prepared arms gave (`reference_error.ahead_arm`), which judge nothing: its prepare
-    passes it to its run (tests/conftest.py's `judged_on_zeros`; rows 10169 on: a cell asserting a product's
-    value failed its file's prepare). A missing program is no such check, nor is a failure whose arm did not
-    finish, nor one outside a prepare."""
-    import types
-
+def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch, tmp_path):
+    """In a GPU tier part's prepare, a failure a test or a flow's cell raises once every site and arm it
+    began finished checks the zeros its prepared arms gave (`reference_error.ahead_arm`), which judge
+    nothing: its prepare passes it to its run, by one rule for both (`CompiledTruths.judged_its_zeros`,
+    tests/conftest.py's `judged_on_zeros`; rows 10169 on: a cell asserting a product's value failed its
+    file's prepare; row 10731: the test's rule took assertions alone, the cell's any error). A missing program
+    is no such check, nor is a failure whose arm did not finish, one before any arm, nor one outside a
+    prepare."""
     import conftest
+    import store_wire
     import tier_wire
     import truths_ahead
 
     with pytest.raises(AssertionError) as checked:
         raise AssertionError
+    with pytest.raises(ValueError) as computed:
+        raise ValueError
     with pytest.raises(truths_ahead.MissingTruth) as missing:
         raise truths_ahead.MissingTruth
-    store = types.SimpleNamespace(prepare=True, tried={"an arm"}, done={"an arm"})
+    store = truths_ahead.CompiledTruths(tmp_path, prepare=True, stamp="a", tried={"an arm"}, done={"an arm"})
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    token = truths_ahead.COMPILED.set(store)
+    token = store_wire.COMPILED.set(store)
     try:
-        assert conftest.judged_on_zeros(checked)
+        assert conftest.judged_on_zeros(checked) and conftest.judged_on_zeros(computed)
         assert not conftest.judged_on_zeros(missing)
+        # A cell's rule reads the sites it tried itself: none since `before`, no check of its zeros.
+        assert not store.judged_its_zeros(checked.value, frozenset({"an arm"}))
         store.done = set()
         assert not conftest.judged_on_zeros(checked)
     finally:
-        truths_ahead.COMPILED.reset(token)
+        store_wire.COMPILED.reset(token)
     monkeypatch.delenv(tier_wire.PREPARE)
     assert not conftest.judged_on_zeros(checked)
 
@@ -364,3 +369,36 @@ def test_a_gpu_parts_prepare_skips_a_test_declared_to_compile_at_run(monkeypatch
         conftest.pytest_runtest_setup(_Marked("gpu", "compiles_at_run"))
     monkeypatch.delenv(tier_wire.PREPARE)
     conftest.pytest_runtest_setup(_Marked("compiles_at_run"))
+
+
+def _machinery_loaded(code: str) -> list[str]:
+    """The truths store's machinery (tests/truths_ahead.py, tests/arm_store.py) a fresh CPU process running
+    `code` from the tests' directory loaded."""
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code += "\nimport json, sys\nprint(json.dumps(sorted({'truths_ahead', 'arm_store'} & set(sys.modules))))"
+    done = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent, capture_output=True,
+                          text=True, check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    return json.loads(done.stdout.splitlines()[-1])
+
+
+def test_a_check_one_site_outside_a_gpu_part_loads_none_of_the_stores_machinery():
+    """`reference_error`, every check-1 site's module, loads none of the truths store's machinery
+    (tests/truths_ahead.py, tests/arm_store.py) until a store is open (`store_wire.COMPILED`, a GPU tier
+    part's prepare or run): the CPU lane's tests, which open none, never load it, so its churn re-keys none
+    of their rows (the test cache keys a row on each module its test loads; 359 test files loaded it through
+    reference_error)."""
+    assert _machinery_loaded("import reference_error") == []
+
+
+def test_a_gpu_flows_cells_outside_a_prepare_load_none_of_the_stores_machinery():
+    """A GPU flow's cells run outside a GPU tier part's prepare (`gpu_flow.run_cells`, the CPU lane's flow
+    files') load none of the truths store's machinery: each cell's read of the prepare's tried sites asks the
+    store's switch (`store_wire.COMPILED`), where it loaded `truths_ahead` first, so a CPU flow file's row
+    re-keyed on its churn (row 10826)."""
+    flow = "import gpu_flow\ngpu_flow.run_cells([gpu_flow.Cell('a cell', lambda: None)])"
+    assert _machinery_loaded(flow) == []

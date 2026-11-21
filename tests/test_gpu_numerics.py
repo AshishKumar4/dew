@@ -49,6 +49,13 @@ DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 OWN = "the GPU's own arithmetic, facts or placement, which a CPU does not have"
 """Why a numerics cell stays on the GPU: what it holds is the device's own."""
 
+PALLAS = "needs a GPU the Pallas kernels compile for"
+
+ON_THE_HOST = "its programs placed on the host's CPU, whose kernels a prepare would choose as on its GPU"
+"""Why a cell placed on a GPU host's CPU compiles at its run (`Cell.at_run`): a bitwise check, no check-1
+site, its programs the CPU's, which a GPU tier part's prepare, choosing every kernel as on its node's GPU
+(`truths_ahead.prepared`), lowered as Triton kernels on the CPU, where they raised (row 10764)."""
+
 
 def _flow_scaling():
     """`test_flow_grpo`'s flow-scaling cell, its module imported only where the cell runs (row 8971)."""
@@ -65,8 +72,7 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
         Cell("a correctly rounded division is IEEE division's at its edges on a GPU",
              precision_policy.divides_as_ieee_division_at_its_edges, fault=OWN),
         Cell("a correctly rounded division is IEEE division's on a GPU dividing approximately",
-             precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN,
-             at_run="a fresh process of its own flags"),
+             precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN),
         Cell("a power of two's scaling rounds a subnormal result once on a GPU",
              precision_policy.power2_rounds_a_subnormal_result_once, fault=OWN),
         Cell("a flow's scaling rounds a subnormal result once on a GPU", _flow_scaling, fault=OWN),
@@ -127,22 +133,26 @@ def norm_cells(_) -> list[Cell]:
 
 def grouped_cells(_) -> list[Cell]:
     """Every tile of the grouped matmuls, and a projection on a GPU host's CPU without their kernels."""
-    pallas = "needs a GPU the Pallas kernels compile for"
     return [
         *(Cell(f"every tile of {kernel.__name__} holds the float64 gate",
-               when(triton_runs(), pallas, functools.partial(
+               when(triton_runs(), PALLAS, functools.partial(
                    moe_precision.every_tile_of_the_grouped_kernels_holds_the_float64_gate,
                    kernel, width, features)),
                generation, native={"kernel": kernel.__name__})
           for kernel, width, features, generation in (
               (grouped_triton.Gmm, 192, 320, None), (grouped_triton.Tgmm, 192, 320, None),
               (grouped_matmul.MosaicGmm, 768, 768, "sm90"), (grouped_matmul.MosaicTgmm, 768, 768, "sm90"))),
-        *(Cell(f"a projection on a GPU host's CPU runs without the Triton kernels: {implementation}",
-               when(triton_runs(), pallas, functools.partial(
-                   moe_precision.a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels,
-                   implementation)), fault=OWN)
-          for implementation in ("auto", "pallas")),
+        *projection_cells(),
     ]
+
+
+def projection_cells() -> list[Cell]:
+    """A projection on a GPU host's CPU, without the grouped matmuls' kernels."""
+    return [Cell(f"a projection on a GPU host's CPU runs without the Triton kernels: {implementation}",
+                 when(triton_runs(), PALLAS, functools.partial(
+                     moe_precision.a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels,
+                     implementation)), fault=OWN, at_run=ON_THE_HOST)
+            for implementation in ("auto", "pallas")]
 
 
 def vocabulary_cells(_) -> list[Cell]:
@@ -169,8 +179,12 @@ def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(group, tmp_path_factory):
 def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops):
     """The norm seams on a GPU host's CPU, as their placement chooses them, without XLA's deterministic
     ops (`without_deterministic_ops`)."""
-    run_cells([
-        Cell(f"a GPU host's CPU runs the seams its placement chooses: {implementation}",
-             functools.partial(norm_swiglu_tests.a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses,
-                               without_deterministic_ops, implementation))
-        for implementation in ("auto", "pallas")])
+    run_cells(seams_cells(without_deterministic_ops))
+
+
+def seams_cells(without_deterministic_ops) -> list[Cell]:
+    """The norm seams on a GPU host's CPU, each implementation a cell."""
+    return [Cell(f"a GPU host's CPU runs the seams its placement chooses: {implementation}",
+                 functools.partial(norm_swiglu_tests.a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses,
+                                   without_deterministic_ops, implementation), at_run=ON_THE_HOST)
+            for implementation in ("auto", "pallas")]

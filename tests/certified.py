@@ -392,9 +392,9 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.nd
     count = terms.shape[-1]
     if count == 0:
         return _same(native, np.zeros_like(native))
-    underflow = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
     error = np.abs(native - exact_sum(terms, -1))
-    slack = allowance(magnitude_sum(terms, -1), count if counts is None else counts, fmt, underflow)
+    slack = allowance(magnitude_sum(terms, -1), count if counts is None else counts, fmt,
+                      underflow(fmt, flushes))
     return np.isfinite(error) & (error <= np.nextafter(slack, np.inf))
 
 
@@ -1141,7 +1141,7 @@ def _integer_power(params, operands, result, fmt):
         powered = _wrapping(lambda a: a ** abs(power))
         return _bits(result) == _bits(powered(result, value))
     read = _read(value, lane().flushes)
-    lost = _underflow(fmt)
+    lost = underflow(fmt, lane().flushes)
     # A zero's or a non-finite value's power is exact in float64; each distinct finite magnitude's ends
     # once (`_power_ends`).
     with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
@@ -1164,15 +1164,15 @@ def _keyed(value) -> bool:
     return dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
 
 
-def _underflow(fmt: Format) -> float:
-    """What one rounding loses below `fmt`'s normal range: its least normal where the lane flushes, else
+def underflow(fmt: Format, flushes: bool) -> float:
+    """What one rounding loses below `fmt`'s normal range: its least normal where the lane `flushes`, else
     half its least subnormal."""
-    return 2.0 ** fmt.emin if lane().flushes else 2.0 ** (fmt.emin - fmt.precision)
+    return 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
 
 
 def _pair_held(params, operands, results, fmt) -> list[np.ndarray]:
     """A compensated sum's `(hi, lo)` pairs (`compensated_add`'s reduction of `(values, residuals)`): `hi +
-    lo` within 5u²·n·Σ|terms| of the terms' exact sum, plus what underflow loses (8n of `_underflow`), and
+    lo` within 5u²·n·Σ|terms| of the terms' exact sum, plus what underflow loses (8n of `underflow`), and
     `lo` within a rounding of `hi`. Each combine's TwoSums are exact and its residuals' two additions
     round (Ogita, Rump and Oishi, Accurate Sum and Dot Product, 2005, §4: an error of at most
     2.01u(|d| + |l1| + |l2|) ≤ 4.03u²(|h1| + |h2|) a combine), at most n combines on a term's path. A
@@ -1193,7 +1193,7 @@ def _pair_held(params, operands, results, fmt) -> list[np.ndarray]:
     count = terms.shape[-1] // 2
     high, low = (np.asarray(value, np.float64) for value in results)
     exact, magnitude = exact_sum(terms, -1), magnitude_sum(terms, -1)
-    u, lost = fmt.unit_roundoff, _underflow(fmt)
+    u, lost = fmt.unit_roundoff, underflow(fmt, lane().flushes)
     bound = 5 * u * u * count * magnitude + 8 * count * lost + 2.0 ** -52 * (np.abs(high) + np.abs(exact))
     one_signed = np.maximum(exact_sum(np.maximum(terms, 0), -1), exact_sum(np.maximum(-terms, 0), -1))
     overflows = ~np.all(np.isfinite(terms), -1) | (one_signed * (1 - gamma(2 * count, fmt)) >= fmt.overflow)
@@ -1210,7 +1210,7 @@ def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     within its bound of the exact Σ s_j e^(x_j - M): a term's path through at most n combines, each a
     subtraction of maxima (its error in the exponent, u|m - M|, summing along the path to at most
     u(M - x_j)), an exponential (the lane's reach for it, `lane`, relative r), a product and a sum, so the
-    term within e^(u(M - x_j) + n(r + 3u)) - 1 of itself, plus what underflow loses (4n of `_underflow`).
+    term within e^(u(M - x_j) + n(r + 3u)) - 1 of itself, plus what underflow loses (4n of `underflow`).
     A row of a NaN may hold any sums; a row whose maximum is -inf keeps its sums as they are, summed
     (γ_n). Its initial values are one more term of every row, its maximum's column the least of the
     columns holding the maximum, as the combine keeps the lesser on a tie."""
@@ -1227,7 +1227,7 @@ def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     peak = np.max(logits, -1)
     held = [_same(np.asarray(results[0], np.float64), peak)]
     nan = np.any(np.isnan(logits), -1)
-    u, lost = fmt.unit_roundoff, _underflow(fmt)
+    u, lost = fmt.unit_roundoff, underflow(fmt, lane().flushes)
     reach = 2 * u * lane().reach[jax.lax.exp_p, fmt.name]
     empty = peak == -np.inf
     with np.errstate(invalid="ignore", over="ignore"):

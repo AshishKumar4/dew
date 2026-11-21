@@ -7,6 +7,7 @@ Triton kernels. The port's distance from float64 against mamba_ssm's own at trai
 gate (docs/performance.md, "The Mamba-2 SSD scan").
 """
 
+import functools
 from pathlib import Path
 
 import jax
@@ -30,6 +31,7 @@ from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
 from test_recurrence_chunk import formed
 from tool_support import load
+from tuned import configs_by_kernel
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -166,21 +168,30 @@ def _port_holds_check_1(case):
     _, inputs = draw(0)
     rows, state = min(64, chunk), min(32, inputs["B"].shape[-1])
 
-    def pinned(heads):
-        """`run` with its summing kernels taking `heads` a program, or their own where None, pinned as it
-        traces."""
-        pins = {} if heads is None else {
-            mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
-            mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
-            mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
-
+    def pinned(pins):
+        """`run` with its launches pinned to `pins` as it traces."""
         def form(index, arrays):
             with tuning.pinned(pins):
                 return run(index, arrays)
 
         return form
 
-    forms = [pinned(heads) for heads in CASES[case]]
+    def heads_pins(heads):
+        """The summing kernels taking `heads` a program, or their own where None."""
+        return {} if heads is None else {
+            mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
+            mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
+            mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
+
+    forms = [pinned(heads_pins(heads)) for heads in CASES[case]]
+    if case == "bf16":
+        # Every variant a tuning run may pick (`mamba_ssd._Launch.variants`: mamba_ssm's A100 picks), each
+        # launch at its i-th in turn, held to the gate as the derived configs are: every one pinned, the
+        # first among them, which sorts by its fields (`configs_by_kernel`), not as the heuristic's (an A100
+        # two-warp `ChunkState` pick sorted first at the seeded geometry, the default arm never taking it).
+        variants = configs_by_kernel(functools.partial(run, 0), inputs)
+        forms += [pinned({kernel: found[i] for kernel, found in variants.items() if len(found) > i})
+                  for i in range(max(len(found) for found in variants.values()))]
     count = len(forms)
     assert_as_exact(jax.jit(lambda index, arrays: tuple(form(index, arrays) for form in forms)),
                     as_given(lambda *args: (reference(*args),) * count), draw,

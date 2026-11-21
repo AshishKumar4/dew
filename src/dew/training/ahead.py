@@ -167,8 +167,9 @@ def host_gpus(generation: str, topology: str | Path, count: int, share: float = 
     attached: XLA compiles over them as over that host's GPUs, the SKU's memory, clocks and multiprocessors
     its own, so a program compiled here keys the persistent cache as that host's compile of it does (its
     backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
-    canonical target (`compile_only_gpus`) keys another entry: the 80 GB A100 it names against a 40 GB
-    host's. Each is admitted at `share`, the pool's share in the host's run (`StatedGpu`)."""
+    canonical target (`compile_only_gpus`) keys another entry: the least memory of the generation's parts
+    it states (an A100's 40 GB, `GpuTarget.memory`) against an 80 GB host's. Each is admitted at `share`,
+    the pool's share in the host's run (`StatedGpu`)."""
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
@@ -1109,9 +1110,9 @@ class AheadTarget:
     where it is not the generation's own (`built_target`): what the step's launches derive for and a GPU
     loading it must have (`BuildTarget`). A TPU topology states its own."""
     topology: str | None = None
-    """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole:
-    their memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A dew-ops
-    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
+    """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole: their
+    memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A GPU node's prepare
+    is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
     phases: tuple[int, ...] = ()
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the

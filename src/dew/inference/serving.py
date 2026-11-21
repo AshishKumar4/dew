@@ -1060,6 +1060,9 @@ class Server:
         # A stage-local run's state is read on its stored layers, as the served tree holds them.
         from dew.nn.backbones.layer_names import stored_layers
 
+        # Packed where its members are, a group holding a host member on the host
+        # (`projections._concatenated`), each leaf placed once, on the served placement (`reloaded`,
+        # row 10822).
         packed = pack_projections(normalized(stored_layers(self.model, variables), self._source_shapes),
                                   self._weight_groups)
         self.variables = reloaded(packed, self.variables)

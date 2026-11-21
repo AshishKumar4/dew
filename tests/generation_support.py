@@ -30,7 +30,7 @@ def interprets() -> bool:
 
 
 TOPOLOGY = "DEW_NODE_TOPOLOGY"
-"""The node's GPUs' serialized topology (dew-ops' session hands a prepare its node's): the GPU a flow's
+"""The node's GPUs' serialized topology (a GPU node's session hands a prepare its node's): the GPU a flow's
 programs are compiled for."""
 
 

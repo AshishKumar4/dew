@@ -39,6 +39,15 @@ def each_config(kernel, function, *args) -> list:
                    for config in op.keyed(ba).autotuning_configs}, key=dataclasses.astuple)
 
 
+def configs_by_kernel(function, *args) -> dict:
+    """`each_config` of every kernel `function(*args)` launches, traced once: each launch's type its
+    variants at the keys of the shapes it launches with, in field order."""
+    found: dict = {}
+    for op, ba in _traced(function, *args):
+        found.setdefault(type(op), set()).update(op.keyed(ba).autotuning_configs)
+    return {kernel: sorted(configs, key=dataclasses.astuple) for kernel, configs in found.items()}
+
+
 def recorded(function, *args) -> list:
     """The launches `function(*args)` makes as it traces, in that order, each keyed as the tuner reads,
     measures and stores it (`tuning.seen`)."""

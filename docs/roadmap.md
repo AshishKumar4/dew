@@ -13,7 +13,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010]
 - The kernel challenge's lessons in the templates. [5271]
 - Cached and block visibility on the template's spans. [1495, 245]
-- Performance measurements. [569, 285, 1378]
+- Performance measurements. [569, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
@@ -23,10 +23,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
-- 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 683 s (a check-1 site: its longest draws task 621 s (1 draws),…. [7603]
-- 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - The wgmma consumer's register model against ptxas on the GEMM gate's sm90 tiles. [8723]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
+- The fla ports' fp32 calls fail check 1 natively against recorded fla, every fp32 port kernel at about 1600x fla's RMS error from float64. [10860]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -43,6 +42,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
 - Grouped scores' gradient cancellation untested. [10551]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
+- Emission prices every operation Mosaic GPU can approximate (emission.APPROXIMATED: exp, exp2, log, log2, log1p, tanh, logistic, sin, cos, sqrt, rsqrt, pow) as…. [10824]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - Exact on every path, every edge and every derivative order. [2656]
@@ -51,12 +51,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - The interpreter (Pallas Mosaic GPU interpret mode, the CPU suite's) takes about 8 times as long a draw for a tcgen05 (sm100) recurrence launch as for its wgmma…. [6521]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
-- The portable recurrence gradient (tests/test_recurrence_stability.py's scalar-delta site at aligned keys, chunk_on 'xla', as tests/test_gpu_compile_ahead.py's…. [9762]
 
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [9780, 5625]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [9780, 10839, 5625]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -69,7 +68,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- The saved data plan as recorded rules, one last version, and the resume modes. [10569, 10814]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 
@@ -82,7 +80,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
-- Prelude-anchored cross-pass message passing on Loop. [10806]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - An NVFP4 source's weights served packed, algebra.md §7.4's prepare step. [8550]
 - Dory: the release qualified and its tests' oracles. [596]
@@ -111,5 +108,5 @@ This page is generated from the maintainers' findings ledger as each change land
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
 - Shared XLA cache (tests/remote_cache.py). [9797]
 - The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
-- The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
+- The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]

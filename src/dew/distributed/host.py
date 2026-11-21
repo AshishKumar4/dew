@@ -8,6 +8,7 @@ cross-host device_put between different device sets (dispatch.py:488-516).
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Protocol, runtime_checkable
@@ -23,10 +24,23 @@ from dew.batch import Variables
 from dew.distributed.pages import evict
 from dew.distributed.placement import Placement
 from dew.nn.kernels.options import program
-from dew.nn.programs import meshless
+from dew.nn.programs import on_host
 
 
 def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
+    """Replace each accelerator coordinate by its process-local CPU partner (`_companion`): admitted once a
+    process for an `accelerator` mesh over its own CPUs, its probe a collective every process runs, and the
+    same mesh after (row 10794: a streamed start probed it three to four times, pricing and placing)."""
+    return _admitted(accelerator) if devices is None else _companion(accelerator, devices)
+
+
+@functools.cache
+def _admitted(accelerator: Mesh) -> Mesh:
+    """The companion of `accelerator` over this process's CPUs, admitted once (`companion_mesh`)."""
+    return _companion(accelerator, None)
+
+
+def _companion(accelerator: Mesh, devices) -> Mesh:
     """Replace each accelerator coordinate by its process-local CPU partner.
 
     CPU cardinality is launch-time JAX configuration, never changed here.
@@ -72,7 +86,7 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
     try:
         # Run now, whatever the caller traces (a trainer's state mesh first read inside its start's trace,
         # row 9693: the probe's sum was a tracer, and `int` refused it).
-        with jax.ensure_compile_time_eval(), meshless():
+        with on_host():
             total = program(jnp.sum)(probe)
         if int(total) != mesh.size:
             raise ValueError("the companion CPU collective did not include every device")

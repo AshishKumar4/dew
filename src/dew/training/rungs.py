@@ -34,6 +34,7 @@ from dew.communicators import loaded_program
 from dew.nn.kernels.generation import assumption, gpu_target
 from dew.nn.sharding import trace_context
 from dew.telemetry.instrumentation import StepFlops, step_flops
+from dew.training.ahead import computation_flags
 
 _log = logging.getLogger(__name__)
 
@@ -79,7 +80,9 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     limits = {f"{device.device_kind}, limit {device_memory(device).get('bytes_limit')}"
               for device in devices}
     devices_seen: list[JSON] = [*sorted(limits)]
-    settings = sorted(os.environ.get('XLA_FLAGS', '').split())
+    # In their order, as XLA reads a flag given twice by its last value (row 10797: sorted, two orders of one
+    # flag's two values were one key).
+    settings = computation_flags()
     allocator = sorted(f"{name}={value}" for name, value in os.environ.items()
                        if name.startswith(('XLA_PYTHON_CLIENT_', 'TF_GPU_ALLOCATOR')))
     # The GPU its kernels are chosen for: this process's, or the one a CPU host builds for (`assumed`), so two

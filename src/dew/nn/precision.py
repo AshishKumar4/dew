@@ -64,7 +64,7 @@ from dew.nn.float_bits import (
     widened_exactly,
 )
 from dew.nn.nested import nested
-from dew.nn.programs import UNROUNDED, equations
+from dew.nn.programs import UNROUNDED, equations, own_preset
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -655,10 +655,9 @@ def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
     algorithm whose products are whole for these operands (F32_F32_F32, and a 16-bit operand's own
     BF16_BF16_F32 or F16_F16_F32); not an algorithm that narrows them (TF32's, bf16 parts of an fp32
     product) or widens them (F64), which a route hands to XLA, which computes it."""
-    dtype = jnp.dtype(dtype)
     whole = {"DEFAULT", "HIGH", "HIGHEST", "F32_F32_F32"}
-    whole |= {jnp.dtype(jnp.bfloat16): {"BF16_BF16_F32"},
-              jnp.dtype(jnp.float16): {"F16_F16_F32"}}.get(dtype, set())
+    if (own := own_preset(dtype)) is not None:
+        whole.add(own.name)
     return precision_names(effective_precision(precision)) <= whole
 
 
@@ -1301,7 +1300,7 @@ def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = No
     from .kernels.generation import bf16_dot_runs
     if not bf16_dot_runs():
         return precision
-    return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    return own_preset(dtype)
 
 
 def fp32_result_dot_general(precision: PrecisionLike = None):
@@ -1460,19 +1459,13 @@ def uncontracted(*values):
     program lowers for fences the mark (`MARKED_BACKENDS`, `jax.lax.platform_dependent`): no step reading
     them contracts, and no barrier splits the fusions around them (row 8378); the barrier on any other.
 
-    In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
-    `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
-    post110, whose attention forms reach `two_product` and `two_sum` in a kernel body, `natural_exp` and
-    `natural_carried`), which the fork's post111 lowers (row 7954 retires this branch). XLA's TPU programs,
-    and an interpreted kernel's body, which lowers to them, keep the barrier."""
-    from dew.nn.kernels.generation import backend
+    In a kernel's body (`launches.interpreting` not None), whose platform is its launch's, the barrier, as
+    the body's lowering takes it: a compiled Pallas TPU kernel's to its operands as they are, Mosaic keeping
+    a kernel's multiply and add apart (the fork's lowering rule from post111, row 7954), Mosaic GPU's and
+    Triton's by their own rules, an interpreted body's as XLA's programs do."""
     from dew.nn.kernels.launches import interpreting
 
-    if (interpreted := interpreting()) is not None:
-        # A kernel's body, whose platform is its launch's: a compiled TPU kernel's as it is, any other's
-        # barriered (an interpreted body's lowers to XLA's programs, whose platform choice a body takes none).
-        return values if not interpreted and backend() == "tpu" else jax.lax.optimization_barrier(values)
-    if not _MARKING.get():
+    if interpreting() is not None or not _MARKING.get():
         return jax.lax.optimization_barrier(values)
     return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
 
