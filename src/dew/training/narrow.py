@@ -177,21 +177,19 @@ def forward_variables(variables: Variables, compute: Variables | None) -> Variab
     return variables if compute is None else merge(variables, compute)
 
 
-def narrow_copies(state, reads: Reads) -> dict:
-    """The parameters a step the trainer composes reads through narrow copies, by path under `params`
-    (`Reads.casts`): on every GPU but one whose row measured them off, for a state that holds no frozen
-    collection. `reads` are those of the loss its first attempt reads as the trainer traced it for its
-    shapes (`dew.training.transaction.traced_loss`: its update a window of microbatches, each step read in
-    its split, its committed updates among its inputs, the state's variables its first inputs,
-    `state_reads`), read in place of a trace of its own, so a parameter the step computes on before its
-    cast (a DEX lambda's anneal) is not copied: a trace of a Qwen3.5-4B step's loss is seconds of its
+def narrow_copies(state) -> bool:
+    """Whether a step the trainer composes over `state` reads narrow copies, of the parameters whose one use
+    is a narrowing cast (`Reads.casts`): on every GPU but one whose row measured them off, for a state that
+    holds no frozen collection. They are read off the loss its first attempt reads as the trainer traced it
+    for its shapes (`state_reads`; `dew.training.transaction.traced_loss`: its update a window of
+    microbatches, each step read in its split, its committed updates among its inputs, the state's
+    variables its first inputs), in place of a trace of its own, so a parameter the step computes on before
+    its cast (a DEX lambda's anneal) is not copied: a trace of a Qwen3.5-4B step's loss is seconds of its
     compile (row 4260)."""
     from dew.nn.kernels.generation import Choice, backend, chosen_kernel
 
-    if (chosen_kernel(Choice.NARROW_COPIES, 'on' if backend() == 'gpu' else 'off') == 'off'
-            or FROZEN in state.variables):
-        return {}
-    return reads.casts
+    return (chosen_kernel(Choice.NARROW_COPIES, 'on' if backend() == 'gpu' else 'off') == 'on'
+            and FROZEN not in state.variables)
 
 
 def state_reads(state, traced: core.Jaxpr) -> Reads:

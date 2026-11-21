@@ -343,9 +343,9 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     # DiLoCo's groups read their own parameters, which no narrow copy shadows.
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
     # None), and a scaled loss's copies none.
-    narrows = narrow and not settings.dynamic_scale and settings.diloco is None
+    narrows = narrow and not settings.dynamic_scale and settings.diloco is None and narrow_copies(state)
     reads = state_reads(state, traced) if traced is not None and (narrows or copies is not None) else None
-    own = narrow_copies(state, reads) if narrows and reads is not None else {}
+    own = reads.casts if narrows and reads is not None else {}
     if copies is not None:
         # The window's copies, its cap's, are read by every step of it: a step reads a copy only of a
         # parameter whose one use in it is that cast, which the copy is (row 10770: a sampled count below an
