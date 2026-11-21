@@ -28,13 +28,6 @@ def draw(seed: int = 7):
             rng.integers(-3, 4, (256, 256)).astype(jnp.bfloat16))
 
 
-def host_normal(seed: int, *shapes, dtype) -> tuple:
-    """Standard normal arrays of `shapes` in `dtype`, from `seed`, as the host holds them (NumPy's), which a
-    GPU tier part's prepare places nowhere (`draw`)."""
-    rng = np.random.default_rng(seed)
-    return tuple(rng.standard_normal(shape).astype(dtype) for shape in shapes)
-
-
 def ran(fn, label: str, *operands):
     """`fn` jitted over host arrays `operands`, as a GPU tier part's prepare compiles it ahead and its run
     runs it (`reference_error.ahead_arm`: a bitwise check's program, computing nothing in the prepare);
@@ -1450,7 +1443,9 @@ def test_a_norm_of_a_stopped_row_passes_no_gradient_to_it():
     def program(x, w):
         return _norm_of(jax.lax.stop_gradient(x), w).astype(jnp.float32).sum()
 
-    x, w = host_normal(4785, (256, 256), (256,), dtype=np.float32)
+    from contract_support import normal_draw
+
+    x, w = normal_draw(4785, (256, 256), (256,), dtype=np.float32)
     grad = jax.grad(functools.partial(_norms_rewritten, program))
     assert not np.any(np.asarray(ran(grad, "a stopped row's gradient, its norm written", x, w)))
 
@@ -1486,7 +1481,9 @@ def test_a_norm_of_a_row_under_its_own_derivative_rule_keeps_the_rule():
     def program(x, w):
         return _norm_of(jax.jit(_doubled_identity)(x), w).astype(jnp.float32)[0, 0]
 
-    x, w = host_normal(4786, (256, 256), (256,), dtype=jnp.bfloat16)
+    from contract_support import normal_draw
+
+    x, w = normal_draw(4786, (256, 256), (256,), dtype=jnp.bfloat16)
     np.testing.assert_array_equal(
         np.asarray(ran(jax.grad(functools.partial(_norms_rewritten, program)),
                        "the row's gradient, its norm written", x, w)),

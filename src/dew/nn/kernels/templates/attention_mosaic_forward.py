@@ -244,7 +244,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     them)."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
     scoped = [family.staged_memory((consumers, parts * block_q, width), dtype, query_swizzle(family)),
-              family.staged_memory((consumers, block_q), jnp.float32)]
+              *family.vector_stage((consumers, block_q), jnp.float32)]
     # The output's stage (a training walk's split sums', fp32), which no walk reads: after the walks on a
     # family that scopes them apart, in their slots (`stages_after_walks`).
     stage = None
@@ -262,7 +262,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     if stage is not None and not after:
         scoped.append(stage)
     if residuals or peaks:
-        scoped.append(family.staged_memory((consumers, block_q), jnp.int32))
+        scoped += family.vector_stage((consumers, block_q), jnp.int32)
     if certified:
         scoped.append(family.staged_memory((consumers, block_q, value_width), jnp.float32))
     if codes is not None:
@@ -872,7 +872,7 @@ class _Refs(NamedTuple):
     read: _Read
     written: tuple
     q_smem: Ref
-    row_smem: Ref
+    row_smem: Ref | None
     out_smem: Ref | None
     stages: tuple
     q_loaded: Ref
@@ -905,7 +905,12 @@ class _Layout(NamedTuple):
         where it `converts` them (`_forward_allocations`' `codes`)."""
         read, refs = refs[:self.reads], refs[self.reads:]
         written, refs = refs[:self.outputs], refs[self.outputs:]
-        (q_smem, row_smem, *stages), (q_loaded, schedule, *verdicts) = refs[:self.arrays], refs[self.arrays:]
+        head_refs, (q_loaded, schedule, *verdicts) = refs[:self.arrays], refs[self.arrays:]
+        if family.stages_vectors:
+            q_smem, row_smem, *stages = head_refs
+        else:
+            q_smem, *stages = head_refs
+            row_smem = None
         words, barrier = verdicts if verdicts else (None, None)
         consumers = 1 if words is None else words.shape[0]
         decided = after_walk.Decided(words, barrier, consumers, family.uniform) if self.decides else None
@@ -1477,7 +1482,8 @@ def _written_views(family: mosaic.Family, block: _Block, written: tuple, stages:
     if training:
         status_ref, rows_ref, keys_ref, others_ref = written
         residuals = _Residuals(tuple(rows_ref.at[place, *block.state] for place in range(5)),
-                               keys_ref.at[block.state], others_ref.at[block.state], stages[0])
+                               keys_ref.at[block.state], others_ref.at[block.state],
+                               stages[0] if stages else None)
         return _Written(block.status(status_ref), None, None, residuals, None)
     status, out_view, finished = block.inference(written, finishes)
     certify = (*block.certified(written), stages[-1]) if certified else None
@@ -2080,11 +2086,12 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
             # The query block's view, an fp32 call's its parts' (`_query_view`).
             q_view = _query_view(family, refs.q, row, pl.ds(block.first, block_q), head, batch=batch,
                                  parts=parts)
+            row_smem = None if refs.row_smem is None else refs.row_smem.at[index]
             if peaks:
                 _peak_consumer(program, spec, index, q_view,
                                lambda: tuple(ref.at[afresh().state] for ref in refs.written), *stages,
-                               refs.row_smem.at[index], refs.stages[0].at[index], streams, views, turn,
-                               streamed, block.first, read.spans, read.hooked,
+                               row_smem, refs.stages[0].at[index] if refs.stages else None, streams, views,
+                               turn, streamed, block.first, read.spans, read.hooked,
                                (row, head, lax.div(head, group)), hooks=hooks, interpret=interpret)
                 return
             written = _written_refs(refs.written, read)
@@ -2100,7 +2107,7 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
             certificate = viewed(block).certify if certified else None
             out_stage = functools.partial(staged_after, after, None if after else refs.out_smem, index)
             _consumer(program, spec, index, q_view,
-                      lambda: viewed(afresh()), *stages, out_stage, refs.row_smem.at[index], streams, views,
+                      lambda: viewed(afresh()), *stages, out_stage, row_smem, streams, views,
                       turn, streamed, block.first, read.spans, read.hooked,
                       (row, head, lax.div(head, group)), hooks=hooks, training=training,
                       anchors=read.anchors, interpret=interpret, certified=certificate,

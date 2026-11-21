@@ -47,3 +47,31 @@ def test_the_convex_mean_holds_every_order(taken):
         direction = (along[0] * scale, along[1] * scale, along[2])
         assert_contract(_merged, primals, direction, cotangent, f"the convex mean {edge}", plain_fn=_plain,
                         taking=ORDERS[taken])
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_a_normal_draw_is_read_where_a_gpu_parts_prepare_places_its_calls(dtype):
+    """`contract_support.normal_draw` made where a GPU tier part's prepare places its calls (a compile-only
+    GPU, on which nothing computes or is read) is read there, each value bit for bit what JAX's conversion
+    of the drawn value to `dtype` is, at float32 and at float64 under x64 (row 10552: a draw placed on the
+    prepare's GPU could not be read, and its cell went unprepared)."""
+    import jax
+    import numpy as np
+    from contract_support import normal_draw
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    def converted():
+        rng = np.random.default_rng(10552)
+        return [np.asarray(jnp.asarray(rng.standard_normal(shape) * 0.3, dtype)) for shape in ((3, 5), (7,))]
+
+    (gpu,) = compile_only_gpus("sm90", 1, 80 * 2**30)
+    for x64 in (False, True):
+        with jax.enable_x64(x64):
+            expected = converted()
+            with jax.default_device(gpu):
+                drawn = [np.asarray(each)
+                         for each in normal_draw(10552, (3, 5), (7,), scale=0.3, dtype=dtype)]
+            for mine, theirs in zip(drawn, expected, strict=True):
+                bits = np.uint16 if mine.itemsize == 2 else np.uint32
+                np.testing.assert_array_equal(mine.view(bits), theirs.view(bits))

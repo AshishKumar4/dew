@@ -24,17 +24,10 @@ from dew.batch import Batch
 from dew.data.dataset import Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ACCOUNTS, DOCUMENT, ExpandStep, Pack
+from dew.data.placement import FirstFit, first_fit
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
-from dew.data.tokens import (
-    FirstFit,
-    PackedWindows,
-    chunk_lengths,
-    chunk_table,
-    entries,
-    first_fit,
-    packed_window,
-)
+from dew.data.tokens import PackedWindows, chunk_lengths, chunk_table, entries, packed_window
 
 
 def plan_name(pack: Pack, field: str) -> str:
@@ -479,6 +472,10 @@ class PackedSource(View[Source]):
         """The inputs each window of the pack holds (`Pack.max_length`), which a token budget divides
         into rows (`dew.data.pipeline.TokenGeometry`)."""
         return self.plan.pack.max_length
+
+    def packed_layout(self) -> tuple[Pack, int]:
+        """Its pack and the most documents a window it reads holds (`dew.data.pipeline.PackedLayout`)."""
+        return self.plan.pack, self.plan.most_documents
 
     def consumed(self, read: Read) -> PackedSource:
         documents = _consumed(self.source, "indexed" if read == "streamed" else read)

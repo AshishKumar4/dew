@@ -124,8 +124,9 @@ def compare(functions, draw, labels, seeds, *, judged=None):
     one by default) held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`)."""
     xla, pallas, exact = functions
     operands, seed = draw(0)
-    reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
-    actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
+    # Their types alone, nothing computed: a GPU tier part's prepare computes nothing before the site below.
+    reference = jax.eval_shape(functools.partial(evaluated, xla), operands, seed)
+    actual = jax.eval_shape(functools.partial(evaluated, pallas), operands, seed)
     gated(labels, actual, reference)
 
     def leaves(result):
@@ -160,12 +161,23 @@ def drawn_key(index: int, draw: int):
     return jax.random.key(index) if draw == 0 else jax.random.fold_in(jax.random.key(index), draw)
 
 
+def on_host(draw):
+    """`draw()`, a draw of `jax.random`'s, made on the host's CPU and held as NumPy's: a GPU tier part's
+    prepare computes nothing on its GPU, where a draw made there went unprepared (rows 8075, 8635), and on
+    the CPU lane it is the same bits."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        return jax.tree.map(np.asarray, draw())
+
+
 def norm_operands(shape, dtype, scale_dtype, draw: int = 0):
-    x = jax.random.normal(drawn_key(23, draw), shape).astype(dtype)
-    scale = None if scale_dtype is None else (
-        0.7 + 0.2 * jax.random.normal(drawn_key(24, draw), (shape[-1],))).astype(scale_dtype)
-    seed = jax.random.normal(drawn_key(25, draw), shape).astype(dtype)
-    return (x, scale), seed
+    def drawn():
+        x = jax.random.normal(drawn_key(23, draw), shape).astype(dtype)
+        scale = None if scale_dtype is None else (
+            0.7 + 0.2 * jax.random.normal(drawn_key(24, draw), (shape[-1],))).astype(scale_dtype)
+        seed = jax.random.normal(drawn_key(25, draw), shape).astype(dtype)
+        return (x, scale), seed
+
+    return on_host(drawn)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -188,7 +200,8 @@ def test_a_wide_rows_norm_walks_its_columns_and_holds_the_float64_gate(dtype, st
         (x, scale), cotangent = norm_operands((25, 9000), dtype, jnp.float32, seed)
         if not streamed:
             return (x, scale), cotangent
-        return (x, jax.random.normal(drawn_key(26, seed), x.shape).astype(dtype), scale), cotangent
+        branch = on_host(lambda: jax.random.normal(drawn_key(26, seed), x.shape).astype(dtype))
+        return (x, branch, scale), cotangent
 
     labels = ("y", "x", "branch", "scale") if streamed else ("y", "x", "scale")
 
@@ -395,8 +408,9 @@ def test_a_weight_folded_into_the_inverse_associates_as_flax_and_takes_every_gra
                                            portable=portable, weight_first=True)[1]
 
     (x, scale), _ = norm_operands((3, 5, 64), dtype, scale_dtype)
-    # The offset adds in the stored weight's dtype, as Dew's norm adds it.
-    weight = scale + 1.0 if offset else scale
+    # The offset adds in the stored weight's dtype, as Dew's norm adds it (JAX's addition: NumPy's widens a
+    # bfloat16 beside a Python float).
+    weight = jnp.asarray(scale) + 1.0 if offset else scale
     flax = nn.RMSNorm(epsilon=1e-5, dtype=jnp.float32, param_dtype=weight.dtype)
     expected = flax.apply({"params": {"scale": weight}}, x.astype(jnp.float32)).astype(dtype)
     np.testing.assert_array_equal(np.asarray(jax.jit(functools.partial(xla, dtype))(x, scale), np.float32),
@@ -510,15 +524,18 @@ def full_step(dtype, draw: int = 0):
     """24,576 rows of one repeated 1000-wide token, so the weight gradient's sums reach a step's
     length (`test_rms_weight_gradient...`)."""
     (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32, draw)
-    x = jnp.broadcast_to(row, (24576, 1000))
-    return (x, scale), jnp.broadcast_to(seed, x.shape)
+    x = np.broadcast_to(row, (24576, 1000))
+    return (x, scale), np.broadcast_to(seed, x.shape)
 
 
 def swiglu_operands(shape, dtype, draw: int = 0):
     """SwiGLU's gate and up projections and a cotangent in `dtype`, at a draw."""
-    keys = jax.random.split(jax.random.fold_in(jax.random.key(31), draw), 3)
-    gate, up, seed = (jax.random.normal(key, shape).astype(dtype) for key in keys)
-    return (gate, up), seed
+    def drawn():
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(31), draw), 3)
+        gate, up, seed = (jax.random.normal(key, shape).astype(dtype) for key in keys)
+        return (gate, up), seed
+
+    return on_host(drawn)
 
 
 def each_config_holds(kernel, functions, draw, labels, seeds):
@@ -756,7 +773,7 @@ def a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_o
         y = gated_product("swiglu", implementation=implementation)(y, y).reshape(1, 4, 2, 64)
         return attention.attention_kernel(y, y, y).astype(jnp.float32).sum()
 
-    x = jax.device_put(jnp.linspace(-1, 1, 512, dtype=jnp.bfloat16).reshape(4, 128), cpu)
+    x = jax.device_put(on_host(lambda: jnp.linspace(-1, 1, 512, dtype=jnp.bfloat16).reshape(4, 128)), cpu)
     with jax.default_device(cpu):
         eager = jax.value_and_grad(seams)(x)
     with jax.set_mesh(Mesh(np.array([cpu]), ("data",))):

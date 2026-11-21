@@ -204,12 +204,6 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     ring_slots = STAGES
 
-    copy_extent = 512
-    """Maximum rows per tile copy on TPU VMEM: caps attention's walked key/query tiles at 512 so live
-    intermediate score tiles (`S`, `P`, `dP`, `dS`) stay within v5e's 16 MiB scoped VMEM at long sequences
-    (e.g. 8192 tokens) and causal walks skip masked tiles instead of forming one whole-sequence tile
-    (row 10152)."""
-
     copies_tiled_rows = True
     def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
                   joined: tuple = ()) -> int:
@@ -346,15 +340,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # A core's scalar is its own: no lanes to read alike.
         return value
 
-    def decided_scratch(self, consumers: int) -> dict:
-        # One core a program, its walk its one role: it decides a second walk alone (`after_walk.Decided`).
-        del consumers
-        return {}
-
     def stream(self, streams, views, lo, hi, *, again=None) -> None:
-        # No producer role: the walk issues its own copies, a decided walk's second pass's too.
+        # No producer role: the walk issues its own copies.
         del streams, views, lo, hi, again
-
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,

@@ -43,7 +43,6 @@ from dew.data.lowering import (
     _TokenSplit,
 )
 from dew.data.mixing import CorpusCounts
-from dew.data.packing import packed_documents
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -339,7 +338,7 @@ def _memory_pack(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], source
                  ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int] | None, int]:
     """A memory read's windows of `rows` as `stage`, the `at`-th stage the chain wrote, packs them, their
     targets' counts, and the most documents a window holds; the plan's facts go into `derived`."""
-    from dew.data.packing import _Held, _PackedRows, refuse_overlong
+    from dew.data.packing import _Held, _PackedRows, packed_documents, refuse_overlong
 
     derived[f"accepted_before_pack_{at}"] = fingerprint([list(identifier) for identifier, _ in rows])
     rule = LayoutRule.of(record(value, "layout document") for _, value in rows)

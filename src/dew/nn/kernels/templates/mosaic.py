@@ -1494,6 +1494,14 @@ class Transport[Allocated, Opened](abc.ABC):
     live wherever a walk adds; an atomic add from registers (cp.async's `red.global`) reads none, so a tile
     staged for the program's stores alone may be scoped after its walks (`scoped`'s `after_walks`)."""
 
+    stages_vectors: bool = True
+    """Whether 1D per-row vectors (attention statistics, status, anchor keys, key sums) stage through shared
+    memory on store (`vector_stage`)."""
+
+    def vector_stage(self, shape: tuple[int, ...], dtype) -> list:
+        """A 1D vector staging allocation of `shape` and `dtype` where `stages_vectors`, else empty."""
+        return [self.staged_memory(shape, dtype)] if self.stages_vectors else []
+
     cluster: int = 1
     """The programs a cluster of the family's launch takes where they share a block or a product (`kernel`'s
     `cluster`): each loading its share of a block multicast into every one's shared memory (`streams`'

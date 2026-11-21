@@ -245,7 +245,7 @@ def test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for(dtype, k
         op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=kept, interpret=False)
-        config = attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync", narrow=True, relaunch_k=64,
+        config = attention_mosaic.Tiles(64, 64, 3, 1, family="mma.sync", narrow=True, relaunch_k=64,
                                         relaunch_consumers=1, relaunch_columns=128)
         target = generation.gpu_target()
         shared = op.staged_bytes(ba, config, target)
@@ -513,16 +513,17 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 @pytest.mark.parametrize("generation_name", FP32_GATED)
 def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name):
     """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
-    of a causal call 64 and 128 wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
-    launch within its shared memory, spilling nothing."""
+    of a causal call 64, 128 (and 256 on Hopper, row 6508) wide, lowered and compiled by ptxas for
+    `generation_name` on this CPU: every launch within its shared memory, spilling nothing."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
+    widths = (64, 128, 256) if generation_name == "sm90" else (64, 128)
     cases = []
     with generation.assumed(generation_name):
-        for width in (64, 128):
+        for width in widths:
             query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.float32)
             key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.float32)
             zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
@@ -539,34 +540,6 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
 
             cases.append(KernelCase(f"fp32-forward-{width}", _make))
         found = compile_mosaic_kernels(cases, generation_name)
-    failed = mosaic_failures(found)
-    assert not failed, "\n".join(failed)
-
-
-@COMPILES_ON_CPU
-def test_an_fp32_forward_at_width_256_compiles_spill_free_on_hopper():
-    """An fp32 call's inference forward (`MosaicForward.parts = 3`) at width 256 derives a 32-key tile on
-    Hopper (`sm90`) within its 232,448-byte shared memory and compiles spill-free (row 6508)."""
-    from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    queries = 512
-    spans = template.spans(queries, queries, 1, causal=True)
-    query = jax.ShapeDtypeStruct((1, queries, 4, 256), jnp.float32)
-    key = jax.ShapeDtypeStruct((1, queries, 2, 256), jnp.float32)
-    with generation.assumed("sm90"):
-        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
-        op, args = attention_mosaic._forward_call(*zeros, spans, None, scale=None,
-                                                  natural=attention_mosaic.NATURAL)
-        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
-        config = op.derived(ba, generation.gpu_target())
-        assert config is not None, "the Mosaic forward derives no fp32 config 256 wide on sm90"
-
-        def forward(query, key, value):
-            return attention_mosaic.forward(query, key, value, spans, None)
-
-        found = compile_mosaic_kernels(
-            [KernelCase("fp32-forward-256", lambda: (forward, (query, key, key)))], "sm90")
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
@@ -1562,3 +1535,42 @@ def test_fused_keys_first_register_model_counts_dq_product():
         reg_unfused = attention_mosaic_program.backward_registers(
             dkv_family, unfused.dkv, 128, 128, jnp.bfloat16, accurate=False, dq=False, split=True)
         assert reg_fused > reg_unfused, (reg_fused, reg_unfused)
+
+
+@COMPILES_ON_CPU
+def test_an_a100_d128_and_d256_forward_use_whole_row_warps_and_high_residency():
+    """An A100's 64x64 forward at width 128 keeps four warps along rows (no relay or cross-warp softmax)
+    and omits unused vector staging (`CpAsync.stages_vectors`), fitting two resident programs per SM
+    spill-free; width 256 at columns=128 caps its natural rewalk at columns=128 and compiles spill-free
+    (rows 5272, 5273)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        spans = template.spans(512, 512, 1, causal=True)
+        q128 = jnp.zeros((1, 512, 4, 128), jnp.bfloat16)
+        k128 = jnp.zeros((1, 512, 2, 128), jnp.bfloat16)
+        op128, args128 = attention_mosaic._forward_call(q128, k128, k128, spans, None, scale=None,
+                                                        natural=attention_mosaic.NATURAL)
+        ba128 = op128.bind(*args128, residuals=template.Kept.NONE, interpret=False)
+        cfg128 = op128._launchable(ba128, attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync"), target)
+        assert cfg128 is not None
+        assert attention_mosaic_program.bundle_of(cfg128, jnp.bfloat16).rows_whole
+        assert op128.resident(ba128, cfg128, target) >= 2
+
+        q256 = jnp.zeros((1, 512, 4, 256), jnp.bfloat16)
+        k256 = jnp.zeros((1, 512, 2, 256), jnp.bfloat16)
+        op256, args256 = attention_mosaic._forward_call(q256, k256, k256, spans, None, scale=None,
+                                                        natural=attention_mosaic.NATURAL)
+        ba256 = op256.bind(*args256, residuals=template.Kept.NONE, interpret=False)
+        cfg256 = op256._launchable(
+            ba256, attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync", columns=128), target)
+        assert cfg256 is not None
+        assert cfg256.relaunch_columns == 128
+
+        found = compile_mosaic_kernels([
+            KernelCase("sm80-d128-64x64", lambda: op128.lowering(ba128, cfg128)),
+            KernelCase("sm80-d256-64x64-c128", lambda: op256.lowering(ba256, cfg256)),
+        ], "sm80")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

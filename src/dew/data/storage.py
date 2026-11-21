@@ -502,10 +502,6 @@ class PositionText:
         return held[1]
 
 
-# Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through
-# fsspec itself from the moment the data layer is imported.
-fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
-
 _MEMORY_LOCK = threading.RLock()
 
 

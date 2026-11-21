@@ -10,19 +10,22 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851]
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701]
-- The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010]
 - The kernel challenge's lessons in the templates. [5271]
 - Cached and block visibility on the template's spans. [1495, 245]
 - Performance measurements. [569, 285, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
+- The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900, 10742]
 - Convolution repairs above their owner. [5665]
+- The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
+- The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 683 s (a check-1 site: its longest draws task 621 s (1 draws),…. [7603]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
+- The wgmma consumer's register model against ptxas on the GEMM gate's sm90 tiles. [8723]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
@@ -31,7 +34,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Native TPU GEMM dispatch. [1560]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5327]
-- The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Block-selected attention's other selections as mixers. [6301]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - A certification verdict's key names the ptxas that assembled it by the installed nvcc wheels alone. [7309]
@@ -39,11 +41,10 @@ This page is generated from the maintainers' findings ledger as each change land
 - The GEMM's quantizing epilogue, algebra.md §7.3 and §7.4's encode consumer. [8547]
 - FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
-- The wgmma consumer's register model against ptxas on the GEMM gate's sm90 tiles. [8723]
 - Grouped scores' gradient cancellation untested. [10551]
+- The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
-- The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - The suite's wall. [5478]
@@ -63,7 +64,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556]
+- Time to first step: the compile path's re-derivations. [5556, 10762]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
@@ -101,7 +102,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1903]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
-- Check 2's ratio contract reads the law's bound looser than its spec states. [7980]
 
 ## Tutorials and docs
 

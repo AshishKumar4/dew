@@ -583,7 +583,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
 
-    adds_through_shared = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
+    adds_through_shared = False
+    stages_vectors = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
 
     @property
     @abc.abstractmethod
@@ -777,11 +778,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # one has no strided layout, which wants a multiple of 128), where its registers keep their own.
         del wait
         for part, view in zip(parts, views, strict=True):
-            if smem is None:
-                view[...] = part.astype(view.dtype)
-                continue
-            if len(smem.shape) == 1:
-                plgpu.store(view, part.astype(view.dtype), optimized=False)
+            if smem is None or len(smem.shape) == 1:
+                if len(view.shape) == 1 and not launches.interpreting():
+                    plgpu.store(view, part.astype(view.dtype), optimized=False)
+                else:
+                    view[...] = part.astype(view.dtype)
                 continue
             plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]

@@ -267,7 +267,6 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     rows arrive, and so are documents counted by a role or a pad id (`_ruled`),
     whose windows a plan of their lengths does not count."""
     from dew.data.generation import Generation, _GenerationSource
-    from dew.data.packing import PackedSource, chunks_for, plan_name
     from dew.data.sources.tokens import TokenFiles
     from dew.data.steps.windows import WindowSource
 
@@ -275,6 +274,9 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         """The overlap of a chunk step that cuts documents as the pack after it plans them
         (`chunks_for`), or None where none comes first."""
         if len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack):
+            # The packer imported where a pack is promoted: a chain that packs nothing imports none.
+            from dew.data.packing import chunks_for
+
             return chunks_for(stages[0].step, stages[1])
         return None
 
@@ -299,12 +301,15 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             # A published plan cuts a document as a window-long chunk step without overlap does; a best-fit
             # plan places documents whole, an empty one too, which a chunk step after the generation drops,
             # so that step runs as written (row 9053).
-            if (isinstance(source, _GenerationSource) and isinstance(packing, Pack)
-                    and plan_name(packing, "accepted") in plans and overlap in (None, 0)
-                    and not (packing.policy == "best-fit" and overlap is not None)
-                    and not _ruled(source)):
-                source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
-                stages = stages[at + 1 :]
+            if isinstance(source, _GenerationSource) and isinstance(packing, Pack):
+                # The packer imported where a published generation is packed.
+                from dew.data.packing import PackedSource, plan_name
+
+                if (plan_name(packing, "accepted") in plans and overlap in (None, 0)
+                        and not (packing.policy == "best-fit" and overlap is not None)
+                        and not _ruled(source)):
+                    source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
+                    stages = stages[at + 1 :]
             break
     overlap = cutting(stages)
     at = int(overlap is not None)
@@ -318,6 +323,8 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         and source.lengths() is not None
         and not _ruled(source)
     ):
+        from dew.data.packing import PackedSource
+
         source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
     first = stages[0] if stages else None
     if isinstance(first, Windows) and first.fields == TOKEN_FIELDS and isinstance(source, TokenFiles):

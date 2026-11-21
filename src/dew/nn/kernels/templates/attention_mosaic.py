@@ -265,15 +265,15 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     # count, its issuer's rows at least, where no tile of them all holds (a 48-row training walk's scaled op
     # on mma.sync held 278 registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`,
     # et-sm86scaled). The first that holds is the config: legality steps down, nothing is ranked (design §7).
-    if not family.budgets_registers and rows is None:
-        # TPU has no per-thread register cap: widen held rows up to copy_extent (512 fwd, 256 bwd) to
-        # cut K/V HBM reads 4x and match Splash's 512x512 tiling within v5e's 16 MiB VMEM (row 10152).
-        cap = family.copy_extent or (4 * unit)
-        tpu_top = cap if overlapped else min(cap, 2 * unit)
-        heights = [h for h in (4 * unit, 2 * unit)
-                   if h <= tpu_top and padded(h, 1) - padded(unit, 1) <= held // 8]
+    if rows is None and not family.budgets_registers:
+        # Families without a per-thread register cap (TPU) walk every whole multiple of `unit` up to the
+        # held extent; `fits` (VMEM-priced against `generation.shared_budget`) steps down (rows 10715, 10716).
+        heights = [h for h in extents(family, dtype, held)
+                   if h > unit and (h & (h - 1) == 0) and padded(h, 1) - padded(unit, 1) <= held // 8]
+    elif wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8:
+        heights = [2 * unit]
     else:
-        heights = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
+        heights = []
     heights.append(unit)
     fewer = range(unit - family.rows, 0, -family.rows) if rows is None and few_rows(family, held) else ()
     order = ((unit, [count for count in counts(unit) if count > 1]), *((height, [1]) for height in heights),
@@ -968,7 +968,8 @@ class MosaicForward(_Mainloop[Tiles]):
         # kernel's five resident programs of 20 KB, M-DD-7 W34).
         dividing = [launched for launched in (
                         self._launchable(ba, dataclasses.replace(config, block_k=extent), target)
-                        for extent in reversed(walked_extents(family, query.dtype, config.block_k))
+                        for extent in reversed(walked_extents(family, query.dtype, config.block_k,
+                                                              parts=self.parts))
                         if self.keys % extent == 0)
                     if launched is not None]
         for candidate in dividing:
@@ -1035,22 +1036,27 @@ class MosaicForward(_Mainloop[Tiles]):
         decides = self.deciding(ba, config)
         # Its value columns whole first, then in blocks (`_column_blocks_of`): a launch a block (row 2526: at
         # width 256 no tile held the anchored rewalk's whole sums).
+        col_blocks = _column_blocks_of(family, query.dtype, value.shape[-1])
+        if config.columns is not None:
+            col_blocks = [c for c in col_blocks if c is not None and c <= config.columns]
         relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True,
                                           columns=columns)
-                      for columns in _column_blocks_of(family, query.dtype, value.shape[-1])
+                      for columns in col_blocks
                       for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k, parts=self.parts)
                       if config.block_k % block == 0)
-        relaunch = next((tiles for tiles in relaunches
-                         if self._launch_legal(ba, tiles, target, decides=decides)
-                         and self.proposes(ba, tiles, target,
-                                           held=lambda tiles=tiles: self.within(
-                                               self.registers(ba, tiles, decides=decides), tiles))),
-                        None)
-        if relaunch is None:
-            return None
-        return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers,
-                                   relaunch_columns=relaunch.columns)
+        for tiles in relaunches:
+            if not (self._launch_legal(ba, tiles, target, decides=decides)
+                    and self.proposes(ba, tiles, target,
+                                      held=lambda tiles=tiles: self.within(
+                                          self.registers(ba, tiles, decides=decides), tiles))):
+                continue
+            launched = dataclasses.replace(config, relaunch_k=tiles.block_k,
+                                           relaunch_consumers=tiles.consumers,
+                                           relaunch_columns=tiles.columns)
+            if not any(NATURAL_NAME in kernel for kernel in report.refused_at(self, ba, launched)):
+                return launched
+        return None
 
     def _rewalked_apart(self, ba: tokamax.BoundArguments, config: Tiles, family: mosaic.Family,
                         target: generation.GpuTarget) -> Tiles | None:
@@ -1139,10 +1145,17 @@ class MosaicForward(_Mainloop[Tiles]):
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
-        return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
-                                                           reduces=forward_reduces(family, reduced),
-                                                           products=products, over_rings=True))
-
+        # On TPU (`not family.budgets_registers`), live score-tile VMEM intermediates (`S`, mask, `exp2`, `P`,
+        # softmax temps: ~12 fp32 tiles plain, ~20 in natural/scaled walks matching v5e's 22 MiB measurement)
+        # plus the fp32 accumulator (`4 * block_q * value_width`) bound tile size against `shared_budget`
+        # instead of repurposing `copy_extent` (row 10715).
+        score_tiles = 20 if (config.natural_form or self.scales_in_kernel(ba)) else 12
+        score_vmem = (0 if family.budgets_registers
+                      else (score_tiles * config.block_q * config.block_k
+                            + 4 * config.block_q * value_width) * 4)
+        return score_vmem + resources.shared_bytes(
+            family, launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
+                                 products=products, over_rings=True))
     def _products(self, ba: tokamax.BoundArguments, config: Tiles,
                   target: generation.GpuTarget) -> tuple:
         """The launch's products at `config` as its program scopes them (`forward_products`): its logits a
@@ -2034,10 +2047,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The fused launch's warpgroups reserve fp16's running scale's reduction scratch too, as it launches
         # (`reducing`'s `scaled`: `_fused_launch`'s and `_coop_launch`'s).
         scaled = config.fused and staged_parts(dtype) > 1
-        return max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
+        score_vmem = 0 if family.budgets_registers else 24 * config.block_q * config.block_k * 4
+        return score_vmem + max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
             layout, tiles.consumers, self.score_reduces, scaled=scaled), reduces=reduces))
             for layout, tiles, allocations, reduces in launches)
-
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
         # None on a family that budgets none (`Family.budgets_registers`), which holds every config.
         if not bundle_of(config, ba.arguments["query"].dtype).budgets_registers:
