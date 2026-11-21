@@ -442,18 +442,19 @@ class Merging(ByteTokenizer):
 
 
 def test_a_state_cut_in_a_row_encoded_whole_takes_a_longer_cut_whose_row_encodes_shorter():
-    """A question row encoded whole whose room holds the state "aaxy" whole only as its "xy" merges with
-    the "z" written after it: the cut its share counts ("a", the state's own tokens against the room)
-    grows past "aa" and "aax", whose rows overflow, to the whole state, whose row is the one the room
-    past all lays out (row 9060: the growth stopped at the first longer cut that overflowed)."""
+    """A question row encoded whole whose room is one token short of the state "aaxyq" whole: the cut its
+    share counts ("aa", the state's own tokens against the room) grows past "aax", whose row overflows, to
+    "aaxy", whose "xy" merges with the "z" written after it into one token and whose row fits (row 9060:
+    the growth stopped at the first longer cut that overflowed)."""
     _, _, _, *question = release().segments
 
-    def row(max_len: int):
+    def row(state: str, max_len: int):
         layout = SegmentLayout.state_first_row(max_len=max_len, labels=release().labels, unit="whole",
                                                segments=(Text("S:"), State(), Text("z\n"), *question))
-        [laid] = layout.rows(Merging(), SPECIALS, "aaxy", {"team": TEAM})
+        [laid] = layout.rows(Merging(), SPECIALS, state, {"team": TEAM})
         return laid
 
-    whole = row(1 << 16)
-    assert 2 in list(whole.tokens)
-    assert list(row(len(whole.tokens)).tokens) == list(whole.tokens)
+    # The row of the cut "aaxy" kept whole, its "xyz" one token: the room the cut state is given.
+    fitting = row("aaxy", 1 << 16)
+    assert 2 in list(fitting.tokens)
+    assert list(row("aaxyq", len(fitting.tokens)).tokens) == list(fitting.tokens)

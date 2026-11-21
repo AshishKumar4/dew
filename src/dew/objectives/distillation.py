@@ -384,8 +384,9 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         """The `[B, S]` KL of the teacher's tempered distribution from the student's, each position's
         logits computed from its final states a tile of rows at a time (the student's head tile's), each
         tile's recomputed in the backward: no `[B, S, vocab]` logits of either model are held."""
+        student_head, teacher_head = student.head, teacher.head
         assert student.final is not None and teacher.final is not None
-        assert student.head is not None and teacher.head is not None
+        assert student_head is not None and teacher_head is not None
         tile = self._student_tile()
         assert tile is not None
         rows, positions = student.final.shape[:2]
@@ -402,8 +403,8 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         @jax.checkpoint
         def one(at):
             start = at * size
-            student_logits = student.head(jax.lax.dynamic_slice_in_dim(own, start, size))
-            teacher_logits = teacher.head(jax.lax.dynamic_slice_in_dim(other, start, size))
+            student_logits = student_head(jax.lax.dynamic_slice_in_dim(own, start, size))
+            teacher_logits = teacher_head(jax.lax.dynamic_slice_in_dim(other, start, size))
             held = jnp.where(jax.lax.dynamic_slice_in_dim(kept, start, size)[..., None], teacher_logits, 0)
             return categorical.kl_divergence(student_logits / temperature, held / temperature)
 
