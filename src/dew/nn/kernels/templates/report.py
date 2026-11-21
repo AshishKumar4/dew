@@ -42,6 +42,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
 from dew import _cache, communicators
+from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
 
@@ -336,24 +337,6 @@ def _identity(op, arguments: tokamax.BoundArguments) -> str:
     return repr((hardware, tuning._identity(op, traced=False), operands))
 
 
-def _provenance(op, arguments: tokamax.BoundArguments) -> frozenset[str] | None:
-    """A launch's provenance (`dew._code.provenance`): of its op's class, its fields' values and its hooks."""
-    from dew._code import provenance
-
-    fields = ([getattr(op, field.name) for field in dataclasses.fields(type(op))]
-              if dataclasses.is_dataclass(type(op)) else [])
-    return provenance([type(op), *fields, *(value for name, value in arguments.arguments.items()
-                                             if name in op.HOOKS)])
-
-
-def launch_code(provenance: frozenset[str] | None) -> list[str] | None:
-    """The code a launch's stored verdict and choice key on (`dew._code.provenance_code`): the
-    certification's, each GPU family's template (`mosaic_sm90`, ...) among it, and its `provenance`'s."""
-    from dew._code import provenance_code
-
-    return provenance_code(__name__, provenance)
-
-
 def _digest(text: str) -> str:
     return hashlib.blake2b(text.encode(), digest_size=5).hexdigest()
 
@@ -365,7 +348,7 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
                                   lambda: op.padded(arguments, config), op.emitted,
                                   reverse=_PULLED.get() and op.CARRIES_DERIVATIVE,
-                                  provenance=lambda: _provenance(op, arguments)))
+                                  provenance=lambda: op_provenance(op, arguments.arguments)))
     try:
         yield
     finally:
@@ -794,7 +777,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
             return _CERTIFIED[key].refused
         if key in _UNCERTIFIED:
             return None
-    stored = _verdict_key(_identity(op, arguments), config, reverse, _provenance(op, arguments))
+    provenance = op_provenance(op, arguments.arguments)
+    stored = _verdict_key(_identity(op, arguments), config, reverse, provenance)
     verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (), device, read=True).refused
@@ -884,7 +868,7 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: fro
     """What decides a launch's certification for a compile target (the store's file, `verdict_target`,
     `tuning.stored_verdict`) before it traces, as its stored verdict's key: the launch's `identity`
     (`_identity`, the same in every process), its config, whether reverse mode runs it, its code
-    (`launch_code` of its `provenance`: an edit of it certifies again), the installed JAX, jaxlib and CUDA
+    (`dew._code.provenance_code`: an edit of it certifies again), the installed JAX, jaxlib and CUDA
     plugins, whose Mosaic GPU and XLA lower and compile it (the Pallas lowering cache's seal of them), the
     ptxas that assembles it (`_assemblers`), and the environment a kernel's lowering and compile read (that
     cache's policy). None where the installation has no seal (an edited or a source install of JAX), whose
@@ -895,7 +879,7 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: fro
     from dew.nn.kernels.tuning import encoded
 
     installed = seal().digest
-    if installed is None or (code := launch_code(provenance)) is None:
+    if installed is None or (code := provenance_code(__name__, provenance)) is None:
         return None
     stated = [code, installed.hex(), _assemblers(), identity, encoded(config), reverse,
               _keyed_environment()]

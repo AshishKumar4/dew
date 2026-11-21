@@ -155,6 +155,14 @@ def provenance(values: Sequence[object]) -> frozenset[str] | None:
     return frozenset(module for module in modules if _path(module) is not None)
 
 
+def op_provenance(op, arguments: Mapping[str, object]) -> frozenset[str] | None:
+    """A kernel launch's provenance (`provenance`): its op's class, its fields' values and the hooks among its
+    `arguments` (`op.HOOKS`), which a certification's verdict and an attention choice key on."""
+    fields = ([getattr(op, field.name) for field in dataclasses.fields(type(op))]
+              if dataclasses.is_dataclass(type(op)) else [])
+    return provenance([type(op), *fields, *(value for name, value in arguments.items() if name in op.HOOKS)])
+
+
 def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str] | None:
     """The digests (`code_digest`) of the code a record of `root`'s, of values whose `provenance` it names,
     keys on: `root`'s and each module's of `provenance`, or the whole package's (`whole_digest`) where it

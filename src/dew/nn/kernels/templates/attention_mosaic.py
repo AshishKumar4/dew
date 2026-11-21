@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import tokamax
 from jax._src.pallas import mpmd
 
+from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
@@ -171,7 +172,8 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
     installed = seal().digest
-    if installed is None or (code := report.launch_code(report._provenance(op, ba))) is None:
+    provenance = op_provenance(op, ba.arguments)
+    if installed is None or (code := provenance_code(report.__name__, provenance)) is None:
         return None
     rates = cost.rates(target, device=False)
     stated = [code, installed.hex(), report._identity(op, ba), target.generation, target.device_kind,
