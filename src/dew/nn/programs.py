@@ -196,6 +196,14 @@ def algorithm_arithmetic(algorithm) -> DotArithmetic:
                          imprecise=algorithm.allow_imprecise_accumulation)
 
 
+def canonical_precision(precision: jax.lax.PrecisionLike):
+    """`precision` as JAX reads it (its own canonicalization: a name, an enum, a pair of them, a dot
+    algorithm or a preset), the one place Dew reads it so."""
+    from jax._src.lax import lax as lax_internal
+
+    return lax_internal.canonicalize_precision(precision)
+
+
 def dot_arithmetic(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype) -> DotArithmetic | None:
     """The arithmetic the dot algorithm `precision` names runs a product of operands of those dtypes in, as
     JAX lowers it: a preset's by JAX's own conversion of it (`_preset_arithmetic`), a `jax.lax.DotAlgorithm`'s
@@ -203,9 +211,7 @@ def dot_arithmetic(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype) -> Do
     them, the default preset), the backend's choice by the operands. The one reading of a preset: the
     algebra's cost prices a product's mode by it (`dew.algebra.cost`) and its rounding bound admits a
     contraction by it (`dew.algebra.terms`), no list of preset names beside JAX's."""
-    from jax._src.lax import lax as lax_internal
-
-    named = lax_internal.canonicalize_precision(precision)
+    named = canonical_precision(precision)
     if isinstance(named, jax.lax.DotAlgorithm):
         sides = (named.lhs_precision_type, named.rhs_precision_type)
         return DotArithmetic(operand_bits=(_bits(sides[0]), _bits(sides[1])),
