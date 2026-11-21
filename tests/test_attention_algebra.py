@@ -1762,8 +1762,8 @@ def test_rescaled_uses_exact_power_of_two_constants_for_dropout_reach():
         state = algebra.Partial(jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32),
                                 jnp.ones((1,), jnp.float32),
                                 algebra.Scale(jnp.zeros((1,), jnp.float32), prior))
-        scale = jax.jit(lambda s: algebra.rescaled(s, jnp.ones((1,), jnp.float32),
-                                                   lambda: jnp.zeros((1,), jnp.float32), drop))(state)
+        scale = jax.jit(lambda s, d=drop: algebra.rescaled(s, jnp.ones((1,), jnp.float32),
+                                                           lambda: jnp.zeros((1,), jnp.float32), d))(state)
         assert scale is not None
         np.testing.assert_array_equal(np.asarray(scale.bound), np.array([np.float32(1.5)], np.float32))
     # Static exponents past fp32's normal range [-126, 127] split into exact normal host multiplies.
