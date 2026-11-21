@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from arm_arithmetic import float64_held, summed_as_run, unrewritten
+from arm_arithmetic import float64_held
 from flax import linen as nn
 from model_support import flat_tree, largest_difference, stepped_decode, steps_from
 from reference_error import (
@@ -32,7 +32,6 @@ from reference_error import (
     widened,
     without_ynn,
 )
-from rounding_bound import rounding_scale
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -210,16 +209,6 @@ shapes' bit for bit on a CPU), the most any platform gives: Gemma 3n's 128 on an
 the selection margin (8 on armada); the others' on armada, whose errors are heavy-tailed across draws: the
 four largest of 1024 draws hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek
 one's, which the plain loop against itself resolves within no 512 draws."""
-
-SCAN_CONDITIONING = {"gemma3n": 128}
-"""The weighed check's declared seeds of a shape whose draws admit near ties (`assert_as_exact`'s
-`conditioning`, sized by `seeds_for(..., conditioning=True)` on armada): Gemma 3n's, whose unit just above
-its cutoff holds an activation mostly float32's rounding (`SCAN_MARGIN`), so where its unweighted check stays
-undecided each element's error is weighed by the plain loop's own rounding there and a draw near that tie
-is judged at its own conditioning (an exact widening of float64 sums moved one admitted draw to such a tie,
-its kept unit's gradient row 4.1e-3 off float64 in the loop and 8.9e-3 scanned)."""
-
-
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
     """Every metric within `relative` of the other run's; perplexity is exp
     of the cross entropy, so an absolute bound would say nothing about it."""
@@ -259,14 +248,8 @@ class ScanCase:
             ids = np.random.default_rng([0x5CA7, key]).integers(0, VOCAB, (rows, SEQ_LEN)).astype(np.int32)
             return ids, np.float32(1.0)
 
-        # The plain loop's program, made once: its arm runs it compiled (`measured`'s), and the weighed check
-        # replays it for each draw's rounding scale (`scale`), keyed by this one function.
-        self.plain_run = self.computed(self.plain, self.variables, self.training)
-        # As the rounding scale traces a program, unrewritten (`arm_arithmetic.unrewritten`), held so each
-        # draw's scale traces the one function JAX keys its trace by.
-        self.plain_written = unrewritten(self.plain_run)
         self.runs = {"scanned": self.measured(self.scanned, self.variables, self.training),
-                     "plain": without_ynn(self.plain_run)}
+                     "plain": self.measured(self.plain, self.variables, self.training)}
         self.drawn = drawn
         if selection_margins.selects(self.config):
             selected = selection_margins.capture(self.plain)
@@ -284,12 +267,9 @@ class ScanCase:
             self.draw = drawn
 
     def measured(self, model, forward, trained):
-        """`computed`, compiled as both arms of a check between Dew's paths are (`without_ynn`)."""
-        return without_ynn(self.computed(model, forward, trained))
-
-    def computed(self, model, forward, trained):
         """The logits under `forward`, and the loss with its gradients under `trained` and the draw's
-        cotangent (as `with_gradients` gives them)."""
+        cotangent (as `with_gradients` gives them), compiled as both arms of a check between Dew's paths
+        are (`without_ynn`)."""
         def run(ids, cotangent):
             def loss(params):
                 logits = model.apply({**trained, "params": params}, ids)
@@ -299,14 +279,7 @@ class ScanCase:
             value, pull = jax.vjp(loss, trained["params"])
             gradients, = pull(cotangent)
             return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
-        return run
-
-    def scale(self, inputs, seed):
-        """The plain loop's rounding scale at a draw (`rounding_bound.rounding_scale`, as its arm sums:
-        `summed_as_run`), which the weighed check reads (`assert_as_exact`'s `conditioning_scale`): the plain
-        arm's own program (`plain_run`), replayed here, where its arm runs it compiled (`without_ynn`)."""
-        with summed_as_run():
-            return rounding_scale(self.plain_written, *inputs, seed=seed)[1]
+        return without_ynn(run)
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
@@ -334,7 +307,7 @@ def scans_as_the_loop(shape: str) -> None:
     case = ScanCase(shape)
     scanned, plain, truth = case.arms()
     assert_as_exact(scanned, plain, case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
-                    truth_fn=truth, conditioning=SCAN_CONDITIONING.get(shape), conditioning_scale=case.scale)
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize("shape", sorted(set(SHAPES) - {"gemma3n"}))
@@ -344,7 +317,7 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     scans_as_the_loop(shape)
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=24, conditioning=128, conditioning_per_task=24)
+@pytest.mark.check1_shards(seeds=128, per_task=24)
 def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
     """`scans_as_the_loop` over Gemma 3n's shape, its 128 seeds and their redraws drawn by CI's map tasks
     (`check1_shards`), 24 a task: tasks of 32 took 79 to 115 s on armada's 25/17 workers (f1c0868b8),
