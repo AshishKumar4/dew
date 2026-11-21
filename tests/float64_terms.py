@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import functools
 import weakref
 from typing import Protocol
 
@@ -603,26 +602,11 @@ def _moved(equation) -> bool:
 
 def _body(equation):
     """The jaxpr and constants a call runs (`dew.nn.programs.called`: a jit, a remat, a custom rule's primal,
-    a marked span, each evaluated op by op as the computation's own), or None. A hijax primitive's call
-    (`call_hi_primitive_p`: Dew's chained linear map, `generation`'s `Linear`) is the program it lowers to
-    (`to_lojax`), traced once an equation (`LOWERED`). A shard_map's per-device program is evaluated too, on
-    each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas kernel, is one operation, its
-    outputs their own size."""
-    from jax._src import hijax
-
-    if equation.primitive is hijax.call_hi_primitive_p:
-        if equation not in LOWERED:
-            lowered = functools.partial(equation.primitive.to_lojax, **equation.params)
-            traced = jax.make_jaxpr(lowered)(*(var.aval for var in equation.invars))
-            LOWERED[equation] = (traced.jaxpr, traced.consts)
-        return LOWERED[equation]
+    a marked span, each evaluated op by op as the computation's own), or None. A shard_map's per-device
+    program is evaluated too, on each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas
+    kernel, is one operation, its outputs their own size."""
     body = programs.called(equation)
     return None if body is None else (body, body.consts)
-
-
-LOWERED: dict = {}
-"""Each walked hijax call's lowered program and its constants (`_body`), by the equation: a traced program's
-equations are the same objects every draw."""
 
 
 def _sized(value):
