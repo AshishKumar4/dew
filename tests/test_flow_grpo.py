@@ -482,7 +482,7 @@ def test_deterministic_rollout_cannot_contribute_policy_gradient():
 
 
 
-def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
+def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods(monkeypatch):
     """The rollout's recorded likelihoods and their rescoring are on par with
     the authors' Gaussian at the DiT's own guided velocities over rollouts
     (check 1), guidance included: the rollout walks 4 points and guides its
@@ -490,7 +490,9 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     would not guide a step 1 of 6, so the rescoring reads the rollout's step
     count off the batch. Its group advantages are the float64 normalization's,
     rounded once, and its timesteps the 4-point walk's first two, bit for
-    bit."""
+    bit. The walk its collective gathers is its trained prefix: three of its
+    four states, two densities and stochastic marks, its four times whole
+    (row 10795)."""
     from dew.inputs import CharTable, Condition
     from dew.nn.backbones.dit import SimpleDiT
 
@@ -515,8 +517,20 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     def reward(images, context):
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
+    from dew.objectives.rl import flow as flow_rollouts
+
+    gathered = []
+
+    def collected(value, **named):
+        gathered.append(jax.tree.map(np.shape, value[0][0]))
+        return collective_host(value, **named)
+
+    collective_host = flow_rollouts.collective_host
+    monkeypatch.setattr(flow_rollouts, "collective_host", collected)
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
     batch = rollout(state, prompts, jax.random.key(23), objective=objective)
+    walk = gathered[0]
+    assert (walk.states[1], walk.log_probs[1], walk.stochastic[1], walk.times) == (3, 2, 2, (4,))
     rewards = np.asarray(batch["rewards"], np.float64).reshape(2, 3)
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))

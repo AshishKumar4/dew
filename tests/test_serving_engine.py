@@ -79,11 +79,13 @@ def test_a_reload_of_host_weights_places_them_once_on_the_served_placement():
     """A reload of NumPy weights (a checkpoint's host leaves) places each leaf once, on the served
     placement: checking them against the served tree (`engine.normalized`) transfers nothing, where it
     placed each on the default device before the reload copied it again (row 10799), and the new pair
-    scores what is submitted after, its weights a buffer of its own."""
+    scores what is submitted after, its weights a buffer of its own, the caller's array changed after the
+    reload changing none of them."""
     from dew.inference.engine import normalized
 
     server = ScoringServer.from_task(Named("a"), weights(1.0))
-    host = {"w": np.full((), 2.0, np.float64)}
+    # The served dtype's own, so no cast copies it before its placement (a CPU's may alias it).
+    host = {"w": np.full((), 2.0, np.float32)}
     source = jax.tree_util.tree_flatten_with_path(
         jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), weights(1.0)))[0]
     with jax.transfer_guard("disallow_explicit"):

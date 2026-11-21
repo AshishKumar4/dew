@@ -512,7 +512,18 @@ class FlowRollout(GroupedRollout):
         samples = trajectory.samples
         if objective.autoencoder is not None:
             samples = objective.autoencoder.decode(params["autoencoder"], samples)
-        return trajectory, jnp.clip(samples, -1, 1), spatial
+        # The walk the rollout's collective gathers is its trained prefix (`_selected`): its states one past
+        # it, its densities and stochastic steps cut to it, its grid whole; the sample decoded before the cut
+        # (row 10795: each process gathered every row's whole walk to train its first transitions).
+        selected = self._selected()
+        trained = trajectory.replace(states=trajectory.states[:, :selected + 1],
+                                     log_probs=trajectory.log_probs[:, :selected],
+                                     stochastic=trajectory.stochastic[:, :selected])
+        return trained, jnp.clip(samples, -1, 1), spatial
+
+    def _selected(self) -> int:
+        """How many of the walk's transitions train: its first `train_steps`, every one where None."""
+        return self.steps - 1 if self.train_steps is None else self.train_steps
 
     def _training_rows(self, generated: FlowTrajectory, context: Batch, spatial: Mapping[str, np.ndarray],
                        rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
@@ -528,7 +539,7 @@ class FlowRollout(GroupedRollout):
         advantages = advantages.astype(np.float32).reshape(-1)
         if not np.isfinite(advantages).all():
             raise ValueError("flow group advantages must remain finite")
-        selected = self.steps - 1 if self.train_steps is None else self.train_steps
+        selected = self._selected()
         local_advantages = advantages[owned]
         # A sample of a source row a partly read share repeated trains nothing (`real_samples`).
         held = real_samples(context)
@@ -536,13 +547,12 @@ class FlowRollout(GroupedRollout):
         prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
                                                  context[condition.field])
                     for condition in self.objective.inputs.conditions.values()}
-        # This rank's rows of the walk, laid out as every flow batch is (`transition_rows`): the trained
-        # prefix of each part cut on the devices before its rows are read to the host, the states one past it.
-        stochastic = np.asarray(generated.stochastic[:, :selected])[owned]
+        # This rank's rows of the walk's trained prefix (`_generate_impl`), laid out as every flow batch is
+        # (`transition_rows`).
+        stochastic = np.asarray(generated.stochastic)[owned]
         trains = stochastic & (local_advantages[:, None] != 0) & real[:, None]
-        prepared.update({**transition_rows(np.asarray(generated.states[:, :selected + 1])[owned],
-                                           np.asarray(generated.times),
-                                           np.asarray(generated.log_probs[:, :selected])[owned], stochastic,
+        prepared.update({**transition_rows(np.asarray(generated.states)[owned], np.asarray(generated.times),
+                                           np.asarray(generated.log_probs)[owned], stochastic,
                                            local_advantages, selected=selected, trains=trains),
                          REWARDS_KEY: rewards[owned]})
         if spatial:
