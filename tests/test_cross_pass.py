@@ -379,16 +379,19 @@ def test_a_decoder_drawn_at_one_pass_holds_every_merge_a_later_pass_reads():
     lambda: dataclasses.replace(decoder("attention"), kv_shared_layers=(3,), loop=Loop(
         2, step_norm=False, messages=MESSAGES)).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
     lambda: decoder("attention", steps=2, messages=None).with_passes(3, messages=MESSAGES),
+    lambda: dataclasses.replace(decoder("attention", steps=2), normed_residual=True).init(
+        jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
     lambda: decoder("depth", steps=2, exit_gate=True).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))],
     ids=["a step norm", "implicit", "an empty block", "an empty message block", "depth blocks misaligned",
          "a message block not the depth block", "shared keys", "messages joining a loop of passes",
-         "exits over depth residuals"])
+         "a normed residual", "exits over depth residuals"])
 def test_a_loop_whose_messages_cannot_summarize_its_blocks_is_refused(refused):
     """A loop passing messages is refused where its passes would not each enter at the block's input (a
     step norm, the θ-method), where it banks nothing (an empty block or message block), where under
     attention residuals a summary would not be a whole depth block's partial sum or a pass would exit
     through a depth state uncollapsed, where a layer's keys would cross a message block's end, and where
-    it would join a loop already of several passes, changing what it computes at the merges' draw."""
+    it would join a loop already of several passes, changing what it computes at the merges' draw, and
+    where a normed residual makes a sublayer's normed input the stream its merge would leave as it is."""
     with pytest.raises(ValueError):
         refused()
 

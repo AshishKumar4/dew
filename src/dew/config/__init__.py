@@ -1814,7 +1814,8 @@ class DecoderRunConfig(RunConfig):
     """The rank of each merge's controller (`CrossPass.rank`); None its default."""
     loop_message_additive: bool = True
     """Whether each merge's message adds a term of its own beside the gained summary
-    (`CrossPass.additive`)."""
+    (`CrossPass.additive`): `--no-loop-message-additive` drops it; left on, a checkpoint's own choice is
+    kept, and the default taken where it holds no messages."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -1917,22 +1918,22 @@ class DecoderRunConfig(RunConfig):
         return looping(start, self.handed_passes, self.loop_layers, backprop_steps=self.loop_backprop_steps,
                        remat=self.loop_remat or None, implicit=self.loop_implicit or None,
                        exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
-                       theta_passes=rows if self.loop_theta_per_pass else None, messages=self.messages,
-                       key=self.trainer.key)
+                       theta_passes=rows if self.loop_theta_per_pass else None,
+                       messages=self.messages(None if own is None else own.messages), key=self.trainer.key)
 
-    @property
-    def messages(self) -> "CrossPass | None":
-        """The messages the run's loop passes (`loop_messages`), None where it keeps a checkpoint's own."""
+    def messages(self, held: "CrossPass | None") -> "CrossPass | None":
+        """The messages the run's loop passes (`loop_messages`), None where it keeps a checkpoint's own: the
+        checkpoint's own messages where it holds them (`held`), else the defaults, with what the run
+        states in their place (a block size, a rank, `--no-loop-message-additive`), so a checkpoint's
+        others, which shape no parameter, are kept, not reset (row 10855)."""
         if not self.loop_messages:
             return None
         from dew.nn.cross_pass import CrossPass
 
-        spec = CrossPass(additive=self.loop_message_additive)
-        if self.loop_message_block_size is not None:
-            spec = dataclasses.replace(spec, block_size=self.loop_message_block_size)
-        if self.loop_message_rank is not None:
-            spec = dataclasses.replace(spec, rank=self.loop_message_rank)
-        return spec
+        stated = {"block_size": self.loop_message_block_size, "rank": self.loop_message_rank,
+                  "additive": None if self.loop_message_additive else False}
+        return dataclasses.replace(CrossPass() if held is None else held,
+                                   **{name: value for name, value in stated.items() if value is not None})
 
 
 def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,

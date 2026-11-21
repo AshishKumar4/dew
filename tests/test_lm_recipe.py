@@ -927,6 +927,38 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
     assert fresh == set(gate) and len(groups) == 2
 
 
+def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoints_own(tmp_path):
+    """`--loop-messages` gives a --pretrained decoder's loop the messages its flags shape (`Loop.messages`):
+    the run trains each merge fresh beside the checkpoint's weights, and one step moves its gains off the
+    zero they are drawn at, the bank reaching them (row 10854). A run that states no shape over a loop
+    holding messages already keeps that loop's own, not the defaults (row 10855)."""
+    from dew.interop import Pretrained
+    from dew.nn.cross_pass import CrossPass
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    looping = ("--loop-steps", "2", "--loop-layers", "0", "1", "--loop-messages")
+    config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
+                                     "--max-new-tokens", "0", *looping, "--loop-message-block-size", "1",
+                                     "--loop-message-rank", "2", "--no-loop-message-additive"),
+                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+    objective = config.prepare().train("messaged")
+    assert objective.model.loop.messages == CrossPass(block_size=1, rank=2, additive=False)
+    assert objective.fresh_modules() and all("cross_pass_" in path for path in objective.fresh_modules())
+    named = {jax.tree_util.keystr(path): leaf
+             for path, leaf in jax.tree_util.tree_leaves_with_path(objective.held_variables()["params"])}
+    gains = [leaf for name, leaf in named.items() if "cross_pass_" in name and name.endswith("['gain']")]
+    assert gains and all(np.any(np.asarray(gain) != 0) for gain in gains)
+
+    held = CrossPass(block_size=1, rank=2, normalize_values=False, scale_by_input_rms=False)
+    loaded = Pretrained.load(checkpoint, dtype="float32")
+    start = loaded.with_model(loaded.model.with_passes(2, (0, 1), messages=held), key=0)
+    resumed = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--max-new-tokens", "0",
+                                      *looping),
+                          default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+    assert resumed.looped(start).model.loop.messages == held
+
+
 def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):
     """`--val-metrics '[]'` scores no metric: a run whose data holds no validation split trains with no
     suite at all, as one that names none does, rather than an empty set of splits."""
