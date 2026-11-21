@@ -26,7 +26,6 @@ from dew.distributed.placement import Validation, allocated_bytes, placed_bytes,
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import (
-    OuterProgram,
     abstract_signature,
     collecting,
     hold,
@@ -1094,12 +1093,6 @@ class StepCompiler[L, E]:
         finally:
             self.phase_passes.current = sampled.cap
 
-    def whole_program(self) -> OuterProgram:
-        """The program a split step's whole runs on its microbatches' outputs (`whole_step_program`), each
-        microbatch counting its own work where the run draws its pass count per microbatch, as both the
-        runner and a build ahead compile it (`dew.training.ahead`, row 7983)."""
-        return whole_step_program(self.objective, parted_work=self.phase_passes.sampled is not None)
-
     @staticmethod
     def _flops(planned: Planned) -> StepFlops | None:
         """A step's FLOPs at `planned`, a microbatch's (`plan_flops`) times its split."""
@@ -1211,7 +1204,7 @@ class StepCompiler[L, E]:
         # this step's window first (`laid_out`).
         returned: list[jax.Array | None] = [None]
         # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
-        whole = self.whole_program()
+        whole = whole_step_program(self.objective, parted_work=settings.sampled_passes is not None)
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
