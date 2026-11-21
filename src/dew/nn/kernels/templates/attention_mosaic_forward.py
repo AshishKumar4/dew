@@ -189,10 +189,11 @@ def forward_products(family: mosaic.Family, tiles: Tiles, value_width: int, dtyp
     if not (training or family.rescales_kept):
         return (tiles.consumers, (*logits, value_width), lefts, ahead_logits)
     fresh = (value_width,) if scaled or jnp.dtype(dtype) == jnp.dtype(jnp.float16) else ()
-    base = (tiles.consumers, (*logits, *fresh), lefts, ahead_logits, (value_width,))
+    tail = ((), tmem_columns) if family.places_on_role else ()
+    base = (tiles.consumers, (*logits, *fresh), lefts, ahead_logits, (value_width,), *tail)
     if family.places_on_role and query_width is not None and parts == 1:
         with_query = (tiles.consumers, (*logits, *fresh), (*lefts, (query_width, dtype)),
-                      ahead_logits, (value_width,))
+                      ahead_logits, (value_width,), *tail)
         if family.product_columns(with_query) <= (tmem_columns or 0):
             return with_query
     return base
@@ -526,6 +527,15 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     return (out, *finished), maxima.reshape(*maxima.shape[:2], splits, -1) if splits > 1 else maxima, None
 
 
+class SplitOutput(NamedTuple):
+    """A split inference launch's outputs as its launch wrote them, padded (`_walked_outputs`, row 8775):
+    its slices' outputs `[B, S, Qp, H, Dvp]` and stacked maxima and denominators `[2, B, H, S, Qp]`,
+    which `merged.merged_split` merges where they lie."""
+
+    padded: jax.Array
+    stacked: jax.Array
+
+
 def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, splits: int,
                     family: mosaic.Family):
     """The inference walk's outputs from its launches' (`_inference_walk`'s `finished`), unpadded to the
@@ -538,8 +548,8 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     out = head_layout(family, out)
     if splits > 1:
         stacked = rows_of[0]
-        return (out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
-                stacked.reshape(*stacked.shape[:3], splits, -1))
+        return SplitOutput(out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
+                           stacked.reshape(*stacked.shape[:3], splits, -1))
     out = out[:, :queries, :, :width]
     if not rows:
         return out

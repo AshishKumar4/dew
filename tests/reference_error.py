@@ -1942,6 +1942,21 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
     return with_launches
 
 
+def ran_here(fn: Callable, label: str) -> list[Callable]:
+    """`fn` each way this run takes a law's computation with no check-1 site: jitted as an arm (`ahead_arm`,
+    under `label`), which a GPU tier part's prepare compiles ahead and its run runs from that program, and op
+    by op on the CPU lane alone, whose eager dispatch no prepare compiles ahead (a GPU's tier takes the
+    jitted way; row 10169's cells ran unprepared for it). A caller runs every way before it judges any: a
+    prepare's arm gives zeros, and a check failing there leaves the arms after it uncompiled."""
+    import tier_wire
+
+    def eager(*args):
+        with jax.disable_jit():
+            return fn(*args)
+    cpu_lane = jax.default_backend() == "cpu" and not tier_wire.preparing()
+    return [ahead_arm(jax.jit(fn), label), *([eager] if cpu_lane else [])]
+
+
 def input_digest(inputs) -> np.uint64:
     """A seed's inputs (a dict of NumPy arrays, a torch draw's converted) as 64 bits of the SHA-256 of
     each array's name, dtype by name, shape and bytes in C order: what a recording of outputs alone

@@ -695,7 +695,8 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
     # fits a target's configs (18 fits a decision on the CPU, 0.86 of its 0.87 s, row 6740); a call naming
     # the template passes it (`selection`'s forcing) and reaches its eligibility interpreted.
     Requirement('device', lambda case: case.family is not None,
-                "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
+                "no GPU of an instruction family the template's bundles cover (a CPU, or a GPU of none, a "
+                "Turing's): off a GPU the mainloop runs interpreted where a call names it",
                 row=INHERENT, kind='measured'),
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "

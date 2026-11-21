@@ -804,23 +804,36 @@ def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches
     """The objective's loss, metrics and gradients on `spec`'s mesh over
     `devices` (every device by default), with the pipeline's schedule of
     `microbatches` in context the way the trainer's compiled step puts it
-    there."""
+    there (`stepping`'s, at one batch)."""
+    return stepping(objective, spec, variables, devices, microbatches)(batch)
+
+
+def stepping(objective, spec, variables, devices=None, microbatches=None):
+    """A batch's loss, metrics and gradients (`loss_and_grads`'), the objective's variables placed on `spec`'s
+    mesh once and its step compiled once for every batch of one shape, the batch its argument: a check's
+    draws each one call, where each draw placed, traced and compiled its step anew (rows 10147, 10162: a
+    pipelined arm's eight draws, 864 s of a CI task)."""
     mesh = spec.build(devices)
     layout = Layout(min_shard=TINY_SHARD)
     # The run's table of its parameters' axes, as the trainer holds it while it places and steps.
     with boxed(objective.parameter_axes):
         placed = jax.device_put(variables, layout.shardings(mesh, variables))
     assert_sharded(placed["params"], mesh)
-    batch = shard_batch(mesh, batch)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
-    def loss(params):
+    def loss(params, batch):
         return objective.scalar_loss({**variables, "params": params}, batch, step)
 
-    with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
-        (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
-    return (float(value), {name: float(number) for name, number in aux.metrics.items()},
-            jax.tree.map(np.asarray, grads))
+    program = jax.jit(jax.value_and_grad(loss, has_aux=True))
+
+    def run(batch):
+        batch = shard_batch(mesh, batch)
+        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
+            (value, aux), grads = program(placed["params"], batch)
+        return (float(value), {name: float(number) for name, number in aux.metrics.items()},
+                jax.tree.map(np.asarray, grads))
+
+    return run
 
 
 def layer_states(model, variables, ids):
@@ -1033,11 +1046,15 @@ def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_
         twin, wide = tiny(max_seq_len=16, dtype=jnp.float64, **FUSED_DELTA_STACK), float64_held(variables)
 
     def stepped(model, variables, spec, microbatches=None, devices=four):
-        # Each arm placed and compiled on its own mesh, called as given (`loss_and_grads` sets its mesh).
+        # Each arm placed and compiled on its own mesh at its first draw, in the context the check calls it
+        # in (the truth's x64), and called as given at every draw after (`stepping` sets its mesh).
+        held = []
+
         @as_given
         def step(text):
-            loss, _, grads = loss_and_grads(LMObjective(model, 16), spec, variables, {"text": text}, devices,
-                                            microbatches)
+            if not held:
+                held.append(stepping(LMObjective(model, 16), spec, variables, devices, microbatches))
+            loss, _, grads = held[0]({"text": text})
             return np.float32(loss) if model is not twin else np.float64(loss), grads
 
         return step

@@ -1,7 +1,8 @@
-"""A delta-rule mixer split over the sequence axis, the gated delta net and Kimi delta attention: each shard
-runs its slice from the memory it enters with, its summary's composition over the earlier shards
-(`recurrence_chunk.entering_memory`), and its conv after the real tokens before it (`linear.sequence_conv`),
-checked against the same layer on one device (row 1437)."""
+"""A recurrent mixer split over the sequence axis, and its heads over the axes a split leaves them: the gated
+delta net and Kimi delta attention, each shard running its slice from the memory it enters with, its
+summary's composition over the earlier shards (`recurrence_chunk.entering_memory`), and its conv after the
+real tokens before it (`linear.sequence_conv`), and Mamba-1, Mamba-2 and lightning, checked against the same
+layer on one device (row 1437)."""
 
 import flax.linen as nn
 import jax
@@ -19,7 +20,7 @@ from sequence_split_support import (
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.linear import GatedDeltaNet, held_conv1d, over_sequence, sequence_conv, sequence_halo
+from dew.nn.linear import GatedDeltaNet, Heads, held_conv1d, over_sequence, sequence_conv, sequence_halo
 from dew.nn.mixers.lightning import LightningAttention
 from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2
@@ -119,20 +120,77 @@ def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tens
     scan's and conv's half (row 1437: each device ran every head, 0.99 of it), and so under rules giving the
     heads the sequence axis too, and no other, where the tensor axis alone divides them (two key heads)."""
     module = mixers[name]
+    assert split_work(module, MixerCall(), rules, tensor=2) < 0.75 * split_work(module, MixerCall(), rules,
+                                                                                tensor=1)
+
+
+def split_work(module, call: MixerCall, rules: tuple, *, tensor: int) -> float:
+    """The work each device's compiled forward and backward of `module` called with `call` does under a
+    sequence axis of 2 beside a tensor axis of `tensor`, on the host's devices, which take the portable
+    math, whose every dot XLA's count holds."""
     hidden = jnp.asarray(np.random.default_rng(0).standard_normal((2, 32, WIDTH)), jnp.float32)
-    variables = module.init(jax.random.key(7), hidden)
+    variables = module.init(jax.random.key(7), hidden, call)
 
     def step(params, hidden):
-        out, pull = jax.vjp(lambda params, hidden: module.apply(params, hidden, MixerCall()), params, hidden)
+        out, pull = jax.vjp(lambda params, hidden: module.apply(params, hidden, call), params, hidden)
         return out, pull(jnp.ones_like(out))
 
-    def work(tensor: int) -> float:
-        # On the host's devices, which take the portable math, whose every dot XLA's count holds.
-        mesh = MeshSpec(sequence=2, tensor=tensor).build(jax.devices("cpu")[:2 * tensor])
-        with jax.set_mesh(mesh), nn.logical_axis_rules(heads_rules(rules)):
-            return jax.jit(step).lower(variables, hidden).compile().cost_analysis()["flops"]
+    mesh = MeshSpec(sequence=2, tensor=tensor).build(jax.devices("cpu")[:2 * tensor])
+    with jax.set_mesh(mesh), nn.logical_axis_rules(heads_rules(rules)):
+        return jax.jit(step).lower(variables, hidden).compile().cost_analysis()["flops"]
 
-    assert work(2) < 0.75 * work(1)
+
+SPLIT_HEADS = {
+    "mamba": Mamba(emb_features=WIDTH, intermediate_size=64, state_size=64, time_step_rank=2, chunk_size=4),
+    "mamba2": Mamba2(emb_features=WIDTH, num_heads=4, head_dim=32, state_size=64, n_groups=2, chunk_size=4,
+                     dtype=jnp.float32),
+    "lightning": LightningAttention(emb_features=WIDTH, num_heads=4, head_dim=32,
+                                    slopes=(0.5, 0.25, 0.125, 0.0625), layers=4, chunk_size=4),
+}
+"""The other recurrent mixers that split a training call over the sequence, each with heads (Mamba-1's
+channels) its scan's work dwarfs its projections' on, Mamba-2's B and C in two groups a tensor axis of 2
+divides."""
+
+
+def _called(name: str) -> MixerCall:
+    """A training call of `SPLIT_HEADS[name]` over two rows of 32 tokens: a lightning layer's the second of
+    its stack's (`MixerCall.depth`)."""
+    return MixerCall(depth=jnp.ones((2, 32), jnp.int32)) if name == "lightning" else MixerCall()
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(SPLIT_HEADS))
+def test_a_recurrent_mixer_split_over_the_sequence_divides_its_heads_work_over_a_tensor_axis(name):
+    """Under a sequence axis of 2, a tensor axis of 2 beside it divides Mamba-1's channels and Mamba-2's and
+    a lightning layer's heads (`linear.over_sequence`'s `Heads`), as it divides a delta rule's: each
+    device's compiled forward and backward does under three quarters of the work it does with no tensor
+    axis, where each ran every head (train 1108's F1)."""
+    module, call = SPLIT_HEADS[name], _called(name)
+    assert split_work(module, call, (), tensor=2) < 0.75 * split_work(module, call, (), tensor=1)
+
+
+HEADED_MIXERS = {
+    "mamba": Mamba(emb_features=WIDTH, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4),
+    "mamba2": Mamba2(emb_features=WIDTH, num_heads=4, head_dim=8, state_size=8, n_groups=2, chunk_size=4,
+                     dtype=jnp.float32),
+}
+"""Mamba-1 and -2 at a small geometry whose heads (channels) and groups a tensor axis of 2 divides."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("row", ["packed", "empty_shard_packed"])
+@pytest.mark.parametrize("name", sorted(HEADED_MIXERS))
+def test_a_mamba_layer_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones(name, row):
+    """Under a sequence axis of 2 beside a tensor axis of 2, which splits Mamba-1's channels and Mamba-2's
+    heads and groups (each device its share of the conv's channels and taps and of the scan's, `Heads`),
+    the layer runs packed rows as on one device (`assert_split_as_whole`): one starting a document at the
+    cut, one carrying a document's conv and state across it past padding."""
+    module = HEADED_MIXERS[name]
+    hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
+    variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
+    assert_split_as_whole(module, variables, row, SEEDS[row],
+                          f"{name} split over the sequence and its heads, {row}", width=WIDTH, shards=2,
+                          tensor=2)
 
 
 DECODE_MIXERS = {
@@ -173,13 +231,16 @@ LIGHTNING = LightningAttention(emb_features=WIDTH, num_heads=2, head_dim=8, slop
 """MiniMax's lightning layer at a small geometry, the second of a stack of four."""
 
 
-def on_one_device(module, call: MixerCall, shape: tuple[int, int], seeds: int, site: str):
+def on_one_device(module, call: MixerCall, shape: tuple[int, int], seeds: int, site: str, *, shards: int = 4,
+                  tensor: int = 1):
     """`module`, initialized here, called with `call` over hidden states of `shape` `[B, S]` and `WIDTH`
-    wide on a sequence axis of 4 as on one device (`assert_as_on_one_device`)."""
+    wide on a sequence axis of `shards` beside a tensor axis of `tensor` as on one device
+    (`assert_as_on_one_device`)."""
     depth = None if call.depth is None else jnp.ones((1, shape[1]), jnp.int32)
     variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), jnp.zeros((1, shape[1], WIDTH)),
                                                      MixerCall(depth=depth)))
-    assert_as_on_one_device(module, variables, call, (*shape, WIDTH), seeds, site)
+    assert_as_on_one_device(module, variables, call, (*shape, WIDTH), seeds, site, shards=shards,
+                            tensor=tensor)
 
 
 @pytest.mark.mesh
@@ -198,6 +259,23 @@ def test_a_lightning_layer_split_over_the_sequence_runs_its_rows_as_whole_ones(r
     call = MixerCall(AttentionMetadata(coordinates=tokens), depth=jnp.ones((SPLIT_BATCH, 32), jnp.int32))
     on_one_device(LIGHTNING, call, (SPLIT_BATCH, 32), SEEDS[row],
                             f"lightning split over the sequence, {row}")
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("row", ["packed", "empty_shard_packed"])
+def test_a_lightning_layer_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones(row):
+    """Under a sequence axis of 2 beside a tensor axis of 2, which splits a lightning layer's heads (each
+    device its share of the queries', keys', values' and decays' heads, `Heads`), the layer runs packed rows
+    as on one device, each shard and head from the memory the earlier shards leave it."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata
+
+    valid, segments = SPLIT_ROWS[row]
+    tokens = coordinates(valid=jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32))),
+                         segments=jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32))
+    call = MixerCall(AttentionMetadata(coordinates=tokens), depth=jnp.ones((SPLIT_BATCH, 32), jnp.int32))
+    on_one_device(LIGHTNING, call, (SPLIT_BATCH, 32), SEEDS[row],
+                  f"lightning split over the sequence and its heads, {row}", shards=2, tensor=2)
 
 
 FORK_ROWS = [[3, 4, 5, 6, 7, 8, 9, 10, 11], [3, 4, 5, 6, 7, 8, 9, 12], [20, 21, 22, 23, 24]]
@@ -252,8 +330,10 @@ def test_a_split_convs_bias_gradient_sums_its_shards_as_the_whole_conv_does(row)
         return jax.jit(run)
 
     def split_conv(taps, bias, mixed):
+        # Each channel its own, as Mamba-1's conv splits them (`Heads`).
         return over_sequence(lambda mixed, valid, segments, taps, bias: sequence_conv(
-            mixed, taps, bias, segments, valid), 4, (mixed, valid, segments), (taps, bias))
+            mixed, taps, bias, segments, valid), 4, (mixed, valid, segments), (taps, bias),
+                             heads=Heads(16, 16, {0: 2, 3: 0, 4: 0}))
 
     def whole_conv(taps, bias, mixed):
         return held_conv1d(mixed, taps, valid, bias=bias, segments=segments)[0]
@@ -270,7 +350,8 @@ def test_a_split_convs_bias_gradient_sums_its_shards_as_the_whole_conv_does(row)
         return jnp.broadcast_to(partial, (mixed.shape[0], 1, partial.shape[-1]))
 
     partials = jax.jit(lambda taps, bias, mixed, cotangent: over_sequence(
-        shard_partial, 4, (mixed, valid, segments, cotangent), (taps, bias)))
+        shard_partial, 4, (mixed, valid, segments, cotangent), (taps, bias),
+        heads=Heads(16, 16, {0: 2, 3: 2, 4: 0, 5: 0})))
 
     def draw(seed):
         generator = np.random.default_rng([0x2169, seed])

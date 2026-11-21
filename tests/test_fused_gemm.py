@@ -52,6 +52,46 @@ def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generat
 
 
 @INTERPRETS
+@pytest.mark.parametrize("target", ["sm90", "cpu"])
+def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_its_own_of(target):
+    """A region fused through `fused_gemm.fused` in a shard_map over two CPU devices that checks the axes its
+    values vary over (`check_vma`): each device's rows and its own bias (both varying over the map's axis), a
+    feature scale and the matrix the same on every device, the rows scaled before the product (its producer,
+    the template's prologue) and the bias added after (its epilogue). On an assumed, interpreted H100 the
+    template's launch, named, takes both, its product typed as its operands vary (row 9808); on the CPU, XLA's
+    products run them whole, checked. Each device's region computes the scaled rows' dot rounded to bf16 plus
+    its bias, bitwise, over integers whose sums pass bf16's 256."""
+    keys = jax.random.split(jax.random.key(9808), 4)
+    x = jax.random.randint(keys[0], (2, 64, 128), -7, 8).astype(jnp.bfloat16)
+    scale = jax.random.randint(keys[1], (128,), -3, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[2], (128, 256), -7, 8).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[3], (2, 256), -3, 4).astype(jnp.bfloat16)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def region(x, scale, w, bias):
+        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16,
+                                  interpret_on_cpu=target != "cpu") + bias
+
+    def each_device(x, scale, w, bias):
+        return fused_gemm.fused(region, x[0], scale, w, bias[0])[None]
+
+    mapped = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, data),
+                                   out_specs=data, check_vma=True))
+    if target == "cpu":
+        got = mapped(x, scale, w, bias)
+    else:
+        with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"), \
+                generation.routes() as routes:
+            got = mapped(x, scale, w, bias)
+        assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
+    expected = jnp.einsum("dri,io->dro", x * scale, w,
+                          preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(got, np.float32),
+                                  np.asarray(expected + bias[:, None, :], np.float32))
+
+
+@INTERPRETS
 def test_a_fused_regions_consumer_is_rewritten_by_the_algebra_pass_before_its_epilogue_tiles_it():
     """A region fused through `fused_gemm.fused` whose consumer two capped column scales of the product
     summed, which the epilogue takes tile by tile: the region traces the consumer's cheaper form, the one

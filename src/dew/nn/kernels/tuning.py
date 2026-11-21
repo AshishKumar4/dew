@@ -691,14 +691,16 @@ class KernelOp(tokamax.Op):
         return pick.fastest_config
 
     def _certified(self, ba: tokamax.BoundArguments, config: Hashable, *,
-                   offered: Callable[[], Hashable | None] | None = None) -> Hashable | None:
+                   offered: Callable[[], Hashable | None] | None = None,
+                   decided: Hashable | None = None) -> Hashable | None:
         """The derived `config`, or, where its kernels spill as the GPU assembles them alone
         (`report.certified`), each refused (`report.refuse_launch`, so its legality
         refuses it) and its misses recorded (`report.missed`: stepped where the next was derived),
         and the next in turn: a rung of it that holds (`_climbed`), else what the launch offers now
         (`offered`, its derivation's `remaining` unless a caller launches another form of its configs, a
-        decode's streamed tile): the first whose kernels hold, None where nothing is offered past the
-        refused. An offer of a refused config again (its legality reads no refusal) has it kept, its
+        decode's streamed tile): the first whose kernels hold, `decided` uncertified where `offered` steps
+        back to that already-decided terminal offer (recorded as stepped), or None where nothing is offered
+        past the refused. An offer of a refused config again (its legality reads no refusal) has it kept, its
         program's compile left to read it (`report.settled`). A pinned or a tuned pick is a measured
         choice, not certified here: its program's compile reads it."""
         offered = offered or functools.partial(self.remaining, ba)
@@ -718,6 +720,8 @@ class KernelOp(tokamax.Op):
                     stepped is not None and stepped not in seen))
             if stepped is None:
                 return None
+            if decided is not None and stepped == decided:
+                return decided
             config = stepped
         return config
 

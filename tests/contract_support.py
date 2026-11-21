@@ -91,15 +91,19 @@ def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values:
     weights of another, each document's signed by the memory it enters (`_entered_signs`), so every memory
     is zero, one or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`)
     of one power of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds
-    once, as float64's."""
+    once, as float64's. Every other column's draws reach float32's largest itself (row 9074, the endpoint the
+    scaled draws stay below): unscaled, each write's levels summing to it, and weights of a half, so a memory
+    of two writes is it or its negative, their randomness spent as the scaled draws'."""
     rows, documents = len(FORKED), len(FORKED[0][0])
     rng = np.random.default_rng([8840, seed])
     factors, levels = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
     key = np.zeros((rows, documents, len(factors), key_heads, keys), np.float32)
     key[..., 0] = factors[:, None]
     group, columns = heads // key_heads, np.zeros((heads, values))
-    columns[np.arange(key_heads) * group + seed % group, seed // group % values] = (
-        rng.choice([-1.0, 1.0], key_heads) * 2.0 ** -int(rng.integers(28, 34)))
+    column = seed // group % values
+    largest = column % 2 == 1
+    columns[np.arange(key_heads) * group + seed % group, column] = (
+        rng.choice([-1.0, 1.0], key_heads) * 2.0 ** -(0 if largest else int(rng.integers(28, 34))))
     value = np.broadcast_to(levels[:, None, None] * columns, (rows, documents, len(levels), heads, values))
     signs = _entered_signs(rng.choice([-1.0, 1.0], (rows, heads)))
     scale = 2.0 ** -int(rng.integers(10, 15))
@@ -107,7 +111,7 @@ def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values:
     def signed(shape):
         return (rng.choice([-1.0, 1.0], shape) * scale).astype(np.float32)
 
-    weight = signs * 2.0 ** -int(rng.integers(0, 4))
+    weight = signs * 2.0 ** -(1 if largest else int(rng.integers(0, 4)))
     return Entries(key, value.astype(np.float32), weight.astype(np.float32), signed)
 
 
@@ -336,10 +340,9 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
             continue
         site = f"{label}, {name}, on training's mesh of two"
 
-        # The mesh's run a placement and the program run there, compiled once an order (each seed's draw of
-        # one shape), which the gate runs as given (`as_given`).
-        program = jax.jit(lambda primals, direction, cotangent, name=name: orders(
-            fn, primals, direction, cotangent)[name]())
+        # The mesh's run a placement and the program run there (`_mesh_program`), which the gate runs as given
+        # (`as_given`).
+        program = _mesh_program(fn, name)
 
         @as_given
         def on(primals, direction, cotangent, program=program, name=name, site=site):
@@ -363,6 +366,15 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
         truth_of = None if truth_fn is None else truth
         count = seeds_for(off, draw, site, truth_fn=truth_of, dew_fn=on) if seeds is None else seeds
         assert_as_exact(on, off, draw, site, seeds=count, truth_fn=truth_of)
+
+
+@functools.lru_cache(maxsize=256)
+def _mesh_program(fn, name: str):
+    """Order `name` of `fn` (`orders`) as one jitted program of its primals, direction and cotangent, made
+    once a function and an order: compiled once a shape, each seed's draw and each of a cell's edges (`EDGES`,
+    one shape at three scales) running it (rows 9806, 9807, 10132: the convex mean's mesh runs compiled each
+    order again at every edge, a third of its cell)."""
+    return jax.jit(lambda primals, direction, cotangent: orders(fn, primals, direction, cotangent)[name]())
 
 
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
