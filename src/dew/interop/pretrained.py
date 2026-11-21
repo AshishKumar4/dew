@@ -441,7 +441,8 @@ class Pretrained:
             from dew.interop.layouts import source_layout
             from dew.nn.protocols import CrossAttending
 
-            laid = model if isinstance(model, MediaWrapper) else from_record(CausalTransformer, model)
+            kind = MultimodalTransformer if isinstance(model, MediaWrapper) else CausalTransformer
+            laid = from_record(kind, model)
             crossing = isinstance(laid, CrossAttending) and laid.cross_attention is not None
             stated = source_layout(laid.with_cross_attention(None) if crossing else laid)
             if isinstance(stated, Unwritable):
@@ -712,12 +713,16 @@ class Pretrained:
                              "model in its place keeps every parameter it holds")
         # A parameter drawn beside a source's own (drawn fresh, or a loop's merges, whatever drew them) is
         # read again at the shape the new model declares, or refused: kept at another it would not apply.
-        loaded = flatten_dict(dict(unboxed(thaw(self.variables)).get("params", {})))
-        drawing = flatten_dict(dict(unboxed(declared).get("params", {})))
-        reshaped = sorted(name for path, leaf in drawing.items()
-                          if path in loaded and ((name := "/".join(path)) in self.fresh
-                                                 or any(key.startswith(MERGE_PREFIX) for key in path))
-                          and np.shape(loaded[path]) != leaf.shape)
+        def shapes(tree) -> dict[str, tuple[int, ...]]:
+            return {jax.tree_util.keystr(path, simple=True, separator="/"): np.shape(leaf)
+                    for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(tree).get("params", {}))}
+
+        def drawn_beside(name: str) -> bool:
+            return name in self.fresh or any(part.startswith(MERGE_PREFIX) for part in name.split("/"))
+
+        loaded, drawing = shapes(thaw(self.variables)), shapes(declared)
+        reshaped = sorted(name for name, shape in drawing.items()
+                          if name in loaded and loaded[name] != shape and drawn_beside(name))
         if reshaped:
             raise ValueError(f"this {type(model).__name__} declares {reshaped[:6]}, drawn fresh beside the "
                              "loaded weights, at shapes other than the source holds: draw it without them")
@@ -817,6 +822,7 @@ class Pretrained:
         from dew.nn.projections import unpacked
         from dew.nn.protocols import Differential
 
+        refuse_extensions(self.model)
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.
@@ -825,7 +831,6 @@ class Pretrained:
         # A packed load's expert banks are written as the dense matrices they hold (`decoded_expert_banks`),
         # which the source's format encodes back.
         held = unboxed(decoded_expert_banks(self.variables if variables is None else variables))
-        refuse_extensions(self.model, held)
         values = unpacked(self.model, stored_layers(self.model, held, banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)

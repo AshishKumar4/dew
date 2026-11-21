@@ -42,13 +42,6 @@ MESSAGES_UNWRITTEN = ("the source's format holds no cross-pass messages, which t
 """Why a decoder holding merges is written in no family's layout (`Pretrained.export`)."""
 
 
-def holds_merges(params) -> bool:
-    """Whether `params` holds a block's merges anywhere (`MERGE_PREFIX`)."""
-    paths = jax.tree_util.tree_flatten_with_path(params)[0]
-    return any(isinstance(key, jax.tree_util.DictKey) and str(key.key).startswith(MERGE_PREFIX)
-               for path, _ in paths for key in path)
-
-
 @dataclasses.dataclass(frozen=True)
 class CrossPass:
     """How a looped block's passes pass messages (`Loop.messages`, the module doc): the layers a bank

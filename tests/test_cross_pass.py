@@ -293,35 +293,54 @@ def test_a_shared_cache_prefills_as_a_cache_a_pass_does(form):
     """A hybrid decoder passing messages over four passes, its gates drawn off zero, prefills with one
     cache its passes share (`shared_cache`, each pass starting from the cache the step found) what it
     prefills with a cache a pass, bit for bit: the bank crosses its scanned passes as it crosses them
-    apart, its block's layers one at a time or a periodic run of two periods (`PipelineStage`)."""
+    apart, its block's layers one at a time or a periodic run of two periods (`PipelineStage`); and the
+    shared cache it leaves holds, layer by layer, its last pass's entries, those the cache a pass keeps
+    of its last pass (`pass_offset`), and the prelude's alike."""
+    from dew.nn.backbones.looping import pass_offset
+
     models = [decoder(form, steps=4, shared_cache=shared) for shared in (True, False)]
     variables, ids = gated_draw(models[0], salt=0xC407)(0)
-    prefilled = []
+    prefilled, caches = [], []
     for model in models:
         made, step = decode_steps(model)
-        prefilled.append(np.asarray(step(variables, made(variables, ids.shape[0]), ids)[0]))
+        logits, cache = step(variables, made(variables, ids.shape[0]), ids)
+        prefilled.append(np.asarray(logits))
+        caches.append(cache)
     np.testing.assert_array_equal(*prefilled)
+    if form == "periodic":
+        return
+    shared, apart = caches
+    loop = models[1].loop
+    first, end = loop.layers
+    offset = pass_offset(loop, models[1].num_layers, loop.steps - 1)
+    named = {f"layers_{index}": f"layers_{index}" for index in range(first)} | {
+        f"layers_{first + index}": f"layers_{offset + index}" for index in range(end - first)}
+    for kept, last in named.items():
+        for one, other in zip(jax.tree.leaves(shared[kept]), jax.tree.leaves(apart[last]), strict=True):
+            np.testing.assert_array_equal(np.asarray(one), np.asarray(other), err_msg=kept)
 
 
 def test_a_packed_attention_projects_each_site_apart_as_its_own_projections_do():
-    """A decoder passing messages whose attention's projections a server packed (`qkv_proj`), each site's
-    input projected apart through the packed projection (`ProjectionGroup.apart`), computes what its own
-    three projections compute at drawn gates (check 1 against them in float64)."""
-    from dew.nn.projections import pack_projections
-    from dew.nn.protocols import ProjectionGroup
+    """A decoder passing messages packs none of its block's attention projections anew (`pending`: a later
+    pass would run the packed product once a site), the prelude's alone; a tree a server packed as the
+    decoder without the loop packs (`qkv_proj`) runs each site's input apart through the packed product
+    (`ProjectionGroup.apart`), computing what its own three projections compute at drawn gates (check 1
+    against them in float64), and unpacks back to them (`unpacked`)."""
+    from dew.nn.projections import pack_projections, pending, unpacked
 
     looped = decoder("attention", steps=3)
     draw = gated_draw(looped, salt=0xC406)
+    variables, _ = draw(0)
+    assert {group.path[0] for group in pending(looped, variables)} == {"layers_0"}
+    plain = decoder("attention")
+    groups = pending(plain, {"params": _without_merges(variables["params"])})
+    assert {group.path[0] for group in groups} == {f"layers_{index}" for index in range(4)}
+    packed_tree = pack_projections(variables, groups)
+    for one, other in zip(jax.tree.leaves(unpacked(looped, packed_tree)), jax.tree.leaves(variables),
+                          strict=True):
+        np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
 
     def packed(variables, ids):
-        members = ("q_proj", "k_proj", "v_proj")
-
-        def widths(index):
-            held = variables["params"][f"layers_{index}"]["self_attn"]
-            return tuple(held[member]["kernel"].shape[-1] for member in members)
-
-        groups = [ProjectionGroup((f"layers_{index}", "self_attn"), "qkv_proj", members, widths(index))
-                  for index in range(looped.num_layers)]
         return looped.apply(pack_projections(variables, groups), ids)
 
     assert_as_exact(jax.jit(packed), jax.jit(looped.apply), draw, "packed attention",

@@ -856,7 +856,7 @@ class DecoderBlock(nn.Module):
         mixer = self.mixer(parent=None)
         sites = len(mixer.input_sites) if isinstance(mixer, InputSites) else 1
         merges = sites + int(self.feedforward is not None)
-        merge = CrossPassMerge(spec, self.emb_features, self.norm_eps, parent=None)
+        merge = CrossPassMerge(spec, self.emb_features, self._stated_eps('cross-pass messages'), parent=None)
         count = merges * merge.merge_flops(lengths, blocks, trained=trained)
         if NormSite.INPUT in self._built_norms():
             reruns = sites - 1 + int(self.feedforward is not None and self.wiring.shared_parallel_norm)

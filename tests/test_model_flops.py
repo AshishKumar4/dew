@@ -815,6 +815,14 @@ def test_gated_norms_count_each_run_at_its_width(fields):
     assert gated[0] - plain[0] == gated[1] - plain[1] > 0
 
 
+def _counted_and_traced(model):
+    """A tiny decoder's counted work over two rows of four tokens and the products its forward traces."""
+    lengths = np.array([4, 4], np.int64)
+    operands = (jnp.ones((2, 4), jnp.int32),)
+    variables = model.init(jax.random.key(201), *operands)
+    return model.model_flops(lengths), forward_products(model.apply, variables, *operands)
+
+
 @pytest.mark.parametrize("messages", [CrossPass(block_size=1, rank=2),
                                       CrossPass(block_size=2, rank=3, additive=False)],
                          ids=["a block a layer", "one block, gained alone"])
@@ -823,17 +831,10 @@ def test_a_loop_passing_messages_counts_each_later_passs_merges(messages):
     them, a merge at each of a layer's attention's input sites and its feed-forward's over the bank's
     blocks: as many products as the forward traces beside the plain loop's (the first pass, which reads
     no bank, merging none)."""
-    lengths = np.array([4, 4], np.int64)
-    operands = (jnp.ones((2, 4), jnp.int32),)
-
-    def counted_and_traced(model):
-        variables = model.init(jax.random.key(202), *operands)
-        return model.model_flops(lengths), forward_products(model.apply, variables, *operands)
-
     base = {"causal": False, "attention_impl": "reference"}
-    plain = counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3))))
-    messaged = counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3),
-                                                            messages=messages)))
+    plain = _counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3))))
+    messaged = _counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3),
+                                                             messages=messages)))
     assert messaged[0] - plain[0] == messaged[1] - plain[1] > 0
 
 
@@ -844,15 +845,8 @@ def test_a_norm_gated_on_the_routed_layers_counts_there_alone():
     routed = {"mixture": Mixture(experts=4, top_k=2, layers=(1, 2), expert_features=8),
               "causal": False, "attention_impl": "reference"}
     gate = NormSpec(gate_rank=2, gated_layers="routed")
-    lengths = np.array([4, 4], np.int64)
-    operands = (jnp.ones((2, 4), jnp.int32),)
-
-    def counted_and_traced(model):
-        variables = model.init(jax.random.key(201), *operands)
-        return model.model_flops(lengths), forward_products(model.apply, variables, *operands)
-
-    plain = counted_and_traced(decoder(**routed))
-    gated = counted_and_traced(decoder(**routed, norms={"post_attention_layernorm": gate}))
+    plain = _counted_and_traced(decoder(**routed))
+    gated = _counted_and_traced(decoder(**routed, norms={"post_attention_layernorm": gate}))
     assert gated[0] - plain[0] == gated[1] - plain[1] == 2 * 2 * 2 * 8 * 2 * 8
 
 
