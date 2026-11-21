@@ -29,7 +29,7 @@ from op_certificates import (
     two_sum,
 )
 
-from dew.algebra import means, ratios, scaled, windows
+from dew.algebra import ratios, scaled, windows
 from dew.nn.precision import correctly_rounded_divide_p
 from dew.nn.programs import dot_arithmetic
 

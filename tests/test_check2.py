@@ -134,7 +134,8 @@ def test_the_ratios_contract_holds_quotients_summed_across_as_their_sum(numerato
                                                                         apart):
     """`ratios.ratio_p`'s contract (`certified._ratio_holds`) of quotients summed across an axis before they
     land (`ratios.Ratio.across`, `sum_c N_c / D_c`) holds the law's own landing of their sum, exact (2/3,
-    and 0 where each quotient passes the format), and refuses a quotient's own and their sum landed apart (`apart`),
+    and 0 where each quotient passes the format), and refuses a quotient's own and their sum landed
+    apart (`apart`),
     as a contract reading one quotient alone, or the quotients landed, would pass them (the merge P0's base
     review F1)."""
     from dew.algebra import ratios, windows
