@@ -37,9 +37,10 @@ class SourceOptions:
     scan_layers: bool = False
     """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
     (`Pretrained.load`'s `scan_layers`): a step's program grows with the period, not the depth."""
-    packed_experts: bool = False
-    """An MXFP4 source's routed experts served as their codes, NVFP4 banks the expert layers multiply
-    as they are (`Pretrained.load`'s `packed_experts`, row 4516): its experts' memory a quarter of bf16's."""
+    packed_weights: bool = False
+    """A quantized source's 4-bit weights served as their codes, NVFP4 matrices their layers multiply as
+    they are (`Pretrained.load`'s `packed_weights`): an MXFP4 source's routed experts (row 4516) and a
+    ModelOpt source's W4A16_NVFP4 Linears (row 8550), each a quarter of bf16's memory."""
     param_dtype: str | None = None
     """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
@@ -65,7 +66,7 @@ class SourceOptions:
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
                 "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers,
-                "packed_experts": self.packed_experts, "step": self.step, "ema": self.ema}
+                "packed_weights": self.packed_weights, "step": self.step, "ema": self.ema}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -86,7 +87,7 @@ class SourceBuild(TypedDict, total=False):
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
     scan_layers: bool
-    packed_experts: bool
+    packed_weights: bool
     step: int | str | None
     ema: bool | None
 

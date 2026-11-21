@@ -1,6 +1,7 @@
 """A quantized source's bindings at load time, beside its weights' decoding (`dew.interop.codecs`): the
-stored input scales its projections compute under (`input_quantization`), and the MXFP4 expert banks a
-load serves packed (`Pretrained.load`'s `packed_experts`: `packed_banks`, `with_banks`, `bank_axes`)."""
+stored input scales its projections compute under (`input_quantization`), and the 4-bit weights a load
+serves packed (`Pretrained.load`'s `packed_weights`: `packed_banks`, `with_banks`, `bank_axes`), an MXFP4
+source's expert banks and a ModelOpt source's W4A16_NVFP4 Linears."""
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ import dataclasses
 import logging
 from collections.abc import Mapping
 
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -86,9 +88,10 @@ def input_quantization(model: nn.Module, variables: Variables, layouts: tuple[We
 def bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables: Variables
                ) -> dict[tuple[str, ...], tuple[str | None, ...]]:
     """`table` (a model's drawn axes, `decoder_axes`) with each packed bank's leaves (`with_banks`) at its
-    dense matrix's axes as the bank lays them out (`quantization.expert_leaf_axes`), by their fields' paths
-    (`dew.nn.sharding.parameter_path`), as placement reads a leaf's."""
-    from dew.quantization import QUANTIZATION, expert_leaf_axes
+    dense matrix's axes as the bank lays them out (`quantization.expert_leaf_axes`, a Linear's kernel's
+    `quantization.dense_leaf_axes`), by their fields' paths (`dew.nn.sharding.parameter_path`), as
+    placement reads a leaf's."""
+    from dew.quantization import QUANTIZATION, dense_leaf_axes, expert_leaf_axes
 
     banks = {path: bank for path, bank in flatten_dict(
         dict(variables.get(QUANTIZATION, {})), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()
@@ -99,56 +102,91 @@ def bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables
         if dense is None:
             continue
         names = [member.name for member in dataclasses.fields(bank)]
-        for name, axes in zip(names, expert_leaf_axes(bank, dense), strict=True):
+        leaves = dense_leaf_axes(dense) if jnp.ndim(bank.scale) == 0 else expert_leaf_axes(bank, dense)
+        for name, axes in zip(names, leaves, strict=True):
             held[(QUANTIZATION, *path, name)] = axes
     return held
 
 
 def packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, object]
                   ) -> tuple[dict[str, unread.Stored], dict[str, NvFp4]]:
-    """`tensors` with each MXFP4 expert bank a load serves packed (`Pretrained.load`'s `packed_experts`)
-    taken out of the source's decoding, and those banks by their source names (`dew.nn.kernels.formats.NvFp4`,
-    built on the host, exactly the MXFP4 values: `codecs.mxfp4_as_nvfp4`). In each one's place an unread
-    leaf of its decoded shape and dtype, which the decoder's translation binds as it binds a load without
-    weights (`unread.Unread`), and `with_banks` replaces. A bank whose depth is no whole NVFP4 stages
-    (`formats.NVFP4_STAGE`), whose experts' group powers span past one tensor scale's reach
-    (`mxfp4_tensor_powers` None), or that holds no experts (a 2-D weight's blocks), is decoded as the source
-    states it, and named in the load's log, once a load; another source format is refused."""
+    """`tensors` with each 4-bit weight a load serves packed (`Pretrained.load`'s `packed_weights`) taken
+    out of the source's decoding, and those weights by their source names as NVFP4 banks
+    (`dew.nn.kernels.formats.NvFp4`, built on the host, exactly the values the source's codes state): an
+    MXFP4 source's expert banks (`codecs.mxfp4_as_nvfp4`), and a format's dense weights its codec reads as
+    NVFP4 (`SourceQuantization.as_nvfp4`: ModelOpt's W4A16_NVFP4 ones). In each one's place an unread leaf
+    of its decoded shape and dtype, which the decoder's translation binds as it binds a load without weights
+    (`unread.Unread`), and `with_banks` replaces. A weight whose depth is no whole NVFP4 stages
+    (`formats.NVFP4_STAGE`), an MXFP4 bank whose experts' group powers span past one tensor scale's reach
+    (`mxfp4_tensor_powers` None) or that holds no experts (a 2-D weight's blocks), and a weight its codec
+    reads as no NVFP4 (an FP8 one, or one whose product quantizes its input), is decoded as the source states
+    it, and named in the load's log, once a load; a source of no quantized weights is refused."""
     from dew.interop import codecs
-    from dew.nn.kernels.formats import NVFP4_STAGE
 
     quantization = source_quantization(config)
-    if quantization is None or quantization is not codecs.MXFP4:
-        raise ValueError("packed_experts serves an MXFP4 source's expert banks (gpt-oss's quant_method "
-                         f"mxfp4); this source's quantization is {config.get('quantization_config')!r}")
+    if quantization is None:
+        raise ValueError("packed_weights serves a quantized source's 4-bit weights as their codes; this "
+                         "source states no quantization")
     tensors, banks = dict(tensors), {}
     for name in quantization.names(tensors):
-        blocks, scales = (tensors[name + suffix] for suffix in codecs.MXFP4_SUFFIXES)
-        powers = None
-        if len(blocks.shape) != 4:
-            reason = "it holds no experts"
-        elif blocks.shape[2] * codecs.GROUP % NVFP4_STAGE:
-            reason = f"its depth {blocks.shape[2] * codecs.GROUP} is no whole {NVFP4_STAGE}-deep stages"
+        if quantization is codecs.MXFP4:
+            packed = _mxfp4_bank(tensors, name)
         else:
-            powers = codecs.mxfp4_tensor_powers(blocks, scales)
-            reason = "its experts' group powers span past one tensor scale's reach"
-        if powers is None:
-            _log.warning("packed_experts: %s stays dense: %s", name, reason)
+            parts = quantization.as_nvfp4(tensors, name)
+            packed = ("its codec reads it as no NVFP4" if parts is None else
+                      _staged(parts[0].shape[0]) or (NvFp4.of(*parts), tuple(reversed(parts[0].shape))))
+        if isinstance(packed, str):
+            _log.warning("packed_weights: %s stays dense: %s", name, packed)
             continue
-        experts, outputs, groups, _ = blocks.shape
-        banks[name] = NvFp4.of(*codecs.mxfp4_as_nvfp4(blocks, scales, powers))
-        for suffix in codecs.MXFP4_SUFFIXES:
-            del tensors[name + suffix]
-        tensors[name] = unread.Unread((experts, groups * codecs.GROUP, outputs), np.dtype(np.float32))
+        banks[name], shape = packed
+        for part in (name, *quantization.partners(name)):
+            tensors.pop(part, None)
+        tensors[name] = unread.Unread(shape, np.dtype(np.float32))
     return tensors, banks
+
+
+def _kernel_of(layout: WeightLayout, bank: NvFp4) -> bool:
+    """Whether `layout` binds a Linear's kernel `[in, out]` from the source's `[out, in]` weight `bank`
+    packs, transposed whole (a layer whose kernel holds more axes, a DenseGeneral's heads, reads no packed
+    matrix)."""
+    depth, width = 8 * np.shape(bank.words)[-1], np.shape(bank.words)[-2]
+    return (layout.transpose == (1, 0) and tuple(layout.shape) == (width, depth)
+            and layout.paths[0][-1] == "kernel")
+
+
+def _staged(depth: int) -> str | None:
+    """Why a matrix of `depth` inputs is no NVFP4 bank (`formats.NVFP4_STAGE`), or None."""
+    from dew.nn.kernels.formats import NVFP4_STAGE
+
+    return f"its depth {depth} is no whole {NVFP4_STAGE}-deep stages" if depth % NVFP4_STAGE else None
+
+
+def _mxfp4_bank(tensors: Mapping[str, unread.Stored], name: str) -> tuple[NvFp4, tuple[int, ...]] | str:
+    """An MXFP4 expert bank's NVFP4 bank and its decoded shape `[experts, in, out]`, or why it stays dense
+    (`packed_banks`)."""
+    from dew.interop import codecs
+
+    blocks, scales = (tensors[name + suffix] for suffix in codecs.MXFP4_SUFFIXES)
+    if len(blocks.shape) != 4:
+        return "it holds no experts"
+    experts, outputs, groups, _ = blocks.shape
+    if (reason := _staged(groups * codecs.GROUP)) is not None:
+        return reason
+    powers = codecs.mxfp4_tensor_powers(blocks, scales)
+    if powers is None:
+        return "its experts' group powers span past one tensor scale's reach"
+    return NvFp4.of(*codecs.mxfp4_as_nvfp4(blocks, scales, powers)), (experts, groups * codecs.GROUP, outputs)
 
 
 def with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: Mapping[str, NvFp4]
                 ) -> Variables:
     """`variables` with each packed bank (`packed_banks`) in `QUANTIZATION` under the path its source name's
-    layout binds, the unread leaf there taken out of `params`: a bank its layout reads as it stands, one
-    path, untransposed, uncut, whole (gpt-oss's experts), the expert layers read it so
-    (`dew.quantization.expert_matrix`); any other binding is refused."""
+    layout binds, the unread leaf there taken out of `params`: one path, uncut, whole, and a bank its
+    layout reads as it stands (gpt-oss's experts, `[experts, in, out]`, which the expert layers read so,
+    `dew.quantization.expert_matrix`) or a Linear's kernel its layout transposes from the source's
+    `[out, in]` (a ModelOpt weight's, packed `[in, out]` already, which the layer reads so,
+    `dew.quantization.dense_matrix`); any other binding is refused, naming the weight, which a load
+    without `packed_weights` decodes."""
     if not banks:
         return variables
     from dew.quantization import QUANTIZATION
@@ -158,10 +196,14 @@ def with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: M
     bound = {layout.name: layout for layout in layouts}
     for name, bank in banks.items():
         layout = bound.get(name)
+        dense = jnp.ndim(bank.scale) == 0
         if layout is None or len(layout.paths) != 1 or layout.paths[0][0] != "params" or (
-                layout.transpose or layout.concatenate is not None or layout.expert_index is not None):
+                layout.concatenate is not None or layout.expert_index is not None or layout.padded
+                or layout.chunks) or (
+                not _kernel_of(layout, bank) if dense else layout.transpose is not None):
             raise ValueError(f"{name} binds {None if layout is None else layout.paths}, which a packed bank "
-                             "does not take: it holds a whole [experts, in, out] matrix at one path")
+                             "does not take: it holds a whole [experts, in, out] matrix, or a Linear's "
+                             "kernel [in, out], at one path; load it without packed_weights")
         path = layout.paths[0][1:]
         del params[path]
         held[path] = bank

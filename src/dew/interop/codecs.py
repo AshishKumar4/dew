@@ -344,6 +344,12 @@ class SourceQuantization:
     decode_kept: Callable[[Mapping[str, Stored], str, str], Stored] | None = None
     """A weight decoded straight into the dtype `param_dtype` keeps it in, for a format that decodes
     faster so than in float32 and rounds alike; None decodes in float32 and casts."""
+    as_nvfp4: Callable[[Mapping[str, Stored], str], tuple[np.ndarray, np.ndarray, np.ndarray] | None] = (
+        lambda tensors, name: None)
+    """A dense weight's NVFP4 parts as `dew.nn.kernels.formats.NvFp4.of` packs them (its codes `[in, out]`,
+    its block scales `[in / 16, out]` and its tensor scale), read from its stored ones with no value
+    decoded, which a load serves packed (`Pretrained.load`'s `packed_weights`); None for a weight the
+    format stores otherwise or a load decodes (`dew.interop.quantized_loads.packed_banks`)."""
 
     def tensor_names(self, tensors: Mapping[str, Stored]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
@@ -1709,6 +1715,27 @@ def _modelopt_decode(tensors: Mapping[str, Stored], name: str, *, method: str = 
         np.float32)
 
 
+def _modelopt_as_nvfp4(tensors: Mapping[str, Stored], name: str, *, method: str = 'NVFP4',
+                       layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS
+                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """A ModelOpt W4A16_NVFP4 weight's NVFP4 parts (`SourceQuantization.as_nvfp4`), exactly the values its
+    codes, E4M3 block scales and float32 global scale state (code 8 read as +0, as the author's reader reads
+    it): its U8 pairs `[out, in / 2]` as E2M1 nibbles `[in, out]`, its scales `[out, in / 16]` as
+    `[in / 16, out]`, its global scale the tensor's. None for an FP8 or NVFP4 weight, whose stored input
+    scale its product quantizes its input under (`dew.interop.quantized_loads.input_quantization`), and for
+    an expert stack's."""
+    if _modelopt_algo(name, method, layers) != 'W4A16_NVFP4':
+        return None
+    parts = _modelopt_layer_parts(name, 'W4A16_NVFP4')
+    packed, scale, overall = (np.asarray(unread.held(tensors[part])) for part in (name, *parts))
+    if packed.ndim != 2 or overall.size != 1:
+        return None
+    nibbles = np.stack([packed & 15, packed >> 4], axis=-1).reshape(packed.shape[0], -1)
+    nibbles = np.where(nibbles == 8, np.uint8(0), nibbles).astype(np.uint8)
+    return (np.ascontiguousarray(nibbles.T), np.ascontiguousarray(scale.astype(ml_dtypes.float8_e4m3fn).T),
+            overall.reshape(()).astype(np.float32))
+
+
 def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored] | None,
                      method: str = 'NVFP4', layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS
                      ) -> dict[str, np.ndarray]:
@@ -1781,7 +1808,8 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
         partial(_modelopt_encode, grid=grid, method=str(method), layers=layers),
         grid=lambda name: (*_modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)), name),
         input_scale_dtype='float8_e4m3fn', input_format='modelopt', input_suffix='.input_scale',
-        input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers))
+        input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers),
+        as_nvfp4=partial(_modelopt_as_nvfp4, method=str(method), layers=layers))
 
 
 # --------------------------------------------------------------------------

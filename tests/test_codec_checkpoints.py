@@ -108,3 +108,113 @@ def test_a_quantized_checkpoint_saves_its_own_bytes(name, tmp_path):
     for saved in (own, masters):
         reloaded = Pretrained.load(saved, dtype="float32", attention_impl="reference")
         np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids), actual)
+
+
+E2M1_VALUES = np.asarray([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
+"""Each E2M1 code's value, its sign bit 3, code 8 read as +0 (ModelOpt's reader's)."""
+
+PACKED_MLP = ("gate_proj", "up_proj", "down_proj")
+"""The Linears `_w4a16_qwen3` stores as ModelOpt W4A16_NVFP4."""
+
+
+def _w4a16_qwen3(directory: Path) -> Path:
+    """A one-layer Qwen3 whose MLP's Linears ModelOpt stores as W4A16_NVFP4 (`quant_algo`, the layers whose
+    scales are stored): U8 pairs of drawn codes, drawn E4M3 block scales and a float32 global scale, each
+    depth one NVFP4 stage (256, `formats.NVFP4_STAGE`); its attention, norms and tied embedding bf16."""
+    import ml_dtypes
+    from safetensors.numpy import save_file
+
+    width, inner, heads, kv, head = 256, 256, 4, 2, 64
+    rng = np.random.default_rng(0x8550)
+    bf16 = ml_dtypes.bfloat16
+
+    def dense(*shape):
+        return (rng.standard_normal(shape) * 0.05).astype(bf16)
+
+    layer = "model.layers.0."
+    tensors = {"model.embed_tokens.weight": dense(96, width), "model.norm.weight": np.ones(width, bf16),
+               layer + "input_layernorm.weight": np.ones(width, bf16),
+               layer + "post_attention_layernorm.weight": np.ones(width, bf16),
+               layer + "self_attn.q_norm.weight": np.ones(head, bf16),
+               layer + "self_attn.k_norm.weight": np.ones(head, bf16),
+               layer + "self_attn.q_proj.weight": dense(heads * head, width),
+               layer + "self_attn.k_proj.weight": dense(kv * head, width),
+               layer + "self_attn.v_proj.weight": dense(kv * head, width),
+               layer + "self_attn.o_proj.weight": dense(width, heads * head)}
+    shapes = ((inner, width), (inner, width), (width, inner))
+    for name, (outputs, inputs) in zip(PACKED_MLP, shapes, strict=True):
+        stem = f"{layer}mlp.{name}.weight"
+        tensors[stem] = rng.integers(0, 256, (outputs, inputs // 2)).astype(np.uint8)
+        scales = rng.uniform(0.25, 4, (outputs, inputs // 16))
+        tensors[stem + "_scale"] = scales.astype(ml_dtypes.float8_e4m3fn)
+        tensors[stem + "_scale_2"] = np.asarray(rng.uniform(0.002, 0.02), np.float32)
+    config = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": width,
+              "intermediate_size": inner, "num_hidden_layers": 1, "num_attention_heads": heads,
+              "num_key_value_heads": kv, "head_dim": head, "hidden_act": "silu", "vocab_size": 96,
+              "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "tie_word_embeddings": True,
+              "attention_bias": False, "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+              "layer_types": ["full_attention"], "dtype": "bfloat16",
+              "quantization_config": {"quant_method": "modelopt", "quant_algo": "W4A16_NVFP4",
+                                      "producer": {"name": "modelopt", "version": "0.47.0"}}}
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_text(json.dumps(config))
+    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    return directory
+
+
+def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_decoded(tmp_path):
+    """A ModelOpt source's W4A16_NVFP4 Linears loaded packed (`Pretrained.load`'s `packed_weights`, row
+    8550): each kernel an NVFP4 matrix in the `QUANTIZATION` collection, no parameter beside it, holding
+    exactly the values its codes, block scales and global scale state (decoded, bitwise, against the
+    stored tensors read here); the packed model's logits on par with the same model over those values
+    decoded (check 1 in bf16, the truth the decoded model in float64); and its export the source's own
+    bytes."""
+    from flax.traverse_util import flatten_dict
+    from reference_error import assert_as_exact
+    from safetensors.numpy import load_file
+
+    from dew.nn.kernels.formats import NvFp4
+    from dew.quantization import QUANTIZATION, decoded_banks
+
+    source = _w4a16_qwen3(tmp_path / "source")
+    packed = Pretrained.load(source, dtype="bfloat16", attention_impl="reference", packed_weights=True)
+    banks = {path: bank for path, bank in flatten_dict(
+        dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()
+        if isinstance(bank, NvFp4)}
+    assert sorted(path[-2] for path in banks) == sorted(PACKED_MLP)
+    assert all(path[-1] == "kernel" for path in banks)
+    params = flatten_dict(dict(packed.variables["params"]))
+    assert not set(banks) & set(params)
+    stored = load_file(str(source / "model.safetensors"))
+    dense = decoded_banks(packed.variables)
+    held = flatten_dict(dict(dense["params"]))
+    for path in banks:
+        stem = f"model.layers.0.mlp.{path[-2]}.weight"
+        codes = stored[stem]
+        values = E2M1_VALUES[np.stack([codes & 15, codes >> 4], axis=-1).reshape(codes.shape[0], -1)]
+        scales = np.repeat(stored[stem + "_scale"].astype(np.float32), 16, axis=-1)
+        expected = (values * scales * stored[stem + "_scale_2"]).T
+        np.testing.assert_array_equal(np.asarray(held[path], np.float32).view(np.uint32),
+                                      expected.view(np.uint32), err_msg=stem)
+
+    def draw(seed: int):
+        return (jax.random.randint(jax.random.key(seed), (2, 8), 0, 96),)
+
+    wide = ModelConfig.from_model(packed.model).with_dtype("float64").build()
+
+    def truth(tokens):
+        with jax.enable_x64(new_val=True):
+            variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(
+                jnp.asarray(leaf).dtype, jnp.floating) else leaf, dense)
+            return np.asarray(wide.apply(variables, jnp.asarray(tokens)))
+
+    assert_as_exact(jax.jit(lambda tokens: packed.model.apply(packed.variables, tokens)),
+                    jax.jit(lambda tokens: packed.model.apply(dense, tokens)), draw,
+                    "a ModelOpt W4A16 model served packed", seeds=8, truth_fn=truth)
+    exported = packed.export()
+    for name in PACKED_MLP:
+        stem = f"model.layers.0.mlp.{name}.weight"
+        for part in (stem, stem + "_scale", stem + "_scale_2"):
+            np.testing.assert_array_equal(np.asarray(exported[part]).view(np.uint8),
+                                          np.asarray(stored[part]).view(np.uint8), err_msg=part)
+

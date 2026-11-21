@@ -722,8 +722,8 @@ class RunConfig:
     compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
     (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`), as it does
     with a looped block's passes recomputed in its backward or held (`loop_remat`), memory alone. A source's
-    experts packed or decoded (`SourceOptions.packed_experts`) are not: packed, the experts' banks are no
-    trainable parameters and hold no optimizer moments, so a resume across them is refused by name."""
+    weights packed or decoded (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable
+    parameters and hold no optimizer moments, so a resume across them is refused by name."""
 
     BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,

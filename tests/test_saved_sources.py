@@ -484,7 +484,7 @@ def test_a_run_resumes_under_another_kernel_choice_and_refuses_its_experts_packe
                        trainer={"name": "run", "steps": 2, "checkpoint_final": True})
     assert int(again.step) == 2
     record = (tmp_path / "runs" / "run" / "run.json").read_text()
-    packed = dataclasses.replace(first, source=dataclasses.replace(first.source, packed_experts=True))
+    packed = dataclasses.replace(first, source=dataclasses.replace(first.source, packed_weights=True))
     with pytest.raises(ValueError):
         trained(packed, tmp_path, "run", trainer={"name": "run", "steps": 3, "checkpoint_final": True})
     assert (tmp_path / "runs" / "run" / "run.json").read_text() == record

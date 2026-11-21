@@ -574,12 +574,30 @@ def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> l
     return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,), (None,)]
 
 
-def decoded_expert_banks(variables: Variables) -> Variables:
-    """`variables` with each packed expert bank (`expert_matrix`) decoded into `params` under its name,
-    `[..., experts, in, out]` float32 (a scanned run's banks stacked on its layer axis before their
-    experts), each value its code times its block's scale times its expert's, exactly (`NvFp4.decoded`
-    times its factor), and the bank gone from `QUANTIZATION`: the float tree an export or a merge takes,
-    as `decoded_frozen_fp8` decodes a frozen FP8 site."""
+def dense_matrix(module: nn.Module) -> NvFp4 | None:
+    """A dense layer's packed kernel (`[in, out]`, `dew.nn.kernels.formats.NvFp4`: a checkpoint's 4-bit
+    weight served as its codes, row 8550) its `QUANTIZATION` collection holds under `kernel`, else None,
+    the layer's own parameter its kernel."""
+    if not module.has_variable(QUANTIZATION, "kernel"):
+        return None
+    return module.get_variable(QUANTIZATION, "kernel")
+
+
+def dense_leaf_axes(axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
+    """The logical axes of each leaf of a dense layer's packed kernel (`dense_matrix`), its own kernel's
+    being `axes` (a Linear's `[in, out]`): its words' and block scales' `[out, in / 8 or in / 16]`, its
+    tensor scale a scalar and its form's version bytes whole on every device, in its leaves' order."""
+    inputs, outputs = axes
+    return [(outputs, inputs), (outputs, inputs), (), (None,)]
+
+
+def decoded_banks(variables: Variables) -> Variables:
+    """`variables` with each packed bank decoded into `params` under its name: an expert bank's
+    (`expert_matrix`) `[..., experts, in, out]` float32 (a scanned run's banks stacked on its layer axis
+    before their experts), a Linear's kernel (`dense_matrix`) `[..., in, out]`, each value its code times its
+    block's scale times its matrix's, exactly (`NvFp4.decoded` times its factor), and the bank gone from
+    `QUANTIZATION`: the float tree an export or a merge takes, as `decoded_frozen_fp8` decodes a frozen FP8
+    site."""
     from dew.nn.kernels.formats import NvFp4
 
     held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
