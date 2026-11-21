@@ -109,6 +109,15 @@ def prefix(g):
                                  padding)
 
 
+def prefix_terms(g) -> tuple:
+    """Each token's term of `prefix`'s pair, `g log2(e)` as a Dekker product and its residual plus `g` times
+    the constant's own rounding, an fp32 pair `(hi, lo)` `g`'s shape: the factor split where it is known
+    (`two_product` of a constant), `g` by its bits in the launch."""
+    scale = np.float32(LOG2_E)
+    scaled, error = two_product(g, scale, bit_split=True)
+    return scaled, error + g * float(np.float32(LOG2_E - float(scale)))
+
+
 def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk: int) -> tuple:
     """`prefix`'s pair of a chunk's decay tile `g` `[C, BK]` (natural log) within a launch, its compensated
     sums taken by doubling (Hillis-Steele's scan: `log2(C)` steps, each row's running pair added to the one
@@ -122,10 +131,7 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
     product into the sum (`fma(g, log2(e), shifted)`), its rounding counted twice beside the Dekker residual
     that keeps it: the native prefix lay 1.9e-6 from exact where the interpreted one lay 1e-12 (M-MC-9), a
     key's gated write one bf16 step from the witness's at a tie (M-MC-8)."""
-    # The factor split where it is known (`two_product` of a constant), `g` by its bits in the launch.
-    scale = np.float32(LOG2_E)
-    scaled, error = two_product(g, scale, bit_split=True)
-    pair = scaled, error + g * float(np.float32(LOG2_E - float(scale)))
+    pair = prefix_terms(g)
     shift = 1
     while shift < chunk:
         staged = stage(pair)
