@@ -107,26 +107,30 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
                 else arg for arg, sharding in zip(args, placed, strict=True)]
         none: list[int] = []
         held: list[int] = []
+        unheld: dict[int, ocp.ArrayRestoreArgs] = {}
         for index, arg in enumerate(args):
-            sharding = getattr(arg, "sharding", None)
-            (none if isinstance(sharding, jax.sharding.Sharding) and not sharding.addressable_devices
-             else held).append(index)
+            if (isinstance(arg, ocp.ArrayRestoreArgs) and isinstance(arg.sharding, jax.sharding.Sharding)
+                    and not arg.sharding.addressable_devices):
+                none.append(index)
+                unheld[index] = arg
+            else:
+                held.append(index)
         read = [] if not held else list(await super().deserialize([infos[index] for index in held],
                                                                    [args[index] for index in held]))
         # Its shape and dtype as the restore states them, else as the step's files do (a local tier's
         # process wrote none of an array it held none of).
-        unstated = [index for index in none if args[index].global_shape is None or args[index].dtype is None]
+        unstated = [index for index, arg in unheld.items() if arg.global_shape is None or arg.dtype is None]
         stated = dict(zip(unstated, await self.metadata([infos[index] for index in unstated]) if unstated
                           else [], strict=True))
 
         def known(index: int, field: str):
-            given = getattr(args[index], "global_shape" if field == "shape" else field)
+            given = getattr(unheld[index], "global_shape" if field == "shape" else field)
             return getattr(stated[index], field) if given is None else given
 
         made = [jax.make_array_from_single_device_arrays(
-            tuple(known(index, "shape")), args[index].sharding, [], dtype=known(index, "dtype"))
+            tuple(known(index, "shape")), unheld[index].sharding, [], dtype=known(index, "dtype"))
             for index in none]
-        results: list = [None] * len(infos)
+        restored: list = [None] * len(infos)
         for index, value in [*zip(held, read, strict=True), *zip(none, made, strict=True)]:
-            results[index] = value
-        return results
+            restored[index] = value
+        return restored

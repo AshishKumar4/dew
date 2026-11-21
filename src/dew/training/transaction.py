@@ -703,7 +703,7 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
         else:
             held = [leaves[index] for index in members]
             read.append([True] * len(members) if _held_flag(program(all_finite)(held)) else
-                        [_held_flag(flag) for flag in program(_finite_each)(held)])
+                        [_held_flag(finite) for finite in program(_finite_each)(held)])
     # The round decided alike on every process, by which processes each placement spans.
     if any({device.process_index for device in devices} != set(range(jax.process_count()))
            for devices, _ in groups):
@@ -718,9 +718,9 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
     return flags
 
 
-def _held_flag(flag: jax.Array) -> bool:
-    """A flag replicated over its placement's devices, read from one this process holds."""
-    return bool(np.asarray(flag.addressable_data(0)))
+def _held_flag(finite: jax.Array) -> bool:
+    """A verdict replicated over its placement's devices, read from one this process holds."""
+    return bool(np.asarray(finite.addressable_data(0)))
 
 
 def compact_qk(tree, calls: bool = False):

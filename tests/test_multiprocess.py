@@ -777,7 +777,7 @@ def test_a_pipeline_whose_stages_are_each_one_processs_checkpoints_and_resumes(t
     from dew.training import MeshSpec
 
     pool = run_pool("stage_save", tmp_path / "pool", 2, devices=2, run_dir=tmp_path / "run",
-                    local_dir=tmp_path / "local")
+                    local_dir=tmp_path / "local", script=Path(__file__).with_name("stage_save_worker.py"))
     assert [report["finite"] for report in pool] == [[True, False]] * 2, pool
     # The stepped step and the persistent tier's latest after each run: the first ran on the local tier
     # alone, the second resumed from it, the third from the persistent tier's step 2.
