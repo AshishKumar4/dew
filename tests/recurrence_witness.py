@@ -781,7 +781,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide),
-               pairing=intra.pairing_parts(family, held),
+               pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained),
                pairs_tf32=tf32_conversion(intra.pairs_family(generation.gpu_target().generation, dtype)

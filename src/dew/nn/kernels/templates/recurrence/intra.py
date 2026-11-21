@@ -473,18 +473,19 @@ def intra_rows(call: Call, name: str, operand: Callable[[str], jax.Array], beta)
     return algebra.write_gated(operand("keys"), call.family.rows_of(beta))
 
 
-def pairing_parts(family: mosaic.Family, held: int) -> int:
+def pairing_parts(held: int) -> int:
     """The parts the factored pairs' fp32 operands take to their products (`algebra.key_block_pairs`) in a
-    call holding its values in `held` parts: in a 16-bit call, fp32 itself where the family's products take
-    it as TF32 (`Family.takes_tf32`), one product a pair as fla's sub-chunk products take, else two bf16
-    parts (16 of their bits, past TF32's); an fp32 call's three bf16 parts."""
-    if held > 1:
-        return product.EXACT_PARTS
-    return 1 if family.takes_tf32 else 2
+    call holding its values in `held` parts: in a 16-bit call two bf16 parts, 16 of their bits, in the bytes
+    one fp32 value stages in; an fp32 call's three. One TF32 part a pair, as fla's sub-chunk products take
+    it, put Kimi delta attention's outputs under tiny gates at the floor at 8.3 times fla's distance from
+    float64 at a sub-chunk's first tokens, where pairs across its edge cancel (M-JS-162 on a GH200's
+    mma.sync, digit for digit an A100's at main, row 10382; the TF32 rounding interpreted gave the same
+    digits, two parts 0.1 times fla's, p-kdavar)."""
+    return product.EXACT_PARTS if held > 1 else 2
 
 
 def _pairing_operand(call: Call) -> Operand:
     """The form the factored pairs' fp32 operands take (`pairing_parts`)."""
-    return Operand(call.rows, pairing_parts(call.family, call.held.parts), jnp.dtype(jnp.float32))
+    return Operand(call.rows, pairing_parts(call.held.parts), jnp.dtype(jnp.float32))
 
 
