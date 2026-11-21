@@ -1894,7 +1894,31 @@ def test_a_batched_map_that_keeps_its_rows_makes_each_group_once_however_its_row
     assert ordered == [(index, index // 4 * 4) for index in range(24)]
     assert sorted(GROUPS_MADE) == list(range(0, 24, 4)), GROUPS_MADE
     shuffled = read(grouped.shuffle(seed=1, window=8).batch(2))
-    assert sorted(shuffled) == ordered and sorted(set(GROUPS_MADE)) == list(range(0, 24, 4))
-    assert len(GROUPS_MADE) < 24, GROUPS_MADE
+    assert sorted(shuffled) == ordered and sorted(GROUPS_MADE) == list(range(0, 24, 4)), GROUPS_MADE
     with pytest.raises(ValueError):
-        compile(grouped.shuffle(seed=1).batch(2), read="indexed", loading=READ)
+        read(grouped.shuffle(seed=1).batch(2))
+
+
+@pytest.mark.parametrize(("read", "window"), [("indexed", 8), ("memory", 8), ("memory", None)])
+def test_a_batched_map_that_keeps_its_rows_groups_alike_at_any_share_count_under_a_shuffle(read, window):
+    """A batched map that keeps its rows, a shuffle after it (in a window, or global over a memory read),
+    makes the same rows read by one share or by two: each share's rows are a part of the one read's, every
+    row its own group's (row 9784: the shuffle made the read per share, each share grouping its own strided
+    records, and a global one was refused)."""
+    chain = Memory(rows("a", 24)).map(group_firsts, batched=True, batch_size=4).shuffle(seed=1, window=window)
+
+    def read_by(partition: DataPartition) -> list[tuple[int, int]]:
+        data = compile(chain.batch(2), read=read, loading=READ)
+        reader = data.train(partition)
+        try:
+            batches = [next(reader) for _ in range(24 // 2)]
+        finally:
+            reader.close()
+        return [(int(i), int(group)) for batch in batches
+                for i, group in zip(np.asarray(batch["i"]).ravel(), np.asarray(batch["group"]).ravel(),
+                                    strict=True)]
+
+    whole = read_by(DataPartition())
+    assert sorted(whole) == [(index, index // 4 * 4) for index in range(24)], whole
+    shares = read_by(DataPartition(0, 2)) + read_by(DataPartition(1, 2))
+    assert sorted(shares) == sorted(whole), shares

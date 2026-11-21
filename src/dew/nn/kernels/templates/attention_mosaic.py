@@ -64,6 +64,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _trained_forward,
     certified_walk,
     column_slices,
+    folded_form,
     forward_block_plan,
     forward_products,
     logits_ahead,
@@ -100,6 +101,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     query_rows,
     reducing,
     refused,
+    scaled_drop,
     score_places,
     split_queries,
     stagings,
@@ -278,8 +280,6 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     (`attention_decode`), whose walk the memory bounds."""
     per_span: int = 1
     """The queries each of the spans' intervals holds (`KeySpans.per_span`)."""
-    whole: bool = False
-    """Whether the spans' every query sees every key (`KeySpans.whole`), which its launches' costs state."""
 
     @property
     def score_types(self) -> tuple:
@@ -288,7 +288,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
         """The call's spans from its arrays and the op's static form, key count and queries an interval."""
-        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span, whole=self.whole)
+        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span)
 
     UNBUNDLED: ClassVar[str] = "the Mosaic mainloop has no bundle for {name} yet"
     """Why a launch runs on no device of a family it has no bundle of (`declined`)."""
@@ -647,8 +647,10 @@ class MosaicForward(_Mainloop[Tiles]):
         # A family that places its products on a role issues its logits ahead (`_ahead`: tcgen05's rows,
         # whose issuer warp is a step ahead of its consumer), which past its tensor memory it does not: its
         # products' scratch then none it takes (`Issuer.product_scratch`).
-        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and not self._ahead(ba, config,
-                                                                                              target):
+        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and (
+                not self._ahead(ba, config, target)
+                or scaled_drop(ba.arguments["query"].dtype, ba.arguments.get("drop"),
+                               ba.arguments.get("initial"))):
             return False
         if not super().legal(ba, config, target):
             return False
@@ -921,12 +923,10 @@ class MosaicForward(_Mainloop[Tiles]):
         query = ba.arguments["query"]
         if self._natural(query):
             return True
-        power, scale = prescale(query.dtype, query.shape[3], self.scale)
-        taken = power if self.form != "spans" else 1.0
         subtracted = self.subtracted and ba.arguments.get("residuals") is not Kept.SPLIT
-        return not algebra.Forward(self.form, self.keys, ids=False, scale=scale * taken,
-                                   score_mod=self.score_mod, natural=self.natural, prescale=power / taken,
-                                   subtracted=subtracted).reaches
+        return not folded_form(self.form, self.keys, ids=False, dtype=query.dtype, width=query.shape[3],
+                               scale=self.scale, natural=self.natural, score_mod=self.score_mod,
+                               subtracted=subtracted)[0].reaches
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
                      decides: bool | None = None) -> int:
@@ -1082,6 +1082,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 started=initial is not None and residuals is Kept.SPLIT,
                                 dropped=drop is not None,
                                 weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
+                                scaled_products=scaled_drop(computed, drop, initial),
                                 prologue=(None if self.query_mod is None
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)))
 
@@ -1359,7 +1360,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
-                       splits=splits, subtracted=subtracted, per_span=spans.per_span, whole=spans.whole,
+                       splits=splits, subtracted=subtracted, per_span=spans.per_span,
                        parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded, in_key=in_key,
                        query_mod=hooks.query_mod,
                        query_kinds=tuple(param.kind for param in hooks.query_params),
