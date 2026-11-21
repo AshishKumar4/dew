@@ -104,6 +104,7 @@ __all__ = [
     "Exposing",
     "Generating",
     "HiddenStates",
+    "HookedDecoder",
     "IntervalModel",
     "Lacks",
     "LayerScalars",
@@ -1082,12 +1083,6 @@ class BlockReading(Protocol):
     def block_chunks(self) -> tuple[int | None, ...]: ...
 
 
-def block_chunks_of(model: object) -> tuple[int | None, ...]:
-    """The attention chunk of each trunk layer that reads blocks whole, None where a layer has none; empty for
-    a model that says nothing, or whose layers read none (`BlockReading`)."""
-    return model.block_chunks() if isinstance(model, BlockReading) else ()
-
-
 def whole_block(chunks: tuple[int | None, ...]) -> bool:
     """Whether a layer that reads blocks reads every block whole: one with no attention chunk. A chunk is
     a run of places counted from 0 (`chunk_mask`), and a block's places start wherever its tokens sit in
@@ -1189,6 +1184,18 @@ class Layered(Protocol):
     def kv_cache(self) -> KVCache: ...
 
     def with_kv_cache(self, layout: KVCache) -> Self: ...
+
+
+class HookedDecoder(Bounded, CacheCapacity, Layered, Protocol):
+    """A decoder a module around it forwards its hooks to (`dew.nn.wrapping.DecoderHooks`): its vocabulary
+    and bounds, its cache's layout and the same decoder at another layout or capacity. The rest the module
+    reads through the protocol the decoder states, where it states one."""
+
+
+def block_chunks_of(model: nn.Module | HookedDecoder) -> tuple[int | None, ...]:
+    """The attention chunk of each trunk layer that reads blocks whole, None where a layer has none; empty for
+    a model that says nothing, or whose layers read none (`BlockReading`)."""
+    return model.block_chunks() if isinstance(model, BlockReading) else ()
 
 
 @runtime_checkable

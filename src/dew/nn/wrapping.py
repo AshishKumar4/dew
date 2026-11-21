@@ -6,7 +6,7 @@ backbone with a head over its final states, two modules over one variables tree 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Self
 
 import jax
 import jax.numpy as jnp
@@ -18,12 +18,10 @@ from dew.batch import Variables, part, thaw
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.progress import ReadsProgress
 from dew.nn.protocols import (
-    Bounded,
-    CacheCapacity,
     ComputesIn,
     CrossAttending,
     Generating,
-    Layered,
+    HookedDecoder,
     OutputTable,
     ReplacesTokens,
     VocabularyRows,
@@ -37,7 +35,6 @@ __all__ = [
     "DecoderHooks",
     "DecoderWrapper",
     "HeadedModel",
-    "HookedDecoder",
 ]
 
 if TYPE_CHECKING:
@@ -45,12 +42,6 @@ if TYPE_CHECKING:
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.kv_cache import KVCache
-
-
-class HookedDecoder(Bounded, CacheCapacity, Layered, Protocol):
-    """What `DecoderHooks` forwards to a wrapped decoder: its vocabulary and bounds, its cache's layout and
-    the same decoder at another layout or capacity. The rest it reads through the protocol the decoder
-    states, where it states one."""
 
 
 class DecoderHooks(nn.Module):
