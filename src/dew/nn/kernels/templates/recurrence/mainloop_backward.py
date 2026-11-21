@@ -1140,10 +1140,13 @@ def _scores_back_held(call: Call, grads: Operand) -> Held:
     (`algebra.scores_gradient`; an accumulator a block, four, and an H100's need was 232 in a bf16 call, 192
     in one, back-need-one-32 at 9482e4d26). Where the scores' gradient leaves in parts (an fp32 call's), the
     remainder each part after the first is formed from (`product.formed`): without it the model stated 232
-    registers where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22)."""
+    registers where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22). Stored fp32 (a key
+    head's group's terms, `_head_grads`), the fp32 tile is stored as it is, no narrow copy (sm120's 208
+    registers to ptxas at Kimi's log-linear level, jsf-llc120d)."""
     chunk, given, held = call.chunk, call.given, dataclasses.replace(call.held, rows=call.rows)
+    narrow = [] if grads.stored == jnp.float32 else held_tile(grads, chunk, chunk)
     phases = ([f32(chunk, chunk)] * (3 + (grads.parts > 1))
-              + held_tile(grads, chunk, chunk)
+              + narrow
               + masks(chunk, chunk)
               # In turn: the queries against the keys read transposed ('local_t'); the output's gradient
               # against the corrected values read transposed ('values_ds'); the pairs' sum's three fp32
