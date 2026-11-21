@@ -2123,30 +2123,25 @@ def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool, rows: bool = F
     yield product.Scaled(low, low_exponent + high_exponent)
 
 
-@functools.cache
-def _bf16_parts_for(target_key: str | None, accurate: bool) -> int:
-    del target_key
-    from dew.algebra.error import product_precision
-    from dew.nn import programs
-
-    need = 6 if accurate else 1
-    chosen = product_precision(
-        64, 64, 64, jnp.float32,
-        admits=lambda p: (a := programs.dot_arithmetic(p, jnp.float32, jnp.float32)) is not None and (
-            a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
-            and not a.imprecise and a.operations >= need))
-    arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
-    assert arith is not None, chosen
-    return max(1, (math.isqrt(1 + 8 * arith.operations) - 1) // 2)
-
+_BF16_PARTS: dict[tuple[str | None, bool], int] = {}
 
 def bf16_part_count(*, accurate: bool) -> int:
     """bf16 parts for fp32 attention products from `dew.algebra.error.product_precision` (row 5473)."""
+    from dew.algebra.error import product_precision
+    from dew.nn import programs
     from dew.nn.kernels import generation
 
     target = generation.gpu_target()
-    return _bf16_parts_for(target.generation if target is not None else generation.placed_platform(),
-                           accurate)
+    key = (target.generation if target is not None else generation.placed_platform(), accurate)
+    if key not in _BF16_PARTS:
+        chosen = product_precision(
+            64, 64, 64, jnp.float32,
+            admits=lambda p: (a := programs.dot_arithmetic(p, jnp.float32, jnp.float32)) is not None
+            and a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
+            and not a.imprecise and a.operations >= (6 if accurate else 1))
+        arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
+        _BF16_PARTS[key] = max(1, (math.isqrt(1 + 8 * arith.operations) - 1) // 2) if arith else 1
+    return _BF16_PARTS[key]
 
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
