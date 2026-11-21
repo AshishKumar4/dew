@@ -910,11 +910,13 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
 
 
 @COMPILES_ON_CPU
-def test_a_launchs_stored_verdict_is_not_read_where_another_ptxas_assembles_it(tmp_path):
-    """A launch certified by one process is certified again by the next where the ptxas that assembles its
-    kernels moved (another CUDA nvcc wheel installed), its kernels' IR the same: the verdict a ptxas judged
-    (its spills, its serialized products) is that assembler's, so neither the launch's own key nor its lowered
-    kernels' key reads it back (row 10782: the lowered key named no assembler)."""
+def test_a_launchs_stored_verdict_is_not_read_where_another_nvcc_wheel_is_installed(tmp_path):
+    """A launch certified by one process is certified again by the next where the installed CUDA nvcc wheels
+    differ (another wheel's metadata on its path, its kernels' IR the same): the wheels name the ptxas that
+    judges a kernel's spills and serialized products (`report._assemblers`), so neither the launch's own key
+    nor its lowered kernels' key reads a verdict judged under other wheels back (row 10782: the lowered key
+    named none). The child changes wheel metadata alone, not the ptxas binary or the provider XLA selects;
+    that a fingerprint of wheels is no whole compiler identity is row 7309's."""
     from process_support import REPO_ROOT, fresh, keeping_picks
 
     moved = tmp_path / "site"
