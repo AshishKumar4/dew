@@ -38,9 +38,12 @@ from .precision import at_least_fp32, float32_einsum
 
 @dataclasses.dataclass(frozen=True)
 class AttentionResiduals:
-    """The block size the depth softmax groups layers by, `attn_res_block_size`."""
+    """The block size the depth softmax groups layers by, `attn_res_block_size`, and whether each depth
+    mixture sums its sources as its keys read them, each at unit RMS (`normalize_values`, Inkling 2
+    Mini's `attn_res_normalize_values`; Kimi K3's mix them as they are)."""
 
     block_size: int
+    normalize_values: bool = False
 
     def blocks(self, num_layers: int) -> int:
         """The finished blocks after `num_layers` layers: every layer opening one counts."""
@@ -48,7 +51,14 @@ class AttentionResiduals:
 
     def site(self, index: int) -> ResidualSite:
         """Layer `index`'s place in the blocks."""
-        return ResidualSite(finished=-(-index // self.block_size), opens=index % self.block_size == 0)
+        return ResidualSite(finished=-(-index // self.block_size), opens=index % self.block_size == 0,
+                            normalize_values=self.normalize_values)
+
+
+NORMALIZED_UNWRITTEN = ("the source's format mixes its attention residuals' values as they are, and this "
+                        "decoder normalizes them (AttentionResiduals.normalize_values); a run's checkpoint "
+                        "or release keeps it")
+"""Why a decoder normalizing its residuals' values is written in no family's layout (`Pretrained.export`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,11 +67,13 @@ class ResidualSite:
 
     `finished` counts the blocks done before the layer runs, which its
     attention input mixes with the partial sum; `opens` makes the layer
-    close the partial it received into block `finished` and restart it.
+    close the partial it received into block `finished` and restart it;
+    `normalize_values` is its mixtures' (`AttentionResiduals.normalize_values`).
     """
 
     finished: int
     opens: bool
+    normalize_values: bool = False
 
 
 def sources(state, finished: int, partial):
@@ -74,10 +86,19 @@ class DepthAttention(nn.Module):
 
     Both contractions run at full fp32 precision: they are `n + 1` wide, so
     the cost is the elementwise work, and the reference computes them in fp32.
+    With `normalize_values` the mixture sums the sources as their keys read
+    them, each at unit RMS, rather than as they are (Inkling 2 Mini's
+    `attn_res_normalize_values`). Its parameters are declared in `setup`, so
+    a site's tree holds them whether or not a call reads it.
     """
 
     emb_features: int
     norm_eps: float = 1e-5
+    normalize_values: bool = False
+
+    def setup(self):
+        self.scale = self.param('scale', nn.initializers.ones, (self.emb_features,), jnp.float32)
+        self.kernel = self.param('kernel', nn.initializers.zeros, (self.emb_features, 1), jnp.float32)
 
     @nn.nowrap
     def depth_flops(self, lengths, num_sources: int) -> float:
@@ -89,15 +110,12 @@ class DepthAttention(nn.Module):
         """Only the score contracts a learned matrix; value mixing uses its weights."""
         return projection_flops(lengths, self.emb_features, num_sources)
 
-    @nn.compact
     def __call__(self, values):
-        scale = self.param('scale', nn.initializers.ones, (self.emb_features,), jnp.float32)
-        kernel = self.param('kernel', nn.initializers.zeros, (self.emb_features, 1), jnp.float32)
         wide = at_least_fp32(values.dtype)
         work = values.astype(wide)
         keys = unweighted_rmsnorm(work, self.norm_eps, implementation='xla')
-        query = scale.astype(wide) * kernel[:, 0].astype(wide)
-        return depth_mixed(keys, query, work).astype(values.dtype)
+        query = self.scale.astype(wide) * self.kernel[:, 0].astype(wide)
+        return depth_mixed(keys, query, keys if self.normalize_values else work).astype(values.dtype)
 
 
 def depth_mixed(keys: jax.Array, query: jax.Array, values: jax.Array) -> jax.Array:

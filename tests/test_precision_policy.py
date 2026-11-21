@@ -650,12 +650,17 @@ def division_edges() -> tuple[np.ndarray, np.ndarray]:
             np.concatenate([denominator for _, denominator in pairs]))
 
 
-def divides_as_ieee_division_at_its_edges():
+EDGES = "a correctly rounded division's edges"
+"""The label of `divides_as_ieee_division_at_its_edges`'s arm over the edges, before its divider's."""
+
+
+def divides_as_ieee_division_at_its_edges(divider: str = ""):
     """`correctly_rounded_divide` over `division_edges`, compiled for this backend: each quotient of normal
     operands IEEE division's, bit for bit (NumPy's float64 quotient rounded once to float32, which rounds as
     once: 53 >= 2 x 24 + 2), its overflows infinite and its subnormal quotients on their grid, ties to even,
     over divisors given as arrays and as constants (which the backend's division approximates); and each
-    quotient of a zero, subnormal, infinite or NaN operand the backend's own division."""
+    quotient of a zero, subnormal, infinite or NaN operand the backend's own division. Its arms' labels end in
+    `divider`, a process's divider of its own (`APPROXIMATELY`), so one test's store holds both processes'."""
     from reference_error import ahead_arm
 
     from dew.nn.precision import correctly_rounded_divide
@@ -665,10 +670,9 @@ def divides_as_ieee_division_at_its_edges():
         np.abs(denominator) >= np.finfo(np.float32).tiny) & np.isfinite(denominator)
     # Programs with no check-1 site, each prepared as an arm is in a GPU tier part (`ahead_arm`), every one
     # run before any is judged: a prepare's arm gives zeros.
-    actual = np.asarray(ahead_arm(jax.jit(correctly_rounded_divide), "a correctly rounded division's edges")(
-        numerator, denominator))
-    plain = np.asarray(ahead_arm(jax.jit(jnp.divide), "the plain division of the edges past the normals")(
-        numerator[~normal], denominator[~normal]))
+    actual = np.asarray(ahead_arm(jax.jit(correctly_rounded_divide), EDGES + divider)(numerator, denominator))
+    past = f"the plain division of the edges past the normals{divider}"
+    plain = np.asarray(ahead_arm(jax.jit(jnp.divide), past)(numerator[~normal], denominator[~normal]))
     # A constant divisor, which XLA takes as a product by its rounded reciprocal (on a CPU and a GPU alike),
     # so the first quotient is off and the correction and the last move decide: the edges' normal numerators
     # over divisors just below a power of two, odd ones and the ones the callers divide by.
@@ -676,7 +680,7 @@ def divides_as_ieee_division_at_its_edges():
     divisors = [np.array(bits, np.uint32).view(np.float32) for bits in (
         0x3FFFFFFF, 0x3F7FFFFF, 0x40400000, 0x42FE0000, 0x43E00000, 0x3F400000, 0x7F000000, 0x00800000)]
     quotients = [np.asarray(ahead_arm(jax.jit(lambda values, divisor=divisor: correctly_rounded_divide(
-        values, divisor)), f"a correctly rounded division by {hex(divisor.view(np.uint32))}")(held))
+        values, divisor)), f"a correctly rounded division by {hex(divisor.view(np.uint32))}{divider}")(held))
         for divisor in divisors]
     with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
         expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
@@ -694,27 +698,52 @@ APPROXIMATE = "--xla_backend_extra_options=-nvptx-prec-divf32=1"
 (`dew._devices.divide_exactly`)."""
 
 
+APPROXIMATELY = ", on an approximate divider"
+"""The suffix of the arms' labels of `divides_as_ieee_division_on_an_approximate_divider`'s process."""
+
+
 def divides_as_ieee_division_on_an_approximate_divider():
     """`divides_as_ieee_division_at_its_edges` in a process whose GPU divides fp32 approximately
     (`APPROXIMATE`), so each first quotient is off and the correction and its last move decide every
-    result: there its plain division is off IEEE's somewhere, which the check would otherwise not show."""
+    result: there its plain division is off IEEE's somewhere, which the check would otherwise not show. The
+    process opens its test's store (`truths_ahead.for_a_child`, `approximately_divided`), so a GPU tier
+    part's prepare prepares its arms and its run compiles none on its GPU (row 10748: it was passed by in the
+    prepare, every arm compiled on the held GPU unprepared and unrecorded)."""
     import os
     import subprocess
     import sys
     from pathlib import Path
 
+    from truths_ahead import for_a_child
+
     flags = " ".join(filter(None, (os.environ.get("XLA_FLAGS"), APPROXIMATE)))
-    program = (
-        "import sys; sys.path.insert(0, sys.argv[1]); import jax, jax.numpy as jnp, numpy as np\n"
-        "import test_precision_policy as checks\n"
-        "rng = np.random.default_rng(0)\n"
-        "n, d = (rng.uniform(1e-4, 10, 1 << 20).astype(np.float32) for _ in range(2))\n"
-        "plain = np.asarray(jax.jit(jnp.divide)(n, d))\n"
-        "nearest = (n.astype(np.float64) / d.astype(np.float64)).astype(np.float32)\n"
-        "assert (plain != nearest).any(), 'this process divides as IEEE does'\n"
-        "checks.divides_as_ieee_division_at_its_edges()\n")
+    program = ("import sys; sys.path.insert(0, sys.argv[1])\n"
+               "import test_precision_policy\n"
+               "test_precision_policy.approximately_divided()\n")
     subprocess.run([sys.executable, "-c", program, str(Path(__file__).parent)],
-                   env={**os.environ, "XLA_FLAGS": flags}, check=True)
+                   env={**os.environ, **for_a_child(), "XLA_FLAGS": flags}, check=True)
+
+
+def approximately_divided():
+    """`divides_as_ieee_division_on_an_approximate_divider`'s own process: its plain division off IEEE's
+    somewhere, and the edges held, in its test's store (`truths_ahead.of_the_parent`), each program an arm
+    (`ahead_arm`) judged after every one ran; in a prepare, a failure checking its arms' zeros passes it
+    (`CompiledTruths.judged_its_zeros`), its run judging it."""
+    from reference_error import ahead_arm
+    from truths_ahead import of_the_parent
+
+    rng = np.random.default_rng(0)
+    numerator, denominator = (rng.uniform(1e-4, 10, 1 << 20).astype(np.float32) for _ in range(2))
+    with of_the_parent() as store:
+        try:
+            plain = np.asarray(ahead_arm(jax.jit(jnp.divide), f"the GPU's fp32 division{APPROXIMATELY}")(
+                numerator, denominator))
+            divides_as_ieee_division_at_its_edges(APPROXIMATELY)
+            nearest = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
+            assert (plain != nearest).any(), "this process divides as IEEE does"
+        except Exception as error:
+            if store is None or not store.judged_its_zeros(error):
+                raise
 
 
 def test_a_correctly_rounded_division_is_ieee_divisions_at_its_edges():

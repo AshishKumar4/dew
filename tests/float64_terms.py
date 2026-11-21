@@ -21,6 +21,9 @@ from store_wire import COMPILED as STORE, running
 from dew.nn import programs
 from dew.nn.precision import correctly_rounded_divide_p
 
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
+
 SUMS = frozenset({jax.lax.dot_general_p, primitives.ragged_dot_general_p, jax.lax.reduce_sum_p,
     jax.lax.conv_general_dilated_p, jax.lax.cumsum_p, jax.lax.scatter_add_p})
 """The operations that sum terms: a leaf's terms are those its own sums add,
@@ -630,7 +633,10 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     walked = wanted or rule is not None
     if walked and body is not None:
         return evaluated(*body, inputs, given, compiling, rule, used)
-    if rule is not None and programs.control_flow(primitive) and _traced_values(inputs):
+    # A branch picks by its selector alone: one known (a platform's, `_platform`) walks its branch beside
+    # traced operands, never every dead one (a platform's other branches, primitives no rule evaluates).
+    picking = inputs[:1] if primitive is jax.lax.cond_p else inputs
+    if rule is not None and programs.control_flow(primitive) and _traced_values(picking):
         # Traced, its values pick no branch and bound no Python loop: the primitive itself over walked bodies.
         outputs = _bound_walk(equation, inputs, rule, used)
         return outputs, [None] * len(outputs)

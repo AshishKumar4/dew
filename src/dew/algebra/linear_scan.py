@@ -932,7 +932,7 @@ CONSTRUCTORS = (
 
 def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionLike) -> Work:
     """A node's own work and dependent steps at the chunk's extents: products as fp32 products at `precision`
-    (`cost._mode`), elementwise work on the CUDA cores, exponentials on the special-function units,
+    (`product.product_mode`), elementwise work on the CUDA cores, exponentials on the special-function units,
     a reduction's and a product's kernel (each a root of XLA's fusion, `cost.work`'s) and its result kept on
     chip (`cost.kept`, at a lane's bytes; a token step's state so too), and a loop's and a substitution's
     rows a step each, whose launches the step's latency holds (`GpuTarget.step_seconds`, a loop iteration's,
