@@ -1900,7 +1900,7 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
 def normalized_output(state: Partial) -> jax.Array:
     """A normalized `Partial`'s output (`finish(normalized=True)`, `merged`): its sums where it holds mass,
     else 0 (row 10675)."""
-    return jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
+    return jnp.where(expand(means.holding(state.total), state.acc), state.acc, 0.0)
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
