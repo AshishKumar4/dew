@@ -621,9 +621,10 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
     totals = jnp.zeros((batch, kv_heads, slices, rows), jnp.float32)
     stacked = jnp.stack([maxima, totals])
     sub = jnp.float32(2.0 ** -127)
+    scale = jnp.float32(2.0 ** 20)
     init_m = jnp.zeros((batch, kv_heads, queries), jnp.float32)
     init_t = jnp.array([[[sub, 0.0]]], jnp.float32)
-    init_acc = jnp.stack([jnp.full((batch, kv_heads, width), sub, jnp.float32),
+    init_acc = jnp.stack([jnp.full((batch, kv_heads, width), jnp.float32(2.0 ** -107), jnp.float32),
                           jnp.zeros((batch, kv_heads, width), jnp.float32)], axis=2)
     initial = template.Initial(init_m, init_t, init_acc)
 
@@ -636,11 +637,14 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
         resumed = algebra.resumable(spec, state)
         next_init = template.Initial(jnp.swapaxes(resumed.m, 1, 2), jnp.swapaxes(resumed.total, 1, 2),
                                      jnp.swapaxes(resumed.acc, 1, 2))
-        return merged.merged_finished(spec, p_in, low_s, queries=queries, width=width,
-                                      out_dtype=jnp.float32, out_heads=queries, initial=next_init)
+        out = merged.merged_finished(spec, p_in, low_s, queries=queries, width=width,
+                                     out_dtype=jnp.float32, out_heads=queries, initial=next_init)
+        return resumed.m, out
 
     # Under jitted XLA:CPU FTZ, `state.total > 0` would replace m=0.0 with LEAST so the -140 slice wins (0.0);
-    # with `means.holding`, m=0.0 survives and 2^-127 dominates 2 * 2^-140 (output ~1.0).
-    got = jax.jit(step)(padded, stacked, initial, low_stacked)
-    np.testing.assert_allclose(np.asarray(got[0, 0, 0]), np.ones(width, dtype=np.float32), atol=1e-3)
+    # with `means.holding`, m=0.0 survives and 2^-127 dominates 2 * 2^-140 (output ~2^20).
+    resumed_m, got = jax.jit(step)(padded, stacked, initial, low_stacked)
+    assert float(resumed_m[0, 0, 0]) == 0.0, resumed_m
+    np.testing.assert_allclose(np.asarray(got[0, 0, 0]), np.full(width, float(scale), dtype=np.float32),
+                               rtol=1e-3)
     np.testing.assert_array_equal(np.asarray(got[0, 0, 1]), np.zeros(width, dtype=np.float32))
