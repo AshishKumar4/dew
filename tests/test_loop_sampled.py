@@ -235,6 +235,40 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
     assert len(set(drawn)) > 1 and interval.microbatches == 8
 
 
+def test_a_sampled_run_of_an_implicit_loop_in_bf16_reads_its_caps_narrow_copies_at_every_count():
+    """A bf16 decoder whose implicit loop's pass count is drawn per microbatch, its parameters read through
+    narrow copies (row 10770): at its cap the loop's layers sum their cotangents over its passes and are read
+    whole, and at one pass they are cast once and could be copied; the window reads the cap's copies at every
+    count, the loop's layers whole, so it plans and steps each count drawn, where it refused at its first
+    step."""
+    from dew.nn.kernels.generation import chosen
+
+    model = dataclasses.replace(looped(implicit=True, steps=CAP), dtype=jnp.bfloat16)
+    batch = token_batch()
+    with chosen(narrow_copies="on"):
+        sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, accumulation=2)
+        state, _, _ = sampled.place()
+        step = sampled.compile(state, batch)
+        interval = Interval(time.time(), None, microbatches=0)
+        drawn = []
+        for index in range(8):
+            step.drawn(interval, index)
+            drawn.extend(step.counts)
+            state, loss, *_ = step(state, batch)
+            assert np.isfinite(float(loss)), (index, step.counts)
+        # The copies a run of the cap's passes alone reads, the loop's layers whole among them.
+        alone = phased_trainer(model, 0, None, accumulation=2)
+        start, _, _ = alone.place()
+        stepped, *_ = alone.compile(start, batch)(start, batch)
+
+    def copied(compute) -> list[str]:
+        flat = jax.tree_util.tree_flatten_with_path(compute)[0]
+        return sorted(jax.tree_util.keystr(path) for path, _ in flat)
+
+    assert len(set(drawn)) > 1 and state.compute is not None, drawn
+    assert copied(state.compute) == copied(stepped.compute) != [], copied(state.compute)
+
+
 def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     """The draws continue one stream of the run's dispatched microbatches (`Interval.microbatches`): ten
     steps of four microbatches, then, resumed from a checkpoint's control, five of two, draw at positions 0

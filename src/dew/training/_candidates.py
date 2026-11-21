@@ -341,11 +341,15 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     narrows = narrow and not settings.dynamic_scale and settings.diloco is None
     own = narrow_copies(state, traced) if narrows and traced is not None else {}
     if copies is not None:
-        outside = sorted(".".join(path) for path, dtype in own.items()
-                         if path not in copies or jnp.dtype(copies[path]) != jnp.dtype(dtype))
-        if outside:
-            raise ValueError(f"the step reads {outside} through narrow copies its window's other steps hold "
-                             "none of: every step of one window reads one set of copies")
+        # The window's copies, its cap's, are read by every step of it: a step reads a copy only of a
+        # parameter whose one use in it is that cast, which the copy is (row 10770: a sampled count below an
+        # implicit loop's cap narrows the loop's layers, whose cap sums their cotangents over its passes and
+        # reads them whole). A parameter it would narrow and the window does not it reads whole and casts.
+        unread = sorted(".".join(path) for path, dtype in copies.items()
+                        if path not in own or jnp.dtype(own[path]) != jnp.dtype(dtype))
+        if unread:
+            raise ValueError(f"the step reads {unread} other than through the narrow copies its window holds "
+                             "of them: every step of one window reads one set of copies, each its one cast")
     copies = own if copies is None else copies
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
         lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
