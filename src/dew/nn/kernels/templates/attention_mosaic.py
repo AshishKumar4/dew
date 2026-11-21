@@ -1840,8 +1840,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                for columns in (1, 2, 4) for walked in walked_extents(queries, query.dtype, key.shape[1])
                for step in steps] if queries is not None else []
         config = next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
-        if config is None:
-            return None
+        if config is None or config.dkv_blocks is None:
+            return config
         # Deepen sm100 tcgen05 walked backward's TMA ring up to 3 stages (`TURNS + 1`) where SMEM holds it
         # without reducing SM residency so TMA prefetches ahead of tcgen05 MMA (row 4839).
         q_steps = -(-query.shape[1] // config.dkv_blocks[0])
