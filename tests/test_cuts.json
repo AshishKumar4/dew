@@ -841,9 +841,6 @@
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-second orders, staged]"
 ],
-"tests/test_counted_passes.py": [
-"tests/test_counted_passes.py::test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one_steps_its_batches"
-],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_cached_document_reads_its_own_context_without_it[the layer's attention]",
 "tests/test_cross_attention.py::test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it",
@@ -997,9 +994,6 @@
 "tests/test_decision_state_once.py::test_each_question_reads_the_shared_part_and_itself",
 "tests/test_decision_state_once.py::test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores",
 "tests/test_decision_state_once.py::test_sibling_questions_packed_a_window_read_each_their_own_requests_context"
-],
-"tests/test_decision_streams.py": [
-"tests/test_decision_streams.py::test_each_token_reads_exactly_what_its_streams_record_says_in_a_packed_window[joint]"
 ],
 "tests/test_decision_task.py": [
 "tests/test_decision_task.py::test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in",
@@ -1921,6 +1915,9 @@
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
 ],
+"tests/test_level_stacking.py": [
+"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
+],
 "tests/test_lfm3.py": [
 "tests/test_lfm3.py::test_plain_and_looped_lfm3_train_through_a_decision_run[looped]"
 ],
@@ -2397,9 +2394,6 @@
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float16-repeated]",
 "tests/test_norm_swiglu.py::test_stream_seam_takes_the_add_and_the_stream_cotangent[shape0-float32-False]"
 ],
-"tests/test_online_loader.py": [
-"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-processes-map]"
-],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
 "tests/test_optim.py::test_a_scheduled_rate_is_as_near_float64_as_optaxs[cosine]",
@@ -2530,10 +2524,6 @@
 "tests/test_ppo.py::test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged[sessions]",
 "tests/test_ppo.py::test_ppos_critic_reads_the_progress_its_step_passes"
 ],
-"tests/test_precision_policy.py": [
-"tests/test_precision_policy.py::test_aligned_cotangents_sum_a_shared_factors_terms_before_they_round",
-"tests/test_precision_policy.py::test_an_aligned_sums_shared_float32_factor_takes_its_gradient_summed_wide[past float32 alone]"
-],
 "tests/test_prefix_blocks.py": [
 "tests/test_prefix_blocks.py::test_a_prefix_page_is_shared_only_between_prompts_whose_groups_agree[scattered-reach]",
 "tests/test_prefix_blocks.py::test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_decoder",
@@ -2581,10 +2571,6 @@
 "tests/test_quantization_sites.py::test_the_scanned_stack_quantizes_each_layer_with_its_own_scales[tiny]",
 "tests/test_quantization_sites.py::test_the_served_pipeline_quantizes_as_the_loaded_model[e4m3]",
 "tests/test_quantization_sites.py::test_the_served_pipeline_quantizes_as_the_loaded_model[unrounded]"
-],
-"tests/test_qwen4_exp.py": [
-"tests/test_qwen4_exp.py::test_an_export_opens_in_transformers_as_the_model_it_was",
-"tests/test_qwen4_exp.py::test_images_and_a_video_read_through_the_processor_as_transformers_reads_them"
 ],
 "tests/test_qwen_image_source.py": [
 "tests/test_qwen_image_source.py::test_a_published_qwen_image_prompt_walked_alone_matches_the_source",
