@@ -1242,9 +1242,6 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     holds no more documents than tokens. A corpus that shows no packing
     while another packs into the same batches holds windows packed where
     none of this can see, so then each declares its window's length."""
-    # A packed source exists only where the packer was imported, which a chain that packs nothing never does.
-    packing = sys.modules.get("dew.data.packing")
-
     fields: dict[str, tuple[str, ...]] = {}
     bounds: dict[str, int] = {}
     laid: dict[str, bool] = {}
@@ -1283,9 +1280,13 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
                 declare(stage, stage.segments if documents is None else documents, not itself)
                 packed = True
         *_, source = beneath(source, ("read", "materialized"))
-        if packing is not None and isinstance(source, packing.PackedSource):
-            declare(source.plan.pack, source.plan.most_documents, not itself)
-            packed = True
+        # A packed source exists only where the packer was imported, which no chain that packs nothing does.
+        if "dew.data.packing" in sys.modules:
+            from dew.data.packing import PackedSource
+
+            if isinstance(source, PackedSource):
+                declare(source.plan.pack, source.plan.most_documents, not itself)
+                packed = True
         unseen = unseen or not packed
 
     for pipeline in pipelines:
