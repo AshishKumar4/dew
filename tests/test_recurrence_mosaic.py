@@ -966,10 +966,9 @@ def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.Shap
 @COMPILES_ON_CPU
 @lowers('sm90')
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
-    """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
-    at a variant's, each the forward's own (`_ran`): a kernel's name compiled under both launches
-    (`report.launching`) is gated on each launch's evidence, the variant's shared memory its own; a gate that
-    read a kernel by its name alone kept one launch's and dropped the other's."""
+    """The 27B gated delta net's forward launched twice in one program on an H100, at the first two variants'
+    distinct forward tiles (`_ran`): a kernel's name compiled under both launches (`report.launching`) is gated
+    on each launch's evidence, the second's shared memory its own; one read by its name alone kept one's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -979,7 +978,8 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=1.0)
     with generation.assumed(facts):
-        derived, variant = (_ran(tiles, training=False) for tiles in template.MOSAIC.variants(bound)[:2])
+        forwards = dict.fromkeys(_ran(tiles, training=False) for tiles in template.MOSAIC.variants(bound))
+        derived, variant = list(forwards)[:2]
 
     def call():
         def fn(*operands):
