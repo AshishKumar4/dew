@@ -518,6 +518,6 @@ def test_a_forward_alones_kernels_are_refused_at_its_own_tiles():
     for digest in set(report._LAUNCHES) - before:
         launch = report._LAUNCHES[digest]
         ran.setdefault(launch.config, set()).update(launch.kernels)
-    assert tiles.forward is not None and {'recurrence_states', 'recurrence_output'} <= ran.get(tiles.forward,
-                                                                                            set()), (tiles, ran)
-    assert not ran.get(tiles, set()) & {'recurrence_states', 'recurrence_output'}, (tiles, ran)
+    launches = {'recurrence_states', 'recurrence_output'}
+    assert tiles.forward is not None and launches <= ran.get(tiles.forward, set()), (tiles, ran)
+    assert not ran.get(tiles, set()) & launches, (tiles, ran)
