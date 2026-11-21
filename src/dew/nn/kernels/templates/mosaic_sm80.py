@@ -162,13 +162,17 @@ def _pipelined(key: tuple, steps: int | None, target: str) -> tuple:
 
     version = generation.capability(target)
     if version is None:
-        raise ValueError(f"mma.sync's pipeline is a CUDA GPU's, not {target!r}'s")
-    # A device stating the capability lowered for (Mosaic GPU's `utils._infer_arch`), an unseen GPU's too.
-    device = jax.sharding.AbstractDevice(device_kind=target, num_cores=None, platform="gpu",
-                                         compute_capability=".".join(map(str, version)))
-    with meshless(), jax.sharding.use_abstract_mesh(
-            jax.sharding.AbstractMesh((1,), ("walk",), abstract_device=device)):
+        # No CUDA GPU planned (a walk interpreted on a CPU): its pipeline lowers for the architecture Mosaic
+        # GPU infers where it is traced (`utils._infer_arch`, Hopper's where the device states none), so its
+        # allocations are read there, as the walk's own are made.
         jax.make_jaxpr(allocated)()
+    else:
+        # A device stating the capability lowered for (`utils._infer_arch`), an unseen GPU's too.
+        device = jax.sharding.AbstractDevice(device_kind=target, num_cores=None, platform="gpu",
+                                             compute_capability=".".join(map(str, version)))
+        with meshless(), jax.sharding.use_abstract_mesh(
+                jax.sharding.AbstractMesh((1,), ("walk",), abstract_device=device)):
+            jax.make_jaxpr(allocated)()
     leaves = (*found["in_smem_refs"], *found["out_smem_refs"], found["barrier_ref"])
     return tuple(leaf for leaf in leaves if leaf is not None)
 
