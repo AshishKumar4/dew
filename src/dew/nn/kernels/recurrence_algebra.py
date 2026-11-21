@@ -838,6 +838,20 @@ def own_bands(pairs: jax.Array, *, chunk: int, sub: int = SUB) -> jax.Array:
     return banded.reshape(rows, heads * sub).T
 
 
+def split_scale(scale: float) -> tuple[float, float]:
+    """`scale` as `(before, after)`, their product it: `before` a power of two a pairs' rows take before
+    their products (so a row its decay attenuates stays finite, and a row a product reads exactly stays
+    exact: a bf16 query near its sub-chunk's first token, its decay one), `after` the rest, in `[1, 2)` or
+    `scale` itself where `|scale|` is at least one, which their sum takes once. Kimi's `2^-3.5` taken whole
+    before rounded each such query to TF32's bits, its scores 8.3 times fla's distance from float64 where
+    float64's are zero (row 10382; fla's chunk_kda_fwd_kernel_inter_solve_fused scales after its dot)."""
+    magnitude = abs(scale)
+    if magnitude >= 1 or magnitude == 0:
+        return 1.0, scale
+    before = 2.0 ** math.floor(math.log2(magnitude))
+    return before, math.copysign(magnitude / before, scale)
+
+
 def write_gated(tile: jax.Array, strengths: jax.Array) -> jax.Array:
     """A tile `[C, D]` each row scaled by its token's write strength (`strengths` `[C]`, the delta rule's
     beta): the keys and values the delta rule writes, as their products take them (fla's `k * beta` before

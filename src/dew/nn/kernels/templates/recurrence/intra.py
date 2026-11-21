@@ -335,8 +335,7 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
                      functools.partial(_sub_chunk_staged, call, products=products),
                      functools.partial(pair_streams, call, queries=scored), contracted=True)
     steps = width // keys
-    shrinking = min(abs(scale), 1.0)
-    growing = math.copysign(max(abs(scale), 1.0), scale)
+    shrinking, growing = algebra.split_scale(scale)
 
     def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, taken_ref, *sums, streams, staging, landing):
         del taken_ref
