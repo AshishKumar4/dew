@@ -108,9 +108,28 @@ def ran(rows: Mapping[str, list[dict]]) -> dict[str, list[float]]:
     return runs
 
 
+def held(rows: Mapping[str, list[dict]]) -> dict[str, list[set[str]]]:
+    """Each file `ran` reads, its groups' tests in their order, as their rows timed them."""
+    found = {}
+    for name, seconds in ran(rows).items():
+        tests = {row["name"].partition("#")[2]: set(row.get("tests", {})) for row in rows[name]}
+        found[name] = ([tests[""]] if len(seconds) == 1
+                       else [tests[f"{group}/{len(seconds)}"] for group in range(1, len(seconds) + 1)])
+    return found
+
+
+def moved(bounds: list[str], groups: list[set[str]] | None) -> bool:
+    """Whether a stored cut's `bounds` are not what ran as `groups` (`held`): a bound, the first test of the
+    group after it, timed in another group. A bound timed in none (skipped, or uncollected) proves nothing,
+    so a cut is never refused for what a run did not time, and recut every train."""
+    return groups is not None and any(
+        bound in tests and index != place + 1
+        for place, bound in enumerate(bounds) for index, tests in enumerate(groups))
+
+
 def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[float]], target: float,
-             before: Mapping[str, dict[str, float]],
-             after: Mapping[str, dict[str, float]]) -> dict[str, list[str]]:
+             before: Mapping[str, dict[str, float]], after: Mapping[str, dict[str, float]],
+             groups: Mapping[str, list[set[str]]] | None = None) -> dict[str, list[str]]:
     """The stored cuts (session.CUTS) after main's CI ran each file as `runs` says (`ran`), every group within
     `KEPT` of `target`, setup and all: a file it ran as its stored cut keeps it; one it ran as another cut
     stores that cut, made from the record it was cut by (`before`: each file's own tests, node id to seconds).
@@ -118,11 +137,15 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
     (`rebalanced`); where none fit, or the file ran as another cut, the file is cut anew from the folded
     record (`after`), as `split` cuts a file it has no cut for. Each group's first test is its boundary; a
     file run whole within its bound, or cut into a group that holds none of its recorded tests, stores none; a
-    file it did not run keeps its own. The fold is the one place a cut changes (Main, 2026-11-13: a group's
-    name means the same tests from run to run, so its record is found again)."""
+    file it did not run keeps its own. A file whose run's `groups` (`held`) show another cut of the same count
+    ran stores that one, never its stored cut it did not run, which a plan reweighed since would take up
+    again and rename every group of it (review, row 10787). The fold is the one place a cut changes (Main,
+    2026-11-13: a group's name means the same tests from run to run, so its record is found again)."""
     kept = dict(stored)
     for name, seconds in runs.items():
         bounds = stored.get(name)
+        if bounds is not None and moved(bounds, (groups or {}).get(name)):
+            bounds = None
         if max(seconds) <= session.KEPT * target:
             if bounds is not None and len(bounds) + 1 == len(seconds):
                 continue

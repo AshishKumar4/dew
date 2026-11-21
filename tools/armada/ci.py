@@ -2390,7 +2390,8 @@ def main() -> int:
             session.DURATIONS.write_text(json.dumps(recorded, indent=0) + "\n")
         after = {name: own_tests(name, tests) for name, tests in parted_record().items()}
         runs = cuts.ran(rows_of)
-        stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after)
+        stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after,
+                               cuts.held(rows_of))
         if stored != session.stored_cuts():
             session.CUTS.write_text(json.dumps(stored, indent=0, sort_keys=True) + "\n")
         changed = sorted({grading.owning(node) for node in before.keys() ^ recorded.keys()}
