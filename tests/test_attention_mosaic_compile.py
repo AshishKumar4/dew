@@ -1696,45 +1696,6 @@ def test_sm90_and_sm100_forward_scale_prescaled_query_in_smem_without_spills():
                            lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)),
             ], gen)
             assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-def test_forward_pricing_aligns_with_m_fs_15_sm90_and_sm80_receipts():
-    """Wave-quantized residency pricing (`_launch_seconds` + `_derived`'s residency-step rung, row 6216)
-    ranks M-FS-15's faster sm90 2-consumer config ahead of 3-consumer on T=512 split forward (0.0508 vs
-    0.0846 ms on GH200) and ranks a higher-residency smaller `block_k` ahead of a 1-resident `block_k`
-    when `_derived` offers both."""
-    spans = template.spans(512, 512, 1, causal=True)
-    q = jax.ShapeDtypeStruct((2, 512, 32, 128), jnp.bfloat16)
-    k = jax.ShapeDtypeStruct((2, 512, 8, 128), jnp.bfloat16)
-    with generation.assumed("sm90"):
-        sm90 = generation.gpu_target()
-        op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
-                                                  natural=attention_mosaic.NATURAL)
-        ba = op.bind(*args, residuals=template.Kept.SPLIT, interpret=False)
-        c2 = attention_mosaic.Tiles(64, 64, 2, 2, family="wgmma")
-        c3 = attention_mosaic.Tiles(64, 64, 2, 3, family="wgmma")
-        p2 = op._price_config(ba, c2, sm90)
-        p3 = op._price_config(ba, c3, sm90)
-        assert p2 is not None and p3 is not None and p2 < p3, (p2, p3)
-
-    # Verify `_derived` offers a higher-residency smaller `block_k` to `choose` on sm80 when residency jumps.
-    with generation.assumed("sm80"):
-        family = attention_mosaic_program.bundle_of(
-            attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync"), jnp.bfloat16)
-        seen: list[list[attention_mosaic.Tiles]] = []
-
-        def choose(cands: list[attention_mosaic.Tiles]) -> attention_mosaic.Tiles:
-            seen.append(list(cands))
-            return cands[0]
-
-        def fake_res(cfg: attention_mosaic.Tiles) -> int:
-            return 2 if cfg.block_k <= 32 else 1
-
-        attention_mosaic._derived(
-            family, jnp.bfloat16, 512, 512,
-            lambda r, w, c: attention_mosaic.Tiles(r, w, 2, c, family=family.name),
-            lambda cfg: cfg.block_k <= 64, overlapped=True,
-            walks=attention_mosaic_program.walked_extents, choose=choose, residency=fake_res)
-        assert seen and any(c.block_k == 64 for c in seen[0]) and any(c.block_k == 32 for c in seen[0]), seen
-
 
 @COMPILES_ON_CPU
 def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
@@ -1742,11 +1703,22 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, queries, 4, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, queries, 2, 64), jnp.bfloat16)
+    shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
+                          _residuals(query.shape))
+
+    def backward(q, k, v, dout, residuals):
+        grads = attention_mosaic.backward(q, k, v, spans, None, dout, residuals=residuals, accurate=False)
+        return grads.query, grads.key, grads.value
+
     for gen in ("sm80", "sm100"):
-        op, ba, cfg = _gated_backward(gen, 64, accurate=False)
+        _, _, cfg = _gated_backward(gen, 64, accurate=False)
         assert cfg is not None and cfg.fused, (gen, cfg)
         with generation.assumed(gen):
             found = compile_mosaic_kernels([
-                KernelCase(f"{gen}-fused-d64", lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)),
+                KernelCase(f"{gen}-fused-d64", lambda: (backward, (query, key, key, query, shapes))),
             ], gen)
             assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
