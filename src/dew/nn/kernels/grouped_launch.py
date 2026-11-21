@@ -1,6 +1,8 @@
 """Dew: a grouped product's launches' shared base (`_GroupedLaunch`): its tile, interpretation and
 stage facts, and the sizes it benchmarks, for `grouped_matmul`'s launches."""
 
+from __future__ import annotations
+
 import dataclasses
 import math
 from collections.abc import Callable, Hashable
@@ -11,10 +13,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels.templates.gemm import tiling
+
 from . import tuning
 from .templates import base
 from .templates.axes import held as held_axes
-from .templates.gemm import mosaic_gpu
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 
 
@@ -104,8 +107,9 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
         (`tuning.KernelOp.padded`), the output's sides its launch's (`output_sides`); None for a grouped
         call, whose groups' rows a step routes, for a tile of no such blocks (a TPU's), and for a launch
         that states no sides."""
+
         sides = self.output_sides(ba)
-        if not ba.arguments.get('dense') or not isinstance(config, Tile | mosaic_gpu.Tiles) or sides is None:
+        if not ba.arguments.get('dense') or not isinstance(config, Tile | tiling.Tiles) or sides is None:
             return None
         rows, width = sides
         grid = -(-rows // config.block_m) * config.block_m * -(-width // config.block_n) * config.block_n

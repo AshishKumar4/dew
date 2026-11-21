@@ -25,7 +25,7 @@ from jax import numpy as jnp
 
 from dew.nn.kernels.templates import mosaic, resources, swizzling
 from dew.nn.kernels.templates.gemm import pricing
-from dew.nn.kernels.templates.gemm.mosaic_gpu import CONSUMERS, Tiles
+from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,

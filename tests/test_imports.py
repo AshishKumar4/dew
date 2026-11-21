@@ -166,6 +166,12 @@ FOREIGN |= {"dew.registry": (
     "dew.optim")}
 # A model's quantization, which loading, adapters and serving read, starts no trainer; the conditioning inputs
 # read no release's storage, the encoders that bind a released checkpoint dew.interop's (row 5996).
+# A Dense layer's projection routes its launch by its selector, which imports the template toolkit where a
+# launch runs, not as it loads: an edit to the toolkit re-runs none of a Dense layer's tests (the test cache's
+# executed units; train 1108 re-ran 3,891 rows for one, 518 of 759 files loading the toolkit).
+FOREIGN |= {"dew.nn.dense": tuple(f"dew.nn.kernels.templates.{name}" for name in (
+    "mosaic", "bundles", "fed", "rings", "bodies", "mosaic_sm80", "mosaic_sm90", "mosaic_sm100", "mosaic_tpu",
+    "gemm.mosaic_gpu"))}
 FOREIGN |= {"dew.quantization": ("dew.training",),
             **dict.fromkeys(("dew.inputs.condition", "dew.inputs.diffusion", "dew.inputs.encoders",
                              "dew.inputs.spec"), ("dew.interop",)),

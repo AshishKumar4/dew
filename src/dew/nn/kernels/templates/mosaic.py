@@ -1774,7 +1774,7 @@ class Transport[Allocated, Opened](abc.ABC):
         `resources.producer_floor` where None), the floor its launch plans with; a family without a producer
         role takes none. With `pingpong`, on a family that takes it (`takes_pingpong`), its two consumers take
         alternate tiles whole, their products in turn (`persistent.consumed`'s `turns`), each consumer's tile
-        its own share (`gemm.mosaic_gpu.Tiles.pingpong`)."""
+        its own share (`gemm.tiling.Tiles.pingpong`)."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
