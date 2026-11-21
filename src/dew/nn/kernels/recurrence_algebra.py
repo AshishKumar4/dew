@@ -702,26 +702,26 @@ def gated_up(prefix: tuple, reference: tuple, index: jax.Array, place) -> jax.Ar
 def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, prefix: tuple,
                     at: Callable[[int], tuple], *, chunk: int, scales: Sequence[float],
                     sub: int = SUB) -> tuple[list[jax.Array], Callable[[int], jax.Array]]:
-    """A chunk's pairs under a decay a key dimension, one key block's, as the operands of the products whose
-    sum they are: `(gated, raised)`, each of `rows`' gated rows `[C, BK]` (each forming its row when called:
-    the queries, the write-gated keys; fp32), and `raised(s)` sub-chunk `s`'s keys gated up `[C, BK]`. A
-    caller stages each row set's gated rows once and each later sub-chunk's keys in turn, and issues for each
-    sub-chunk `s` past the first one product a row set (`(name, lhs, rhs)`, 'pairs'): the `sub` rows of `s`
-    of the staged rows (a `Staged` tile's `rows`) against the staged keys read transposed, `[sub, C]` a row
-    set and sub-chunk, `sum_k r_ik k_jk exp2(g_ik - g_jk)` for row `i` in `s` and key `j` in an earlier
-    sub-chunk, zero for keys from `s` on (a sub-chunk's own pairs are `key_diagonal_bands`', each its own
-    decay, as fla's token-parallel diagonal). Each pair's decay splits at `s`'s first token `G_s`, as fla_kda's
-    inter-sub-chunk products split it (chunk_kda_fwd_kernel_inter_solve_fused): `exp2(g_i - G_s) exp2(G_s -
-    g_j)`, each exponent at most zero (`decay`), the rows gated down to `G_s` and every key gated up to it
-    (`gated_up`). `prefix` is the block's separated prefix (`separated`) and `at(token)` it at the chunk's
-    `token`, a column's vectors; each row set's gated rows are scaled by its of `scales` (the scores' the
-    attention scale), so the sums a mainloop holds are its pairs scaled. A row set's products sum into one
-    accumulator a sub-chunk, which a mainloop may hold across its key blocks, read once. The products take a
-    sub-chunk's rows (mma.sync's, `intra.sub_chunked`): a whole chunk's rows masked to a sub-chunk's took 4.2
-    times fla's inter-sub-chunk launch on an A100 (1508 us against 356, M-JS-144-a100). A sub-chunk's own
-    pairs factored too, taken on the tensor cores, put a packed document's first token's output, a row of
-    2.5e-5 where `q . k` cancels, at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own
-    decay (row 5194, M-JS-48w)."""
+    """A chunk's pairs under a decay a key dimension, one key block's, as the operands of the products
+    whose sum they are: `(gated, raised)`, each of `rows`' gated rows `[C, BK]` (each forming its row when
+    called: the queries, the write-gated keys; fp32), and `raised(s)` sub-chunk `s`'s keys gated up `[C,
+    BK]`. A caller stages each row set's gated rows once and each later sub-chunk's keys in turn, and
+    issues for each sub-chunk `s` past the first one product a row set (`(name, lhs, rhs)`, 'pairs'): the
+    `sub` rows of `s` of the staged rows (a `Staged` tile's `rows`) against the staged keys read
+    transposed, `[sub, C]` a row set and sub-chunk, `sum_k r_ik k_jk exp2(g_ik - g_jk)` for row `i` in `s`
+    and key `j` in an earlier sub-chunk, zero for keys from `s` on (a sub-chunk's own pairs are
+    `key_diagonal_bands`', each its own decay, as fla's token-parallel diagonal). Each pair's decay splits
+    at `s`'s first token `G_s`, as fla_kda's inter-sub-chunk products split it
+    (chunk_kda_fwd_kernel_inter_solve_fused): `exp2(g_i - G_s) exp2(G_s - g_j)`, each exponent at most zero
+    (`decay`), the rows gated down to `G_s` and every key gated up to it (`gated_up`). `prefix` is the
+    block's separated prefix (`separated`) and `at(token)` it at the chunk's `token`, a column's vectors;
+    each row set's gated rows are scaled by its of `scales` (the scores' the attention scale), so the sums
+    a mainloop holds are its pairs scaled. A row set's products sum into one accumulator a sub-chunk, which
+    a mainloop may hold across its key blocks, read once. The products take a sub-chunk's rows (mma.sync's,
+    `intra.sub_chunked`): a whole chunk's rows masked to a sub-chunk's took 4.2 times fla's inter-sub-chunk
+    launch on an A100 (1508 us against 356, M-JS-144-a100). A sub-chunk's own pairs factored too, taken on
+    the tensor cores, put a packed document's first token's output, a row of 2.5e-5 where `q . k` cancels,
+    at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay (row 5194, M-JS-48w)."""
     index, _ = _grid(prefix[0].shape)
     # Every row gated down to its own sub-chunk's first token.
     down = decay(prefix, _laid_references(lambda s: at(s * sub), index, chunk, sub))
