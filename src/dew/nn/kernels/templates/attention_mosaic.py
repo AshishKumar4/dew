@@ -831,15 +831,14 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def _deepened(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
                   refused: Set[Tiles] = frozenset()) -> Tiles:
-        """Deepen a compute-bound multi-consumer forward's TMA ring up to `consumers + 1` stages where the
-        block holds them without reducing resident programs per SM (row 5272): with two consumers straddling
-        consecutive steps, a third stage keeps the producer prefetching instead of stalling on both slots."""
+        """Deepen a compute-bound TMA forward's ring up to `max(consumers, 2) + 1` stages where the block
+        holds them without reducing resident programs per SM (rows 5272, 4839): a third stage keeps the TMA
+        producer prefetching ahead of the consumer(s) instead of stalling on two slots."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if (config.consumers < 2 or family.feeds_itself or not family.budgets_registers
-                or streams(query, target)):
+        if family.feeds_itself or not family.budgets_registers or streams(query, target):
             return config
-        want = min(config.consumers + 1, -(-_keys(ba) // config.block_k))
+        want = min(max(config.consumers, 2) + 1, -(-_keys(ba) // config.block_k))
         if want <= config.stages:
             return config
         base_resident = self.resident(ba, config, target)
@@ -1926,29 +1925,33 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def _deepened(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                   target: generation.GpuTarget) -> BackwardTiles:
-        """Deepen a multi-consumer fused backward's TMA ring up to `consumers + 1` stages where SMEM holds
-        it without reducing SM residency or dropping streamed `peak`/`total`/`delta` statistics (row 5272)."""
-        if not config.fused or config.consumers < 2:
-            return config
+        """Deepen a TMA backward's ring up to `max(consumers, 2) + 1` stages where SMEM holds it without
+        reducing SM residency or (for fused launches) dropping streamed `peak`/`total`/`delta` statistics
+        (row 5272)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if not family.budgets_registers or family.operands_in_registers:
+        if family.feeds_itself or not family.budgets_registers or family.operands_in_registers:
             return config
-        want = min(config.consumers + 1, -(-query.shape[1] // config.block_q))
+        q_steps = -(-query.shape[1] // config.block_q)
+        steps = q_steps if config.fused else min(q_steps, -(-ba.arguments["key"].shape[1] // config.block_k))
+        want = min(max(config.consumers, 2) + 1, steps)
         if want <= config.stages:
             return config
         base_resident = self.resident(ba, config, target)
         allocator = _coop_allocations if config.shared_keys else None
         reduced = reducing(family, config.consumers, self.score_reduces,
                            scaled=staged_parts(query.dtype) > 1)
-        base_stats = streamed_statistics(family, config, query.shape[3], query.dtype, config.stages,
-                                         reduced=reduced, allocations_of=allocator)
+        base_stats = (streamed_statistics(family, config, query.shape[3], query.dtype, config.stages,
+                                          reduced=reduced, allocations_of=allocator)
+                      if config.fused else 0)
         for stage_count in range(want, config.stages, -1):
             candidate = dataclasses.replace(config, stages=stage_count)
-            if (self.takes(ba, candidate, target)
-                    and self.resident(ba, candidate, target) == base_resident
-                    and streamed_statistics(family, candidate, query.shape[3], query.dtype, stage_count,
-                                            reduced=reduced, allocations_of=allocator) >= min(3, base_stats)):
+            if not (self.takes(ba, candidate, target)
+                    and self.resident(ba, candidate, target) == base_resident):
+                continue
+            if (not config.fused
+                    or streamed_statistics(family, candidate, query.shape[3], query.dtype, stage_count,
+                                           reduced=reduced, allocations_of=allocator) >= min(3, base_stats)):
                 return candidate
         return config
 

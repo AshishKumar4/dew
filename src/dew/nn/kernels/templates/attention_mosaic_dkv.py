@@ -187,15 +187,11 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # 2^-10): a stream of their own, or where one passes the block staged a step from the call's own
     # (`BackwardTiles.staged_logits`; a third of the launch at Qwen3-8B, ET-SWAPABL-h100). dK from the call's
     # own, which the power would flush where a query is 2^-126 at the scale 2^-10.
-    if logits_stage is None:
-        s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
-                                    v_smem, do_slot.transpose((1, 0)), shape)
-    else:
-        s = family.product(k_smem, logits_slot.transpose((1, 0)), shape)
-        # Its share of the staged queries read (the product waited): the next step's stage may be written.
+    s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
+                                v_smem, do_slot.transpose((1, 0)), shape)
+    if logits_stage is not None:
+        # Its share of the staged queries read (the products waited): the next step's stage may be written.
         walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
-        dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
-    # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
     read = walk.places_read(masked=masked)
