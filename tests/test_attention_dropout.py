@@ -152,7 +152,7 @@ def route_arm(case: dict):
     return call
 
 
-def reference_arm(case: dict, names: frozenset = frozenset()):
+def reference_arm(case: dict, names: tuple[str, ...] = ()):
     """`case`'s reference path over its dense mask `case_keep(case)`, dropping at `RATE` from the call's
     key, with the score hooks `names` (`sinks`, `softcap`); a query that sees no key reads zero, as every
     attention call reads (`attention_kernel`)."""
