@@ -34,6 +34,7 @@ from dew.nn.kernels.templates import (
     outputs,
     placed,
     resources,
+    stores,
     swizzling,
 )
 from dew.nn.kernels.templates.attention import (
@@ -1862,9 +1863,18 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
     return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in chunked]
 
 
+def _epilogue_phase(family: mosaic.Family, block_q: int, value_width: int, dtype, *,
+                    residuals: bool) -> list[list]:
+    """Wide (>128) inference epilogue's live phase (`attention_mosaic_forward._stored_walk`): chunks
+    `state.acc` by `stores.staged_columns`, holding the fp32 slice, quotient, finished chunk, and narrowed
+    output beside carried `state.acc` (row 10964)."""
+    if residuals or family.operands_in_registers or scopes_products(family) or value_width <= 128:
+        return []
+    chunk = stores.staged_columns(value_width, (dtype,))
+    return [[(block_q, chunk, jnp.float32)] * 3 + [(block_q, chunk, dtype)]]
+
 
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
-                      natural: bool = False, params: tuple = (), width: int | None = None,
                       parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
                       per_span: int = 1, merged: bool = False, started: bool = False,
                       dropped: bool = False, weight_parts: int = 1, scaled_products: bool = False) -> int:
@@ -1946,9 +1956,9 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if scaled:
         step, scaled_terms = _scaled_step(family, step, logits, weights, (block_q, value_width, jnp.float32),
                                           block_k=block_k, parts=parts, dtype=dtype, residuals=residuals)
-    phases = [step + ([(block_q, value_width, jnp.float32)] if scaled_products and not scaled else [])]
+    phases = [step + ([(block_q, value_width, jnp.float32)] if scaled_products and not scaled else []),
+              *_epilogue_phase(family, block_q, value_width, dtype, residuals=residuals)]
     if family.operands_in_registers:
-        # Its weights relaid as the values' product's left operand (`MmaIssuer._left`), a copy in each warp
         # along the columns (`Family.lhs_copies`), beside the step's logits, where `_products` holds a
         # register left operand no fragment: unpriced, three of an sm103's narrow bounded walks priced 225
         # and 241 spilled 12 and 444 bytes at 255; priced, 257 (narrow-replication-grid).

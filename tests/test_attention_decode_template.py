@@ -1048,8 +1048,6 @@ def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(gene
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    from dew.nn.kernels.templates import report
-
     query = jax.ShapeDtypeStruct((1, 256, 8, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 2048, 2, width), jnp.bfloat16)
     spans = template.spans(256, 2048, 1, causal=False)
@@ -1057,7 +1055,7 @@ def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(gene
     def forward(q, k, v):
         return attention_mosaic.forward(q, k, v, spans, natural=False)
 
-    with report.refusals(), generation.assumed(generation_name):
+    with generation.assumed(generation_name):
         found = compile_mosaic_kernels([KernelCase("inference", lambda: (forward, (query, key, key)))],
                                        generation_name)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)

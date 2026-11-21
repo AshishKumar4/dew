@@ -1904,7 +1904,8 @@ def test_planned_stages_deepens_at_residency_two_with_registers():
         family = program.layouts("sm80", jnp.bfloat16, 4096)[0]
         tile = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
         def scope_of(stages):
-            return resources.Scope(program=(tile,), walks=((stages, (tile,)),))
+            ring = jax.ShapeDtypeStruct((stages, 64, 64), jnp.bfloat16)
+            return resources.Scope(program=(tile,), walks=((ring,),))
         stages = attention_mosaic._planned_stages(family, scope_of, target, consumers=1, registers=128,
                                                   floor=2, most=3, resident=2)
         assert stages == 3, stages
