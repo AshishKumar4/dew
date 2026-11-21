@@ -204,24 +204,44 @@ def _scaled(jaxpr, tapped, keys):
     """`jaxpr`'s untapped float64 outputs and each floating output's scale (`rounding_scale`), from
     `tapped(key, scale)`, its evaluation with every rounding moved by `scale` times a draw keyed by `key`
     (`keys`: the untapped evaluation's and each draw's, `_keys`): the root mean square of each draw's
-    displacement from the untapped evaluation (`_spread`)."""
+    displacement from the untapped evaluation, folded in a draw at a time (`_folded`), so the untapped
+    outputs, one draw's and the running fold are all it holds, where it held every draw's at once (row 9780:
+    a 10-layer model's loss and gradients, nine float64 copies of them, were killed for memory)."""
     key, drawn = keys
     plain = tapped(key, 0.0)
-    draws = [tapped(each, 1.0) for each in drawn]
-    return plain, [_spread(value, *(draw[at] for draw in draws))
-                   if jnp.issubdtype(var.aval.dtype, jnp.floating) else None
-                   for at, (var, value) in enumerate(zip(jaxpr.outvars, plain, strict=True))]
+    floating = [jnp.issubdtype(var.aval.dtype, jnp.floating) for var in jaxpr.outvars]
+    # The largest displacement at the outputs' own width (a float64 output's may lie below float32's range),
+    # the scaled squares, at most the count, in float32: held, the untapped outputs, one draw's and about
+    # one more output's (rows 9780 on: a 2 GiB float64 gradient tree's walk peaked at 6.15 GiB).
+    folds = [(jnp.zeros_like(value), jnp.zeros(jnp.shape(value), jnp.float32)) if kept else None
+             for value, kept in zip(plain, floating, strict=True)]
+    for each in drawn:
+        draw = tapped(each, 1.0)
+        folds = [None if fold is None else _folded(value, moved, *fold)
+                 for value, moved, fold in zip(plain, draw, folds, strict=True)]
+        del draw
+    return plain, [None if fold is None else _spread(*fold, len(drawn)) for fold in folds]
 
 
 @jax.jit
-def _spread(value, *draws):
-    """The root mean square of each draw's displacement from `value`, each element taken relative to its
-    largest displacement, so no square overflows and a nonfinite displacement stays nonfinite: one program
-    a shape, where its operations eagerly were a dispatch each."""
-    moved = jnp.stack([jnp.abs(draw - value) for draw in draws])
-    largest = jnp.max(moved, axis=0)
-    held = jnp.where(largest > 0, largest, 1)
-    return jnp.where(largest > 0, largest * jnp.sqrt(jnp.mean(jnp.square(moved / held), axis=0)), largest)
+def _folded(value, draw, largest, squares):
+    """A draw's displacement from `value` folded into its running root mean square: the largest
+    displacement so far and the sum of the squares of each displacement relative to it, rescaled where a
+    larger one comes (LAPACK's `dnrm2` update), so no square overflows and a nonfinite displacement keeps the
+    fold nonfinite. One program a shape, where its operations eagerly were a dispatch each."""
+    moved = jnp.abs(draw - value)
+    larger = moved > largest
+    held = jnp.where(larger, moved, jnp.where(largest > 0, largest, 1))
+    # Each ratio at most 1 at the outputs' width, then the sum's float32 (`_scaled`).
+    squares = jnp.where(larger, squares * jnp.square(largest / held).astype(squares.dtype) + 1,
+                        squares + jnp.where(largest > 0, jnp.square(moved / held), 0).astype(squares.dtype))
+    return jnp.maximum(largest, moved), squares
+
+
+def _spread(largest, squares, count: int):
+    """The root mean square of `count` folded displacements (`_folded`), zero where none moved, at the
+    largest's width."""
+    return jnp.where(largest > 0, largest * jnp.sqrt(squares / count).astype(largest.dtype), largest)
 
 
 def _widened(leaf):
