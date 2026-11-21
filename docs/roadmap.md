@@ -24,6 +24,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 683 s (a check-1 site: its longest draws task 621 s (1 draws),…. [7603]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - The portable recurrence gradient (tests/test_recurrence_stability.py's scalar-delta site at aligned keys, chunk_on 'xla', as tests/test_gpu_compile_ahead.py's…. [9762]
+- Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -33,7 +34,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5327]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Block-selected attention's other selections as mixers. [6301]
-- Mosaic has no float32 forward at width 256 on Hopper. [6508]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - A certification verdict's key names the ptxas that assembled it by the installed nvcc wheels alone. [7309]
 - The GPU interpreter's race detection (plgpu.InterpretGPUParams(detect_races=True)) flags a correctly ordered consumer-fed ring at one consumer. [7853]
@@ -51,7 +51,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - The interpreter (Pallas Mosaic GPU interpret mode, the CPU suite's) takes about 8 times as long a draw for a tcgen05 (sm100) recurrence launch as for its wgmma…. [6521]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
-- Log-linear attention 6.6x fla's forward on a GH200. [10525]
 
 ## Models and interop
 
