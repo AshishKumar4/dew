@@ -1239,10 +1239,10 @@ def each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
     """Two processes, each seeing one GPU (`CUDA_VISIBLE_DEVICES`): the second's device is global id 1
     and its own ordinal 0, and each process's kernel target holds the CUDA driver's clock, bandwidth and
     multiprocessors for that GPU, the same in both, as GPUs of one kind give."""
-    from process_support import ProcessGroup, free_port, report_of, start_process
+    from process_support import ProcessGroup, coordinator_port, report_of, start_process
 
     worker = Path(__file__).with_name("device_facts_worker.py")
-    coordinator = f"127.0.0.1:{free_port()}"
+    coordinator = f"127.0.0.1:{coordinator_port()}"
     outs = [tmp_path / f"process{rank}.json" for rank in range(2)]
     # The test's own two GPUs, as the run allotted them, one to each process, which allocates on demand
     # beside this process's preallocation.

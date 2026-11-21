@@ -27,7 +27,9 @@ plan steps fastest, a rung that recomputes more at fewer microbatches or the pla
 tell. `--trainer.compile-ahead.frontier`, with each GPU's memory stated, lists past the plan each rung
 above it that fits at fewer microbatches than every plan before it, at the fewest that fit there, and,
 where the ladder's top ('full') is reached, its sibling that offloads the residuals 'minimal' saves
-('minimal_offloaded') at the same split (`compile_ahead`'s `frontier`, `FitSearch.above`);
+('minimal_offloaded') at the same split (`compile_ahead`'s `frontier`, `FitSearch.above`), and below the
+plan each lighter rung the run's remat-first search passed over that fits, at the coarsest split it fits at
+(the plan's `lighter`, `FitSearch.below`: a head's tile, XLA's defaults or no copies at less recomputation);
 tools/benchmark_step.py times each on the GPUs, a case at its remat and head tile, a plan of s
 microbatches as its microbatch's rows accumulated s times (`accumulation`), the time it reports a
 microbatch's, s of them an update; and the run names the fastest by its model's remat, `--trainer.split`
@@ -1104,7 +1106,8 @@ class AheadTarget:
     capacity_gib: float | None = None
     frontier: bool = False
     """Whether the report lists each rung above the plan that fits at fewer microbatches than every plan
-    before it (`compile_ahead`, `FitSearch.above`)."""
+    before it (`compile_ahead`, `FitSearch.above`), and each lighter rung below it that the run's search
+    passed over and that fits (`lighter`, `FitSearch.below`)."""
     multiprocessors: int | None = None
     """The multiprocessors of the GPU of `generation` it compiles for (an H100 PCIe's 114, an L40S's 142),
     where it is not the generation's own (`built_target`): what the step's launches derive for and a GPU
@@ -1487,7 +1490,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     again. Its batch is what `fit` hands to its step (`step_batch`), its fresh state abstract, and
     tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
     time the search took, and with `frontier` each rung above it that fits at fewer microbatches than
-    every plan before it (`FitSearch.above`), compiled and not saved: the plans a run's speed is chosen
+    every plan before it (`FitSearch.above`) and each lighter rung below it its search passed over that fits
+    (`lighter`, `FitSearch.below`), compiled and not saved: the plans a run's speed is chosen
     among (the module's docstring). With `fit`, what the run's `Trainer.fit` over `batch` is asked for, its
     evaluations' programs compile with its start's (`started`). The GPUs' memory is the one their
     compile-only devices carry (`compile_only_gpus`' `memory`, a host topology's own), the plan made against
