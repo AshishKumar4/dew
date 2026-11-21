@@ -126,7 +126,7 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     held = family.adds_through_shared
     # Chunk held fp32 add stages (`stores.staged_columns`: 64 cols = 32 KB at d128 vs 64 KB whole-width) so
     # sm90 64x64 d128 frees 32 KB SMEM for streaming `delta`, `stores_typed`, and extra pipeline stages.
-    stage_width = stores.staged_columns(width, (jnp.float32,)) if held else width
+    stage_width = stores.staged_columns(width, (jnp.float32,)) if held and width <= 128 else width
     stage = family.staged_memory((consumers, max(block_q, block_k), stage_width), jnp.float32)
     kv_swizzles = transposed_swizzles(config, "keys", "values")
     scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("keys")),
