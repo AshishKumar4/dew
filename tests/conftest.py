@@ -308,14 +308,15 @@ def pytest_runtest_setup(item):
         # other in the lane's; both select a file's tests alike, so the tier cuts its groups alike.
         pytest.skip("runs in the lane's process" if users else "runs in a process that computes as a user's "
                     f"does ({lane_environment.USERS_ARITHMETIC}=1)")
-    if tier_wire.preparing():
-        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there, and every
-        # other test of the part's files compiles its check-1 sites' programs (`compiled_ahead`), however it
-        # is marked: the part's run runs each of them on its GPU. One that prepares none runs in the run.
-        return
-    for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
+    # A GPU part's prepare, on its node's CPU (tests/model_flows.py), skips what the part's run skips on its
+    # GPU, a test marked for another backend (a TPU's, the CPU lane's): a flow prepares there, and every other
+    # test of the part's files compiles its check-1 sites' programs (`compiled_ahead`), the run running each
+    # of them on its GPU; one that prepares none runs in the run. Prepared where its run skips it, a test
+    # computed there and was filed unprepared (row 10169's cells, the TPU's ways of test_algebra_scaled).
+    here = "gpu" if tier_wire.preparing() else jax.default_backend()
+    for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu"), ("cpu", "the CPU lane")):
         marker = item.get_closest_marker(backend)
-        if marker and jax.default_backend() != backend:
+        if marker and here != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
 
 
