@@ -236,13 +236,14 @@ def _prefix_halves(g, taken, call: Call):
         def step(index, slots, carry, accumulators):
             slots.acquire_all()
             tile = stream_tile(slots, "decays", gates)
-            decays = tile.value()
             found = None
             if running:
-                _running_prefix(call, rows, carried[0], decays, keys)
+                # Row-major from the slot, as a step's rows are fewer than a warpgroup accumulator's tile
+                # takes (the gates one fp32 part).
+                _running_prefix(call, rows, carried[0], _rows_of(tile.refs[0], keys), keys)
             else:
                 _scan_zeroed(call, rows, keys)
-                found = _intra_prefix(call, rows, decays, keys)
+                found = _intra_prefix(call, rows, tile.value(), keys)
             for i, ref in enumerate((hi_ref, lo_ref)):
                 # A running sum's halves read as each is stored, one tile held at a time: both at once
                 # spilled the program's 128 registers at two programs a multiprocessor (M-JS-145g). Row-major,
