@@ -383,37 +383,38 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
 @lowered_once
 def _prefix_halves(g, taken, call: Call):
     """`(hi, lo) [R, HV * Dk]` fp32: the laid decay `g`'s prefix halves within each chunk
-    (`algebra.scanned_prefix`, `call.gates`), a program a chunk and value head walking its key blocks, as
-    `_intra_walk` scans them: fla_kda's chunk_local_cumsum, a launch the sub-chunk walk and every later launch
-    read (`_sub_chunk_walk`)."""
+    (`algebra.scanned_prefix`, `call.gates`), a program a chunk, value head and key block, each its block's
+    one load, scan and store (`_intra_prefix`): fla_kda's chunk_local_cumsum, a launch the sub-chunk walk and
+    every later launch read (`_sub_chunk_walk`). A program walking its head's key blocks held three a
+    multiprocessor waiting on its scan's shared-memory steps, 150 us of an emulated GH200's Kimi Linear
+    forward against fla's cumsum's 40 measured (M-JS-145b, M-JS-144-gh200)."""
     chunk, width, gates, family = call.chunk, call.width, call.gates, call.family
-    keys = family.depths(jnp.float32)[0] if width % family.depths(jnp.float32)[0] == 0 else algebra.SUB
-    steps = width // keys
+    keys = algebra.SUB * 2 if width % (algebra.SUB * 2) == 0 else algebra.SUB
 
     def program(at, g_ref, taken_ref, hi_ref, lo_ref, *, streams, staging, landing):
         del taken_ref
-        n, h = at["chunks"], at["heads"]
-        row = n * chunk
-        views = stream_views(lambda i: (0, i), decays=gates.views(g_ref, row, chunk, h * width, width))
+        n, h, b = at["chunks"], at["heads"], at["blocks"]
+        row, column = n * chunk, h * width + b * keys
+        views = stream_views(decays=gates.views(g_ref, row, chunk, column, keys))
         (scanned,) = staging
-        before_store = walk_stores(family, 2)
 
         def step(index, slots, carry, accumulators):
+            del index
             slots.acquire_all()
+            _scan_zeroed(call, scanned, keys)
             prefix = _intra_prefix(call, scanned, stream_tile(slots, "decays", gates).value(), keys)
             for i, (half, ref) in enumerate(zip(prefix, (hi_ref, lo_ref), strict=True)):
-                before_store()
-                gates.store(ref, half, row, chunk, h * width + index * keys, keys, family=family,
-                            smem=landing[f"prefix{i}"], wait=False)
+                gates.store(ref, half, row, chunk, column, keys, family=family, smem=landing[f"prefix{i}"])
             return carry, accumulators
 
-        return mosaic.Walk(views, step, steps=steps, prologue=lambda: _scan_zeroed(call, scanned, keys))
+        return mosaic.Walk(views, step)
 
     blocks = stream_blocks(decays=((chunk, keys), gates))
     landing = {f"prefix{i}": gates.landing(chunk, keys) for i in (0, 1)}
     return launch_kernel(program, call, out_type=(gates.shape(call.heads * width),) * 2,
-                         grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=blocks,
-                         stages=2, live=chunk_liveness(1), steps=steps, model=chunk * width,
+                         grid=(call.chunks, call.heads, width // keys),
+                         grid_names=("chunks", "heads", "blocks"),
+                         blocks=blocks, stages=1, live=chunk_liveness(1), steps=1, model=chunk * keys,
                          held=Held(phases=([f32(chunk, keys)] * 5,)),
                          staging=(swizzling.plain((2, 2 * chunk, keys), jnp.float32),), landing=landing)(
         g, taken)
