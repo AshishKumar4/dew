@@ -166,6 +166,9 @@ test = [
     # tools/armada/ci.py reads a pytest stalled past its deadline from outside it, every thread's Python
     # frames and the native ones under them, a thread holding the GIL in native code included (`dumped`).
     "py-spy",
+    # tools/armada/natives.py reads a process a signal ends from outside it, each OS thread's native and Python
+    # frames, a thread with no Python state too, beside py-spy (train 791's review F7: no fetch of its own).
+    "pystack==1.7.2; sys_platform == 'linux'",
     # Property, metamorphic and fuzz tests (docs/design/testing.md), under tests/conftest.py's
     # derandomized profile.
     "hypothesis",
