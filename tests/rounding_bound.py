@@ -248,6 +248,13 @@ def _weight(equation, params, operands, value):
         return FUNCTIONS[primitive] * magnitude
     if primitive is jax.lax.integer_pow_p:
         return max(abs(int(params["y"])) - 1, 1) * magnitude
+    if primitive is jax.lax.pow_p:
+        # A float's power (Adam's bias correction, `1 - b**count`): at an integer exponent rounding as an
+        # integer power's, `max(|e| - 1, 1)` times, else through `exp(e log x)`, by each function's ulps;
+        # `_dew_torch.rounding`'s rule for aten.pow, element by element.
+        exponent = jnp.broadcast_to(operands[1], jnp.shape(value))
+        whole = jnp.maximum(jnp.abs(exponent) - 1, 1)
+        return jnp.where(exponent == jnp.round(exponent), whole, ULPS["exp"] + ULPS["log"]) * magnitude
     if primitive is jax.lax.reduce_p and params["computation"] in compensating():
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
         # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
