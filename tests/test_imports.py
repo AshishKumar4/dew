@@ -170,8 +170,7 @@ FOREIGN |= {"dew.quantization": ("dew.training",),
             **dict.fromkeys(("dew.inputs.condition", "dew.inputs.diffusion", "dew.inputs.encoders",
                              "dew.inputs.spec"), ("dew.interop",)),
             # Primitive owners register Pallas Triton lowerings lazily on first pallas_call (row 9794).
-            **dict.fromkeys(("dew.nn.precision", "dew.nn.derivatives", "dew.algebra.scaled"),
-                            ("jax._src.pallas.triton",))}
+            **dict.fromkeys(("dew.nn.precision", "dew.nn.derivatives"), ("jax._src.pallas.triton",))}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
