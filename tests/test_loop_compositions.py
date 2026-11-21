@@ -5,12 +5,14 @@ exit gate or none, each pair of them met at least once and all four together, ea
 stepped on the CPU."""
 
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from test_loop_sampled import CAP, TRAINED, token_batch
-from test_pass_weights import phased_trainer
+from test_pass_weights import looped, phased_trainer
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
@@ -29,8 +31,10 @@ COMPOSED = [
                          ids=lambda value: "on" if value else "off")
 def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copies, gated):
     """A bf16 decoder of three layers whose middle one loops `CAP` passes, its features composed: it plans
-    and takes four steps, two microbatches an update, each loss finite; it holds narrow copies where they
-    are on and none where off; and a drawn pass count steps more than one count."""
+    and takes four steps, two microbatches an update, committing two updates, each loss finite; it holds
+    narrow copies where they are on and none where off; and a drawn pass count steps more than one count,
+    each microbatch's loss, with every feature on, that of the program a run fixed at its count compiles
+    from the same state (its copies or its weights read whole the same values)."""
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
                               max_seq_len=128, attention_impl="xla", dtype=jnp.bfloat16,
                               loop=Loop(CAP, layers=(1, 2), implicit=implicit, step_norm=not implicit,
@@ -41,14 +45,24 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         interval = Interval(0.0, None, microbatches=0)
-        counts = []
+        counts, fixed = [], {}
         for index in range(4):
             if isinstance(step, DrawingStep):
                 step.drawn(interval, index)
                 counts.extend(step.counts)
+            given = (jax.device_get(state), jax.tree.map(lambda leaf: leaf.sharding, state))
             state, loss, *_ = step(state, batch)
             assert np.isfinite(float(loss)), (index, counts)
+            if drawn and implicit and copies and gated:
+                (count,) = step.counts
+                if count not in fixed:
+                    alone = phased_trainer(model.with_passes(count), 0, None, accumulation=2)
+                    start, _, _ = alone.place()
+                    fixed[count] = alone.compile(start, batch)
+                own_loss = fixed[count](jax.device_put(*given), batch)[1]
+                np.testing.assert_array_equal(np.asarray(loss), np.asarray(own_loss), err_msg=f"{index}")
     assert isinstance(step, DrawingStep) == drawn and (not drawn or len(set(counts)) > 1), counts
+    assert int(state.step) == 2, int(state.step)
     held = [] if state.compute is None else jax.tree.leaves(state.compute)
     assert bool(held) == copies, (drawn, implicit, copies, gated)
 
@@ -59,8 +73,11 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
     step is refused, naming why, where read whole it plans and steps (row 10770's composition audit)."""
     import optax
 
+    from dew.mesh import MeshSpec
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, Trainer
+    from dew.training.ahead import compile_ahead
 
     class Normalized(LMObjective):
         def batch_statistics(self, variables, part_at, split):
@@ -70,15 +87,55 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
                               max_seq_len=128, attention_impl="xla", loop=Loop(CAP, layers=(1, 2)))
     batch = token_batch()
 
-    def compiled(split: int):
-        trainer = Trainer(Normalized(model, 16), optax.sgd(0.1), key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), phase_passes=None,
-                          sampled_passes=TRAINED, accumulation=2, split=split)
+    def trainer_of(split: int, law=TRAINED):
+        return Trainer(Normalized(model, 16), optax.sgd(0.1), key=jax.random.key(0),
+                       layout=Layout(min_shard=1, tolerance=1.0), phase_passes=None,
+                       sampled_passes=law, accumulation=2, split=split)
+
+    def stepped(trainer) -> float:
         state, _, _ = trainer.place()
-        return trainer.compile(state, batch), state
+        step = trainer.compile(state, batch)
+        step.drawn(Interval(0.0, None, microbatches=0), 0)
+        return float(step(state, batch)[1])
 
     with pytest.raises(ValueError):
-        compiled(2)
-    step, state = compiled(1)
-    step.drawn(Interval(0.0, None, microbatches=0), 0)
-    assert np.isfinite(float(step(state, batch)[1]))
+        stepped(trainer_of(2))
+    # A build ahead admits the counts as the run does, and refuses alike.
+    built = trainer_of(2)
+    built.device_mesh = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2 ** 30))
+    with pytest.raises(ValueError):
+        compile_ahead(built, batch)
+    assert np.isfinite(stepped(trainer_of(1)))
+    # A law of one count compiles its cap's step alone, whose parts read the statistics of their own model.
+    assert np.isfinite(stepped(trainer_of(2, dataclasses.replace(TRAINED, cap=1))))
+
+
+def test_a_drawn_count_whose_metric_is_another_kind_of_mean_over_the_same_leaves_is_refused():
+    """A count whose step returns the same metric over the same leaves as its cap's, pooled as another kind
+    of mean (an `Exponentiated` where the cap's is a `Ratio`), would pool with the cap's as the cap's: its
+    admission is refused, where the same metric as one kind at every count steps (row 10770's audit)."""
+    import optax
+
+    from dew.objectives.base import Exponentiated, Ratio
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+
+    def objective(kind_at):
+        class Kinded(LMObjective):
+            def loss(self, variables, batch, step):
+                stats, aux = super().loss(variables, batch, step)
+                kind = kind_at(self.model.loop.steps)
+                named = {**aux.metrics, "spread": kind(jnp.zeros(()), jnp.ones(()))}
+                return stats, dataclasses.replace(aux, metrics=named)
+        return Kinded(looped(steps=CAP), 16)
+
+    def compiled(kind_at):
+        trainer = Trainer(objective(kind_at), optax.sgd(0.1), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED, split=2,
+                          accumulation=2)
+        state, _, _ = trainer.place()
+        return trainer.compile(state, token_batch())
+
+    with pytest.raises(ValueError):
+        compiled(lambda steps: Ratio if steps == CAP else Exponentiated)
+    assert isinstance(compiled(lambda steps: Ratio), DrawingStep)
