@@ -257,11 +257,8 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
                                            raw_scale, out_dtype, out_heads) for block in blocks}
 
     def seconds(block: int) -> float:
-        per_program, total, launched = candidates[block]
-        # A program a wave where the target states no multiprocessors; traffic free where no rate is known.
-        waves = -(-launched // (target.multiprocessors or 1))
-        traffic = total.device_bytes / target.memory_rate if target.memory_rate else 0.0
-        return max(waves * cost.walked(per_program, target), traffic)
+        _, total, launched = candidates[block]
+        return cost.launch_seconds(total, launched, target)
 
     chosen = min(blocks, key=lambda block: (seconds(block), -block))
     return chosen, candidates[chosen][1]

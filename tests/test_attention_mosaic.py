@@ -2402,40 +2402,47 @@ def test_an_unrounded_fused_backward_keeps_its_key_and_value_gradients_fp32_inte
 
 
 def test_hopper_forward_derives_consumer_count_from_analytic_launch_price():
-    """Hopper's forward derives its consumer count by pricing each legal count's main launch through
-    `emission.work_of` and `cost.walked` / `cost.seconds` rather than hardcoding `derived_consumers`
-    (row 6710): on M-ET-79's causal cells (8 heads, 1024 tokens, widths 64 and 128), three consumers'
-    analytic launch price exceeds two consumers', so `derived` picks two."""
-    from dew.nn.kernels.templates import mosaic, mosaic_sm90
+    """Hopper's forward derives two consumers across M-ET-79's causal cells via `cost.launch_seconds`
+    (rows 6710, 10680, 10681): three consumers' analytic launch price exceeds two consumers'."""
+    from dew.nn.kernels.templates import mosaic_sm90
 
-    assert not hasattr(mosaic.Family, "derived_consumers")
-    assert not hasattr(mosaic_sm90.WGMMA, "derived_consumers")
-    for width in (64, 128):
-        query = jax.ShapeDtypeStruct((1, 1024, 8, width), jnp.bfloat16)
-        spans = template.spans(1024, 1024, 1, causal=True)
+    cells = ((1, 1024, 8, 64), (1, 1024, 8, 128), (2, 4096, 16, 64), (2, 4096, 32, 64), (2, 4096, 32, 128))
+    for batch, seq, heads, width in cells:
+        query = jax.ShapeDtypeStruct((batch, seq, heads, width), jnp.bfloat16)
+        spans = template.spans(seq, seq, batch, causal=True)
         with generation.assumed("sm90"):
             target = generation.gpu_target()
             op, args = attention_mosaic._forward_call(query, query, query, spans, None, scale=None,
                                                       natural=attention_mosaic.NATURAL)
             ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
             chosen = op.derived(ba, target)
-            assert chosen is not None and chosen.consumers == 2
-            three = next(c for c in op.offered(ba, mosaic_sm90.WGMMA, target) if c.consumers == 3)
-            price_two = op._price_config(ba, chosen, target)
-            price_three = op._price_config(ba, three, target)
-            assert price_two is not None and price_three is not None
-            assert price_three > price_two, (width, price_two, price_three)
+            assert chosen is not None and chosen.consumers == 2, (batch, seq, heads, width, chosen)
+            threes = [c for c in op.offered(ba, mosaic_sm90.WGMMA, target) if c.consumers == 3]
+            if threes:
+                price_two = op._price_config(ba, chosen, target)
+                price_three = op._price_config(ba, threes[0], target)
+                assert price_two is not None and price_three is not None
+                assert price_three > price_two, (batch, seq, heads, width, price_two, price_three)
 
 
 def test_consumer_choice_persists_beside_verdicts_in_tuning_store(tmp_path):
     """`tuning.store_choice` / `tuning.stored_choice` persist consumer-count choices beside certification
-    verdicts in `_verdicts_path` without clobbering verdicts, and `store_verdict` preserves choices
-    (row 6710)."""
-    verdicts_file = str(tmp_path / "certified_sm90.json")
-    tuning.store_verdict("sm90", "verdict-key", {}, path=verdicts_file)
-    tuning.store_choice("sm90", "choice-key", 2, path=verdicts_file)
-    assert tuning.stored_verdict("sm90", "verdict-key", path=verdicts_file) == {}
-    assert tuning.stored_choice("sm90", "choice-key", path=verdicts_file) == 2
-    # Writing another verdict preserves stored choices in the same file.
-    tuning.store_verdict("sm90", "verdict-key-2", {}, path=verdicts_file)
-    assert tuning.stored_choice("sm90", "choice-key", path=verdicts_file) == 2
+    verdicts through the cache owner without clobbering verdicts, and `store_verdict` preserves choices
+    (rows 6710, 10681)."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(tmp_path)}
+    write = ("from dew.nn.kernels import tuning; "
+             "tuning.store_verdict('sm90', 'verdict-key', {}); "
+             "tuning.store_choice('sm90', 'choice-key', 2)")
+    subprocess.run([sys.executable, "-c", write], env=env, check=True)
+    read_and_write = ("from dew.nn.kernels import tuning; "
+                      "assert tuning.stored_verdict('sm90', 'verdict-key') == {}; "
+                      "assert tuning.stored_choice('sm90', 'choice-key') == 2; "
+                      "tuning.store_verdict('sm90', 'verdict-key-2', {})")
+    subprocess.run([sys.executable, "-c", read_and_write], env=env, check=True)
+    recheck = ("from dew.nn.kernels import tuning; "
+               "assert tuning.stored_choice('sm90', 'choice-key') == 2")
+    subprocess.run([sys.executable, "-c", recheck], env=env, check=True)

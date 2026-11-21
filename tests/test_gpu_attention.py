@@ -349,3 +349,9 @@ def test_the_mosaic_template_holds_on_an_h100(part):
     never derives (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's
     `_repeat_promised`) they failed as unpaired draws (row 3171)."""
     run_cells(parted(covering(mosaic_cells()), part, MOSAIC_PARTS))
+
+
+def test_a_finished_split_merge_preserves_subnormal_initial_mass_on_this_gpu():
+    """Row 10819: the Pallas `merged_finished` kernel on GPU preserves subnormal initial mass (`2^-127`)
+    as `1.0` and truly empty rows as `0.0`."""
+    test_merged.test_a_finished_split_merge_preserves_subnormal_initial_mass()
