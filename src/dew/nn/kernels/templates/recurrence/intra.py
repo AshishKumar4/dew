@@ -238,8 +238,8 @@ def _prefix_halves(g, taken, call: Call):
             tile = stream_tile(slots, "decays", gates)
             found = None
             if running:
-                # Row-major from the slot, as a step's rows are fewer than a warpgroup accumulator's tile
-                # takes (the gates one fp32 part).
+                # Row-major from the slot, plain (`_plain_decays`), as a step's rows are fewer than a
+                # warpgroup accumulator's tile takes (the gates one fp32 part).
                 _running_prefix(call, rows, carried[0], _rows_of(tile.refs[0], keys), keys)
             else:
                 _scan_zeroed(call, rows, keys)
@@ -270,7 +270,14 @@ def _prefix_halves(g, taken, call: Call):
                          grid_names=("chunks", "heads", "blocks"), blocks=blocks, stages=1,
                          live=chunk_liveness(1), steps=steps, model=chunk * keys, held=held,
                          staging=_prefix_staging(chunk, keys, running=running), landing=landing,
-                         issues=False)(g, taken)
+                         issues=False, swizzles=_plain_decays(running=running))(g, taken)
+
+
+def _plain_decays(*, running: bool) -> dict[str, int] | None:
+    """The running sum's decays' slot unswizzled (`swizzling.UNSWIZZLED`): its rows read into registers alone,
+    a step's fewer than a warpgroup accumulator's tile, which a family's swizzled slot took in no layout (an
+    sm80's and an sm100's, jsf-kdan-bis); the doubling's the family's own."""
+    return {"decays0": swizzling.UNSWIZZLED} if running else None
 
 
 def _running_rows(chunk: int) -> int:
@@ -292,7 +299,8 @@ def _running(call: Call) -> bool:
     chunk, keys, gates = call.chunk, scan.THREADS, call.gates
     rows = _running_rows(chunk)
     _, scope, _, _ = shared_allocation(call, stream_blocks(decays=((rows, keys), gates)),
-                                       _prefix_staging(chunk, keys, running=True), {}, issues=False)
+                                       _prefix_staging(chunk, keys, running=True), {}, issues=False,
+                                       swizzles=_plain_decays(running=True))
     return resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
 
 
