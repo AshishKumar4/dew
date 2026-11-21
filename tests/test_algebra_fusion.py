@@ -346,6 +346,48 @@ def test_a_product_whose_epilogue_the_template_refuses_is_fused_without_it():
     assert last.primitive is jax.lax.mul_p
 
 
+def four_float32_terms(x, w, a, b, c, d):
+    """A projection whose consumers read four float32 arrays of its product's shape: on an A100 its epilogue's
+    side tiles derive the launch at one program a multiprocessor, where the product alone takes two
+    (FS-HOOKED-RES)."""
+    return ((x @ w).astype(jnp.float32) * a + b * c + d).astype(jnp.bfloat16)
+
+
+def one_float32_term(x, w, a):
+    """A projection plus one float32 array of its product's shape, which keeps the launch's programs."""
+    return ((x @ w).astype(jnp.float32) + a).astype(jnp.bfloat16)
+
+
+def test_a_neighbour_costing_the_launch_a_program_stays_outside_it():
+    """A neighbour joins the kernel where the kernel with it keeps its residency (KERNEL-TEMPLATES-13, row
+    9032). On an A100 whose template a call names: a projection whose consumers read four float32 arrays of
+    its product's shape is not fused, though its price favours it, its product the template's launch at the
+    programs a multiprocessor the product alone takes and its consumers XLA's after it; one float32 array,
+    which keeps the launch's programs, is its epilogue."""
+    from dew.nn.kernels import tuning
+
+    x, w = jax.ShapeDtypeStruct((2048, 2560), jnp.bfloat16), jax.ShapeDtypeStruct((2560, 9216), jnp.bfloat16)
+    term = jax.ShapeDtypeStruct((2048, 9216), jnp.float32)
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
+        with tuning.seen() as alone:
+            jax.jit(algebra.rewritten(lambda x, w: x @ w, kernels=True)).trace(x, w)
+        with generation.routes() as found, tuning.seen() as four:
+            terms = (term,) * 4
+            traced = jax.jit(algebra.rewritten(four_float32_terms, kernels=True)).trace(x, w, *terms)
+        fused = [route for route in found if route.choice == "gemm_epilogue" and route.kernel == "fused"]
+        assert not fused, [(route.choice, route.kernel) for route in found]
+        programs = [config.programs for config, _ in four.taken]
+        assert programs and programs == [config.programs for config, _ in alone.taken], (four.taken,
+                                                                                         alone.taken)
+        program = traced.jaxpr.jaxpr
+        (last,) = (equation for equation in program.eqns if set(equation.outvars) & set(program.outvars))
+        assert last.primitive is jax.lax.convert_element_type_p, last.primitive
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(one_float32_term, kernels=True)).trace(x, w, term)
+        assert any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found), [
+            (route.choice, route.kernel) for route in found]
+
+
 def named_gate(x, w, up):
     """A gate projection named for remat (`checkpoint_name`, as Dew's models name gate_proj) and its SwiGLU
     with `up` after it, the activation written entry by entry (`jax.nn.silu`'s own derivative rule is a call
