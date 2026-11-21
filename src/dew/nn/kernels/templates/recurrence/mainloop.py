@@ -686,16 +686,20 @@ STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype", "solves")
 and its constants; its every other argument an array or None."""
 
 
+_ALONE = "recurrence_alone"
+"""A forward alone's kernels' prefix (`named`), no other launch's name's."""
+
+
 def named(name: str, call: "Call | None") -> str:
-    """The kernel `name` (`recurrence...`) as `call` launches it: a forward alone's `recurrence_alone...`
+    """The kernel `name` (`recurrence...`) as `call` launches it: a forward alone's `_ALONE...`
     (`Call.alone`), a prefix no other launch's name starts, as the template matches a kernel to its launch
     (`template._owner`, the longest name it starts with)."""
-    return name.replace("recurrence", "recurrence_alone", 1) if call is not None and call.alone else name
+    return name.replace("recurrence", _ALONE, 1) if call is not None and call.alone else name
 
 
 def ran_alone(kernel: str) -> bool:
     """Whether a forward alone launched `kernel` (`named`): a refusal of it is that product's alone."""
-    return kernel.startswith("recurrence_alone")
+    return kernel.startswith(_ALONE)
 
 
 def building(kernels: Callable[[Callable], Collection[str]]) -> Callable[[Callable], Callable]:

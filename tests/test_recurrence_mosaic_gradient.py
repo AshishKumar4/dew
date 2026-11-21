@@ -513,14 +513,19 @@ def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
         first = template.MOSAIC.derived(bound, target)
-        base = template._base(first)
-        report.refuse([(report._identity(template.MOSAIC, bound), rung, {kernel})
-                       for rung in (base, *template.MOSAIC.rungs(bound, base))])
+        base, identity = template._base(first), report._identity(template.MOSAIC, bound)
+        # The base refused first, whose ladder its rungs then are (`rungs` walks a refused config's).
+        report.refuse([(identity, base, {kernel})])
+        rungs = list(template.MOSAIC.rungs(bound, base))
+        report.refuse([(identity, rung, {kernel}) for rung in rungs])
         stepped = template.MOSAIC.derived(bound, target)
 
-        def others(tiles):
-            if alone:
+        def launches(tiles, training: bool):
+            if training:
                 return template.MOSAIC.launches(bound, tiles, target, backward=True)
             return template.MOSAIC.launches(bound, tiles.forward or tiles, target, backward=False)
 
-        assert stepped is not None and stepped != first and others(stepped) == others(first), (first, stepped)
+        assert rungs and stepped is not None, (first, rungs, stepped)
+        # The spent product off its ladder, the other's launches as they were.
+        assert launches(stepped, not alone) != launches(first, not alone), (first, stepped)
+        assert launches(stepped, alone) == launches(first, alone), (first, stepped)
