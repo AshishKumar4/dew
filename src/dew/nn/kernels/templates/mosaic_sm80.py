@@ -449,7 +449,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         (an instruction's granule): what a step's prefetch holds across the step before's last product is
         then the one instruction's fragments the lookahead holds within a step, no register beyond it."""
         instruction = self.fragment_depth(int(rhs.shape[0]))
-        widest = 0 if sliced else self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=swizzling.swizzle_of(lhs))
+        widest = 0 if sliced else self.lhs_fragment_depth(int(lhs.shape[1]),
+                                                           swizzle=swizzling.swizzle_of(lhs))
         lhs_depth = max(_depth_granule(lhs, 1, instruction), widest)
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
