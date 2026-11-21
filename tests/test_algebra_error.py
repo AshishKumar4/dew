@@ -10,7 +10,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra.error import choose, product_precision
+from dew.algebra.error import at_least, choose, product_precision
 from dew.nn import programs
 from dew.parity import GateFailure
 
@@ -169,6 +169,38 @@ def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
         product_precision(*shape, jnp.float32, admits=lambda preset: False)
     eight = product_precision(*shape, jnp.float8_e4m3fn, admits=lambda preset: True)
     assert programs.dot_arithmetic(eight, jnp.float8_e4m3fn, jnp.float8_e4m3fn).operand_bits == (8, 8)
+
+
+def test_an_algorithm_at_least_another_is_as_exact_as_it():
+    """A site's gate stated as an algorithm (`at_least`, row 5473) admits, of the algorithms this backend
+    runs fp32 operands in, only ones whose product is as exact as the algorithm asked's from the float64
+    truth (check 1 between them, over every pair), by what each states of its arithmetic alone: its
+    operands' significand digits, its parts and its accumulation. Every algorithm is at least itself, so a
+    site asking its upstream's algorithm can always take it."""
+    shape = (64, 128, 32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (rng.standard_normal(shape[:2]).astype(np.float32),
+                rng.standard_normal(shape[1:]).astype(np.float32))
+
+    def product(preset):
+        return jax.jit(lambda x, y: jnp.dot(x, y, precision=preset, preferred_element_type=jnp.float32))
+
+    runs = []
+    for preset in jax.lax.DotAlgorithmPreset:
+        try:
+            product(preset)(*draw(0))
+        except ValueError:  # this backend's dot_general refuses the algorithm
+            continue
+        if programs.dot_arithmetic(preset, jnp.float32, jnp.float32) is not None:
+            runs.append(preset)
+    for asked in runs:
+        admits = at_least(asked, jnp.float32)
+        assert admits(asked)
+        for chosen in filter(admits, runs):
+            assert_as_exact(product(chosen), product(asked), draw, f"{chosen.name}, at least {asked.name}",
+                            seeds=8)
 
 
 def cancelled(seed):
