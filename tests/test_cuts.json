@@ -23,10 +23,10 @@
 ],
 "tests/test_algebra_scaled.py": [
 "tests/test_algebra_scaled.py::test_a_merge_under_shard_map_and_under_a_sharded_jit_is_each_shards_own",
-"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-a zero mass]",
-"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-drawn]",
-"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[on a gpu-a zero mass]",
-"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-drawn]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-along its anchors]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-batched]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[on a gpu-along every operand]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-its gradient's derivative]",
 "tests/test_algebra_scaled.py::test_a_merged_state_is_the_same_on_whichever_axis_its_states_lie[jitted]",
 "tests/test_algebra_scaled.py::test_a_merged_state_of_broadcast_anchors_is_its_output_and_its_total[a common scalar]",
 "tests/test_algebra_scaled.py::test_a_merged_state_under_an_explicit_mesh_drops_its_states_axis_from_its_shardings",
@@ -129,6 +129,9 @@
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[one-query-sm90-1]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[verify-four-sm90-1]",
 "tests/test_attention_decode_template.py::test_a_verify_blocks_drafts_read_their_prefix_causally_interpreted[8]"
+],
+"tests/test_attention_derived.py": [
+"tests/test_attention_derived.py::test_the_derived_backward_is_on_par_in_every_cell[causal-queries-first-scaled-dout]"
 ],
 "tests/test_attention_dropout.py": [
 "tests/test_attention_dropout.py::test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term[training-mosaic]",
@@ -288,9 +291,9 @@
 "tests/test_attention_mosaic_compile.py::test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100[0]",
 "tests/test_attention_mosaic_compile.py::test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100[1]",
 "tests/test_attention_mosaic_compile.py::test_a_ladder_holds_no_rung_its_assembler_caps_otherwise",
-"tests/test_attention_mosaic_compile.py::test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them",
-"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[sm100]",
-"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[sm89]",
+"tests/test_attention_mosaic_compile.py::test_a_launch_is_certified_once_a_machine",
+"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[sm120]",
+"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[sm90]",
 "tests/test_attention_mosaic_compile.py::test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources[sm100-256]",
 "tests/test_attention_mosaic_compile.py::test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources[sm80-64]",
 "tests/test_attention_mosaic_compile.py::test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources[sm90-256]",
@@ -304,7 +307,7 @@
 "tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm100]",
 "tests/test_attention_mosaic_compile.py::test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free[e4m3fn]",
 "tests/test_attention_mosaic_compile.py::test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free[sm80]",
-"tests/test_attention_mosaic_compile.py::test_each_attention_launch_states_its_outputs_dimensions_for_an_h100[fast]",
+"tests/test_attention_mosaic_compile.py::test_bf16_template_compiles_for_a_v5e",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[decision-inference]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[decision-training]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[step-inference]",
@@ -486,7 +489,7 @@
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a small weight on a large value, float32-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share of an overflowing row, float32-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a weight at the exponent's edge on a large value, float32-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys an ulp apart, bfloat16-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys an ulp apart, bfloat16-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[small values beside unseen ones near fp32's largest, float32-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/4, cotangents near 2**125-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values near fp32's largest over 256 equal keys-portable]",
@@ -536,8 +539,8 @@
 "tests/test_attention_triton.py::test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block[64]",
 "tests/test_attention_triton.py::test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_over_every_call_form[causal-window-Tiles(block_q=128, block_k=64, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-chunk]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[custom-vjp-bfloat16-default]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-widest-window]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[custom-vjp-float16-accurate]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[row-indexed-bfloat16-default]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[softcap-sinks-alibi-float16-default]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm120-backward]",
@@ -756,8 +759,8 @@
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[lm]"
 ],
 "tests/test_contracts_algebra.py": [
-"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[near the least normal]",
-"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[normal]"
+"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[its forward derivatives of the gradient]",
+"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[its gradient's gradient]"
 ],
 "tests/test_contracts_attention.py": [
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-first orders]",
@@ -1001,6 +1004,9 @@
 "tests/test_decision_state_once.py::test_each_question_reads_the_shared_part_and_itself",
 "tests/test_decision_state_once.py::test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores",
 "tests/test_decision_state_once.py::test_sibling_questions_packed_a_window_read_each_their_own_requests_context"
+],
+"tests/test_decision_streams.py": [
+"tests/test_decision_streams.py::test_each_token_reads_exactly_what_its_streams_record_says_in_a_packed_window[joint]"
 ],
 "tests/test_decision_task.py": [
 "tests/test_decision_task.py::test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in",
@@ -1675,9 +1681,6 @@
 ],
 "tests/test_in_context_generation.py": [
 "tests/test_in_context_generation.py::test_a_decode_reads_the_logits_its_training_forward_gives[an adapter]"
-],
-"tests/test_indexer_training.py": [
-"tests/test_indexer_training.py::test_the_loss_its_gradient_and_the_selection_are_maxtexts[packed_dense]"
 ],
 "tests/test_inference.py": [
 "tests/test_inference.py::test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds",
