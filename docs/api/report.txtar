@@ -167,7 +167,7 @@ class Objective()  [dew.objectives.base]
   .parameter_axes: cached property -> dict[tuple[str, ...], LogicalAxes]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
-  .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
+  .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
   .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
@@ -272,7 +272,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .parameter_axes: cached property -> dict[tuple[str, ...], LogicalAxes]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
-  .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
+  .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
   .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
@@ -367,7 +367,7 @@ def jit(function: Callable[P, R], **arguments: Unpack[JitArguments]) -> OuterPro
 module kernels  [dew.kernels]
   class KernelRefused(choice: str, kernel: str, first: Refusal, rest: Iterator[Refusal]) -> None  [dew.nn.kernels.selection]
     .refusals: property -> list[Refusal]
-  choices = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule', 'gated_mlp', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'nvfp4_block', 'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
+  choices = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule', 'gated_mlp', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'nvfp4_block', 'paged_decode', 'qkv', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
   def use(**kernels: str) -> Iterator[None]  [dew.nn.kernels.generation]
 def pipeline(source: str, *, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, dtype: DTypeLike | None = None, param_dtype: DTypeLike | Literal['auto'] | None = None, ema: bool | None = None, step: int | str | None = None, revision: str | None = None, trust: Sequence[str] = (), options: SourceOptions | None = None, precision: Numerics | str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask  [dew.inference.loading]
 def register(name: str, /) -> Callable[[M], M]  [dew.registry]
@@ -622,6 +622,7 @@ dew.config.trainer.TrainerConfig
   mesh: MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
   layout: Annotated[Layout, tyro.conf.subcommand('layout')] | None = None
+  layout_unsettable: Annotated[bool, tyro.conf.Suppress] = True
   profile: ProfileWindow | None = None
   run_profile: RunProfile | None = dew.training.profiling.RunProfile()
   compilation_cache_dir: str | None = None

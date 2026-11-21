@@ -463,14 +463,15 @@ def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_p
     with prepared(store, stamp="a", target=model_flows.node_target()):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
     sites = [json.loads(site.read_text()) for site in store.glob("*/site.json")]
+    # Its truths, its arms, and its reference's twin as written (`arm_forms._written_twin`), apart.
     assert sorted((site["arms"], site["host"], "at_run" in site) for site in sites) == [
-        (False, False, True), (True, False, True)], sites
+        (False, False, True), (True, False, True), (True, False, True)], sites
     # Their memory read offline, by which the lane sizes the run's worker (`compiled_memory`).
     assert all(site["memory"] for site in sites), sites
     with compiled_truths(store, prepare=False, stamp="a"):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
-    # Its truths and its two arms, each named once.
-    assert len(json.loads((store / AT_RUN).read_text())["reasons"]) == 3
+    # Its truths, its two arms and its reference's twin, each named once.
+    assert len(json.loads((store / AT_RUN).read_text())["reasons"]) == 4
     assert not (store / UNPREPARED).exists()
 
 

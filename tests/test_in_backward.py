@@ -10,7 +10,7 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact, dew_path, widened
 from token_support import token_rows
 
 from dew.distributed.batches import shard_batch
@@ -109,7 +109,7 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
     def draw(seed):
         return (jax.random.randint(jax.random.key(seed), (2, SEQ), 0, VOCAB),)
 
-    assert_as_exact(jax.jit(in_backward_step), jax.jit(whole_step(plain, layered)), draw,
+    assert_as_exact(jax.jit(in_backward_step), dew_path(jax.jit(whole_step(plain, layered))), draw,
                     "a run updating in its backward", seeds=RUN_SEEDS,
                     truth_fn=jax.jit(whole_step(wide, widened(layered))), conditioning=RUN_CONDITIONING)
 

@@ -5,6 +5,7 @@ whose barriers count the arrivals of the roles that fill and give back each."""
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -157,7 +158,8 @@ class Schedule:
                              f"warpgroup's {WARPS}")
         return places
 
-    def run[R](self, *, exclusive: bool = False, **bodies: Callable[..., R]) -> R | None:
+    def run[R](self, *, exclusive: bool = False, static: str | None = None,
+               **bodies: Callable[..., R]) -> R | None:
         """Each role's body by its name, at its index among its role's units: on a schedule of one role,
         `body(index)` on every warpgroup, its index along `axis` (the value it returns, a program's whose
         consumers keep theirs); otherwise each raised role's `body(index)` on its warpgroups, their
@@ -170,7 +172,9 @@ class Schedule:
         producer's register drop, where a B200's forward at width 256 held the consumers' values across it
         and spilled 172 bytes, 112 under one switch and none with its values formed in each role (row
         5466); a switch commons a value both bodies read above their register instructions, where a
-        recurrence's persistent tile index and its count spilled 52 bytes, conditionals apart none."""
+        recurrence's persistent tile index and its count spilled 52 bytes, conditionals apart none.
+        `static` names a role each of whose warpgroups is a branch of its own, its index a static number, so
+        the warpgroup index selects the branch alone, none of it carried across the register move."""
         if set(bodies) != {role.name for role in self.roles}:
             raise ValueError(f"a schedule of {[role.name for role in self.roles]} given bodies for "
                              f"{sorted(bodies)}")
@@ -186,17 +190,21 @@ class Schedule:
         moving = MOVES.get()
         branches, bounds, first = [], [], 0
         for role in self.raised:
-            def raised(role=role, first=first):
+            def raised(role=role, first=first, index=None):
                 if moving:
                     plgpu.set_max_registers(budgets[role.name], action="increase")
                 # The first role's warpgroups are those below its count, each its own index: no bound and no
                 # shift is traced for it (an attention forward's spill-free registers on an H100 turn on it,
                 # test_attention_mosaic's compile gate).
-                bodies[role.name](wg if first == 0 else wg - first)
+                bodies[role.name]((wg if first == 0 else wg - first) if index is None else index)
 
-            branches.append(raised)
+            if role.name == static and role.count > 1:
+                branches.extend(functools.partial(raised, index=index) for index in range(role.count))
+                bounds.extend(range(first + 1, first + role.count + 1))
+            else:
+                branches.append(raised)
+                bounds.append(first + role.count)
             first += role.count
-            bounds.append(first)
         lowered = [role for role in self.roles if not role.weight]
 
         def lower():

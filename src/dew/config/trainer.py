@@ -269,6 +269,11 @@ class TrainerConfig:
     """The layout the run's trainer is given (`Trainer`'s `layout`): unset, the layout chooser decides
     (`dew.training.streaming.laid_start`); stated, as `--trainer.layout.min-shard 8`, its own, the device
     layout kept."""
+    layout_unsettable: Annotated[bool, tyro.conf.Suppress] = True
+    """That the record states `layout` as this Dew does, unset as null: a record written while it could not
+    be unset (`Layout()` its default) lacks it, and reads `Layout()` as unset
+    (`dew.config.earlier.earlier_trainer_layout`), where one written since keeps a stated `Layout()`
+    (row 9664)."""
     profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before them and the output directory, in place
     of the run's own (`run_profile`). Unset traces the run's own window alone.

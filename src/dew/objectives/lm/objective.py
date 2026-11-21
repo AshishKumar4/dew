@@ -121,9 +121,12 @@ from dew.objectives.base import (
 from dew.objectives.lm.adaptation import (
     CARRIED,
     ChunkAdaptation,
+    InContext,
+    InContextDecoder,
     _carried_start,
     _carried_update,
     adapted_scores,
+    decoded_alone,
 )
 from dew.objectives.lm.chunked import (
     final_read,
@@ -869,27 +872,45 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
-        ratio needs. An objective that steps its level in context (`adaptation`) has no
-        generation that steps it, so it refuses (ValueError) rather than draw from the
-        level it starts with.
+        ratio needs. An objective that steps its level in context (`adaptation`) draws with its level
+        stepped as its training forward steps it (`InContextDecoder`, row 9066), and one whose steps no
+        generation takes (`_undrawn`) refuses (ValueError) rather than draw from the level it starts with.
         """
-        if self.adaptation is not None:
-            raise ValueError("an objective that steps its continuum level in context scores what no "
-                             "generation draws yet: a generation reads the level it starts with")
-        return TextGeneration(self.model, params, sampling=self.sampled(sampling), prefix=self.prefix,
+        refused = self._undrawn()
+        if refused is not None:
+            raise ValueError(f"{refused}: a generation would read the level it starts with")
+        model = (self.model if self.adaptation is None
+                 else InContextDecoder(self.model, self.adaptation, pad_id=self.pad_id))
+        return TextGeneration(model, params, sampling=self.sampled(sampling), prefix=self.prefix,
                               progress=progress)
 
+    def _undrawn(self) -> str | None:
+        """Why no generation steps this objective's continuum level as its training forward does
+        (`InContextDecoder`), None where one does or none steps: the adaptation's own reason
+        (`decoded_alone`), or a loss of one role's targets, whose role no generation's tokens name."""
+        if self.adaptation is None:
+            return None
+        if self.loss_role is not None:
+            return "its level steps on one role's targets alone, a role no generation's tokens name"
+        return decoded_alone(self.adaptation)
+
     def task_settings(self) -> TextSettings | None:
-        """The decoder's row length, preview budget, sampling policy (`sampled`), and tokenizer or
-        source processor. None for an objective that steps its level in context (`adaptation`), which
-        no generation task serves yet: its saved runs restore their trained state, and build no task."""
-        if self.adaptation is not None:
+        """The decoder's row length, preview budget, sampling policy (`sampled`), tokenizer or source
+        processor, and how its level steps in context (`adaptation`'s record, and the padding id whose
+        targets it never takes), which its saved run's task steps as its training forward does (row
+        9066). None where no generation steps it so (`_undrawn`): its saved runs restore their trained
+        state, and build no task."""
+        from dew.registry import to_record
+
+        if self._undrawn() is not None:
             return None
         samples = self.samples
         return TextSettings(seq_len=self.seq_len,
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
                             sampling=self.sampled(Sampling() if samples is None else samples.sampling),
-                            **processor_settings(self.processor), prefix=self.prefix)
+                            **processor_settings(self.processor), prefix=self.prefix,
+                            adaptation=None if self.adaptation is None else to_record(
+                                InContext(self.adaptation, self.pad_id), InContext))
 
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
         """Refuse a batch's blocks where no trunk layer reads them, where prediction depths would read
@@ -1451,9 +1472,10 @@ class LMObjective(TokenScorer):
     (`dew.objectives.lm.adaptation.ChunkAdaptation`): every `window` tokens of a document, the level
     steps by `rate` times the summed gradient of their weighted losses, and the next window reads
     it; training learns the level's start through every step. Evaluation and validation score the
-    same way. A preview, a rollout policy and a saved run's task would draw from the level's start,
-    which no generation steps yet, so an objective with `adaptation` takes no `samples`, refuses
-    `policy` and records no task.
+    same way, and a preview, a rollout policy and a saved run's task draw with the level stepped as
+    the forward steps it (`InContextDecoder`). A damped or stacked adaptation, or a loss of one role's
+    targets (`loss_role`), steps it where no generation can (`TokenScorer._undrawn`): such an objective
+    takes no `samples`, refuses `policy` and records no task.
     """
 
     resumable: ClassVar[tuple[str, ...]] = ("token_accuracy",)
@@ -1520,11 +1542,12 @@ class LMObjective(TokenScorer):
             if not adaptation.layers and not _steps_in_context(self.model):
                 raise ValueError("adaptation steps a continuum level, which this model does not have "
                                  "(CausalTransformer.continuum, `SteppedInContext`)")
-            if samples is not None:
-                raise ValueError("adaptation scores through a level stepped in context, which a preview's "
-                                 "generation does not step; train it without samples")
         self.adaptation = adaptation
         self.loss_role = loss_role
+        if samples is not None and self._undrawn() is not None:
+            # A preview's generation steps the level as the forward does (`InContextDecoder`) where one
+            # can.
+            raise ValueError(f"{self._undrawn()}; train it without samples")
         self.mtp_weight = mtp_weight
         self.z_loss = z_loss
         self.indexer = indexer
@@ -1693,7 +1716,7 @@ class LMObjective(TokenScorer):
         return statistics, aux
 
     def predict(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
-                logits: bool = True) -> tuple[Ratio, Aux[Variables], Prediction]:
+                logits: bool = True) -> tuple[Ratio | RoutedStatistics, Aux[Variables], Prediction]:
         """Return the loss with the logits, target weights and `layers` outputs behind it.
 
         A teacher compares these (`Objective.predict`). The logits are the whole
@@ -1701,21 +1724,15 @@ class LMObjective(TokenScorer):
         distillation's KL reads every column; without `logits` the loss is scored as `loss` scores
         it, its head a tile at a time where its policy tiles it, and the prediction holds none (a
         distillation reading the sampled ids' likelihoods alone). The balance loss's and the router
-        z-loss's terms normalize per router, so they cannot share a distillation's token mass and are
-        refused; a `balance_rate` alone balances without a loss term. The indexer warm-up scores no
-        tokens, so it has nothing to distill.
+        z-loss's terms normalize per router, so they come beside the token statistics (`RoutedStatistics`),
+        which a distillation keeps apart from its own mass (row 9071: refused). The indexer warm-up scores
+        no tokens, so it has nothing to distill.
         """
         if self._warmup:
             raise ValueError("the indexer warm-up scores no token, so it has no prediction")
-        balance = self.balance
-        if balance is not None and (balance.aux_loss_alpha is not None or balance.router_z_loss):
-            raise ValueError(
-                "the balance loss's and the router z-loss's router terms normalize per router, and a "
-                "distillation mixes terms over the counted tokens; balance the "
-                "student's routers with balance_rate instead")
         statistics, aux, scores, _ = self._scored_loss(params, batch, step, train=train, layers=layers,
                                                        logits=logits)
-        assert isinstance(statistics, Ratio) and (scores.logits is not None or not logits)
+        assert scores.logits is not None or not logits
         whole = None if scores.logits is None else constrain(scores.logits, LOGITS)
         return statistics, aux, Prediction(whole, scores.losses, scores.weights, scores.layers)
 

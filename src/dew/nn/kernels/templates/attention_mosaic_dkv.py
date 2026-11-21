@@ -310,10 +310,10 @@ class _PlacedDq:
 
     def pieces(self) -> tuple[tuple[int, int], ...]:
         """A step's dQ a slot's columns at a time, in turn, each its first column and its count: its halves'
-        (`dq_halves`), each a slot's columns at a time (`mosaic.column_chunks`), which divide them."""
+        (`dq_halves`), sliced by `stores.column_spans` (one chunk plan shared with `added`, row 8813)."""
         columns, found, first = self.stages[1].shape[-1], [], 0
         for half in dq_halves(self.dq_ref.shape[-1]):
-            found += [(first + at, columns) for at in range(0, half, columns)]
+            found += [(first + at, count) for at, count in stores.column_spans(half, columns)]
             first += half
         return tuple(found)
 

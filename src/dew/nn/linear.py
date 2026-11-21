@@ -41,7 +41,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_bounds, valid_order
-from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
+from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, LayoutRefused, MeshAxes, axis_rules, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
@@ -82,6 +82,7 @@ from .sharding import (
     automatic_axes,
     constrain,
     grouped_heads,
+    in_pipeline_stage,
     manual_map,
     on_shards,
     rows_like,
@@ -747,17 +748,60 @@ def sequence_halo(mixed, valid, segments, width: int):
 
 
 def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, parts, dtype, rule):
-    """A delta-rule mixer's conv and rule over this shard's slice of whole training sequences, inside a
-    `shard_map` that holds the sequence axis manual (`over_sequence`): the conv with its halo
-    (`sequence_conv`, its `parts` the queries', keys' and values' widths, the first two l2-normalised), the
-    pieces in heads of their `widths`, and `rule(query, key, value, g, beta, state, starts=)` from the
-    memory this shard's slice enters with (`entering_memory`), its output named as `held_scan`'s."""
+    """A delta-rule mixer's conv and rule over this shard's slice of whole training sequences and of its
+    heads, inside a `shard_map` that holds the sequence axis manual (`sequence_delta_rule`): the conv with
+    its halo (`sequence_conv`, its `parts` the queries', keys' and values' channels and l2-normed widths,
+    `mixed` and `taps` each this shard's heads of each part laid in turn), the pieces in heads of their
+    `widths`, and `rule(query, key, value, g, beta, state, starts=)` from the memory this shard's slice
+    enters with (`entering_memory`), its output named as `held_scan`'s."""
     query, key, value = (piece.reshape(*piece.shape[:2], -1, width) for piece, width in
                          zip(sequence_conv(mixed, taps, None, segments, valid, parts=parts, dtype=dtype),
                              widths, strict=True))
     state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS)
     out, _ = rule(query, key, value, g, beta, state, starts=starts)
     return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+
+
+def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int, key_heads: int, widths,
+                        parts: Pieces, dtype, rule):
+    """A delta-rule mixer's conv and rule (`split_delta_rule`) on shards that split the rows and the sequence
+    as `over_sequence`'s do, and its heads where the rule table splits a `[B, S, H, D]` activation's over axes
+    the rows, the sequence and a pipeline stage leave, where the split divides its `key_heads` (as
+    `grouped_heads` splits the unsplit rule's): each of `parts`' channels of `mixed` `[B, S, C]` and of the
+    conv's `taps` `[C, K]` placed by its heads, the queries', keys' and values' laid in turn on each shard,
+    `g` and `beta` by theirs. Where a tensor axis held every head whole, each of its devices ran the whole
+    mixer's conv and scan (row 1437); each still runs its heads over its slice of the sequence whole."""
+    batch, length, _ = mixed.shape
+    if length % shards:
+        raise LayoutRefused(f"the sequence of {length} tokens splits {shards} ways over the mesh's sequence "
+                            f"axis, and it does not divide")
+    rows, sequence = logical_spec(("activation_batch", "activation_length"), (batch, length))
+    # The heads' rule read with the axes the rows, the sequence and a pipeline stage's vmap hold set aside (a
+    # rule naming them takes what it has left, or its next where none), split where it divides the key
+    # heads (`grouped_heads`' test).
+    taken = {*mesh_axes(rows), *mesh_axes(sequence), *((STAGE_AXIS,) if in_pipeline_stage() else ())}
+    left = tuple((name, None if assignment is None else tuple(axis for axis in mesh_axes(assignment)
+                                                              if axis not in taken))
+                 for name, assignment in axis_rules())
+    heads = mesh_axes((*logical_spec(("activation_heads",), (beta.shape[2],), rules=left), None)[0])
+    mesh = jax.sharding.get_abstract_mesh()
+    split = None if not heads or key_heads % math.prod(mesh.shape[axis] for axis in heads) else heads
+    tokens, channels = P(rows, sequence, split), P(split, None)
+    edges = np.cumsum([width for width, _ in parts])[:-1]
+
+    def local(pieces, g, beta, segments, starts, valid, held):
+        # Each shard's heads of each part laid in turn, each part's width its own piece's.
+        mine = tuple((piece.shape[-1], head) for piece, (_, head) in zip(pieces, parts, strict=True))
+        return split_delta_rule(jnp.concatenate(pieces, axis=-1), g, beta, segments, starts, valid,
+                                jnp.concatenate(held, axis=0), widths=widths, parts=mine, dtype=dtype,
+                                rule=rule)
+
+    operands = (tuple(jnp.split(mixed, edges, axis=-1)), g, beta, coordinates.segments, coordinates.starts,
+                valid, tuple(jnp.split(taps, edges, axis=0)))
+    masks = P(rows, sequence)
+    specs = ((tokens,) * len(parts), tokens, tokens, *(None if operand is None else masks
+                                                      for operand in operands[3:6]), (channels,) * len(parts))
+    return manual_map(local, specs, tokens)(*operands)
 
 
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None,
@@ -1344,10 +1388,9 @@ class GatedDeltaNet(nn.Module):
         if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
                                      max_segments=tokens.max_segments, write_bound=1.0)
-            out = over_sequence(functools.partial(split_delta_rule, widths=widths, parts=heads,
-                                                  dtype=operand if ported else wide, rule=rule),
-                                shards, (mixed, g, beta, tokens.segments, tokens.starts, valid),
-                                (self.conv1d()[0],))
+            out = sequence_delta_rule(mixed, self.conv1d()[0], g, beta, tokens, valid, shards=shards,
+                                      key_heads=self.num_k_heads, widths=widths, parts=heads,
+                                      dtype=operand if ported else wide, rule=rule)
         else:
             out = held_scan(self, mixed, self.conv1d()[0], None, scan,
                             (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,

@@ -58,7 +58,7 @@ configuration."""
 import dataclasses
 import itertools
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -105,12 +105,14 @@ class _Interpreter:
     """A warpgroup's program: the kernel's body evaluated with its index (`thread`), each equation of the
     toolkit's synchronization an `Event` (`events`), every other evaluated concretely (`bind`) or, a value no
     synchronization reads (a tile's data), left unevaluated; where it runs warp roles, each warp's events a
-    program of its own (`warps`), its warp's index along the warps' axis (`warp`); and the arrivals a phase
-    each barrier its inlined bodies initialize takes (`initialized`, by name)."""
+    program of its own (`warps`), its warp's index along the warps' axis (`warp`); the arrivals a phase
+    each barrier its inlined bodies initialize takes (`initialized`, by name); and each load warp's logical
+    step over a gathered ring's entries (`entry_steps`, by the entries' ref and the warp: its awaits so far,
+    `_started`), which tags its fills and reads."""
 
     def __init__(self, thread: int, rare: bool = False):
         self.thread, self.events, self.refs, self.allocated, self.rare = thread, [], 0, [], rare
-        self.warp, self.warps, self.initialized = None, [], {}
+        self.warp, self.warps, self.initialized, self.entry_steps = None, [], {}, {}
 
     def programs(self) -> list[list[Event]]:
         """The warpgroup's program, or its warps' each, where it runs warp roles: those alone, a warpgroup's
@@ -229,7 +231,8 @@ class _Interpreter:
         transforms = jax.tree.unflatten(params["pytree_ref_transforms"], values[count:])
         located = [_located(value, transform) if isinstance(value, Ref) else value
                    for value, transform in zip(values[:count], transforms, strict=True)]
-        read(self, body, values[:count], located)
+        # Each operand's abstract value (a ref's shape and dtype as the body takes it), and where it is.
+        read(self, body, [variable.aval for variable in equation.invars[:count]], located)
         return [None] * len(equation.outvars)
 
     def scoped(self, params, values) -> list:
@@ -251,7 +254,7 @@ class _Interpreter:
         return []
 
 
-def _slot(ref, treedef, leaves) -> tuple:
+def _slot(ref, treedef, leaves) -> "tuple | frozenset[tuple]":
     """A transformed ref's location (`_located`), its transforms flattened (`treedef`, `leaves`)."""
     if ref is None:
         return ()
@@ -260,25 +263,31 @@ def _slot(ref, treedef, leaves) -> tuple:
     return _located(ref, jax.tree_util.tree_unflatten(treedef, list(leaves)))
 
 
-def _located(ref, transforms) -> tuple:
+def _located(ref, transforms) -> "tuple | frozenset[tuple]":
     """A ref's location through `transforms`: the ref and each leading index that is one value, in order (a
     ring's slot; a consumer's staging buffer and its chunk's buffer within it, `stores.staged_chunks`; a
     one-entry slice of an axis, which keeps it, last: a gathered ring's slot mbarrier, `gathered.Ring`), else
     the ref whole. Two locations share memory where one's indices are a prefix of the other's (`_overlaps`):
     a consumer's two chunk buffers, keyed by its own index alone, read as one buffer, so its double-buffered
-    stores raced (base review f86cb5b03's witness at 128 x 256)."""
+    stores raced (base review f86cb5b03's witness at 128 x 256). Through a gather (an indexer's array of
+    indices), the blocks of the ref it reaches (`_reached`)."""
+    transforms = list(transforms or ())
+    if any(_selects_none(transform) for transform in transforms):
+        return frozenset()
+    if any(_gathering(transform) for transform in transforms):
+        return _reached(ref, transforms)
     found = []
 
     def whole(index, extent) -> bool:
         return (hasattr(index, "start") and index.start is not None and int(np.asarray(index.start)) == 0
                 and index.size == extent)
 
-    for transform in transforms or ():
+    for transform in transforms:
         if getattr(transform, "indices", None) is None:
             # A transform that moves axes (a transpose, a reshape): later indices are not the base's
             # coordinates, so the location stops at the prefix known (base review 2e4651b2e F3). A tiling's,
             # a swizzle's or a bitcast's changes the trailing axes alone, the leading ones indexed as before.
-            if hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower():
+            if _moves_axes(transform):
                 return (ref.name, *found) if found else (ref.name, None)
             continue
         indices, shape = transform.indices, getattr(transform, "shape", None)
@@ -286,14 +295,7 @@ def _located(ref, transforms) -> tuple:
             if index is None:
                 return (ref.name, *found) if found else (ref.name, None)
             if not hasattr(index, "start"):
-                # An array index (advanced indexing, ndim > 0) introduces its own output axis, so later
-                # transforms do not index the base's next axis: keep the single base coordinate if constant
-                # and stop at the known base prefix (row 8978).
-                if (one := _one_value(index)) is None:
-                    return (ref.name, *found) if found else (ref.name, None)
-                found.append(one)
-                if np.asarray(index).ndim > 0:
-                    return (ref.name, *found)
+                found.append(int(np.asarray(index)))
                 continue
             # A slice: the axes from it on whole, the next transform indexes them; else its one entry, if it
             # takes one, the location's last.
@@ -306,14 +308,81 @@ def _located(ref, transforms) -> tuple:
     return (ref.name, *found) if found else (ref.name, None)
 
 
-def _one_value(index) -> int | None:
-    """An indexer's index where it names one entry of its axis (a value, an array of one value broadcast
-    beside a gathered index, or a one-entry slice), else None (a slice of more, or an array of several
-    indices: a gathered tile's rows)."""
+def _selects_none(transform) -> bool:
+    """Whether `transform` is an indexer of a static zero extent, a slice of no entry or a gather of no index:
+    an access through it touches nothing, whatever its other indices are (the base review of 369d0ad7b,
+    F2: `ref.at[[0, 1]].at[row, :0]`, at a row the checker does not evaluate, read the ref whole)."""
+    indices = getattr(transform, "indices", None)
+    if indices is None:
+        return False
+    return (any(hasattr(index, "start") and isinstance(index.size, int) and index.size == 0
+                for index in indices)
+            or any(isinstance(extent, int) and extent == 0 for extent in transform.int_indexer_shape))
+
+
+def _gathering(transform) -> bool:
+    """Whether `transform` is an indexer gathering along some axis (an array of indices, not one value)."""
+    return any(index is not None and not hasattr(index, "start") and np.ndim(index) > 0
+               for index in getattr(transform, "indices", None) or ())
+
+
+def _moves_axes(transform) -> bool:
+    """Whether a transform other than an indexer moves the axes its ref's later indices name (a transpose,
+    a reshape), where a tiling's, a swizzle's or a bitcast's changes the trailing axes alone."""
+    return hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower()
+
+
+def _reached(ref, transforms: list) -> "tuple | frozenset[tuple]":
+    """A gather's location (`_located`): the ref's elements its indexers reach, each indexer's indices
+    applied as NumPy indexes an array (JAX's `NDIndexer` lays a gather's axes out as NumPy's advanced
+    indexing does) to the places of the shape the first reads, so every view axis composes into the ref's
+    coordinates (`ref.at[[[0, 1], [2, 3]]].at[1, 0]`, a `(4,)` ref's element 2), as the blocks of them it
+    reaches whole (`_blocks`): one block's location, a set of several's, and an empty selection's no block,
+    which touches nothing (row 8978 and the base reviews of 2e043406d, 71686face, 8c1c9efca, 31b5fe85b,
+    8a5405c55 and 839bb19de: a gather crashed, lost an alias, located a cell at its row, flattened a
+    rank-two gather, raised on an empty one or on a pick the checker does not evaluate, or read an empty one
+    whole). A transform moving axes, or an indexer of an index or a slice's start the checker does not
+    evaluate (None to it; of 369d0ad7b, F1: `ref.at[[0, 1]].at[pl.ds(row, 1), 0]` raised), leaves the
+    elements reached before it, every one it could reach among them: the ref whole before the first
+    indexer."""
+    places, shape = None, None
+    for transform in transforms:
+        indices = getattr(transform, "indices", None)
+        if indices is None and places is None and not _moves_axes(transform):
+            continue
+        if indices is None or any(index is None or (hasattr(index, "start") and index.start is None)
+                                  for index in indices):
+            if places is None:
+                return (ref.name, None)
+            break
+        if places is None:
+            shape = tuple(transform.shape)
+            places = np.arange(int(np.prod(shape))).reshape(shape)
+        places = places[tuple(_numpy_index(index) for index in indices)]
+    reached = np.zeros(shape, bool)
+    reached.reshape(-1)[np.asarray(places).reshape(-1)] = True
+    blocks = [(ref.name, *block) if block else (ref.name, None) for block in _blocks(reached, ())]
+    return blocks[0] if len(blocks) == 1 else frozenset(blocks)
+
+
+def _numpy_index(index):
+    """An `NDIndexer`'s index as NumPy indexes by it: a `Slice`'s start, size and stride as a slice, a value
+    as an integer, an array of indices as itself."""
     if hasattr(index, "start"):
-        return int(np.asarray(index.start)) if index.size == 1 and index.start is not None else None
-    values = None if index is None else np.unique(np.asarray(index))
-    return None if values is None or values.size != 1 else int(values[0])
+        start, stride = int(np.asarray(index.start)), int(getattr(index, "stride", 1))
+        return slice(start, start + index.size * stride, stride)
+    return int(np.asarray(index)) if np.ndim(index) == 0 else np.asarray(index)
+
+
+def _blocks(reached: np.ndarray, prefix: tuple) -> Iterator[tuple]:
+    """The leading coordinates of each largest block of the elements `reached` marks (an array of the ref's
+    shape below `prefix`): a block reached whole is one, else its entries' blocks along its leading axis; a
+    block of no elements none."""
+    if reached.size and reached.all():
+        yield prefix
+    elif reached.any():
+        for entry, below in enumerate(reached):
+            yield from _blocks(below, (*prefix, entry))
 
 
 def _governing(value, what: str):
@@ -396,7 +465,10 @@ def _access(kind: str, indexed: int) -> Callable:
             tree = equation.params.get("tree")
             if tree is None:
                 tree = equation.params["transforms_treedef"]
-            self.emit(kind, _slot(ref, tree, values[indexed:]))
+            at = _slot(ref, tree, values[indexed:])
+            # An empty gather touches nothing: no access.
+            if at != frozenset():
+                self.emit(kind, at)
             if kind == "read" and ref.value is not None:
                 # A known operand's read, through its transforms as JAX's state discharge reads one.
                 transforms = jax.tree_util.tree_unflatten(tree, values[indexed:])
@@ -496,10 +568,9 @@ def _waited(self: _Interpreter, body: gathered.Waited, values, located) -> None:
 def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> None:
     """A load warp's gathers of a step (`gathered.Gathers`): the first warp's arrival expecting every tile's
     copy, and a copy of each tile the warp issues into its part of the slot, each completing its bytes at
-    the slot's barrier; read a step ahead (`body.ahead`), its tiles' entries read from the entries' parity
-    the step before filled, once its fills are awaited (`gathered.Held.awaited`), a warp's fills an
-    asynchronous write of its own; a tile's first step fills its own entries first (`gathered.Held.awaited`);
-    the next step's fill is the load's next body (`_filled`).
+    the slot's barrier; read a step ahead (`body.ahead`), its tiles' entries read where its lowered loads
+    read them (`_lowered_reads`), once its drain has awaited its fills (`_drain`); the next step's fill is
+    the load's next body (`_filled`).
     The warp's lanes are its one program: the body's warp syncs, which make a lane's fill seen by the
     others, are its own statement, not an event."""
     _, _, slot, barrier, _, *ahead = located
@@ -509,18 +580,236 @@ def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> Non
     if body.expects:
         self.emit("expect", barrier, tiles)
     if body.ahead:
-        entries = ahead[0]
-        parity, held = (int(np.asarray(_governing(value, "an entry's parity"))) for value in ahead[1:])
-        # A warp's fills of a step are one cp.async group, awaited together: one write of its parity's
-        # entries, its tiles' all (each warp's its own rows: `gathered.Gathers.tiles`).
+        entries, parity = ahead
+        parity = int(np.asarray(_governing(parity, "an entry's parity")))
         warp = body.share[0]
-        if not held:
-            self.emit("fill", (entries[0], parity, warp))
-        self.emit("fill_wait")
-        # A read of entries a fill must have written: no fill ordered before it is a read of nothing.
-        self.emit("read", (entries[0], parity, warp), "filled")
+        # Its reads of its step's entries at the parities its loads take (`_lowered_reads`), each needing
+        # that step's fill there: no such fill ordered before it is a read of nothing or of another step's
+        # (`"filled"`, the step `_started` counted).
+        step = self.entry_steps[(entries[0], warp)] - 1
+        reads = list(dict.fromkeys(_lowered_reads(body, values, parity)))
+        _entry_events(self, reads, entries[0], warp, step)
     for tile in body.tiles(tiles):
         self.emit("copy", (*slot, tile), barrier)
+
+
+def _lowered(body, avals, scalars: dict[int, int]) -> list[tuple[str, int | None]]:
+    """The entries' events of an inlined body as its lowered ops state them, in their order (`_walked`). The
+    body is lowered as `plgpu.inline_mgpu` lowers it, its memory operands as memrefs of their shapes (the
+    first in shared memory), its scalar operands (`scalars`, by position) as constants; a branch on a known
+    value is walked down its taken region (a tile's first step's own fill: `gathered.Started`). A kernel
+    change that drops, adds or moves a copy, a commit or a wait, or changes a wait's count, is what the
+    checker reads (row 8657: its fields stated by hand passed a body without its wait)."""
+    def lowered(memories, constants):
+        operands = iter(memories)
+        body(None, *(_Splat(constants[at]) if at in scalars else next(operands) for at in range(len(avals))))
+
+    return _lowering([aval for at, aval in enumerate(avals) if at not in scalars], scalars, lowered)
+
+
+def _lowered_reads(body: gathered.Gathers, avals, parity: int) -> list[tuple[str, int | None]]:
+    """A load warp's reads of its step's entries (where it reads them ahead: `gathered.Held.entry`) as the
+    production body's lowered loads state them (`gathered.Gathers.__call__`, lowered whole over its operands'
+    memrefs, `parity` the step's operand): each a `"read"` of the parity its address takes (`_walked`; base
+    review 0991196fb F2: the read was stated from the operand; head review of 0099a4701 F2: read from a Held
+    the checker built, a body handing on another parity passed). Its TMA copies, which `_gathers` counts from
+    the body's tiles, are issued nowhere."""
+    source, rows, slot, barrier, _, entries, _ = avals
+    # One stage's slot and barrier, as a kernel hands the body its ring's step: the walk's avals hold every
+    # stage's (`_gathers`' `(slot, stage)`).
+    slot = jax.core.ShapedArray(slot.shape[1:], slot.dtype)
+    barrier = jax.core.ShapedArray((1,), barrier.dtype)
+
+    # The production body, its every tile's TMA gather issued nowhere (`gathered.Gathers._gathered`): what it
+    # reads of its entries and how it hands its operands on are its own.
+    unissued = type("Reading", (type(body),), {"_gathered": lambda self, *_: None})
+    reading = unissued(**{field.name: getattr(body, field.name) for field in dataclasses.fields(body)
+                          if field.init})
+
+    def lowered(memories, constants):
+        entries_, source_, rows_, slot_, barrier_ = memories
+        reading(None, source_, rows_, slot_, barrier_, _Splat(constants["column"]), entries_,
+                _Splat(constants["parity"]))
+
+    return _lowering([entries, source, rows, slot, barrier], {"column": 0, "parity": parity}, lowered,
+                     shared=(0, 3, 4))
+
+
+def _lowering(memories, constants: dict, lowered: Callable, *, shared: tuple[int, ...] = (0,)
+              ) -> list[tuple[str, int | None]]:
+    """`lowered(memories, constants)`'s ops, built in a function of `memories`' memrefs (those at `shared` in
+    shared memory, the first the entries) with `constants` as i32 constants, walked (`_walked`)."""
+    from jax._src.interpreters import mlir as jax_mlir
+    from jax.experimental.mosaic.gpu import dialect as mgpu_dialect
+    from jax.extend.mlir import ir
+    from jax.extend.mlir.dialects import arith, func
+
+    with jax_mlir.make_ir_context() as context, ir.Location.unknown():
+        mgpu_dialect.register_dialect(context)
+        module = ir.Module.create()
+        i32 = ir.IntegerType.get_signless(32)
+        # An H100's module, as Mosaic GPU's lowering states the generation its helpers read (`get_arch`).
+        module.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, 9)
+        module.operation.attributes["mosaic_gpu.arch_minor"] = ir.IntegerAttr.get(i32, 0)
+        workgroup = ir.Attribute.parse("#gpu.address_space<workgroup>")
+        types = [ir.MemRefType.get(list(aval.shape), _element(aval.dtype),
+                                   memory_space=workgroup if at in shared else None)
+                 for at, aval in enumerate(memories)]
+        with ir.InsertionPoint(module.body):
+            function = func.FuncOp("body", (types, []))
+            block = function.add_entry_block()
+        with ir.InsertionPoint(block):
+            values = {key: arith.constant(i32, value) for key, value in constants.items()}
+            lowered(list(block.arguments), values)
+            func.ReturnOp([])
+        # The entries, the first memory operand; a body of none (a drain's) writes and reads none.
+        return _walked(block, block.arguments[0] if memories else None)
+
+
+class _Splat:
+    """A splat scalar as an inlined body takes it (`gathered.splat_value` reads its one register)."""
+
+    def __init__(self, value):
+        self.registers = np.array([value], dtype=object)
+
+
+def _element(dtype):
+    """`dtype`'s MLIR element type: a signless integer of its width, or a float."""
+    from jax.extend.mlir import ir
+
+    dtype = np.dtype(dtype)
+    if dtype.kind in "iu":
+        return ir.IntegerType.get_signless(dtype.itemsize * 8)
+    return {2: ir.BF16Type.get(), 4: ir.F32Type.get()}[dtype.itemsize]
+
+
+def _walked(block, memory, state: dict | None = None) -> list[tuple[str, int | None]]:
+    """The entries' events of `block`'s ops, in order, each with its argument: a cp.async group writing
+    `memory` (`"fill"`: its copies, committed, one a half of `memory`'s two steps its copies' addresses
+    write, `_half`), a wait for such groups seen by the warp's every lane (`"fill_wait"`, the groups it
+    leaves in flight: its `n`, at the warp barrier after it, a lane's copy its own till the warp meets: base
+    review 760be77fe F4), a load from `memory` (`"read"`, the parity its first index takes where a constant
+    states it). An op's regions are walked, a branch on a constant condition down its taken region alone,
+    a copy in any region counted toward the next commit and a wait toward the next barrier (`state`, shared
+    down the walk)."""
+    state = {"copies": set(), "waited": None} if state is None else state
+    found = []
+    for op in block.operations:
+        name = op.operation.name
+        regions = list(op.regions)
+        if name == "scf.if" and (known := _constant(op.operands[0])) is not None:
+            regions = [op.regions[0] if known else op.regions[1]]
+        if name.startswith("nvvm.cp.async.shared.global") and _derives(op.operands[0], memory):
+            state["copies"].add(_half(op.operands[0], _memref_shape(memory)[1]))
+        elif name == "nvvm.cp.async.commit.group" and state["copies"]:
+            found += [("fill", half) for half in sorted(state["copies"])]
+            state["copies"].clear()
+        elif name == "nvvm.cp.async.wait.group":
+            state["waited"] = int(op.attributes["n"].value)
+        elif name == "nvvm.bar.warp.sync" and state["waited"] is not None:
+            found.append(("fill_wait", state["waited"]))
+            state["waited"] = None
+        elif name == "memref.load" and op.operands[0] == memory:
+            found.append(("read", _constant(op.operands[1])))
+        for region in regions:
+            for inner in region.blocks:
+                found += _walked(inner, memory, state)
+    return found
+
+
+def _memref_shape(memory) -> tuple[int, ...]:
+    """A memref value's static shape."""
+    from jax.extend.mlir import ir
+
+    return tuple(ir.MemRefType(memory.type).shape)
+
+
+def _half(pointer, height: int) -> int:
+    """The half of a two-step entries memref (`height` entries a step) a cp.async copy's destination
+    `pointer` (its `llvm.getelementptr` from the memref's base) writes: its index's constant part over the
+    step's entries, its lane's own row below `height` (base review 9d013a4b9 F1: the destination was the
+    operand's parity, so a copy into the other half passed)."""
+    [index] = pointer.owner.operands[1:]
+    return _constant_part(index) // height
+
+
+def _constant_part(value) -> int:
+    """The sum of `value`'s constant terms: itself where constant, through casts and additions; a value no
+    constant states none."""
+    found = _constant(value)
+    if found is not None:
+        return found
+    owner = value.owner
+    name = getattr(owner, "name", None)
+    if name in ("arith.index_cast", "arith.extui", "arith.extsi"):
+        return _constant_part(owner.operands[0])
+    if name == "arith.addi":
+        return sum(_constant_part(operand) for operand in owner.operands)
+    return 0
+
+
+def _constant(value) -> int | None:
+    """`value`'s constant, folding the comparisons and arithmetic of constants a body's branch reads, else
+    None."""
+    owner = value.owner
+    if not hasattr(owner, "name"):
+        return None
+    name = owner.name
+    if name == "arith.constant":
+        return int(owner.attributes["value"].value)
+    if name in ("arith.index_cast", "arith.extui", "arith.extsi"):
+        return _constant(owner.operands[0])
+    folded = {"arith.cmpi": None, "arith.addi": lambda a, b: a + b, "arith.muli": lambda a, b: a * b,
+              "arith.subi": lambda a, b: a - b}
+    if name not in folded:
+        return None
+    left, right = (_constant(operand) for operand in owner.operands[:2])
+    if left is None or right is None:
+        return None
+    if name == "arith.cmpi":
+        predicate = int(owner.attributes["predicate"].value)
+        return int({0: left == right, 1: left != right, 2: left < right, 3: left <= right, 4: left > right,
+                    5: left >= right}[predicate])
+    return folded[name](left, right)
+
+
+def _derives(value, memory) -> bool:
+    """Whether `value` (a pointer or memref) is formed from `memory` (a block argument) through the ops that
+    view, index or cast it."""
+    seen = [value]
+    while seen:
+        value = seen.pop()
+        if value == memory:
+            return True
+        owner = value.owner
+        if hasattr(owner, "operands"):
+            seen += list(owner.operands)
+    return False
+
+
+def _started(self: _Interpreter, body: gathered.Started, values, located) -> None:
+    """A load warp's start of its step's entries (`gathered.Started`, every ring's before its one drain and
+    any ring's gathers), its events its lowered ops' (`_lowered`): a tile's first step its own fill of them,
+    one asynchronous write of the half its copies' addresses take. Each start is the warp's next logical
+    step over the entries (`entry_steps`), which its fills and reads carry (base review 571a5ee10 F2: a read
+    of a parity a stale step filled passed)."""
+    entries, _, parity, held = located
+    parity, held = (int(np.asarray(_governing(value, "an entry's parity"))) for value in (parity, held))
+    key = (entries[0], body.share[0])
+    step = self.entry_steps.get(key, 0)
+    # A tile's rows (`body.tiled`) are one step's entries held for its every step: only a fill begins one.
+    if not (body.tiled and held):
+        self.entry_steps[key] = step + 1
+    _entry_events(self, _lowered(body, values, {2: parity, 3: held}), entries[0], body.share[0], step)
+
+
+def _drain(self: _Interpreter, body: gathered.Drained, values, located) -> None:
+    """A load warp's one drain of its entries' fills for a step (`gathered.Drained`), its wait its lowered
+    op's, with the groups it leaves in flight (`fill_wait`), where its `needed` takes its branch."""
+    (needed,) = located
+    needed = int(np.asarray(_governing(needed, "a drain's need")))
+    for kind, argument in _lowered(body, values, {0: needed}):
+        self.emit(kind, (), argument)
 
 
 def _unsynchronized(self: _Interpreter, body, values, located) -> None:
@@ -537,14 +826,31 @@ def _scale_smem(self: _Interpreter, body: across.ScaleSmem, values, located) -> 
 
 
 def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
-    """A load warp's fill of its next step's entries (`gathered.Filled`, where the walk has a next step):
-    one asynchronous write of the parity it fills, its tiles' all, a cp.async group the next step awaits."""
+    """A load warp's fill of its next step's entries (`gathered.Filled`, where the walk has a next step), its
+    events its lowered ops' (`_lowered`): one asynchronous write of the parity it fills, its tiles' all, a
+    cp.async group the next step awaits, tagged with that step (`entry_steps`)."""
     entries, _, parity = located
-    self.emit("fill", (entries[0], int(np.asarray(_governing(parity, "an entry's parity"))), body.share[0]))
+    parity = int(np.asarray(_governing(parity, "an entry's parity")))
+    events = _lowered(body, values, {2: parity})
+    _entry_events(self, events, entries[0], body.share[0], self.entry_steps[(entries[0], body.share[0])])
+
+
+def _entry_events(self: _Interpreter, events: list, entries, warp: int, step: int) -> None:
+    """A load warp's lowered events of its entries (`_walked`) emitted: a fill of the half its copies write,
+    tagged with `step`, a wait with the groups it leaves in flight, a read of the parity its load takes,
+    needing `step`'s fill there."""
+    for kind, argument in events:
+        if kind == "fill":
+            self.emit(kind, (entries, argument, warp), step)
+        elif kind == "fill_wait":
+            self.emit(kind, (), argument)
+        else:
+            self.emit(kind, (entries, argument, warp), ("filled", step))
 
 
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
-                                 gathered.Gathers: _gathers, gathered.Filled: _filled,
+                                 gathered.Gathers: _gathers, gathered.Started: _started,
+                                 gathered.Drained: _drain, gathered.Filled: _filled,
                                  across.LaneZero: _unsynchronized, across.ScaleSmem: _scale_smem}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
@@ -602,11 +908,29 @@ class Violation(AssertionError):
 
     kind: str
     what: str
-    trace: list
+    trace: list | tuple | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.trace, list):
+            self.trace = _trace_list(self.trace)
 
     def __str__(self) -> str:
         shown = "\n".join(f"  {mover}: {event}" for mover, event in self.trace[-24:])
         return f"{self.what}\n{shown}"
+
+
+def _trace_list(trace) -> list:
+    """Materialize a linked trace `(parent, entry)` (or None) into a chronological list."""
+    if trace is None:
+        return []
+    if isinstance(trace, list):
+        return trace
+    out = []
+    while trace is not None:
+        trace, entry = trace
+        out.append(entry)
+    out.reverse()
+    return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -627,8 +951,10 @@ def explore(threads: list[list[Event]], arrivals: dict[str, int], *, limit: int 
     Returns the states explored; raises `Violation` with its interleaving where a property fails."""
     counts = [_waits(program) for program in threads]
     awaited = [_awaited(program) for program in threads]
+    observed = [_observed(program) for program in threads]
     seen: set = set()
-    stack: list = [(_State(len(threads)), [])]
+    start = _State(len(threads))
+    stack: list = [(start, start.advance_local(threads, None))]
     completed = None
     while stack:
         state, trace = stack.pop()
@@ -642,11 +968,11 @@ def explore(threads: list[list[Event]], arrivals: dict[str, int], *, limit: int 
         if not moves:
             if not state.ended(threads):
                 raise Violation("deadlock", "no warpgroup can move and some has not ended", trace)
-            state.whole(arrivals, [_observed(program) for program in threads], trace)
+            state.whole(arrivals, observed, trace)
             completed = trace if completed is None else completed
             continue
         stack.extend(moves)
-    _races(threads, completed or [], arrivals)
+    _races(threads, _trace_list(completed), arrivals)
     return len(seen)
 
 
@@ -761,64 +1087,123 @@ class _State:
             self.barriers[at] = _Barrier(state.phases, pending, transactions,
                                          state.arrived | ({thread} if count else frozenset()))
 
+    @staticmethod
+    def _handler(event: Event):
+        """Single dispatch for `_State` effects: returns the transition handler for `event`, or None when
+        `event` is thread-local (never blocks and touches no barrier, flight or tracked state)."""
+        if event.kind in ("load", "copy") and not event.argument:
+            return None
+        return _State._EFFECTS.get(event.kind)
+
+    def advance_local(self, threads, trace):
+        """Advance every thread past consecutive local events (those with no `_handler`) in program order."""
+        positions = list(self.positions)
+        changed = False
+        for thread, program in enumerate(threads):
+            pos = positions[thread]
+            while pos < len(program) and self._handler(program[pos]) is None:
+                trace = (trace, (thread, (thread, pos)))
+                pos += 1
+                changed = True
+            positions[thread] = pos
+        if changed:
+            self.positions = tuple(positions)
+        return trace
+
     def moves(self, threads, arrivals, counts, awaited, trace) -> Iterator:
         for flight in sorted(self.flight):
             issuer, position, barrier = flight
             made = self.copy()
             made.flight = self.flight - {flight}
-            moved = [*trace, ("landed", (issuer, position))]
+            moved = (trace, ("landed", (issuer, position)))
             if threads[issuer][position].kind == "committed":
                 # A commit's completion: its arrival, the issuing thread's.
                 made.arrive(barrier, arrivals, issuer, moved)
             elif barrier:
                 made.arrive(barrier, arrivals, issuer, moved, transaction=-1, count=False)
+            made.check(awaited, moved)
             yield made, moved
         for thread, program in enumerate(threads):
             position = self.positions[thread]
             if position == len(program):
                 continue
-            moved = [*trace, (thread, (thread, position))]
-            made = self.step(thread, program[position], arrivals, counts, moved)
+            moved = (trace, (thread, (thread, position)))
+            made = self.step(thread, program, arrivals, counts, moved)
             if made is not None:
                 made.positions = (*self.positions[:thread], position + 1, *self.positions[thread + 1:])
                 made.check(awaited, moved)
+                moved = made.advance_local(threads, moved)
                 yield made, moved
 
-    def step(self, thread, event, arrivals, counts, trace) -> "_State | None":
+    def step(self, thread, program, arrivals, counts, trace) -> "_State | None":
+        event = program[self.positions[thread]]
         made = self.copy()
-        if event.kind == "wait":
-            state = self.barrier(event.at, arrivals)
-            tracked = event.at in self.tracked[thread]
-            parity = tracked if event.argument is None else event.argument % 2 == 1
-            if state.phases % 2 == int(parity):
-                return None
-            # The completion it waits for: the one it names, or its next.
-            awaited = (counts[thread][self.positions[thread]].get(event.at, 0) if event.argument is None
-                       else event.argument) + 1
-            if state.phases != awaited:
-                raise Violation(
-                    "aliased", f"thread {thread}'s wait for completion {awaited} on {event.at} passes at "
-                                f"phase {state.phases}: a parity aliased", trace)
-            if event.argument is None:
-                made.tracked = (*self.tracked[:thread], self.tracked[thread] ^ {event.at},
-                                *self.tracked[thread + 1:])
-        elif event.kind == "arrive":
-            made.arrive(event.at, arrivals, thread, trace)
-        elif event.kind == "expect":
-            made.arrive(event.at, arrivals, thread, trace, transaction=event.argument)
-        elif event.kind in ("load", "copy") and event.argument:
-            if event.kind == "load":
-                made.arrive(event.argument, arrivals, thread, trace, transaction=1)
-            made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
-        elif event.kind == "committed":
-            made.flight = self.flight | {(thread, self.positions[thread], event.at)}
-        elif event.kind == "fill":
-            # A thread's asynchronous write (cp.async's), no barrier's: it lands later, `fill_wait` its wait.
-            made.flight = self.flight | {(thread, self.positions[thread], None)}
-        elif event.kind == "fill_wait" and any(issuer == thread and barrier is None
-                                                for issuer, _, barrier in self.flight):
+        handler = self._handler(event)
+        if handler is None:
+            return made
+        return handler(self, made, thread, event, program, arrivals, counts, trace)
+
+    def _step_wait(self, made, thread, event, program, arrivals, counts, trace):
+        del program
+        state = self.barrier(event.at, arrivals)
+        tracked = event.at in self.tracked[thread]
+        parity = tracked if event.argument is None else event.argument % 2 == 1
+        if state.phases % 2 == int(parity):
+            return None
+        # The completion it waits for: the one it names, or its next.
+        awaited = (counts[thread][self.positions[thread]].get(event.at, 0) if event.argument is None
+                   else event.argument) + 1
+        if state.phases != awaited:
+            raise Violation(
+                "aliased", f"thread {thread}'s wait for completion {awaited} on {event.at} passes at "
+                           f"phase {state.phases}: a parity aliased", trace)
+        if event.argument is None:
+            made.tracked = (*self.tracked[:thread], self.tracked[thread] ^ {event.at},
+                            *self.tracked[thread + 1:])
+        return made
+
+    def _step_arrive(self, made, thread, event, program, arrivals, counts, trace):
+        del program, counts
+        made.arrive(event.at, arrivals, thread, trace)
+        return made
+
+    def _step_expect(self, made, thread, event, program, arrivals, counts, trace):
+        del program, counts
+        made.arrive(event.at, arrivals, thread, trace, transaction=event.argument)
+        return made
+
+    def _step_transfer(self, made, thread, event, program, arrivals, counts, trace):
+        del program, counts
+        if event.kind == "load":
+            made.arrive(event.argument, arrivals, thread, trace, transaction=1)
+        made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
+        return made
+
+    def _step_committed(self, made, thread, event, program, arrivals, counts, trace):
+        del program, arrivals, counts, trace
+        made.flight = self.flight | {(thread, self.positions[thread], event.at)}
+        return made
+
+    def _step_fill(self, made, thread, event, program, arrivals, counts, trace):
+        del event, program, arrivals, counts, trace
+        # A thread's asynchronous write (cp.async's), no barrier's: it lands later, `fill_wait` its wait.
+        made.flight = self.flight | {(thread, self.positions[thread], None)}
+        return made
+
+    def _step_fill_wait(self, made, thread, event, program, arrivals, counts, trace):
+        del event, arrivals, counts, trace
+        # Held till every fill the wait drains has landed.
+        drained = _drained(program, self.positions[thread])
+        if any(issuer == thread and barrier is None and issued in drained
+               for issuer, issued, barrier in self.flight):
             return None
         return made
+
+    _EFFECTS: ClassVar[dict[str, Callable]] = {
+        "wait": _step_wait, "arrive": _step_arrive, "expect": _step_expect,
+        "load": _step_transfer, "copy": _step_transfer, "committed": _step_committed,
+        "fill": _step_fill, "fill_wait": _step_fill_wait,
+    }
 
     def check(self, awaited, trace) -> None:
         """No barrier runs past the completion a thread's next wait on it awaits (`_awaited`): a wait naming
@@ -835,6 +1220,15 @@ class _State:
 def _joined(one: dict, other: dict) -> dict:
     """Two vector clocks' join."""
     return {key: max(one.get(key, 0), other.get(key, 0)) for key in one.keys() | other.keys()}
+
+
+def _drained(program: list, position: int) -> set[int]:
+    """The positions of the fills a thread's `fill_wait` at `position` of `program` waits for: cp.async's
+    wait for every group but its `n` latest (its argument), each issued before it; the one statement the
+    explorer's hold (`_State.step`) and the order's landings (`_Order.moved`) read (base review 9d013a4b9
+    F3)."""
+    issued = [at for at in range(position) if program[at].kind == "fill"]
+    return set(issued[:max(len(issued) - (program[position].argument or 0), 0)])
 
 
 def _before(one: dict, other: dict) -> bool:
@@ -885,6 +1279,16 @@ class _Order:
         else:
             self.accumulating[at] = (joined, count, flying)
 
+    def last_filled(self, at, clock, step) -> bool:
+        """Whether the last writes to `at` ordered before `clock` (those no other such write follows) are
+        fills of `step`: a fill an overwrite follows no longer holds its entries (base review 3f38bf20d
+        F4: fill step 0, wait, fill step 2, wait, then a read of step 0 passed on the first fill)."""
+        prior = [(when, written) for where, when, written in self.writes
+                 if where == at and _before(when, clock)]
+        last = [written for when, written in prior
+                if not any(when != other and _before(when, other) for other, _ in prior)]
+        return bool(last) and all(written.kind == "fill" and written.argument == step for written in last)
+
     def ordered(self, at, clock, event, *, write: bool) -> None:
         for where, prior, prior_event in self.writes:
             if _overlaps(where, at) and not _before(prior, clock):
@@ -924,7 +1328,7 @@ class _Order:
         self.ordered(event.at, landing, event, write=True)
         self.writes.append((event.at, landing, event))
         if event.kind == "fill":
-            self.fills.setdefault(thread, []).append(landing)
+            self.fills.setdefault(thread, []).append((position, landing))
         elif event.argument:
             self.arrived(event.argument, landing, counted=False, transaction=-1)
 
@@ -939,19 +1343,25 @@ class _Order:
         elif kind == "expect":
             self.arrived(event.at, clock, counted=True, transaction=event.argument)
         elif kind == "fill_wait":
-            # Its fills landed (`_State.step` holds it till then): each landing before it.
-            for landing in self.fills.pop(thread, ()):
-                clock = _joined(clock, landing)
+            # Its fills but its `n` latest landed (`_State.step` holds it till then): each one's landing
+            # before it; a later one's, landed already or not, ordered only by a later wait.
+            awaited = _drained(self.threads[thread], position)
+            fills = self.fills.pop(thread, [])
+            for at, landing in fills:
+                if at in awaited:
+                    clock = _joined(clock, landing)
+            if rest := [(at, landing) for at, landing in fills if at not in awaited]:
+                self.fills[thread] = rest
             self.clocks[thread] = clock
         elif kind in ("load", "copy", "fill"):
             self.issued[(thread, position)] = dict(clock)
             if event.argument and kind == "load":
                 self.arrived(event.argument, clock, counted=True, transaction=1)
         elif kind in ("read", "write"):
-            if kind == "read" and event.argument == "filled" and not any(
-                    where == event.at and _before(prior, clock) for where, prior, _ in self.writes):
-                raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
-                                [(thread, event)])
+            filled = isinstance(event.argument, tuple) and event.argument[0] == "filled"
+            if kind == "read" and filled and not self.last_filled(event.at, clock, event.argument[1]):
+                raise Violation("unwritten", f"read of {event.at}, whose last write ordered before it is no "
+                                f"fill of its step ({event.argument[1]})", [(thread, event)])
             self.ordered(event.at, clock, event, write=kind == "write")
             (self.writes if kind == "write" else self.reads).append((event.at, dict(clock), event))
             if kind == "write":
@@ -999,11 +1409,17 @@ class _Order:
             self.pending[thread].remove(entry)
 
     def retired(self, thread, kind, kept: int, clock) -> None:
-        """A wait retiring all but its `kept` latest asynchronous reads of `kind`: each read ends here."""
+        """A wait retiring all but its `kept` latest asynchronous issues of `kind` (a warpgroup MMA's group:
+        `wgmma_wait`'s count), each issue's every read ending here together: an issue reads all its
+        operands until its group retires (base review 156a4595a F1: each operand counted as a group of its
+        own retired one operand where the wait left the whole issue in flight)."""
         mine = [entry for entry in self.pending[thread] if entry[0] == kind]
-        for entry in mine[:max(len(mine) - kept, 0)]:
-            self.reads.append((entry[1], dict(clock), entry[2]))
-            self.pending[thread].remove(entry)
+        issues = list(dict.fromkeys(entry[4] for entry in mine))
+        retiring = set(issues[:max(len(issues) - kept, 0)])
+        for entry in mine:
+            if entry[4] in retiring:
+                self.reads.append((entry[1], dict(clock), entry[2]))
+                self.pending[thread].remove(entry)
 
 
 def commits_group(event: Event) -> bool:
@@ -1013,12 +1429,20 @@ def commits_group(event: Event) -> bool:
     return (event.kind == "store" and bool(event.argument)) or event.kind == "store_group"
 
 
-def _overlaps(one: tuple, other: tuple) -> bool:
+def _overlaps(one: "tuple | frozenset[tuple]", other: "tuple | frozenset[tuple]") -> bool:
     """Whether two locations share memory: one ref, one slot or the ref whole, and one part of the slot or
-    the slot whole (a gathered step's tile, `Event`)."""
+    the slot whole (a gathered step's tile, `Event`); a gather's set of blocks (`_reached`) where any of them
+    does, its empty set nowhere."""
+    if isinstance(one, frozenset) or isinstance(other, frozenset):
+        return any(_overlaps(mine, theirs) for mine in _each(one) for theirs in _each(other))
     return bool(one) and bool(other) and one[0] == other[0] and all(
         mine is None or theirs is None or mine == theirs
         for mine, theirs in itertools.zip_longest(one[1:], other[1:]))
+
+
+def _each(location: "tuple | frozenset[tuple]") -> "tuple | frozenset[tuple]":
+    """A location's blocks: a gather's set of them (`_reached`), any other one location."""
+    return location if isinstance(location, frozenset) else (location,)
 
 
 def configurations(**bounds) -> Iterator[dict]:

@@ -157,21 +157,24 @@ def test_every_token_identity_holds_over_the_reals(index, rule):
     assert proven, f"token[{index}]: no instantiation makes both sides values"
 
 
-def _chunk_values(per_key: bool, values_read: bool = False, across: bool = False) -> dict:
+def _chunk_values(per_key: bool, values_read: bool = False, across: bool = False,
+                  before: bool = False, erased: bool = False) -> dict:
     """A symbolic chunk: its tokens, its entering state, and its decays (`scan._Decays`), each token's a
     positive symbol (a key's own where `per_key`) and each span's the product of its tokens'; its reader and
     free readout along the values and the keys where `values_read`; where `across`, its decays along the
-    values too, each token's a positive symbol a value's (`linear_scan.Chunk.across`)."""
+    values too, each token's a positive symbol a value's (`linear_scan.Chunk.across`); where `erased`, its
+    corrections along a vector of their own (`A`, `linear_scan.Parts.erase`)."""
     keys = KEYS if per_key else 1
     read, out = (VALUES, KEYS) if values_read else (KEYS, VALUES)
-    tokens = {name: _symbols(name, (TOKENS, KEYS)) for name in ("B", "C")}
+    tokens = {name: _symbols(name, (TOKENS, KEYS)) for name in ("B", "C", *("A" * erased))}
     tokens.update(Q=_symbols("Q", (TOKENS, read)), R=_symbols("R", (TOKENS, out)),
                   U=_symbols("U", (TOKENS, VALUES)))
     tokens["s"] = _symbols("s", (TOKENS,))
     step = _symbols("d", (TOKENS, keys), positive=True)
     valued = _symbols("e", (TOKENS, VALUES), positive=True) if across else None
     return {"tokens": tokens, "decays": _spans(step), "h": _symbols("h", (KEYS, VALUES)),
-            "values_read": values_read, "across": None if valued is None else _spans(valued)}
+            "values_read": values_read, "across": None if valued is None else _spans(valued),
+            "before": before, "erased": erased}
 
 
 def _spans(step: np.ndarray) -> dict:
@@ -188,9 +191,14 @@ def _spans(step: np.ndarray) -> dict:
 
     between = np.asarray([[span(j + 1, i) if j <= i else np.zeros(width, dtype=object)
                            for j in range(TOKENS)] for i in range(TOKENS)], dtype=object)
+    # A token back: through the token before each (none at the first), from after `j` for `j < i`.
+    between_before = np.asarray([[span(j + 1, i - 1) if j < i else np.zeros(width, dtype=object)
+                                  for j in range(TOKENS)] for i in range(TOKENS)], dtype=object)
     return {"entering": np.asarray([span(0, i) for i in range(TOKENS)], dtype=object),
             "to_last": np.asarray([span(i + 1, TOKENS - 1) for i in range(TOKENS)], dtype=object),
-            "whole": span(0, TOKENS - 1), "between": between, "step": step}
+            "whole": span(0, TOKENS - 1), "between": between, "step": step,
+            "entering_before": np.asarray([span(0, i - 1) for i in range(TOKENS)], dtype=object),
+            "between_before": between_before}
 
 
 def _solved(lower: np.ndarray, given: np.ndarray) -> np.ndarray:
@@ -207,11 +215,13 @@ def _looped(chunk: dict, values: np.ndarray, *, corrected: bool) -> tuple:
     outputs = []
     across = chunk["across"]
     for t in range(TOKENS):
+        entered = tokens["C"][t] @ h
         h = step[t][:, None] * h
         if across is not None:
             h = h * across["step"][t][None, :]
         if corrected:
-            h = h - tokens["s"][t] * np.outer(tokens["B"][t], tokens["C"][t] @ h)
+            read = entered if chunk["before"] else tokens["C"][t] @ h
+            h = h - tokens["s"][t] * np.outer(tokens["A" if chunk["erased"] else "B"][t], read)
         h = h + np.outer(tokens["B"][t], values[t])
         read = h @ tokens["Q"][t] if chunk["values_read"] else tokens["Q"][t] @ h
         outputs.append(read + tokens["R"][t])
@@ -284,35 +294,45 @@ VARIABLES = {"given": (TOKENS, VALUES), "other": (TOKENS, KEYS), "left": (TOKENS
 """Each chunk identity's variable's shape: a solve's given values and the left operand of a product with
 the entering state, a pair's parts; a solve's `lower` strictly lower."""
 
-CHUNK_FORMS = [(corrects, per_key, values_read, across) for corrects in (True, False)
+CHUNK_FORMS = [(corrects, per_key, values_read, across, before, erased) for corrects in (True, False)
                for per_key in (False, True) for values_read in (False, True) for across in (False, True)
-               if not (across and (corrects or values_read))]
+               for before in (False, True) for erased in (False, True)
+               if not (across and (corrects or values_read)) and not (before and not corrects)
+               and not (erased and (not before or values_read))]
 """Each form the identities take: tokens correcting the state or not, a decay a scalar's or each key's, a
-readout along the keys or the values, and a decay along the values too (two-sided GLA's), which no form
-takes beside corrections or a readout along the values."""
+readout along the keys or the values, a decay along the values too (two-sided GLA's), which no form takes
+beside corrections or a readout along the values, corrections reading the state a token enters (`before`),
+and those along a vector of their own (`erased`, RWKV7's), which no form takes beside a readout along the
+values."""
 
 FORM_IDS = [f"{'wy' if corrects else 'plain'}-{'per_key' if per_key else 'scalar'}"
-            f"{'-values' if values_read else ''}{'-across' if across else ''}"
-            for corrects, per_key, values_read, across in CHUNK_FORMS]
+            f"{'-values' if values_read else ''}{'-across' if across else ''}{'-before' if before else ''}"
+            f"{'-erased' if erased else ''}"
+            for corrects, per_key, values_read, across, before, erased in CHUNK_FORMS]
 
-def _form_identities(corrects: bool, per_key: bool, values_read: bool, across: bool) -> list:
+
+def _form_identities(corrects: bool, per_key: bool, values_read: bool, across: bool, before: bool,
+                     erased: bool) -> list:
     """The identities the engine saturates for a form (`linear_scan._identities`)."""
-    return _declared(linear_scan._identities(corrects, not per_key, values_read, across=across))
+    return _declared(linear_scan._identities(corrects, not per_key, values_read, across=across,
+                                             before=before, erased=erased))
 
 
 CHUNK_IDENTITIES = [(*form, index, rule) for form in CHUNK_FORMS
                     for index, rule in enumerate(_form_identities(*form))]
 
 
-@pytest.mark.parametrize(("corrects", "per_key", "values_read", "across", "index", "rule"), CHUNK_IDENTITIES,
+@pytest.mark.parametrize(("corrects", "per_key", "values_read", "across", "before", "erased", "index",
+                          "rule"), CHUNK_IDENTITIES,
                          ids=[f"{named}[{index}]" for form, named in zip(CHUNK_FORMS, FORM_IDS, strict=True)
                               for index, _ in enumerate(_form_identities(*form))])
-def test_every_chunk_identity_holds_over_the_reals(corrects, per_key, values_read, across, index, rule):
+def test_every_chunk_identity_holds_over_the_reals(corrects, per_key, values_read, across, before, erased,
+                                                   index, rule):
     """The identity's two sides equal exactly over a symbolic chunk of three tokens, its decays a scalar's
     or each key's, along the values too where `across`, its readout along the state's keys or its values,
     each under the identities the engine saturates for them (`linear_scan._identities`): every entry of
     each side's value."""
-    chunk = _chunk_values(per_key, values_read, across)
+    chunk = _chunk_values(per_key, values_read, across, before, erased)
     bound = {name: _symbols(name, shape) for name, shape in VARIABLES.items()}
     bound["lower"] = np.tril(_symbols("lower", (TOKENS, TOKENS)), -1)
     left, right = (_chunk(side, chunk, bound) for side in (rule.lhs, rule.rhs))
@@ -411,7 +431,7 @@ def _token_blocks(chunk: dict, name: str) -> _Rows:
     if name == "s":
         return _Rows([_operand("S", b, sizes[b], sizes[b]) for b in chunk["blocks"]], token="s")
     read, out = (v, k) if chunk["values_read"] else (k, v)
-    width = {"B": k, "C": k, "U": v, "Q": read, "R": out}
+    width = {"A": k, "B": k, "C": k, "U": v, "Q": read, "R": out}
     return _Rows([_operand(name, b, sizes[b], width[name]) for b in chunk["blocks"]], token=name)
 
 
@@ -426,18 +446,21 @@ def _decayed_to(chunk: dict, rows: _Rows, part: str):
     h`); a token's rows forward from its block's start, the second block's led by the first's whole. Along
     the values (`_Across`), its reads elementwise after its `entering` decay as a read along the values' are
     (the second block's led by the first's whole `V_1`), or a write's rows decayed `to_last`: back to its
-    block's start (`KV_b`, linear in them), then through every whole from its block on."""
+    block's start (`KV_b`, linear in them), then through every whole from its block on. A token back
+    (`entering_before`: through the token before each, `E(X)_b`) as `entering`'s, the second block's first
+    row its lead alone."""
     if isinstance(part, _Across):
         return _across(chunk, rows, part)
-    if part != "entering":
+    if part not in ("entering", "entering_before"):
         raise TypeError(f"no blockwise product with the {part} decay")
     lead, sizes, k = _lead(chunk), chunk["sizes"], chunk["k"]
+    forward = "F" if part == "entering" else "E"
     if rows.inner:
         return _Rows([part * lead[i] for i, part in enumerate(rows)], inner=True)
     if rows.read is not None:
-        return _Rows([_operand(f"F{rows.read}", b, sizes[b], k) * lead[i] * chunk["h"]
+        return _Rows([_operand(f"{forward}{rows.read}", b, sizes[b], k) * lead[i] * chunk["h"]
                       for i, b in enumerate(chunk["blocks"])])
-    return _Rows([_operand(f"F{rows.token}", b, sizes[b], k) * lead[i]
+    return _Rows([_operand(f"{forward}{rows.token}", b, sizes[b], k) * lead[i]
                   for i, b in enumerate(chunk["blocks"])])
 
 
@@ -481,14 +504,16 @@ def _product(chunk: dict, left, right):
 
 
 def _gram(chunk: dict, left: _Rows, right: _Rows, strict, between):
-    """Each block's own masked pairs, and the pairs across the split decayed through it."""
-    del between
+    """Each block's own masked pairs, and the pairs across the split decayed through it: the row's decay
+    from its block's start through it (`F`), or through the token before where its pairs' decays are a token
+    back (`between_before`, `E`), the key's back to its own block's start (`K`)."""
     sizes, k, blocks = chunk["sizes"], chunk["k"], chunk["blocks"]
-    own = {(i, i): _operand(f"G{left.token}{right.token}{strict}", b, sizes[b], sizes[b])
-           for i, b in enumerate(blocks)}
+    back = between == "between_before"
+    pairs = f"G{left.token}{right.token}{strict}{'b' if back else ''}"
+    own = {(i, i): _operand(pairs, b, sizes[b], sizes[b]) for i, b in enumerate(blocks)}
     if len(blocks) == 2:
         across = _operand(f"K{right.token}", 1, sizes[1], k).T
-        own[1, 0] = _operand(f"F{left.token}", 2, sizes[2], k) * _lead(chunk)[1] * across
+        own[1, 0] = _operand(f"{'E' if back else 'F'}{left.token}", 2, sizes[2], k) * _lead(chunk)[1] * across
     return own
 
 
@@ -616,9 +641,11 @@ def _in_turn(first, second):
     return _Rows([*first, *second], inner=first.inner)
 
 
-@pytest.mark.parametrize(("corrects", "per_key", "values_read", "across"), CHUNK_FORMS, ids=FORM_IDS)
+@pytest.mark.parametrize(("corrects", "per_key", "values_read", "across", "before", "erased"), CHUNK_FORMS,
+                         ids=FORM_IDS)
 def test_every_chunk_identitys_right_side_composes_over_two_blocks_of_any_sizes(corrects, per_key,
-                                                                                 values_read, across):
+                                                                                 values_read, across, before,
+                                                                                 erased):
     """Each chunk identity's right side as declared (`linear_scan._identities`: the dual form, and where
     tokens correct the state the WY form), evaluated blockwise at symbolic sizes (`_blocked`), over a chunk
     of `m + n` tokens equals its first `m` tokens' followed by its last `n` tokens' from the state the
@@ -627,7 +654,7 @@ def test_every_chunk_identitys_right_side_composes_over_two_blocks_of_any_sizes(
     each output reads its own and earlier tokens alone), every declared identity holds at every chunk size:
     the induction docs/design/algebra.md §6.9 states. A term the declaration added that vanishes at three
     tokens (a power of a strictly lower system) breaks its composition here."""
-    identities = _form_identities(corrects, per_key, values_read, across)
+    identities = _form_identities(corrects, per_key, values_read, across, before, erased)
     composed = [rule for rule in identities if _name(_inner(rule.lhs)) in ("plain", "loop")]
     assert len(composed) == 1 + corrects
     for rule in composed:

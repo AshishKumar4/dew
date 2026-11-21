@@ -100,6 +100,7 @@ __all__ = [
     "DecoderTraining",
     "Decoding",
     "DenoisingModel",
+    "DrawsAlone",
     "Exposing",
     "Generating",
     "HiddenStates",
@@ -1201,10 +1202,12 @@ class Exposing(Protocol):
 @runtime_checkable
 class Selective(Protocol):
     """A decoder that scores one position per row instead of them all, so its
-    prefill runs the head only on the slot the first draw reads."""
+    prefill runs the head only on the slot the first draw reads; its prediction
+    states beside the logits, or None for a decoder that keeps none, whose decode
+    steps carry none (`dew.sampling.strategies.DecoderState.hidden`)."""
 
     def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: ModelKwarg
-                             ) -> tuple[jax.Array, jax.Array]: ...
+                             ) -> tuple[jax.Array | None, jax.Array]: ...
 
 
 @runtime_checkable
@@ -1354,6 +1357,17 @@ class IntervalModel(Protocol):
 
     @property
     def interval(self) -> bool: ...
+
+
+@runtime_checkable
+class DrawsAlone(Protocol):
+    """A decoder whose decode state moves with every token it reads, past what a cache's cursor rewinds
+    (an in-context level's chain, `dew.objectives.lm.adaptation.InContextDecoder`): it draws one token a
+    row at a time (`dew.sampling.strategies.Sample`), and a strategy that reads tokens it then rejects or
+    reorders (a speculative block's, a beam's) is refused, naming `draws_alone`'s reason."""
+
+    @property
+    def draws_alone(self) -> str: ...
 
 
 @runtime_checkable

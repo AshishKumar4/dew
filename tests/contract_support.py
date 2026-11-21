@@ -179,6 +179,19 @@ every order through a forward derivative, and reverse over reverse, its backward
 (a fused attention kernel's, ledger 2654, which `forward_mode_attention` serves forward)."""
 
 
+ORDER_SETS = {"first orders": ("primal", "jvp", "vjp"), "jvp of grad": ("jvp of grad",),
+              "second jvp": ("second jvp",), "grad of grad": ("grad of grad",),
+              "second orders, staged": ("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit"),
+              "jvp of grad, scanned": ("jvp of grad, scanned",)}
+"""The contract's orders (`orders`) a case takes at once, the chunked delta rule's and a padded merge's: all
+ten in one case took 127 to 156 s near float32's largest, each order's program compiled for itself (row
+4433); the three second orders in one case 172 s over packed documents there (row 5348), so each is a case
+of its own, the scanned one apart from the staged ones (an interpreted selective scan's 170 s alone). The
+derived delta rule's and a turned template call's every order in one case, their rule and references
+dispatched op by op, took 178 to 193 s and 132 s at unit operands (row 9512): each a case an order set, its
+rule and references staged (`jax.jit`)."""
+
+
 def orders(fn, primals, direction, cotangent):
     """`fn` at each order the contract holds, by name: the primal, a forward and a reverse derivative, a
     forward derivative of the gradient of the output's sum against `cotangent` and a second forward
@@ -310,7 +323,7 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
     8429's 300 s): the mesh's program is another, partitioned, whose floats no common bits hold
     (docs/design/testing.md), and a sum it counts twice fails by its own size. Where the cell set its own
     mesh, its orders already run under it."""
-    from arm_forms import as_given
+    from arm_forms import as_given, dew_path
     from jax.sharding import NamedSharding, PartitionSpec
     from reference_error import assert_as_exact, seeds_for
 
@@ -341,6 +354,8 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
         if draw is None:
             continue
 
+        # The same program off the mesh: one of Dew's own paths, an invariance claim (`dew_path`).
+        @dew_path
         def off(primals, direction, cotangent, name=name):
             return orders(fn, primals, direction, cotangent)[name]()
 

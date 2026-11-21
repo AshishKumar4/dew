@@ -97,9 +97,9 @@ def keywords(case: dict) -> dict:
     if case.get("segment_ids") == "cross":
         keywords["segment_ids"], keywords["key_segment_ids"] = cross_documents()
     if case.get("lengths"):
-        keywords["key_value_seq_lengths"] = LENGTHS
+        keywords["key_value_seq_lengths"] = jnp.asarray(LENGTHS, jnp.int32)
     if case.get("starts"):
-        keywords["key_value_seq_starts"] = STARTS
+        keywords["key_value_seq_starts"] = jnp.asarray(STARTS, jnp.int32)
     if case.get("block_groups"):
         keywords["block_groups"], keywords["image_groups"] = (jnp.asarray(groups)
                                                               for groups in block_groups(geometry(case)[1]))
@@ -1341,7 +1341,7 @@ def test_backward_route_declines_and_runs_with_its_rounded_flag():
     row = jnp.zeros((1, 1, 64), jnp.float32)
     acc = jnp.zeros((1, 1, 64, 64), jnp.float32)
     residuals = (row, jnp.ones_like(row), jnp.zeros((1, 1, 64), jnp.int32),
-                 template.Split(acc, acc, jnp.ones_like(row), row))
+                 template.Split(acc, row, jnp.ones_like(row), row))
     with generation.assumed("sm90"):
         assert attention_mosaic.backward_declined(q, q, q, spans, template.Hooks(), q, residuals=residuals,
                                                   rounded=False) is None
