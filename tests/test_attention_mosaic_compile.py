@@ -1735,7 +1735,7 @@ def test_sm90_d256_forward_fits_single_launch_without_spills():
                 cfg = op.derived(ba, target)
                 assert cfg is not None, (gen, label)
                 assert cfg.columns is None, (gen, label, cfg)
-                # Step to 1 consumer (255 regs/thread) as live certification does when 2-consumer 168-reg spills.
+                # Step to 1 consumer (255 regs/thread) as certification does when 2-consumer spills.
                 one = dataclasses.replace(cfg, consumers=1, relaunch_consumers=1)
                 cases.append(KernelCase(f"{gen}-d256-{label}",
                                         lambda op=op, ba=ba, cfg=one: op.lowering(ba, cfg)))

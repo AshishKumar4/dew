@@ -2425,21 +2425,24 @@ def test_hopper_forward_derives_consumer_count_from_analytic_launch_price():
                 assert price_three > price_two, (batch, seq, heads, width, price_two, price_three)
 
 
-def test_consumer_choice_persists_beside_verdicts_in_tuning_store(tmp_path, monkeypatch):
+def test_consumer_choice_persists_beside_verdicts_in_tuning_store(tmp_path):
     """`tuning.store_choice` / `tuning.stored_choice` persist consumer-count choices beside certification
     verdicts through the cache owner without clobbering verdicts, and `store_verdict` preserves choices
     (rows 6710, 10681)."""
-    monkeypatch.setattr(tuning._cache, "kernel_picks_path", lambda name: str(tmp_path / f"{name}.json"))
-    monkeypatch.setattr(tuning, "_VERDICTS", {})
-    monkeypatch.setattr(tuning, "_CHOICES", {})
-    tuning.store_verdict("sm90", "verdict-key", {})
-    tuning.store_choice("sm90", "choice-key", 2)
-    # Re-read from disk by clearing the process caches.
-    monkeypatch.setattr(tuning, "_VERDICTS", {})
-    monkeypatch.setattr(tuning, "_CHOICES", {})
-    assert tuning.stored_verdict("sm90", "verdict-key") == {}
-    assert tuning.stored_choice("sm90", "choice-key") == 2
-    # Writing another verdict preserves stored choices in the same file.
-    tuning.store_verdict("sm90", "verdict-key-2", {})
-    monkeypatch.setattr(tuning, "_CHOICES", {})
-    assert tuning.stored_choice("sm90", "choice-key") == 2
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(tmp_path)}
+    write = ("from dew.nn.kernels import tuning; "
+             "tuning.store_verdict('sm90', 'verdict-key', {}); "
+             "tuning.store_choice('sm90', 'choice-key', 2)")
+    subprocess.run([sys.executable, "-c", write], env=env, check=True)
+    read_and_write = ("from dew.nn.kernels import tuning; "
+                      "assert tuning.stored_verdict('sm90', 'verdict-key') == {}; "
+                      "assert tuning.stored_choice('sm90', 'choice-key') == 2; "
+                      "tuning.store_verdict('sm90', 'verdict-key-2', {})")
+    subprocess.run([sys.executable, "-c", read_and_write], env=env, check=True)
+    recheck = ("from dew.nn.kernels import tuning; "
+               "assert tuning.stored_choice('sm90', 'choice-key') == 2")
+    subprocess.run([sys.executable, "-c", recheck], env=env, check=True)

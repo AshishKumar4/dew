@@ -634,7 +634,8 @@ class MosaicForward(_Mainloop[Tiles]):
             case Kept.SPLIT:
                 if scales is not None:
                     raise NotImplementedError("a quantized cache's keys are read by inference alone")
-                spec, launch, finished = _training_walk(query, key, value, spans, hooks, scaled=scaled, **form)
+                spec, launch, finished = _training_walk(query, key, value, spans, hooks,
+                                                        scaled=scaled, **form)
                 return spec, launch, finished, False
             case Kept.NONE | Kept.OUTPUT:
                 return _plain_walk(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,

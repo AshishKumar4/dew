@@ -1606,7 +1606,11 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             # Chunk wide (>128) register epilogues into 64-column slices (32 regs/slice) into SMEM, then
             # flush once (`store_staged`) so `state.acc` and `output` fit without spilling on sm90/sm80
             # d256 forward (which forced 2-launch `columns=128`, row 5272).
-            maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
+            finished = stored().finished
+            if finished is not None:
+                maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
+                family.stored(tuple(family.as_row(part) for part in (maximum, denominator)),
+                              finished, smem=row_smem)
 
             def store_chunks(stage):
                 width = state.acc.shape[-1]
@@ -1623,6 +1627,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                 family.store_staged(stage, out_view)
 
             out_stage(store_chunks)
+            return
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,
