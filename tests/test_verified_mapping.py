@@ -457,7 +457,7 @@ def test_a_convention_turns_the_ramp_its_source_turns_past_the_original_context(
 
 
 def test_a_change_to_the_twins_package_verifies_a_mapping_again(tmp_path):
-    """A verified mapping is kept under the digest of the code that verified it (`package_digest`), the
+    """A verified mapping is kept under the digest of the code that verified it (`whole_digest`), the
     float64 twins' torch-only package (`_dew_torch`) among it: an edit there alone, which changes the
     truth a candidate was held to, names another record, so the mapping is verified again."""
     import os
@@ -472,7 +472,7 @@ def test_a_change_to_the_twins_package_verifies_a_mapping_again(tmp_path):
 
     def digest() -> str:
         return subprocess.run(
-            [sys.executable, "-c", "from dew._cache import package_digest; print(package_digest())"],
+            [sys.executable, "-c", "from dew._code import whole_digest; print(whole_digest())"],
             env={**os.environ, "PYTHONPATH": str(tmp_path), "JAX_PLATFORMS": "cpu"}, check=True,
             capture_output=True, text=True).stdout.strip()
 

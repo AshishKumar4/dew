@@ -1049,9 +1049,14 @@ def assert_carry_faults_refused(lane: Lane, heads: int | None = None) -> None:
 def assert_step_faults_refused(lane: Lane, heads: int | None = None) -> None:
     """Decays from a difference of fp32 cumulative sums in a decay alone, refused at `CUMSUM_SHARES`; and each
     chunk's boundary a token early, at `SHIFTED_SHARES`; no record held where its intervals separate."""
+    import tier_wire
+
     sized = {} if heads is None else {"heads": heads}
     cumsum = cumsum_refusals(draw(1, "decay", length=128, **sized), lane)
     shifted = shifted_refusals(draw(1, "mild", length=128, **sized), lane)
+    # Every run recorded: a GPU tier's prepare gives each zeros, which judge nothing (row 7882).
+    if tier_wire.preparing():
+        return
     assert_refusals(cumsum, CUMSUM_SHARES)
     assert_refusals(shifted, SHIFTED_SHARES)
 

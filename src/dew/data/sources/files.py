@@ -658,8 +658,10 @@ class Files(Dataset):
                 return True
             for url in self.paths:
                 fs, _ = Store(url, self.storage_options).resolve()
-                # ArrayRecord's own reader opens a local path or a GCS URL (`ArrayRecords.reader`).
-                if not (local(fs) or on_gcs(fs)):
+                # ArrayRecord's own reader opens a local path or a GCS URL, and a shard its producer
+                # declared from a checked copy on this host (`ArrayRecords.reader`, `Declared.leased`;
+                # row 9052).
+                if not (local(fs) or on_gcs(fs) or url in self.declared):
                     return False
             return True
         if self.where is not None:

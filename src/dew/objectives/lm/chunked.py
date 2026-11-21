@@ -750,7 +750,7 @@ def chunked_tile() -> tuple[int, int]:
     return 4096, 8192
 
 
-def _token_spec(shape: tuple[int, ...]) -> P:
+def token_spec(shape: tuple[int, ...]) -> P:
     """How the loss splits `[batch, length, ...]` targets over the mesh in
     context: rows and positions where the rule table puts the hidden's, then
     over every other axis whose shards the tokens still divide into, the
@@ -820,7 +820,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     MDLM's SUBS parameterization never predicts. A target there scores +inf.
     At None, the default, the compiled program holds no trace of it.
 
-    On a mesh every device scores its own tokens (`_token_spec`): the token
+    On a mesh every device scores its own tokens (`token_spec`): the token
     tiles are dynamic slices in a loop, which GSPMD would only compute on a
     replicated operand, so the split is a `shard_map`. Where the head's
     vocabulary is split over axes that split the tokens too, and the tokens
@@ -1117,7 +1117,7 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
     (`fused_head_loss`), each device's share of it out along the token axes,
     and gathers the head whole. `targets` may be a tuple of arrays alike, split alike."""
     sums = column_logits is None
-    spec = _token_spec(jax.tree.leaves(targets)[0].shape)
+    spec = token_spec(jax.tree.leaves(targets)[0].shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
     if not axes:
         return head(hidden, table, targets, excluded, cap, columns)

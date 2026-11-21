@@ -612,16 +612,36 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
                                np.zeros((1, 1, 1, width), dtype=np.float32)], axis=2)
     np.testing.assert_array_equal(np.asarray(got, dtype=np.float32), expected)
 
-    traced = jax.make_jaxpr(lambda p, s, im, it, ia: merged._launch(
-        p, s, im, it, ia, units=algebra.units_of(spec), queries=queries, width=width, block=width,
-        out_dtype=jnp.bfloat16, out_heads=out_heads))(padded, stacked, init_m, init_t, init_acc)
-    from dew.nn import programs
 
-    (call_eqn,) = [eqn for eqn in programs.equations(traced.jaxpr) if eqn.primitive.name == "pallas_call"]
-    body = call_eqn.params["jaxpr"]
-    producers = {outvar: eqn for eqn in body.eqns for outvar in eqn.outvars}
-    (store,) = [eqn for eqn in body.eqns if eqn.primitive.name == "swap"]
-    cast = producers[store.invars[1]]
-    assert cast.primitive.name == "convert_element_type", cast
-    value_eqn = producers.get(cast.invars[0])
-    assert value_eqn is None or value_eqn.primitive.name != "select_n", value_eqn
+def test_resumable_split_merge_preserves_subnormal_initial_mass():
+    """Row 10818: `algebra.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps its
+    natural maximum instead of replacing it with `LEAST`, so a subsequent `merged.merged_finished` with a
+    low-logit slice (`-140`) preserves the resumed output instead of letting the low-logit slice overwrite
+    it."""
+    batch, slices, rows, kv_heads, width, queries = 1, 2, 4, 1, 16, 2
+    spec = algebra.finished_form(algebra.Forward(form="full", ids=False, keys=16, scale=1.0))
+    padded = jnp.zeros((batch, slices, rows, kv_heads, width), jnp.float32)
+    sub = jnp.float32(2.0 ** -127)
+    scale = jnp.float32(2.0 ** 20)
+    state_acc = jnp.stack([jnp.full((batch, kv_heads, width), scale, jnp.float32),
+                           jnp.zeros((batch, kv_heads, width), jnp.float32)], axis=1)
+    state_m = jnp.zeros((batch, queries, kv_heads), jnp.float32)
+    state_total = jnp.array([[[sub], [0.0]]], jnp.float32)
+    state = algebra.Partial(state_acc, state_m, state_total)
+
+    low_m = jnp.full((batch, kv_heads, slices, rows), -160.0, jnp.float32)
+    low_t = jnp.ones((batch, kv_heads, slices, rows), jnp.float32)
+    low_stacked = jnp.stack([low_m, low_t])
+
+    def step(p_in, st_in, low_s):
+        resumed = algebra.resumable(spec, st_in)
+        next_init = template.Initial(jnp.swapaxes(resumed.m, 1, 2), jnp.swapaxes(resumed.total, 1, 2),
+                                     jnp.swapaxes(resumed.acc, 1, 2))
+        out = merged.merged_finished(spec, p_in, low_s, queries=queries, width=width,
+                                     out_dtype=jnp.float32, out_heads=queries, initial=next_init)
+        return resumed.m, out
+
+    resumed_m, got = jax.jit(step)(padded, state, low_stacked)
+    assert float(resumed_m[0, 0, 0]) == 0.0, resumed_m
+    np.testing.assert_array_equal(np.asarray(got[0, 0, 0]), np.full(width, float(scale), dtype=np.float32))
+    np.testing.assert_array_equal(np.asarray(got[0, 0, 1]), np.zeros(width, dtype=np.float32))

@@ -96,7 +96,7 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, 
 
 
 @functools.cache
-def need_ahead(generation: str, *, split: int, remat: str, tiled: bool = False) -> int:
+def need_ahead(generation: str, *, split: int, remat: str | None, tiled: bool = False) -> int:
     """The bytes the fine-tuned step (`fine_tune`) compiled ahead for a compile-only GPU of `generation`
     needs at `split` microbatches and `remat`, its head tiled where asked: the headroom its compile left of
     a room past all (`gpus`' 64 GiB, which states exactly that allocator limit, `memory_limited_to`), taken
