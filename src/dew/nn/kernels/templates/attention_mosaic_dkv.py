@@ -103,7 +103,7 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         family.staged_memory((holders, max(block_q, block_k), out_width), jnp.float32),
         *([] if value_width == width
           else [family.staged_memory((holders, block_k, value_out), jnp.float32)]),
-        family.staged_memory((holders, block_k), jnp.float32)]
+        *family.vector_stage((holders, block_k), jnp.float32)]
     after = outputs if stages_after_walks(family) else []
     scoped = [family.staged_memory((holders, block_k, width), dtype, swizzle),
               family.staged_memory((holders, block_k, value_width), dtype, swizzle),
@@ -508,13 +508,13 @@ def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple,
     else:
         family.stored((dk,), (dk_view,), smem=dk_stage)
         family.stored((dv,), (dv_view,), smem=dv_smem.at[index])
+    rows_stage = None if rows_smem is None else rows_smem.at[index]
     for key_sum, key_view in zip(key_sums, key_views, strict=True):
         # Each key gradient, the walk's row sums, added into its own `[B or 1, H or 1, Kp]`.
         if family.adds_vectors:
-            family.added(key_sum, key_view, interpret, smem=rows_smem.at[index])
+            family.added(key_sum, key_view, interpret, smem=rows_stage)
         else:
-            family.stored((family.as_row(key_sum),), (key_view,), smem=rows_smem.at[index])
-
+            family.stored((family.as_row(key_sum),), (key_view,), smem=rows_stage)
 def _grad_buffers(graded: list[Kind], shapes: list, batch: int, heads: int, queries: int, keys_padded: int, *,
                   adds_vectors: bool) -> list[tuple]:
     """Each graded parameter's gradient buffer's shape (`_dkv_launched`): its own batch rows and heads
@@ -541,7 +541,7 @@ def _graded(score_params: tuple, kinds: tuple, shares: tuple, shape: tuple, keys
 
 
 def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, widths: bool, split: bool,
-              fused: bool, after: bool) -> tuple:
+              fused: bool, after: bool, vectors: bool = True) -> tuple:
     """The dK/dV program's refs by role: its nine inputs, its spans' and hook parameters' (`treedef` of
     `leaves`), a fused launch's dQ and the hook's key and tile gradients, each added into in place, a ref a
     group of equal shapes (`_dkv_launched`, `stacked.groups`), its dK and dV outputs, and its scoped
@@ -554,7 +554,7 @@ def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, 
     dk_ref, dv_ref, *refs = refs
     keyed = tuple([ref for ref, kind in zip(views, graded, strict=True) if kind == wanted]
                   for wanted in DKV_GRADS)
-    held = _dkv_scoped(refs, widths=widths, staged=not split and not after)
+    held = _dkv_scoped(refs, widths=widths, staged=not split and not after, vectors=vectors)
     return inputs, unflattened, (dq_ref, dk_ref, dv_ref), held, keyed
 
 def _shared_views(family: mosaic.Family, outputs, grad_refs, graded: list[Kind], block_k: int) -> tuple:
@@ -590,7 +590,7 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
         pl.run_scoped(total, family.staged_memory(value.shape, jnp.float32),
                       **across.summing(value.shape, consumers), collective_axes="wg")
 
-def _dkv_scoped(refs, *, widths: bool, staged: bool) -> tuple:
+def _dkv_scoped(refs, *, widths: bool, staged: bool, vectors: bool = True) -> tuple:
     """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, dK's output
     stage and dV's (dK's where the head `widths` agree) and its key gradients' stage where the program's
     scope holds them (`staged`: none where its consumers share its keys, `split_queries`, or a scope after
@@ -599,15 +599,18 @@ def _dkv_scoped(refs, *, widths: bool, staged: bool) -> tuple:
     keys, values, refs = refs[0], refs[1], refs[2:]
     if not staged:
         return keys, values, None, None, None, *refs
-    dk_stage, dv_stage, rows_stage = _output_stages(refs[:3], widths=widths)
-    return keys, values, dk_stage, dv_stage, rows_stage, *refs[3 - widths:]
+    count = (1 if widths else 2) + vectors
+    dk_stage, dv_stage, rows_stage = _output_stages(refs[:count], widths=widths, vectors=vectors)
+    return keys, values, dk_stage, dv_stage, rows_stage, *refs[count:]
 
 
-def _output_stages(refs, *, widths: bool) -> tuple:
+def _output_stages(refs, *, widths: bool, vectors: bool = True) -> tuple:
     """dK's output stage, dV's (dK's where the head `widths` agree) and the key gradients' from the first of
     `refs` (`_dkv_allocations`' outputs)."""
-    return (refs[0], refs[0], refs[1]) if widths else (refs[0], refs[1], refs[2])
-
+    dk_stage = refs[0]
+    dv_stage = refs[0] if widths else refs[1]
+    rows_stage = refs[1 if widths else 2] if vectors else None
+    return dk_stage, dv_stage, rows_stage
 def _keys_last(arrays, kinds) -> tuple[jax.Array, ...]:
     """Each tile kind's of `arrays` (a score hook parameter's or gradient's, `[B, H, ., .]`) with its last two
     axes swapped, between the call's queries-first entries and the dK/dV program's keys-first ones."""
@@ -677,7 +680,7 @@ def _keys_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple
     if after is None:
         stored(stages)
     else:
-        after(lambda *scoped: stored(_output_stages(scoped, widths=widths)))
+        after(lambda *scoped: stored(_output_stages(scoped, widths=widths, vectors=family.stages_vectors)))
 
 
 @tuning.lowered_once(("walk", "shares", "name"))
@@ -710,7 +713,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     def body(*refs, streams, after=None):
         inputs, unflattened, outputs, held, (key_refs, tile_refs) = _dkv_refs(
             refs, treedef, len(leaves), graded, groups, widths=value_width == width, split=split,
-            fused=walk.fused, after=after is not None)
+            fused=walk.fused, after=after is not None, vectors=family.stages_vectors)
         spans_of, score_refs, drop_of, l_ref = unflattened
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
