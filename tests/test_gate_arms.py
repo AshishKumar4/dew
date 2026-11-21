@@ -366,20 +366,34 @@ def test_a_gpu_parts_prepare_skips_a_test_declared_to_compile_at_run(monkeypatch
     conftest.pytest_runtest_setup(_Marked("compiles_at_run"))
 
 
-def test_a_check_one_site_outside_a_gpu_part_loads_none_of_the_stores_machinery():
-    """`reference_error`, every check-1 site's module, loads none of the truths store's machinery
-    (tests/truths_ahead.py, tests/arm_store.py) until a store is open (`store_wire.COMPILED`, a GPU tier
-    part's prepare or run): the CPU lane's tests, which open none, never load it, so its churn re-keys none
-    of their rows (the test cache keys a row on each module its test loads; 359 test files loaded it through
-    reference_error)."""
+def _machinery_loaded(code: str) -> list[str]:
+    """The truths store's machinery (tests/truths_ahead.py, tests/arm_store.py) a fresh CPU process running
+    `code` from the tests' directory loaded."""
     import json
     import os
     import subprocess
     import sys
     from pathlib import Path
 
-    code = ("import json, sys, reference_error\n"
-            "print(json.dumps(sorted({'truths_ahead', 'arm_store'} & set(sys.modules))))")
+    code += "\nimport json, sys\nprint(json.dumps(sorted({'truths_ahead', 'arm_store'} & set(sys.modules))))"
     done = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent, capture_output=True,
                           text=True, check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
-    assert json.loads(done.stdout.splitlines()[-1]) == []
+    return json.loads(done.stdout.splitlines()[-1])
+
+
+def test_a_check_one_site_outside_a_gpu_part_loads_none_of_the_stores_machinery():
+    """`reference_error`, every check-1 site's module, loads none of the truths store's machinery
+    (tests/truths_ahead.py, tests/arm_store.py) until a store is open (`store_wire.COMPILED`, a GPU tier
+    part's prepare or run): the CPU lane's tests, which open none, never load it, so its churn re-keys none
+    of their rows (the test cache keys a row on each module its test loads; 359 test files loaded it through
+    reference_error)."""
+    assert _machinery_loaded("import reference_error") == []
+
+
+def test_a_gpu_flows_cells_outside_a_prepare_load_none_of_the_stores_machinery():
+    """A GPU flow's cells run outside a GPU tier part's prepare (`gpu_flow.run_cells`, the CPU lane's flow
+    files') load none of the truths store's machinery: each cell's read of the prepare's tried sites asks the
+    store's switch (`store_wire.COMPILED`), where it loaded `truths_ahead` first, so a CPU flow file's row
+    re-keyed on its churn (row 10826)."""
+    flow = "import gpu_flow\ngpu_flow.run_cells([gpu_flow.Cell('a cell', lambda: None)])"
+    assert _machinery_loaded(flow) == []
