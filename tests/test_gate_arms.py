@@ -288,3 +288,79 @@ def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_ref
     for x, made in zip(draws, ran, strict=True):
         np.testing.assert_array_equal(np.asarray(made), x * 2)
 
+
+
+class _Marked:
+    """A test's markers as pytest's item reads them (`get_closest_marker`), the conftest's hook's only read
+    of it (the prepare skip witnesses'): each name's mark, its reason given."""
+
+    def __init__(self, *names: str):
+        self.names = names
+
+    def get_closest_marker(self, name: str):
+        return getattr(pytest.mark, name)(reason="the witness's").mark if name in self.names else None
+
+
+def test_a_gpu_parts_prepare_skips_what_its_run_skips_by_backend(monkeypatch):
+    """A GPU tier part's prepare (`tier_wire.preparing`) skips a test its GPU run skips by its backend
+    marker, a TPU's or the CPU lane's, and prepares one marked for a GPU or unmarked (tests/conftest.py's
+    `pytest_runtest_setup`): prepared where its run skips it, a test computed there and was filed
+    unprepared (row 10169's cells, the TPU's ways of test_algebra_scaled)."""
+    import lane_environment
+    import conftest
+    import tier_wire
+
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.delenv(lane_environment.USERS_ARITHMETIC, raising=False)
+    for backend in ("tpu", "cpu"):
+        with pytest.raises(pytest.skip.Exception):
+            conftest.pytest_runtest_setup(_Marked(backend))
+    conftest.pytest_runtest_setup(_Marked("gpu"))
+    conftest.pytest_runtest_setup(_Marked())
+
+
+def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch):
+    """In a GPU tier part's prepare, an assertion a test makes once every site and arm it began finished
+    checks the zeros its prepared arms gave (`reference_error.ahead_arm`), which judge nothing: its prepare
+    passes it to its run (tests/conftest.py's `judged_on_zeros`; rows 10169 on: a cell asserting a product's
+    value failed its file's prepare). A missing program is no such check, nor is a failure whose arm did not
+    finish, nor one outside a prepare."""
+    import types
+
+    import conftest
+    import tier_wire
+    import truths_ahead
+
+    with pytest.raises(AssertionError) as checked:
+        raise AssertionError
+    with pytest.raises(truths_ahead.MissingTruth) as missing:
+        raise truths_ahead.MissingTruth
+    store = types.SimpleNamespace(prepare=True, tried={"an arm"}, done={"an arm"})
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    token = truths_ahead.COMPILED.set(store)
+    try:
+        assert conftest.judged_on_zeros(checked)
+        assert not conftest.judged_on_zeros(missing)
+        store.done = set()
+        assert not conftest.judged_on_zeros(checked)
+    finally:
+        truths_ahead.COMPILED.reset(token)
+    monkeypatch.delenv(tier_wire.PREPARE)
+    assert not conftest.judged_on_zeros(checked)
+
+
+def test_a_gpu_parts_prepare_skips_a_test_declared_to_compile_at_run(monkeypatch):
+    """A behavioral GPU test with no check-1 site that declares its programs compiled at its run
+    (`compiles_at_run`) is skipped by its part's prepare, which has nothing of it to compile ahead, and run
+    outside one (tests/conftest.py's `pytest_runtest_setup`): its first computation in a prepare was filed
+    as a check-1 site's prepare missed (rows 8310, 8097)."""
+    import lane_environment
+    import conftest
+    import tier_wire
+
+    monkeypatch.delenv(lane_environment.USERS_ARITHMETIC, raising=False)
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with pytest.raises(pytest.skip.Exception):
+        conftest.pytest_runtest_setup(_Marked("gpu", "compiles_at_run"))
+    monkeypatch.delenv(tier_wire.PREPARE)
+    conftest.pytest_runtest_setup(_Marked("compiles_at_run"))

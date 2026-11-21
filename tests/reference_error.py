@@ -128,10 +128,7 @@ from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 from truths_ahead import COMPILED, CompiledTruths, arm_role, judged, named, reading, running
 
 from dew._accuracy import distance, reduction_bound, within
-from dew.algebra import passes
 from dew.nn import programs
-from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import report
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -652,6 +649,11 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     for seed in range(staged_units(seeds)):
         inputs = drawn_on_the_host(draw, seed)
         shaped.setdefault(named("truth", widened(inputs)), inputs)
+
+    # The algebra's switch and the kernels' report read where a site prepares, never at load: a test of the
+    # gate imports no kernel (the test cache keys a row on every module it loads).
+    from dew.algebra import passes
+    from dew.nn.kernels.templates import report
 
     programs, held = {}, {}
     with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
@@ -1705,7 +1707,7 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None, orders=None, examples: bool = False,
               conditioning: bool = False, conditioning_scale=None, followed=None, arms: tuple | None = None,
-              written: bool = False) -> int:
+              written: bool = False, progress=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
     (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
@@ -1739,7 +1741,8 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it.
     `arms`, where given, are the pair as compiled (Dew's and the reference's, a store's, `_stored_arms`; with
     `written` the reference's twin as written), taken in place of compiling them here, an arm computing in
-    NumPy refused where they were made."""
+    NumPy refused where they were made. `progress`, where given, is told each count before its draws are
+    drawn (`parity.Sized`)."""
     if COMPILED.get() is not None:
         raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths' programs no "
                          "prepare compiled")
@@ -1775,7 +1778,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None,
                       conditioning=weighing, followed=followed)[0]
 
-    return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None)
+    return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None, progress=progress)
 
 
 def recording(path) -> dict[str, np.ndarray]:
@@ -1931,11 +1934,28 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
         return called
 
     def with_launches(*inputs):
+        from dew.nn.kernels import tuning
+
         with tuning.seen() as found:
             outputs = called(*inputs)
         return outputs, found.held()
 
     return with_launches
+
+
+def ran_here(fn: Callable, label: str) -> list[Callable]:
+    """`fn` each way this run takes a law's computation with no check-1 site: jitted as an arm (`ahead_arm`,
+    under `label`), which a GPU tier part's prepare compiles ahead and its run runs from that program, and op
+    by op on the CPU lane alone, whose eager dispatch no prepare compiles ahead (a GPU's tier takes the
+    jitted way; row 10169's cells ran unprepared for it). A caller runs every way before it judges any: a
+    prepare's arm gives zeros, and a check failing there leaves the arms after it uncompiled."""
+    import tier_wire
+
+    def eager(*args):
+        with jax.disable_jit():
+            return fn(*args)
+    cpu_lane = jax.default_backend() == "cpu" and not tier_wire.preparing()
+    return [ahead_arm(jax.jit(fn), label), *([eager] if cpu_lane else [])]
 
 
 def input_digest(inputs) -> np.uint64:

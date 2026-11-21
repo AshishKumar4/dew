@@ -576,7 +576,7 @@ def main(config: Config) -> dict:
     if config.runner not in ("process", "container"):
         raise ValueError(f"runner is process or container, got {config.runner!r}")
     runner = ProcessRunner() if config.runner == "process" else ContainerRunner(config.image)
-    fleet = SandboxFleet(runner, limits=limits, workers=max(os.cpu_count() or 1, 4))
+    fleet = SandboxFleet(runner, limits=limits)
     reward = CodeReward(fleet)
     if config.turns == 1:
         sessions = PromptSource(server, reward, decode=words.decode, max_new_tokens=config.new_tokens)

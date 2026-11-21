@@ -946,9 +946,18 @@ class CausalSelfAttention(nn.Module):
             return metadata is not None
         # QK-Clip's logit maxima are taken under the mask (`_attended`), so a
         # layer that sows them keeps it.
-        implied = (metadata is not None and metadata.right_padded and causal
-                   and not (not self.is_initializing() and self.is_mutable_collection(QK)))
-        return metadata is not None and metadata.valid is not None and not implied
+        return (metadata is not None and metadata.valid is not None
+                and not self._causal_implies_right_padding(metadata, causal))
+
+    @property
+    def _sows(self) -> bool:
+        """Whether this call sows QK-Clip's per-head logit maxima (`QK`)."""
+        return not self.is_initializing() and self.is_mutable_collection(QK)
+
+    def _causal_implies_right_padding(self, metadata: AttentionMetadata | None, causal: bool) -> bool:
+        """Whether causality alone keeps each real query off trailing padding (so right-padded validity
+        or single-document metadata need not materialize a mask), unless QK-Clip is sowing under it."""
+        return metadata is not None and metadata.right_padded and causal and not self._sows
 
     def _one_document_a_row(self, metadata: AttentionMetadata | None, causal: bool, prefix,
                             append: Append | None, decode: bool) -> bool:
@@ -961,9 +970,8 @@ class CausalSelfAttention(nn.Module):
         for its documents (`_reads_whole_blocks`), and a layer that sows QK-Clip's logit maxima takes them
         under the mask, so both keep them."""
         laid = None if metadata is None else metadata.coordinates
-        sowing = not self.is_initializing() and self.is_mutable_collection(QK)
-        return (causal and not decode and laid is not None and laid.max_segments == 1 and laid.right_padded
-                and laid.forks is None and not sowing
+        return (not decode and laid is not None and laid.max_segments == 1 and laid.forks is None
+                and self._causal_implies_right_padding(metadata, causal)
                 and not self._reads_whole_blocks(metadata, prefix, append, decode))
 
     @nn.compact
@@ -1536,7 +1544,7 @@ class CausalSelfAttention(nn.Module):
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
-        sowing = not self.is_initializing() and self.is_mutable_collection(QK)
+        sowing = self._sows
         if sowing:
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
             seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,

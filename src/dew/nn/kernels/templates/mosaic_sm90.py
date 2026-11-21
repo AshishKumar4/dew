@@ -10,7 +10,8 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import bodies, fed, mosaic, resources, ring_family
+from dew.nn.kernels import launches
+from dew.nn.kernels.templates import fed, mosaic, resources, ring_family
 
 
 class WgmmaLayout:
@@ -80,14 +81,24 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+        def both(acc1, acc2):
+            plgpu.wgmma(acc1, lhs1, rhs1)
+            plgpu.wgmma(acc2, lhs2, rhs2)
+            mosaic.committed()
+            return acc1[...], acc2[...]
+
+        return pl.run_scoped(both, plgpu.WGMMAAccumulatorRef(shape, jnp.float32),
+                             plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         if interpret:
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         mosaic.committed()
         if interpret:
             fresh = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
@@ -118,7 +129,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return super().read(value, first=first, columns=columns)
 
     def register_products(self, acc, parts, rhs):
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         for formed in parts:
             part = mosaic.unscaled_part(formed)
             mosaic.committed()
@@ -135,7 +146,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         """`Family.summed` into a scoped warpgroup accumulator: reading it (`acc_ref[...]`) waits on the
         products `issue` issued into it, so the value is theirs once they are done."""
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         if interpret:
             return issue(self.zeros(shape))
 
@@ -194,13 +205,6 @@ class Wgmma(WgmmaIssuer, ring_family.RingFamily):
     # program takes.
     consumers = 3
     cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
-
-    @property
-    def derived_consumers(self) -> int:
-        # Two first: the forward's two consumers (128-row programs) ran every causal cell measured faster
-        # than its three at equal peak, 1.29x to 1.57x, at widths 64 and 128, eight heads to 128 (M-ET-79, a
-        # GH200).
-        return 2
 
 
 WGMMA = Wgmma()

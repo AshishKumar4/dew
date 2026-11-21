@@ -141,7 +141,10 @@ Each template is a `Template`, Dew's launch protocol: its `derived(call, target)
 
 A template's algebra is derived from a declaration of what the operation computes, by the same e-graph engine as the algebra pass, and both uses of the engine price their candidates in one cost vocabulary. The declarations, the derivation, what is bound and what is still written by hand, and the cost model are [algebra.md](algebra.md)'s (§6.9 Derived template forms; §1.6 and §6.5, cost).
 
-*Where it lives: `dew.algebra.derive` (`Reduction`, `derive`), `dew.algebra.scan` (`Scan`, `derive_scan`), `dew.algebra.carry`, `dew.algebra.forms` (`Derived`, `derived`), `dew.algebra.cost` (`work`, `fused`, `walk`), `templates/cost.py` (`Work`, `walked`), `attention_algebra` (`declaration`, `_derived_step`), `recurrence_chunk.xla_mainloop`.*
+*Where it lives: `dew.algebra.derive` (`Reduction`, `derive`), `dew.algebra.scan` (`Scan`, `derive_scan`),
+`dew.algebra.carry`, `dew.algebra.forms` (`Derived`, `derived`), `dew.algebra.cost` (`work`, `fused`,
+`walk`), `templates/cost.py` (`Work`, `walked`), `attention_algebra` (`declaration`, `plain_step`),
+`recurrence_chunk.xla_mainloop`.*
 
 ## Lowering to machine code
 

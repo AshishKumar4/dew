@@ -24,6 +24,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Program,
     _streamed,
     _views_of,
+    head_slice,
     indexed_views,
     riding,
     score_stream,
@@ -157,11 +158,12 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
     cotangents."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
-    held = keys.transpose((1, 0))
-    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
-         if walk.scaled else family.product(q_slot, held, shape))
-    dp = family.product(do_slot, values.transpose((1, 0)), shape)
-
+    held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
+    if walk.scaled:
+        s = family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
+        dp = family.product(do_slot, values_t, shape)
+    else:
+        s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
         exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, (), s, dp, *rows,
@@ -259,7 +261,8 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
     dQ reduce runs off the consumers' path."""
     row, head = place
     rows = dq.shape[0]
-    view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
+    view = dq_ref.at[index if walk.interpret else 0,
+                     *head_slice(walk.program.family, row, head, pl.ds(q_first, rows))]
     if out_smem is None:
         walk.program.family.added(dq, view, walk.interpret, smem=None)
         return
@@ -280,7 +283,7 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     row, head = family.program_index("batch"), family.program_index("heads")
     pair = consumers * block_q
     refs, kinds = score
-    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+    views = _views_of(family, {"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
     if riding(family, kinds, "keys"):
         views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
     if spans is not None and spans.walk_count is not None:
@@ -299,6 +302,6 @@ def _query_tile_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: 
     """Consumer `index`'s query tile from `first` and its output cotangents, each `(ref, smem)` of `refs`
     and `smem` loaded whole against its `loaded` barrier at the program's batch row and head (`place`)."""
     row, head = place
-    rows = (row, pl.ds(first, smem[0].shape[1]), head)
+    rows = head_slice(family, row, head, pl.ds(first, smem[0].shape[1]))
     family.loaded(tuple((ref.at[rows], stage.at[index], barrier.at[index])
                         for ref, stage, barrier in zip(refs, smem, loaded, strict=True)))

@@ -17,7 +17,8 @@ from dew.data.dataset import Loader
 from dew.objectives.world_model import CausalTokenizer, TokenizerObjective
 from dew.training import Trainer
 
-pytestmark = pytest.mark.gpu(reason="tutorial 12's tokenizer at its own scale, 8,000 updates of 32 clips")
+pytestmark = [pytest.mark.gpu(reason="tutorial 12's tokenizer at its own scale, 8,000 updates of 32 clips"),
+              pytest.mark.compiles_at_run(reason="a training run the learning gate judges, no check-1 site")]
 
 TUTORIAL = Path(__file__).parent.parent / "tutorials" / "12-world-models.ipynb"
 BALL_UNITS = 32

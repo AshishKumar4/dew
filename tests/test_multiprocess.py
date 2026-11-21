@@ -1161,6 +1161,7 @@ def packed_checkpoint(tmp_path_factory):
 
 
 @pytest.mark.distributed
+@pytest.mark.shared_setup("packed_checkpoint")
 @pytest.mark.parametrize("processes", [1, 4])
 def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
                                                                  packed_checkpoint,
@@ -1195,15 +1196,16 @@ def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
 
 
 @pytest.mark.distributed
+@pytest.mark.shared_setup("packed_checkpoint")
 def test_a_packed_pool_reads_the_windows_one_process_reads(tmp_path, packed_checkpoint):
     """The same claim without a checkpoint in it: the union of the windows a
-    pool reads at a step is the step one process reads, row for row."""
+    pool reads at a step, the checkpointed pool's (`packed_checkpoint`, the same
+    fit), is the step one process reads, row for row."""
     flags = {"name": "packed", "fsdp_size": 1, "steps": POOL_STEPS,
              "tokens": packed_checkpoint["corpus"].train, "seq_len": PACKED_SEQ_LEN}
     single = run_worker("packed_fit", tmp_path / "single.json", devices=MESH_DEVICES,
                         run_dir=tmp_path / "single-run", **flags)
-    pool = run_pool("packed_fit", tmp_path / "pool", 2,
-                    run_dir=tmp_path / "pool-run", **flags)
+    pool = packed_checkpoint["reports"]
 
     for step in range(POOL_STEPS):
         rows = [row for held in zip(*(report["windows"][step] for report in pool), strict=True)

@@ -33,7 +33,6 @@ from __future__ import annotations
 import atexit
 import dataclasses
 import functools
-import gc
 import itertools
 import pickle
 import shutil
@@ -1129,19 +1128,6 @@ assert {method.name for method in METHODS} == {
 assert {method.name for method in METHODS if method.refuse is not None} <= {
     param.values[0].name for param in cells(supported=False)
 }, "every method with a refusal check must generate at least one refused cell"
-
-
-@pytest.fixture(autouse=True)
-def release_compilations():
-    """conftest's release after every test here rather than past its budget
-    of mappings (`released_past_budget`): this file's 167 cells each compile
-    their own executables, which no later cell reuses, and in one process the
-    file took 2,457 s releasing after each against 3,101 s holding them to
-    the budget (33,491 mappings, 4.6 against 2.9 GB resident), on an armada
-    container."""
-    yield
-    jax.clear_caches()
-    gc.collect()
 
 
 @pytest.mark.parametrize("method, family", cells(supported=True))

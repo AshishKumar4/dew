@@ -134,6 +134,32 @@ def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_train
     assert stepped.values == []
 
 
+@pytest.mark.parametrize("eval_every", [None, 2], ids=["at-the-end", "midway"])
+def test_a_validation_split_holding_no_field_its_metric_reads_is_refused_before_the_run_trains(eval_every):
+    """A metric that reads a field beside its scores (`Mean.fields`, as a CLIP score reads the captions it
+    compares) over a validation split whose records hold none: the split's first batch is read before the
+    run updates, whether it is scored every two steps or only at the end, and the run is refused there, on
+    every process at once, before it completes a step. Before, an end-only split met the missing field at
+    its first scoring, after training (row 9063)."""
+    from dew.artifacts import TokenScores
+    from dew.eval.common import Mean
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
+    rows = Memory({"text": tokens}).read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
+    model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=4, attention_impl="reference")
+    captioned = Mean(lambda scores, batch: [len(caption) for caption in batch["caption"]], name="captioned",
+                     better="higher", reads=TokenScores, fields=("caption",))
+    stepped = Observe(1, lambda state: int(state.step))
+    with pytest.raises(ValueError):
+        Trainer(LMObjective(model, seq_len=4, ema_decay=None), optax.adam(.05), key=0).fit(
+            rows.shuffle().repeat().batch(8), steps=4, log_every=1, eval_every=eval_every,
+            metrics=[captioned], validation=rows.batch(8), observe=stepped)
+    assert stepped.values == []
+
+
 def regression_rows(rows: int, seed: int) -> dict:
     x = np.random.default_rng(seed).normal(size=(rows, 3)).astype(np.float32)
     return {"x": x, "y": x[:, :2]}

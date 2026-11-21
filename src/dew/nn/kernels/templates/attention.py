@@ -41,7 +41,6 @@ from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import bodies
 from dew.nn.precision import (
     at_least_fp32,
     compensated_sum,
@@ -51,6 +50,19 @@ from dew.nn.precision import (
     two_product,
     two_sum,
 )
+
+DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
+"""The operand dtypes the attention template's kernels take, one on queries, keys and values alike."""
+
+WARPS = 4
+"""A program's warps: one warpgroup, its tile's rows over its four warps, FlashAttention 2's."""
+
+ROWS = 32
+"""A warp's rows of the block: two mma.sync instructions' sixteen."""
+
+BLOCK = WARPS * ROWS
+"""The most rows or keys a tile takes, the block a call pads to (`padded_call`): a warp's rows a warp
+(FlashAttention 2's 128 a program)."""
 
 
 @jax.tree_util.register_dataclass
@@ -2065,6 +2077,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             numerator = raised_exactly(delta, raised) * half * half
             divisor = jnp.where(total > 0, total, 1.0)
             return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
+        from dew.nn.kernels.templates import bodies
 
         weighed = bodies.subnormals(weighed_by, delta.dtype)
         # In the state's own structure, its static marks with it (`Initial.valueless`).

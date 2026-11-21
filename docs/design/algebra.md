@@ -66,8 +66,13 @@ they are declared: neither is generated yet.
   - elementwise operations, casts, broadcasts, reshapes and transposes;
   - reductions (sum, max, min), `dot_general` and select;
   - rsqrt, sqrt, exp, log, log1p, expm1, abs and sign.
-- **Opaque leaves,** never rewritten: Pallas kernels, collectives, `shard_map`, sharding constraints, random
-  numbers, callbacks and effects.
+- **Opaque leaves,** never rewritten: Pallas kernels, collectives, sharding constraints, random numbers,
+  callbacks and effects.
+- **A manual mesh's body** (`jax.shard_map`'s, each device's program) is a boundary, not a leaf: the pass
+  rewrites inside it in the map's recorded context (its newly manual axes bound, its abstract mesh manual,
+  its variance checked as the map checks it), each traced value typed by the manual axes it varies over, and
+  nothing moves across it; a constant its rewrite holds becomes one of the map's replicated operands, as JAX
+  stages a map (row 6578).
 - **Marked regions** (§6.10): Dew brackets a span of a computation with a marker primitive whose JVP and
   transpose rules bracket the span's tangent and cotangent too, so a span keeps its marker through autodiff. A
   marker carries its kind as an object, never a name string:
@@ -1097,9 +1102,9 @@ derived one replaced is deleted with it, check 1 holding the derived forms to XL
   in the mainloop's own accumulator and every product through its own issuer. (Today a finish of a state
   already normalized, a merge of finished states (`finished_merged`), takes its sums as its output by hand,
   `finish`'s `normalized`.) The declaration covers
-  natural and base-2 exponents, keys-first tiles, initial states and score hooks; its products sum in fp32.
-  A dropping call's step keeps the template's: the declaration narrows a dropped weight unnormalized, past
-  fp16's largest at a rate near 1, where the template's scaled parts keep it. A walk's merge and finish name
+  natural and base-2 exponents, keys-first tiles, initial states, dropout and score hooks; its products sum
+  in fp32. Every forward step, dropping calls included, takes the derived forms
+  (`attention_algebra.plain_step`). A walk's merge and finish name
   the forms they read by the walk's tiles (`Derived.merge`, `finish`: a state's values alone name no walk, a
   bf16 walk's fp32 sums being an fp32 walk's too); the attention state's merge and finish read the same
   forms at any keys a tile or values' dtype, so the template names its base's walk at the state's rows and
@@ -1146,11 +1151,9 @@ a derived form replaces a hand-written one only where it states the walk, passes
   maximum). A compensated walk's running sums are the mainloop's own additions over the derived forms
   (`Derived.step`'s `stepped`, the mainloop's one step over each sum's parts, `Accumulated` and `Added`). The
   attention template runs these forms: its step, its merge and its output are the derived ones
-  (`attention_algebra.plain_step`, `merge` and `finish`, through `_derived_step`, `_derived_merge` and
-  `_derived_output`), compensated and scaled walks among them. Two hand branches remain, each a gap: a
-  dropping call's step (the derivation narrows a dropped weight unnormalized, past fp16's largest at a rate
-  near 1, where the hand step's scaled parts keep it, a representation the declaration states none of), and
-  a normalized state's output, whose sums are its output already. The guard's shifted sums follow, its
+  (`attention_algebra.plain_step`, `merge` and `finish`, through `plain_step`, `_derived_merge` and
+  `_derived_output`), compensated, scaled and dropping walks among them. One hand branch remains: a
+  normalized state's output, whose sums are its output already. The guard's shifted sums follow, its
   control flow the template's. Error-aware
   extraction (§1.5) waits for a cell whose cheapest form fails check 1 where an equal one passes: row 3310's
   was the test's schedule, not a form.

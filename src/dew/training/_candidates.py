@@ -28,7 +28,7 @@ from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_
 from dew.distributed.placement import Placement, Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
-from dew.nn.kernels.options import held_context, owned_program
+from dew.nn.kernels.options import held_context, owned_program, program_key
 from dew.nn.sharding import Link, Schedule, spread_axes, spread_over
 from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training._lowering import Routed, kernel_report, routed
@@ -223,12 +223,16 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
 
 
 def forget(lowered: jax.stages.Lowered) -> None:
-    """Drop every step this process keeps for a trainer built anew (`candidate_for`) lowered as `lowered`:
-    one whose program a compile guided by a profile supersedes (`Planned.guided`), whose executable a kept
-    lowering would hold alive beside the guided one (JAX keeps each executable of a lowering while it
-    lives)."""
+    """Drop every step this process keeps for a trainer built anew (`candidate_for`) whose program is
+    `lowered`'s (`program_key`): one whose executable a compile guided by a profile supersedes
+    (`Planned.guided`), whether compiled from `lowered` or taken from `options._HELD` after an earlier
+    trainer lowered it, so no kept lowering holds the superseded executable alive beside the guided one (JAX
+    keeps each executable of a lowering while it lives)."""
+    target = program_key(lowered)
     with _KEEPING:
-        for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered]:
+        # Its trees first, so only a lowering of the same shapes renders its text to compare.
+        for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered or (
+                kept.lowered.in_tree == lowered.in_tree and program_key(kept.lowered) == target)]:
             del _CANDIDATES[key]
 
 

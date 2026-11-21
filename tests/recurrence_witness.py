@@ -255,17 +255,16 @@ def output(q, k, entering, values, exponents: Exponents, scale: float, lane: Lan
     return fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
 
 
-def keys_gated_enclosures(step: "Step", scale: float, lane: Lane,
-                          entering: Iv | None = None) -> dict[str, Iv]:
+def keys_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, Iv]:
     """`enclosures` of a chunk whose write gate takes the keys' side (`mainloop.Call.gated_keys`, Mamba2's SSD
     under the fast forms): the memory it leaves, fp32 (`algebra.keys_gated_carried`: the carry decayed to the
     chunk's end, plus each key row gated in fp32 by its write gate times its decay to the end and rounded to
     the values' dtype, against the values as given), and its output before its store (`chunk_scores` with
     each key column scaled by its write gate before the scores round, `chunk_output`). The scores' tile is a
     derived form (`algebra.derived_tile`), its products, decays and gates multiplied in either association:
-    their enclosure is both's hull. `entering` is the memory its output reads, by default the stored `h`."""
+    their enclosure is both's hull. Its output reads the memory the chunk enters as stored (`h`)."""
     exponents = Exponents.of(step.g)
-    entering = point(step.h) if entering is None else entering
+    entering = point(step.h)
     gate = fp32(mul(exponents.gated(lane), point(step.beta)), lane)
     keys = staged(fp32(mul(point(step.k), Iv(gate.lo[:, None], gate.hi[:, None])), lane), lane)
     write = dot(Iv(keys.lo.T, keys.hi.T), point(step.v), lane, parts=(lane.held, lane.given))
@@ -285,34 +284,6 @@ def keys_gated_enclosures(step: "Step", scale: float, lane: Lane,
     local = dot(scores, point(step.v), lane, parts=(lane.held, lane.given))
     output = fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
     return {"h": leaving, "o": out(output, lane)}
-
-
-def walk_enclosures(step: "Step", scale: float, lane: Lane, *, write: str) -> dict[str, Iv]:
-    """`enclosures` of a chunk of the fused inference walk (`mainloop._scan`, a 16-bit call no gradient
-    follows, under a decay a head), whose records are its inverse (the delta rule's, `_solved`'s), its output
-    and the memory it leaves: the memory it enters in its registers, staged as the memories' form for its
-    products, the walk's corrected values from it (`_scan_corrected`: under the delta rule
-    `(I + L) (beta (v - exp2(g) k S))`, the keys' prediction from the memory decayed to each token, its
-    difference from the values write-gated and corrected by the stored inverse; the gated values without
-    it; the values as given where the keys take the gate), and the output and leaving memory from them."""
-    exponents = Exponents.of(step.g)
-    entering = staged(step.carry, lane)
-    if write == "keys":
-        return keys_gated_enclosures(step, scale, lane, entering)
-    found = {}
-    if write == "delta":
-        found["a"] = staged(inverse(step.k, step.beta, exponents, lane), lane)
-        predicted = blocked(point(step.k), entering, lane, parts=(lane.given, lane.held))
-        decay = exponents.raised(lane)
-        decayed = fused(mul(Iv(decay.lo[:, None], decay.hi[:, None]), neg(predicted)), lane)
-        difference = fp32(add(point(step.v), decayed), lane)
-        scaled = fp32(mul(difference, point(np.asarray(step.beta)[:, None])), lane)
-        lower = dot(point(step.a), staged(scaled, lane), lane, parts=(lane.held, lane.held))
-        corrected = fp32(add(scaled, lower), lane)
-    else:
-        corrected = fp32(mul(point(step.v), point(np.asarray(step.beta)[:, None])), lane)
-    output_ = output(step.q, step.k, entering, staged(corrected, lane), exponents, scale, lane)
-    return {**found, "h": carried(step.carry, corrected, step.k, exponents, lane), "o": out(output_, lane)}
 
 
 def values_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, Iv]:
@@ -493,9 +464,6 @@ VALUES_GATED_RECORDS = ("c", "o", "h", "leaving")
 (`values_gated_enclosures`)."""
 WRITES = {"delta": RECORDS, "keys": KEYS_GATED_RECORDS, "values": VALUES_GATED_RECORDS}
 """Each write's records (`Run.write`)."""
-WALKED = {"delta": ("a", "o", "leaving"), "keys": ("o", "leaving"), "values": ("o", "leaving")}
-"""Each write's records in the fused inference walk (`walk_enclosures`), which stores no memory a chunk enters
-and no weighted keys or corrected values."""
 """The records the witness holds (`enclosed`)."""
 
 
@@ -553,8 +521,6 @@ class Run:
     """The parts its operands are given in (`Lane.given`)."""
     wide: bool
     """Whether it is an fp32 call (`Lane.wide`)."""
-    walked: bool
-    """Whether it is the fused inference walk's (`walk_enclosures`), its records `WALKED`'s."""
     pairing: int
     """The parts a factored pair's fp32 operand takes (`Lane.pairing`, `intra.pairing_parts`)."""
     merged: int
@@ -622,20 +588,20 @@ def _through(operands: tuple, starts, last: int) -> tuple:
     return (*held, operands[5]), None if starts is None else starts & ~past[None]
 
 
-def _route_forward(route, operands: tuple, walked: bool, form: str) -> tuple:
+def _route_forward(route, operands: tuple, form: str, *, inference: bool = False) -> tuple:
     """The forward of `route` over `operands` as a training step runs it, the template's (`chosen`):
     `(output, final memory, tiles, trained)`. The training forward, the primal of the route's VJP, where
-    the template trains the call (`Mosaic.trains`, `trained`); else, or where no gradient follows
-    (`walked`), the inference forward: a training step takes another kernel for a call the template does
-    not train (an fp32 call's backward on an A100's registers, 264 to 328 a thread). `form` names the
-    options `route` closes over, which its launches' labels carry."""
+    the template trains the call (`Mosaic.trains`, `trained`) and the `inference` forward is not asked; else
+    the inference forward: a training step takes another kernel for a call the template does not train (an
+    fp32 call's backward on an A100's registers, 264 to 328 a thread). `form` names the options `route`
+    closes over, which its launches' labels carry."""
     import jax
 
     (o, final), launches = launched(jax.jit(route), operands, f"inference forward, {form}")
     [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
                         zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
     trained = template.MOSAIC.trains(bound, template.Mosaic.launched())
-    if not walked and trained:
+    if trained and not inference:
         trained_forward = jax.jit(lambda *x: jax.vjp(route, *x)[0])
         (o, final), launches = launched(trained_forward, operands, f"training forward, {form}")
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
@@ -703,12 +669,13 @@ def tf32_conversion(family) -> Literal["plain", "rna", "read"]:
 
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None, carried: bool = True,
-             delta: bool = True, rounded: bool | None = None, walked: bool = False) -> Run:
+             delta: bool = True, rounded: bool | None = None, inference: bool = False) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `chunk_forward.kept_forward` at the tiles the route
     takes (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
-    build is production's), on the device's bundle, interpreted off a GPU; not a call no gradient follows
-    (`chunk_forward.forward`, one walk that stores no state it reads). Operands `[1, T, ...]`. With `carried`,
+    build is production's), on the device's bundle, interpreted off a GPU; where `inference`, the forward a
+    call no gradient follows runs (`chunk_forward.forward`, the same launches keeping nothing, at its own
+    tiles, `Tiles.forward`). Operands `[1, T, ...]`. With `carried`,
     each chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to it, whose
     final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`, each
     chunk's: end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's
@@ -718,9 +685,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     `rounded` as the route's fast forms round it unless given (a 16-bit call's keys then take the write gate,
     `mainloop.Call.gated_keys`; unrounded, Lightning's, its values held in parts). An fp32 call's operands and
     passed values are held in parts as the mainloop holds them (`Lane.held`, `Lane.given`), each record their
-    sum. `walked`, the inference forward no gradient follows: a 16-bit call's under a decay a head runs its
-    fused walk (`mainloop._scan`, `kept_forward` keeping nothing), whose records are its inverse, output and
-    final memory (`WALKED`)."""
+    sum."""
     import jax
     import jax.numpy as jnp
 
@@ -729,6 +694,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
     scale = k.shape[-1] ** -0.5 if delta else 1.0
+    # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
+    write_bound = 1.0 if delta else None
     if rounded is None:
         rounded = route_rounding(delta, dtype)
     family = mainloop.issued(dtype)[0]
@@ -739,31 +706,28 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         if not delta:
             return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
                                                   delta=False, wide=False, rounded=rounded)
-        # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
         return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
-                                                       write_bound=1.0)
+                                                       write_bound=write_bound)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         # The options the call's programs close over name their launches (`launched`), the starts' by digest.
         hasher = hashlib.sha1()
         if starts is not None:
             array_fingerprint(hasher, np.asarray(starts))
-        form = (f"delta {delta}, rounded {rounded}, walked {walked}, segments {max_segments}, starts "
+        form = (f"delta {delta}, rounded {rounded}, inference {inference}, segments {max_segments}, starts "
                 f"{None if starts is None else hasher.hexdigest()[:16]}")
-        o, final, tiles, trained = _route_forward(route, operands, walked, form)
+        o, final, tiles, trained = _route_forward(route, operands, form, inference=inference)
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
-        tiles = tiles if trained and not walked else tiles.forward or tiles
-        # The fused walk where the forward runs one (`chunk_forward.walks_once`; mma.sync's runs launches).
-        walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False)
+        tiles = tiles if trained and not inference else tiles.forward or tiles
         chunk = tiles.chunk
 
         # One program for the call and each of its chunks' leaving memories (`through`), traced once, run as a
         # GPU tier runs it (`launched`); its family read in it from its operands, a family no identity states.
         program = jax.jit(lambda *x: chunk_forward.kept_forward(
             *x[:6], tiles=tiles, starts=x[6], max_segments=max_segments, scale=scale, delta=delta,
-            rounded=rounded, family=mainloop.issued(jnp.result_type(*x[:3]))[0], keeps=not walked,
-            interpret=generation.backend() != "gpu"))
+            rounded=rounded, family=mainloop.issued(jnp.result_type(*x[:3]))[0],
+            interpret=generation.backend() != "gpu", unit_keys=write_bound is not None))
 
         def kept(*x, starts):
             return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
@@ -784,13 +748,6 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                                             for first, count in table[:-1])] if carried else []
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
     # call's come first.
-    if walked:
-        # The walk stores no memories, weighted keys or corrected values (`WALKED`), each chunk its own.
-        assert starts is None and jnp.dtype(dtype).itemsize == 2, "the walk is a 16-bit call's, unpacked"
-        laid = chunks
-        w = np.zeros((held * laid * chunk, heads * key_width))
-        h, c = (np.zeros((held * laid * heads * key_width, value_width)),
-                np.zeros((held * laid * chunk, heads * value_width)))
     laid = np.shape(h)[0] // (held * heads * key_width)
     if not delta:
         # No inverse or weighted keys of its own, nor corrected values where its keys take the gate.
@@ -816,7 +773,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     begins = np.asarray([first > 0 and (starts is not None and bool(np.asarray(starts)[0, first]))
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
-               write=write, held=held, given=given, wide=bool(wide), walked=walked,
+               write=write, held=held, given=given, wide=bool(wide),
                pairing=intra.pairing_parts(family, held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained),
@@ -877,7 +834,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     `a`, `w`, `c`, `o`; `h`, the memory each chunk enters as stored; and `leaving`, the fp32 memory it
     leaves."""
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
-    enclose = functools.partial(walk_enclosures, write=run.write) if run.walked else writes[run.write]
+    enclose = writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
                                merged=run.merged, tf32=run.tf32)
     found: dict[str, list] = {}
@@ -895,7 +852,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
 def records(run: Run) -> dict[str, np.ndarray]:
     """Each record `[N, H, ...]`, as `enclosed` names them."""
     held = {"a": run.a, "w": run.w, "c": run.c, "o": run.o, "h": run.h, "leaving": run.carries[1:]}
-    return {name: held[name] for name in (WALKED if run.walked else WRITES)[run.write]}
+    return {name: held[name] for name in WRITES[run.write]}
 
 
 def witness(run: Run, lane: Lane) -> dict:
@@ -1008,16 +965,15 @@ def cumsum_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, 
     return refusals(faulty, dataclasses.replace(faulty, g=hosted(operands)["g"]), lane)
 
 
-def handed_refusals(operands: tuple, truth: Run, at: int, lane: Lane, *,
-                    walked: bool = False) -> tuple[np.ndarray, np.ndarray]:
-    """A state rounded to bf16 where fp32 is held: the call over the chunks from `at` on (the fused inference
-    walk's where `walked`), from the fp32 memory `truth`'s chunks before it leave rounded to bf16, its first
-    chunk's leaving memory held to the step from the memory unrounded (`refusals`)."""
+def handed_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[np.ndarray, np.ndarray]:
+    """A state rounded to bf16 where fp32 is held: the call over the chunks from `at` on, from the fp32 memory
+    `truth`'s chunks before it leave rounded to bf16, its first chunk's leaving memory held to the step from
+    the memory unrounded (`refusals`)."""
     import ml_dtypes as dtypes
 
     carry = truth.carries[at]
     handed = np.asarray(np.asarray(carry, np.float32).astype(dtypes.bfloat16), np.float32)
-    tail = recorded(*(x[:, at * truth.chunk:] for x in operands[:5]), handed[None], walked=walked)
+    tail = recorded(*(x[:, at * truth.chunk:] for x in operands[:5]), handed[None])
     claimed = dataclasses.replace(tail, carries=np.concatenate([carry[None], tail.carries[1:]]))
     return refusals(tail, claimed, lane)["leaving"]
 
@@ -1150,30 +1106,6 @@ def assert_parts_witnessed(lane: Lane, heads: int = 1) -> None:
         for name in WRITES[run.write]:
             assert np.all(inside[name]), (run.write, run.held, name, np.mean(inside[name]))
     assert_refusals(refusals(narrow, as_claimed, lane), PARTS_SHARES)
-
-
-WALK_HANDED_SHARE = 0.55
-"""The least share of the fp32 memory the walk's second chunk leaves at which its entering memory rounded to
-bf16 is refused: 0.597 of it interpreted at a8dccec7a (the training call's states launch, `HANDED_SHARE`,
-reads the stored memory too, which the walk never stores)."""
-
-
-def assert_walk_witnessed(lane: Lane, heads: int = 1) -> None:
-    """The step witness of the fused inference walk (`walk_enclosures`, `mainloop._scan`): a bf16 call of
-    three chunks no gradient follows, with the delta rule and without it (its keys taking the write gate, and
-    unrounded), every record each keeps inside its step's enclosure; and the walk run from a memory rounded to
-    bf16 where fp32 is held refused (`handed_refusals`, `WALK_HANDED_SHARE`)."""
-    from native_certificates import assert_refused
-
-    operands, slow = draw(0, "mild", heads=heads), draw(1, "slow", length=128, heads=heads)
-    runs = (recorded(*operands, walked=True), recorded(*operands, delta=False, walked=True),
-            recorded(*operands, delta=False, rounded=False, walked=True))
-    handed = handed_refusals(slow, recorded(*slow, walked=True), 1, lane, walked=True)
-    for run in runs:
-        held = witness(run, lane)
-        for name in WALKED[run.write]:
-            assert np.all(held[name]), (run.write, name, np.mean(held[name]))
-    assert_refused(*handed, WALK_HANDED_SHARE)
 
 
 class BackStep(NamedTuple):
@@ -1368,12 +1300,13 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
     dfinal = np.asarray(rng.standard_normal(h0.shape), np.float32)
     scale, rounded = run.scale, route_rounding(delta, dtype)
     interpret = generation.backend() != "gpu"
+    write_bound = 1.0 if delta else None
 
     def route(*x):
         if not delta:
             return recurrence_chunk.template_rule(*x, None, scale=scale, delta=False, wide=False,
                                                   rounded=rounded)
-        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
+        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=write_bound)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         native, launches = launched(jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal))), operands,
@@ -1385,10 +1318,12 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
             # Its family read from its operands, a family no identity states (`launched`'s statement).
             family = mainloop.issued(jnp.result_type(*x[:3]))[0]
             _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
-                                                         delta=delta, family=family, interpret=interpret)
+                                                         delta=delta, family=family, interpret=interpret,
+                                                         unit_keys=write_bound is not None)
             grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
                                                            rounded=rounded, delta=delta, family=family,
-                                                           interpret=interpret, inverse=inverse, kept=held)
+                                                           interpret=interpret, inverse=inverse, kept=held,
+                                                           unit_keys=write_bound is not None)
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 

@@ -227,6 +227,30 @@ def test_a_worst_row_one_element_rules_takes_one_values_factor():
         assert _judgement(draws, "leaf")[0], width
 
 
+def test_a_worst_row_one_element_of_dews_rules_defers_to_a_conditioned_sites_weighed_check():
+    """A wide leaf whose worst row, Dew's alone, one element rules (past RULED_SHARE, the reference's spread
+    over its values), twenty times the reference's: at a site that declares its weighed check (`_judgement`'s
+    `deferring`) it is left unresolved for that check, nothing over (row 10145: at an amplified element the
+    arms' errors part as two values' do); at a site that declares none it fails by its width's factor, as a
+    row of Dew's spread over its values does at either."""
+    from dew.parity import NO_ZERO_ROWS, RULED_SHARE, _Draws, _judgement
+
+    ruled, spread = (1 + RULED_SHARE) / 2, RULED_SHARE / 2
+
+    def judged(worst: float, mine: float, width: int, *, deferring: bool):
+        draws = _Draws(["leaf"], np.zeros((8, 1)), np.zeros((8, 1)),
+                       np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
+                       np.ones((8, 1), bool), (width,), shares=np.tile([[[mine, spread]]], (8, 1, 1)))
+        return _judgement(draws, "leaf", deferring=deferring)
+
+    for width in (3, 16):
+        _, within = judged(1.0, ruled, width, deferring=True)
+        over, undecided = judged(20.0, ruled, width, deferring=True)
+        assert not over and len(undecided) == len(within) + 1, (width, over, undecided)
+        assert judged(20.0, ruled, width, deferring=False)[0], width
+        assert judged(20.0, spread, width, deferring=True)[0], width
+
+
 def test_a_narrow_rows_factor_holds_through_check_one():
     """Through `assert_as_exact`: a first row of one value ten times the reference's relative error, too
     small a value for the pooled ratio to see, passes at one value a row and fails at eight."""

@@ -147,15 +147,17 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
     assert not failures(found), "\n".join(failures(found))
 
 
+@pytest.mark.parametrize("case_index", [0, 1], ids=["kda", "kda-keys-256"])
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, case_index):
     """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
     compiled by XLA's CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py), within
-    the compile bound and the block's shared memory."""
-    found = compile_kernels(kda_training_cases(), target)
-    assert len(found) == 2
+    the compile bound and the block's shared memory (row 10557: each case its own pytest node)."""
+    cases = list(kda_training_cases())
+    assert len(cases) == 2
+    found = compile_kernels([cases[case_index]], target)
+    assert len(found) == 1
     assert not failures(found), "\n".join(failures(found))
-
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("target", gate_generations(scoped=True))
@@ -730,6 +732,21 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     assert {case.form for case in cases} == _gate_forms(generation_name)
 
 
+@lowers("sm90")
+def test_an_h100s_forward_whose_depth_no_tile_divides_lowers_at_its_derived_tile():
+    """An H100's bf16 forward of a call whose depth and width no tile divides (the 'unaligned in whole 16
+    bytes' projection: 200 deep, 136 wide, four groups) lowers at the tile its launch derives: a partial
+    axis's blocks move untiled at the array's true extents, each copy's rows a dimension of its box, so the
+    derivation takes no block of more rows than one copy moves (it derived 384 x 64, whose (384, 64) copy
+    Mosaic GPU refuses past 256 rows, a case the gate's tile dedup had dropped behind an aligned projection's
+    same tile)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    [case] = _gemm_mainloop_cases("sm90", "unaligned in whole 16 bytes", form="forward bf16")
+    found = compile_mosaic_kernels([case.case], "sm90")
+    assert not mosaic_failures(found), (case.tile, mosaic_failures(found))
+
+
 def _gate_forms(generation_name: str) -> set[str]:
     """The forms a generation's GEMM launches emit (`_emitted_forms`), each on the most capable issuer
     whose bundle takes it (`bundles.groups`): what its compile gate holds."""
@@ -983,15 +1000,6 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
                 for count in {1, min(emitting.consumers, tiling.CONSUMERS)}}
     got = {(case.form, case.consumers) for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
-
-
-@pytest.fixture
-def libtpu_shared(monkeypatch):
-    """libtpu loaded in this process beside another's: its lock file holds one process's libtpu at a time,
-    so two test workers compiling for a TPU at once failed the second's load (ABORTED, /tmp/libtpu_lockfile).
-    A compile-only TPU needs no device a lock guards, so each loads with libtpu's own allowance and takes no
-    lock file."""
-    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
 
 
 @COMPILES_FOR_TPU

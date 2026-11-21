@@ -414,7 +414,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return out
 
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         if not accumulate:
             # A fresh product: onto zeros, its accumulator a value (`read` is that value).
             acc = self.zeros(acc.shape)
@@ -467,7 +467,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         (dV, dK, dQ, independent of each other) and held 170 words of their fragments at once, an A100's step
         at 64 x 64, width 64, under a softcap spilling 96 bytes; looped, 20 (one slice's), none spilled, the
         same 320 mma.sync instructions issued (row 5477). Interpreted, `products`."""
-        if bodies.interpreting():
+        if launches.interpreting():
             return self.products(acc, lhs, rhs, accumulate=accumulate)
         if jnp.dtype(lhs.dtype) != self.dtype:
             return self.for_dtype(lhs.dtype).looped_products(acc, lhs, rhs, accumulate=accumulate)
@@ -577,7 +577,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
 
-    adds_through_shared = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
+    adds_through_shared = False
+    stages_vectors = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
 
     @property
     @abc.abstractmethod
@@ -772,7 +773,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del wait
         for part, view in zip(parts, views, strict=True):
             if smem is None:
-                view[...] = part.astype(view.dtype)
+                if len(view.shape) == 1 and not launches.interpreting():
+                    plgpu.store(view, part.astype(view.dtype), optimized=False)
+                else:
+                    view[...] = part.astype(view.dtype)
                 continue
             if len(smem.shape) == 1:
                 plgpu.store(view, part.astype(view.dtype), optimized=False)

@@ -23,6 +23,7 @@ from jax.tree_util import KeyPath
 from dew.batch import Variables
 from dew.distributed.placement import Placement
 from dew.nn.kernels.options import program
+from dew.nn.programs import meshless
 
 
 def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
@@ -71,7 +72,7 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
     try:
         # Run now, whatever the caller traces (a trainer's state mesh first read inside its start's trace,
         # row 9693: the probe's sum was a tracer, and `int` refused it).
-        with jax.ensure_compile_time_eval():
+        with jax.ensure_compile_time_eval(), meshless():
             total = program(jnp.sum)(probe)
         if int(total) != mesh.size:
             raise ValueError("the companion CPU collective did not include every device")

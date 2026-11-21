@@ -111,6 +111,9 @@ class DiffusionNFTObjective(DiffusionObjective):
     shown: Mapping[str, Shown] = {"loss": Shown(), "reward": Shown(better="higher")}
     # The EMA slot holds the old policy, the sampler's and v_old's, not an average to publish.
     ema_is_reference = True
+    # What its run records as built (`RunConfig.recorded`): its evaluation's solver and steps, and no
+    # guidance, which it takes none of (row 9668: every run of it refused to record one and never trained).
+    resolved = ("solver", "steps")
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
                  beta: float = 1.0, adv_clip_max: float = 5.0, kl: float = 1e-4,

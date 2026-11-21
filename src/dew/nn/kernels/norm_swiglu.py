@@ -88,12 +88,13 @@ from .. import programs
 from ..precision import (
     activation_and_slope,
     at_least_fp32,
-    compensated_add,
     compensated_total,
     logistic_value,
     rms_weighted,
     rounded_to,
+    summed_pairs,
     two_product,
+    uncontracted,
 )
 from ..sharding import automatic_axes, manual_map, on_shards, varying_like
 from . import generation, tuning
@@ -205,8 +206,8 @@ def _neumaier_add(total, correction, value, *, interpret: bool) -> tuple[jax.Arr
             }""", constraints="=f,f,f,f", args=(total, correction, value),
             result_shape_dtypes=(shape,), pack=1)[0]
         return high, low
-    value = jax.lax.optimization_barrier(value)
-    merged = jax.lax.optimization_barrier(total + value)
+    (value,) = uncontracted(value)
+    (merged,) = uncontracted(total + value)
     lost = jnp.where(jnp.abs(total) >= jnp.abs(value),
                      (total - merged) + value, (value - merged) + total)
     return merged, correction + lost
@@ -228,7 +229,7 @@ def _product_parts(left, right, *, interpret: bool) -> tuple[jax.Array, jax.Arra
             }""", constraints="=f,f,f,f", args=(left, right, high),
             result_shape_dtypes=(shape,), pack=1)[0]
         return high, low
-    return two_product(left, right, bit_split=True, rounding=jax.lax.optimization_barrier)
+    return two_product(left, right, bit_split=True, rounding=lambda product: uncontracted(product)[0])
 
 
 def _selected[C](op: Op[C], case: C, implementation: str) -> str:
@@ -954,13 +955,11 @@ def _rms_backward(x_ref, scale_ref, gate_ref, mean_square_ref, dy_ref, stream_re
 
 def _scale_sum(partial, correction):
     """The programs' compensated parts summed over programs as compensated
-    pairs (`compensated_add`), one XLA column reduction, read as every
+    pairs (`precision.summed_pairs`), one XLA column reduction, read as every
     compensated sum is (`compensated_total`): the pair rounded once, or the
     programs' plain sum where that reaches an infinity, whose residual is
     inf - inf."""
-    zero = jnp.zeros((), jnp.float32)
-    pair = jax.lax.reduce((partial, correction), (zero, zero), compensated_add, (0,))
-    return compensated_total(pair, jnp.sum(partial, axis=0))
+    return compensated_total(summed_pairs((partial, correction), (0,)), jnp.sum(partial, axis=0))
 
 
 def _varying(operands: tuple, outputs):

@@ -939,7 +939,8 @@ class Issuer[Accumulator](abc.ABC):
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
-                        together: tuple[int, ...] = ()) -> tuple | dict:
+                        together: tuple[int, ...] = (),
+                        tmem_limit: int | None = None) -> tuple | dict:
         """The memory a program's products take where the issuer keeps each product's accumulator itself
         (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a
         consumer role each), and stages a register left operand of each `(depth, dtype)` in `lefts` where
@@ -950,7 +951,7 @@ class Issuer[Accumulator](abc.ABC):
         sums of each width in `sums` stay in an accumulator of the issuer's across the walk (`accumulated`),
         where it keeps them so, a role each. Groups of `together`'s widths a role sums together
         (`summed_together`) take an accumulator each where the issuer awaits them as one."""
-        del consumers, widths, lefts, ahead, sums, together
+        del consumers, widths, lefts, ahead, sums, together, tmem_limit
         return ()
 
     def keeps_sums(self, width: int) -> bool:
@@ -1218,10 +1219,14 @@ class Issuer[Accumulator](abc.ABC):
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
 
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+        """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
+        (`WgmmaIssuer`), else in turn (`product`)."""
+        return self.product(lhs1, rhs1, shape), self.product(lhs2, rhs2, shape)
+
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""
         return self.product(lhs, rhs, shape)
-
     def read(self, acc: Accumulator, *, first: int = 0, columns: int | None = None, pending: int = 0
              ) -> jax.Array:
         """The accumulator's columns `first` to `first + columns` (all of them where None), once at most
@@ -1479,6 +1484,8 @@ class Transport[Allocated, Opened](abc.ABC):
     instead."""
 
     adds_through_shared: bool = True
+    stages_vectors: bool = True
+    """Whether 1D per-row vectors (attention statistics, status) stage through shared memory on store."""
     """Whether `added` reads its value through its `smem` (TMA's reduction from a staged tile), which is then
     live wherever a walk adds; an atomic add from registers (cp.async's `red.global`) reads none, so a tile
     staged for the program's stores alone may be scoped after its walks (`scoped`'s `after_walks`)."""
@@ -1740,7 +1747,7 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def uniform(self, value: jax.Array) -> jax.Array:
         """`value`, a scalar every lane holds alike, read warp-uniform (`across.uniform`, row 7898)."""
-        return value if bodies.interpreting() else across.uniform(value)
+        return value if launches.interpreting() else across.uniform(value)
 
     def decided_scratch(self, consumers: int) -> dict:
         """A decided walk's verdicts' allocations (`after_walk.Decided`), none where one consumer feeds."""
@@ -1960,12 +1967,6 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     """Whether its programs hold a block of keys, a key a row, and walk the queries a tile a step (a
     keys-first placement's, `placed.KEYS`); every other family's hold queries and walk the keys
     (`held_walked`)."""
-
-    @property
-    def derived_consumers(self) -> int:
-        """The compute roles a forward's derivation tries first (`attention_mosaic._derived`), at most
-        `consumers`: the count its programs run fastest at where measured (`Wgmma`'s), else `consumers`."""
-        return self.consumers
 
     @property
     def register_step(self) -> int:
