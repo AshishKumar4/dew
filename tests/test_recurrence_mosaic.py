@@ -1074,8 +1074,7 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     kernel spilled), its forward alone's output launch (`mainloop.named`), its training forward's states or
     its backward's: the derivation steps the refused tiles down, which the call takes (`fits`); a refusal of
     the joined tiles once matched none of the rules' candidates, and the call found none (`Unfitted`). The
-    forward alone's refusal steps its own tiles alone (`Tiles.forward`): its launches ran the training
-    forward's work under the same names, and its spill stepped the training call's tiles too (row 10559)."""
+    forward alone's steps its own (`Tiles.forward`): named as the training forward's, it stepped both (10559)."""
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
     bound = template.MOSAIC.bind(*args, None, bound=1.0)
     with report.refusals(), generation.assumed('sm90'):
