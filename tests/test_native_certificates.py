@@ -29,6 +29,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import recurrence_witness as rw
+import tier_wire
 from attention_witness import assert_faults_refused, assert_witnessed
 from gpu_flow import RUNNING, Cell, run_cells
 from interval_certificates import Lane, exp2_reach
@@ -648,6 +649,10 @@ def the_recurrence_templates_records_certify_natively_a_step_at_a_time(generatio
     memory is the fp32 memory the chunks before it leave, rounded as stored (end_j == start_{j+1})."""
     with generation.assumed(generation_name):
         run = rw.recorded(*rw.draw(0, regime, heads=2))
+    # Its one run recorded: a GPU tier's prepare gives it zeros, which judge nothing (as the attention
+    # witness's, row 9546); judged there, the cell went unprepared, its run compiling on its GPU (row 7882).
+    if tier_wire.preparing():
+        return
     held = rw.witness(run, mosaic_lane())
     for name in rw.RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
