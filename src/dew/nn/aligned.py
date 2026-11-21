@@ -3,8 +3,7 @@
 `aligned_sum` returns the exact sum of its terms' exact products, rounded once to nearest, ties to even. Its
 tangent and transpose are formed as its value is. `aligned_cotangents` returns the cotangents its transpose
 gives each factor, for a backward that takes no autodiff. Both run integer arithmetic on the factors' bits
-(`dew.nn.float_bits`), so a Pallas TPU kernel forms them in place. `dew.nn.precision` re-exports
-`aligned_sum`."""
+(`dew.nn.float_bits`), so a Pallas TPU kernel forms them in place."""
 
 from __future__ import annotations
 

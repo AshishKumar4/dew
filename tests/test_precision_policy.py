@@ -13,6 +13,7 @@ from contract_support import CANCELLING_LEVELS, MOST
 from low_precision_support import edge_values
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
+from dew.nn.aligned import aligned_sum
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
@@ -37,7 +38,6 @@ from dew.nn.precision import (
     ACCURATE,
     Numerics,
     _rounded_significand,
-    aligned_sum,
     compensated_add,
     compensated_difference,
     exact_products,
