@@ -41,3 +41,25 @@ def test_a_platforms_branch_walks_the_branch_its_platform_takes_alone():
     value, _ = rounding_scale(lambda a: jax.lax.platform_dependent(
         a, **{dead: jax.lax.linalg.cholesky}, default=lambda z: z + 1.0), x)
     np.testing.assert_array_equal(value, np.asarray(x, np.float64) + 1.0)
+
+
+def test_a_program_traced_under_one_context_is_not_served_under_another():
+    """A rounding scale's program, held once traced (`rounding_bound.TRACED`), is held by the context its
+    trace reads (`options.trace_context`): a function reading a context variable set anew is traced again
+    under it, never served the program traced before it was set (row 10878: a hand-picked key missed Dew's
+    contexts, its kernel choices among them)."""
+    import contextvars
+
+    factor = contextvars.ContextVar("factor", default=1.0)
+    x = jnp.asarray([1.0, 2.0, 3.0], jnp.float32)
+
+    def scaled(x):
+        return x * np.float32(factor.get())
+
+    before, _ = rounding_scale(scaled, x)
+    token = factor.set(2.0)
+    try:
+        after, _ = rounding_scale(scaled, x)
+    finally:
+        factor.reset(token)
+    np.testing.assert_array_equal(after, 2.0 * before)
