@@ -1581,7 +1581,8 @@ def test_fp32_forward_derives_parted_wgmma_and_consumer_choice_uses_launch_secon
     """An accurate fp32 forward on sm90 derives its 3-part bf16 wgmma plan from
     `dew.algebra.error.product_precision` (row 5473) and compiles without spills, while a split bf16
     forward derives its consumer count via `cost.launch_seconds` (row 10811)."""
-    from kernel_compile import KernelCase, compile_mosaic_kernels, mosaic_failures
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     spans = template.spans(512, 512, 1, causal=True)
     with generation.assumed("sm90"):
