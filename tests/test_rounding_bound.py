@@ -87,3 +87,23 @@ def test_a_program_of_more_steps_than_a_span_is_scaled_as_compiled_whole(monkeyp
     rounding_bound.released_scales()
     np.testing.assert_array_equal(spanned[0], whole[0])
     np.testing.assert_array_equal(spanned[1], whole[1])
+
+
+def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypatch):
+    """A call whose body holds more steps than a compiled span (`float64_terms.SPAN_STEPS`; a jit-wrapped
+    reference, the gate's common arm, is one such step) is a span of its own, walked as its body's spans,
+    and the steps beside it compiled apart: counted as one step, it was compiled whole with its neighbours
+    however large its body (row 10950)."""
+    import float64_terms
+
+    monkeypatch.setattr(float64_terms, "SPAN_STEPS", 8)
+
+    @jax.jit
+    def body(x):
+        for _ in range(10):
+            x = x * np.float32(1.5) + np.float32(0.25)
+        return x
+
+    closed = jax.make_jaxpr(lambda x: body(x + np.float32(1.0)) * np.float32(2.0))(
+        jnp.ones(3, jnp.float32))
+    assert float64_terms._runs(closed.jaxpr) == [(0, 1), (1, 2), (2, 3)]

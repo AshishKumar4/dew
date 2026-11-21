@@ -39,7 +39,7 @@ from arm_arithmetic import (
     rounds_nothing,
     unrewritten,
 )
-from float64_terms import SPAN_STEPS, SUMS, _target, evaluated_on, released, static, walked
+from float64_terms import SPAN_STEPS, SUMS, _target, evaluated_on, released, static, steps, walked
 from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
@@ -206,8 +206,9 @@ def rounding_scale(fn, *args, seed: int = 0):
         leaves = [jnp.asarray(_widened(leaf)) for leaf in moved]
         consts = [_widened(value) for value in on_float64_host(closed.consts)]
         keys = _keys(seed)
-        # A static program compiles whole, one of more than a span's steps in spans (`float64_terms._runs`).
-        if static(closed.jaxpr) and len(closed.jaxpr.eqns) <= SPAN_STEPS:
+        # A static program compiles whole, one of more than a span's steps (its calls' bodies' counted,
+        # `float64_terms.steps`; row 10950) in spans (`float64_terms._runs`).
+        if static(closed.jaxpr) and steps(closed.jaxpr) <= SPAN_STEPS:
             held = SCALES.setdefault(fn, {})
             # Compiled for the device it evaluates on (`float64_terms.evaluated_on`), which its trace is not.
             compiled = (key, _target())
