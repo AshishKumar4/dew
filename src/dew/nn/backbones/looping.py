@@ -225,6 +225,32 @@ def _passed(module, x, bank, *, block: tuple[int, int] | None, train: bool, deco
     return x, jnp.stack(summaries, axis=2)
 
 
+def _exit_state(model, x, step: int, *, train: bool, decode: bool, **inputs):
+    """A loop's pass `step`'s exit state (from 0): its output, or the coda run on it in the pass's own
+    cache (`exit_offset`)."""
+    loop, layers = model.loop, model.num_layers
+    _, end = loop.layers or (0, layers)
+    if end == layers:
+        return x
+    view = PassView(exit_offset(loop, layers, step), end, layers - end)
+
+    def pass_coda(module, x):
+        return module.stack(x, span=(end, layers), train=train, decode=decode, **inputs)
+
+    coda = nn.map_variables(pass_coda, mapped_collections=WRITTEN, trans_in_fn=view.inside,
+                            trans_out_fn=view.outside, mutable=True)
+    return coda(model, x)
+
+
+def _entered(model, x, bank, injected, *, stop: bool, normed=None, theta=None):
+    """A loop's later pass's input and the bank it reads: under `messages` the block's input and the bank
+    the pass before left, which the cut stops (`_passed`); else the pass before's state (`_preamble`)."""
+    loop = model.loop
+    if loop.messages is not None:
+        return injected, jax.lax.stop_gradient(bank) if stop else bank
+    return _preamble(model, loop, x, injected, stop=stop, normed=normed, theta=theta), None
+
+
 def run_loop(model, x, *, train: bool, decode: bool, **inputs):
     """Run `model`'s layer stack over `x` once, or as its `loop` says (the module doc): the layers before
     its block once, the block `steps` times, each later pass reading the last one's output, normed under
@@ -244,9 +270,6 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
     def pass_block(module, x, bank=None, **inputs):
         return _passed(module, x, bank, block=block, train=train, decode=decode, **inputs)
 
-    def pass_coda(module, x):
-        return module.stack(x, span=(end, layers), train=train, decode=decode, **inputs)
-
     run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
     if first:
         x = model.stack(x, span=(0, first), train=train, decode=decode, **inputs)
@@ -259,28 +282,16 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
     cut = None if loop.backprop_steps is None else loop.steps - loop.backprop_steps
     exited: list[tuple[jax.Array, jax.Array]] = []
 
-    def exit_state(x, step: int):
-        """Pass `step`'s exit state (from 0): its output, or the coda run on it in the pass's own cache."""
-        if end == layers:
-            return x
-        view = PassView(exit_offset(loop, layers, step), end, layers - end)
-        coda = nn.map_variables(pass_coda, mapped_collections=WRITTEN, trans_in_fn=view.inside,
-                                trans_out_fn=view.outside, mutable=True)
-        return coda(model, x)
-
     def entering(module, x, bank, *, stop: bool, normed=None, theta=None):
-        """A later pass's input and the bank it reads: under `messages` the block's input and the bank the
-        pass before left, which the cut stops (`_passed`); else the pass before's state (`_preamble`)."""
-        if loop.messages is not None:
-            return injected, jax.lax.stop_gradient(bank) if stop else bank
-        return _preamble(module, loop, x, injected, stop=stop, normed=normed, theta=theta), None
+        return _entered(module, x, bank, injected, stop=stop, normed=normed, theta=theta)
 
     def unrolled(x, bank, step: int, view):
         """A later pass traced alone over `view`'s collections, the one before it exiting first if all do."""
         normed = None
         if loop.exiting:
             # A pass the cut holds back exits without passing its own gradient back.
-            leaving = exit_state(jax.lax.stop_gradient(x) if cut is not None and step <= cut else x, step - 1)
+            leaving = _exit_state(model, jax.lax.stop_gradient(x) if cut is not None and step <= cut else x,
+                                  step - 1, train=train, decode=decode, **inputs)
             output, logit = _sown_exit(model, leaving)
             if logit is not None:  # a gated exit, which the threshold's choice weighs (`_exited`)
                 exited.append((leaving, logit))
@@ -360,10 +371,10 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
 
 
 def _sown_exit(model, leaving):
-    """A pass's exit state `leaving` as the last pass's leaves the stack (its residual collapsed to one,
-    `_collapse`, then `exit_states`), and its exit-gate logit under a gate (None without one), sown into
-    `exits` beside the states the head reads of it where the caller opens the collection."""
-    output = model.exit_states(model._collapse(leaving)[1])
+    """A pass's exit state `leaving` as the last pass's leaves the stack (`exit_states`), and its exit-gate
+    logit under a gate (None without one), sown into `exits` beside the states the head reads of it where
+    the caller opens the collection."""
+    output = model.exit_states(leaving)
     logit = model.early_exit_gate(output) if model.loop.exit_gate else None
     if not model.is_initializing():
         if logit is not None:

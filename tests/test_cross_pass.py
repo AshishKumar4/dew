@@ -79,17 +79,14 @@ def gated_draw(model, shape=(2, 12), salt=0):
 def merged_by_hand(params, read, bank, spec: CrossPass, eps: float):
     """A merge's formula (the module doc of `dew.nn.cross_pass`) in float64 NumPy, from its parameters."""
     read, bank = np.asarray(read, np.float64), np.asarray(bank, np.float64)
-
-    def rms(x):
-        return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)
-
     depth = params["depth"]
-    keys = rms(bank)
+    keys = bank / np.sqrt(np.mean(bank * bank, axis=-1, keepdims=True) + eps)
     query = np.asarray(depth["scale"], np.float64) * np.asarray(depth["kernel"], np.float64)[:, 0]
     scores = keys @ query
     weights = np.exp(scores - scores.max(-1, keepdims=True))
     weights /= weights.sum(-1, keepdims=True)
-    message = rms(np.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank))
+    mixed = np.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank)
+    message = mixed / np.sqrt(np.mean(mixed * mixed, axis=-1, keepdims=True) + eps)
     sigma = np.sqrt(np.mean(read * read, axis=-1, keepdims=True) + eps)
     state = (read / sigma) @ np.asarray(params["input_down"], np.float64) + message @ np.asarray(
         params["message_down"], np.float64)

@@ -172,6 +172,10 @@ def _messaged_blocks(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]
                          "a block's end: kv_shared_layers and publishing mixers take no messages")
     residuals, loop = model.attention_residuals, model.loop
     assert loop is not None
+    if residuals is not None and loop.exiting:
+        raise ValueError("under attention residuals a pass's state is the depth state, which only the last "
+                         "pass collapses through the output site: a loop passing messages over them exits at "
+                         "its last pass alone (no exit gate or exits)")
     first, _ = loop.layers or (0, model.num_layers)
     if residuals is not None and (first % residuals.block_size
                                   or messages.block_size != residuals.block_size):

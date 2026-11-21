@@ -1097,19 +1097,19 @@ class DecoderBlock(nn.Module):
             state = self._crossed(state, held.context, decode, train, held.progress,
                                   CrossContext.queries_of(held.coordinates))
         state, read, site = self._read(state, "attention")
-        messaged = self.cross_pass is not None and prior_bank is not None
-        if self.cross_pass is not None and not messaged and self.is_initializing():
+        bank = prior_bank if self.cross_pass is not None else None
+        if self.cross_pass is not None and bank is None and self.is_initializing():
             # A first pass reads no bank; its merges' parameters are declared all the same, so a decoder
             # initialized at one pass resumes at more.
             for merge in self.cross_pass_merges.values():
                 merge.declare()
         site_inputs = None
-        if messaged:
+        if bank is not None:
             # Each site's input its own merge of the bank, normed as the block norms its attention's input;
             # a seam norm's fused stream would norm the stream, which no merge reads.
             sites = self._mixer_sites()
-            normed, *rest = (self._attention_input(self.cross_pass_merges[name](read, prior_bank))
-                             for name in sites)
+            merges = self.cross_pass_merges
+            normed, *rest = (self._attention_input(merges[name](read, bank)) for name in sites)
             site_inputs = dict(zip(sites[1:], rest, strict=True)) or None
         elif not (self.wiring.pre_norms and self.attention_norm):
             normed = read
@@ -1126,8 +1126,8 @@ class DecoderBlock(nn.Module):
         if self.wiring.output_norms:
             mixed = residual_normed(self.attention_output_norm, mixed)
         attention_branch = self._branch(mixed, train, "attention")
-        # The MLP's merged input is normed apart from the stream (`messaged`), which a seam norm would join.
-        joined = None if messaged else self._joined(state)
+        # The MLP's merged input is normed apart from the stream (`bank`), which a seam norm would join.
+        joined = None if bank is not None else self._joined(state)
         if not (self.wiring.parallel_residual or joined):
             state = self._write(state, "attention", attention_branch, site)
         if self.laurel_rank is not None:
@@ -1142,10 +1142,10 @@ class DecoderBlock(nn.Module):
                 state, read, site = self._read(state, "mlp")
             else:
                 state, read, site = self._read(state, "mlp")
-                if messaged:
+                if bank is not None:
                     # The feed-forward's site (and a parallel branch's, which reads it unnormed).
-                    read = self.cross_pass_merges['mlp'](read, prior_bank)
-                shared = self.input_layernorm(read) if messaged else normed
+                    read = self.cross_pass_merges['mlp'](read, bank)
+                shared = normed if bank is None else self.input_layernorm(read)
                 mlp_input = (shared if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
                 if self.wiring.normed_residual:
