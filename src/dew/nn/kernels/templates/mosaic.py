@@ -348,24 +348,30 @@ def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
         return [(value, view)]
     return [(piece, view.at[..., pl.ds(first, width)]) for first, piece in column_chunks(value, width)]
 
+@dataclasses.dataclass(frozen=True)
+class StagedWriter:
+    """A staged epilogue writer passed to `stored` / `Family.stored` in place of a register array:
+    `write(smem)` populates the shared staging buffer `smem` (or writes directly when `smem is None`)."""
+
+    write: Callable[[Ref | None], None]
+
 
 def stored(parts, views, *, smem, wait: bool = True) -> None:
-    """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, a
-    chunk of its columns at a time where `smem` is narrower (`chunked`), the buffer reused once its copy
-    has read it; the last copy waited for unless `wait` is false, when it stays in flight, one store group
-    (`Family.store_wait`)."""
+    """Each of `parts` (a register array or a `StagedWriter`) written whole to its view of `views` through
+    the shared buffer `smem`, in turn, a chunk of its columns at a time where `smem` is narrower (`chunked`),
+    the buffer reused once its copy has read it; the last copy waited for unless `wait` is false, when it
+    stays in flight, one store group (`Family.store_wait`)."""
     pieces = [piece for part, view in zip(parts, views, strict=True)
-              for piece in ([(part, view)] if callable(part) else chunked(part, view, smem))]
+              for piece in ([(part, view)] if isinstance(part, StagedWriter) else chunked(part, view, smem))]
     last = len(pieces) - 1
     for index, (part, view) in enumerate(pieces):
-        if callable(part):
-            part(smem)
+        if isinstance(part, StagedWriter):
+            part.write(smem)
         else:
             smem[...] = part.astype(smem.dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(smem, view)
         if index < last:
-            # The next piece writes `smem`: this copy's reads of it done first.
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
         elif wait:
             plgpu.wait_smem_to_gmem(0)
@@ -1916,8 +1922,8 @@ class Transport[Allocated, Opened](abc.ABC):
 
     @abc.abstractmethod
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
-        """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so.
-        Unless `wait`, the last copy out of `smem` stays in flight as one store group, so the caller's
+        """Each of `parts` (a register array or `StagedWriter`) written whole to its view of `views`, through
+        `smem` where the family stores so. Unless `wait`, the last copy out of `smem` stays in flight as one
         next work overlaps it, and the caller owns `smem`'s reuse: it waits (`store_wait`) before writing
         `smem` again, an earlier deferred store's or an add's (`added`) reads of it included, so stores
         into other tiles stay in flight past the call (`store_wait(stores - 1)` keeps one a tile). A call

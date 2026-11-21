@@ -478,7 +478,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         del wait
         for part, view in zip(parts, views, strict=True):
-            smem[...] = part.astype(smem.dtype)
+            if isinstance(part, mosaic.StagedWriter):
+                part.write(smem)
+            else:
+                smem[...] = part.astype(smem.dtype)
             pltpu.sync_copy(smem, view)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:

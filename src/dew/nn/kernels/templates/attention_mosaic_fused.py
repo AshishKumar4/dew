@@ -15,6 +15,7 @@ from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outpu
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
+    STATISTICS_STREAM_ORDER as _STREAM_ORDER,
     BackwardTiles,
     TileWalk,
     _coords,
@@ -37,10 +38,6 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _rescaled_parts,
     _tile_scores,
 )
-
-_STREAM_ORDER: tuple[str, ...] = ("peak", "total", "delta", "anchor", "chosen")
-"""Priority order for TMA-streaming query statistics beside query tiles: `peak`, `total`, and `delta` are
-read on every fast-form step, while `anchor` and `chosen` are unused in plain bf16 backward (row 5272)."""
 
 
 def streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,

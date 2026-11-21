@@ -1600,7 +1600,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                     else:
                         family.stage_output(out_chunk, smem.at[:, sl])
             out_stage(lambda stage: write_chunks(None) if stage is None
-                      else family.stored((write_chunks,), (out_view,), smem=stage))
+                      else family.stored((mosaic.StagedWriter(write_chunks),), (out_view,), smem=stage))
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,

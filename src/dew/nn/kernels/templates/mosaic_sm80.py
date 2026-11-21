@@ -775,13 +775,15 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del wait
         for part, view in zip(parts, views, strict=True):
             if smem is None or len(smem.shape) == 1:
-                if len(view.shape) == 1 and not launches.interpreting():
+                if isinstance(part, mosaic.StagedWriter):
+                    part.write(None)
+                elif len(view.shape) == 1 and not launches.interpreting():
                     plgpu.store(view, part.astype(view.dtype), optimized=False)
                 else:
                     view[...] = part.astype(view.dtype)
                 continue
-            if callable(part):
-                part(smem)
+            if isinstance(part, mosaic.StagedWriter):
+                part.write(smem)
             else:
                 self.stage_output(part, smem)
             rows = smem.shape[0]

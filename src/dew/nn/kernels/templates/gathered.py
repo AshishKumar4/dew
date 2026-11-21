@@ -7,7 +7,6 @@ lane-level code (Pallas's warpgroup semantics reach no thread's own copy, addres
 import contextlib
 import dataclasses
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -60,9 +59,7 @@ class Ring(rings.Ring):
         refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(swizzle), plgpu.RefType())
         plgpu.inline_mgpu(arg_types=refs)(
             emission.stating(lambda _src, table, smem, _bar: cost.Work(
-                device_bytes=math.prod(smem.shape) * smem.dtype.itemsize
-                + math.prod(table.shape) * table.dtype.itemsize,
-                shared_bytes=math.prod(smem.shape) * smem.dtype.itemsize))(
+                device_bytes=cost.stored(smem, table), shared_bytes=cost.stored(smem)))(
                     lambda ctx, *refs: copies(*refs)))(
             source, rows.table.at[pl.ds(rows.start, height)], self.smem.at[slot],
             self.full.at[pl.ds(slot, 1)])
@@ -134,8 +131,7 @@ class Committed(Ring):
         splat = plgpu.Layout.WG_SPLAT(())
         plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), splat, splat))(
             emission.stating(lambda _entries, table, *_: cost.Work(
-                device_bytes=math.prod(table.shape) * table.dtype.itemsize,
-                shared_bytes=math.prod(table.shape) * table.dtype.itemsize))(
+                device_bytes=cost.stored(table), shared_bytes=cost.stored(table)))(
                     Started(self.share, rows.tiled)))(self.entries, rows.table.at[pl.ds(rows.start, height)],
                                              jnp.asarray(ahead.parity, jnp.int32),
                                              jnp.asarray(ahead.held, jnp.int32))
@@ -170,8 +166,7 @@ class Committed(Ring):
             refs += (plgpu.RefType(), splat)
         plgpu.inline_mgpu(arg_types=refs)(
             emission.stating(lambda _tok, _tbl, smem, *_: cost.Work(
-                device_bytes=math.prod(smem.shape) * smem.dtype.itemsize,
-                shared_bytes=math.prod(smem.shape) * smem.dtype.itemsize))(
+                device_bytes=cost.stored(smem), shared_bytes=cost.stored(smem)))(
                     Gathers(bytes_, self.share, ahead is not None)))(*operands)
         if ahead is not None:
             @pl.when(ahead.live)
@@ -183,8 +178,7 @@ class Committed(Ring):
                 next_rows = following.table.at[pl.ds(following.start, height)]
                 plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), splat))(
                     emission.stating(lambda _entries, table, *_: cost.Work(
-                        device_bytes=math.prod(table.shape) * table.dtype.itemsize,
-                        shared_bytes=math.prod(table.shape) * table.dtype.itemsize))(
+                        device_bytes=cost.stored(table), shared_bytes=cost.stored(table)))(
                             Filled(self.share)))(self.entries, next_rows,
                                                 1 - jnp.asarray(ahead.parity, jnp.int32))
 
@@ -566,9 +560,7 @@ def scattered_rows(smem, out: stores.Scattered, row_start, first, stored, column
     plgpu.inline_mgpu(
         arg_types=(plgpu.RefType(), plgpu.RefType(), plgpu.RefType(), scalar, scalar))(
             emission.stating(lambda smem, table, *_: cost.Work(
-                device_bytes=math.prod(smem.shape) * smem.dtype.itemsize
-                + math.prod(table.shape) * table.dtype.itemsize,
-                shared_bytes=math.prod(smem.shape) * smem.dtype.itemsize))(pieces))(
+                device_bytes=cost.stored(smem, table), shared_bytes=cost.stored(smem)))(pieces))(
         smem, table, dest, jnp.asarray(first, jnp.int32), jnp.asarray(stored, jnp.int32))
 
 

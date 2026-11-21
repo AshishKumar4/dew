@@ -1928,6 +1928,12 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
             step.append((block_k, value_width * family.rhs_copies, dtype))
     masks = _mask_places(family, block_q, block_k)
     step += masks
+    if (not family.operands_in_registers and not family.places_on_role and not scopes_products(family)
+            and value_width > 128):
+        # Wide (>128) register-home Wgmma forward holds extra accumulator/staging pressure across the
+        # softmax step (spilling 16-32B on cuda12 ptxas at consumers=2's 232-reg cap); pricing a 64-col
+        # f32 tile shifts consumers=2 past its cap while consumers=1's 255 regs fits spill-free (row 5272).
+        step.append((block_q, 64, jnp.float32))
     # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
@@ -2192,6 +2198,9 @@ STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "ancho
 launch over a shared dQ streams each beside its queries, and the fused launch the first its block holds
 (`attention_mosaic_fused.streamed_statistics`); row vectors a fused launch's queries first holds
 (`backward_registers`), column vectors keys first, one at a time."""
+STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total", "delta", *STATISTICS)))
+"""Stream priority for per-query statistics (`STATISTICS`): `peak`, `total`, and `delta` first so
+the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
 
 
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
