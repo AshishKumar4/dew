@@ -1397,7 +1397,9 @@ def small_parts(small: jax.Array, dtype) -> tuple[product.Scaled, ...]:
     exactly (`product.formed`), each's product exact in fp32, so none loses its bits."""
     if jnp.dtype(dtype) == jnp.dtype(jnp.float32):
         return (product.Scaled(small, float(-SMALL_SHIFT)),)
-    return tuple(product.Scaled(part, float(-SMALL_SHIFT)) for part in product.formed(small, product.EXACT_PARTS))
+    return tuple(
+        product.Scaled(part, float(-SMALL_SHIFT)) for part in product.formed(small, product.EXACT_PARTS)
+    )
 
 
 def taken_back(value: jax.Array, exponent: jax.Array | float) -> jax.Array:
