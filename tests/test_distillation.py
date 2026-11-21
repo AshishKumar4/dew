@@ -748,9 +748,9 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
             return False
         return walk(jax.make_jaxpr(program)(params).jaxpr)
 
-    def gradient(params):
-        return jax.grad(lambda held: objective.scalar_loss(held, batch, step_at())[0])(params)
+    def gradient(objective):
+        return lambda params: jax.grad(lambda held: objective.scalar_loss(held, batch, step_at())[0])(params)
 
-    assert holds_whole(gradient)
-    assert objective.tile_head((3, vocab)) is not None
-    assert not holds_whole(gradient)
+    tiled, _ = fixture_objective(arrays)
+    assert tiled.tile_head((3, vocab)) is not None
+    assert holds_whole(gradient(objective)) and not holds_whole(gradient(tiled))
