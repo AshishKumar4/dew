@@ -48,7 +48,7 @@ def step_bytes(kind: str, layers: int, feature: str = "plain", copies: bool = Tr
     from dew.registry import mixers
     from dew.training import MeshSpec, Trainer
     from dew.training.ahead import compile_ahead
-    from dew.training.narrow import narrowed_paths
+    from dew.training.narrow import program_reads
 
     devices = 2
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
@@ -65,18 +65,27 @@ def step_bytes(kind: str, layers: int, feature: str = "plain", copies: bool = Tr
     with generation.chosen(**({} if copies else {"narrow_copies": "off"})):
         ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
     tokens = jnp.zeros((MIXER_ROWS, MIXER_LENGTH), jnp.int32)
-    boxed = jax.eval_shape(lambda: model.init(jax.random.key(0), tokens))
-    variables = nn.unbox(boxed)
+    # The model's tree as the trainer's start drew it (`Objective.drawn_shapes`, recorded by its trace), not
+    # traced again (13 s of a 4-block sparse decoder's case, rows 6766 on).
+    variables = trainer.objective.model_variables(trainer.objective.drawn_shapes())
 
     def loss(params, constants, tokens):
         return jnp.sum(jnp.asarray(model.apply({"params": params, **constants}, tokens), jnp.float32))
 
     constants = {key: value for key, value in variables.items() if key != "params"}
     with generation.assumed("sm90"), nn.logical_axis_rules(DEFAULT_RULES):
+        # The model traced once, its program replayed for both reads: what its backward saves and what
+        # it casts narrower (a decoder's trace is seconds of a case, rows 6766 on).
+        closed = jax.make_jaxpr(loss)(variables["params"], constants, tokens)
+
+        def replayed(params, constants, tokens):
+            return jax.core.eval_jaxpr(closed.jaxpr, closed.consts,
+                                       *jax.tree.leaves((params, constants, tokens)))[0]
+
         saved = sum(aval.size * aval.dtype.itemsize
-                    for aval, source in saved_residuals(loss, variables["params"], constants, tokens)
+                    for aval, source in saved_residuals(replayed, variables["params"], constants, tokens)
                     if not source.startswith("from the argument"))
-        paths = narrowed_paths(loss, variables["params"], constants, tokens) if copies else {}
+        paths = program_reads(closed, variables["params"]).casts if copies else {}
     placement = STEP_LAYOUT.shardings(trainer.device_mesh, {"params": variables["params"]})["params"]
     leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
     gradients = sum(math.prod(sharding.shard_shape(leaf.shape))
