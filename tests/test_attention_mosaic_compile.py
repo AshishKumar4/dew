@@ -1629,3 +1629,42 @@ def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
         assert algebra.bf16_part_count(accurate=False) == 1
         assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
         assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
+
+
+@COMPILES_ON_CPU
+def test_sm90_fused_and_coop_backward_stream_delta_and_compile_spill_free():
+    """Row 5272: chunking the held fp32 add stage in fused backward frees SMEM so sm90 d64/d128 fused
+    and d256 shared-keys backward stream `peak`, `total`, and `delta` via TMA and compile spill-free."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_mosaic_coop, attention_mosaic_fused
+
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    cases = []
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        for label, width in (("sm90-fused-d64", 64), ("sm90-fused-d128", 128), ("sm90-coop-d256", 256)):
+            q = jax.ShapeDtypeStruct((1, queries, 8, width), jnp.bfloat16)
+            k = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
+            shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
+                                  _residuals(q.shape))
+            _, _, cfg = _gated_backward("sm90", width, accurate=False)
+            assert cfg is not None and cfg.fused, (label, cfg)
+            family = attention_mosaic.bundle_of(cfg, jnp.bfloat16)
+            if cfg.shared_keys:
+                assert attention_mosaic_coop.coop_streamed_statistics(
+                    family, cfg, width, jnp.bfloat16, cfg.stages, reduced=0) >= 3, (label, cfg)
+            else:
+                assert attention_mosaic_fused.streamed_statistics(
+                    family, cfg, width, jnp.bfloat16, cfg.stages, reduced=0) >= 3, (label, cfg)
+
+            def backward(q_in, k_in, v_in, dout_in, res_in):
+                grads = attention_mosaic.backward(q_in, k_in, v_in, spans, None, dout_in,
+                                                  residuals=res_in, accurate=False)
+                return grads.query, grads.key, grads.value
+
+            cases.append(KernelCase(label, lambda b=backward, args=(q, k, k, q, shapes): (b, args)))
+        found = compile_mosaic_kernels(cases, "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
