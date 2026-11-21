@@ -150,6 +150,10 @@ class Work:
     integer_operations: float = 0.0
     """32-bit integer operations a CUDA multiprocessor's ALU issues (add, shift, logic, comparison), beside
     its fp32 lanes at its own rate (`Architecture.integer_per_clock`)."""
+    unpriced_operations: float = 0.0
+    """Elementwise operations no rule prices (`emission.operation_work`: an atan2's, an erf_inv's, which no
+    kernel's body holds and no probe has measured), one an output element, at no rate (`units`): a form
+    taking more of them is never cheaper (`dew.algebra.cost.cheaper`), its price never a guess."""
     chains: tuple[Chain, ...] = ()
 
     def __add__(self, other: "Work") -> "Work":
@@ -227,14 +231,15 @@ def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
     FP8 modes in turn), the CUDA cores (operations and conversions), the special-function units, on-chip
     memory (shared memory's bytes, then what XLA's fusion keeps there, one memory's two levels, so a TPU's
-    one VMEM is one unit), device memory and the integer units; and, level by level, the work at a rate the
-    target states none
+    one VMEM is one unit), device memory, the integer units and the operations no rule prices
+    (`Work.unpriced_operations`, at no rate); and, level by level, the work at a rate the target states none
     of, which no time prices (0 where one does)."""
     grouped = (((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
                ((work.operations + work.conversions, at.cuda),),
                ((work.exponentials, at.special),),
                ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
-               ((work.device_bytes, at.device),), ((work.integer_operations, at.integer),))
+               ((work.device_bytes, at.device),), ((work.integer_operations, at.integer),),
+               ((work.unpriced_operations, None),))
     priced = [sum((amount / per_second for amount, per_second in unit if amount and per_second is not None),
                   0.0) for unit in grouped]
     unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)
