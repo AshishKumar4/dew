@@ -34,6 +34,7 @@ from collections.abc import Callable, Collection, Hashable, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import util as jax_util
 from jax.core import Tracer, eval_context, eval_jaxpr
 from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
@@ -443,11 +444,31 @@ def _evaluating() -> bool:
 SPANS_HELD = 4096
 """The most marked spans' programs a process holds (`_SPANS`), the least recently used dropped first."""
 
-_SPANS: collections.OrderedDict[Hashable, tuple] = collections.OrderedDict()
+class _Spans:
+    """The marked spans' held programs (`_SPANS`), registered with JAX's caches, so `jax.clear_caches`
+    forgets them as it forgets its own (row 10762's review: a user clearing caches to free memory kept
+    them)."""
+
+    def __init__(self) -> None:
+        self.held: collections.OrderedDict[Hashable, tuple] = collections.OrderedDict()
+
+    def cache_clear(self) -> None:
+        self.held.clear()
+
+    def cache_info(self) -> int:
+        return len(self.held)
+
+    def cache_keys(self) -> list:
+        return list(self.held)
+
+
+_SPANS = _Spans()
 """Each marked span's program as `marked` traced it, with its outputs' structure and the known zeros among
 them, by what a trace of it reads (`_span_key`): a span called again in that state is that program, never
 traced again (row 10762: precision's error-free transforms traced afresh at every call, 7.5 percent of a
 padded merge's grad of grad)."""
+
+jax_util.register_cache(_SPANS, "dew.nn.derivatives.marked's spans")
 
 
 SPAN_CONSTANTS_HELD = 1 << 20
@@ -462,12 +483,6 @@ def _holdable(closed) -> bool:
     if closed.effects or any(isinstance(const, Tracer) for const in closed.consts):
         return False
     return sum(getattr(const, "nbytes", 0) for const in closed.consts) <= SPAN_CONSTANTS_HELD
-
-
-def release_spans() -> None:
-    """Forget every marked span's program held (`_SPANS`) and the arrays they hold: where a process releases
-    its compiled programs (tests/conftest.py's `release`)."""
-    _SPANS.clear()
 
 
 def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hashable | None:
@@ -514,15 +529,15 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
             return [leaf for leaf in produced if not isinstance(leaf, SymbolicZero)]
 
         key = _span_key(kind, function, structure, flat)
-        if key is not None and key in _SPANS:
-            _SPANS.move_to_end(key)
-            closed, returned["structure"], returned["zeros"] = _SPANS[key]
+        if key is not None and key in _SPANS.held:
+            _SPANS.held.move_to_end(key)
+            closed, returned["structure"], returned["zeros"] = _SPANS.held[key]
         else:
             closed = jax.make_jaxpr(span)(*flat)
             if key is not None and _holdable(closed):
-                _SPANS[key] = (closed, returned["structure"], returned["zeros"])
-                while len(_SPANS) > SPANS_HELD:
-                    _SPANS.popitem(last=False)
+                _SPANS.held[key] = (closed, returned["structure"], returned["zeros"])
+                while len(_SPANS.held) > SPANS_HELD:
+                    _SPANS.held.popitem(last=False)
         # A value of the enclosing trace the function closes over (a kernel's mask, a reference's operand) is
         # one of the call's operands, leading its arguments, as a closed-over value is no constant there.
         held = [isinstance(const, Tracer) for const in closed.consts]
