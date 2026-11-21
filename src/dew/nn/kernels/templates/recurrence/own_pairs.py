@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
-from jax.extend import ir
+from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref
 
 from dew.nn.kernels import recurrence_algebra as algebra
