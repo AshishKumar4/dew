@@ -54,11 +54,14 @@ def test_an_fp32_forward_the_template_does_not_train_is_witnessed_as_its_inferen
         assert np.all(inside), (name, float(np.mean(inside)))
 
 
-@pytest.mark.parametrize("target", TARGETS)
+@pytest.mark.parametrize("target", (*TARGETS, "sm100"))
 def test_an_inference_forward_is_witnessed_at_its_own_tiles(target):
     """A bf16 call no gradient follows, with the delta rule and without it (its keys taking the write gate),
     its forward at its own tiles (`Tiles.forward`) as its states then output launches, no walk forming the
-    output in one (rows 5668, 7877): every record inside its step's enclosure (`rw.witness`)."""
+    output in one (rows 5668, 7877): every record inside its step's enclosure (`rw.witness`). Its records
+    are the keeping build's at those tiles, its output and final memory the inference forward's bit for bit
+    (`rw.recorded`'s); a tcgen05 call's (an sm100's) solve fused with its application, which stores no
+    inverse where nothing is kept (`mainloop._solved`'s `keeps`), so its inverse is the keeping build's."""
     with generation.assumed(target, interpreted=True):
         operands = rw.draw(0, "mild", heads=2)
         runs = (rw.recorded(*operands, inference=True), rw.recorded(*operands, delta=False, inference=True))

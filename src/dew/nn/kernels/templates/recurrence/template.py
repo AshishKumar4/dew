@@ -295,14 +295,12 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
     # tracer).
     def primal(query, key, value, g, beta, state, starts, firsts, skip, table):
-        # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`),
-        # its kernels refused there (`report.ran_at`): they share the training forward's launches' names.
+        # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
         alone = {**run, "tiles": tiles.forward or tiles}
-        with report.ran_at(tiles.forward) if tiles.forward else contextlib.nullcontext():
-            return chunk_forward.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
-                                         max_segments=max_segments, scale=scale, delta=delta, wide=wide,
-                                         rounded=rounded, apart=apart, values_gated=values_gated,
-                                         unit_keys=unit_keys, skip=skip, forked=table, **alone)
+        return chunk_forward.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
+                                max_segments=max_segments, scale=scale, delta=delta, wide=wide,
+                                rounded=rounded, apart=apart, values_gated=values_gated,
+                                unit_keys=unit_keys, skip=skip, forked=table, **alone)
 
     def forward(*operands):
         if not fast:
@@ -696,13 +694,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
             # where None). A refusal of the joined tiles is no refusal of either's (`legal`'s), so a forked
             # forward's spilling scan once refused its whole value block where a shallower ring held
             # (Nemotron-H 4B's on sm100).
-            # Each product's kernels refused at the tiles they ran at (`report.ran_at`): the two products'
-            # states and output launches share their names.
+            # A forward alone's launches are named apart from a training call's (`mainloop.Call.alone`), so a
+            # kernel's name says which product ran it.
             spilled = report.refused_at(self, ba, joined)
             products = ((refused[True], trained, self.launches(ba, joined, target, backward=True), spilled),
                         (refused[False], forward,
                          self.launches(ba, joined.forward or joined, target, backward=False),
-                         report.refused_at(self, ba, joined.forward) if joined.forward else spilled))
+                         _refused_kernels(self, ba, joined)))
             ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches, kernels in products
                    if _owners(kernels, launches)]
             assert ran, (f"the spilled kernels {sorted(_refused_kernels(self, ba, joined))} are none of the "
@@ -961,7 +959,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         or where `training` the forward its fast backward takes (`chunk_forward.kept_forward`)."""
         return next(launch for launch in self.launches(ba, tiles, target, backward=False,
                                                         training_forward=training)
-                    if launch.name.startswith("recurrence_states"))
+                    if launch.name.startswith(("recurrence_states", "recurrence_alone_states")))
 
     def _blocks(self, ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
                 ) -> list[int]:

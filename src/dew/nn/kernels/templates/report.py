@@ -351,23 +351,6 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
 
 
 @contextlib.contextmanager
-def ran_at(config: Hashable) -> Iterator[None]:
-    """Within the block, the launch tracing now (`launching`'s) as its kernels run at `config`: a product of
-    it at tiles of its own (a template's forward alone, `Tiles.forward`), its kernels named and refused at
-    `config` (`refused_at`), not at the launch's, whose other product runs kernels of the same names (row
-    5668's states and output launches)."""
-    pending = _TRACING.get()
-    if pending is None:
-        yield
-        return
-    token = _TRACING.set(dataclasses.replace(pending, config=config, digest=None))
-    try:
-        yield
-    finally:
-        _TRACING.reset(token)
-
-
-@contextlib.contextmanager
 def relaunched(digest: str | None) -> Iterator[None]:
     """Within the block, the kernels traced carry the launch `digest` names in their names, as `launching`'s
     do: a launch's derivative traced after its forward's scope ended (a custom VJP's backward, which JAX
