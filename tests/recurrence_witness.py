@@ -694,6 +694,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
     scale = k.shape[-1] ** -0.5 if delta else 1.0
+    # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
+    write_bound = 1.0 if delta else None
     if rounded is None:
         rounded = route_rounding(delta, dtype)
     family = mainloop.issued(dtype)[0]
@@ -704,9 +706,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         if not delta:
             return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
                                                   delta=False, wide=False, rounded=rounded)
-        # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
         return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
-                                                       write_bound=1.0)
+                                                       write_bound=write_bound)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         # The options the call's programs close over name their launches (`launched`), the starts' by digest.
@@ -726,7 +727,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         program = jax.jit(lambda *x: chunk_forward.kept_forward(
             *x[:6], tiles=tiles, starts=x[6], max_segments=max_segments, scale=scale, delta=delta,
             rounded=rounded, family=mainloop.issued(jnp.result_type(*x[:3]))[0],
-            interpret=generation.backend() != "gpu"))
+            interpret=generation.backend() != "gpu", unit_keys=write_bound is not None))
 
         def kept(*x, starts):
             return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
@@ -1299,12 +1300,13 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
     dfinal = np.asarray(rng.standard_normal(h0.shape), np.float32)
     scale, rounded = run.scale, route_rounding(delta, dtype)
     interpret = generation.backend() != "gpu"
+    write_bound = 1.0 if delta else None
 
     def route(*x):
         if not delta:
             return recurrence_chunk.template_rule(*x, None, scale=scale, delta=False, wide=False,
                                                   rounded=rounded)
-        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
+        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=write_bound)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         native, launches = launched(jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal))), operands,
@@ -1316,10 +1318,12 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
             # Its family read from its operands, a family no identity states (`launched`'s statement).
             family = mainloop.issued(jnp.result_type(*x[:3]))[0]
             _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
-                                                         delta=delta, family=family, interpret=interpret)
+                                                         delta=delta, family=family, interpret=interpret,
+                                                         unit_keys=write_bound is not None)
             grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
                                                            rounded=rounded, delta=delta, family=family,
-                                                           interpret=interpret, inverse=inverse, kept=held)
+                                                           interpret=interpret, inverse=inverse, kept=held,
+                                                           unit_keys=write_bound is not None)
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
