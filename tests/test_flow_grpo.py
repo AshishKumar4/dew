@@ -517,16 +517,10 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     def reward(images, context):
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
-    from dew.distributed.batches import split_fields
-
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
-    # What the rollout's generation hands its collective (`_generate_impl`), by its shapes alone.
-    expanded = rollout._expanded(split_fields(prompts)[0])[0]
-    walk = jax.eval_shape(lambda: rollout._generate_impl(rollout._policy(state), expanded,
-                                                         jax.random.key(23)))[0]
-    assert (walk.states.shape[1], walk.log_probs.shape[1], walk.stochastic.shape[1], walk.times.shape) == (
-        3, 2, 2, (4,))
     batch = rollout(state, prompts, jax.random.key(23), objective=objective)
+    # Its rows hold the walk's first two transitions alone, its trained prefix (row 10903).
+    assert batch["timesteps"].shape == batch["transition_mask"].shape == (6, 2)
     rewards = np.asarray(batch["rewards"], np.float64).reshape(2, 3)
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
