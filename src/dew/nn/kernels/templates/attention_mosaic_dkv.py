@@ -38,6 +38,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     column_share,
+    head_layout,
     head_slice,
     held_params,
     holders,
@@ -698,10 +699,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     graded, buffers, groups = _graded(score_params, kinds, shares, query.shape, key.shape[1],
                                       adds_vectors=family.adds_vectors)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
-    staged_logits = program.tiles.staged_logits
-    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop,
-                                        None if staged_logits else scaled))
-
+    (scaled_in,) = head_layout(family, None if program.tiles.staged_logits else scaled)
+    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop, scaled_in))
     tiled = Kind.TILE in graded
 
     def body(*refs, streams, after=None):
@@ -792,16 +791,11 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             outputs = refs[first + len(groups):first + len(groups) + 2]
             _summed_stored(family, summed, _shared_views(family, outputs, grads, graded, block_k), consumers,
                            walk.interpret)
-
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
-    heads_first = family.copies_tiled_rows
-    if heads_first:
-        query, key, value, dout = (jnp.swapaxes(arr, 1, 2) for arr in (query, key, value, dout))
-    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    result = _dkv_launched(walk, launch, operands, graded, buffers, groups)
-    if heads_first:
-        return (jnp.swapaxes(result[0], 1, 2), jnp.swapaxes(result[1], 1, 2), *result[2:])
-    return result
+    query, key, value, dout = head_layout(family, query, key, value, dout)
+    result = _dkv_launched(walk, launch, (query, key, value, dout, peak, total, anchor, delta, key_index,
+                                          *leaves), graded, buffers, groups)
+    return (*head_layout(family, *result[:2]), *result[2:])
 
 
 def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:
@@ -855,7 +849,7 @@ def _query_streams(family: mosaic.Family, streams, named: dict, score: tuple, ro
     hook's parameters that ride them (`score`, their refs and kinds: `score_views`, at the program's key
     tile), and its streams opened with them."""
     refs, kinds = score
-    views = _views_of(named, row, head, heads_first=family.copies_tiled_rows)
+    views = _views_of(family, named, row, head)
     if riding(family, kinds, "queries"):
         views |= score_views(family, refs, kinds, "queries", row, head, family.program_index("k_tiles"))
     return views, family.opened(streams, views)

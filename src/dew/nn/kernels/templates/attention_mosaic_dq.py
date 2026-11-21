@@ -28,6 +28,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _rows,
     _Spans,
     column_share,
+    head_layout,
     head_slice,
     held_params,
     issued_into,
@@ -361,12 +362,10 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after),
                       **products)
-
     # Its outputs as its query's axes (`outputs.Output`): dQ's share of the columns, and its rows' statistics.
-    heads_first = family.copies_tiled_rows
     rows, positions, heads_of = (outputs.axis(query, index) for index in range(3))
-    sums_shape = (rows, heads_of, positions) if heads_first else (rows, positions, heads_of)
-    sums = outputs.output(jnp.float32, *sums_shape, column_share(query, share[1]))
+    sums = outputs.output(jnp.float32, *head_slice(family, rows, heads_of, positions),
+                          column_share(query, share[1]))
     stats_shape = outputs.output(jnp.float32, rows_count, rows, heads_of, positions)
     launch = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
@@ -381,11 +380,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                     tile_walk=TileWalk((queries, key.shape[1]), (block_q, block_k), consumers,
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))
-    if heads_first:
-        query, key, value, dout = (jnp.swapaxes(arr, 1, 2) for arr in (query, key, value, dout))
+    query, key, value, dout = head_layout(family, query, key, value, dout)
     out = launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
-    if heads_first:
-        dq = jnp.swapaxes(dq, 1, 2)
-        keyed = None if keyed is None else jnp.swapaxes(keyed, 1, 2)
-    return dq, keyed, rows
+    return *head_layout(family, dq, keyed), rows

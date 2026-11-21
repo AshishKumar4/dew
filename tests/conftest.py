@@ -634,3 +634,12 @@ def cache_worker():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_address[1]}", stored, seen
     server.shutdown()
+
+
+@pytest.fixture
+def libtpu_shared(monkeypatch):
+    """libtpu loaded in this process beside another's: its lock file holds one process's libtpu at a time,
+    so two test workers compiling for a TPU at once failed the second's load (ABORTED, /tmp/libtpu_lockfile).
+    A compile-only TPU needs no device a lock guards, so each loads with libtpu's own allowance and takes no
+    lock file."""
+    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")

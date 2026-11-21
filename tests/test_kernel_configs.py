@@ -977,15 +977,6 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     assert got == expected, (sorted(expected - got), sorted(got - expected))
 
 
-@pytest.fixture
-def libtpu_shared(monkeypatch):
-    """libtpu loaded in this process beside another's: its lock file holds one process's libtpu at a time,
-    so two test workers compiling for a TPU at once failed the second's load (ABORTED, /tmp/libtpu_lockfile).
-    A compile-only TPU needs no device a lock guards, so each loads with libtpu's own allowance and takes no
-    lock file."""
-    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
-
-
 @COMPILES_FOR_TPU
 @pytest.mark.usefixtures("libtpu_shared")
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])

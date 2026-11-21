@@ -1733,13 +1733,20 @@ def head_slice(family: mosaic.Family, row, head, span) -> tuple:
     return (row, head, span) if family.copies_tiled_rows else (row, span, head)
 
 
-def _views_of(refs: dict, row, head, *, heads_first: bool = False) -> dict:
-    """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each `[B, S, H, D]`
-    (or `[B, H, S, D]` where `heads_first`) operand's `[S, D]` at batch row `row` and head `head`, step
-    `j` its `j`-th block of rows."""
-    return {name: (ref.at[row, head, :] if heads_first else ref.at[row, :, head], lambda j: (j, 0))
-            for name, ref in refs.items()}
+def head_layout(family: mosaic.Family, *arrays):
+    """Swap sequence and head axes of `arrays` (`[B, S, H, D]` <-> `[B, H, S, D]`) for a head-first TPU
+    family (`Family.copies_tiled_rows`), leaving non-TPU arrays and `None` untouched."""
+    if not family.copies_tiled_rows:
+        return arrays
+    return tuple(None if arr is None else jnp.swapaxes(arr, 1, 2) for arr in arrays)
 
+
+def _views_of(family: mosaic.Family, refs: dict, row, head) -> dict:
+    """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each operand's `[S, D]`
+    at batch row `row` and head `head` in `family`'s axis order (`head_slice`), step `j` its `j`-th block
+    of rows."""
+    return {name: (ref.at[head_slice(family, row, head, slice(None))], lambda j: (j, 0))
+            for name, ref in refs.items()}
 
 def _fused_held(logits: tuple, dtype, *, dropped: bool) -> list:
     """The tiles a fused backward launch holds beside both products and its pullback (`backward_registers`):

@@ -1264,6 +1264,7 @@ def test_the_launches_lower_for_a_v5e(call):
 
 
 @COMPILES_FOR_TPU
+@pytest.mark.usefixtures("libtpu_shared")
 def test_bf16_template_compiles_for_a_v5e():
     """Head-first `[B, H, S, D]` TPU layout lets the template's bf16 forward and training step compile on
     v5e through `libtpu` without Mosaic's packed-sublane head-slice error (rows 6993, 10152)."""
@@ -1274,12 +1275,13 @@ def test_bf16_template_compiles_for_a_v5e():
     key = jax.ShapeDtypeStruct((1, 256, 2, 128), jnp.bfloat16)
 
     def fwd(q, k, v):
-        return scaled_dot_product_attention(q, k, v, causal=True, implementation="template")
+        with generation.chosen(attention_mainloop="mosaic"):
+            return scaled_dot_product_attention(q, k, v, causal=True, implementation="template")
 
     def step(q, k, v, dout):
-        out, pull = jax.vjp(fwd, q, k, v)
-        return out, *pull(dout)
-
+        with generation.chosen(attention_mainloop="mosaic"):
+            out, pull = jax.vjp(fwd, q, k, v)
+            return out, *pull(dout)
     cases = [KernelCase("v5e-bf16-fwd", lambda: (fwd, (query, key, key))),
              KernelCase("v5e-bf16-step", lambda: (step, (query, key, key, query)))]
     found = compile_tpu_kernels(cases, "v5e")

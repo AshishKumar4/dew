@@ -22,6 +22,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    head_layout,
     head_slice,
     launch_scope,
     modelled,
@@ -247,9 +248,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     q_steps = queries // block_q
     grouped, group = heads != kv_heads, heads // kv_heads
     leaves, treedef = jax.tree.flatten((spans, drop))
-    heads_first = family.copies_tiled_rows
-    # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
-    kv_shape = (batch, kv_heads, keys_padded, width) if heads_first else (batch, keys_padded, kv_heads, width)
+    kv_shape = ((batch, kv_heads, keys_padded, width) if family.copies_tiled_rows
+                else (batch, keys_padded, kv_heads, width))
     shapes = [kv_shape] * 2
     groups = stacked.groups(shapes)
     def body(*refs, streams, after=None):
@@ -266,8 +266,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, group)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
-        views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head, heads_first=heads_first),
-                 **statistics}
+        views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         pair_first = family.program_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
@@ -321,7 +320,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
 
     # dK and dV as their own arrays' axes (`outputs.Output`).
-    axis_order = (0, 2, 1) if heads_first else (0, 1, 2)
+    axis_order = (0, 2, 1) if family.copies_tiled_rows else (0, 1, 2)
     gradients = tuple(outputs.output(array.dtype if typed else jnp.float32,
                                      *(outputs.axis(array, index) for index in axis_order), width)
                       for array in (key, value))
@@ -337,14 +336,11 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
-    if heads_first:
-        query, key, value, dout = (jnp.swapaxes(arr, 1, 2) for arr in (query, key, value, dout))
+    query, key, value, dout = head_layout(family, query, key, value, dout)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     dq, dk, dv = _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
                                grouped=grouped)
-    if heads_first:
-        return jnp.swapaxes(dq, 1, 2), jnp.swapaxes(dk, 1, 2), jnp.swapaxes(dv, 1, 2)
-    return dq, dk, dv
+    return head_layout(family, dq, dk, dv)
 
 def _fused_called(launch: Callable, operands: tuple, grads: tuple, *, copies: int, grouped: bool
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:

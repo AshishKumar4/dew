@@ -463,8 +463,8 @@ NATIVE_FLOAT16 = _Need('float16', lambda case: (case.dtype != np.dtype(np.float1
                                                  or generation.gpu_target().float16),
                        "the TPU computes in no float16, so its Mosaic lowers no float16 load the kernel "
                        "issues (`generation.Architecture.float16`: a v5e, rows 6993, 7227)", row=INHERENT)
-"""Splash's capability on a TPU: float16 only where the TPU computes in it. A capability, so a call that names
-its kernel is refused too (`selection.KernelRefused`) rather than failing its compile."""
+"""Splash's and the template's capability on a TPU: float16 only where the TPU computes in it. A capability,
+so a call that names its kernel is refused too (`selection.KernelRefused`) rather than failing its compile."""
 
 TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
                     kind='measured')
