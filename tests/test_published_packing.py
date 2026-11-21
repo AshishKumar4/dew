@@ -29,16 +29,18 @@ def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_pack
     import grain
     from grain.experimental import BestFitPackIterDataset
 
+    # Each document its own letter, so a window's byte ids name the documents it holds; tokenized, the
+    # documents' lengths are certified (`Tokenize`), as a published plan needs.
     sizes = (3, 7, 6, 2, 4, 5, 7, 1, 5, 6, 7, 2, 3, 8, 1, 4)
-    documents = tuple({"text": (np.arange(size) + 100 * index + 1).astype(np.int32)}
-                      for index, size in enumerate(sizes))
-    packed = Pipeline(Memory(documents)).pack(9, bins=bins, segments=segments, policy="best-fit")
+    texts = tuple(chr(ord("a") + index) * size for index, size in enumerate(sizes))
+    prefix = Pipeline(Memory(tuple({"text": text} for text in texts))).map(Tokenize())
+    packed = prefix.pack(9, bins=bins, segments=segments, policy="best-fit")
     generation = publish(packed, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
                                        shard_bytes=256 * 1024), read="indexed", loading=READ)
 
     def held(tokens) -> list[int]:
-        """The documents a window's tokens are of, in their order."""
-        return list(dict.fromkeys(int(token) // 100 for token in np.ravel(tokens) if token))
+        """The documents a window's tokens are of, in their order: each its letter's byte id."""
+        return list(dict.fromkeys(int(token) for token in np.ravel(tokens) if token))
 
     def windows(chain, read) -> list[list[int]]:
         # One pass, in order (a validation read's).
@@ -49,9 +51,10 @@ def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_pack
             reader.close()
 
     grains = [held(window["text"]) for window in BestFitPackIterDataset(
-        grain.MapDataset.source(list(documents)).to_iter_dataset(), length_struct={"text": 9},
+        grain.MapDataset.source([{"text": np.frombuffer(text.encode(), np.uint8).astype(np.int32)}
+                                 for text in texts]).to_iter_dataset(), length_struct={"text": 9},
         num_packing_bins=bins, shuffle_bins=False, max_sequences_per_bin=segments)]
-    published = windows(Pipeline(Memory(documents)).cache(generation).pack(
+    published = windows(prefix.cache(generation).pack(
         9, bins=bins, segments=segments, policy="best-fit"), "indexed")
     assert published == grains, (published, grains)
     assert windows(packed, "memory") == grains
