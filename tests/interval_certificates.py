@@ -158,13 +158,14 @@ PART_SUBNORMAL = 2.0 ** (BFLOAT16.emin - BFLOAT16.precision)
 however small the value (`two_parts_reach`)."""
 
 
-def two_parts_reach(magnitude):
+def two_parts_reach(magnitude, lane: Lane):
     """How far two bf16 parts' sum lies from the fp32 value of `magnitude` they split: the second part the
     remainder rounded, within 2^-16 of the value, or within half bf16's least subnormal step where the
-    remainder lies below bf16's normals (`PART_SUBNORMAL`): a value near 1e-40 split into parts dropped
-    2^-134, whose relative reach was none, and Kimi's steep inverse lay one bf16 step outside its enclosure
-    natively on a GH200 (row 10007, M-JS-156: 68 of 24576 entries, each 2^-133 out)."""
-    return 2.0 ** -16 * magnitude + PART_SUBNORMAL
+    remainder lies below bf16's normals (`PART_SUBNORMAL`), or, on a lane that flushes, the whole of a
+    remainder or value below fp32's normals: a value near 1e-40 split into parts dropped 2^-134, whose
+    relative reach was none, and Kimi's steep inverse lay one bf16 step outside its enclosure natively on a
+    GH200 (row 10007, M-JS-156: 68 of 24576 entries, each 2^-133 out)."""
+    return 2.0 ** -16 * magnitude + (2.0 ** FLOAT32.emin if lane.flushes else PART_SUBNORMAL)
 
 
 def staged(iv: Iv, lane: Lane) -> Iv:
@@ -174,7 +175,7 @@ def staged(iv: Iv, lane: Lane) -> Iv:
     if lane.held == 1:
         return iv if lane.wide else cast(iv, BFLOAT16)
     if lane.held == 2:
-        reach = two_parts_reach(np.maximum(np.abs(iv.lo), np.abs(iv.hi)))
+        reach = two_parts_reach(np.maximum(np.abs(iv.lo), np.abs(iv.hi)), lane)
         return outward(iv.lo - reach, iv.hi + reach)
     return iv
 
@@ -186,7 +187,7 @@ def held_cell(x, lane: Lane) -> Iv:
         return cell(x, BFLOAT16)
     if lane.held == 2:
         x = np.asarray(x, np.float64)
-        reach = two_parts_reach(np.abs(x) * (1 + 2.0 ** -7))
+        reach = two_parts_reach(np.abs(x) * (1 + 2.0 ** -7), lane)
         return outward(x - reach, x + reach)
     return point(x)
 

@@ -78,8 +78,9 @@ def test_two_bf16_parts_of_a_value_sum_within_its_staged_reach():
     """fp32 values split into two bf16 parts (`product.formed`, a 16-bit call's doubling merges' operands in
     fp32, `mainloop.merge_parts`) sum within the witness's reach of the value
     (`interval_certificates.staged`), subnormals among them, whose second part rounds below bf16's normals at
-    an absolute step: a value near 1e-40 dropped 2^-134 where the reach held none, and Kimi's steep inverse
-    lay one bf16 step outside its enclosure on a GH200 (row 10007)."""
+    an absolute step, or flushes on a lane that flushes (this CPU's): a value near 1e-40 dropped 2^-134
+    where the reach held none, and Kimi's steep inverse lay one bf16 step outside its enclosure on a GH200
+    (row 10007)."""
     rng = np.random.default_rng(0)
     x = np.concatenate([np.float32([1.0e-40, -6.43e-40, 1.956e-38, 2.5e-38, -1.4e-45, 0.0, 1.0, -3.7e-3]),
                         rng.standard_normal(256).astype(np.float32) * np.float32(2.0) ** rng.integers(
