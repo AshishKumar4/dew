@@ -1059,7 +1059,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
             hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool, params_held: tuple,
             share: int = 0, held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
             interpret: bool = False, codes: _Codes | None = None, training: bool = False,
-            first_at: Callable | None = None, tile: Callable | None = None) -> tuple:
+            first_at: Callable | None = None, tile: Callable | None = None,
+            masked: bool | None = None) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`, or from `first_at()` formed at its mask), and their products where the logits are a
     factor of them (`algebra.logits_of`), every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's
@@ -1103,9 +1104,10 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
         # The quantized keys' products their codes', each key's column scaled to its keys' (`_Codes`).
         s = s * algebra.across(codes.key_scales(k_first), s)
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
-    # Its mask chosen at run time (`whole`): the masked tile's reads.
-    read = algebra.places_read(spec, masked=True, hooked=score_places(hooks), dropped=drawn,
-                               padded=spec.keys % tiles.block_k != 0)
+    # Its mask chosen at run time (`whole`) unless the walk segmented unmasked vs masked tiles (`masked`).
+    read_masked = True if masked is None else masked
+    read = algebra.places_read(spec, masked=read_masked, hooked=score_places(hooks), dropped=drawn,
+                               padded=read_masked and spec.keys % tiles.block_k != 0)
     # The block's first query formed where the mask reads it (`first_at`): carried across the logits'
     # product, which waits on the step's register-A products to retire (`retires_register_products`), an
     # H100's training forward at 128 x 64 on three consumers spilled its two query places, 16 bytes, and
@@ -1121,7 +1123,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first, held=kept,
                           slot=slots[score_stream(index)] if index in streamed else None, at=(share, 0))
                    for index, (ref, param, kept) in enumerate(laid))
-    logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
+    is_masked = jnp.logical_not(whole(index)) if masked is None else masked
+    logits, products = algebra.logits_of(spec, s, coords, params, masked=is_masked)
     return k_first, coords, logits, products
 
 
@@ -1301,16 +1304,16 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
         start, merged = _started(program, spec, hooked, state_rows, value_width, training=training)
         unit = _bound_unit(spec, hooks.drop, decided)
 
-        def scored(index, slots, product=None):
+        def scored(index, slots, product=None, *, masked: bool | None = None):
             return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                            hooks=hooks, drawn=hooked.drop is not None, held=held, params_held=params_held,
                            share=consumer * tiles.block_q, product=product, tile=tile,
                            interpret=interpret, codes=codes, training=training,
                            first_at=(first_at if family.in_flight and family.retires_register_products
-                                     else None))
+                                     else None), masked=masked)
 
-        def step(index, slots, carry, accumulators):
-            k_first, coords, logits, products = scored(index, slots)
+        def step(index, slots, carry, accumulators, *, masked: bool | None = None):
+            k_first, coords, logits, products = scored(index, slots, masked=masked)
             converted = None if codes is None else codes.values(slots["values"], k_first)
             tile = values(slots, converted)
             # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`); the
@@ -1339,8 +1342,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
 
         def walked(streams, lo, hi, counted):
             if not training:
+                whole_end = (jnp.minimum(jnp.maximum(jnp.where(program.padded(first), 0,
+                                                               program.whole(first, hi)), lo), hi)
+                             if (spans is None and program.causal and not program.ahead
+                                 and certified is None) else None)
                 return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret,
-                                          products=program.products))
+                                          products=program.products, whole_end=whole_end))
             assert anchors is not None
             known = algebra.Argmax(family.rows_of(anchors[0].at[state_rows]),
                                    family.rows_of(anchors[1].at[state_rows]))
@@ -1615,16 +1622,19 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
 
 def _walk_of(family: mosaic.Family, streams, lo, hi, counted, *, interpret: bool,
-             products: Sequence[mosaic.Product] = ()) -> Callable:
+             products: Sequence[mosaic.Product] = (), whole_end=None) -> Callable:
     """A consumer's walk of its key tiles `lo` to `hi` over its program's `streams` from the program's
     `counted`-th step (`Family.walk`, which places its declared `products`), as `walk(step, start, shapes,
-    initial=)` takes it."""
+    initial=)` takes it. Where `whole_end` is given, splits `[lo, whole_end)` (static `masked=False`) from
+    `[whole_end, hi)` (`masked=True`) so unmasked causal tiles skip mask coordinates and selects."""
     def walk(step, start, shapes, initial=None):
-        return family.walk(streams, ((step, lo, hi),), start, shapes, interpret, first=counted,
+        segments = (((step, lo, hi),) if whole_end is None
+                    else ((functools.partial(step, masked=False), lo, whole_end),
+                          (functools.partial(step, masked=True), whole_end, hi)))
+        return family.walk(streams, segments, start, shapes, interpret, first=counted,
                            initial=initial, products=products)
 
     return walk
-
 
 def _started(program: _Program, spec: algebra.Forward, hooked: _Hooked, rows: tuple, value_width: int, *,
              training: bool) -> tuple[algebra.Partial, bool]:
