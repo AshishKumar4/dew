@@ -324,12 +324,10 @@ def relays(family: mosaic.Family, tiles: Tiles, *, peaks: bool = False) -> bool:
     return not peaks and family.relay_bytes(tiles.block_q, tiles.block_k) > 0
 
 
-def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                   masked: bool = False, **walk):
-    """`MosaicForward`'s launch without residuals (`_inference_walk`), its launches walked by the fold's guard
-    (`algebra.walked_launches`): a `masked` walk's rewalk in place (its launch's programs that walk
-    nothing write nothing, so it declares no output of its own), which takes no output hook, whose rows XLA
-    forms past the launch from its whole output."""
+def _plain_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                masked: bool = False, **walk):
+    """Return `(spec, launch, finished, in_place)` for an inference forward walk (`_inference_walk`), the one
+    owner of the `in_place` rewalk rule shared by `_plain_forward`, `_fwd`, and `_main_launch` (row 10677)."""
     if masked and hooks.output_mod is not None:
         raise ValueError("a masked walk rewalks in place, which an output hook formed past its launch does "
                          "not take")
@@ -341,6 +339,13 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         masked or (hooks.output_mod is None and _copy_costs_more(query, value)))
     spec, launch, finished = _inference_walk(query, key, value, spans, hooks, masked=masked, flagged=in_place,
                                              **walk)
+    return spec, launch, finished, in_place
+
+
+def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                   masked: bool = False, **walk):
+    """`MosaicForward`'s launch without residuals (`_plain_walk`), walked by the fold's guard."""
+    spec, launch, finished, in_place = _plain_walk(query, key, value, spans, hooks, masked=masked, **walk)
     return finished(algebra.walked_launches(spec, launch, in_place=in_place))
 
 
@@ -1597,33 +1602,24 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
         elif (hooks.output_mod is None and keep is None and family.budgets_registers
-              and state.acc.shape[-1] > 128 and state.acc.shape[-1] % 64 == 0):
-            # Chunk wide (>128) register epilogues into 64-column slices (32 regs/slice) so `state.acc`
-            # and `output` (`quotient` + `midpoint_settled`) fit within 168 regs (2 consumers on sm90)
-            # instead of spilling 96-248 B and falling back to 2-launch `columns=128` (row 5272).
+              and not family.operands_in_registers and state.acc.shape[-1] > 128
+              and state.acc.shape[-1] % 64 == 0):
+            # Chunk wide (>128) TMA register epilogues into 64-column slices (32 regs/slice) so `state.acc`
+            # and `output` (`quotient` + `midpoint_settled`) fit without spilling 96-112 B on sm90 d256
+            # forward (which forced 2-launch `columns=128`, row 5272).
             maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
 
             def store_chunks(stage):
                 width = state.acc.shape[-1]
-                if not family.operands_in_registers and stage is not None and stage.shape[-1] == width:
-                    for col in range(0, width, 64):
-                        chunk = state._replace(acc=state.acc[:, col:col + 64])
-                        out_chunk = algebra.finish(spec, chunk, initial=hooked.initial is not None,
-                                                   held=program.parts > 1)[0]
-                        stage[:, pl.ds(col, 64)] = out_chunk.astype(stage.dtype)
-                    plgpu.commit_smem()
-                    plgpu.copy_smem_to_gmem(stage, out_view)
-                    plgpu.wait_smem_to_gmem(0)
-                    return
+                assert stage is not None and stage.shape[-1] == width
                 for col in range(0, width, 64):
                     chunk = state._replace(acc=state.acc[:, col:col + 64])
                     out_chunk = algebra.finish(spec, chunk, initial=hooked.initial is not None,
                                                held=program.parts > 1)[0]
-                    sl = pl.ds(col, 64)
-                    chunk_stage = (None if stage is None
-                                   else stage.at[:, sl] if stage.shape[-1] == width else stage)
-                    family.stored((out_chunk,), (out_view.at[:, sl],), smem=chunk_stage,
-                                  wait=col + 64 >= width)
+                    stage[:, pl.ds(col, 64)] = out_chunk.astype(stage.dtype)
+                plgpu.commit_smem()
+                plgpu.copy_smem_to_gmem(stage, out_view)
+                plgpu.wait_smem_to_gmem(0)
 
             out_stage(store_chunks)
         else:
