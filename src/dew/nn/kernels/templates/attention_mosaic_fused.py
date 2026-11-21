@@ -165,15 +165,25 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
             masked=masked, whole_operands=True))
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
                                   whole(index), shape, masked=masked)
+    cotangents_staged = staged.at[1]
+    if not family.operands_in_registers:
+        # Stage P and dS before dQ so narrowed frees before dQ allocates, then fire dV and dK asynchronously
+        # so add_dq (register->SMEM copy + TMA reduceAdd) runs concurrently with dV and dK wgmma (row 5272).
+        family.staged(narrowed, staged.at[0])
+        family.staged(part, cotangents_staged)
+        dq = family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]))
+        dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
+        dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
+        add_dq(q_first, dq)
+        return carry, (dk_acc, dv_acc)
     family.staged(narrowed, staged.at[0])
     dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
-    cotangents_staged = staged.at[1]
     family.staged(part, cotangents_staged)
     dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
     # The tile's dQ, its staged cotangents times the resident keys (`algebra.cotangent_product`'s `a @ b`),
     # added into dQ: the query tile's other key blocks add theirs.
     add_dq(q_first, family.looped_product(cotangents_staged, k_smem,
-                                         (tiles.block_q, k_smem.shape[-1])))
+                                          (tiles.block_q, k_smem.shape[-1])))
     return carry, (dk_acc, dv_acc)
 
 def _sixteen_step(walk: _Backward, k_smem, staged, add_dq, slots, carry, accumulators, q_first,
