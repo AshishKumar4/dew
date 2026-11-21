@@ -1239,10 +1239,12 @@ class Issuer[Accumulator](abc.ABC):
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                     between: Callable[[jax.Array], Any] = lambda value: value) -> tuple[Any, jax.Array]:
         """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
-        (`WgmmaIssuer`), else in turn (`product`)."""
-        return self.product(lhs1, rhs1, shape), self.product(lhs2, rhs2, shape)
+        (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
+        second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""
+        return between(self.product(lhs1, rhs1, shape)), self.product(lhs2, rhs2, shape)
 
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""

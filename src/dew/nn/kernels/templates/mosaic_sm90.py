@@ -81,12 +81,16 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                     between=lambda value: value):
+        if launches.interpreting():
+            return super().product_pair(lhs1, rhs1, lhs2, rhs2, shape, between=between)
+
         def both(acc1, acc2):
             plgpu.wgmma(acc1, lhs1, rhs1)
             plgpu.wgmma(acc2, lhs2, rhs2)
             mosaic.committed()
-            return acc1[...], acc2[...]
+            return between(self.read(acc1, pending=1)), self.read(acc2)
 
         return pl.run_scoped(both, plgpu.WGMMAAccumulatorRef(shape, jnp.float32),
                              plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
