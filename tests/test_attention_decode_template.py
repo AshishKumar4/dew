@@ -1099,8 +1099,8 @@ def test_a_decode_step_resuming_an_initial_state_near_fp32s_largest_keeps_its_ma
     acc = total[..., None] * jnp.ones((query.shape[0], heads, positions, value.shape[-1]), jnp.float32)
     def ours(q, k, v, im, it, ia):
         with generation.assumed("sm90"):
-            return attention_decode.attend(q, k, v, spans, template.Hooks(initial=template.Initial(im, it, ia)),
-                                           interpret=True)
+            hooks = template.Hooks(initial=template.Initial(im, it, ia))
+            return attention_decode.attend(q, k, v, spans, hooks, interpret=True)
 
     def reference(q, k, v, im, it, ia):
         return jnp.ones_like(q)
