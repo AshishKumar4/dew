@@ -1530,8 +1530,7 @@ class _Build:
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
             return mixed_indexed(mapped, source)
-        # A streamed mix saves each member's position under its key (`Plan.check`); a mix of stated counts
-        # weighs each member's targets as it accepts them, as `TokenDeficit` does as it draws (row 10784).
+        # Each member's position under its key (`Plan.check`); its targets weighed as accepted (row 10784).
         stated = self.lowering.order.get("shares") == STATED_SHARES
         weighed: _Counter = {"tokens": source.tokens} if source.tokens is not None and stated else {}
         streams = [build.accepted(_as_iter(parent, build.loading), _name(child), _label(child), **weighed)
@@ -1691,7 +1690,7 @@ class _Build:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
             reader = filled.streamed(shards.reader, manifest, transform=prefix, pool=prefix.pool,
-                                     source=source, transparent=transparent)
+                                     source=source, transparent=transparent, shard_count=len(shards.shards))
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards, partition, self.stream_loading) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]

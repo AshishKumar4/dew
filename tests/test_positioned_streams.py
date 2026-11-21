@@ -66,3 +66,36 @@ def test_a_positioned_streams_shards_are_named_alike_wherever_its_store_is_mount
     first, second = (Files(str(tmp_path / mount / "data" / "rows.jsonl"),
                            shard_bytes=40).positioned_manifest() for mount in ("a", "b"))
     assert [shard.id for shard in first.shards] == [shard.id for shard in second.shards]
+
+
+def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_shard(tmp_path):
+    """An indexed JSONL store read by a stream that numbers its rows before its cache, in several shards
+    (two readers): the cache publishes the store's generation once the read has filled every positioned
+    shard, so the next streamed read reads it back, numbering and running nothing (row 9051's confirm
+    review: the fill counted the store's byte ranges, and no seal reached its publication)."""
+    from dew.data import Cache
+    from dew.data.compile import iterate
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Pipeline
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(12)))
+    files = Files(str(path), shard_bytes=40)
+    files.provision()
+    cache = Cache(str(tmp_path / "cache"))
+    numbered: list[int] = []
+
+    def at(index, row):
+        numbered.append(int(index))
+        return {**row, "at": np.int64(index)}
+
+    def values() -> list[tuple[int, int]]:
+        rows = iterate(Pipeline(files).map_with_index(at).cache(cache), read="streamed",
+                       loading=Loading(workers=0, threads=2, read_buffer=1))
+        return sorted((int(row["at"]), int(row["id"])) for row in rows)
+
+    first = values()
+    count = len(numbered)
+    again = values()
+    assert first == again == [(index, index) for index in range(12)]
+    assert count == 12 and len(numbered) == count

@@ -304,7 +304,7 @@ def test_an_older_snapshot_kept_for_its_profiles_alone_keeps_no_exported_model(t
                       layout=Layout(min_shard=1, tolerance=1.0),
                       checkpoints=Checkpoints(str(directory), keep=1, export_model=True))
     trainer.fit(dataset(), steps=8, log_every=8, checkpoint_every=4)
-    trainer.checkpoints.wait()
+    trainer.checkpoints.close()
     assert {entry.step: entry.kind for entry in Checkpoints(str(directory), keep=1).kept()} == {
         4: "profiles", 8: "state"}
     assert not (directory / "4" / "exported").exists() and (directory / "8" / "exported").exists()

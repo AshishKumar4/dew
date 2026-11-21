@@ -155,13 +155,6 @@ def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "
     checkpoints = trainer.checkpoints
     if checkpoints is None:
         return None
-    if checkpoints.export_model:
-        from dew.checkpoints._exported import export_refusal
-        from dew.mesh import STAGE_AXIS
-
-        # Refused as the run starts, not at its last checkpoint.
-        if (refusal := export_refusal(trainer.device_mesh, STAGE_AXIS)) is not None:
-            raise ValueError(refusal)
 
     def continued() -> int | None:
         step, held = checkpoints.resumed(resume), max(checkpoints.committed(), default=None)
@@ -173,6 +166,20 @@ def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "
         return step
 
     return agreed_same("newest checkpoint", continued)
+
+
+def refuse_export[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]") -> None:
+    """Refused as a run starts, not at its last checkpoint: a run whose checkpoints export its model
+    (`Checkpoints.export_model`) and whose pipeline's stages each hold their rows on processes of the pool
+    apart (`StageLocal.apart`, `export_refusal`), which Orbax's standard layout writes none of."""
+    checkpoints = trainer.checkpoints
+    if checkpoints is None or not checkpoints.export_model or not trainer._staging.apart:
+        return
+    from dew.checkpoints._exported import export_refusal
+    from dew.mesh import STAGE_AXIS
+
+    if (refusal := export_refusal(trainer.device_mesh, STAGE_AXIS)) is not None:
+        raise ValueError(refusal)
 
 
 def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", checkpoints: "Checkpoints",

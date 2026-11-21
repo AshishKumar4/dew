@@ -942,8 +942,10 @@ class Files(Dataset):
         if (self.kind not in ("jsonl", "text", "csv") or self.where is not None or not self.paths
                 or any(infer_compression(url.lower()) for url in self.paths) or not self.supports("indexed")):
             return self.manifest()
-        # Named by its files' places (`_places`), which every host that mounted them anywhere names alike.
-        return _single_indexed_manifest(self, ",".join(self._places[url] for url in self.paths))
+        # Named by its files' places (`_places`), which every host that mounted them anywhere names alike, as
+        # a digest of them, of one length however many files it holds.
+        places = "\n".join(self._places[url] for url in self.paths)
+        return _single_indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}")
 
     def manifest(self) -> ShardManifest:
         """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a fill
