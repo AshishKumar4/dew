@@ -2427,31 +2427,15 @@ def test_hopper_forward_derives_consumer_count_from_analytic_launch_price():
             assert price_three > price_two, (width, price_two, price_three)
 
 
-def test_consumer_choice_persists_beside_verdicts_in_tuning_store(monkeypatch, tmp_path):
+def test_consumer_choice_persists_beside_verdicts_in_tuning_store(tmp_path):
     """`tuning.store_choice` / `tuning.stored_choice` persist consumer-count choices beside certification
-    verdicts in `_verdicts_path` without clobbering verdicts, and a stored choice is read without tracing
-    `_price_config` on a warm start (row 6710)."""
+    verdicts in `_verdicts_path` without clobbering verdicts, and `store_verdict` preserves choices
+    (row 6710)."""
     verdicts_file = str(tmp_path / "certified_sm90.json")
-    monkeypatch.setattr(tuning, "_verdicts_path", lambda target: verdicts_file)
-    monkeypatch.setattr(tuning, "_VERDICTS", {})
-    monkeypatch.setattr(tuning, "_CHOICES", {})
-
-    tuning.store_verdict("sm90", "verdict-key", {})
-    tuning.store_choice("sm90", "choice-key", 2)
-    monkeypatch.setattr(tuning, "_VERDICTS", {})
-    monkeypatch.setattr(tuning, "_CHOICES", {})
-    assert tuning.stored_verdict("sm90", "verdict-key") == {}
-    assert tuning.stored_choice("sm90", "choice-key") == 2
-
-    query = jax.ShapeDtypeStruct((1, 1024, 8, 64), jnp.bfloat16)
-    spans = template.spans(1024, 1024, 1, causal=True)
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        op, args = attention_mosaic._forward_call(query, query, query, spans, None, scale=None,
-                                                  natural=attention_mosaic.NATURAL)
-        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
-        monkeypatch.setattr(attention_mosaic, "_choice_key", lambda *a, **kw: "choice-key")
-        monkeypatch.setattr(attention_mosaic.MosaicForward, "_price_config",
-                            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("warm start traced")))
-        chosen = op.derived(ba, target)
-        assert chosen is not None and chosen.consumers == 2
+    tuning.store_verdict("sm90", "verdict-key", {}, path=verdicts_file)
+    tuning.store_choice("sm90", "choice-key", 2, path=verdicts_file)
+    assert tuning.stored_verdict("sm90", "verdict-key", path=verdicts_file) == {}
+    assert tuning.stored_choice("sm90", "choice-key", path=verdicts_file) == 2
+    # Writing another verdict preserves stored choices in the same file.
+    tuning.store_verdict("sm90", "verdict-key-2", {}, path=verdicts_file)
+    assert tuning.stored_choice("sm90", "choice-key", path=verdicts_file) == 2

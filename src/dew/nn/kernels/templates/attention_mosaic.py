@@ -16,6 +16,7 @@ from typing import ClassVar, Literal, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import tokamax
 from jax._src.pallas import mpmd
 
@@ -184,14 +185,19 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 
+def _abstract(value):
+    """`value`'s arrays as `ShapeDtypeStruct`s, leaving non-array leaves unchanged."""
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+                        if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
+
+
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                              tiles: Callable[[int, int, int], Config],
                                              fits: Callable[[Config], bool], *,
-                                             overlapped: bool,
-                                             walks: Callable[[mosaic.Family, object, int], Sequence[int]],
-                                             least_walked: Callable[[int], int] = lambda rows: 1,
+                                             overlapped: bool, walks: Callable = extents,
                                              rows: int | None = None,
-                                             least_held: Callable[[mosaic.Family, object, int], int] = query_rows,
+                                             least_walked: Callable[[int], int] = lambda rows: 1,
+                                             least_held: Callable[..., int] = query_rows,
                                              choose: Callable[[list[Config]], Config] | None = None
                                              ) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7): its
@@ -829,7 +835,7 @@ class MosaicForward(_Mainloop[Tiles]):
         through `tuning.lowered_once` under `report.launching` so the winning count's trace is held."""
         names = ("query", "key", "value", "start", "end", "query_ids", "key_ids", "score_params",
                  "output_params", "initial", "drop", "table", "sources", "scales", "query_params")
-        operands = tuple(tuning._shapes(ba.arguments[name]) for name in names)
+        operands = tuple(_abstract(ba.arguments[name]) for name in names)
         residuals = ba.arguments["residuals"]
         identity = report._identity(self, ba)
 
