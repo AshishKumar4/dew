@@ -162,14 +162,3 @@ CASES = [(code, *case) for table in (ROW_1878_LINTS, BANNED_ASSERTION_LINTS, IR_
 @pytest.mark.parametrize(("code", "files", "where", "lines"), CASES)
 def test_each_lint_reports_its_cases_and_spares_the_rest(code, files, where, lines, tmp_path):
     assert linted(tmp_path, files) == [(where, line, code) for line in lines]
-
-
-def test_a_module_that_marks_itself_the_gates_compares_floats_within_a_bound_and_no_list_names_it(tmp_path):
-    """SLOP020 spares a module whose top level binds the accuracy gate's mark (`__accuracy_gate__`), as the
-    gate's own modules and tests state it, and reports the same comparison in a product test: a new gate
-    test is the gate's as it is written, no hand-kept list of names to join (row 5377)."""
-    comparison = ("import numpy as np\n"
-                  "def test_close():\n    np.testing.assert_allclose(np.ones(2), np.ones(2), rtol=1e-6)\n")
-    found = linted(tmp_path, {"tests/test_new_gate.py": comparison + "__accuracy_gate__ = True\n",
-                              "tests/test_product.py": comparison})
-    assert {path for path, _, code in found if code == "SLOP020"} == {"tests/test_product.py"}

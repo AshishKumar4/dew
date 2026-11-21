@@ -11,9 +11,6 @@ import numpy as np
 from dew import parity as gate
 from dew._accuracy import distance, within
 
-__accuracy_gate__ = True
-"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
-
 
 def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tuple[str, float, str]]:
     """Where Dew's rows are further from float64 than gate.ROW_FACTOR times the
