@@ -883,6 +883,21 @@ class ProgramModule(NamedTuple):
     more than a tile (`Objective.unfuse_head`)."""
 
 
+def head_tile_of(objective: Objective) -> tuple[int, int] | None:
+    """The tile the vocabulary head the objective trains computes its
+    backward in (`ProgramModule.head_tile`), or None for a head that keeps
+    its whole logits or an objective that trains no head: what `tile_head`
+    moves and `restore_head` sets."""
+    return next((entry.head_tile for entry in objective.program_key()
+                 if entry.trained and entry.head_tile is not None), None)
+
+
+def head_fused_of(objective: Objective) -> bool:
+    """Whether the vocabulary head the objective trains takes its gradient in the forward
+    (`ProgramModule.head_fused`): what `unfuse_head` moves and `restore_head` sets."""
+    return any(entry.head_fused for entry in objective.program_key() if entry.trained)
+
+
 def _ruled_tangent(primals, tangents, value) -> jax.Array:
     """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent; a
     symbolic zero adds nothing. The value's side is a stopped gradient's, so no input's cotangent leaves
@@ -1841,6 +1856,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         logits raise `TypeError`.
         """
         raise TypeError(f"{type(self).__name__} scores no token logits")
+
+    @property
+    def predicts_by_head(self) -> bool:
+        """Whether its prediction states the final states its logits are its head's of and that head
+        (`Prediction.final`, `Prediction.head`), so a caller reading every column reads them a slice at a
+        time; none for an objective whose scores go through more than its head."""
+        return False
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
         """Return scoring artifacts for every row of the global batch that all processes evaluate.

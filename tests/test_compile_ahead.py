@@ -951,8 +951,9 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
     head's workspace makes the offloaded sibling at two need more than 'full' at one, so only the tiled
     head has a room where 'full' takes two microbatches and the sibling fits."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
+    from dew.objectives.base import head_fused_of, head_tile_of
     from dew.training.ahead import compile_ahead
-    from dew.training.memory import head_fused_of, head_tile_of, recompute_record
+    from dew.training.memory import recompute_record
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     capacity = 2**30
@@ -991,8 +992,9 @@ def test_a_fused_tiled_heads_plan_compiled_ahead_with_its_frontier_restores_the_
     remat, its head's tile and whether it is fused, the trainer's plan the one compiled ahead: in room for
     what two microbatches need with the head tiled at 'full' and less than one needs (each measured,
     `need_ahead`), where the plan's compile at one did not fit."""
+    from dew.objectives.base import head_fused_of, head_tile_of
     from dew.training.ahead import compile_ahead
-    from dew.training.memory import head_fused_of, head_tile_of, recompute_record
+    from dew.training.memory import recompute_record
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     one, room = (need_ahead("sm90", split=split, remat="full", tiled=True) for split in (1, 2))
