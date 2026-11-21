@@ -322,7 +322,7 @@ source .venv/bin/activate
 sh tools/install_environment.sh cpu   # cuda12 or cuda13 on a GPU host
 ```
 
-The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, every file with its sha256, and CI, the GPU nodes and the kernel lab's GPU jobs all install the lock for their host (`tools/install_environment.sh`, which requires each hash, so a file whose bytes changed under its name and version fails to install by name), with the same JAX build CI uses: `constraints.txt` names Dew's JAX build, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, every file with its sha256, and CI, the GPU nodes and the GPU fleet's jobs all install the lock for their host (`tools/install_environment.sh`, which requires each hash, so a file whose bytes changed under its name and version fails to install by name), with the same JAX build CI uses: `constraints.txt` names Dew's JAX build, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
 
 ## Bumping JAX
 

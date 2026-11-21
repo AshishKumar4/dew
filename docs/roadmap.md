@@ -43,6 +43,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
 - Grouped scores' gradient cancellation untested. [10551]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
+- Emission prices every operation Mosaic GPU can approximate (emission.APPROXIMATED: exp, exp2, log, log2, log1p, tanh, logistic, sin, cos, sqrt, rsqrt, pow) as…. [10824]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - Exact on every path, every edge and every derivative order. [2656]
@@ -51,7 +52,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - The interpreter (Pallas Mosaic GPU interpret mode, the CPU suite's) takes about 8 times as long a draw for a tcgen05 (sm100) recurrence launch as for its wgmma…. [6521]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
-- The portable recurrence gradient (tests/test_recurrence_stability.py's scalar-delta site at aligned keys, chunk_on 'xla', as tests/test_gpu_compile_ahead.py's…. [9762]
 
 ## Models and interop
 

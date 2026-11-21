@@ -187,8 +187,9 @@ type _Array = jax.Array | np.ndarray
 
 def _concatenated(leaves: Sequence[_Array]) -> _Array:
     """`leaves` concatenated on their last axis where they are: a compiled call's arrays in it, host
-    arrays on the host."""
-    if isinstance(leaves[0], np.ndarray):
+    arrays on the host, and a group of host and device members on the host, its device members read
+    there, so the packed leaf is placed once where its caller places it (row 10822)."""
+    if any(isinstance(leaf, np.ndarray) for leaf in leaves):
         return np.concatenate([np.asarray(leaf) for leaf in leaves], axis=-1)
     return jnp.concatenate(leaves, axis=-1)
 

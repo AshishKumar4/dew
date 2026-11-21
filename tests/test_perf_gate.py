@@ -211,7 +211,7 @@ def test_a_step_reports_its_mfu_from_the_same_invocation_and_a_lower_one_regress
 
 
 def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmeasured_off_it(gate):
-    """The fine-tune rows time a 4B decoder's full AdamW step on Hopper, an H100 or the GH200 dew-ops
+    """The fine-tune rows time a 4B decoder's full AdamW step on Hopper, an H100 or the GH200 the fleet
     measures Hopper on, and a 1.7B one's on an A100: each case is one benchmark_step reads, on a declared
     field of the decoder, stepping the optimizer it names, and off its devices its four rows are not
     measured, never compared against another's, nor failing a claim, which requires the references alone."""
@@ -518,7 +518,7 @@ def test_the_servers_compiles_are_measured_cold_in_every_arm_and_round(gate, tmp
 @pytest.mark.parametrize(("kind", "gib"), [("h100", 80), ("gh200", 96)])
 def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path, monkeypatch, kind, gib):
     """`compile` plans and compiles each of a kind's steps ahead of its run for one compile-only GPU of the
-    kind's generation and memory (Hopper's as an H100 or the GH200 dew-ops measures Hopper on), its
+    kind's generation and memory (Hopper's as an H100 or the GH200 the fleet measures Hopper on), its
     attention XLA's in every arm and named so in the row (ledger 4616: the GPU's attention route lowers on
     no compile-only GPU), in each tree's environment of the lock the GPU run used, three arms a round in an
     order kept, every sample a process of its own with an empty compile cache: a head whose
@@ -800,6 +800,18 @@ def test_a_runs_step_rows_read_the_steps_their_trees_prepare_compiled_ahead(gate
     for tree, command in stepped:
         handed = command[command.index("--ahead") + 1] if "--ahead" in command else None
         assert handed == (str(tmp_path / "ahead" / "head") if tree == "head" else None), (tree, command)
+
+
+def test_a_filter_chooses_the_same_step_probes_to_compile_ahead_as_to_run(gate):
+    """`--only` chooses a step probe by any of its rows' names (its step's, its peak's, its MFU's), the same
+    for the prepare that compiles it ahead as for the run that measures it (`chosen`): a filter on an MFU
+    row compiled no step and the run then found its handed directory without it (row 10796's review)."""
+    stepped = [probe for probe in gate.PROBES if probe.tool == "benchmark_step.py"
+               and probe.rows[0].name in gate.STEP_CASES]
+    assert stepped and all(gate.chosen(probe, ["mfu step"]) for probe in stepped)
+    assert [probe.rows[0].name for probe in stepped if gate.chosen(probe, ["peak step lm-dense"])] == [
+        "step lm-dense 4x1024"]
+    assert all(gate.chosen(probe, None) for probe in gate.PROBES)
 
 
 def test_ahead_fails_where_a_trees_compile_ahead_fails_and_asks_none_of_a_tree_that_has_none(

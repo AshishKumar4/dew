@@ -352,3 +352,21 @@ def test_a_parts_prepare_chooses_kernels_as_its_nodes_gpu(tmp_path, monkeypatch)
     with prepared(tmp_path / "store", stamp="a", target=node_target()):
         target = gpu_target()
         assert (device_generation(), target.generation, target.multiprocessors) == ("sm90", "sm90", 132)
+
+
+def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), the numerics flows' cells placed on the host's CPU, a
+    projection and the norm seams, are passed by, none recorded deferred: the prepare chooses every kernel as
+    on its GPU, so their CPU programs took Triton kernels that do not lower on a CPU, raised, and named their
+    tests unprepared (row 10764)."""
+    import model_flows
+    import test_gpu_numerics
+    import tier_wire
+    from generation_support import node_target
+    from truths_ahead import DEFERRED, prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        run_cells([*test_gpu_numerics.projection_cells(), *test_gpu_numerics.seams_cells(None)])
+    assert not (tmp_path / "store" / DEFERRED).exists()

@@ -1109,9 +1109,9 @@ class AheadTarget:
     where it is not the generation's own (`built_target`): what the step's launches derive for and a GPU
     loading it must have (`BuildTarget`). A TPU topology states its own."""
     topology: str | None = None
-    """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole:
-    their memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A dew-ops
-    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
+    """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole: their
+    memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A GPU node's prepare
+    is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
     phases: tuple[int, ...] = ()
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the

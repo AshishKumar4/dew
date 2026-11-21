@@ -661,7 +661,7 @@ def main(arguments: list[str]) -> int:
     """`python tests/remote_cache.py prefetch TOPOLOGY ITEM...`: a GPU job's prepare, on its node's CPU,
     fetching the bundles of each of its run's items (a test file, or a group of one as CI names it,
     `<file>#G/N`) into the cache directory its run reads (`dew._cache.default_compilation_cache_dir`), keyed
-    for the node's GPU as its serialized TOPOLOGY names it (dew-ops' session hands a prepare its node's,
+    for the node's GPU as its serialized TOPOLOGY names it (a GPU node's session hands a prepare its node's,
     $DEW_NODE_TOPOLOGY)."""
     command, topology, *items = arguments
     if command != "prefetch" or not requested():

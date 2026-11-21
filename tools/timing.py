@@ -458,9 +458,9 @@ and Nsight Compute's replays (M-EM-38's on an A100, 79-85 s each; LF-HSNCU's and
 
 
 def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
-    """One measurement window a GPU kind, as `dewops.node` takes them (`node submit`): each a timing
+    """One measurement window a GPU kind, as the GPU fleet takes them (its `node submit`): each a timing
     (`"kind"`), or a profile where any of its cases profiles, which a node runs with its GPU's performance
-    counters open (`dewops.node.dispatch`'s `"counters"`; row 4557: a profiling window submitted as a
+    counters open (the fleet's `"counters"` field; row 4557: a profiling window submitted as a
     timing ran Nsight Compute with them closed), packed beside the node's other jobs and alone on its GPU
     around its rounds, at `ref`, running this harness over that kind's manifest (beside the jobs' file,
     which stages it as $SESSION/extra/<its name>), its minutes a minute for each 60 timed calls and

@@ -1069,13 +1069,11 @@ class _Draws:
     """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
     on the same example, each over its size (`_example_worst_rows`), else None."""
     shares: np.ndarray | None = None
-    """The share of each seed's worst row's squared error its largest element carries, Dew's and the
-    reference's (seed by leaf by arm, as `worst`), zero where no row is sized and NaN where it is unknown (a
-    recording's summary keeps no row's elements, a row of float64 zero a live reference measured); None
-    where none was kept (`held_shares`)."""
-    collinear: np.ndarray | None = None
-    """The share of each seed's worst row's squared error along its truth row (`_collinear_share`), Dew's and
-    the reference's (seed by leaf by arm, as `shares`), NaN where unknown."""
+    """Each seed's worst row's shares of its squared error, Dew's and the reference's, `[seed, leaf, kind,
+    arm]` (`SHARE_KINDS`: its largest element's, `ELEMENT`, and its share along its truth row, `COLLINEAR`,
+    `_collinear_share`), zero where no row is sized and NaN where one is unknown (a recording's summary keeps
+    no row's elements, a row of float64 zero a live reference measured); None where none was kept
+    (`held_shares`)."""
 
     def factor(self, index: int) -> float:
         """The worst-row rule's factor for leaf `index` (its maximum's, `_judgement`): its rows' width's
@@ -1084,9 +1082,9 @@ class _Draws:
         value rules alike. A share unknown keeps the width's."""
         width = self.widths[index]
         if width > 2:
-            shares = self.held_shares()
+            shares = self.held_shares()[:, index, ELEMENT]
             mine, theirs = (int(np.argmax(self.worst[:, index, arm])) for arm in (0, 1))
-            if shares[mine, index, 0] > RULED_SHARE and shares[theirs, index, 1] > RULED_SHARE:
+            if shares[mine, 0] > RULED_SHARE and shares[theirs, 1] > RULED_SHARE:
                 return row_factor(1)
         return row_factor(width)
 
@@ -1096,30 +1094,27 @@ class _Draws:
         its error along its truth row (row 9780); a share unknown is not. Read where a site declares its
         weighed check alone (`_judgement`'s `deferring`); `factor` keeps the element's share."""
         mine = int(np.argmax(self.worst[:, index, 0]))
-        return bool(self.held_shares()[mine, index, 0] > RULED_SHARE
-                    or self.held_collinear()[mine, index, 0] > RULED_SHARE)
+        return bool((self.held_shares()[mine, index, :, 0] > RULED_SHARE).any())
 
     def held_shares(self) -> np.ndarray:
         """`shares`, every cell unknown (NaN) where none was kept, so draws join and pick per cell."""
-        return np.full(self.worst.shape, np.nan) if self.shares is None else self.shares
-
-    def held_collinear(self) -> np.ndarray:
-        """`collinear`, every cell unknown (NaN) where none was kept, so draws join and pick per cell."""
-        return np.full(self.worst.shape, np.nan) if self.collinear is None else self.collinear
+        if self.shares is not None:
+            return self.shares
+        seeds, leaves, arms = self.worst.shape
+        return np.full((seeds, leaves, len(SHARE_KINDS), arms), np.nan)
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
                                    if getattr(self, field) is not None and getattr(other, field) is not None
                                    else None) for field in ("examples", "example_rows"))
         shares = np.concatenate([self.held_shares(), other.held_shares()])
-        collinear = np.concatenate([self.held_collinear(), other.held_collinear()])
         return _Draws(self.names, np.concatenate([self.mine, other.mine]),
                       np.concatenate([self.theirs, other.theirs]), np.concatenate([self.worst, other.worst]),
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
-                      self.widths, examples, example_rows, shares, collinear)
+                      self.widths, examples, example_rows, shares)
 
     def __post_init__(self) -> None:
-        optional = (self.examples, self.example_rows, self.shares, self.collinear)
+        optional = (self.examples, self.example_rows, self.shares)
         held = {len(self.mine), len(self.theirs), len(self.worst), len(self.zero_rows), len(self.finite),
                 *(len(field) for field in optional if field is not None)}
         if len(held) > 1:
@@ -1135,8 +1130,7 @@ class _Draws:
                                   for field in ("examples", "example_rows"))
         return _Draws(self.names, self.mine[cut], self.theirs[cut], self.worst[cut], self.zero_rows[cut],
                       self.finite[cut], self.widths, examples, example_rows,
-                      None if self.shares is None else self.shares[cut],
-                      None if self.collinear is None else self.collinear[cut])
+                      None if self.shares is None else self.shares[cut])
 
     def of_examples(self, index: int) -> list[np.ndarray] | None:
         """Leaf `index`'s per-example log ratios a seed, or None where the site stacks none or a seed's
@@ -1185,9 +1179,7 @@ class _Draws:
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
         # A picked cell's worst row is the library arm's, and so is its share.
         shares = self.held_shares().copy()
-        shares[..., 1] = np.where(pick, library.held_shares()[..., 1], shares[..., 1])
-        collinear = self.held_collinear().copy()
-        collinear[..., 1] = np.where(pick, library.held_collinear()[..., 1], collinear[..., 1])
+        shares[..., 1] = np.where(pick[:, :, None], library.held_shares()[..., 1], shares[..., 1])
 
         def uncovered(field: str):
             held = getattr(self, field)
@@ -1196,7 +1188,7 @@ class _Draws:
 
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
                       self.finite & (library.finite | ~covered), self.widths,
-                      uncovered("examples"), uncovered("example_rows"), shares, collinear)
+                      uncovered("examples"), uncovered("example_rows"), shares)
 
 
 def example_mse(arm, truth) -> np.ndarray | None:
@@ -1320,16 +1312,20 @@ class Paired(NamedTuple):
     shares: np.ndarray
 
 
-SHARE_KINDS = ("element", "collinear")
-"""The kinds of a worst row's share of its squared error `Paired.shares` holds, in its order: its largest
-element's (`RecordedLeaf.share`) and its share along its truth row (`RecordedLeaf.collinear`, row 9780)."""
+SHARE_KINDS = ("share", "collinear")
+"""The kinds of a worst row's share of its squared error, each the `RecordedLeaf` field holding it, in the
+order `Paired.shares` and `_Draws.shares` hold them: its largest element's (`share`) and its share along its
+truth row (`collinear`, row 9780)."""
+
+ELEMENT, COLLINEAR = (SHARE_KINDS.index(kind) for kind in SHARE_KINDS)
+"""Each kind's place on a shares array's kind axis (`SHARE_KINDS`)."""
 
 
 def _shares_of(mine: RecordedLeaf | None, theirs: RecordedLeaf | None) -> np.ndarray:
     """`Paired.shares` from each arm's summary (`SHARE_KINDS` of it), NaN for an arm passed as None or a
     share it does not know."""
     return np.asarray([[np.nan if leaf is None or getattr(leaf, kind) is None else getattr(leaf, kind)
-                        for leaf in (mine, theirs)] for kind in ("share", "collinear")], np.float64)
+                        for leaf in (mine, theirs)] for kind in SHARE_KINDS], np.float64)
 
 
 def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, their_terms=None,
@@ -1862,11 +1858,9 @@ def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[P
 
     worst = np.asarray([[(entry.worst, entry.their_worst) for entry in row]
                         for row in evidence]).reshape(count, -1, 2)
-    # Each seed's leaves' shares, `[seed, leaf, arm]` a kind (`Paired.shares`' `[kind, arm]`).
     shares = np.asarray(each("shares"), np.float64).reshape(count, -1, len(SHARE_KINDS), 2)
     return _Draws(names, np.asarray(each("mse")), np.asarray(each("their_mse")), worst, each("zero_rows"),
-                  np.asarray(each("finite")), widths, examples, example_rows, shares[:, :, 0],
-                  shares[:, :, 1])
+                  np.asarray(each("finite")), widths, examples, example_rows, shares)
 
 
 
