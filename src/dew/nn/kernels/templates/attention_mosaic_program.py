@@ -1939,10 +1939,10 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if (not family.operands_in_registers and not family.places_on_role and not scopes_products(family)
             and value_width > 128):
         # Wide (>128) register-home Wgmma forward holds extra accumulator/staging pressure across the
-        # softmax step (spilling 16-32B on cuda12 ptxas at consumers=2's 232-reg cap); pricing 64 f32 cols
-        # in training and 96 in inference shifts consumers=2 past its 232-reg cap (240 regs) while
+        # softmax step (spilling 16-32B on cuda12 ptxas at consumers=2's 240-reg cap); pricing 64 f32 cols
+        # in training and 112 in inference shifts consumers=2 past its 240-reg cap (248 regs) while
         # consumers=1's 255 regs fits spill-free with 3 TMA stages (rows 5272, 10890).
-        step.append((block_q, 64 if residuals else 96, jnp.float32))
+        step.append((block_q, 64 if residuals else 112, jnp.float32))
     # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
