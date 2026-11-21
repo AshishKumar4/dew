@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from arm_arithmetic import float64_held
+from arm_arithmetic import float64_held, unrewritten
 from flax import linen as nn
 from model_support import flat_tree, largest_difference, stepped_decode, steps_from
 from reference_error import (
@@ -32,6 +32,7 @@ from reference_error import (
     widened,
     without_ynn,
 )
+from rounding_bound import rounding_scale
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -202,6 +203,13 @@ their inputs from their float64 values over 48 draws of both parameter sets, 4.9
 that selects otherwise, Gemma 3n's gaussian top-k, admits `selection_margins.MARGIN`: a unit every run
 keeps just above its cutoff holds an activation, its gate less the cutoff, that is mostly float32's
 rounding of either, so a draw near that tie measures which run rounded it worse."""
+SCAN_CONDITIONING = {"gemma3n": 32}
+"""Each shape's weighed check's declared seeds (`assert_as_exact`'s `conditioning`, sized by
+`seeds_for(..., conditioning=True)` on armada): Gemma 3n's, whose gaussian top-k keeps a unit active on one
+token just above its cutoff on some admitted draws, so a block's down projection gradient row moves whole
+with each ULP of rounding upstream of it (row 9780): such a row, a scalar multiple of its truth, is deferred
+to the weighed check (`dew.parity`'s collinear deferral), judged per site."""
+
 SCAN_SEEDS = {"gemma4": 64, "gemma3n": 128, "deepseek": 8, "deepseek_widths": 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` paired with the scanned
 stack, whose arms share every upstream rounding (the same weights, rows and arithmetic, the DeepSeek
@@ -266,10 +274,10 @@ class ScanCase:
         else:
             self.draw = drawn
 
-    def measured(self, model, forward, trained):
+    def computed(self, model, forward, trained):
         """The logits under `forward`, and the loss with its gradients under `trained` and the draw's
-        cotangent (as `with_gradients` gives them), compiled as both arms of a check between Dew's paths
-        are (`without_ynn`)."""
+        cotangent (as `with_gradients` gives them): the program both arms run (`measured`) and the plain
+        loop's rounding scale traces (`weighed`)."""
         def run(ids, cotangent):
             def loss(params):
                 logits = model.apply({**trained, "params": params}, ids)
@@ -279,7 +287,30 @@ class ScanCase:
             value, pull = jax.vjp(loss, trained["params"])
             gradients, = pull(cotangent)
             return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
-        return without_ynn(run)
+        return run
+
+    def measured(self, model, forward, trained):
+        """`computed`'s program compiled as both arms of a check between Dew's paths are (`without_ynn`)."""
+        return without_ynn(self.computed(model, forward, trained))
+
+    def sites(self) -> tuple[str, ...]:
+        """The sites a draw's outputs are judged at apart (`site_of`): the logits and the loss, and each
+        top-level parameter's gradients, a block's (`layers_i`) or the embedding's."""
+        shapes = jax.eval_shape(self.computed(self.plain, self.variables, self.training), *self.drawn(0))
+        return ("logits and loss", *sorted(shapes["gradients"]))
+
+    def weighed(self, site: str):
+        """The plain loop's rounding scale of `site`'s outputs at a draw (`rounding_bound.rounding_scale`),
+        which its weighed check reads (`assert_as_exact`'s `conditioning_scale`): the plain arm's own
+        program, its other outputs left unheld, replayed unrewritten. A site's walk alone: one over every
+        output held them all, past an armada worker's memory (row 9780), and a site pays it only where its
+        unweighted check stays undecided."""
+        run = self.computed(self.plain, self.variables, self.training)
+        written = unrewritten(lambda ids, cotangent: site_of(run(ids, cotangent), site))
+
+        def scale(inputs, seed):
+            return rounding_scale(written, *inputs, seed=seed)[1]
+        return scale
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
@@ -297,17 +328,53 @@ class ScanCase:
         return arm("scanned"), arm("plain"), truth
 
 
+def site_of(outputs, site: str):
+    """`site`'s part of a draw's outputs (`ScanCase.sites`): the logits and the loss, or one top-level
+    parameter's gradients."""
+    if site == "logits and loss":
+        return {"logits": outputs["logits"], "loss": outputs["loss"]}
+    return outputs["gradients"][site]
+
+
+def _held(arm):
+    """`arm`, a host arm run on a draw's concrete inputs, run once a draw: the sites judged apart, each over
+    every draw before the next site, read one run of it a draw (`site_of`), every draw's kept (a task's
+    draws of the tiny stack's outputs)."""
+    runs: dict = {}
+
+    def run(ids, cotangent):
+        key = (np.asarray(ids).tobytes(), float(cotangent))
+        if key not in runs:
+            runs[key] = arm(ids, cotangent)
+        return runs[key]
+    return run
+
+
 def scans_as_the_loop(shape: str) -> None:
     """The scanned stack's logits, loss and gradients on a stack deep enough to scan are as near a float64
     run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):
     scanning reorders the loop's fp32 sums where an accelerator fuses a scanned layer apart from its
     neighbours, and is otherwise the same computation. A shape that selects discretely draws rows whose
     selections clear its margin (`SCAN_MARGIN`), the precondition on which check 1 compares one
-    computation."""
+    computation. A shape with a weighed check (`SCAN_CONDITIONING`) is judged a site at a time
+    (`ScanCase.sites`): its logits and loss, and each block's gradients, each sizing and deciding apart,
+    weighed by the plain loop's own rounding of that site alone (`ScanCase.weighed`) where it stays
+    undecided."""
     case = ScanCase(shape)
     scanned, plain, truth = case.arms()
-    assert_as_exact(scanned, plain, case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
-                    truth_fn=truth)
+    conditioning = SCAN_CONDITIONING.get(shape)
+    if conditioning is None:
+        assert_as_exact(scanned, plain, case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
+                        truth_fn=truth)
+        return
+    held = [_held(arm) for arm in (scanned, plain, truth)]
+    for site in case.sites():
+        scanned_site, plain_site, truth_site = (
+            as_given(lambda ids, cotangent, run=run, site=site: site_of(run(ids, cotangent), site))
+            for run in held)
+        assert_as_exact(scanned_site, plain_site, case.draw, f"{shape} scanned stack, {site}",
+                        seeds=SCAN_SEEDS[shape], truth_fn=truth_site, conditioning=conditioning,
+                        conditioning_scale=case.weighed(site))
 
 
 @pytest.mark.parametrize("shape", sorted(set(SHAPES) - {"gemma3n"}))
@@ -317,7 +384,7 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     scans_as_the_loop(shape)
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=24)
+@pytest.mark.check1_shards(seeds=128, per_task=24, conditioning=32, conditioning_per_task=8)
 def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
     """`scans_as_the_loop` over Gemma 3n's shape, its 128 seeds and their redraws drawn by CI's map tasks
     (`check1_shards`), 24 a task: tasks of 32 took 79 to 115 s on armada's 25/17 workers (f1c0868b8),
