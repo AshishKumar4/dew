@@ -9,6 +9,7 @@ models' layout (`dew.nn.sharding`) constrains and maps their arrays by these, an
 from __future__ import annotations
 
 import math
+import weakref
 
 import jax
 from flax import linen as nn
@@ -241,13 +242,20 @@ __all__ = ["BATCH_AXES", "DATA_AXIS", "DEFAULT_RULES", "DILOCO_AXIS", "EXPERT_AX
            "MeshAxes", "axis_rules", "batch_axes", "logical_spec", "mesh_axes", "row_axes"]
 
 
-HELD_APART: set[jax.sharding.Mesh] = set()
-"""The meshes whose arrays a checkpoint holds on part of a pool (`held_apart`, `dew.checkpoints.submesh`)."""
+_HELD_APART: weakref.WeakValueDictionary[int, jax.Array] = weakref.WeakValueDictionary()
+"""The arrays a checkpoint holds on part of a pool, by identity, each as long as it lives (`held_apart`)."""
 
 
-def held_apart(mesh: jax.sharding.Mesh) -> jax.sharding.Mesh:
-    """`mesh`, a pipeline stage's (`dew.training.stages.stage_mesh`), named one whose arrays a checkpoint
-    holds on part of the pool, as every process names it; any other array on part of a pool is refused as
-    Orbax refuses a `pmap`'s host-local one."""
-    HELD_APART.add(mesh)
-    return mesh
+def held_apart[T](tree: T) -> T:
+    """`tree`, a pipeline's rows as a checkpoint holds them (`dew.training.stages.StageLocal.saved`), each of
+    its arrays named one a checkpoint holds on part of the pool (`dew.checkpoints.submesh`); any other array
+    on part of a pool, a `pmap`'s host-local output above all, is refused as Orbax refuses it."""
+    for leaf in jax.tree.leaves(tree):
+        if isinstance(leaf, jax.Array):
+            _HELD_APART[id(leaf)] = leaf
+    return tree
+
+
+def is_held_apart(value: jax.Array) -> bool:
+    """Whether `value` is an array `held_apart` named, itself and not another at its address."""
+    return _HELD_APART.get(id(value)) is value

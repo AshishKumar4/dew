@@ -785,6 +785,8 @@ def test_a_pipeline_whose_stages_are_each_one_processs_checkpoints_and_resumes(t
         {"scalar": {"shape": [], "held": []}, "vector": {"shape": [4], "held": [[0.0, 1.0, 2.0, 3.0]]}},
         {"scalar": {"shape": [], "held": [3.5]}, "vector": {"shape": [4], "held": []}}], pool
     assert [report["refused"] for report in pool] == [True, True], pool
+    # A value each process puts on its own stage's devices under one name, no checkpoint's row, is refused.
+    assert [report["stray_refused"] for report in pool] == [True, True], pool
     # The stepped step and the persistent tier's latest after each run: the first ran on the local tier
     # alone, the second resumed from it, the third from the persistent tier's step 2.
     assert [report["steps"] for report in pool] == [[[1, None], [2, 2], [3, 2]]] * 2, pool

@@ -56,7 +56,7 @@ def mode_stage_save(args) -> dict:
     # persistent tier holds; then that resumed from the persistent tier alone to step 3, which it does not.
     steps = [run(1, resume="never"), run(2), run(3, local=False)]
     return {"process_index": jax.process_index(), "finite": read, "steps": steps, "handled": staged_values,
-            "refused": refused}
+            "refused": refused, "stray_refused": _stray(mesh.build(paired), args.run_dir)}
 
 
 def _handled(mesh, directory) -> tuple[dict, bool]:
@@ -70,15 +70,16 @@ def _handled(mesh, directory) -> tuple[dict, bool]:
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.checkpoints import _handler
+    from dew.mesh import held_apart
     from dew.training.stages import stage_mesh
 
     placed = {"scalar": NamedSharding(stage_mesh(mesh, 1), P()),
               "vector": NamedSharding(stage_mesh(mesh, 0), P())}
     values = {"scalar": np.float32(3.5), "vector": np.arange(4, dtype=np.float32)}
-    arrays = {name: jax.make_array_from_callback(np.shape(values[name]), placed[name],
-                                                 lambda index, name=name: np.asarray(values[name])[index],
-                                                 dtype=np.float32)
-              for name in values}
+    # Made as a pipeline's checkpoint makes its rows (`StageLocal.saved`, `held_apart`).
+    arrays = held_apart({name: jax.make_array_from_callback(
+        np.shape(values[name]), placed[name], lambda index, name=name: np.asarray(values[name])[index],
+        dtype=np.float32) for name in values})
     with ocp.Checkpointer(_handler()) as checkpointer:
         checkpointer.save(f"{directory}/handled", arrays)
         restored = checkpointer.restore(f"{directory}/handled", restore_args={
@@ -94,6 +95,28 @@ def _handled(mesh, directory) -> tuple[dict, bool]:
     except ValueError:
         refused = True
     return {name: {"shape": list(restored[name].shape), "held": held[name]} for name in held}, refused
+
+
+def _stray(mesh, directory) -> bool:
+    """Whether a value each process puts on its own stage's devices under one name, after a pipeline's
+    checkpoints wrote rows on those very devices, is refused: no checkpoint made it (row 10780)."""
+    import jax
+    import numpy as np
+    import orbax.checkpoint as ocp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.checkpoints import _handler
+    from dew.training.stages import stage_mesh
+
+    own = NamedSharding(stage_mesh(mesh, jax.process_index()), P())
+    value = np.full((2,), jax.process_index(), np.float32)
+    stray = jax.make_array_from_callback((2,), own, lambda index: value[index], dtype=np.float32)
+    try:
+        with ocp.Checkpointer(_handler()) as checkpointer:
+            checkpointer.save(f"{directory}/stray", {"x": stray})
+    except ValueError:
+        return True
+    return False
 
 
 MODES = {"stage_save": mode_stage_save}

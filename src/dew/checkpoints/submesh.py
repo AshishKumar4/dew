@@ -1,17 +1,19 @@
 """Orbax's array handler for a pool whose arrays live on part of it: a pipeline stage's rows, each on its own
-stage's devices (`dew.training.stages.StageLocal.saved`), which a stage of one process's devices holds whole.
+stage's devices (`dew.training.stages.StageLocal.saved`), which a stage of one process's devices holds
+whole.
 
-Orbax 0.12.7 refuses such an array as a `pmap`'s host-local one (`ArrayHandler.serialize`), takes its first
-addressable shard where a process holds none (`replica_slices.get_replica_slices`), and makes it on restore
-without the dtype a process that holds none of it must state (`serialization._read_and_create_array`). Here
-each array on a strict part of the pool (`apart`) is written by the processes that hold its shards, its
-metadata by the first of them, the others writing nothing of it, and read back by them, the others making it
-with no shard; every other array is Orbax's own. The files are Orbax's: each such row its own array, read by
-any topology as the stages wrote it (docs/design/training.md, checkpoints). Only an array on a stage's mesh
-(`dew.mesh.held_apart`, which `dew.training.stages.stage_mesh` names of every mesh it makes, alike on every
-process) is written so; any other array on part of the pool, a `pmap`'s host-local output on each
-process's own devices under one name above all, is still refused as Orbax refuses it, with no round
-between the processes (a local tier's saves are each process's own)."""
+Orbax 0.12.7 refuses such an array as a `pmap`'s host-local one (`ArrayHandler.serialize`), takes its
+first addressable shard where a process holds none (`replica_slices.get_replica_slices`), and makes it on
+restore without the dtype a process that holds none of it must state
+(`serialization._read_and_create_array`). Here each array on a strict part of the pool (`apart`) is
+written by the processes that hold its shards, its metadata by the first of them, the others writing
+nothing of it, and read back by them, the others making it with no shard; every other array is Orbax's
+own. The files are Orbax's: each such row its own array, read by any topology as the stages wrote it
+(docs/design/training.md, checkpoints). Only an array a pipeline's checkpoint made (`dew.mesh.held_apart`,
+which `dew.training.stages.StageLocal.saved` names of each row it makes, by the array itself) is written
+so; any other array on part of the pool, a `pmap`'s host-local output on each process's own devices under
+one name above all, is still refused as Orbax refuses it, with no round between the processes (a local
+tier's saves are each process's own)."""
 
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ from orbax.checkpoint._src.futures import future
 from orbax.checkpoint._src.path import async_path
 from orbax.checkpoint._src.serialization import jax_array_handlers as handlers, replica_slices
 
-from dew.mesh import HELD_APART
+from dew.mesh import is_held_apart
 
 
 def apart(value) -> bool:
@@ -52,7 +54,7 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
         for index, value in enumerate(values):
             # A stage's array alone: any other's on part of the pool, Orbax's own refusal (module docstring).
             (parted if apart(value) and isinstance(value.sharding, jax.sharding.NamedSharding)
-             and value.sharding.mesh in HELD_APART else whole).append(index)
+             and is_held_apart(value) else whole).append(index)
         futures = [] if not whole else list(await super().serialize(
             [values[index] for index in whole], [infos[index] for index in whole],
             [args[index] for index in whole]))
@@ -98,7 +100,11 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
         return futures
 
     async def deserialize(self, infos, args=None):
-        if args is None or not infos:
+        # Orbax's own read where every array is placed where this process holds part of it.
+        if args is None or not infos or all(
+                not isinstance(arg, ocp.ArrayRestoreArgs) or (isinstance(arg.sharding, jax.sharding.Sharding)
+                                                              and arg.sharding.addressable_devices)
+                for arg in args):
             return await super().deserialize(infos, args)
         # Each array's placement as Orbax resolves it, the step's own sharding file read where a restore
         # states none, so a row another stage holds is known before Orbax reads it.

@@ -106,9 +106,8 @@ def stage_mesh(mesh: Mesh, stage: int) -> Mesh:
     one stage's, whole."""
     if STAGE_AXIS not in mesh.axis_names:
         return mesh
-    # A checkpoint holds a stage's rows on its own devices, on part of a pool (`held_apart`).
-    return held_apart(Mesh(np.take(mesh.devices, [stage], axis=mesh.axis_names.index(STAGE_AXIS)),
-                           mesh.axis_names, axis_types=mesh.axis_types))
+    return Mesh(np.take(mesh.devices, [stage], axis=mesh.axis_names.index(STAGE_AXIS)), mesh.axis_names,
+                axis_types=mesh.axis_types)
 
 
 def _layer_rows(path, leaf: jax.Array, shape: tuple[int, ...]) -> list[jax.Array]:
@@ -393,7 +392,8 @@ class StageLocal:
                 rows.extend(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
                     math.prod(shape) // self.stages))(piece, stacked=len(shape)))
             return rows
-        return self.state(state, lambda tree: self.layered(tree, cut))
+        # Each row a checkpoint holds on its own stage's devices, on part of a pool (`held_apart`).
+        return held_apart(self.state(state, lambda tree: self.layered(tree, cut)))
 
     def restored(self, tree):
         """`saved`'s inverse of one of a state's trees, read onto `checkpointed`'s placement: each
