@@ -731,9 +731,10 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
     config and certifying the next in turn: its own certifications' refusals, or another caller's committed
     after its trace took the config (row 8603: another thread's drain left a program compiling at it). A
     relowering that launches a config refused before again (a derivation reading no refusal, a pin's) is its
-    compile's to read (`settled`). Every trace a compile point settles lowers through it: a program's own
+    compile's to read (`settled`). Every lowering a compile point settles lowers through it: a program's own
     (`options.OuterProgram`) and a step's planner's and fit check's (`planning.FitSearch.lowering`), whose
-    launches certified in turn took 64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324)."""
+    launches certified in turn took 64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324); a program's
+    trace alone certifies aside too (`OuterProgram.trace`)."""
     with certifying_aside() as aside:
         value = lower()
     settled_aside(aside)

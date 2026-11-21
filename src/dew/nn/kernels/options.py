@@ -982,7 +982,16 @@ class OuterProgram:
         return self.trace(*args, **kwargs).lower()
 
     def trace(self, *args, **kwargs) -> jax.stages.Traced:
-        return self._traced(self.jitted, args, kwargs)
+        """Its trace of a call, the launches the trace reaches certified aside (`report.certifying_aside`)
+        and settled as it ends: a start traces its programs (its initial state's, `drawn.traced_draw`) before
+        it lowers them, and certified there in turn they took the start's tracing thread (row 5324). A
+        launch the settling refused leaves its program to the lowering's relowering (`_lowered_aside`)."""
+        from dew.nn.kernels.templates import report
+
+        with report.certifying_aside() as aside:
+            traced = self._traced(self.jitted, args, kwargs)
+        report.settled_aside(aside)
+        return traced
 
     def key_of(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
