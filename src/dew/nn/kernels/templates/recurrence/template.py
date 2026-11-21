@@ -252,7 +252,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     `bound` its form proves, its solve at fp32's range where it proves none
     (`ranged`); a `rounded` call takes the run's fast forms' numbers (`recurrence_chunk.fast_rounding`,
     `chunk_forward.forward`). Where `recomputed`, its fast backward forms the forward's memories again rather
-    than keeping them (a remat rung recomputing 'delta_memory', `recurrence_chunk.RECOMPUTED`, resolved at its
+    than keeping them (a remat rung recomputing 'delta_memory', `residuals.RECOMPUTED`, resolved at its
     route). A `forked` call's documents (`recurrence_chunk.Chunk.loads`), `state` its table's given memories
     `[B, S', HV, Dk, Dv]`, are laid as a packed call's are (`forked_table`), each row's walk taking each
     document's memory up from the table at its first chunk (`chunk_forward.ForkedTable`): a forked row costs

@@ -93,7 +93,7 @@ from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS, Opened, cache_variables, kept, stated
 from dew.nn.precision import softplus
-from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS
+from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS, RECOMPUTED
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.quantization import (
@@ -113,7 +113,7 @@ CARRY = MEMORY_RESIDUALS[0]
 CHUNK = MEMORY_RESIDUALS[1]
 """The name of the state a chunk hands the next (`checkpoint_name`), for a remat policy to save
 (`dew.nn.residuals.RESIDUALS`), and of a chunk's own values, which a rung naming it recomputes from that
-state (`recurrence_chunk.RECOMPUTED`: the heaviest rung's, `decoder_block.recomputed_inside`)."""
+state (`residuals.RECOMPUTED`: the heaviest rung's, `decoder_block.recomputed_inside`)."""
 
 STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start", "memory_count"
 """The decode cache's variables: the network's fast parameters now, the momentum, the parameters at the
@@ -795,7 +795,7 @@ class InContextMemory(LinearProducts):
         # chunk's gradients and steps, as fast as the step that fits them runs (row 6577: recomputed always, a
         # Titans step that fit ran 31-41% slower).
         chunk = functools.partial(self._chunk, heads=heads)
-        if CHUNK in recurrence_chunk.RECOMPUTED.get():
+        if CHUNK in RECOMPUTED.get():
             chunk = jax.checkpoint(chunk, prevent_cse=False)
         _, reads = jax.lax.scan(chunk, carry, laid)
         reads = jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]

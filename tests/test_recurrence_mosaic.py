@@ -50,12 +50,13 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding, recomputed_memory
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
+from dew.nn.residuals import recomputed_memory, recomputing
 from tools import benchmark_recurrence
 
 pytestmark = pytest.mark.kernel
@@ -1158,12 +1159,11 @@ def test_a_launch_spilling_at_every_rung_refuses_the_tiles_that_plan_it_alike():
 
 
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
-    """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a refusal of
-    every tile of the run's training call's launch (its identity as its lowering for an H100 names it,
-    `report.traced`) reaches the route: a call naming the template is refused first for its launch (code
-    'launch'; its backward with it) where it was taken before. The route's bind is the run's launch, the
-    rung's flag resolved alike (`recurrence_chunk.recomputed_memory`); bound as kept, it judged another
-    launch than the run's (row 4133)."""
+    """Under the remat rung recomputing the delta rule's memory (`residuals.recomputing`), a refusal of every
+    tile of the run's training call's launch (its identity as an H100's lowering names it, `report.traced`)
+    reaches the route: a call naming the template is refused first for its launch (code 'launch'; its
+    backward with it) where it was taken before. The route binds the run's launch, the rung's flag resolved
+    alike (`residuals.recomputed_memory`); bound as kept, it judged another launch (row 4133)."""
     from dew.nn.kernels import recurrence_chunk
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.selection import KernelRefused
@@ -1182,7 +1182,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
 
     # The run's rounded products are its declaration's at the default precision (`rounds_products`; the
     # suite's lanes configure 'highest').
-    with (report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)),
+    with (report.refusals(), generation.assumed('sm90'), recomputing(('delta_memory',)),
           generation.chosen(gated_delta_rule='mosaic_gpu'), jax.default_matmul_precision('default')):
         target = template.Mosaic.launched()
         named()

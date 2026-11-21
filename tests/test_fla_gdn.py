@@ -840,7 +840,7 @@ three."""
 def test_a_remat_policy_changes_no_gradient(policy):
     """A block's remat policy over the port's named residuals (`residuals.RESIDUALS`): none,
     'all_but_delta_memory', which the block applies by tracing its layers recomputing that name
-    (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, and a policy saving the output,
+    (`residuals.recomputing`) rather than by a checkpoint policy, and a policy saving the output,
     decay and inverse. Each computes the gradients the layer computes without remat, on
     par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
     (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient. A GPU compiles
@@ -849,7 +849,7 @@ def test_a_remat_policy_changes_no_gradient(policy):
     inside the loss each arm runs (`row_names_port`), under check 1's own scope, which would hand an fp32
     call on to XLA."""
     from dew.nn.backbones.decoder_block import remat_policy
-    from dew.nn.kernels.recurrence_chunk import recomputing
+    from dew.nn.residuals import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
     initialize = jax.jit(lambda *args: nn.unbox(layer.init(*args)))

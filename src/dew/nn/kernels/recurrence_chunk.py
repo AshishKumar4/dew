@@ -21,8 +21,6 @@ of mamba_ssm's kernels (`dew.nn.kernels.mamba_ssd`) on such a GPU, or on a TPU's
 (`dew.nn.kernels.ssd`) (`SCAN`). `chunk` picks one per call and applies the hooks around it.
 """
 
-import contextlib
-import contextvars
 import dataclasses
 import functools
 import math
@@ -52,7 +50,7 @@ from dew.nn.precision import (
     l2norm,
     rounds_products,
 )
-from dew.nn.residuals import Residual
+from dew.nn.residuals import recomputed_memory
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, rows_spec, shard_shapes, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -1716,31 +1714,6 @@ def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, fo
             recomputed=recomputed_memory(), **options)
 
     return operands, specs, (four, P(four[0], four[2], None, None)), bound
-
-
-RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
-"""The residuals a decoder block's remat rung has the layers that compute them recompute, the block
-keeping every other (`dew.nn.backbones.decoder_block.RematPolicy.recompute`): a delta rule traced
-inside recomputes its memory in its backward where this names 'delta_memory' (`_blocked_rule`),
-and keeps it otherwise. A block sets it as it traces its layers (`recomputing`)."""
-
-
-def recomputed_memory() -> bool:
-    """Whether the layers traced here recompute the delta rule's memory in their backward (`RECOMPUTED`): the
-    template's call takes it as an argument (`template.mosaic_rule`'s `recomputed`), so the selectors' binds
-    (`port_kernel`, `scan_kernel`) and the run's (`template_rule`) read it alike, and a launch a compile
-    refused under the rung is the one the route judges (row 4133)."""
-    return Residual.DELTA_MEMORY in RECOMPUTED.get()
-
-
-@contextlib.contextmanager
-def recomputing(names: tuple[str, ...]):
-    """Trace the layers inside with `names` recomputed by the layers that compute them (`RECOMPUTED`)."""
-    token = RECOMPUTED.set(names)
-    try:
-        yield
-    finally:
-        RECOMPUTED.reset(token)
 
 
 def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, segments: int | None,
