@@ -92,6 +92,56 @@ def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_i
 
 
 @INTERPRETS
+@pytest.mark.parametrize("target", ["sm90", "cpu"])
+def test_a_replicated_operands_gradient_in_a_checked_manual_map_is_summed_over_its_devices(target):
+    """The gradient of a region fused through `fused_gemm.fused` in a shard_map that checks the axes its
+    values vary over (`check_vma`), with respect to the feature scale and the matrix every device holds the
+    same of: each device's rows and bias its own, so each device's partial gradient of the replicated values
+    varies over the map's axis, and the gradient of the replicated value is their sum over the devices, typed
+    the same on every device. On an assumed, interpreted H100 the template's launch takes the product, its
+    kernel gradient typed as its operands vary (row 9808), which reverse mode then sums over the devices (row
+    10526: `ad.ct_check` refused a varying cotangent for the unvarying matrix); on the CPU, XLA's products,
+    checked. The gradients equal the whole program's, bitwise, over integers whose sums stay exact."""
+    keys = jax.random.split(jax.random.key(10526), 4)
+    x = jax.random.randint(keys[0], (2, 64, 128), -3, 4).astype(jnp.bfloat16)
+    scale = jax.random.randint(keys[1], (128,), -2, 3).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[2], (128, 256), -3, 4).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[3], (2, 256), -2, 3).astype(jnp.bfloat16)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def region(x, scale, w, bias):
+        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16,
+                                  interpret_on_cpu=target != "cpu") + bias
+
+    def each_device(x, scale, w, bias):
+        return fused_gemm.fused(region, x[0], scale, w, bias[0])[None]
+
+    mapped = jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, data),
+                           out_specs=data, check_vma=True)
+
+    def loss(scale, w):
+        return jnp.sum(mapped(x, scale, w, bias).astype(jnp.float32))
+
+    gradient = jax.jit(jax.grad(loss, argnums=(0, 1)))
+    if target == "cpu":
+        got = gradient(scale, w)
+    else:
+        with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"), \
+                generation.routes() as routes:
+            got = gradient(scale, w)
+        assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
+
+    def whole_loss(scale, w):
+        product = jnp.einsum("dri,io->dro", x * scale, w, preferred_element_type=jnp.float32)
+        return jnp.sum((product.astype(jnp.bfloat16) + bias[:, None, :]).astype(jnp.float32))
+
+    expected = jax.grad(whole_loss, argnums=(0, 1))(scale, w)
+    for each, want in zip(got, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(each, np.float32), np.asarray(want, np.float32))
+
+
+@INTERPRETS
 def test_a_fused_regions_consumer_is_rewritten_by_the_algebra_pass_before_its_epilogue_tiles_it():
     """A region fused through `fused_gemm.fused` whose consumer two capped column scales of the product
     summed, which the epilogue takes tile by tile: the region traces the consumer's cheaper form, the one
