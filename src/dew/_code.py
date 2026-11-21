@@ -102,6 +102,12 @@ def code_digest(*roots: str) -> str:
         _log.warning("the code of %s imports by computed names at %s, none reviewed (dew._code.REVIEWED): "
                      "its records are keyed by all of Dew's code", ", ".join(roots), ", ".join(unreviewed))
         return package_digest()
+    if not _unchanged() or not all(map(_as_read, modules)):
+        # A file changed since this process first read the tree: the code it runs is the one it imported,
+        # which no read now states, so its records key as the whole package it first read.
+        _log.warning("Dew's source changed while this process ran: the records of %s are keyed by all of "
+                     "Dew's code", ", ".join(roots))
+        return package_digest()
     digest = hashlib.sha256()
     for module in sorted(modules):
         path = _path(module)
@@ -461,6 +467,8 @@ class _Imports(ast.NodeVisitor):
             return set()
         held = set()
         for module in self.resolved(node.value):
+            if module == "sys" and node.attr == "modules":
+                self.site(node)
             found = self.attribute(module, node.attr)
             if found is not None:
                 self.read(found)
@@ -470,9 +478,6 @@ class _Imports(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in _IMPORTERS and id(node) not in self.calling:
-            self.site(node)
-        if node.attr == "modules" and isinstance(node.value, ast.Name) and "sys" in self.aliases.get(
-                node.value.id, set()):
             self.site(node)
         if id(node) not in self.read_whole:
             for module in self.resolved(node):
@@ -485,6 +490,16 @@ class _Imports(ast.NodeVisitor):
         if id(node) not in self.read_whole and isinstance(node.ctx, ast.Load):
             for module in self.aliases.get(node.id, ()):
                 self.whole(module)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # A module bound to a name (`package = import_module("dew.data")`): the name reads as the module,
+        # and, held as a value, every name of its table may be read.
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and isinstance(
+                node.value, (ast.Name, ast.Attribute, ast.Call)):
+            for module in self.resolved(node.value):
+                self.bind(node.targets[0].id, module)
+                self.whole(module)
+        self.generic_visit(node)
 
     def importing(self, node: ast.Call) -> bool:
         """Whether `node` calls `import_module` or `__import__`, by any name the module binds them to."""
@@ -500,23 +515,27 @@ class _Imports(ast.NodeVisitor):
             self.calling.add(id(function))
             if id(node) not in self.calling:
                 self.calling.add(id(node))
-                self.imported(node)
+                # Its module held as a value: every name of its table may be read.
+                for module in self.imported(node):
+                    self.whole(module)
         elif called in _LOADERS:
             self.site(None)
         elif called == "getattr" and len(node.args) >= 2:
-            self.read_whole.add(id(node.args[0]))
             name = node.args[1]
             stated = name.value if isinstance(name, ast.Constant) and isinstance(name.value, str) else None
-            reflective = isinstance(node.args[0], ast.Name) and self.aliases.get(node.args[0].id, set()) & {
-                "sys", "importlib", "builtins"}
-            if reflective and (stated is None or stated in {"modules", *_IMPORTERS}):
+            escaped = id(node) not in self.read_whole
+            receivers = self.resolved(node.args[0])
+            if receivers & {"sys", "importlib", "builtins"} and (stated is None or stated in {
+                    "modules", *_IMPORTERS}):
                 self.site(node)
-            for module in self.resolved(node.args[0]):
-                if isinstance(name, ast.Constant) and isinstance(name.value, str):
-                    if (found := self.attribute(module, name.value)) is not None:
-                        self.read(found)
-                else:
+            for module in receivers:
+                found = None if stated is None else self.attribute(module, stated)
+                if stated is None:
                     self.whole(module)
+                elif found is not None:
+                    self.read(found)
+                    if escaped and found == f"{module}.{stated}":
+                        self.whole(found)
         self.generic_visit(node)
 
     def imported(self, node: ast.Call) -> set[str]:
