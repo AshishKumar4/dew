@@ -275,14 +275,11 @@ def test_a_split_merged_with_a_subnormal_initial_mass_keeps_its_output():
 
 @pytest.mark.parametrize("run", ["jitted", "op by op"])
 @pytest.mark.parametrize("form", sorted(SPECS))
-@pytest.mark.check1_shards(seeds=32, per_task=4)
 def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     """The padded merge's finished output, its state's mass, the output's gradient and that gradient's
     derivative along a direction on par with the plain merge's (`_plain_state`, JAX's differentiation of it,
     independent of the law) against float64 (check 1), jitted or op by op (`as_given`), each a case (both
-    in one took 225 s over the two forms), the reference run op by op; its seeds drawn by CI's map tasks,
-    4 a task (`check1_shards`: a case op by op took 139 to 155 s, 8 draws of the four cases 115 to 119 s, row
-    10672)."""
+    in one took 225 s over the two forms), the reference run op by op."""
     spec, ours, _ = _merges(form)
     reference = as_given(state_orders(_plain_state(spec)))
     orders = state_orders(finished_state(ours, spec))
