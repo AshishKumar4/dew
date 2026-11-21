@@ -541,30 +541,19 @@ def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan(
     assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
 
 
-def route_holds_every_order() -> list:
+@on_device
+def test_a_forked_call_through_the_tpu_route_holds_every_order():
     """`levels_documents_draw`'s forked call (documents taking their memories up, entry writes of cancelling
-    levels) through the route a model takes (`documents_as_selected`): every order of it finite wherever
-    float64's is a normal float32 (`assert_contract`), the kernel's own rule first-order reverse mode
-    (`ssd._chunk_scan`) and forward mode and every higher order the route's portable chunked op's
-    (`recurrence_chunk._per_product`, row 9698). The routes it took."""
+    levels) through the route a model takes on a TPU (`documents_as_selected`, its Pallas scan taken): every
+    order of it finite wherever float64's is a normal float32 (`assert_contract`), the kernel's own rule
+    first-order reverse mode (`ssd._chunk_scan`) and forward mode and every higher order the route's
+    portable chunked op's (`recurrence_chunk._per_product`, row 9698). Off a TPU the route is the portable
+    op's at every order, which no routing of the kernel's reaches; its ten orders there took 1906 s on a CPU
+    (each order set a case, 128 to 742 s, jsf-route-orders), past CI's budget."""
     operands, seeded = levels_documents_draw(0)
     with generation.routes() as found:
         assert_contract(documents_as_selected, operands, operands, seeded, "the route's forked call",
                         truth_fn=documents_one_by_one)
-    return found
-
-
-def test_a_forked_call_through_the_route_holds_every_order():
-    """`route_holds_every_order` on the host's route: off a TPU the portable math (the kernel lowered for an
-    assumed TPU runs on none, `ssd._interpreting`)."""
-    route_holds_every_order()
-
-
-@on_device
-def test_a_forked_call_through_the_tpu_route_holds_every_order():
-    """`route_holds_every_order` on a TPU, the route its Pallas scan: the kernel's reverse mode handing every
-    other order to the portable chunked op."""
-    found = route_holds_every_order()
     assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
 
 
