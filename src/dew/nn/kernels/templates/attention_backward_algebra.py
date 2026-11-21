@@ -14,6 +14,30 @@ from dew.nn.kernels.templates.attention import REFERENCE_PRECISION
 from dew.nn.precision import float32_einsum
 
 
+def softmax_weights(logits, peak, total, *, keys_first: bool = False,
+                    how: algebra.Recompute = algebra.PLAIN, accurate: bool = False):
+    """A backward tile's unnormalized and normalized attention weights (`softmax_cotangents`'s first half):
+    depends on `logits`, `peak`, and `total` alone, so `S`'s softmax can run while `dP = dO Vᵀ` is in
+    flight (`attention_mosaic_fused._overlapped_fused_step`, row 5272)."""
+    def per_query(x):
+        return x[None, :] if keys_first else x[:, None]
+
+    e = gradient.below(logits, per_query(peak if accurate else gradient.safe_peak(peak)), how,
+                       safe=not accurate)
+    over = per_query(1.0 / jnp.where(total == 0, 1.0, total))
+    return e, e * over
+
+
+def softmax_from_weights(weights, products, anchor, delta, seen=None, *, keys_first: bool = False):
+    """Undropped fast-form score cotangents from normalized `weights` and `dP` (`products`)
+    (`softmax_cotangents`'s second half, runnable while `dV = Pᵀ dO` is in flight, row 5272)."""
+    def per_query(x):
+        return x[None, :] if keys_first else x[:, None]
+
+    cotangents = weights * ((products - per_query(anchor)) - per_query(delta))
+    return gradient.where_seen(seen, cotangents, 0.0)
+
+
 def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, seen=None, at_anchor=None,
                        *, keys_first: bool = False, how: algebra.Recompute = algebra.PLAIN,
                        accurate: bool = False):
@@ -32,8 +56,9 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     def per_query(x):
         return x[None, :] if keys_first else x[:, None]
 
-    e = gradient.below(logits, per_query(peak if accurate else gradient.safe_peak(peak)), how,
-                       safe=not accurate)
+    e, weights = softmax_weights(logits, peak, total, keys_first=keys_first, how=how, accurate=accurate)
+    if not accurate and keep is None and at_anchor is None:
+        return e, weights, softmax_from_weights(weights, products, anchor, delta, seen, keys_first=keys_first)
     over = per_query(1.0 / jnp.where(total == 0, 1.0, total))
     # The dropped products rounded once before any centre reads them (`gradient.dropped_products`), as the
     # mainloop's dropout centre takes them: where kept products agree its D is exactly their product.
@@ -41,7 +66,6 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     about = dropped - per_query(anchor)
     if at_anchor is not None:
         about = jnp.where(at_anchor, 0.0, about)
-    weights = e * over
     # Each mainloop's hand form's order: Mosaic's fast form takes its cotangents from the weights it forms
     # anyway (FlashAttention's order, 16 multiplies a tile fewer on the fused dK/dV launch,
     # ET-CONFLICTS-h100); a form that holds its anchor (portable's and Triton's, the accurate form) scales
@@ -63,7 +87,6 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
         cotangents = jnp.where(algebra.finite(cotangents), cotangents, quartered * 4.0)
     return e, weights, gradient.where_seen(seen, cotangents, 0.0)
 
-
 @functools.cache
 def derived_cotangents(keys_first: bool, dropped: bool, masked: bool, how: algebra.Recompute = algebra.PLAIN,
                        accurate: bool = False, anchored: bool = False) -> derive.Derived:
@@ -81,6 +104,26 @@ def derived_cotangents(keys_first: bool, dropped: bool, masked: bool, how: algeb
     return derive.derive(derive.Reduction(declared, axes, walked="keys", exponent="e"), accurate=accurate,
                          saturation=SATURATION)
 
+@functools.cache
+def derived_weights(keys_first: bool, how: algebra.Recompute = algebra.PLAIN,
+                    accurate: bool = False) -> derive.Derived:
+    """Derived form of `softmax_weights` (`derived_cotangents`'s first half, row 5272)."""
+    tile = ("keys", "rows") if keys_first else ("rows", "keys")
+    axes = {"logits": tile, "peak": ("rows",), "total": ("rows",)}
+    declared = functools.partial(softmax_weights, keys_first=keys_first, how=how, accurate=accurate)
+    return derive.derive(derive.Reduction(declared, axes, walked="keys", exponent="e"), accurate=accurate,
+                         saturation=SATURATION)
+
+
+@functools.cache
+def derived_from_weights(keys_first: bool, masked: bool) -> derive.Derived:
+    """Derived form of `softmax_from_weights` (`derived_cotangents`'s second half, row 5272)."""
+    tile = ("keys", "rows") if keys_first else ("rows", "keys")
+    axes = {"weights": tile, "products": tile, "anchor": ("rows",), "delta": ("rows",),
+            **({"seen": tile} if masked else {})}
+    declared = functools.partial(softmax_from_weights, keys_first=keys_first)
+    return derive.derive(derive.Reduction(declared, axes, walked="keys"), accurate=False,
+                         saturation=SATURATION)
 
 def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, slope=None, seen=None,
                       keep=None, at_anchor=None, *, scale: float, how: algebra.Recompute = algebra.PLAIN,

@@ -1889,3 +1889,61 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
 
         found = compile_mosaic_kernels([KernelCase(f"{gen}-fused-d128-3stage", _make)], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
+    """Row 5272: split `derived_weights` + `derived_from_weights` match `derived_cotangents` bit-for-bit
+    (masked and unmasked), and `streamed_statistics(..., anchored=False)` excludes dead `chosen`."""
+    from dew.nn.kernels.templates import attention_backward_algebra as bwd_alg, attention_mosaic_fused as fused
+
+    rng = jax.random.key(5272)
+    k1, k2, k3, k4, k5 = jax.random.split(rng, 5)
+    logits = jax.random.normal(k1, (64, 64), jnp.float32)
+    products = jax.random.normal(k2, (64, 64), jnp.float32)
+    peak = jnp.max(logits, axis=-1)
+    total = jnp.sum(jnp.exp(logits - peak[:, None]), axis=-1)
+    anchor = jax.random.normal(k3, (64,), jnp.float32)
+    delta = jax.random.normal(k4, (64,), jnp.float32)
+    seen = jax.random.bernoulli(k5, 0.7, (64, 64))
+
+    for masked in (False, True):
+        full_in = {"logits": logits, "products": products, "peak": peak, "total": total,
+                   "anchor": anchor, "delta": delta, **({"seen": seen} if masked else {})}
+        e_ref, w_ref, ds_ref = bwd_alg.derived_cotangents(False, False, masked).mapped(full_in)
+        e_got, w_got = bwd_alg.derived_weights(False, accurate=False).mapped(
+            {"logits": logits, "peak": peak, "total": total})
+        ds_in = {"weights": w_got, "products": products, "anchor": anchor, "delta": delta,
+                 **({"seen": seen} if masked else {})}
+        ds_got = bwd_alg.derived_from_weights(False, masked).mapped(ds_in)
+        assert jnp.array_equal(e_got, e_ref)
+        assert jnp.array_equal(w_got, w_ref)
+        assert jnp.array_equal(ds_got, ds_ref)
+
+    with generation.assumed("sm90"):
+        family = program.bundle("sm90", jnp.bfloat16)
+        cfg = program.BackwardTiles(64, 64, 2, 2, fused=True, family=family.name)
+        assert fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=False) <= 4
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
+    """Row 5272: sm90 overlapped fused backward (`_overlapped_fused_step`: S softmax overlapped with dP,
+    dS overlapped with dV, add_dq overlapped with dK) compiles spill-free at d64 and d128."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((2, 4096, 32, width), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, 8, width), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+
+        def _make():
+            def backward(query, key, value, dout, residuals):
+                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                                  residuals=residuals, accurate=False)
+                return grads.query, grads.key, grads.value
+            return backward, (q, k, k, q, shapes)
+
+        found = compile_mosaic_kernels([KernelCase(f"sm90-overlapped-fused-d{width}", _make)], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
