@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
 
-from dew.algebra import derive, means
+from dew.algebra import derive, means, windows
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, raised_exactly
 from dew.nn.kernels.templates import bodies, layout, product
@@ -569,7 +569,7 @@ def finished_form(spec: Forward) -> Forward:
     return spec if spec.natural or spec.raw else unfolded(spec)
 
 
-def slice_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
+def slice_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
     """A finished slice of a row's keys as a state of their merge (`finished_merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
     keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
@@ -597,7 +597,7 @@ def initial_state(spec: Forward, initial: Partial) -> Partial:
     return slice_state(spec, out, maximum, initial.total)
 
 
-def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array, total: jax.Array,
+def merged_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Array, total: jax.Array,
                  initial: Initial | None = None, *, raw_scale: float | None = None) -> Partial:
     """A split walk's slices and the call's initial state merged into one finished state (`finished_merged`
     of `slice_state`s): their outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural
@@ -631,19 +631,19 @@ def resumable(spec: Forward, state: Partial) -> Partial:
                    state.total)
 
 
-def units_of(spec: Forward | means.Units) -> means.Units:
-    """The units a finished form's states merge in (`means.Units`), its factor `carried`'s: the accurate
+def units_of(spec: Forward | windows.Units) -> windows.Units:
+    """The units a finished form's states merge in (`windows.Units`), its factor `carried`'s: the accurate
     form's exponential of the anchors' difference taken exactly, at its raw products' scale where it keeps
     them; a raw fold's of that difference times `scale log2(e)` rounded, as its walk weighs a key."""
-    if isinstance(spec, means.Units):
+    if isinstance(spec, windows.Units):
         return spec
     if spec.natural:
-        return means.Units(scale=spec.scale if spec.raw else 1.0)
-    return means.Units(scale=spec.scale, compensated=False)
+        return windows.Units(scale=spec.scale if spec.raw else 1.0)
+    return windows.Units(scale=spec.scale, compensated=False)
 
 
 
-def finished_merged(spec: Forward | means.Units, stacked: Partial, axis: int) -> Partial:
+def finished_merged(spec: Forward | windows.Units, stacked: Partial, axis: int) -> Partial:
     """Finished states over disjoint keys (`slice_state`'s, their outputs normalized, or merges of them)
     stacked on `axis` as one merge of them, the algebra's law of finished means (`dew.algebra.means`, its
     derivative the law's own): their outputs' convex combination, each weighed by its mass at the largest of
@@ -660,9 +660,9 @@ def finished_merged(spec: Forward | means.Units, stacked: Partial, axis: int) ->
 
 
 
-def finished_merged_chunked(spec: Forward | means.Units, load: Callable[[jax.Array], tuple],
+def finished_merged_chunked(spec: Forward | windows.Units, load: Callable[[jax.Array], tuple],
                             chunks: int) -> Partial:
-    """`finished_merged` of a row's slices `load(c)` gives `means.CHUNK` at a time along axis 0 (a kernel's
+    """`finished_merged` of a row's slices `load(c)` gives `windows.CHUNK` at a time along axis 0 (a kernel's
     loads of its refs: the decode merge's, `merged`), `chunks` of them: each chunk's outputs, maxima,
     denominators and the slots it holds (`valid`, laid as the denominators are), its slices' states as
     `slice_state` takes them, merged by the law's chunked merge (`means.merged_state_chunked`, the value

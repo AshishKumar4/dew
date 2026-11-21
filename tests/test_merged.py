@@ -13,7 +13,7 @@ from generation_support import COMPILES_ON_CPU
 from kernel_compile import compile_kernels
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
 
-from dew.algebra import means
+from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, merged
@@ -390,7 +390,7 @@ def _emitted_device_bytes(body, *, rows: int, blocks: int, slices: int, read_wid
     ref bounds (`slices`, `read_width`, `width`)."""
     from jax import lax
 
-    chunk = means.chunk_width(slices)
+    chunk = windows.chunk_width(slices)
     chunks = -(-slices // chunk)
     channels = 1 << (width - 1).bit_length()
     slice_frac = slices / (chunks * chunk)

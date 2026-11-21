@@ -3,7 +3,7 @@ and minus zero, a subnormal, the least normal, one, the format's largest, produc
 range, tangents of one, 2^100 and 2^-100, zero and subnormal totals, mixed scales, outputs an ulp apart, and
 products by an inexact constant feeding a compensated sum under a jit (the contraction ledger 7856 found).
 The construct's operations are values (`scaled`'s account): each its float64 truth landed once, bit for bit.
-The law's are ratios (`means.ratio_p`, `means`'s account): its value and the first two orders of its
+The law's are ratios (`ratios.ratio_p`, `means`'s account): its value and the first two orders of its
 derivative, each a ratio of its operands, its factors as formed and the order beneath it as landed, held
 equation by equation to the ratio's contract by check 2 of the gate (`certified.assert_certified`,
 `certified._ratio_holds`: the exact ratio within the compensated sum's bound); its formulas are held at
@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 from certified import assert_certified
 
-from dew.algebra import means, scaled
+from dew.algebra import means, ratios, scaled, windows
 
 LARGEST = float(np.finfo(np.float32).max)
 LEAST = float(np.finfo(np.float32).tiny)
@@ -50,7 +50,7 @@ def _land(value: float) -> float:
 
 
 def _unsigned_land(value: float) -> float:
-    """A float64 value landed as the construct and a ratio land it (`scaled`'s account, `means.Ratio`): once,
+    """A float64 value landed as the construct and a ratio land it (`scaled`'s account, `ratios.Ratio`): once,
     a zero +0."""
     landed = _land(value)
     return 0.0 if landed == 0 else landed
@@ -158,7 +158,7 @@ def test_a_merge_at_degenerate_states_holds_its_contract(case, along, tangent):
     """The law (`means.merged_output`) at degenerate states, its outputs, totals or anchors moving by
     `tangent`: its value and its first and second derivatives, each ratio held to its contract (check 2)."""
     outputs, totals, anchors = (np.asarray(v, np.float32) for v in MERGES[case][:3])
-    units = means.Units(scale=MERGES[case][3])
+    units = windows.Units(scale=MERGES[case][3])
     operands = {"outputs": outputs, "totals": totals, "anchors": anchors}
 
     def fn(moved):
@@ -177,7 +177,7 @@ def test_a_merge_past_its_anchors_resolution_lands_an_infinite_total():
     total cells' "two totals of 2^127 at a near anchor")."""
     outputs = np.asarray([[1.0], [0.5]], np.float32)
     totals, anchors = np.full(2, 2.0 ** 127, np.float32), np.full(2, 2.0 ** 31, np.float32)
-    units = means.Units(scale=1.0)
+    units = windows.Units(scale=1.0)
     total = jax.jit(lambda w, m: means.merged_total(w, m, units, 0)[0])(totals, anchors)
     state = jax.jit(lambda o, w, m: means.merged_state(o, w, m, units=units, axis=0)[1])
     assert [float(np.asarray(total)), float(np.asarray(state(outputs, totals, anchors)))] == [np.inf, np.inf]
@@ -190,7 +190,7 @@ def test_a_zero_mass_state_past_its_reach_adds_nothing_to_a_merge():
     F3: a zero total times the refused factor was NaN)."""
     outputs = np.asarray([[1.0], [2.0]], np.float32)
     totals, anchors = np.asarray([1.0, 0.0], np.float32), np.asarray([0.0, 1e8], np.float32)
-    units = means.Units(scale=1.0)
+    units = windows.Units(scale=1.0)
     merged = jax.jit(lambda o, w, m: means.merged_output(o, w, m, units=units, axis=0))
     state = jax.jit(lambda o, w, m: means.merged_state(o, w, m, units=units, axis=0))
     merged, state = merged(outputs, totals, anchors), state(outputs, totals, anchors)
@@ -205,7 +205,7 @@ def test_opposite_channels_gradients_are_their_sums_landed_once():
     channel at a time, `16 2^126 / 2` was `+-inf`, and their sum NaN (the base review's F1)."""
     outputs = np.asarray([[2.0 ** 126, -2.0 ** 126], [-2.0 ** 126, 2.0 ** 126]], np.float32)
     totals, anchors = np.ones(2, np.float32), np.zeros(2, np.float32)
-    units = means.Units(scale=1.0)
+    units = windows.Units(scale=1.0)
     cotangent = np.full(2, 16.0, np.float32)
 
     def loss(w, m):
@@ -277,7 +277,7 @@ def test_a_merge_of_anchors_whose_difference_passes_the_format_weighs_its_scaled
     totals = np.asarray([2.0 ** -126, 2.0 ** 127], np.float32)
     merges = []
     for anchor, scale in ((2.0 ** 127, 2.0 ** -120), (2.0 ** 126, 2.0 ** -119)):
-        units = means.Units(scale=scale)
+        units = windows.Units(scale=scale)
         anchors = np.asarray([anchor, -anchor], np.float32)
         output = jax.jit(lambda o, w, m, units=units: means.merged_output(o, w, m, units, 0))
         state = jax.jit(lambda o, w, m, units=units: means.merged_state(o, w, m, units, 0))
@@ -309,7 +309,7 @@ def test_a_merged_state_of_operands_shared_by_a_batch_is_its_parts(outputs, tota
         return (rng.standard_normal(outputs).astype(np.float32), held,
                 rng.standard_normal(anchors).astype(np.float32))
 
-    units = means.Units()
+    units = windows.Units()
 
     def state(o, w, m):
         return means.merged_state(o, w, m, units, 1)
@@ -341,7 +341,7 @@ def test_the_laws_operations_vary_where_any_operand_they_read_does():
 
     def run(totals):
         def body(carry, _):
-            merged, total, _ = means.merged_state(outputs, totals, anchors, means.Units(), 0)
+            merged, total, _ = means.merged_state(outputs, totals, anchors, windows.Units(), 0)
             done = means.finished(accumulated, totals[:1])
             moved = scaled.applied(outputs[:, 0], scaled.scaled(totals))
             return (merged, total, done, moved), None
@@ -404,11 +404,11 @@ def test_a_sums_derivative_along_one_operand_runs_over_the_whole_domain():
     by one: its derivative `[2, 2, 2]`, each of the two states and three channels its domain's, forward and
     reverse; with `y`, which no derivative term reads, dropped, it was `[1]` (the merge P0's base review 9,
     F3)."""
-    form = means.Ratio(((1.0, (("v", 0),)), (1.0, (("v", 1),))), (), 0, reduced=True, units=means.Units())
+    form = ratios.Ratio(((1.0, (("v", 0),)), (1.0, (("v", 1),))), (), 0, reduced=True, units=windows.Units())
     x, y = np.ones((1, 1), np.float32), np.ones((2, 3), np.float32)
 
     def summed(x):
-        return means.ratio_p.bind(jnp.asarray(x), jnp.asarray(y), form=form)
+        return ratios.ratio_p.bind(jnp.asarray(x), jnp.asarray(y), form=form)
 
     tangent = jax.jit(lambda x: jax.jvp(summed, (x,), (jnp.ones_like(x),))[1])(x)
     pulled = jax.jit(lambda x: jax.vjp(summed, x)[1](jnp.ones(3, jnp.float32))[0])(x)
@@ -421,7 +421,7 @@ def test_a_merged_total_past_the_format_lands_at_the_least_finite_anchor_that_ho
     one binade past it overflowed to an infinite anchor though `3 2^126` holds them (the merge P0's base
     review 9, F4)."""
     totals, anchors = np.full(32, 2.0 ** 127, np.float32), np.zeros(32, np.float32)
-    units = means.Units(scale=2.0 ** -126)
+    units = windows.Units(scale=2.0 ** -126)
     total, anchor = jax.jit(lambda t: means.merged_total(t, anchors, units, 0))(totals)
     assert np.isfinite(np.asarray(anchor)) and np.isfinite(np.asarray(total))
     assert_certified(lambda t: means.merged_total(t, anchors, units, 0)[0], lambda seed: (totals,),
@@ -434,7 +434,7 @@ def test_an_empty_rows_anchor_is_chosen_by_the_law_before_its_mass_and_tangent()
     `(1, 0, 1)`, the output's derivative along `t` at 0 is `-exp(1)`, as the walk's start would hold it. A
     row whose states' anchors are all -inf returns -inf (the merge P0's base review 10, F1: chosen outside
     the law, the row's tangent was taken at 0 and its anchor moved to 1 after, giving -exp(2))."""
-    units = means.Units()
+    units = windows.Units()
 
     def merged(t):
         one, total, anchor = means.merged_state(jnp.zeros((1, 1)), jnp.reshape(t, (1,)), jnp.ones(1), units,
@@ -461,7 +461,7 @@ def test_a_merged_totals_anchor_and_move_are_formed_together_in_its_units(jitted
     overflowed to an infinite anchor and total wherever no compiler fused it into the anchor's sum (the
     merge P0's base review 10, F2: op by op)."""
     totals, anchors = np.full(64, 2.0 ** 127, np.float32), np.full(64, -(2.0 ** 127), np.float32)
-    units = means.Units(scale=2.0 ** -126)
+    units = windows.Units(scale=2.0 ** -126)
     with contextlib.nullcontext() if jitted else jax.disable_jit():
         total, anchor = jax.jit(lambda t: means.merged_total(t, anchors, units, 0))(totals)
     assert np.isfinite(np.asarray(anchor)) and np.isfinite(np.asarray(total))
@@ -474,11 +474,11 @@ def test_a_derivative_along_a_scalar_keeps_the_domains_rank():
     """`sum(x + y)` over the states' axis, `x` of shape `[1, 1]` and `y` a scalar, moved along `y` alone by
     one: its derivative `[1]`, of the domain's rank, forward and reverse; compacted to `y`'s tangent alone,
     a scalar, its states' axis was none (the merge P0's base review 10, F3)."""
-    form = means.Ratio(((1.0, (("v", 0),)), (1.0, (("v", 1),))), (), 0, reduced=True, units=means.Units())
+    form = ratios.Ratio(((1.0, (("v", 0),)), (1.0, (("v", 1),))), (), 0, reduced=True, units=windows.Units())
     x = jnp.ones((1, 1), jnp.float32)
 
     def summed(y):
-        return means.ratio_p.bind(x, y, form=form)
+        return ratios.ratio_p.bind(x, y, form=form)
 
     tangent = jax.jit(lambda y: jax.jvp(summed, (y,), (jnp.ones_like(y),))[1])(jnp.float32(2.0))
     pulled = jax.jit(lambda y: jax.vjp(summed, y)[1](jnp.ones(1, jnp.float32))[0])(jnp.float32(2.0))
@@ -486,16 +486,16 @@ def test_a_derivative_along_a_scalar_keeps_the_domains_rank():
 
 
 def test_a_product_of_a_sum_over_the_states_and_a_sum_over_channels_transposes():
-    """`f[i] = sum_k x[k] sum_c y[i, c]` (`means.Ratio.products`: one sum over the states, one a state at a
+    """`f[i] = sum_k x[k] sum_c y[i, c]` (`ratios.Ratio.products`: one sum over the states, one a state at a
     time over its channels), `y = [[1, 2], [3, 4]]`: the gradient of `sum(f)` along each `x` is `sum_ic y =
     10`, its cotangent contracted over the states against the channel sum, each sum unlanded; refused before
     (the merge P0's base review 10, F4)."""
-    over_states = means.Summed(((1.0, (("v", 0),)),), reduced=True)
-    over_channels = means.Summed(((1.0, (("v", 1),)),), reduced=False, over=(1,))
-    form = means.Ratio((), (), 0, reduced=False, units=means.Units(), over=(1,),
+    over_states = ratios.Summed(((1.0, (("v", 0),)),), reduced=True)
+    over_channels = ratios.Summed(((1.0, (("v", 1),)),), reduced=False, over=(1,))
+    form = ratios.Ratio((), (), 0, reduced=False, units=windows.Units(), over=(1,),
                        products=((1.0, (over_states, over_channels)),))
     x, y = jnp.ones((2, 1), jnp.float32), jnp.asarray([[1.0, 2.0], [3.0, 4.0]], jnp.float32)
-    gradient = jax.jit(jax.grad(lambda x: jnp.sum(means.ratio_p.bind(x, y, form=form))))(x)
+    gradient = jax.jit(jax.grad(lambda x: jnp.sum(ratios.ratio_p.bind(x, y, form=form))))(x)
     assert np.asarray(gradient).tolist() == [[10.0], [10.0]]
 
 
@@ -504,10 +504,10 @@ def test_products_beneath_their_neighbours_binade_are_summed_before_they_cancel(
     summed banded and compensated as a sum's terms are, landing once; joined in turn, the middle one was
     shifted past its precision before the outer two cancelled, and the sum was 0 (the merge P0's base
     review 10, F5)."""
-    form = means.Ratio((), (), 0, reduced=False, units=means.Units(), products=tuple(
-        (1.0, (means.Summed(((1.0, (("v", index),)),), reduced=False),)) for index in range(3)))
+    form = ratios.Ratio((), (), 0, reduced=False, units=windows.Units(), products=tuple(
+        (1.0, (ratios.Summed(((1.0, (("v", index),)),), reduced=False),)) for index in range(3)))
     operands = [jnp.full(1, value, jnp.float32) for value in (2.0 ** 127, 2.0 ** -126, -(2.0 ** 127))]
-    assert np.asarray(jax.jit(lambda *xs: means.ratio_p.bind(*xs, form=form))(*operands)).tolist() == [
+    assert np.asarray(jax.jit(lambda *xs: ratios.ratio_p.bind(*xs, form=form))(*operands)).tolist() == [
         2.0 ** -126]
 
 
@@ -515,12 +515,12 @@ def test_a_product_of_a_sum_over_the_states_and_two_channel_sums_transposes():
     """`f[i] = sum_k x[k] sum_c y[i, c] sum_c z[i, c]`, two states, `y = z = ones((2, 2))`: the gradient of
     `sum(f)` along each `x` is `sum_i (sum_c y)(sum_c z) = 8`, the two channel sums a product, not one sum of
     their terms' products, each unlanded; refused before (the merge P0's base review 11, F3)."""
-    over_states = means.Summed(((1.0, (("v", 0),)),), reduced=True)
-    over_channels = [means.Summed(((1.0, (("v", index),)),), reduced=False, over=(1,)) for index in (1, 2)]
-    form = means.Ratio((), (), 0, reduced=False, units=means.Units(), over=(1,),
+    over_states = ratios.Summed(((1.0, (("v", 0),)),), reduced=True)
+    over_channels = [ratios.Summed(((1.0, (("v", index),)),), reduced=False, over=(1,)) for index in (1, 2)]
+    form = ratios.Ratio((), (), 0, reduced=False, units=windows.Units(), over=(1,),
                        products=((1.0, (over_states, *over_channels)),))
     x, y = jnp.ones((2, 1), jnp.float32), jnp.ones((2, 2), jnp.float32)
-    gradient = jax.jit(jax.grad(lambda x: jnp.sum(means.ratio_p.bind(x, y, y, form=form))))(x)
+    gradient = jax.jit(jax.grad(lambda x: jnp.sum(ratios.ratio_p.bind(x, y, y, form=form))))(x)
     assert np.asarray(gradient).tolist() == [[8.0], [8.0]]
 
 
@@ -530,14 +530,14 @@ def test_a_channel_sum_beside_a_factor_that_keeps_the_channel_transposes_as_thei
     factor beside it; the transpose contracted `y_ic z_ic` over the one channel axis, 30 (the merge P0's
     base review 12, F1). Along `y`, `z` held, it is `sum_c (sum_k x_k) z_ic`, the same at every `d`:
     `[[6, 6], [14, 14]]`, where the transpose read `z` at `d`, `[[2, 4], [6, 8]]` (base review 13, F1)."""
-    over_states = means.Summed(((1.0, (("v", 0),)),), reduced=True)
-    over_channels = means.Summed(((1.0, (("v", 1),)),), reduced=False, over=(1,))
-    kept = means.Summed(((1.0, (("v", 2),)),), reduced=False)
-    form = means.Ratio((), (), 0, reduced=False, units=means.Units(),
+    over_states = ratios.Summed(((1.0, (("v", 0),)),), reduced=True)
+    over_channels = ratios.Summed(((1.0, (("v", 1),)),), reduced=False, over=(1,))
+    kept = ratios.Summed(((1.0, (("v", 2),)),), reduced=False)
+    form = ratios.Ratio((), (), 0, reduced=False, units=windows.Units(),
                        products=((1.0, (over_states, over_channels, kept)),))
     x, y = jnp.ones((2, 1), jnp.float32), jnp.asarray([[1.0, 2.0], [3.0, 4.0]], jnp.float32)
-    gradient = jax.jit(jax.grad(lambda x: jnp.sum(means.ratio_p.bind(x, y, y, form=form))))(x)
-    along_y = jax.jit(jax.grad(lambda held: jnp.sum(means.ratio_p.bind(x, held, y, form=form))))(y)
+    gradient = jax.jit(jax.grad(lambda x: jnp.sum(ratios.ratio_p.bind(x, y, y, form=form))))(x)
+    along_y = jax.jit(jax.grad(lambda held: jnp.sum(ratios.ratio_p.bind(x, held, y, form=form))))(y)
     assert np.asarray(gradient).tolist() == [[58.0], [58.0]]
     assert np.asarray(along_y).tolist() == [[6.0, 6.0], [14.0, 14.0]]
 
@@ -549,7 +549,7 @@ def test_a_sum_cancelling_in_two_bands_keeps_the_band_beneath_both():
     binades beneath its band's pair and the derivative was 0 (the merge P0's base review 13, F2)."""
     outputs = np.asarray([1, -1, 1, -1, 1, 0], np.float32)[:, None]
     anchors = np.asarray([1000, 1000, 200, 200, 0, 0], np.float32)
-    units = means.Units(scale=1.0)
+    units = windows.Units(scale=1.0)
 
     def merged(totals):
         return means.merged_output(outputs, totals, anchors, units=units, axis=0)
@@ -564,11 +564,11 @@ def test_a_ratio_whose_derivatives_products_cancel_has_a_zero_tangent():
     opposite coefficients, so its tangent and its gradient are zero; its empty numerator reached its sum's
     bits before (the merge P0's base review 11, F2)."""
     own = ((1.0, (("v", 0),)),)
-    form = means.Ratio(own, own, 0, reduced=True, units=means.Units(scale=1.0))
+    form = ratios.Ratio(own, own, 0, reduced=True, units=windows.Units(scale=1.0))
     x = jnp.asarray([2.0], jnp.float32)
-    value, tangent = jax.jit(lambda x, t: jax.jvp(lambda x: means.ratio_p.bind(x, form=form), (x,), (t,)))(
+    value, tangent = jax.jit(lambda x, t: jax.jvp(lambda x: ratios.ratio_p.bind(x, form=form), (x,), (t,)))(
         x, jnp.ones_like(x))
-    gradient = jax.jit(jax.grad(lambda x: means.ratio_p.bind(x, form=form)))(x)
+    gradient = jax.jit(jax.grad(lambda x: ratios.ratio_p.bind(x, form=form)))(x)
     assert (float(value), float(tangent), np.asarray(gradient).tolist()) == (1.0, 0.0, [0.0])
 
 
@@ -581,7 +581,7 @@ def test_a_band_beneath_the_normals_keeps_a_half_ulp_its_larger_terms_opposite_c
     big = 1.5 * 2.0 ** 127
     outputs = np.asarray([2.0 ** -97, big, -(2.0 ** -97), 0.0, 2.0 ** -121, -big], np.float32)[:, None]
     totals = np.asarray([1 / 32, 3 / 8, 1 / 32, 0, 1 / 32, 3 / 8], np.float32)
-    units = means.Units(scale=1.0)
+    units = windows.Units(scale=1.0)
     merged = jax.jit(lambda o, w, m: means.merged_output(o, w, m, units=units, axis=0))(
         outputs, totals, np.zeros(6, np.float32))
     assert np.asarray(merged).tolist() == [float(np.float32(2.0 ** -126 * 32 / 27))]
@@ -591,10 +591,10 @@ def test_a_ratios_own_sum_transposes_to_its_cotangent_repeated():
     """A ratio summing its numerator over a further axis its one operand alone carries (`Ratio.over`): its
     value the whole sum, and its gradient the cotangent repeated across that axis (the review: the
     transpose's result kept one along it and was refused the operand's shape)."""
-    form = means.Ratio(((1.0, (("v", 0),)),), (), 0, reduced=True, units=means.Units(scale=1.0), over=(1,))
+    form = ratios.Ratio(((1.0, (("v", 0),)),), (), 0, reduced=True, units=windows.Units(scale=1.0), over=(1,))
     x = np.arange(6, dtype=np.float32).reshape(2, 3)
-    value = jax.jit(lambda x: means.ratio_p.bind(x, form=form))(x)
-    gradient = jax.jit(jax.grad(lambda x: jnp.sum(means.ratio_p.bind(x, form=form))))(x)
+    value = jax.jit(lambda x: ratios.ratio_p.bind(x, form=form))(x)
+    gradient = jax.jit(jax.grad(lambda x: jnp.sum(ratios.ratio_p.bind(x, form=form))))(x)
     assert (np.asarray(value).tolist(), np.asarray(gradient).tolist()) == ([15.0], [[1.0] * 3] * 2)
 
 
@@ -612,7 +612,7 @@ def test_states_cancelling_across_a_long_row_merge_to_their_truth(case, states):
     for place, value in ((0, big), (states // 2, -big), (states - 1, 3 * LEAST)):
         outputs[place, 0], totals[place] = value, 1.0
     anchors = np.zeros(states, np.float32)
-    units = means.Units(scale=1.0)
+    units = windows.Units(scale=1.0)
     merged = jax.jit(lambda o, w, m: means.merged_output(o, w, m, units=units, axis=0))
     state = jax.jit(lambda o, w, m: means.merged_state(o, w, m, units=units, axis=0)[0])
     merged, state = merged(outputs, totals, anchors), state(outputs, totals, anchors)
@@ -638,7 +638,7 @@ def test_states_cancelling_beside_a_least_normal_merge_to_their_truth(case, orde
     big = CANCELLING[case]
     outputs = np.asarray([[big], [-big], [3 * LEAST]], np.float32)[list(order)]
     totals, anchors = np.ones(3, np.float32), np.zeros(3, np.float32)
-    units = means.Units(scale=1.0)
+    units = windows.Units(scale=1.0)
     merged = jax.jit(lambda o, w, m: means.merged_output(o, w, m, units=units, axis=0))
     state = jax.jit(lambda o, w, m: means.merged_state(o, w, m, units=units, axis=0)[0])
     merged, state = merged(outputs, totals, anchors), state(outputs, totals, anchors)
@@ -654,11 +654,11 @@ def test_a_merged_total_at_degenerate_states_holds_its_contract(case, tangent):
     three of 2^102 landed past it where its landing read a rounded sum that lost them, the law's review);
     and its derivatives (linear in the totals) the factors' sum along them, then none."""
     _, totals, anchors = (np.asarray(v, np.float32) for v in MERGES[case][:3])
-    units = means.Units(scale=MERGES[case][3])
+    units = windows.Units(scale=MERGES[case][3])
     along = np.full_like(totals, TANGENTS[tangent])
     got = _derivatives(lambda w: means.merged_total(w, anchors, units, 0)[0], totals, along)
     landing = float(means.merged_total(jnp.asarray(totals), jnp.asarray(anchors), units, 0)[1])
-    significand, exponent = means._factors_value(jnp.asarray(anchors), jnp.full((1,), landing, jnp.float32),
+    significand, exponent = windows._factors_value(jnp.asarray(anchors), jnp.full((1,), landing, jnp.float32),
                                                   units=units)
     factors = np.ldexp(np.asarray(significand, np.float64), np.asarray(exponent))
     value = _unsigned_land(np.sum(totals.astype(np.float64) * factors))

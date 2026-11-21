@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import pytest
 from contract_support import EDGES, assert_contract, normal_draw
 
-from dew.algebra import means
+from dew.algebra import means, windows
 
 
 def _plain(outputs, totals, anchors):
@@ -18,7 +18,7 @@ def _plain(outputs, totals, anchors):
 def _merged(outputs, totals, anchors):
     """The merge of finished states the contract holds, one function at every edge, so the cell's programs
     compiled at one edge serve the others (`contract_support._mesh_program`)."""
-    return means.merged_output(outputs, totals, anchors, means.Units(), 0)
+    return means.merged_output(outputs, totals, anchors, windows.Units(), 0)
 
 
 @pytest.mark.parametrize("edge", EDGES)
