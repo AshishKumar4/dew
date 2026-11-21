@@ -4,6 +4,7 @@ forward's statistics (`_scores`)."""
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 from jax import lax
