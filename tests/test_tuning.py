@@ -645,3 +645,24 @@ def test_a_launch_lowered_once_keeps_its_program_only_for_a_hook_it_may_hold(mad
         del hook
         gc.collect()
         assert (kept() is not None) == cached
+
+
+def _halved_score(scores):
+    """A module's score hook (the prepared-hook witness's)."""
+    return scores * 0.5 + 1.0
+
+
+def test_a_prepared_hook_pickles_as_its_source_and_is_rebuilt_by_the_constructor_that_made_it():
+    """A prepared hook pickles as its source, rebuilt by the constructor that made it (`Prepared.__reduce__`):
+    one the pass rewrites (`prepared`) runs the pass's form again, one taken as prepared (`prepared_as`) its
+    source itself, each equal to the hook pickled and computing what it did, so a launch a GPU tier part's
+    prepare held is its run's (rows 9582 on: a held launch's score hook refused the truths store)."""
+    import pickle
+
+    scores = jnp.arange(8.0).reshape(2, 4)
+    rewritten, taken = tuning.prepared(_halved_score), tuning.prepared_as(_halved_score)
+    loaded_rewritten, loaded_taken = (pickle.loads(pickle.dumps(made)) for made in (rewritten, taken))
+    assert loaded_rewritten == rewritten and loaded_taken == taken
+    assert loaded_rewritten.run is not loaded_rewritten.source and loaded_taken.run is loaded_taken.source
+    for loaded, made in ((loaded_rewritten, rewritten), (loaded_taken, taken)):
+        assert jnp.array_equal(loaded(scores), made(scores))
