@@ -45,7 +45,7 @@ from dew.batch import Variables
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.precision import at_least_fp32, compensated_add, two_product
+from dew.nn.precision import at_least_fp32, compensated_add, power2, summed_pairs, two_product
 from dew.sampling.solvers.common import given
 
 Pair = tuple[jax.Array, jax.Array]
@@ -312,17 +312,16 @@ def _projected_components(direction, output):
     orders on CPU (default, AVX and SDE-ICX). Raw predictions meet the
     reference-error rule on an RTX 4080. TPU arithmetic has not been measured."""
     dtype = jnp.result_type(direction, output, jnp.float32)
-    vector, conditioned = direction.astype(dtype), output.astype(dtype)
+    whole, conditioned = direction.astype(dtype), output.astype(dtype)
     axes = tuple(range(1, output.ndim))
     shape = (output.shape[0],) + (1,) * (output.ndim - 1)
-    zero = jnp.asarray(0.0, dtype)
     # Finite inputs cannot overflow either dot product before the quotient removes their scale.
-    vector, vector_exponent = _row_scaled(vector)
+    vector, vector_exponent = _row_scaled(whole)
     conditioned, output_exponent = _row_scaled(conditioned)
-    floor = jnp.ldexp(jnp.asarray(1e-24, dtype), -2 * output_exponent)
+    floor = power2(jnp.asarray(1e-24, dtype), -2 * output_exponent)
 
     def summed(left, right):
-        high, low = jax.lax.reduce(two_product(left, right), (zero, zero), compensated_add, axes)
+        high, low = summed_pairs(two_product(left, right), axes)
         return high.reshape(shape), low.reshape(shape)
 
     numerator, numerator_lo = summed(vector, conditioned)
@@ -337,19 +336,28 @@ def _projected_components(direction, output):
     parallel, parallel_lo = two_product(quotient, conditioned)
     parallel_lo = parallel_lo + correction * conditioned
     orthogonal, orthogonal_lo = compensated_add((vector, jnp.zeros_like(vector)), (-parallel, -parallel_lo))
-    orthogonal = jnp.ldexp(orthogonal + orthogonal_lo, vector_exponent).astype(output.dtype)
-    parallel = jnp.ldexp(parallel + parallel_lo, vector_exponent).astype(output.dtype)
+    orthogonal = power2(orthogonal + orthogonal_lo, vector_exponent)
+    # A lane the row's scaling put below the least normal takes its remainder at its own scale, the parallel
+    # pair restored to it, so the direction's lane is its own there on every device, where over the scaled
+    # row it was subnormal, flushed on a CPU and kept on a GPU (`+2^-7` against `-2^-7` at a lane of `2^-7`
+    # beside `2^120`, row 9710); every other lane over the scaled row, whose subtraction cannot overflow.
+    below = jnp.abs(vector) < jnp.finfo(dtype).tiny
+    restored = (power2(parallel, vector_exponent), power2(parallel_lo, vector_exponent))
+    own, own_lo = compensated_add((whole, jnp.zeros_like(whole)), (-restored[0], -restored[1]))
+    orthogonal = jnp.where(below, own + own_lo, orthogonal).astype(output.dtype)
+    parallel = power2(parallel + parallel_lo, vector_exponent).astype(output.dtype)
     return orthogonal, parallel
 
 
 def _row_scaled(vector: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Each row of `vector` over 2**exponent, its largest entry's power of two where that passes one, and
     the exponent: powers of two move the exponent exactly, so a row's products and squares formed over
-    the scaled row cannot overflow where what they form is finite."""
+    the scaled row cannot overflow where what they form is finite. Scaled by `precision.power2`, the one
+    owner of a power of two (row 8971's guidance half)."""
     axes = tuple(range(1, vector.ndim))
     _, exponent = jnp.frexp(jnp.max(jnp.abs(vector), axis=axes, keepdims=True))
     exponent = jnp.maximum(exponent, 0)
-    return jnp.ldexp(vector, -exponent), exponent
+    return power2(vector, -exponent), exponent
 
 
 def _clipped(vector: jax.Array, threshold: float) -> jax.Array:
@@ -358,7 +366,8 @@ def _clipped(vector: jax.Array, threshold: float) -> jax.Array:
     finite row whose norm passes the dtype's largest is still clipped to its threshold."""
     scaled, exponent = _row_scaled(vector)
     norm = jnp.sqrt(jnp.sum(jnp.square(scaled), axis=tuple(range(1, vector.ndim)), keepdims=True))
-    return vector * jnp.minimum(1.0, jnp.ldexp(jnp.asarray(threshold, vector.dtype), -exponent) / norm)
+    limit = power2(jnp.asarray(threshold, vector.dtype), -exponent)
+    return vector * jnp.minimum(1.0, limit / norm)
 
 
 @struct.dataclass

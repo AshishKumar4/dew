@@ -28,6 +28,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _rows,
     _Spans,
     column_share,
+    head_layout,
+    head_slice,
     held_params,
     issued_into,
     modelled,
@@ -135,8 +137,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     shape = (tiles.block_q, tiles.block_k)
     k_slot = slots["keys"]
     k_first = (index if tile is None else tile(index)) * tiles.block_k
-    s = family.product(q, k_slot.transpose((1, 0)), shape)
-    dp = family.product(do, slots["values"].transpose((1, 0)), shape)
+    s, dp = family.product_pair(q, k_slot.transpose((1, 0)), do, slots["values"].transpose((1, 0)), shape)
     slots.release("values")
     params = params_of(s, k_first=k_first, slots=slots)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
@@ -328,7 +329,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                     streams, ((step, lo, hi),), start, ((block_q, share[1]),) * (2 if walk.accurate else 1),
                     walk.interpret, first=counted))
             dq, *keyed = accumulated
-            rows = (row, pl.ds(first, block_q), head)
+            rows = head_slice(family, row, head, pl.ds(first, block_q))
             written = [(dq, dq_ref.at[rows])]
             if keyed_ref is not None:
                 written.append((keyed[0], keyed_ref.at[rows]))
@@ -360,12 +361,12 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after),
                       **products)
-
     # Its outputs as its query's axes (`outputs.Output`): dQ's share of the columns, and its rows' statistics.
     rows, positions, heads_of = (outputs.axis(query, index) for index in range(3))
-    sums = outputs.output(jnp.float32, rows, positions, heads_of, column_share(query, share[1]))
+    sums = outputs.output(jnp.float32, *head_slice(family, rows, heads_of, positions),
+                          column_share(query, share[1]))
     stats_shape = outputs.output(jnp.float32, rows_count, rows, heads_of, positions)
-    out = family.kernel(
+    launch = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=walk.approx_math,
@@ -377,7 +378,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         cost=stated(walk.spec, batch, heads, query, key, value, dout,
                     tile_walk=TileWalk((queries, key.shape[1]), (block_q, block_k), consumers,
                                        common=family.feeds_itself)),
-        model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))(
-            query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
+        model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))
+    query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
+    out = launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
-    return dq, keyed, rows
+    return head_layout(family, dq), None if keyed is None else head_layout(family, keyed), rows

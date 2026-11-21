@@ -203,6 +203,12 @@ def pytest_runtest_makereport(item, call):
         report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
                                                       f"computes before its first check-1 site, at {where}: "
                                                       "its run runs it unprepared")
+    elif call.when == "call" and judged_on_zeros(call.excinfo):
+        # A check of what its prepared sites and arms gave, each finished: zeros in a prepare, which judges
+        # nothing (`judged_on_zeros`); its run judges it, as a flow's cell's (`gpu_flow._deferred`).
+        report = outcome.get_result()
+        report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
+                                                      "checked its prepare's zeros: its run judges it")
     # A map task's sites of this test, written as its manifest once its call is done, whatever it ended in
     # (`map_judge.manifested`): its judge judges the test from them. Only a test that loaded the map judge
     # reached a site.
@@ -308,15 +314,39 @@ def pytest_runtest_setup(item):
         # other in the lane's; both select a file's tests alike, so the tier cuts its groups alike.
         pytest.skip("runs in the lane's process" if users else "runs in a process that computes as a user's "
                     f"does ({lane_environment.USERS_ARITHMETIC}=1)")
-    if tier_wire.preparing():
-        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there, and every
-        # other test of the part's files compiles its check-1 sites' programs (`compiled_ahead`), however it
-        # is marked: the part's run runs each of them on its GPU. One that prepares none runs in the run.
-        return
-    for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
+    # A GPU part's prepare, on its node's CPU (tests/model_flows.py), skips what the part's run skips on its
+    # GPU, a test marked for another backend (a TPU's, the CPU lane's): a flow prepares there, and every other
+    # test of the part's files compiles its check-1 sites' programs (`compiled_ahead`), the run running each
+    # of them on its GPU; one that prepares none runs in the run. Prepared where its run skips it, a test
+    # computed there and was filed unprepared (row 10169's cells, the TPU's ways of test_algebra_scaled).
+    here = "gpu" if tier_wire.preparing() else jax.default_backend()
+    for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu"), ("cpu", "the CPU lane")):
         marker = item.get_closest_marker(backend)
-        if marker and jax.default_backend() != backend:
+        if marker and here != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
+    # A behavioral GPU test with no check-1 site, its programs compiled where its run reaches them (a training
+    # run, a save across two meshes: values its own steps compute steer what it compiles next), declares so
+    # (`compiles_at_run`, its reason): its part's prepare, whose device computes nothing, has nothing of it to
+    # compile ahead and skips it, where its first computation was filed as a check-1 site's prepare missed
+    # (rows 8310, 8097); its run runs it as any test's.
+    if tier_wire.preparing() and (declared := item.get_closest_marker("compiles_at_run")) is not None:
+        pytest.skip(f"compiles at run: {declared.kwargs['reason']}")
+
+
+def judged_on_zeros(excinfo) -> bool:
+    """Whether a test's failure (`excinfo`, None where it passed) is a check of what its GPU tier part's
+    prepare gave, in a prepare whose every site and arm the test began finished (`truths_ahead.COMPILED`'s
+    `tried` and `done`): an assertion, its programs all compiled, over the zeros a prepared arm gives in a
+    prepare (`reference_error.ahead_arm`), which judges nothing, its run judging it (rows 10169 on: a cell
+    asserting a product's value failed its file's prepare). A missing program (`truths_ahead.MissingTruth`) is
+    no such check, nor a failure before any site or arm (`pytest_runtest_makereport`'s unprepared)."""
+    if excinfo is None or not tier_wire.preparing() or not excinfo.errisinstance(AssertionError):
+        return False
+    import truths_ahead
+
+    store = truths_ahead.COMPILED.get()
+    return (not excinfo.errisinstance(truths_ahead.MissingTruth) and store is not None and store.prepare
+            and bool(store.tried) and store.tried <= store.done)
 
 
 def _sites_store(item) -> Path | None:
@@ -418,17 +448,26 @@ MAPPINGS_BUDGET = (int(Path("/proc/sys/vm/max_map_count").read_text()) // 2
                    if Path("/proc/sys/vm/max_map_count").exists() else None)
 """The mappings past which a test's end releases the compiled executables (`released_past_budget`): half
 the kernel's limit, leaving the next test the other half to compile in; None where no limit is listed."""
+STATM = Path("/proc/self/statm")
+"""This process's memory pages, resident second, where Linux lists them."""
+RSS_BUDGET = 4 * 1024 ** 3
+"""The resident bytes past which a test's end releases the compiled executables (`released_past_budget`):
+under half of armada's 10 GiB container, so no file accumulates executables to an OOM kill
+(test_capability_matrix.py peaked at 4.6 GB without per-test release; test_attention_algebra.py and
+test_contracts_attention.py hit 10 GiB)."""
 
 
 def release() -> None:
     """Release every compiled executable JAX holds, and the code XLA mapped for it, the float64 terms
     walk's traces and compiled runs among them (`float64_terms.released`, where a test loaded the walk),
-    and those Dew's own programs keep past jit's caches (`dew.nn.kernels.options.release`)."""
-    from dew.nn.kernels import options
-
+    and those Dew's own programs keep past jit's caches (`dew.nn.kernels.options.release`, where a test
+    loaded the kernels: importing them here would make every file's run execute the kernel toolkit's
+    modules, each file's cache key then moving with every edit to them; trains 1107 and 1108 kept 0 of
+    4,324 rows so)."""
     if (terms := sys.modules.get("float64_terms")) is not None:
         terms.released()
-    options.release()
+    if (options := sys.modules.get("dew.nn.kernels.options")) is not None:
+        options.release()
     jax.clear_caches()
     gc.collect()
 
@@ -452,19 +491,23 @@ def release_compilations():
 def fresh_held_steps():
     """Each test plans its steps as a fresh process does: the step executables an earlier test's trainers
     compiled, which the process holds across trainers (`dew.nn.kernels.options.hold`), are dropped as it
-    begins, so what a test's start compiles is its own."""
-    from dew.nn.kernels import options
-
-    options.unhold()
+    begins, so what a test's start compiles is its own. None is held before a test loaded the kernels, and
+    importing them here would make every test's run execute the kernel toolkit (`release`)."""
+    if (options := sys.modules.get("dew.nn.kernels.options")) is not None:
+        options.unhold()
 
 
 @pytest.fixture(autouse=True)
 def released_past_budget():
-    """A test that leaves the process past `MAPPINGS_BUDGET` mappings releases them as it ends, so no file
-    compiles its way to the limit: test_serving.py alone reached 64,581 of armada's 65,530 and failed its
-    next compile ("LLVM compilation error: Cannot allocate memory"); held to the budget it peaked at
-    32,683 and passed. Reading the list takes a few milliseconds at the budget."""
+    """A test that leaves the process past `RSS_BUDGET` resident bytes or `MAPPINGS_BUDGET` mappings
+    releases compiled executables as it ends, so no file compiles its way to an OOM kill or the mapping
+    limit: test_serving.py alone reached 64,581 of armada's 65,530 mappings and failed its next compile
+    ("LLVM compilation error: Cannot allocate memory"); held to the budget it peaked at 32,683 and passed.
+    Reading `/proc/self/statm` takes microseconds and `/proc/self/maps` a few milliseconds at the budget."""
     yield
+    if STATM.exists() and int(STATM.read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE") > RSS_BUDGET:
+        release()
+        return
     if MAPPINGS_BUDGET is not None:
         with MAPPINGS.open("rb") as mapped:
             if sum(1 for _ in mapped) > MAPPINGS_BUDGET:
@@ -632,3 +675,12 @@ def cache_worker():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_address[1]}", stored, seen
     server.shutdown()
+
+
+@pytest.fixture
+def libtpu_shared(monkeypatch):
+    """libtpu loaded in this process beside another's: its lock file holds one process's libtpu at a time,
+    so two test workers compiling for a TPU at once failed the second's load (ABORTED, /tmp/libtpu_lockfile).
+    A compile-only TPU needs no device a lock guards, so each loads with libtpu's own allowance and takes no
+    lock file."""
+    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")

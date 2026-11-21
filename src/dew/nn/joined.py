@@ -39,7 +39,7 @@ from .kernels import gemm, generation
 from .kernels.generation import INHERENT, Choice, device_generation
 from .kernels.projections import kernel_path, mapped_shards, recipe_takes, shard_placement
 from .kernels.selection import Kernel, KernelRefused, Op, Requirement, forced, select
-from .sharding import on_shards, seen_whole
+from .sharding import automatic_axes, on_shards
 
 
 @dataclasses.dataclass(frozen=True)
@@ -424,7 +424,7 @@ class BesideCase:
         # Seen whole where a placement maps the rows, else where the rows and every kernel are, as `gemm`'s
         # forward and input gradient read them (head review of b68fc2382: replicated rows by a varying kernel
         # in a shard_map took no compound launch there).
-        whole = placement is not None or all(map(seen_whole, (inputs, *kernels)))
+        whole = placement is not None or not automatic_axes()
         with _launching(self.plan.named):
             try:
                 return gemm.side_by_side(rows, matrices, inputs.dtype, self.plan.precision, whole=whole)

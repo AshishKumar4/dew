@@ -2399,3 +2399,43 @@ def test_an_unrounded_fused_backward_keeps_its_key_and_value_gradients_fp32_inte
     for grad in (grads.key, grads.value):
         assert grad.dtype == jnp.float32
         assert np.any(np.asarray(grad) != np.asarray(grad.astype(jnp.bfloat16).astype(jnp.float32)))
+
+
+def test_hopper_forward_derives_consumer_count_from_analytic_launch_price():
+    """Hopper's forward derives its consumer count by pricing each legal count's main launch through
+    `emission.work_of` and `cost.walked` / `cost.seconds` rather than hardcoding `derived_consumers`
+    (row 6710): on M-ET-79's causal cells (8 heads, 1024 tokens, widths 64 and 128), three consumers'
+    analytic launch price exceeds two consumers', so `derived` picks two."""
+    from dew.nn.kernels.templates import mosaic, mosaic_sm90
+
+    assert not hasattr(mosaic.Family, "derived_consumers")
+    assert not hasattr(mosaic_sm90.WGMMA, "derived_consumers")
+    for width in (64, 128):
+        query = jax.ShapeDtypeStruct((1, 1024, 8, width), jnp.bfloat16)
+        spans = template.spans(1024, 1024, 1, causal=True)
+        with generation.assumed("sm90"):
+            target = generation.gpu_target()
+            op, args = attention_mosaic._forward_call(query, query, query, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+            ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+            chosen = op.derived(ba, target)
+            assert chosen is not None and chosen.consumers == 2
+            three = next(c for c in op.offered(ba, mosaic_sm90.WGMMA, target) if c.consumers == 3)
+            price_two = op._price_config(ba, chosen, target)
+            price_three = op._price_config(ba, three, target)
+            assert price_two is not None and price_three is not None
+            assert price_three > price_two, (width, price_two, price_three)
+
+
+def test_consumer_choice_persists_beside_verdicts_in_tuning_store(tmp_path):
+    """`tuning.store_choice` / `tuning.stored_choice` persist consumer-count choices beside certification
+    verdicts in `_verdicts_path` without clobbering verdicts, and `store_verdict` preserves choices
+    (row 6710)."""
+    verdicts_file = str(tmp_path / "certified_sm90.json")
+    tuning.store_verdict("sm90", "verdict-key", {}, path=verdicts_file)
+    tuning.store_choice("sm90", "choice-key", 2, path=verdicts_file)
+    assert tuning.stored_verdict("sm90", "verdict-key", path=verdicts_file) == {}
+    assert tuning.stored_choice("sm90", "choice-key", path=verdicts_file) == 2
+    # Writing another verdict preserves stored choices in the same file.
+    tuning.store_verdict("sm90", "verdict-key-2", {}, path=verdicts_file)
+    assert tuning.stored_choice("sm90", "choice-key", path=verdicts_file) == 2

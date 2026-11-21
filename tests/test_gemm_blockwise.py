@@ -12,7 +12,7 @@ import pytest
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, projections, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import tiling
 
 
 @pytest.mark.parametrize("groups", ["1", "4"])
@@ -46,7 +46,7 @@ def test_a_blockwise_fp8_products_launch_reads_its_pin():
     case = {"columns": "128", "groups": "1"}
     sizes = blockwise_matrix._sizes(1)
     operands = blockwise_matrix._operands(case, 0)
-    untakeable = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family='mma.sync')
+    untakeable = tiling.Tiles(128, 128, 128, 2, 1, family='mma.sync')
 
     def product(*operands):
         return gemm.blockwise_fp8_product(*operands[:2], sizes, *operands[2:], out_dtype=jnp.float32,

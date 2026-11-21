@@ -30,6 +30,8 @@ cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA,
 accumulator only where the epilogue's VJP reads it.
 """
 
+from __future__ import annotations
+
 import contextlib
 import contextvars
 import dataclasses
@@ -48,14 +50,14 @@ from jax.custom_derivatives import zero_from_primal
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
-from dew.nn.kernels.templates import axes as side_axes_of, mosaic_sm100
+from dew.nn.kernels.templates import axes as side_axes_of
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import mosaic_gpu, scattered
+from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import called, read_by
-from dew.nn.sharding import seen_whole
+from dew.nn.sharding import automatic_axes
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 """The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
@@ -79,13 +81,13 @@ def unbuilt():
         _UNBUILT.reset(token)
 
 
-def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None = None, *,
+def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4, group_sizes: jax.Array | None = None, *,
          transpose_rhs: bool = False, prologue=None, prologue_operands: tuple = (), epilogue=None,
          epilogue_operands: tuple = (), out_dtype, out_dtypes: tuple | None = None,
          precision: PrecisionLike = None, interpret_on_cpu: bool = False, prologue_jvp=None, compute=None,
          layer: jax.Array | None = None, paired: jax.Array | None = None, gather: jax.Array | None = None,
          scatter: jax.Array | None = None, applied: jax.Array | None = None, named: tuple = (),
-         beside: tuple = (), selected: "generation.Route | None" = None):
+         beside: tuple = (), selected: generation.Route | None = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default (explicitly or
     through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in the kernels: the
@@ -223,7 +225,7 @@ class _Call:
     """The outputs the forward saves under their names (`gemm`'s `named`), in order: its `saved`."""
 
 
-def _pulled(call: "_Call", operands, cotangent, live, saved: tuple = ()) -> tuple:
+def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
     """`gemm`'s reverse mode at `call`: the cotangents of the operands' leaves at `live` (`linear_tangent`'s
     `live_cotangents`), from the outputs' `cotangent`, None for an output no reverse pass reaches."""
     prologue, prologue_axes, epilogue, epilogue_axes = (call.prologue, call.prologue_axes, call.epilogue,
@@ -322,7 +324,7 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
                          f"{lhs.dtype}, not {applied.shape} {applied.dtype}")
 
 
-def _nvfp4_gemm(lhs, matrix: "NvFp4", group_sizes, *, epilogue, epilogue_operands: tuple, out_dtype, layer,
+def _nvfp4_gemm(lhs, matrix: NvFp4, group_sizes, *, epilogue, epilogue_operands: tuple, out_dtype, layer,
                 gather, scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:
     """`gemm` of an NVFP4 `matrix` (a matrix, or a bank of experts' with `group_sizes`, or a stack of banks
     at `layer`: `nvfp4_product`'s fp32 sums times the deferred factor, frozen), its epilogue on them in XLA
@@ -458,7 +460,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                                          sides, tables if tabled else None, out_dtype=jnp.float32,
                                          hooks=hooked, interpret=interpret, promoted=parted.promoted,
                                          dense=dense),
-                parted, whole=seen_whole(lhs) and seen_whole(rhs))):
+                parted, whole=not automatic_axes())):
             def part(left, right, finite, epilogue, prior, axes, dtypes):
                 # A kernel gradient takes no epilogue: the earlier parts' sum is added after. The rows' finite
                 # values are read after their prologue, which rewrites them.
@@ -483,7 +485,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                                         tables if tabled else None, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
-        launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
+        launch = grouped_matmul.launched(*call, product=product, whole=not automatic_axes())
         # A kernel gradient is one product: no launch takes it apart.
         if callable(launch) and not _UNBUILT.get():
             return launch()
@@ -552,7 +554,7 @@ class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
     it on the target (`grouped_matmul.MosaicPackedGmm`), None where it plans none, and its `rows`."""
 
-    tile: mosaic_gpu.Tiles | None
+    tile: tiling.Tiles | None
     rows: int
 
     @property
@@ -740,7 +742,7 @@ class ScaledCase:
     template's launch plans for it on the target (`mosaic_gpu.gmm`'s `step_scales` or `mx_scales`), None
     where it plans none."""
 
-    tile: mosaic_gpu.Tiles | None
+    tile: tiling.Tiles | None
 
 
 BLOCKWISE_FP8: selection.Op[ScaledCase] = selection.Op(generation.Choice.BLOCKWISE_FP8, (
@@ -822,7 +824,7 @@ def _abstract(*arrays) -> tuple:
     return tuple(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in arrays)
 
 
-def _planned(launch, bound) -> mosaic_gpu.Tiles | None:
+def _planned(launch, bound) -> tiling.Tiles | None:
     """The tile `launch` plans for the call it is `bound` to on the target (its derived tile, its allocations
     its kernel's), None where it takes none."""
     target = generation.gpu_target()
@@ -900,6 +902,8 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     (tcgen05's load warp's, row 1376) and their block scales the same table's rows of `lhs.scales`, gathered
     as every call's scales are laid out anew for the products (`mosaic_sm100.scales_tiled`), a sixteenth or a
     thirty-second of the rows' bytes (row 4851)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
@@ -969,7 +973,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
           precision: PrecisionLike, dense: bool = False, paired: jax.Array | None = None,
           first: jax.Array | None = None, gather: jax.Array | None = None, scatter: jax.Array | None = None,
           summed_as: tuple = (), joined: jax.Array | None = None, beside: tuple = (), chained: tuple = (),
-          selected: "generation.Route | None" = None):
+          selected: generation.Route | None = None):
     """`gemm`'s value, on grouped operands; `summed_as`, the outputs of the product whose accumulator it
     recomputes (a reverse pass's, at fp32), whose sums it repeats (`product.promoted`: an fp32 output's
     exact sums, a 16-bit one's not); `first`, a stacked `rhs`'s matrix its first group reads
@@ -988,7 +992,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         # theirs rounded to it, as the product multiplies them.
         holds = jnp.promote_types(rhs.dtype, lhs.dtype) == jnp.dtype(lhs.dtype)
         counts = _part_counts(lhs.dtype, rhs.dtype if holds else lhs.dtype, precision)
-        whole = seen_whole(lhs) and all(map(seen_whole, (rhs, *beside)))
+        whole = not automatic_axes()
         if (counts is not None and prologue is None and paired is None and scatter is None and not several
                 and not chained and _parts_launched(*_gemm_call(
                     lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), group_sizes, None, (), (), epilogue,
@@ -1160,7 +1164,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                if d is not None]
     entrywise = _entrywise(lhs, prologue, prologue_arrays, prologue_axes, plain)
     wide, d_operand = at_least_fp32(lhs.dtype), None
-    whole = all(seen_whole(each) for pair in reached for each in pair)
+    whole = not automatic_axes()
     taken = (None if entrywise
              else _one_launch(reached, group_sizes, lhs.dtype, prologue, options, whole=whole))
     if taken is not None:
@@ -1256,18 +1260,17 @@ def _added(acc, prior):
 
 
 def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *,
-                 whole: bool) -> "generation.Route | None":
+                 whole: bool) -> generation.Route | None:
     """The forward's route where a launch takes `rows` (`[rows, depth]`) by `matrices` side by side (`gemm`'s
     `beside`, each `[depth, width]`, one output each in `out_dtype`) as `gemm` binds them, else None: their
-    forward, or their input gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's
-    launch read unreported: the forward and the input gradient independent choices, but a forward that would
-    not run (a pin's refusal of it) none, a named kernel's refusal raised (`selection.KernelRefused`, as
-    `gemm` would raise it). The route, decided unreported
-    (`selection.decided`), is the one the call runs and reports where its caller hands it on (`gemm`'s
-    `selected`), the call selected once (base review b68fc2382 F5). The operands abstract
-    (`jax.ShapeDtypeStruct`) or arrays, `whole` whether a launch sees them whole (`seen_whole`; a device's
-    own rows where the caller maps them per shard): a layer's choice of the side-by-side product over its
-    projections apart (`dew.nn.joined.side_by_side`)."""
+    forward, or their input gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's launch
+    read unreported: the forward and the input gradient independent choices, but a forward that would not run
+    (a pin's refusal of it) none, a named kernel's refusal raised (`selection.KernelRefused`, as `gemm` would
+    raise it). The route, decided unreported (`selection.decided`), is the one the call runs and reports where
+    its caller hands it on (`gemm`'s `selected`), the call selected once (base review b68fc2382 F5). The
+    operands abstract (`jax.ShapeDtypeStruct`) or arrays, `whole` whether a launch sees them whole (no
+    automatic mesh axis splits them; a device's own rows where the caller maps them per shard): a layer's
+    choice of the side-by-side product over its projections apart (`dew.nn.joined.side_by_side`)."""
     sizes = jnp.full((1,), rows.shape[0], jnp.int32)
     grouped = tuple(jax.ShapeDtypeStruct((1, *matrix.shape), matrix.dtype) for matrix in matrices)
     dtypes = (jnp.dtype(out_dtype),) * len(matrices)
@@ -1299,7 +1302,7 @@ def _one_launch(reached: list, group_sizes, dtype, prologue, options: dict, *, w
     transpose order (`chained`: projections side by side of their own widths, `beside`, row 8282), its
     derivation refusing depths of no whole steps (`mosaic_gpu.chained_refusal`). Cotangents of one dtype and
     no gathered rows; elsewhere each product runs as before, the next adding it in its epilogue. `whole`,
-    whether a launch sees the operands whole (`seen_whole`)."""
+    whether a launch sees the operands whole (no automatic mesh axis splits them)."""
     if options['gather'] is not None or len({d.dtype for d, _ in reached}) > 1:
         return None
     forms = []
@@ -1331,7 +1334,7 @@ def _launch_route(d, matrix, form: dict, group_sizes, dtype, prologue, options: 
     return _mosaic_route(call, product, whole)
 
 
-def _mosaic_route(call: tuple, product, whole: bool) -> "generation.Route | Literal[False]":
+def _mosaic_route(call: tuple, product, whole: bool) -> generation.Route | Literal[False]:
     """The route `grouped_matmul.GROUPED` selects Mosaic GPU's launch for `call` (`_gemm_call`'s: products
     in one launch, `side_by_side`'s and `_one_launch`'s) of `product` by, its operands seen `whole`, decided
     and reported nowhere (`selection.decided`: the dispatch that runs it publishes it), else False: another
@@ -1380,7 +1383,7 @@ def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed
                                    precision=options['precision'], dense=options['dense'], paired=None,
                                    first=options['first'], gather=options['gather'], scatter=None,
                                    summed_as=summed_as)
-        case = grouped_matmul.grouped_case(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
+        case = grouped_matmul.grouped_case(*call, product=product, whole=not automatic_axes())
         try:
             kernels.append(selection.selected(grouped_matmul.GROUPED, case).name)
         except selection.KernelRefused:
@@ -1440,7 +1443,7 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
         call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), sizes, after, None, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
-        case = grouped_matmul.grouped_case(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
+        case = grouped_matmul.grouped_case(*call, product=product, whole=not automatic_axes())
         try:
             kernels.append(selection.selected(grouped_matmul.GROUPED, case).name)
         except selection.KernelRefused:
@@ -1589,6 +1592,8 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     (`mosaic_gpu.joined_sum`, the launch's own finish) where no epilogue is given; with `beside`, each of
     those matrices' products too, an output each; with `chained`, each `(rows, matrix)` product too, each
     summed apart and added in order into the one output (the plain program's sum)."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
     transpose_rhs, precision, compute, dense = (config.transpose_rhs, config.precision, config.compute,
                                                 config.dense)
     if first is not None:

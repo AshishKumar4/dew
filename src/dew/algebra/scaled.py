@@ -15,11 +15,11 @@ where a tangent passed its primal by the format's range and flushed where it fel
 value's, a coefficient's tangent flushed beside the terms it cancels against: the degenerate sweep,
 `tests/test_algebra_scaled_edges.py`), so a law over scaled values states its derivatives as one of its
 own operations whose derivative is that operation again, its tangents its float operands' and its values'
-(`dew.algebra.means.ratio_p`). Its primitives (`split_p`, `applied_p`) carry no derivative rule: a program
+(`dew.algebra.ratios.ratio_p`). Its primitives (`split_p`, `applied_p`) carry no derivative rule: a program
 differentiating one is refused by JAX, never silently differentiated through `frexp`. A subnormal operand
 is read from its bits, its value kept where XLA:CPU's arithmetic flushes it (`scaled`), and a zero is +0:
 no scaled value, nor a float the construct lands (`applied`, `landed`: a flushed landing's too), holds a
-zero's sign, which no law over them reads (a ratio lands its zero +0, `means.Ratio`)."""
+zero's sign, which no law over them reads (a ratio lands its zero +0, `ratios.Ratio`)."""
 
 from __future__ import annotations
 
@@ -153,7 +153,7 @@ def _valued(parameter) -> bool:
         return all(map(_valued, parameter))
     if dataclasses.is_dataclass(parameter):
         # The parameters `dataclasses` kept on the nearest class it made, beside its fields; each field a
-        # value too (a law's form holding the units a call passed, `means.Ratio`).
+        # value too (a law's form holding the units a call passed, `ratios.Ratio`).
         frozen = next(vars(made)["__dataclass_params__"] for made in type(parameter).__mro__
                       if "__dataclass_params__" in vars(made)).frozen
         fields = dataclasses.fields(parameter)
@@ -182,6 +182,22 @@ MADE: dict[core.Primitive, tuple[Callable, bool]] = {}
 value, the function its default lowering runs, and whether it returns several values, by the primitive,
 so a lowering of a launch that runs the construct's functions (a kernel template's) holds each as it is
 made."""
+_TRITON_REGISTERED: set[core.Primitive] = set()
+
+
+def triton_lowerings() -> None:
+    """Register Pallas Triton lowerings for every primitive in `MADE` not yet registered (row 9794).
+    Called lazily on Pallas launch (`dew.nn.kernels.launches.pallas_call`) so importing `scaled` loads no
+    Pallas Triton lowering machinery."""
+    if len(_TRITON_REGISTERED) == len(MADE):
+        return
+    from jax._src.pallas.triton import lowering as triton_lowering
+
+    for made, (value, several) in MADE.items():
+        if made not in _TRITON_REGISTERED:
+            triton_lowering.register_lowering(made)(triton_lowering.lower_fun(value,
+                                                                              multiple_results=several))
+            _TRITON_REGISTERED.add(made)
 
 
 def _alike(value: Callable) -> Callable:
@@ -206,7 +222,7 @@ def primitive(name: str, value: Callable, typed: Callable, batched: Callable | N
     `dew.algebra.means`): computed by `value` (its lowering, and eagerly one dispatch of it, as JAX's own
     primitives run), typed by `typed`, batched by `batched` (entrywise, by broadcasting, where none is
     named), returning `several` values; a derivative and a transpose, where it has them, registered beside
-    it (`means.ratio_p`). Its parameters are values, held at bind (`_Primitive`); it is recorded with its
+    it (`ratios.ratio_p`). Its parameters are values, held at bind (`_Primitive`); it is recorded with its
     value (`MADE`)."""
     made = _Primitive(name)
     made.multiple_results = several
@@ -352,7 +368,7 @@ def applied(x: jax.typing.ArrayLike, a: Scaled) -> jax.Array:
     through it, the same chain."""
     x, significand, exponent = jnp.broadcast_arrays(jnp.asarray(x, a.significand.dtype), a.significand,
                                                     a.exponent)
-    return applied_p.bind(x, significand, exponent, reach=a.reach)
+    return applied_p.bind(x, significand, exponent)
 
 
 def landed(a: Scaled) -> jax.Array:
@@ -360,12 +376,11 @@ def landed(a: Scaled) -> jax.Array:
     return applied(jnp.ones_like(a.significand), a)
 
 
-def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array, reach: int) -> jax.Array:
+def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array) -> jax.Array:
     """`applied`'s product: the factors of one direction (`applied`'s account), the powers of two first and
     the significand last, so its transpose takes a cotangent by the significand first: a zero coefficient's
     cotangent is zero before any power reaches it. Uses `precision.power2`'s default saturating
     single-rounding form (never the two-factor half-split), so a gradual-underflow backend rounds once."""
-    del reach
     growing = exponent >= 0
     last = jnp.where(growing, significand, 0.5 * significand)
     rest = jnp.where(growing, exponent, exponent + 1)
@@ -376,9 +391,9 @@ def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array, reach: int
 
 applied_p = primitive(
     "scaled_applied", _chain,
-    lambda x, significand, exponent, *, reach: entrywise(x, significand, integers=(exponent,)))
-"""`x * significand * 2^exponent` entrywise (`_chain`, `reach` the exponent's bound), an operation of its own,
-a value's alone (the module's account)."""
+    lambda x, significand, exponent: entrywise(x, significand, integers=(exponent,)))
+"""`x * significand * 2^exponent` entrywise (`_chain`), an operation of its own, a value's alone (the
+module's account)."""
 
 
 def entrywise(x, *others, integers=()):
@@ -410,6 +425,15 @@ def varying(typed, *read):
     return typed.update(manual_axis_type=typed.mat.update(varying=axes))
 
 
+def compensated_pair(a: jax.Array, a_error: jax.Array, b: jax.Array, b_error: jax.Array
+                     ) -> tuple[jax.Array, jax.Array]:
+    """One step of a compensated sum's cascade: two partial sums added exactly (`precision.two_sum`), the
+    rounded sum and its error carried with the halves' errors, `error + a_error + b_error` in that order.
+    The one pair step `compensated` and a sum over an axis in halves (`dew.algebra.means`) take."""
+    summed, error = two_sum(a, b)
+    return summed, error + a_error + b_error
+
+
 def compensated(terms: Sequence[jax.Array]) -> tuple[jax.Array, jax.Array]:
     """`terms`' sum (each an array of one shape), compensated, in pairs: a tree over their order, each
     pair's sum exact (`precision.two_sum`, a span the algebra pass keeps as written) and its error carried
@@ -427,9 +451,9 @@ def compensated(terms: Sequence[jax.Array]) -> tuple[jax.Array, jax.Array]:
     while len(parts) > 1:
         paired, carried = [], []
         for at in range(0, len(parts) - 1, 2):
-            summed, error = two_sum(parts[at], parts[at + 1])
+            summed, error = compensated_pair(parts[at], errors[at], parts[at + 1], errors[at + 1])
             paired.append(summed)
-            carried.append(error + errors[at] + errors[at + 1])
+            carried.append(error)
         if len(parts) % 2:
             paired.append(parts[-1])
             carried.append(errors[-1])

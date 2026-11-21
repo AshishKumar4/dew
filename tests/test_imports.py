@@ -166,9 +166,44 @@ FOREIGN |= {"dew.registry": (
     "dew.optim")}
 # A model's quantization, which loading, adapters and serving read, starts no trainer; the conditioning inputs
 # read no release's storage, the encoders that bind a released checkpoint dew.interop's (row 5996).
+# A Dense layer's projection routes its launch by its selector, which imports the template toolkit where a
+# launch runs, not as it loads: an edit to the toolkit re-runs none of a Dense layer's tests (the test cache's
+# executed units; train 1108 re-ran 3,891 rows for one, 518 of 759 files loading the toolkit).
+FOREIGN |= {"dew.nn.dense": tuple(f"dew.nn.kernels.templates.{name}" for name in (
+    "mosaic", "bundles", "fed", "rings", "bodies", "mosaic_sm80", "mosaic_sm90", "mosaic_sm100", "mosaic_tpu",
+    "gemm.mosaic_gpu"))}
 FOREIGN |= {"dew.quantization": ("dew.training",),
             **dict.fromkeys(("dew.inputs.condition", "dew.inputs.diffusion", "dew.inputs.encoders",
-                             "dew.inputs.spec"), ("dew.interop",))}
+                             "dew.inputs.spec"), ("dew.interop",)),
+            # Primitive owners register Pallas Triton lowerings lazily on first pallas_call (row 9794).
+            **dict.fromkeys(("dew.nn.precision", "dew.nn.derivatives"), ("jax._src.pallas.triton",))}
+
+# An activation's every user (a schedule's flow among them) loads no kernel until it asks a fused product
+# (`dew.nn.activations.gated_product`), so a toolkit edit re-keys none of its tests (row 6740's cache warmth).
+FOREIGN |= {"dew.nn.activations": ("dew.nn.kernels",)}
+# Attention routing and linear layers load no GPU template mainloop or ring machinery on import: the
+# mainloops import inside the functions that derive or launch them (FS-IMPORT-CHAIN).
+_ATTENTION_MAINLOOPS = (
+    "dew.nn.kernels.templates.mosaic",
+    "dew.nn.kernels.templates.bundles",
+    "dew.nn.kernels.templates.rings",
+    "dew.nn.kernels.templates.bodies",
+    "dew.nn.kernels.templates.attention_mosaic",
+    "dew.nn.kernels.templates.attention_decode",
+    "dew.nn.kernels.templates.attention_triton",
+    "dew.nn.kernels.templates.attention_portable",
+)
+FOREIGN |= dict.fromkeys(
+    ("dew.nn.attention", "dew.nn.attention_kernels", "dew.nn.kernels.templates.attention_route",
+     "dew.nn.kv_cache"),
+    _ATTENTION_MAINLOOPS,
+)
+
+
+# The bundles a GPU launch composes load no TPU toolkit: Mosaic TPU's bundle loads where a TPU launch composes
+# it, so a TPU template's edit re-keys none of the GPU and CPU tests that compose a GPU bundle (2,592 of them
+# in train 1126's cache keys).
+FOREIGN |= {"dew.nn.kernels.templates.bundles": ("dew.nn.kernels.templates.mosaic_tpu",)}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))

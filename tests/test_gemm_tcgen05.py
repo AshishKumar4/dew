@@ -15,23 +15,23 @@ from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation, grouped_launch, grouped_matmul, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 
-TILE = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+TILE = tiling.Tiles(128, 128, 64, 4, 1, family='tcgen05')
 """A legal tcgen05 tile of every product `_on_tcgen05` pins (`tuning.pinned`): a CTA's 128 rows by 128
 columns, four 64-deep stages."""
-TILES = (mosaic_gpu.Tiles(128, 128, 64, 2, 1, family='tcgen05'),
-         mosaic_gpu.Tiles(128, 256, 64, 3, 2, family='tcgen05'))
+TILES = (tiling.Tiles(128, 128, 64, 2, 1, family='tcgen05'),
+         tiling.Tiles(128, 256, 64, 3, 2, family='tcgen05'))
 """A tile of each accumulator width, its accumulators within the 512 columns of tensor memory, its ring within
 a B200's shared memory beside two outputs' staging (four stages asked 245,900 of its 232,448 bytes,
 gate-2738-gemm-b200, row 4449)."""
-DEEP = (mosaic_gpu.Tiles(128, 128, 64, 6, 1, family='tcgen05'),
-        mosaic_gpu.Tiles(128, 64, 64, 8, 1, family='tcgen05'))
+DEEP = (tiling.Tiles(128, 128, 64, 6, 1, family='tcgen05'),
+        tiling.Tiles(128, 64, 64, 8, 1, family='tcgen05'))
 """The compile-ahead step's two spilling pins (row 5358): the deepest ring a 128-column tile's shared memory
 holds, which spilled 56 bytes at 248 registers while its epilogue read every tensor-memory chunk at once, and
 an eight-slot ring, whose kernel gradient spilled the predicate file (P2R, STL) holding a predicate a slot
 past a thread's seven (`test_an_eight_slot_kernel_gradient_compiles_within_its_predicates`)."""
-PAIRED = mosaic_gpu.Tiles(128, 128, 64, 4, 1, cluster=2, family='tcgen05.pair')
+PAIRED = tiling.Tiles(128, 128, 64, 4, 1, cluster=2, family='tcgen05.pair')
 """A pair of CTAs' tile (`mosaic_sm100.PAIR`: 256 x 256, each CTA's accumulators its 128 rows by the pair's
 256 columns). Mosaic GPU's interpreter models no collective tcgen05 product, so it is compiled here and run
 on a B200 (and in nvgpu-lean's simulator) alone."""
@@ -109,7 +109,7 @@ def test_a_blackwell_tiles_sum_holds_every_step_however_its_rotations_fall(depth
     first starts within a rotation, and each step's products add onto the tile's sum but at its first step
     (the tensor-memory accumulator's `accumulate`), over integers from -1 to 1 bitwise numpy's at every
     tile; interpreted as an sm100."""
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+    tiles = tiling.Tiles(128, 128, 64, 4, 1, family='tcgen05')
     keys = jax.random.split(jax.random.key(3), 2)
     x = jax.random.randint(keys[0], (256, depth), -1, 2).astype(jnp.bfloat16)
     w = jax.random.randint(keys[1], (depth, 512), -1, 2).astype(jnp.bfloat16)
@@ -157,7 +157,7 @@ def _draw(seed):
             jnp.asarray(rng.uniform(0.5, 2.0, size=(ROWS,)), jnp.float32))
 
 
-def _epilogued(case: str, tiles: mosaic_gpu.Tiles, *, interpret: bool):
+def _epilogued(case: str, tiles: tiling.Tiles, *, interpret: bool):
     """The shared mainloop at `tiles` running `case`'s epilogue (`EPILOGUES`), over every multiprocessor of
     the GPU (one, interpreted)."""
     sides, epilogue, dtypes = EPILOGUES[case]
@@ -395,7 +395,7 @@ def test_an_exactly_summed_tile_holds_the_registers_its_promotes_hold():
         target = generation.gpu_target()
         ba = launch.bind(bf16((512, 128)), bf16((4, 128, 128)), jax.ShapeDtypeStruct((4,), jnp.int32),
                          out_dtype="float32", trans_rhs=False, interpret=False, exact_sums=True)
-        assert launch.legal(ba, mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=1, family="tcgen05"), target)
+        assert launch.legal(ba, tiling.Tiles(128, 128, 64, 2, 1, warpgroups=1, family="tcgen05"), target)
 
 
 PARTIALS = ((1024, 488, 512, False), (1024, 488, 512, True), (1000, 488, 488, True))

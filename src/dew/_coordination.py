@@ -30,7 +30,6 @@ from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec
 
 from dew._records import JSON
-from dew.nn.kernels.options import program
 
 if TYPE_CHECKING:
     from jax._src.distributed import State
@@ -87,6 +86,11 @@ def _gathered(group: list[jax.Array], held: bool) -> list[np.ndarray] | None:
     arrays are replicated by one computation; a leaf on another sharding
     goes alone through `process_allgather`. A rank that holds nothing still
     completes the computation, which is a collective."""
+    # The compile point read where a mesh's leaves are gathered, never at load: the data readers, inputs and
+    # checkpoints import this module, and the test cache keys a row on every module it loads (the compile
+    # point loads the kernels and the algebra).
+    from dew.nn.kernels.options import program
+
     mesh = _mesh(group[0])
     if mesh is None:
         return [np.asarray(multihost_utils.process_allgather(group[0], tiled=True))]

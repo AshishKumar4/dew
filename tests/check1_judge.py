@@ -94,7 +94,7 @@ def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Calla
                   for index, named in enumerate(verdict.labels))
     for index, named in enumerate(verdict.labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named, power=verdict.powers[index],
-                                          further=further)
+                                          further=further, deferring=verdict.defers_to is not None)
         exact = (None if verdict.library and not index
                  else _exact(drawn_for(index)(0, seeds).theirs))
         _logged(named, stage, _verdict(over, unresolved), narrow_leaves, mode(), exact)

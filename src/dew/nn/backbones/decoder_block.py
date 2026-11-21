@@ -52,7 +52,6 @@ from ..inputs import (
     PredictionPhase,
     routing_blocks,
 )
-from ..kernels.recurrence_chunk import recomputing
 from ..kv_cache import CacheSpec, cache_of
 from ..mlp import GatedMLP
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP, resolved_dispatch
@@ -60,7 +59,7 @@ from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, NormSite, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, projection_role, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
-from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS, Residual
+from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS, Residual, recomputing
 from ..sharding import RESIDUAL, constrain, declared
 
 if TYPE_CHECKING:
@@ -497,7 +496,7 @@ class RematPolicy:
     `offload` names those to move to pinned host memory. Both empty is
     MaxText's `full`. `recompute` instead names the only residuals recomputed,
     each by the layer that computes it (a delta rule its memory,
-    `dew.nn.kernels.recurrence_chunk.RECOMPUTED`), the block running without remat and keeping
+    `dew.nn.residuals.RECOMPUTED`), the block running without remat and keeping
     every other value; it takes neither list. A checkpoint policy cannot
     say it: one that saves anything but a name saves the value the name
     marks from the op that made it.

@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax._src import core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -430,6 +431,9 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
 
                 made = [activations.gated_hook(equation.params["kind"].name)(*operands)]
             else:
+                # As written, a manual mesh's casts among them (`pvary`, its axes the program's): on whole
+                # arrays a cast is the program's own, and a kernel's tile reads it as the value it casts (the
+                # Pallas fuser's rule for it).
                 bound = equation.primitive.bind(*operands, **equation.params)
                 made = list(bound) if equation.primitive.multiple_results else [bound]
             values.update(zip(equation.outvars, made, strict=True))
@@ -457,9 +461,21 @@ def _product(form: Form, operands: list, precision, out_dtype, fused_gemm) -> ja
 
 
 def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
-    """Each of `variables` as its shape and dtype (each a region's value, an array's)."""
-    return [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in variables
-            if isinstance(var.aval, ShapedArray)]
+    """Each of `variables` as its type (each a region's value, an array's, `typed`)."""
+    return [typed(var.aval) for var in variables if isinstance(var.aval, ShapedArray)]
+
+
+def typed(aval: ShapedArray, *, weak: bool = False) -> jax.ShapeDtypeStruct:
+    """`aval` as a type a trace takes: its shape and dtype (its weak type with `weak`), and inside a manual
+    mesh's body, its variance checked or not, its sharding, its manual axis type (the axes it varies over, a
+    reduced or unreduced placement, an outer checked map's an unchecked one inherits) and its weak type, as
+    the body holds them, so a region's call or a window's form traced over them binds its inputs as the
+    body does (row 6578: binders typed the same on every device beside the body's varying values, which JAX's
+    check of the body refused)."""
+    if not jax.sharding.get_abstract_mesh().manual_axes:
+        return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=weak and aval.weak_type)
+    return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type, sharding=aval.sharding,
+                                manual_axis_type=aval.mat)
 
 
 class RegionDecision(NamedTuple):
@@ -513,8 +529,9 @@ def _decided(identity: Hashable, decide: Callable[[], RegionDecision]) -> Region
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     """Whether the region is fused (`fused_gemm.analysis`): its product's launch the template's (its
     selector's choice, or a call's, `generation.chosen`), its prologue and epilogue the kernel's, nothing
-    refused, and its fused seconds less than its unfused ones; and whether its launch may be the template's
-    without its prologue (`RegionDecision`). The prices are a roofline on the part's rates
+    refused, its fused seconds less than its unfused ones, and its launch keeping with them the residency it
+    takes without (`fused_gemm.Analysis.resident`: KERNEL-TEMPLATES-13, row 9032); and whether its launch may
+    be the template's without its prologue (`RegionDecision`). The prices are a roofline on the part's rates
     (each stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a cell where the
     launch measured slower than XLA's dot (`grouped_matmul.DECLARED`, every dense cell: DENSE1, 1.05 to 2.9
     times XLA's) they favour fusion more than measurement does, so a region whose launch the selector gives
@@ -540,8 +557,10 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     # written whole and read back).
     stages = (*routes, *([found.epilogue] if found.epilogue is not None else []))
     priced = found.fused_seconds is not None and found.unfused_seconds is not None
-    return RegionDecision(all(map(kernel, stages)) and priced and found.fused_seconds < found.unfused_seconds,
-                          launchable, launched)
+    # A neighbour joins the kernel only where the kernel with it keeps its residency (KERNEL-TEMPLATES-13, row
+    # 9032: `fused_gemm.Analysis.resident`); refused for it, the region is still weighed without its stages.
+    return RegionDecision(all(map(kernel, stages)) and priced and found.fused_seconds < found.unfused_seconds
+                          and found.resident, launchable, launched)
 
 
 def _xla_whatever_its_prologue(launch) -> bool:
@@ -600,7 +619,7 @@ class _Trace(NamedTuple):
 _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
 
 
-def _traced(region: Written) -> _Trace:
+def _traced(region: Written) -> _Trace | None:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
     its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held
     (`_cache.holding`) while each fact its trace read answers alike (`generation.still`); its routes and
@@ -614,6 +633,12 @@ def _traced(region: Written) -> _Trace:
 
     held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD,
                           still=lambda trace: trace.record.still())
+    # Its outputs the very types the region made (`jax_core.typematch`: shape, dtype, sharding, the manual
+    # axes they vary over), else it is not written, nothing of its trace reported: a value of another type
+    # in its place is a program JAX refuses.
+    if not all(jax_core.typematch(out.aval, made.aval)
+               for out, made in zip(region.outputs, held.equation.outvars, strict=True)):
+        return None
     held.record.replay()
     return held
 
@@ -621,10 +646,13 @@ def _traced(region: Written) -> _Trace:
 def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:
     """`jaxpr` with each of `regions`' equations replaced by one nested program of its call over its inputs
     (`_traced`), its outputs the very values the region made, written at its place."""
-    removed = {place for region in regions for place in region.places}
+    traces = [(region, trace) for region in regions if (trace := _traced(region)) is not None]
+    if not traces:
+        # No region written: the program itself, whose identity JAX shares its lowering by.
+        return jaxpr
+    removed = {place for region, _ in traces for place in region.places}
     written: dict[int, list[jcore.JaxprEqn]] = {}
-    for region in regions:
-        equation, invars, *_ = _traced(region)
+    for region, (equation, invars, *_) in traces:
         renamed = dict(zip(invars, region.inputs, strict=True))
         written.setdefault(region.at, []).append(equation.replace(
             invars=[renamed.get(var, var) if isinstance(var, jcore.Var) else var for var in equation.invars],

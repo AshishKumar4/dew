@@ -346,6 +346,74 @@ def test_a_product_whose_epilogue_the_template_refuses_is_fused_without_it():
     assert last.primitive is jax.lax.mul_p
 
 
+def four_float32_terms(x, w, a, b, c, d):
+    """A projection whose consumers read four float32 arrays of its product's shape: on an A100 its epilogue's
+    side tiles derive the launch at one program a multiprocessor, where the product alone takes two
+    (FS-HOOKED-RES)."""
+    return ((x @ w).astype(jnp.float32) * a + b * c + d).astype(jnp.bfloat16)
+
+
+def one_float32_term(x, w, a):
+    """A projection plus one float32 array of its product's shape, which keeps the launch's programs."""
+    return ((x @ w).astype(jnp.float32) + a).astype(jnp.bfloat16)
+
+
+def test_a_neighbour_costing_the_launch_a_program_stays_outside_it():
+    """A neighbour joins the kernel where the kernel with it keeps its residency (KERNEL-TEMPLATES-13, row
+    9032). On an A100 whose template a call names: a projection whose consumers read four float32 arrays of
+    its product's shape is not fused, though its price favours it, its product the template's launch at the
+    programs a multiprocessor the product alone takes and its consumers XLA's after it; one float32 array,
+    which keeps the launch's programs, is its epilogue."""
+    from dew.nn.kernels import tuning
+
+    x, w = jax.ShapeDtypeStruct((2048, 2560), jnp.bfloat16), jax.ShapeDtypeStruct((2560, 9216), jnp.bfloat16)
+    term = jax.ShapeDtypeStruct((2048, 9216), jnp.float32)
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
+        with tuning.seen() as alone:
+            jax.jit(algebra.rewritten(lambda x, w: x @ w, kernels=True)).trace(x, w)
+        with generation.routes() as found, tuning.seen() as four:
+            terms = (term,) * 4
+            traced = jax.jit(algebra.rewritten(four_float32_terms, kernels=True)).trace(x, w, *terms)
+        fused = [route for route in found if route.choice == "gemm_epilogue" and route.kernel == "fused"]
+        assert not fused, [(route.choice, route.kernel) for route in found]
+        programs = [config.programs for config, _ in four.taken]
+        assert programs and programs == [config.programs for config, _ in alone.taken], (four.taken,
+                                                                                         alone.taken)
+        program = traced.jaxpr.jaxpr
+        (last,) = (equation for equation in program.eqns if set(equation.outvars) & set(program.outvars))
+        assert last.primitive is jax.lax.convert_element_type_p, last.primitive
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(one_float32_term, kernels=True)).trace(x, w, term)
+        assert any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found), [
+            (route.choice, route.kernel) for route in found]
+
+
+def normed_and_terms(x, scale, w, *terms):
+    """An RMS norm feeding a bf16 projection (the norm the product's prologue, as a measured cell times it)
+    whose consumers add float32 arrays of its product's shape (`terms`)."""
+    wide = x.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(wide * wide, axis=-1, keepdims=True) + 1e-6)
+    out = jnp.dot((wide * inverse * scale).astype(x.dtype), w, preferred_element_type=jnp.float32)
+    return sum(terms, out).astype(jnp.bfloat16)
+
+
+def test_a_neighbour_costing_a_selected_launch_a_program_stays_outside_it():
+    """KERNEL-TEMPLATES-13 (row 9032) where the selector, no call, takes the template: on an A100, the normed
+    q/k/v projection of Qwen3.5-0.8B (its prologue's cell measured the template faster, the product unnormed
+    XLA's dot) whose consumers read four float32 arrays of its product's shape is not fused, its launch at one
+    program a multiprocessor where the template's launch of the product alone takes two; with one array,
+    which keeps its programs, it is."""
+    x, scale = jax.ShapeDtypeStruct((12288, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((1024,), jnp.float32)
+    w = jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16)
+    term = jax.ShapeDtypeStruct((12288, 5120), jnp.float32)
+    with generation.assumed("sm80"):
+        for terms, fuses in (((term,) * 4, False), ((term,), True)):
+            with generation.routes() as found:
+                jax.jit(algebra.rewritten(normed_and_terms, kernels=True)).trace(x, scale, w, *terms)
+            fused = any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found)
+            assert fused == fuses, (len(terms), [(route.choice, route.kernel) for route in found])
+
+
 def named_gate(x, w, up):
     """A gate projection named for remat (`checkpoint_name`, as Dew's models name gate_proj) and its SwiGLU
     with `up` after it, the activation written entry by entry (`jax.nn.silu`'s own derivative rule is a call
@@ -467,6 +535,26 @@ def test_a_name_on_a_products_rows_stays_outside_its_prologue():
     assert any(route.choice == "gemm_prologue" and route.kernel == "fused" for route in found), [
         (route.choice, route.kernel) for route in found]
     assert not [equation for equation in traced.jaxpr.jaxpr.eqns if equation.primitive is jax.lax.sin_p]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_product_mapped_per_shard_runs_the_template_and_computes_as_written():
+    """A projection, its bias and a scale (`biased`) mapped per shard (`jax.shard_map` over rows split two
+    ways, each device's program its own rows' product, as `dew.nn.sharding.on_shards` maps a layer) under
+    the pass on an H100 whose template a call names: the map's body is rewritten in the map's own context,
+    so its product runs the template's launch per shard (row 6578: an opaque body ran XLA's dot), and the
+    program computes as written, as every program under the pass does (`assert_equal`)."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows, whole = PartitionSpec("data"), PartitionSpec()
+    mapped = jax.shard_map(biased, mesh=mesh, in_specs=(rows, whole, whole, rows), out_specs=rows)
+    operands = draw()
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
+        assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+        assert_equal(under_the_pass(mapped, *operands), as_written(mapped, *operands))
 
 
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
@@ -1544,3 +1632,31 @@ def test_a_gated_product_across_a_barrier_is_never_fused(barred):
     assert fused and not crossed
     if barred is checkpointed_swiglu:
         assert any(equation.primitive is primitives.remat_p for equation in equations(made.jaxpr.jaxpr))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_products_written_casts_are_replayed_as_written():
+    """A manual mesh's product of row-split operands by a scale and a weight the program cast to vary itself
+    (`pcast`, JAX writing no cast of its own: `jax_auto_pcast` off) under the pass on an H100 whose template
+    a call names: the fusion analysis's replay of the region binds each operand as the program typed it, the
+    casts' results among them (row 6578's review, F2: a cast replayed as the value it cast, the multiply's
+    operands varied apart and JAX refused it), its product the template's launch per shard, and the program
+    computes as written."""
+    from jax._src import config as jax_config
+    from jax.sharding import Mesh, PartitionSpec
+
+    def scaled_product(x, w, scale):
+        scale, w = (jax.lax.pcast(value, ("data",), to="varying") for value in (scale, w))
+        return (x * scale) @ w
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows, whole = PartitionSpec("data"), PartitionSpec()
+    mapped = jax.shard_map(scaled_product, mesh=mesh, in_specs=(rows, whole, whole), out_specs=rows)
+    x, w, *_ = draw()
+    operands = (x, w, jnp.bfloat16(2))
+    with (jax_config.auto_pcast(new_val=False), generation.assumed("sm90"),
+          generation.chosen(grouped_matmul="mosaic")):
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
+        assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+        assert_equal(under_the_pass(mapped, *operands), as_written(mapped, *operands))

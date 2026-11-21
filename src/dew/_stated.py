@@ -413,11 +413,19 @@ def reads(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
     statement)."""
     within = (*walking, id(function))
     named = function.__qualname__
+    library = library_function(function)
     cells, read = _sources.function_reads(function)
-    return {"closure": {name: _stated(value, f"{at} ({named}'s closure, {name})", known, within)
-                        for name, value in sorted(cells.items())},
+
+    def closed(name: str, value) -> JSON:
+        if library and type(value) is object:
+            # A library's sentinel (`jax.vmap`'s axis name when none is given, its module's `object()`): no
+            # state but its identity, which its module's record and its cell's name state.
+            return ["a library's sentinel", function.__module__, named, name]
+        return _stated(value, f"{at} ({named}'s closure, {name})", known, within)
+
+    return {"closure": {name: closed(name, value) for name, value in sorted(cells.items())},
             "globals": {name: _stated(value, f"{at} ({named}'s global {name})", known, within)
-                        for name, value in sorted(read.items())} if not library_function(function) else {},
+                        for name, value in sorted(read.items())} if not library else {},
             "defaults": _stated((function.__defaults__, function.__kwdefaults__),
                                 f"{at} ({named}'s defaults)", known, within)}
 

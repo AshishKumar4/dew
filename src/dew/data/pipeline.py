@@ -29,7 +29,7 @@ import numpy as np
 from dew._records import ADDED, JSON, integer, json_value, record, text
 from dew.batch import Batch
 from dew.data.concurrent import PoolKind
-from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
+from dew.data.dataset import WORKER_BUFFER, Closeable, Records, phase_ends
 
 if TYPE_CHECKING:
     import jax
@@ -900,9 +900,12 @@ class Pack:
 
     A concatenating pack cuts documents where its windows end; `overlap` is
     how many tokens before a cut through a document the next window holds
-    again, so 1 keeps the next-token target at every cut. A fitting pack cuts
-    no document: one longer than a window is cut before it, into pieces that
-    overlap as `dew.data.text.Chunks` says.
+    again, so 1 keeps the next-token target at every cut. Each piece counts
+    against `segments` and holds its document's `along` entries whole, as
+    Grain's concatenating packer holds a feature it never cuts
+    (`dew.data.packing.ConcatPacked`). A fitting pack cuts no document:
+    one longer than a window is cut before it, into pieces that overlap as
+    `dew.data.text.Chunks` says.
     """
 
     seq_len: int
@@ -938,9 +941,6 @@ class Pack:
         return self.seq_len - 1
 
     def __post_init__(self) -> None:
-        if self.policy == "concat" and (self.segments is not None or self.along):
-            raise ValueError("concatenated packing cuts documents across windows; it takes no "
-                             "segment bound or fields along other axes")
         if self.policy != "concat" and self.overlap:
             raise ValueError(f"a {self.policy} pack cuts no document, so no cut overlaps; cut a long "
                              "document before it with Chunks(overlap=...)")
@@ -1518,22 +1518,37 @@ class Dataset:
         return self._then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
 
     def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] | Writer = "array_record",
-                 rows_per_shard: int = 100_000,
-                 deduplicate: NearDuplicates | None = None) -> Mapping[str, object]:
+                 rows_per_shard: int = 100_000, deduplicate: NearDuplicates | None = None,
+                 seed: int = 0) -> Mapping[str, object]:
         """Run this dataset once over every record and seal what it makes at
         `url`: immutable shards and their committed manifest, which
         `Files(url)` reads back, written as ArrayRecord, as Parquet or by a
-        native writer (`dew.data.sinks.Writer`). A fetch's outcomes are sealed with it, so a
-        run that reads the snapshot resumes exactly. With `deduplicate`
+        native writer (`dew.data.sinks.Writer`). A fetch's outcomes are sealed with it, and a random
+        step's draws (`random_map`, a video's clips, say) drawn once under `seed`, which the manifest's
+        metadata records, so a run that reads the snapshot resumes exactly. With `deduplicate`
         (`dew.data.text.NearDuplicates`, the `curation` extra), each group of
         near-duplicates in that one pass is sealed as one record, and the
         manifest's metadata records the rule, DataTrove's release and the
         records removed. Returns the manifest."""
+        from dew.data.analysis import draws
         from dew.data.sinks import export, passed
 
         chain = self._chain()
+        # The seed is the sealed rows' fact only where a step drew under it, anywhere in the chain's tree.
+        drawn = {"seed": seed} if draws(chain) else {}
+
+        def rows() -> Iterator[Batch]:
+            # The pass opened once `export` has checked where and how it writes, as it opens a chain, and
+            # closed however it ends, a row that fails to read among them.
+            opened = passed(chain, seed)
+            try:
+                yield from opened
+            finally:
+                if isinstance(opened, Closeable):
+                    opened.close()
+
         if deduplicate is None:
-            return export(chain, url, format=format, rows_per_shard=rows_per_shard)
+            return export(rows(), url, format=format, rows_per_shard=rows_per_shard, metadata=drawn or None)
         import tempfile
         from importlib.metadata import version
 
@@ -1544,13 +1559,13 @@ class Dataset:
         # whatever a fetch makes of them the next time.
         with tempfile.TemporaryDirectory(prefix="dew-deduplicate-") as sealed:
             # A pass that kept no record seals none, and has none to deduplicate.
-            if export(chain, sealed, format="array_record", rows_per_shard=rows_per_shard)["rows"]:
+            if export(rows(), sealed, format="array_record", rows_per_shard=rows_per_shard)["rows"]:
                 kept, removed = near_duplicates_removed(lambda: passed(Files(sealed)), deduplicate)
             else:
                 kept, removed = iter(()), 0
             rule = {**dataclasses.asdict(deduplicate), "datatrove": version("datatrove"), "removed": removed}
             return export(kept, url, format=format, rows_per_shard=rows_per_shard,
-                          metadata={"near_duplicates": rule})
+                          metadata={"near_duplicates": rule, **drawn})
 
     def rename_columns(self, names: Mapping[str, str]) -> Pipeline:
         """Each record with its fields renamed, as `rename_columns({"txt": "caption"})`."""

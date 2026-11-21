@@ -230,12 +230,12 @@ def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
 
 def test_a_memory_recomputes_its_chunks_only_where_its_rung_names_them():
     """An in-context memory's training step recomputes each chunk from its carry in the backward only where
-    the rung it runs under names its chunks (`recurrence_chunk.recomputing`, `memory_chunk`: the heaviest
+    the rung it runs under names its chunks (`residuals.recomputing`, `memory_chunk`: the heaviest
     rung's, `decoder_block.recomputed_inside`); under any other it keeps their values, the step's work its
     forward's and backward's alone (row 6577: recomputed under every rung, a Titans step that fit ran
     31-41% slower)."""
     from dew.nn.inputs import PLAIN_CALL
-    from dew.nn.kernels.recurrence_chunk import recomputing
+    from dew.nn.residuals import recomputing
 
     module = layer("titans")
     params = jax.eval_shape(lambda: module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH))))

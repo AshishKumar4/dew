@@ -42,6 +42,7 @@ from dew.nn.precision import (
     running_sum,
     running_total,
     two_sum,
+    uncontracted,
 )
 
 
@@ -528,7 +529,8 @@ def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.A
     against a centre that rounded it, so every centre and cotangent takes this one rounding."""
     if multiplier is None:
         return products
-    return jax.lax.optimization_barrier(products * multiplier)
+    (dropped,) = uncontracted(products * multiplier)
+    return dropped
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],

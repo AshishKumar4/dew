@@ -188,11 +188,12 @@ def kept(cell: Cell) -> int:
     return len(TRAIN[0]) - sum(refused_in(cell, TRAIN[1]).values())
 
 
-def recorded(cell: Cell, backbone: Path, root: Path) -> Recorded:
+def recorded(cell: Cell, backbone: Path, root: Path, examples: int | None = None) -> Recorded:
     """The cell's run as `dew train` replays it (`Recorded`), bounded to every training example its layout
-    keeps (`examples`) or to a share of them (`stop`), its context read through cross-attention where the
-    cell reads one, each step logged."""
-    given = {"trainer.log_every": "1", "trainer.steps": "None", "trainer.examples": str(kept(cell)),
+    keeps, or to `examples` of them where given (`examples`), or to a share of those (`stop`), its context
+    read through cross-attention where the cell reads one, each step logged."""
+    given = {"trainer.log_every": "1", "trainer.steps": "None",
+             "trainer.examples": str(kept(cell) if examples is None else examples),
              **({"trainer.stop": f'{{"fraction": {SHARE}}}'} if cell.bound == "share" else {}),
              **({"context_layers": CONTEXT_LAYERS} if cell.context else {})}
     return Recorded(saved_record(run_of(cell, backbone, root), root, "cell"),
@@ -322,8 +323,11 @@ memory (a joint row's `dew train` holds nearly 8 GB)."""
 def test_the_workflows_resumed_run_ends_on_its_uninterrupted_run_from_its_compiled_programs(backbone,
                                                                                             tmp_path):
     """Resume equals the uninterrupted run, and a resumed run reuses its compiled programs (testing.md's
-    contracts), on the workflow's `ONCE` cell (`assert_resumes_onto_its_uninterrupted_run`)."""
-    assert_resumes_onto_its_uninterrupted_run(recorded(ONCE, backbone, tmp_path), tmp_path)
+    contracts), on the workflow's `ONCE` cell (`assert_resumes_onto_its_uninterrupted_run`) bounded to four
+    batches' examples: the claim is the resume's, whatever the length, and three runs of all 44 took 124 s
+    (row 10137)."""
+    assert_resumes_onto_its_uninterrupted_run(recorded(ONCE, backbone, tmp_path, examples=4 * BATCH),
+                                              tmp_path)
 
 
 def test_the_workflows_task_answers_from_its_compiled_programs(backbone, tmp_path):

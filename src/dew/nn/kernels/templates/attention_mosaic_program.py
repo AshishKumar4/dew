@@ -527,18 +527,23 @@ def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
     return _multiples(family, math.lcm(family.role_rows, family.column_unit(dtype)), extent)
 
 
-def walked_extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
+def walked_extents(family: mosaic.Family, dtype, extent: int, *, parts: int = 1) -> tuple[int, ...]:
     """A walked tile's extents on `family`, largest first: whole multiples of its swizzled rows
     (`Family.column_unit`), a walked tile (a forward's or a dQ launch's keys, a dK/dV launch's queries) a
     product's depth and no consumer's rows, within `extents`' bounds: mma.sync's walks take 32-row tiles,
     where its 64-row unit held no guarded state at width 128 (FS-GUARD80-2) and no plain tile's stages at
-    width 256 (64 x 64 staged 199,696 bytes of an A100's 166,912, 64 x 32 134,160, et-d256e); a family
-    whose products a role issues, whole multiples of its walked rows (`Family.walked_rows`: the depth its
-    walk's right operands are staged for, `placed.walked_swizzles`; tcgen05's rows' a swizzle's 64 rows).
-    """
-    unit = family.walked_rows if family.places_on_role else family.column_unit(dtype)
+    width 256 (64 x 64 staged 199,696 bytes of an A100's 166,912, 64 x 32 134,160, et-d256e); an fp32
+    parted forward (`parts > 1`) on wgmma likewise steps by 64-byte swizzled rows (32 bf16 keys) so width
+    256's three parts fit Hopper's 232,448-byte block (row 6508); a family whose products a role issues,
+    whole multiples of its walked rows (`Family.walked_rows`: the depth its walk's right operands are
+    staged for, `placed.walked_swizzles`; tcgen05's rows' a swizzle's 64 rows)."""
+    if family.places_on_role:
+        unit = family.walked_rows
+    elif parts > 1 and not scopes_products(family):
+        unit = min(family.column_unit(dtype), swizzling.swizzle_columns(dtype, 64))
+    else:
+        unit = family.column_unit(dtype)
     return _multiples(family, unit, extent)
-
 
 def _multiples(family: mosaic.Family, unit: int, extent: int) -> tuple[int, ...]:
     """Whole multiples of `unit`, largest first, at most what one of `family`'s copies moves and the call's
@@ -581,7 +586,7 @@ def column_share(array: jax.Array, count: int) -> outputs.Dim:
     return columns if count == width else columns // (width // count)
 
 
-def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
+def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles", *, parts: int = 1) -> bool:
     """Whether a program of `family` takes `tiles`: its query tiles positive whole multiples of the rows a
     role's products cover (`Family.rows`), its key tiles of the rows a walked tile comes in
     (`Family.walked_rows`), and one to its launch's count of consumers (`most_consumers`), whose turns its
@@ -589,8 +594,11 @@ def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
     rows, a row a consumer thread: a keys-first walk's its key block (`placed.KEYS`)."""
     held, walked = held_walked(family, tiles)
     rows = held == family.rows if family.places_on_role else held % family.rows == 0
+    walked_unit = (min(family.walked_rows, 32)
+                   if parts > 1 and not family.places_on_role and not scopes_products(family)
+                   else family.walked_rows)
     return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
-            and rows and walked % family.walked_rows == 0)
+            and rows and walked % walked_unit == 0)
 
 
 ROUNDED = Refusal('rounds', "a quantized model's weights round at their row's maximum in the anchored "
@@ -1401,7 +1409,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
         return index ^ (count - 1) if count & (count - 1) == 0 else count - 1 - index
 
     def __post_init__(self):
-        if not whole_tiles(self.family, self.tiles):
+        if not whole_tiles(self.family, self.tiles, parts=self.parts):
             raise ValueError(f"{self.tiles}: query and key tiles of whole {self.family.rows} and "
                              f"{self.family.walked_rows} rows and {most_consumers(self.family, self.tiles)} "
                              f"consumers at most ({self.family.name})")
@@ -1726,11 +1734,24 @@ def _rows(family: mosaic.Family, ref, row, head, first, count: int):
     return family.rows_of(ref.at[row, head, pl.ds(first, count)])
 
 
-def _views_of(refs: dict, row, head) -> dict:
-    """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each `[B, S, H, D]`
-    operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
-    return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
+def head_slice(family: mosaic.Family, row, head, span) -> tuple:
+    """Index `(row, head, span)` for a head-first TPU ref (`Family.copies_tiled_rows`), where placing the
+    head axis before the sequence keeps every 16-bit slice tile-aligned on v5e (rows 6993, 10152), else
+    `(row, span, head)`."""
+    return (row, head, span) if family.copies_tiled_rows else (row, span, head)
 
+
+def head_layout(family: mosaic.Family, array: jax.Array) -> jax.Array:
+    """Swap sequence and head axes of `array` (`[B, S, H, D]` <-> `[B, H, S, D]`) for a head-first TPU
+    family (`Family.copies_tiled_rows`), leaving non-TPU arrays untouched."""
+    return jnp.swapaxes(array, 1, 2) if family.copies_tiled_rows else array
+
+def _views_of(family: mosaic.Family, refs: dict, row, head) -> dict:
+    """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each operand's `[S, D]`
+    at batch row `row` and head `head` in `family`'s axis order (`head_slice`), step `j` its `j`-th block
+    of rows."""
+    return {name: (ref.at[head_slice(family, row, head, slice(None))], lambda j: (j, 0))
+            for name, ref in refs.items()}
 
 def _fused_held(logits: tuple, dtype, *, dropped: bool) -> list:
     """The tiles a fused backward launch holds beside both products and its pullback (`backward_registers`):
@@ -2293,7 +2314,8 @@ def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int,
             resources.Product(block_q, value_width, block_k, beside=[logits] * 2, transposed=True),
             resources.Product(block_k, block_q, value_width, beside=[logits]),
             resources.Product(block_k, block_q, width, beside=[logits]),
-            resources.Product(block_q, block_k, width, beside=dq_tile))
+            resources.Product(block_q, block_k, width, beside=dq_tile),
+            narrow=config.narrow)
         if not family.operands_in_registers:
             # A family reading its operands from shared memory holds the weights narrowed for dV's product
             # beside the pullback until they are staged: wgmma's at 64 x 64, width 128, under a softcap held
@@ -2340,12 +2362,15 @@ def _keys_first_registers(family: mosaic.Family, config: BackwardTiles, width: i
     # and the score cotangents in registers, its share of their columns.
     weights = (block_k, queries, dtype)
     columns = config.columns
+    dq_product = (resources.Product(queries, block_k, width,
+                                    beside=[step[0], (queries, width, jnp.float32)]),) if config.fused else ()
     fragments = _products(
         family, dtype,
         resources.Product(block_k, width, queries, beside=step[:1], transposed=True),
         resources.Product(block_k, value_width, queries, beside=step, transposed=True),
         resources.Product(block_k, queries, value_width // columns, beside=[weights], held=True),
         resources.Product(block_k, queries, width // columns, beside=[weights], held=True),
+        *dq_product,
         narrow=config.narrow)
     if accurate and family.operands_in_registers:
         # The accurate form's dK parts issued against one right operand, the queries, held at its whole depth

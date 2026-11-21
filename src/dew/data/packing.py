@@ -21,7 +21,7 @@ import numpy as np
 
 from dew._records import integer, integers, record
 from dew.batch import Batch
-from dew.data.dataset import Records, restore_parent
+from dew.data.dataset import Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ACCOUNTS, DOCUMENT, ExpandStep, Pack
 from dew.data.plan import fingerprint
@@ -78,16 +78,17 @@ position's order fingerprints."""
 
 
 def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int | None = 0) -> Mapping[str, np.ndarray]:
-    """The first-fit plan of documents of `lengths` into `pack.seq_len`-token
-    windows, a document longer than a window cut into window-long pieces
+    """The first-fit plan (best-fit's, for a best-fit pack's whole documents) of documents of `lengths`
+    into `pack.seq_len`-token windows, a document longer than a window cut into window-long pieces
     `overlap` tokens apart: each chunk's document, offset and size, the chunks
     in packing order and where each window starts in it, each window's
     targets, and the windows that hold one (`accepted`), with their total and
     the count left out. With `overlap` None no chunk step cuts them: each document is one entry, an
     empty one too, as a stream of them places it (`FirstFitPacked`), counted against the windows'
     segments (row 6277)."""
-    if pack.policy != "first-fit":
-        raise ValueError("indexed packing currently needs policy='first-fit'")
+    if pack.policy == "concat" or (pack.policy == "best-fit" and overlap is not None):
+        # A best-fit pack places documents whole, as grain's packer does: planned for its publication alone.
+        raise ValueError("indexed packing plans first-fit windows, and best-fit ones of whole documents")
     if pack.along:
         raise ValueError("a plan of document lengths packs tokens alone; fields along other axes "
                          "pack as their rows arrive")
@@ -97,7 +98,7 @@ def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int | None = 0) -> Ma
     else:
         chunk_sizes = chunk_lengths(lengths, pack.seq_len, overlap)
         documents, offsets = chunk_table(lengths, pack.seq_len, overlap)
-    order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins, pack.segments)
+    order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins, pack.segments, policy=pack.policy)
     targets = np.asarray(
         [
             sum(max(0, int(chunk_sizes[index]) - 1) for index in order[starts[window] : starts[window + 1]])
@@ -511,95 +512,141 @@ class PackedSource(View[Source]):
         return _indexed_manifest(self, self.plan.location, 1024)
 
 
-class _Concatenated(pygrain.IterDataset):
-    """Grain's concatenating packer, restored from a position read back from JSON, as every saved
-    position is. Its saved state marks a window's remainder by its slices and none by the tuple
-    (-1, -1), which JSON reads back as a list the packer does not take for that tuple, so a restore
-    reads the next document as a remainder cut to nothing and drops it (grain 0.2.18 to its main of
-    2026-10-18, `packing_concat_then_split._CtsState.has_remainder`). The slices go back as the
-    tuples the packer wrote."""
+class ConcatPacked(pygrain.IterDataset[Batch]):
+    """`documents`, each as `pack` reads one (`Pack.document`), laid end to end in windows of `pack.seq_len`
+    tokens and cut where a window ends, the next window starting again `pack.overlap` tokens before the cut,
+    as Grain's concatenating packer lays them (`ConcatThenSplitIterDataset`, `PackedWindows`). A window
+    holds at most `pack.segments` documents or pieces of one. Each piece holds its document's entries along
+    an axis of its own (`pack.along`) whole, as Grain's packer holds a feature it never cuts (its
+    `meta_features`), so every window a document reaches holds them; a window closes where the next
+    document's do not fit what is left of theirs, and a document whose entries outgrow an empty window is
+    refused. Its position is where the next window begins: the document read then, and how far into it."""
 
-    def __init__(self, parent: pygrain.IterDataset):
-        super().__init__(parent)
-        self._packed = parent
+    def __init__(self, documents: pygrain.IterDataset[Batch], pack: Pack):
+        super().__init__(documents)
+        self._documents, self._pack = documents, pack
 
-    def __iter__(self) -> pygrain.DatasetIterator:
-        return _ConcatenatedIterator(self._packed.__iter__())
-
-
-class _ConcatenatedIterator(pygrain.DatasetIterator):
-    def __init__(self, parent: pygrain.DatasetIterator):
-        super().__init__(parent)
-        self._packed = parent
-
-    def __next__(self) -> Batch:
-        return next(self._packed)
-
-    def get_state(self) -> Mapping[str, object]:
-        return self._packed.get_state()
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        slices = record(state["remainder_slices"], "packed remainder")
-        self._packed.set_state({**state, "remainder_slices": {
-            name: integers(bounds, name) for name, bounds in slices.items()}})
+    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
+        return _ConcatPacking(self._documents.__iter__(), self._pack)
 
 
-class _OverlappedCuts(pygrain.IterDataset):
-    """Documents as a concatenating pack (`Pack.overlap`) reads them: the tokens before each cut
-    through a document written again after it, so the window the cut ends and the next both hold
-    them. Grain's concatenating packer cuts the documents it joins every `seq_len` tokens, so how
-    full this stream leaves its window places the next cut."""
-
-    def __init__(self, parent: pygrain.IterDataset, stage: Pack):
-        super().__init__(parent)
-        self._documents, self._stage = parent, stage
-
-    def __iter__(self) -> pygrain.DatasetIterator:
-        return _OverlappedCutsIterator(self._documents.__iter__(), self._stage)
+type _Begun = tuple[Mapping[str, object], Batch, int]
+"""A document a window begins with: the documents' position before it, the document, and where in it."""
 
 
-class _OverlappedCutsIterator(pygrain.DatasetIterator):
-    """Each document with its cuts overlapped, and where the last one left its window: the room
-    left in it, saved with the parent's position."""
+class _ConcatPacking(pygrain.DatasetIterator[Batch]):
+    def __init__(self, documents: pygrain.DatasetIterator[Batch], pack: Pack):
+        super().__init__(documents)
+        self._documents, self._pack = documents, pack
+        self._lengths, self._paired = window_fields(pack)
+        self._pending: _Begun | None = None
 
-    def __init__(self, parent: pygrain.DatasetIterator, stage: Pack):
-        super().__init__(parent)
-        self._documents, self._stage = parent, stage
-        self._room = stage.seq_len
+    def _begun(self) -> _Begun:
+        if (pending := self._pending) is not None:
+            self._pending = None
+            return pending
+        before = self._documents.get_state()
+        return before, next(self._documents), 0
 
     def __next__(self) -> Batch:
-        document = next(self._documents)
-        count = len(document[self._stage.fields[0]])
-        pieces, start, room = [], 0, self._room
-        while count - start > room:
-            pieces.append(slice(start, start + room))
-            start, room = max(start + room - self._stage.overlap, 0), self._stage.seq_len
-        pieces.append(slice(start, count))
-        self._room = room - (count - start) or self._stage.seq_len
-        if len(pieces) == 1:
-            return document
-        return {name: np.concatenate([value[piece] for piece in pieces]) if name in self._stage.fields
-                else value for name, value in document.items()}
+        pack, ids = self._pack, self._pack.fields[0]
+        room, laid, held = dict(self._lengths), None, 0
+        while pack.segments is None or held < pack.segments:
+            try:
+                before, document, start = self._begun()
+            except StopIteration:
+                break
+            along = {name: entries(document[name]) for name, _ in pack.along}
+            if any(size > self._lengths[name] for name, size in along.items()):
+                raise ValueError(f"a document of {along} entries along its own axes is longer than the "
+                                 f"windows of {dict(pack.along)} it packs into")
+            count = entries(document[ids])
+            # A full window takes a document of no tokens left, as Grain's packer does; one with tokens
+            # begins the next window, as does one whose entries along their own axes no longer fit.
+            if (start < count and not room[ids]) or any(size > room[name] for name, size in along.items()):
+                self._pending = (before, document, start)
+                break
+            end = min(count, start + room[ids])
+            piece = {name: value[start:end] if name in pack.fields else value
+                     for name, value in document.items()}
+            if laid is None:
+                laid = PackedWindows(piece, self._lengths, self._paired, 1)
+            laid.add(0, piece)
+            held += 1
+            room = {name: left - (end - start if name in pack.fields else along[name])
+                    for name, left in room.items()}
+            if end < count:
+                self._pending = (before, document, max(end - pack.overlap, 0))
+                break
+        if laid is None:
+            raise StopIteration
+        (window,) = laid.windows()
+        return window
 
     def get_state(self) -> Mapping[str, object]:
-        return {"documents": self._documents.get_state(), "room": self._room}
+        if self._pending is None:
+            return {"parent": self._documents.get_state(), "offset": 0}
+        before, _, start = self._pending
+        return {"parent": before, "offset": start}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        restore_parent(self._documents, state, "documents", "packed documents")
-        self._room = integer(state["room"], "packed window room")
+        saved = record(state, "concatenating packer position")
+        if "remainder_slices" in saved:
+            self._grains(saved)
+            return
+        self._documents.set_state(record(saved["parent"], "concatenating packer's documents"))
+        self._begin(integer(saved["offset"], "concatenating packer's offset"))
+
+    def _begin(self, offset: int) -> None:
+        """The next window begun `offset` tokens into the next document, or with it whole."""
+        self._pending = None
+        if offset:
+            before = self._documents.get_state()
+            self._pending = (before, next(self._documents), offset)
+
+    def _grains(self, saved: Mapping[str, object]) -> None:
+        """A position Grain's concatenating packer saved (`ConcatThenSplitIterDataset`'s, before row 9059):
+        its documents' position before the remainder it held, where the remainder starts in its document,
+        and the windows emitted since, which a restore emits again. Where the pack overlaps its cuts, its
+        documents were those cuts written out (`_OverlappedCuts` then, saving the room its window had left
+        beside their position), and the remainder starts in that document, at a cut: past the pieces before
+        it, the first that room long and each after a window's, each next one starting `overlap` tokens
+        before the last one's end in the document itself."""
+        pack = self._pack
+        parent = record(saved["parent_state"], "Grain packer's documents")
+        room = pack.seq_len
+        if pack.overlap:
+            room = integer(parent["room"], "packed window room")
+            parent = record(parent["documents"], "packed documents")
+        self._documents.set_state(parent)
+        start, _ = integers(record(saved["remainder_slices"], "packed remainder")[pack.fields[0]],
+                            "packed remainder")
+        offset = max(start, 0)
+        if pack.overlap and start > 0:
+            written, offset = start, 0
+            while written > 0:
+                written, offset, room = written - room, max(offset + room - pack.overlap, 0), pack.seq_len
+            if written:
+                raise ValueError(f"a saved remainder {start} tokens into its overlapped document starts at "
+                                 "no cut of it")
+        self._begin(offset)
+        for _ in range(integer(saved["elements_from_buffer_after_checkpoint"], "windows emitted")):
+            next(self)
+
+    def close(self) -> None:
+        self._documents.close()
 
 
 def packed_documents(documents: pygrain.IterDataset, stage: Pack, *, consumed: bool = False
                      ) -> pygrain.IterDataset:
     """`documents` packed for the stage's policy: first-fit as an indexed read's plan places them
     (`FirstFitPacked`), each example's counts where its last piece is emitted where the documents carry them
-    (`consumed`, `LastPieces`), the rest by Grain's own packers."""
+    (`consumed`, `LastPieces`); concatenated as they come (`ConcatPacked`); best-fit by Grain's packer."""
     if stage.policy == "first-fit":
         return FirstFitPacked(documents, stage, LastPieces(stage.fields[0]) if consumed else None)
-    sizes, _ = window_fields(stage)
     if stage.policy == "concat":
-        cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
-        return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))
+        return ConcatPacked(documents, stage)
+    sizes, _ = window_fields(stage)
     # Fields cut alike with the first share its segments and positions, as the indexed planner's
     # windows do (`packed_window`), so Grain writes no copy of them for the rest.
     return gx.BestFitPackIterDataset(documents, length_struct=sizes, num_packing_bins=stage.bins,

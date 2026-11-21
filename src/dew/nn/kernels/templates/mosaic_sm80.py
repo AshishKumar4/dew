@@ -420,7 +420,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return out
 
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         if not accumulate:
             # A fresh product: onto zeros, its accumulator a value (`read` is that value).
             acc = self.zeros(acc.shape)
@@ -473,7 +473,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         (dV, dK, dQ, independent of each other) and held 170 words of their fragments at once, an A100's step
         at 64 x 64, width 64, under a softcap spilling 96 bytes; looped, 20 (one slice's), none spilled, the
         same 320 mma.sync instructions issued (row 5477). Interpreted, `products`."""
-        if bodies.interpreting():
+        if launches.interpreting():
             return self.products(acc, lhs, rhs, accumulate=accumulate)
         if jnp.dtype(lhs.dtype) != self.dtype:
             return self.for_dtype(lhs.dtype).looped_products(acc, lhs, rhs, accumulate=accumulate)

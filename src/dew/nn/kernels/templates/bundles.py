@@ -24,16 +24,7 @@ from collections.abc import Callable
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import (
-    fed,
-    mosaic,
-    mosaic_sm80,
-    mosaic_sm90,
-    mosaic_sm100,
-    mosaic_tpu,
-    placed,
-    ring_family,
-)
+from dew.nn.kernels.templates import fed, mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100, placed, ring_family
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,11 +118,19 @@ COMPOSITIONS: dict[str, tuple[Composition, ...]] = {
     mosaic_sm80.Mma.name: (Composition(MmaFed), Composition(MmaProduced, lambda launch: launch.produced),
                            Composition(mosaic_sm80.Mma)),
     # A TPU core's MXU, for a launch written wholly against the family's seams.
-    "tpu": (Composition(lambda dtype: mosaic_tpu.MXU, lambda launch: launch.tpu),),
+    "tpu": (Composition(lambda dtype: _mxu(), lambda launch: launch.tpu),),
 }
 """Every bundle, by matrix issuer (`generation.Architecture.issuers`' names), each issuer's in preference
 order: the one declaration a launch's selection (`groups`) and its tile's name (`named`) both read."""
 
+
+
+def _mxu() -> mosaic.Family:
+    """A TPU core's MXU bundle (`mosaic_tpu.MXU`), loaded where a TPU launch composes it: a GPU's or a CPU's
+    composition loads no TPU toolkit, so a TPU template's edit re-keys none of their tests."""
+    from dew.nn.kernels.templates import mosaic_tpu
+
+    return mosaic_tpu.MXU
 
 def groups(generation_name: str, dtype, *, stated: bool = False, scoped: bool = False, tpu: bool = False,
            produced: bool = False, walked: bool = False) -> tuple[tuple[mosaic.Family, ...], ...]:

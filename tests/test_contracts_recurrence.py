@@ -283,7 +283,7 @@ def test_a_split_convs_bias_holds_its_orders(edge):
     not run (`FORWARD_ORDERS`, a custom VJP's)."""
     from sequence_split_support import SPLIT_ROWS
 
-    from dew.nn.linear import held_conv1d, over_sequence, sequence_conv
+    from dew.nn.linear import Heads, held_conv1d, over_sequence, sequence_conv
     from dew.training import MeshSpec
 
     valid, segments = (jnp.asarray(np.broadcast_to(field, (2, 32))) for field in SPLIT_ROWS["packed"])
@@ -294,7 +294,7 @@ def test_a_split_convs_bias_holds_its_orders(edge):
     def split(mixed, bias):
         return over_sequence(lambda mixed, valid, segments, taps, bias: sequence_conv(
             mixed, taps, bias, segments, valid), 4, (mixed, valid, segments),
-            (taps.astype(mixed.dtype), bias))
+            (taps.astype(mixed.dtype), bias), heads=Heads(8, 8, {0: 2, 3: 0, 4: 0}))
 
     def whole(mixed, bias):
         return held_conv1d(mixed, taps.astype(mixed.dtype), valid, bias=bias, segments=segments)[0]

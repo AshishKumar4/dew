@@ -15,11 +15,11 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
 from .activations import GATE_ACTIVATIONS, logistic, silu
 from .dense import Dense
 from .derivatives import portable_formed
-from .kernels import norm_swiglu
 from .precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted, rounded_to
 from .sharding import LogicalAxes, declared
 
@@ -132,6 +132,8 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
     it is elementwise (`norm_swiglu.elementwise`), else on XLA's path.
     `weight_first` as `rms_normalized`'s.
     """
+    from .kernels import norm_swiglu
+
     if weight_first and scale_after_cast and scale is not None:
         raise ValueError("a weight folded into the inverse (weight_first) multiplies before any cast; "
                          "scale_after_cast multiplies after one")
@@ -161,6 +163,8 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     pass; XLA's arithmetic is the portable path and the oracle. `axes`, the
     inputs' logical axes, place the kernel's rows on a mesh.
     """
+    from .kernels import norm_swiglu
+
     def portable(x, gate, scale):
         wide = at_least_fp32(x.dtype)
         x = x.astype(wide)
@@ -223,6 +227,8 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
     takes it where the target's row names it, rounding the inverse as they do
     (`norm_swiglu.rms_norm`'s `inverse_rounded`).
     """
+    from .kernels import norm_swiglu
+
     if norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True) == 'pallas':
         def portable(x, scale):
             return unweighted_rmsnorm(x, eps, implementation='xla')
@@ -401,12 +407,18 @@ class GatedRMSNorm(nn.Module):
         return stream, (normed.astype(wide) * logistic(gate.astype(wide))).astype(normed.dtype)
 
 
+SHIFT = "layer_norm_shift"
+"""The name of a layer norm's row shift (`_Shifted`), the one value its rematerialized body saves
+(`LayerNorm`)."""
+
+
 class _Shifted(nn.LayerNorm):
     """flax's `nn.LayerNorm` over its input less each row's mean, which a layer norm does not change: its
     statistics read rows centered near zero, so a row whose mean dwarfs its spread rounds as a row near
     zero does. The shift is a constant to the gradient, whose own term a layer norm's invariance makes
-    zero; one shift over every shard its statistics read (`axis_name`), and taken in float32 at least, as
-    flax's statistics read a narrower input, its output in the dtype flax gives that input."""
+    zero, named (`SHIFT`); one shift over every shard its statistics read (`axis_name`), and taken in
+    float32 at least, as flax's statistics read a narrower input, its output in the dtype flax gives that
+    input."""
 
     @nn.compact
     def __call__(self, x, *, mask=None):
@@ -415,16 +427,17 @@ class _Shifted(nn.LayerNorm):
         shift = jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask)
         if self.axis_name is not None:
             shift = jax.lax.pmean(shift, self.axis_name, axis_index_groups=self.axis_index_groups)
-        normed = super().__call__(x.astype(wide) - jax.lax.stop_gradient(shift), mask=mask)
+        shift = checkpoint_name(jax.lax.stop_gradient(shift), SHIFT)
+        normed = super().__call__(x.astype(wide) - shift, mask=mask)
         # The parameters' values, out of the partitioning box a norm declaring its axes stores them in.
         held = [nn.unbox(self.get_variable("params", name)) for name in ("scale", "bias")
                 if self.has_variable("params", name)]
         return normed.astype(canonicalize_dtype(x, *held, dtype=self.dtype))
 
 
-class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveable)):
-    """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
-    it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
+class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.save_only_these_names(SHIFT))):
+    """flax's `nn.LayerNorm`, rematerialized saving nothing but its rows' shift: its backward pass keeps the
+    input as it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
     (2.35 GiB of them on one SimpleDiT step). The parameter tree and the module's name are flax's, so
     checkpoints and scopes move both ways. Its statistics read each row less its mean (`_Shifted`), then
     the shifted rows' mean and mean square in one read (`use_fast_variance`), the variance the second
@@ -433,7 +446,10 @@ class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveab
     where flax's E[x^2] - E[x]^2 over the rows as given cancels: row 5907, Gemma 4's audio subsampling at
     1.58 times Transformers' distance on a GH200), without the third read that kept a SimpleDiT step's
     residual sums alive (291 MiB of its temporaries on a GH200, row 6741). A caller that states
-    `use_fast_variance=False` takes the corrected two-pass, its centered rows centered again."""
+    `use_fast_variance=False` takes the corrected two-pass, its centered rows centered again.
+
+    The shift (`SHIFT`) is one value a row, which its backward reads where recomputed each norm's mean was a
+    reduction of its own there (row 6740)."""
 
     def spread(self, x: jax.Array) -> jax.Array:
         """Per row, the root mean square of `x` centered, its statistic (`dew.nn.protocols.BoundedNorm`),

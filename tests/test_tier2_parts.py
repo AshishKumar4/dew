@@ -228,18 +228,33 @@ def write_source(directory, name: str, edit=lambda code: code, source: tuple | N
     (directory / f"modeling_{stem}.py").write_text(edit(modeling()))
 
 
+@pytest.fixture(scope="module")
+def sources(tmp_path_factory):
+    """Each source's repository written once (`write_source`) and loaded from it as a native decoder,
+    shared by the tests reading it, which a group keyed by the source holds together (`shared_setup`)."""
+    made = {}
+
+    def source(name: str):
+        if name not in made:
+            directory = tmp_path_factory.mktemp("sources") / name
+            write_source(directory, name)
+            made[name] = directory, Pretrained.load(directory, dtype="float32", attention_impl="reference",
+                                                    trust_remote_code=True)
+        return made[name]
+    return source
+
+
+@pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
-def test_a_model_of_known_parts_loads_natively_from_its_own_code(tmp_path, name):
+def test_a_model_of_known_parts_loads_natively_from_its_own_code(sources, name):
     """The source verifies from parts (no registered family's whole convention computes it), loads as a
     native decoder, and its logits over drawn ids hold check 1 against its own code's."""
     from transformers import AutoModelForCausalLM
 
-    directory = tmp_path / name
-    write_source(directory, name)
+    directory, loaded = sources(name)
     config = json.loads((directory / "config.json").read_text())
     verified = verify_mapping(config, remote=directory)
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference", trust_remote_code=True)
     forward = jax.jit(loaded.model.apply)
 
     def built(dtype):
@@ -257,16 +272,15 @@ def test_a_model_of_known_parts_loads_natively_from_its_own_code(tmp_path, name)
                     truth_fn=torch_logits(wide, float64))
 
 
+@pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
-def test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads(tmp_path, name):
+def test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads(sources, name):
     """A decoder assembled from parts reads its pad row off its source's own table, the nn.Embedding
     the code builds with padding_idx=config.pad_token_id (ledger 1593), and its lookup's gradient is
     that table's (`assert_pads_as`)."""
     from transformers import AutoModelForCausalLM
 
-    directory = tmp_path / name
-    write_source(directory, name)
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    directory, loaded = sources(name)
 
     def built(dtype):
         return AutoModelForCausalLM.from_pretrained(directory, trust_remote_code=True, dtype=dtype).eval()
@@ -383,15 +397,14 @@ def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
     assert _offline_loads(tmp_path, ("dew/renamed", "hooked")) == [("refused", 1)]
 
 
+@pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
-def test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads(tmp_path, name):
+def test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads(sources, tmp_path, name):
     """A decoder assembled from parts saves under its source's config and tensor names (each tensor at
     its stored name, the experts fused as stored), which load from parts again to the same logits."""
     from safetensors.numpy import load_file
 
-    source, destination = tmp_path / name, tmp_path / "export"
-    write_source(source, name)
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    (source, loaded), destination = sources(name), tmp_path / "export"
     loaded.save(destination)
     assert set(load_file(destination / "model.safetensors")) == set(load_file(source / "model.safetensors"))
     restored = Pretrained.load(destination, dtype="float32", attention_impl="reference",
@@ -694,44 +707,64 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
         Pretrained.load(tmp_path / "unknown", dtype="float32", attention_impl="reference")
 
 
+@pytest.fixture(scope="module")
+def built_ins(tmp_path_factory):
+    """Each built-in type's checkpoint written once at the probe's scatter (its prediction depth past the
+    trunk too) and loaded from it as a native decoder, shared by the tests reading it, which a group keyed
+    by the case holds together (`shared_setup`): its directory and its load."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    made = {}
+
+    def built_in(case: str):
+        if case not in made:
+            fields = dict(BUILT_IN[case])
+            model_type = fields.pop("model_type", case)
+            directory = tmp_path_factory.mktemp("built-in") / case
+            torch.manual_seed(0)
+            config = tiny_config(model_type, **fields)
+            model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
+            scatter_weights(model)
+            model.save_pretrained(directory)
+            if fields.get("num_nextn_predict_layers"):
+                with_prediction_depth(directory, config.num_hidden_layers, config.hidden_size)
+            del model
+            made[case] = directory, Pretrained.load(directory, dtype="float32", attention_impl="reference")
+        return made[case]
+    return built_in
+
+
+@pytest.mark.shared_setup("tier2_built_in", by=r"[a-z0-9_-]+")
 @pytest.mark.parametrize("case", sorted(BUILT_IN))
-def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
+def test_a_built_in_type_of_known_parts_loads_natively(built_ins, case):
     """A type transformers builds and no registered family reads verifies from parts and loads as a
     native decoder, its logits holding check 1 against transformers' own. A routed type's checkpoint
     holds each expert's projections apart, as transformers saves them, which its load stacks into the
     fused tensors its experts module holds (its conversion mapping): the load reads them as stored. A
     release's prediction depth past the trunk, which the source's own code builds none of and its load
     leaves unread, is left unread too."""
-    from interop_support import tiny_config
     from safetensors import safe_open
     from transformers import AutoModelForCausalLM
 
-    fields = dict(BUILT_IN[case])
-    model_type = fields.pop("model_type", case)
-    torch.manual_seed(0)
-    config = tiny_config(model_type, **fields)
-    model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
-    scatter_weights(model)
-    model.save_pretrained(tmp_path)
-    if fields.get("num_nextn_predict_layers"):
-        with_prediction_depth(tmp_path, config.num_hidden_layers, config.hidden_size)
-    with safe_open(tmp_path / "model.safetensors", "pt") as stored:
+    model_type = BUILT_IN[case].get("model_type", case)
+    directory, loaded = built_ins(case)
+    with safe_open(directory / "model.safetensors", "pt") as stored:
         names = set(stored.keys())
     assert model_type not in STORED_EXPERT or STORED_EXPERT[model_type] in names
-    verified = verify_mapping(json.loads((tmp_path / "config.json").read_text()))
+    verified = verify_mapping(json.loads((directory / "config.json").read_text()))
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     forward = jax.jit(loaded.model.apply)
 
     def built(dtype):
-        return AutoModelForCausalLM.from_pretrained(tmp_path, dtype=dtype, attn_implementation="eager",
+        return AutoModelForCausalLM.from_pretrained(directory, dtype=dtype, attn_implementation="eager",
                                                     experts_implementation="eager").eval()
 
     reference = built(torch.float32)
     wide = float64_twin(reference, lambda: built(torch.float64)).eval()
     # The references select by torch's top-k, which breaks no tie as Dew's does: a draw a tie decides is
     # none that clears.
-    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case,
+    draw = clearing_selections(loaded, token_draw(0x3070, reference.config.vocab_size, (4, 24)), case,
                                stable=False)
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
@@ -823,26 +856,19 @@ def test_a_released_config_of_a_new_hybrid_verifies_from_parts(released):
     assert isinstance(verdict, VerifiedMapping) and verdict.family == "parts"
 
 
+@pytest.mark.shared_setup("tier2_built_in", by=r"[a-z0-9_-]+")
 @pytest.mark.parametrize("case", ["apertus", "glm4", "laguna", "jamba", "falcon_h1-norm-first", "axk2"])
-def test_a_learned_activation_and_a_fused_projection_save_as_stored(tmp_path, case):
+def test_a_learned_activation_and_a_fused_projection_save_as_stored(built_ins, tmp_path, case):
     """Apertus's xIELU parameters and the buffers Dew holds as constants, GLM-4's fused gate and up
     Linear, which a load reads as two projections, Laguna's gate projection, router bias and shared
     expert, which its load renames, Jamba's Mamba mixers and routers, Falcon-H1's mixers side by side and
     A.X-K2's fused query and gate and gated norms, which its load renames, save back under their stored
     names bit for bit, the buffers in their stored dtype (ledgers 3076, 3077, 3070, 3080)."""
-    from interop_support import tiny_config
     from safetensors.numpy import load_file
-    from transformers import AutoModelForCausalLM
 
-    fields = dict(BUILT_IN[case])
-    model_type = fields.pop("model_type", case)
-    torch.manual_seed(0)
-    model = AutoModelForCausalLM.from_config(tiny_config(model_type, **fields), dtype=torch.float32)
-    scatter_weights(model)
-    model.save_pretrained(tmp_path / "source")
-    loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
+    directory, loaded = built_ins(case)
     loaded.save(tmp_path / "saved")
-    source, saved = (load_file(tmp_path / folder / "model.safetensors") for folder in ("source", "saved"))
+    source, saved = (load_file(folder / "model.safetensors") for folder in (directory, tmp_path / "saved"))
     assert set(saved) == set(source)
     for name, tensor in source.items():
         np.testing.assert_array_equal(saved[name], tensor, err_msg=name)
