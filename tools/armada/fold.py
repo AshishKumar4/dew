@@ -30,47 +30,60 @@ def raised(session, record: Mapping[str, float], held: list[dict], marked: dict)
     return taken
 
 
-def entries(session, record: Mapping, kept: Mapping[str, float], rows: Mapping[str, list[dict]],
-            marks: Mapping[str, dict], owning: Callable[[str], str], target: float) -> dict:
-    """The durations `record`'s entries with main's CI verdict folded in (`session.entry`), from the warm
-    times ci.py's `folded` `kept` of it (a test the warm record drops loses its cold time and peak with it,
-    one record, so no test is timed cold or sized that the record no longer holds; Main, 2026-11-18, rows
-    7939 and 6003), the verdict's `rows` by file (ci.py's `verdict_rows`) and each file's sites (`marks`).
-    What a row this verdict ran times moves an estimate; a row it reused (`cached`) holds the times of the
-    run that recorded it, which an earlier fold took, and a row armada ran alone after it failed beside
-    other tasks (`aloneAfter`) times its tests on a container of their own, no planning evidence:
+def evidence(row_: dict) -> bool:
+    """Whether `row_` is planning evidence: a run this verdict made (no `cached` row, whose times an earlier
+    fold took) of its tests packed as the plan packs them (no row armada ran alone after it failed beside
+    other tasks, `aloneAfter`, on a container of its own)."""
+    return not row_.get("cached") and row_.get("aloneAfter") is None
 
-    - its warm time lowered to the most its green rows took where it holds the test past that by
-      `session.KEPT` and by over an eighth of the `target`: a warm run's time is its own and a cold run's
-      bounds it from above, so a time a red, cut-off or contended run once raised comes down test by test,
-      a test that compiles cold every run included, where the whole-file fold never finds its file stale
-      (row 10787: test_compile_ahead's frontier test held 274.7 s against the 42 s each green run took); a
-      site's entries stay as they are (`raised`);
+
+def lowered(session, warm: Mapping[str, float], rows: Mapping[str, list[dict]], marks: Mapping[str, dict],
+            target: float) -> dict[str, float]:
+    """The record's `warm` times, each lowered to the most its green rows took (`evidence`; `rows` by file
+    as ci.py's `verdict_rows`, each file's sites `marks`) where it holds the test past that by `session.KEPT`
+    and by over an eighth of the `target`: a warm run's time is its own and a cold run's bounds it from above,
+    so a time a red, cut-off or contended run once raised comes down test by test, a test that compiles cold
+    every run included, where the whole-file fold never finds its file stale (row 10787:
+    test_compile_ahead's frontier test held 274.7 s against the 42 s each green run took); a site's entries
+    stay as they are (`raised`). ci.py folds each file whole from what this returns, so one verdict folded
+    again moves nothing: a lowered time is past no green run's by both bounds."""
+    took: dict[str, float] = {}
+    for name, held in rows.items():
+        for row_ in held:
+            if row_["exitCode"] == 0 and evidence(row_):
+                for node, seconds in row_.get("tests", {}).items():
+                    if node in warm and session.site_name(node, marks[name]) not in marks[name]:
+                        took[node] = max(took.get(node, 0.0), seconds)
+    return {node: took[node] if node in took and seconds > session.KEPT * took[node]
+            and seconds - took[node] > target / 8 else seconds for node, seconds in warm.items()}
+
+
+def entries(session, record: Mapping, kept: Mapping[str, float], rows: Mapping[str, list[dict]],
+            owning: Callable[[str], str]) -> dict:
+    """The durations `record`'s entries with main's CI verdict folded in (`session.entry`), from the warm
+    times ci.py's folds `kept` of it (`lowered`, then each file whole: a test the warm record drops loses its
+    cold time and peak with it, one record, so no test is timed cold or sized that the record no longer
+    holds; Main, 2026-11-18, rows 7939 and 6003) and the verdict's `rows` by file (ci.py's `verdict_rows`):
+
     - its cold time, a run in which it compiled a program the shared cache lacked (a row's `cold`): the most
-      its green rows so took, the newest run's, so a fold of the same verdict again moves nothing (it was the
-      least ever, which held test_loop's threshold case at 33.8 s against 156 s cold), a red or cut-off
-      run's past it raising it;
+      its green rows so took (`evidence`), the newest run's, so one verdict folded again moves nothing (it was
+      the least ever, which held test_loop's threshold case at 33.8 s against 156 s cold); a red or cut-off
+      row's past it raises it, whatever the green rows took;
     - its peak the newest of its rows' (`session.moved_peak`)."""
     cold = {node: found for node, held in record.items()
             if (found := session.warm_cold(held)[1]) is not None}
     peaks = {node: found for node, held in record.items() if (found := session.peak(held)) is not None}
-    took: dict[str, float] = {}
-    ran_cold: dict[str, float] = {}
-    for name, held in rows.items():
-        marked = marks[name]
+    green_cold: dict[str, float] = {}
+    red_cold: dict[str, float] = {}
+    for held in rows.values():
         for row_ in held:
-            green, fresh = row_["exitCode"] == 0, not row_.get("cached") and row_.get("aloneAfter") is None
             timed = row_.get("tests", {})
             for node in row_.get("cold", ()):
                 if node in kept and (seconds := timed.get(node)) is not None and not row_.get("cached"):
-                    if green:
-                        ran_cold[node] = max(ran_cold.get(node, 0.0), seconds)
-                    else:
-                        cold[node] = seconds if (before := cold.get(node)) is None else max(before, seconds)
-            if green and fresh:
-                for node, seconds in timed.items():
-                    if node in kept and session.site_name(node, marked) not in marked:
-                        took[node] = max(took.get(node, 0.0), seconds)
+                    if row_["exitCode"] != 0:
+                        red_cold[node] = max(red_cold.get(node, 0.0), seconds)
+                    elif evidence(row_):
+                        green_cold[node] = max(green_cold.get(node, 0.0), seconds)
             # Each test's peak, the newest task's that ran it, red or green: a bound that follows its test as
             # it grows, never the least of runs it has outgrown (`task_peak`).
             if (measured := row_.get("peak")) is not None:
@@ -84,7 +97,6 @@ def entries(session, record: Mapping, kept: Mapping[str, float], rows: Mapping[s
                     for node in kept:
                         if owning(node) == file:
                             peaks[node] = max(peaks.get(node, 0), int(measured))
-    cold.update(ran_cold)
-    warm = {node: took[node] if node in took and seconds > session.KEPT * took[node]
-            and seconds - took[node] > target / 8 else seconds for node, seconds in kept.items()}
-    return {node: session.entry(seconds, cold.get(node), peaks.get(node)) for node, seconds in warm.items()}
+    cold.update(green_cold)
+    cold.update({node: max(cold.get(node, 0.0), seconds) for node, seconds in red_cold.items()})
+    return {node: session.entry(seconds, cold.get(node), peaks.get(node)) for node, seconds in kept.items()}
