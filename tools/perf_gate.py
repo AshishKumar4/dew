@@ -269,7 +269,7 @@ def _qwen35_comparison(out: Path) -> tuple:
 STEP_HARDWARE = {"step finetune-4b 1x2048": ("H100", "GH200"), "step finetune-1.7b 1x2048": ("A100",)}
 """The devices a step case is sized for (`Row.hardware`): a full fine-tune's, frozen once (batch, sequence,
 dtype, optimizer) and measured on each kind apart, the 4B one on Hopper's 80 GB or more (an H100, or the
-GH200 dew-ops' perf runs measure Hopper on: the owner, 2026-11-06)."""
+GH200 the fleet's perf runs measure Hopper on: the owner, 2026-11-06)."""
 
 
 PROBES = [
@@ -546,7 +546,7 @@ def rounds(args: argparse.Namespace, results: dict, sample: Callable[[str, int],
 
 
 COMPILE_TARGETS = {"a100": ("sm80", 40, "A100"), "h100": ("sm90", 80, "H100"), "gh200": ("sm90", 96, "GH200")}
-"""Each GPU kind dew-ops' perf runs measure, as `compile` plans its steps for it: its CUDA generation, whose
+"""Each GPU kind the fleet's perf runs measure, as `compile` plans its steps for it: its CUDA generation, whose
 multiprocessors `dew.training.ahead.built_target` states, its memory in GiB, the planner's capacity, and the
 device its sized steps run on (`STEP_HARDWARE`). A declared target, not the live run's program: a live run
 plans on its allocator's own pool, which its record keeps."""
@@ -627,7 +627,7 @@ def ahead_battery(args: argparse.Namespace) -> int:
     """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, for one
     compile-only GPU of the kind, `COMPILE_TARGETS`), in each tree's environment of `--lock`, into
     `--out`/<the tree's directory name>: what `run --ahead` hands each arm's step rows, so the GPU compiles
-    none of a step that is the program compiled ahead (dew-ops' perf jobs, in their GPU-free prepare). A
+    none of a step that is the program compiled ahead (the fleet's perf jobs, in their GPU-free prepare). A
     tree whose own benchmark_step has no `--compile-ahead` (one older than the handoff), asked of the tool
     itself, is named and runs as before, its GPU compiling. A tree that has it and fails to compile ahead,
     or whose tool cannot say what it takes, fails the battery (exit 1), and so the prepare that ran it: a
@@ -815,7 +815,7 @@ def report(args: argparse.Namespace) -> int:
     """The verdict table of a run's results (`run`'s or `compile`'s), 1 when the head failed a row: a gated
     row that regressed, a row the head broke, or one the gate could not judge (UNQUALIFIED). With
     `--verdicts`, each row's state and numbers as JSON, which a runner acts on where the gate ran, in the
-    head's environment (dew-ops' perf runs)."""
+    head's environment (the fleet's perf runs)."""
     results = json.loads(Path(args.results).read_text())
     base, head = results["base"], results["head"]
     # A round a run never reached counts as unmeasured, so an interrupted run is partial.

@@ -211,7 +211,7 @@ def test_a_step_reports_its_mfu_from_the_same_invocation_and_a_lower_one_regress
 
 
 def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmeasured_off_it(gate):
-    """The fine-tune rows time a 4B decoder's full AdamW step on Hopper, an H100 or the GH200 dew-ops
+    """The fine-tune rows time a 4B decoder's full AdamW step on Hopper, an H100 or the GH200 the fleet
     measures Hopper on, and a 1.7B one's on an A100: each case is one benchmark_step reads, on a declared
     field of the decoder, stepping the optimizer it names, and off its devices its four rows are not
     measured, never compared against another's, nor failing a claim, which requires the references alone."""
@@ -518,7 +518,7 @@ def test_the_servers_compiles_are_measured_cold_in_every_arm_and_round(gate, tmp
 @pytest.mark.parametrize(("kind", "gib"), [("h100", 80), ("gh200", 96)])
 def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path, monkeypatch, kind, gib):
     """`compile` plans and compiles each of a kind's steps ahead of its run for one compile-only GPU of the
-    kind's generation and memory (Hopper's as an H100 or the GH200 dew-ops measures Hopper on), its
+    kind's generation and memory (Hopper's as an H100 or the GH200 the fleet measures Hopper on), its
     attention XLA's in every arm and named so in the row (ledger 4616: the GPU's attention route lowers on
     no compile-only GPU), in each tree's environment of the lock the GPU run used, three arms a round in an
     order kept, every sample a process of its own with an empty compile cache: a head whose

@@ -1,6 +1,6 @@
 # Data-pipeline migration receipts
 
-These scripts produced the evidence for the move to `Pipeline` recipes: what the old loaders read. Each one is pinned to the revisions it names, so it reproduces that evidence and is not a maintained tool or a CI gate. Run them from the repository root, with Dew installed from the checkout. Their `r2://` pins name Dew's own data bucket, which public Dew does not reach. Reading them needs the dew-ops `r2` filesystem adapter, and the publishing steps need write access through it.
+These scripts produced the evidence for the move to `Pipeline` recipes: what the old loaders read. Each one is pinned to the revisions it names, so it reproduces that evidence and is not a maintained tool or a CI gate. Run them from the repository root, with Dew installed from the checkout. Their `r2://` pins name Dew's own data bucket, which public Dew does not reach. Reading them needs a filesystem adapter for that bucket, and the publishing steps need write access through it.
 
 | File | Baseline | Purpose | Reproduction |
 | --- | --- | --- | --- |

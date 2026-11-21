@@ -1,6 +1,6 @@
 """The gated delta net's real-shape cases, by the model whose layer they are: the one table the compile tests
-(fla_gdn_support) and dew-ops' kernel lab, which loads this file from a job's checkout by path, read. Plain
-Python, no import: a case is its operands' dimensions and the chunk the rule runs at."""
+(fla_gdn_support) and the GPU fleet's kernel jobs, which load this file from a job's checkout by path, read.
+Plain Python, no import: a case is its operands' dimensions and the chunk the rule runs at."""
 
 CASES = {
     "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
