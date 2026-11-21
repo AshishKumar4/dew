@@ -765,7 +765,7 @@ class Tcgen05Walked(Tcgen05Placed):
         # walk's end not taken (`mosaic.taken`), and marked (`mosaic.stepped`); then the issuer's last
         # products awaited (`finished`), whose sums the epilogue reads, zeros where the walk has no step.
         del streams, first, in_flight, unrolled, products
-        segments = mosaic.stepped(segments)
+        segments = list(mosaic.stepped(segments))
         if not segments:
             raise ValueError("Tcgen05Walked.walk requires at least one segment")
         if len(segments) > 1 and self.consumers != TURNS:

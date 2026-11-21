@@ -142,10 +142,9 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
                         at=at)
                  for index, (ref, kind, kept) in enumerate(laid))
 
-def _read[T](value: T | Callable[[], T]) -> T:
-    """Resolve a deferred reader (`Callable[[], T]`), or return an eager value unchanged."""
+def _read(value):
+    """Resolve a deferred reader (`callable`), or return an eager value unchanged."""
     return value() if callable(value) else value
-
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                  coords: algebra.Coords | Callable[[], algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
