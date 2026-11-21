@@ -2002,7 +2002,7 @@ def iterate(
     # canonical index, is a scored split's, which a later pass must draw alike (row 10567).
     sealing = seed is not None
     (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, training=sealing, counts=({},)),
-                        read, ({},), training=False)
+                        read, ({},), training=sealing)
     # Publication reads records, unbatched.
     build = _build(pipeline, read, loading, batch=1, training=False, seed=0 if seed is None else seed,
                    lowering=_analyzed(pipeline, read) if sealing else None)
