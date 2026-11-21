@@ -54,7 +54,16 @@ from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.nested import nested
-from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, twice_scaled, vanishing
+from dew.nn.precision import (
+    accurate_exp,
+    at_least_fp32,
+    compensated_add,
+    renormalized_add,
+    rounding_alone,
+    twice_scaled,
+    uncontracted,
+    vanishing,
+)
 from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
@@ -1321,7 +1330,7 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False, resta
     rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
     element of it the first of its segment's, in either direction: a suffix sums to its segment's last).
     `low`, where given, is each value's own low part, the values then double floats themselves (an exact
-    product's pair, `two_product`: Mamba-3's turns). Each pair joined renormalized (`compensated_add`), the
+    product's pair, `two_product`: Mamba-3's turns). Each pair joined renormalized (`renormalized_add`), the
     hand math's sum: a pair left unrenormalized held a residual that a product XLA:CPU fused into its sum (a
     rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966).
     A nested program (`dew.nn.nested`), traced once for its arguments' types within a trace: the associative
@@ -1332,7 +1341,18 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False, resta
     scan reads each at every level (Mamba-3's frames took a step 13% past its kernels on a GH200 so, row
     7402): prefixes alone, a reverse scan's none."""
     low = jnp.zeros_like(values) if low is None else low
-    joined = compensated_add if wrap is None else (lambda left, right: wrap(compensated_add(left, right)))
+    # Each value read as one where it is made (`uncontracted`, or its additions marked to round alone), once:
+    # the scan's partial sums are its additions', which its combine reads unfenced (`renormalized_add`), where
+    # a fence at every level split its fusions (row 8498). A wrapped sum is no addition's, so a scan that
+    # wraps its sums fences each combine's (`compensated_add`).
+    with rounding_alone():
+        (values,) = uncontracted(values)
+
+    def renormalized(left, right):
+        with rounding_alone():
+            return renormalized_add(left, right)
+
+    joined = renormalized if wrap is None else (lambda left, right: wrap(compensated_add(left, right)))
     if chunk is not None:
         if reverse:
             raise ValueError("compensated's chunk walks prefixes alone: a reverse scan takes chunk=None")

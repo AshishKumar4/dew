@@ -36,7 +36,8 @@ from benchmark_recurrence import SHAPES, operands
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.options import program
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk, recomputing
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.residuals import recomputing
 from dew.telemetry.benchmark import device_time
 from dew.training.memory import peak_memory_gib
 
@@ -91,7 +92,7 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
         # The forward's results returned with the gradients, as a training step reads both: a pass
         # returning the gradients alone leaves XLA to drop every forward launch the backward does not
         # read (each arm's output launch). The recomputing arm keeps no memories for its backward, as the
-        # remat rung 'delta_memory' asks (`recurrence_chunk.recomputing`).
+        # remat rung 'delta_memory' asks (`residuals.recomputing`).
         with recomputing(('delta_memory',) if arm.endswith('-recompute') else ()):
             out, pull = jax.vjp(forward, *args)
         return out, pull(jax.tree.map(jnp.ones_like, out))

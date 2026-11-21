@@ -187,7 +187,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
     `A`, and the launches' weighted keys, memories, corrected values and a forked call's stored slots,
     `(w, h, corrected, stored)`, which the port
-    keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
+    keeps unless a remat rung recomputes them (`residuals.RECOMPUTED`), the caller's choice."""
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, apart=apart, values_gated=values_gated, unit_keys=unit_keys,

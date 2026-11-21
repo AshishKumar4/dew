@@ -88,11 +88,11 @@ from .. import programs
 from ..precision import (
     activation_and_slope,
     at_least_fp32,
-    compensated_add,
     compensated_total,
     logistic_value,
     rms_weighted,
     rounded_to,
+    summed_pairs,
     two_product,
     uncontracted,
 )
@@ -955,13 +955,11 @@ def _rms_backward(x_ref, scale_ref, gate_ref, mean_square_ref, dy_ref, stream_re
 
 def _scale_sum(partial, correction):
     """The programs' compensated parts summed over programs as compensated
-    pairs (`compensated_add`), one XLA column reduction, read as every
+    pairs (`precision.summed_pairs`), one XLA column reduction, read as every
     compensated sum is (`compensated_total`): the pair rounded once, or the
     programs' plain sum where that reaches an infinity, whose residual is
     inf - inf."""
-    zero = jnp.zeros((), jnp.float32)
-    pair = jax.lax.reduce((partial, correction), (zero, zero), compensated_add, (0,))
-    return compensated_total(pair, jnp.sum(partial, axis=0))
+    return compensated_total(summed_pairs((partial, correction), (0,)), jnp.sum(partial, axis=0))
 
 
 def _varying(operands: tuple, outputs):

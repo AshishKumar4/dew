@@ -11,7 +11,8 @@ import pytest
 import test_torchax_fallback as fallback
 from gpu_flow import Cell, run_cells
 
-pytestmark = [pytest.mark.gpu(reason="TF32 is a GPU's default float32 product"), pytest.mark.torchax]
+pytestmark = [pytest.mark.gpu(reason="TF32 is a GPU's default float32 product"), pytest.mark.torchax,
+              pytest.mark.compiles_at_run(reason="torchax models and a tier-3 source, no check-1 site")]
 
 
 def test_the_torchax_fallback_runs_on_the_gpu(tmp_path):

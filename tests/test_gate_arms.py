@@ -292,13 +292,13 @@ def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_ref
 
 class _Marked:
     """A test's markers as pytest's item reads them (`get_closest_marker`), the conftest's hook's only read
-    of it (the backend-skip witness's)."""
+    of it (the prepare skip witnesses'): each name's mark, its reason given."""
 
     def __init__(self, *names: str):
         self.names = names
 
     def get_closest_marker(self, name: str):
-        return getattr(pytest.mark, name).mark if name in self.names else None
+        return getattr(pytest.mark, name)(reason="the witness's").mark if name in self.names else None
 
 
 def test_a_gpu_parts_prepare_skips_what_its_run_skips_by_backend(monkeypatch):
@@ -317,3 +317,20 @@ def test_a_gpu_parts_prepare_skips_what_its_run_skips_by_backend(monkeypatch):
             conftest.pytest_runtest_setup(_Marked(backend))
     conftest.pytest_runtest_setup(_Marked("gpu"))
     conftest.pytest_runtest_setup(_Marked())
+
+
+def test_a_gpu_parts_prepare_skips_a_test_declared_to_compile_at_run(monkeypatch):
+    """A behavioral GPU test with no check-1 site that declares its programs compiled at its run
+    (`compiles_at_run`) is skipped by its part's prepare, which has nothing of it to compile ahead, and run
+    outside one (tests/conftest.py's `pytest_runtest_setup`): its first computation in a prepare was filed
+    as a check-1 site's prepare missed (rows 8310, 8097)."""
+    import lane_environment
+    import conftest
+    import tier_wire
+
+    monkeypatch.delenv(lane_environment.USERS_ARITHMETIC, raising=False)
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with pytest.raises(pytest.skip.Exception):
+        conftest.pytest_runtest_setup(_Marked("gpu", "compiles_at_run"))
+    monkeypatch.delenv(tier_wire.PREPARE)
+    conftest.pytest_runtest_setup(_Marked("compiles_at_run"))

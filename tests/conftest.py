@@ -318,6 +318,13 @@ def pytest_runtest_setup(item):
         marker = item.get_closest_marker(backend)
         if marker and here != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
+    # A behavioral GPU test with no check-1 site, its programs compiled where its run reaches them (a training
+    # run, a save across two meshes: values its own steps compute steer what it compiles next), declares so
+    # (`compiles_at_run`, its reason): its part's prepare, whose device computes nothing, has nothing of it to
+    # compile ahead and skips it, where its first computation was filed as a check-1 site's prepare missed
+    # (rows 8310, 8097); its run runs it as any test's.
+    if tier_wire.preparing() and (declared := item.get_closest_marker("compiles_at_run")) is not None:
+        pytest.skip(f"compiles at run: {declared.kwargs['reason']}")
 
 
 def _sites_store(item) -> Path | None:
