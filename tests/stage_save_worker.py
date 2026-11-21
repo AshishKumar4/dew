@@ -76,7 +76,8 @@ def _handled(mesh, directory) -> tuple[dict, bool]:
               "vector": NamedSharding(stage_mesh(mesh, 0), P())}
     values = {"scalar": np.float32(3.5), "vector": np.arange(4, dtype=np.float32)}
     arrays = {name: jax.make_array_from_callback(np.shape(values[name]), placed[name],
-                                                 lambda index, name=name: np.asarray(values[name])[index])
+                                                 lambda index, name=name: np.asarray(values[name])[index],
+                                                 dtype=np.float32)
               for name in values}
     with ocp.Checkpointer(_handler()) as checkpointer:
         checkpointer.save(f"{directory}/handled", arrays)
