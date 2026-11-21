@@ -2222,9 +2222,9 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool)
         def step(s, dp, peak, total, anchor, delta, q, k):
             coords = algebra.Coords(q, k)
             seen = algebra.seen(spec, coords, s)
-            exps, weights, ds = bwd_algebra.softmax_cotangents(spec, s, dp, peak, total, anchor, delta,
-                                                               seen=seen)
-            return algebra.value_weights(exps, weights, jnp.bfloat16, 1.0), ds.astype(jnp.bfloat16)
+            exps, weights, ds = bwd_algebra.softmax_cotangents(
+                s, dp, peak, total, anchor, delta, seen=seen)
+            return algebra.value_weights(exps, weights, jnp.bfloat16), ds.astype(jnp.bfloat16)
 
         jaxpr = jax.make_jaxpr(step)(s_in, s_in, row, row, row, row, q_pos, k_pos).jaxpr
     else:
@@ -2232,10 +2232,12 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool)
             coords = algebra.Coords(q, k)
             mod = algebra.modify(spec, s, coords, (), masked=True)
             new_m, alpha = algebra.peak(spec, m, mod)
-            if scaled:
-                high, low = algebra.at_scale(spec, mod, new_m, jnp.ones((tile[1],), jnp.float32), 1.0)
-                return high, low, new_m, alpha
             w = algebra.weights(spec, mod, new_m)
+            if scaled:
+                exp = jnp.ones((tile[0],), jnp.int32)
+                held = algebra.Scaled(exp, exp, lambda shift: algebra.weights(spec, mod, new_m - shift))
+                high, low = algebra.at_scale(w, held)
+                return high, low, new_m, alpha
             return w.astype(jnp.bfloat16), algebra.total(l_val, alpha, w), new_m
 
         jaxpr = jax.make_jaxpr(step)(s_in, row, row, q_pos, k_pos).jaxpr
