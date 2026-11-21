@@ -1353,11 +1353,20 @@ def _protected(transform: Callable) -> Callable:
     return bound_span(Protected(), transform)
 
 
-MARKED_BACKENDS = ("cpu",)
+MARKED_BACKENDS = ("cpu", "cuda")
 """The platforms whose compiler rounds an operation the fork's no-contract attribute marks on its own, so a
 marked transform's operands need no barrier there (`uncontracted`, chosen as the program lowers for its
 platform): XLA:CPU's fusion compiler fences the mark (the fork's xla no_contract_mark patch); XLA:GPU's
-fusion emitters carry it and no fence, and contract it as any other (row 10135)."""
+native fusion emitters on CUDA contract no float add, subtract or multiply, marked or not, NVPTX fusing only
+an operation flagged to contract, which no emitter but the CPU's sets (row 10135: a marked and a plain
+`a * b + c` bitwise the separately rounded one on an A100 and a GH200 at post115;
+`test_no_contract.a_marked_multiply_add_rounds_each_step` fails should a later XLA contract one). ROCm's and
+a TPU's take the barrier."""
+
+TRACED_MARKED = ("cpu", "gpu")
+"""The platforms a call's code is chosen for (`dew.nn.kernels.generation.backend`) whose programs lower for
+a platform of `MARKED_BACKENDS`: a GPU's for CUDA's or, where ROCm runs, ROCm's, whose lowering keeps the
+barrier (`uncontracted`'s platform choice)."""
 
 def _as_they_are(values: tuple) -> tuple:
     """`values` unbarriered: a platform choice's branch where its compiler fences the mark
@@ -1389,19 +1398,19 @@ def no_contract() -> str | None:
 def rounding_alone():
     """Every float add, subtract and multiply traced in the block marked to round on its own, never
     contracted into a fused multiply-add, where the jaxlib marks so (`no_contract`, `set_xla_metadata`) and
-    the trace is for a platform whose compiler fences the mark (`MARKED_BACKENDS`, the platform a call's code
-    is chosen for, `dew.nn.kernels.generation.backend`): an error-free transform's arithmetic, each step's
-    rounded value the one every later step reads, its operands read without a barrier where the platform the
-    program lowers for fences the mark too (`uncontracted`). Elsewhere nothing is marked, and the transforms
-    hold their operands behind a barrier, as a Pallas kernel's body a GPU traces does (Triton's lowering takes
-    no platform choice). A kernel Dew launches keeps the barrier in its body however it is traced
-    (`dew.nn.kernels.launches.interpreting`); a raw `pallas_call` outside them, traced for a CPU and lowered
-    for CUDA, meets the platform choice, which Triton's lowering refuses by name: no public JAX predicate
-    states a Pallas trace yet (row 10138)."""
+    the trace is for a platform whose programs lower for one that fences the mark (`TRACED_MARKED`, the
+    platform a call's code is chosen for, `dew.nn.kernels.generation.backend`): an error-free transform's
+    arithmetic, each step's rounded value the one every later step reads, its operands read without a
+    barrier where the platform the program lowers for fences the mark too (`uncontracted`). Elsewhere, and in
+    the body of a kernel Dew launches (`dew.nn.kernels.launches.interpreting`), nothing is marked and the
+    transforms hold their operands behind a barrier. A raw `pallas_call`'s GPU body outside Dew's launches
+    meets the platform choice, which Pallas's Triton and Mosaic GPU lowerings refuse by name, where Mosaic
+    TPU's takes its default: no public JAX predicate states a Pallas trace yet (row 10138)."""
     from dew.nn.kernels.generation import backend
+    from dew.nn.kernels.launches import interpreting
 
     name = no_contract()
-    if name is None or backend() not in MARKED_BACKENDS:
+    if name is None or backend() not in TRACED_MARKED or interpreting() is not None:
         yield
         return
     from jax.experimental.xla_metadata import set_xla_metadata
@@ -1608,10 +1617,12 @@ def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
                    for fraction in (top_fraction, bottom_fraction))
     significand, residual = _rounded_significand(top, bottom)
     exponent = top_field - bottom_field - lowered
-    bits = jax.lax.bitcast_convert_type(significand, jnp.int32)
-    # The rounded significand's biased exponent once scaled: 1 to 254 is a normal float.
-    field = ((bits >> 23) & 0xFF) + exponent
-    normal = jax.lax.bitcast_convert_type(bits + (exponent << 23), jnp.float32)
+    # The rounded significand's fields (`raw_fields`), a positive normal's: its biased exponent once scaled,
+    # 1 to 254 a normal float, set back in its bits.
+    bits, _, significand_field, _ = raw_fields(significand)
+    field = significand_field.astype(jnp.int32) + exponent
+    normal = jax.lax.bitcast_convert_type(bits + jax.lax.bitcast_convert_type(exponent << 23, jnp.uint32),
+                                          jnp.float32)
     # Below the normal range: the significand on the grid of 2^-149, a value under 2^23 whose
     # integer part and half are exact in fp32; within the float32 range scaled by 2^shift.
     shift = jnp.clip(exponent + 149, -126, 127)

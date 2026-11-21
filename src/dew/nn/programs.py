@@ -19,6 +19,7 @@ import jax.extend.core as jcore
 import jax.numpy as jnp
 import numpy as np
 from jax._src import config as jax_config, core as jax_core, dtypes, mesh as mesh_lib
+from jax._src.interpreters import partial_eval
 from jax._src.literals import TypedNdArray
 from jax._src.pallas.mpmd import mpmd_map_p
 from jax.core import ShapedArray
@@ -464,54 +465,81 @@ def _host_folded(primitive: jcore.Primitive, operands: Sequence[jax.typing.Array
                  params: Mapping[str, object]) -> TypedNdArray | None:
     """`scalar_folded` of `operands` as this host's bind takes them, host literals alone (a device array is
     bound): each canonicalized as the bind canonicalizes it (JAX's own, `dtypes.canonicalize_value`: a NumPy
-    integer wider than the process's width narrowed, a Python integer at that width) and at its type, cast to
-    a stated integer output dtype first as XLA casts an operand before its operation (another output dtype
-    declined before any cast), the output a literal of the type the primitive's abstract rule gives it (its
-    dtype and weak type), under no mesh as `host_evaluated` binds a constant (its placement none), which a
-    program's next equation binds as the bind's own output. Nothing is traced."""
+    integer wider than the process's width narrowed, a Python integer at that width), admitted at its type
+    (`admitted`), and cast to a stated output dtype first as XLA casts an operand before its operation, the
+    output a literal of the type the primitive's abstract rule gives it (its dtype and weak type), under no
+    mesh as `host_evaluated` binds a constant (its placement none), which a program's next equation binds as
+    the bind's own output. Nothing is traced."""
     # A host literal alone: a device array's value is no constant this host reads without a transfer.
     if primitive not in SCALAR_FOLDED or any(isinstance(value, jax.Array) for value in operands):
         return None
     canonical = [dtypes.canonicalize_value(value) for value in operands]
+    # Each at the type JAX's canonical aval states, not NumPy's dispatch on the operand as given.
     types = [jax.typeof(value) for value in canonical]
-    # Its rank and dtype read from JAX's canonical aval, not from NumPy's dispatch on the operand as given.
-    if any(kind.ndim or not _integral(kind.dtype) for kind in types):
+    if (held := admitted(canonical, [kind.dtype for kind in types])) is None:
         return None
     with meshless():
         out, _ = primitive.abstract_eval(*types, **params)
-    if not _integral(out.dtype):
-        return None
     # A stated output dtype is the output's (`out`), each operand cast to it first.
-    cast = params.get("out_dtype") is not None
-    held = [np.asarray(value).astype(out.dtype if cast else kind.dtype, copy=False)[()]
-            for value, kind in zip(canonical, types, strict=True)]
+    if params.get("out_dtype") is not None and (held := admitted(held, [out.dtype] * len(held))) is None:
+        return None
     folded = scalar_folded(primitive, held, params, out.dtype)
     return None if folded is None else TypedNdArray(np.asarray(folded, out.dtype), out)
 
 
-def scalar_folded(primitive: jcore.Primitive, operands: Sequence[np.generic | np.ndarray],
+def admitted(values: Sequence, dtypes: Sequence[jax.typing.DTypeLike]) -> list[np.generic] | None:
+    """`values` as the concrete integer and boolean scalars `scalar_folded` computes over, each at its
+    caller's canonical dtype in `dtypes` (a bind's operand's, a kernel's atom's), converted as JAX folds a
+    constant's conversion (`_converted`); None where one is not such a scalar (a traced value or an array of
+    a device, one with axes, a float, a complex value) or its dtype is neither integer nor boolean. The one
+    admission of a host fold's operands, a bind's (`_host_folded`) and a kernel's emission's
+    (`dew.nn.kernels.templates.emission`)."""
+    if not (all(map(integral_scalar, values)) and all(map(_integral, dtypes))):
+        return None
+    return [_converted(value, dtype) for value, dtype in zip(values, dtypes, strict=True)]
+
+
+def integral_scalar(value) -> bool:
+    """Whether `value` is a concrete integer or boolean scalar on this host: a Python integer or boolean, or
+    a NumPy one of an integer or boolean dtype (JAX's 4-bit integers among them), a scalar or an array of no
+    axes. A float is none, nor is a JAX array, whose value no host holds without a transfer."""
+    if isinstance(value, jax.Array) or not isinstance(value, (int, np.generic, np.ndarray)):
+        return False
+    return np.ndim(value) == 0 and _integral(np.result_type(value))
+
+
+def _converted(value, dtype: jax.typing.DTypeLike) -> np.generic:
+    """`value` as `dtype` holds it, converted as JAX folds a constant's conversion (`convert_element_type`'s
+    constant-folding rule, `partial_eval.const_fold_rules`: NumPy's cast, an integer wrapped at its width),
+    with no program traced."""
+    kind = ShapedArray((), np.dtype(dtype))
+    (out,) = partial_eval.const_fold_rules[jax.lax.convert_element_type_p](
+        [np.asarray(value)], {"new_dtype": kind.dtype, "weak_type": False, "sharding": None}, [kind])
+    return np.asarray(out)[()]
+
+
+def scalar_folded(primitive: jcore.Primitive, operands: Sequence[np.generic],
                   params: Mapping[str, object], dtype: jax.typing.DTypeLike) -> np.generic | None:
-    """An elementwise `primitive`'s output, of `dtype`, over concrete integer and boolean NumPy scalars
-    `operands` (or arrays of no axes), each at its own dtype (a program's own: a kernel's index held at int64
-    under its body's x64 scope stays int64), as binding it computes it, exactly, in this host's own integers
+    """An elementwise `primitive`'s output, of `dtype`, over its operands, concrete integer and boolean
+    scalars each at its own dtype (`admitted`: a program's own, a kernel's index held at int64 under its
+    body's x64 scope stays int64), as binding it computes it, exactly, in this host's own integers
     (`_SCALAR`), with no program traced, lowered or compiled: a width's wrap, a quotient truncated and a
     remainder of its dividend's sign (by zero, and of the least integer by -1, as XLA defines them), a shift
     past the width at its first operand's width, and the result wrapped to `dtype`, the type its caller's
     backend gives it: XLA's, a stated output dtype's, its operands cast to it first (`_host_folded`); Mosaic
-    GPU's Lane lowering, its first operand's, reading no stated dtype (`emission._folded`). A quotient by
-    zero is every bit set and a remainder by zero its dividend, and a signed least integer's quotient by -1
-    is itself and its remainder 0, as XLA's elemental emitter guards them; a caller lowering otherwise (a
-    Mosaic kernel's native division, which leaves them undefined) refuses them first (`emission`'s). None for
-    a primitive outside the arithmetic folded (`SCALAR_FOLDED`), a parameter it does not read (`_READ`), and
-    a floating or complex operand or output."""
-    if (primitive not in SCALAR_FOLDED or any(map(np.ndim, operands))
+    GPU's Lane lowering, its first operand's, reading no stated dtype (`emission._folded`); a conversion as
+    JAX folds a constant's (`_converted`). A quotient by zero is every bit set and a remainder by zero its
+    dividend, and a signed least integer's quotient by -1 is itself and its remainder 0, as XLA's elemental
+    emitter guards them; a caller lowering otherwise (a Mosaic kernel's native division, which leaves them
+    undefined) refuses them first (`emission`'s). None for a primitive outside the arithmetic folded
+    (`SCALAR_FOLDED`), a parameter it does not read (`_READ`), and a floating or complex output."""
+    if (primitive not in SCALAR_FOLDED or not _integral(dtype)
             or any(value is not None for name, value in params.items() if name not in _READ)):
         return None
-    kinds = [np.result_type(value) for value in operands]
-    if not all(map(_integral, kinds)) or not _integral(dtype):
-        return None
+    if primitive is jax.lax.convert_element_type_p:
+        return _converted(operands[0], dtype)
     values = [int(value) for value in operands]
-    return np.dtype(dtype).type(_wrapped(_SCALAR[primitive](kinds[0], *values), dtype))
+    return np.dtype(dtype).type(_wrapped(_SCALAR[primitive](operands[0].dtype, *values), dtype))
 
 
 def _wrapped(value: int, dtype) -> int | bool:
@@ -578,14 +606,14 @@ _SCALAR: dict[jcore.Primitive, Callable[..., int | bool]] = {
     jax.lax.shift_left_p: functools.partial(_shifted, jax.lax.shift_left_p),
     jax.lax.shift_right_arithmetic_p: functools.partial(_shifted, jax.lax.shift_right_arithmetic_p),
     jax.lax.shift_right_logical_p: functools.partial(_shifted, jax.lax.shift_right_logical_p),
-    jax.lax.convert_element_type_p: lambda held, a: a,
 }
 """Each of `SCALAR_FOLDED`'s primitives over its operands as Python's integers (a boolean's 0 or 1), the
 dtype they are held at first: its result before `scalar_folded` wraps it to the output's dtype."""
 
-SCALAR_FOLDED = frozenset(_SCALAR)
+SCALAR_FOLDED = frozenset({*_SCALAR, jax.lax.convert_element_type_p})
 """The elementwise primitives `scalar_folded` computes over concrete integer and boolean scalars: a
-kernel's index arithmetic's and a program's integer constants'."""
+kernel's index arithmetic's and a program's integer constants', a conversion as JAX folds one
+(`_converted`)."""
 
 _READ = frozenset({"new_dtype", "out_dtype", "weak_type", "sharding", "out_sharding"})
 """The parameters `scalar_folded` folds with: a conversion's target and weak type, a result's stated dtype
