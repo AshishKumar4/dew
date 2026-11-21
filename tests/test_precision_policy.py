@@ -2342,11 +2342,27 @@ def test_a_compensated_primitive_under_jit_on_a_tpu_is_its_eager_arithmetic(shap
     compensated_primitives_hold_under_jit(shape)
 
 
-def test_a_sum_of_products_rounded_once_cancels_a_product_made_in_its_program():
+PATHS = ("marked", "barriered")
+"""The error-free transforms' two paths (row 8378): their arithmetic marked to round alone where the jaxlib
+marks (`dew.nn.precision.rounding_alone`), or their operands behind a barrier (`dew._cache.BARRIERED`, which
+the suite enters to run that path on a lane whose jaxlib marks)."""
+
+
+def on_path(path: str):
+    """The block run on `path` (`PATHS`): the barrier path entered, the marked one as the process runs."""
+    from dew import _cache
+
+    return _cache.BARRIERED(new_value=True) if path == "barriered" else contextlib.nullcontext()
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_a_sum_of_products_rounded_once_cancels_a_product_made_in_its_program(path):
     """`summed_once` of `-q` and `1 * q`, `q` a square made in the same jitted program (`t = 1 + 2^-12`, whose
     square's rounding drops `2^-24`), is 0 exactly: its products' splits read each operand as one value,
     where a compiler that contracted the square into a split's subtraction read the exact square there and
-    the rounded one in the product, a spurious low part of `2^-24` the sum carried (row 7953)."""
+    the rounded one in the product, a spurious low part of `2^-24` the sum carried (row 7953). On each path
+    (`PATHS`): the caller's square, unmarked, is read by the transform's marked arithmetic, which rounds alone
+    (row 8378)."""
     from dew.nn.precision import summed_once
 
     @jax.jit
@@ -2355,7 +2371,8 @@ def test_a_sum_of_products_rounded_once_cancels_a_product_made_in_its_program():
         return summed_once((-square,), ((jnp.ones_like(square), square),))
 
     t = jnp.full((4096,), 1 + 2.0 ** -12, jnp.float32)
-    np.testing.assert_array_equal(np.asarray(cancelled(t)), np.zeros(4096, np.float32))
+    with on_path(path):
+        np.testing.assert_array_equal(np.asarray(cancelled(t)), np.zeros(4096, np.float32))
 
 
 def test_a_sum_of_products_rounded_once_reaching_an_infinity_is_the_plain_sums():
@@ -2394,10 +2411,13 @@ def test_a_sum_of_products_rounded_once_keeps_its_residuals_apart_from_its_runni
     assert float(cancelled(jnp.asarray(t))) == 2.0 ** -49
 
 
+@pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize("shape", COMPENSATED_SHAPES)
-def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape):
-    """`compensated_primitives_hold_under_jit` on the CPU (a GPU's in tests/test_gpu_numerics.py)."""
-    compensated_primitives_hold_under_jit(shape)
+def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape, path):
+    """`compensated_primitives_hold_under_jit` on the CPU (a GPU's in tests/test_gpu_numerics.py), on each
+    path (`PATHS`)."""
+    with on_path(path):
+        compensated_primitives_hold_under_jit(shape)
 
 
 def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flushing_cpu():

@@ -28,6 +28,7 @@ scope and contracted with the taps as one 2D product (stride 1 train 3.9 times, 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import math
@@ -1352,13 +1353,76 @@ def _protected(transform: Callable) -> Callable:
     return bound_span(Protected(), transform)
 
 
+MARKED_BACKENDS = ("cpu",)
+"""The platforms whose compiler rounds an operation the fork's no-contract attribute marks on its own, so a
+marked transform's operands need no barrier there (`uncontracted`, chosen as the program lowers for its
+platform): XLA:CPU's fusion compiler fences the mark (the fork's xla no_contract_mark patch); XLA:GPU's
+fusion emitters carry it and no fence, and contract it as any other (row 10135)."""
+
+def _as_they_are(values: tuple) -> tuple:
+    """`values` unbarriered: a platform choice's branch where its compiler fences the mark
+    (`uncontracted`)."""
+    return values
+
+
+_UNBARRIERED = dict.fromkeys(MARKED_BACKENDS, _as_they_are)
+"""`uncontracted`'s branches by the platform a program lowers for, each that fences the mark's."""
+
+_MARKING = contextvars.ContextVar("dew.nn.precision.marking", default=False)
+"""Whether the arithmetic traced now is marked to round alone (`rounding_alone`), so the operands it reads
+need no barrier (`uncontracted`)."""
+
+
+def no_contract() -> str | None:
+    """The frontend attribute under which a compiler of `MARKED_BACKENDS` rounds a float add, subtract or
+    multiply on its own, never contracted into a fused multiply-add (`jax.extend.backend
+    .no_contract_attribute`, the fork's from post112); None where the jaxlib marks nothing (a stock jaxlib),
+    or where the suite asks the barrier path (`dew._cache.BARRIERED`)."""
+    from jax.extend.backend import no_contract_attribute
+
+    from dew import _cache
+
+    return None if _cache.BARRIERED.value else no_contract_attribute()
+
+
+@contextlib.contextmanager
+def rounding_alone():
+    """Every float add, subtract and multiply traced in the block marked to round on its own, never
+    contracted into a fused multiply-add, where the jaxlib marks so (`no_contract`, `set_xla_metadata`) and
+    the trace is for a platform whose compiler fences the mark (`MARKED_BACKENDS`, the platform a call's code
+    is chosen for, `dew.nn.kernels.generation.backend`): an error-free transform's arithmetic, each step's
+    rounded value the one every later step reads, its operands read without a barrier where the platform the
+    program lowers for fences the mark too (`uncontracted`). Elsewhere nothing is marked, and the transforms
+    hold their operands behind a barrier, as a Pallas kernel's body a GPU traces does (Triton's lowering takes
+    no platform choice). A kernel Dew launches keeps the barrier in its body however it is traced
+    (`dew.nn.kernels.launches.interpreting`); a raw `pallas_call` outside them, traced for a CPU and lowered
+    for CUDA, meets the platform choice, which Triton's lowering refuses by name: no public JAX predicate
+    states a Pallas trace yet (row 10138)."""
+    from dew.nn.kernels.generation import backend
+
+    name = no_contract()
+    if name is None or backend() not in MARKED_BACKENDS:
+        yield
+        return
+    from jax.experimental.xla_metadata import set_xla_metadata
+
+    held = _MARKING.set(True)
+    try:
+        with set_xla_metadata(**{name: True}):
+            yield
+    finally:
+        _MARKING.reset(held)
+
+
 @_protected
 def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum). Each operand is read as
-    one value (`uncontracted`): a compiler that fused the multiply making an operand into the sum (an FMA,
-    XLA's CPU and GPU contract one) would add its exact product where the steps after read its rounded
-    one, counting that rounding twice."""
-    return _two_sum(*uncontracted(left, right))
+    one value: a compiler that fused the multiply making an operand into the sum (an FMA, XLA's CPU and GPU
+    contract one) would add its exact product where the steps after read its rounded one, counting that
+    rounding twice; its additions are marked to round alone where the jaxlib marks (`rounding_alone`), its
+    operands held behind a barrier elsewhere (`uncontracted`)."""
+    with rounding_alone():
+        return _two_sum(*uncontracted(left, right))
 
 
 def _two_sum(left, right):
@@ -1377,7 +1441,10 @@ def uncontracted(*values):
     compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses, on
     the value where it is made, so every reader sees the one rounded value (`two_sum`'s operands,
     `two_product`'s product); a caller whose plain float32 arithmetic leaned on the contractions a barrier
-    splits around it takes its sum compensated (`summed_once`, row 7979).
+    splits around it takes its sum compensated (`summed_once`, row 7979). Inside a transform whose own
+    arithmetic is marked to round alone (`rounding_alone`), the values as they are where the platform the
+    program lowers for fences the mark (`MARKED_BACKENDS`, `jax.lax.platform_dependent`): no step reading
+    them contracts, and no barrier splits the fusions around them (row 8378); the barrier on any other.
 
     In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
     `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
@@ -1387,8 +1454,13 @@ def uncontracted(*values):
     from dew.nn.kernels.generation import backend
     from dew.nn.kernels.launches import interpreting
 
-    in_tpu_kernel = interpreting() is False and backend() == "tpu"
-    return values if in_tpu_kernel else jax.lax.optimization_barrier(values)
+    if (interpreted := interpreting()) is not None:
+        # A kernel's body, whose platform is its launch's: a compiled TPU kernel's as it is, any other's
+        # barriered (an interpreted body's lowers to XLA's programs, whose platform choice a body takes none).
+        return values if not interpreted and backend() == "tpu" else jax.lax.optimization_barrier(values)
+    if not _MARKING.get():
+        return jax.lax.optimization_barrier(values)
+    return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
 
 
 def _odd(dtype) -> bool:
@@ -1412,6 +1484,13 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     With each arithmetic step rounded, the residual is exact where intermediates
     neither overflow nor underflow.
     """
+    with rounding_alone():
+        return _two_product(left, right, bit_split=bit_split, subtract=subtract, rounding=rounding)
+
+
+def _two_product(left, right, *, bit_split: bool, subtract: bool,
+                 rounding: Callable[[jax.Array], jax.Array] | None) -> tuple[jax.Array, jax.Array]:
+    """`two_product`'s arithmetic, its steps' roundings each their own (`rounding_alone`, `uncontracted`)."""
     def rounded(value):
         return value if rounding is None else rounding(value)
 
@@ -1692,7 +1771,8 @@ def compensated_add(left, right):
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
+    with rounding_alone():
+        return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
 
 
 @_protected
@@ -1736,10 +1816,12 @@ def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """The sum of `values` over `axes` its compensated pair rounds once, its tangent the plain sum's: a
     protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
     algebra pass must not cancel."""
-    # Each value read as one (`uncontracted`) where it is made: the reduction's pairs are its additions'.
-    (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
-    zero = jnp.zeros((), wide.dtype)
-    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
+    # Each value read as one (`uncontracted`) where it is made, or the reduction's additions marked to round
+    # alone (`rounding_alone`): the reduction's pairs are its additions'.
+    with rounding_alone():
+        (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
+        zero = jnp.zeros((), wide.dtype)
+        hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
     return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
 
 

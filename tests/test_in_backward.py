@@ -67,11 +67,14 @@ worst on CUDA, the reference's own arithmetic against itself deciding the same r
 row 10145)."""
 
 
-def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
+@pytest.mark.parametrize("barriered", [False, True], ids=["marked", "barriered"])
+def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would(barriered):
     """A scanned run of three layers that updates in its backward (`dew.nn.in_backward.scanned_run`) under
     adamw, each layer's update the optimizer's on the layer alone, moves each layer's weights as adamw's
     update of the whole tree a layer at a time moves them, on par with it (check 1): two programs, the scanned
-    one never holding the run's gradient whole, a layer below reading the layer above as its forward did."""
+    one never holding the run's gradient whole, a layer below reading the layer above as its forward did. On
+    both paths of precision's error-free transforms: their arithmetic marked to round alone, and behind a
+    barrier (`dew._cache.BARRIERED`, row 8378)."""
     from dew.nn import in_backward
 
     scanned = decoder(scan=True)
@@ -111,9 +114,12 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
     def draw(seed):
         return (jax.random.randint(jax.random.key(seed), (2, SEQ), 0, VOCAB),)
 
-    assert_as_exact(jax.jit(in_backward_step), dew_path(jax.jit(whole_step(plain, layered))), draw,
-                    "a run updating in its backward", seeds=RUN_SEEDS,
-                    truth_fn=jax.jit(whole_step(wide, widened(layered))), conditioning=RUN_CONDITIONING)
+    from dew import _cache
+
+    with _cache.BARRIERED(new_value=barriered):
+        assert_as_exact(jax.jit(in_backward_step), dew_path(jax.jit(whole_step(plain, layered))), draw,
+                        "a run updating in its backward", seeds=RUN_SEEDS,
+                        truth_fn=jax.jit(whole_step(wide, widened(layered))), conditioning=RUN_CONDITIONING)
 
 
 SHARED_SEEDS = 64
