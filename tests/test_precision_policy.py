@@ -656,29 +656,37 @@ def divides_as_ieee_division_at_its_edges():
     once: 53 >= 2 x 24 + 2), its overflows infinite and its subnormal quotients on their grid, ties to even,
     over divisors given as arrays and as constants (which the backend's division approximates); and each
     quotient of a zero, subnormal, infinite or NaN operand the backend's own division."""
+    from reference_error import ahead_arm
+
     from dew.nn.precision import correctly_rounded_divide
 
     numerator, denominator = division_edges()
     normal = (np.abs(numerator) >= np.finfo(np.float32).tiny) & np.isfinite(numerator) & (
         np.abs(denominator) >= np.finfo(np.float32).tiny) & np.isfinite(denominator)
-    actual = np.asarray(jax.jit(correctly_rounded_divide)(numerator, denominator))
-    with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
-        expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
-    np.testing.assert_array_equal(actual[normal].view(np.uint32), expected[normal].view(np.uint32))
-    plain = np.asarray(jax.jit(jnp.divide)(numerator[~normal], denominator[~normal]))
-    np.testing.assert_array_equal(actual[~normal], plain)
+    # Programs with no check-1 site, each prepared as an arm is in a GPU tier part (`ahead_arm`), every one
+    # run before any is judged: a prepare's arm gives zeros.
+    actual = np.asarray(ahead_arm(jax.jit(correctly_rounded_divide), "a correctly rounded division's edges")(
+        numerator, denominator))
+    plain = np.asarray(ahead_arm(jax.jit(jnp.divide), "the plain division of the edges past the normals")(
+        numerator[~normal], denominator[~normal]))
     # A constant divisor, which XLA takes as a product by its rounded reciprocal (on a CPU and a GPU alike),
     # so the first quotient is off and the correction and the last move decide: the edges' normal numerators
     # over divisors just below a power of two, odd ones and the ones the callers divide by.
     held = numerator[(np.abs(numerator) >= np.finfo(np.float32).tiny) & np.isfinite(numerator)]
-    for bits in (0x3FFFFFFF, 0x3F7FFFFF, 0x40400000, 0x42FE0000, 0x43E00000, 0x3F400000, 0x7F000000,
-                 0x00800000):
-        divisor = np.array(bits, np.uint32).view(np.float32)
-        divide = jax.jit(lambda values, divisor=divisor: correctly_rounded_divide(values, divisor))
-        quotient = np.asarray(divide(held))
+    divisors = [np.array(bits, np.uint32).view(np.float32) for bits in (
+        0x3FFFFFFF, 0x3F7FFFFF, 0x40400000, 0x42FE0000, 0x43E00000, 0x3F400000, 0x7F000000, 0x00800000)]
+    quotients = [np.asarray(ahead_arm(jax.jit(lambda values, divisor=divisor: correctly_rounded_divide(
+        values, divisor)), f"a correctly rounded division by {hex(divisor.view(np.uint32))}")(held))
+        for divisor in divisors]
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
+        expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
+    np.testing.assert_array_equal(actual[normal].view(np.uint32), expected[normal].view(np.uint32))
+    np.testing.assert_array_equal(actual[~normal], plain)
+    for divisor, quotient in zip(divisors, quotients, strict=True):
         with np.errstate(over="ignore", under="ignore"):
             wanted = (held.astype(np.float64) / np.float64(divisor)).astype(np.float32)
-        np.testing.assert_array_equal(quotient.view(np.uint32), wanted.view(np.uint32), err_msg=hex(bits))
+        np.testing.assert_array_equal(quotient.view(np.uint32), wanted.view(np.uint32),
+                                      err_msg=hex(divisor.view(np.uint32)))
 
 
 APPROXIMATE = "--xla_backend_extra_options=-nvptx-prec-divf32=1"
