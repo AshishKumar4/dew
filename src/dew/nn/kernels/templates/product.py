@@ -14,7 +14,17 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.precision import accumulated, asks_default_precision, exact_products, float64_sum, products_dtype
+from dew.nn import programs
+from dew.nn.kernels import generation
+from dew.nn.precision import (
+    accumulated,
+    asks_default_precision,
+    effective_precision,
+    exact_products,
+    float64_sum,
+    precision_names,
+    products_dtype,
+)
 
 
 def _floating_bits(dtype) -> int | None:
@@ -35,6 +45,45 @@ def eight(dtype) -> bool:
     step (`Product.promoted`), as Hopper's FP8 tensor cores sum within a step in a narrower accumulator.
     Which formats a family's products read is its own fact (`mosaic.Issuer.fp8_formats`)."""
     return _floating_bits(dtype) == 8
+
+
+_MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "operations"}
+"""The `templates.cost.Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes;
+IEEE fp32 is the CUDA cores')."""
+
+TPU_PASSES = {"DEFAULT": 1, "HIGH": 3, "HIGHEST": 6}
+"""The bfloat16 passes a TPU's matrix units multiply fp32 operands in, by precision (`jax.lax.Precision`'s own
+statement: "On TPU: performs float32 computations in bfloat16", "in 3 bfloat16 passes", "in 6 bfloat16")."""
+
+
+def product_mode(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype,
+                 target: generation.GpuTarget) -> tuple[str, int]:
+    """The `Work` field a product of operands of those dtypes at `precision` on `target` is told in
+    (`_MODES`), and the passes it multiplies in: where `precision` names a dot algorithm, that algorithm's as
+    JAX lowers it (`programs.dot_arithmetic`: TF32's, a 16-bit or an 8-bit precision's whatever the operands'
+    storage, each over its primitive operations, an X3's three; any other on the CUDA cores); else the
+    operands': 16-bit operands' 16-bit mode, FP8 operands' 8-bit mode (`eight`), fp32 operands' on a TPU its
+    matrix units' bfloat16 passes (`TPU_PASSES`, a pair of precisions at its higher's), elsewhere TF32 at the
+    default precision (the product declaration's, `declared`) and IEEE fp32 above it; any other operand's on
+    the CUDA cores. The one rule an XLA product's work is priced by: a term's (`dew.algebra.cost.work`,
+    through `emission.operation_work`) and a chunk form's (`dew.algebra.cost.product_work`); a TPU kernel
+    body's product is its counter's own (`emission._Counting`), whose passes Mosaic TPU's lowering decides."""
+    arithmetic = programs.dot_arithmetic(precision, lhs_dtype, rhs_dtype)
+    if arithmetic is not None:
+        bits = set(arithmetic.operand_bits)
+        mode = "tf32" if arithmetic.tf32 else "16bit" if bits == {16} else "8bit" if bits == {8} else "fp32"
+        return _MODES[mode], arithmetic.operations
+    dtypes = {jnp.dtype(lhs_dtype), jnp.dtype(rhs_dtype)}
+    if all(half(dtype) for dtype in dtypes):
+        return _MODES["16bit"], 1
+    if all(eight(dtype) for dtype in dtypes):
+        return _MODES["8bit"], 1
+    if dtypes == {jnp.dtype(jnp.float32)} and generation.tpu(target):
+        named = precision_names(effective_precision(precision)) or {"DEFAULT"}
+        return _MODES["16bit"], max(TPU_PASSES[name] for name in named)
+    if dtypes == {jnp.dtype(jnp.float32)} and asks_default_precision(precision, configured=True):
+        return _MODES["tf32"], 1
+    return _MODES["fp32"], 1
 
 
 @dataclasses.dataclass(frozen=True)
