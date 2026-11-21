@@ -115,6 +115,11 @@ def followed(first: tuple[Chain, ...], then: tuple[Chain, ...]) -> tuple[Chain, 
     return _kept(tuple(one.then(other) for one in first for other in then))
 
 
+_NOT_ISSUED = {"issued": False}
+"""A `Work` field no kernel body issues instruction by instruction (its device bytes, span, dependent paths,
+fused kernels and kept bytes): every other field is a unit a body issues (`ISSUED_UNITS`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Work:
     """The cost vocabulary every price is told in (docs/design/algebra.md §6.5): an operation's work by unit
@@ -136,13 +141,13 @@ class Work:
     operations: float = 0.0
     exponentials: float = 0.0
     conversions: float = 0.0
-    device_bytes: float = 0.0
+    device_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
-    span: float = 0.0
+    span: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
     fp8_flops: float = 0.0
-    kernels: float = 0.0
-    kept_bytes: float = 0.0
+    kernels: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
+    kept_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
     """The bytes XLA's fusion moves between the vector registers and the on-chip memory its kernels keep their
     operands and results in (`dew.algebra.cost.work`'s: a leaf's read once, a reduction's and a product's
     result written once and read once): a TPU's VMEM, at its rate (`GpuTarget.vmem_rate`); a GPU's on-chip
@@ -154,7 +159,7 @@ class Work:
     """Elementwise operations no rule prices (`emission.operation_work`: an atan2's, an erf_inv's, which no
     kernel's body holds and no probe has measured), one an output element, at no rate (`units`): a form
     taking more of them is never cheaper (`dew.algebra.cost.cheaper`), its price never a guess."""
-    chains: tuple[Chain, ...] = ()
+    chains: tuple[Chain, ...] = dataclasses.field(default=(), metadata=_NOT_ISSUED)
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
@@ -165,6 +170,14 @@ class Work:
         chains = (_kept(self.chains + other.chains) if self.chains and other.chains
                   else self.chains or other.chains)
         return Work(**summed, span=max(self.span, other.span), chains=chains)
+
+
+ISSUED_UNITS = tuple(field.name for field in dataclasses.fields(Work) if field.metadata.get("issued", True))
+"""The units of `Work` a kernel's body issues, which its emission counts instruction by instruction: every
+field not marked otherwise (`_NOT_ISSUED`). A launch's work from its emission takes each
+(`emission.launch_work`), and a launch's programs share each alike beside its device bytes (a program's
+share of a launch's work), so a unit added to `Work` is counted and shared wherever these are with no list
+to update (row 10793)."""
 
 
 class Rates(NamedTuple):
