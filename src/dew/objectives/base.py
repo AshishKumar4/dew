@@ -883,7 +883,7 @@ class ProgramModule(NamedTuple):
     more than a tile (`Objective.unfuse_head`)."""
 
 
-def head_tile_of(objective: Objective) -> tuple[int, int] | None:
+def head_tile_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[int, int] | None:
     """The tile the vocabulary head the objective trains computes its
     backward in (`ProgramModule.head_tile`), or None for a head that keeps
     its whole logits or an objective that trains no head: what `tile_head`
@@ -892,7 +892,7 @@ def head_tile_of(objective: Objective) -> tuple[int, int] | None:
                  if entry.trained and entry.head_tile is not None), None)
 
 
-def head_fused_of(objective: Objective) -> bool:
+def head_fused_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
     """Whether the vocabulary head the objective trains takes its gradient in the forward
     (`ProgramModule.head_fused`): what `unfuse_head` moves and `restore_head` sets."""
     return any(entry.head_fused for entry in objective.program_key() if entry.trained)
