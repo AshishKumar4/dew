@@ -3,6 +3,8 @@ e-graph proposes, each admitted by the accuracy gate (check 1, `assert_as_exact`
 policy), and the cheapest admitted chosen: the log-sum-exp fold, `log1p` and `expm1` where the form as
 written loses digits."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -133,6 +135,18 @@ def test_a_form_an_equation_outside_the_language_reads_is_the_one_its_candidate_
 
 
 
+def _factors(shape: tuple[int, int, int], seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """A seed's fp32 factors of a `[rows, depth] @ [depth, columns]` product, standard normal."""
+    rng = np.random.default_rng(seed)
+    return (rng.standard_normal(shape[:2]).astype(np.float32),
+            rng.standard_normal(shape[1:]).astype(np.float32))
+
+
+def _product(preset: jax.lax.DotAlgorithmPreset):
+    """A product of two factors in the dot algorithm `preset`, compiled."""
+    return jax.jit(lambda x, y: jnp.dot(x, y, precision=preset))
+
+
 def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
     """A product's dot algorithm chosen for an accuracy asked (`product_precision`, row 5473), by a site
     whose gate is check 1 itself: an algorithm is admitted where this backend runs the product in it and
@@ -141,29 +155,22 @@ def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
     refused, never answered with a cheaper algorithm; and FP8 operands, whose algorithms name no operand
     types of their own, are given one JAX lowers for them."""
     shape = (64, 32, 16)
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (rng.standard_normal(shape[:2]).astype(np.float32),
-                rng.standard_normal(shape[1:]).astype(np.float32))
-
-    def product(preset):
-        return jax.jit(lambda x, y: jnp.dot(x, y, precision=preset))
+    draw = functools.partial(_factors, shape)
 
     def admits(preset):
         try:
-            product(preset)(*draw(0))
+            _product(preset)(*draw(0))
         except ValueError:  # this backend's dot_general refuses the algorithm
             return False
         try:
-            assert_as_exact(product(preset), product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
+            assert_as_exact(_product(preset), _product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
                             f"a product in {preset.name}", seeds=8)
         except GateFailure:
             return False
         return True
 
     chosen = product_precision(*shape, jnp.float32, admits=admits)
-    assert_as_exact(product(chosen), product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
+    assert_as_exact(_product(chosen), _product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
                     "the product in the algorithm chosen", seeds=8)
     with pytest.raises(ValueError):
         product_precision(*shape, jnp.float32, admits=lambda preset: False)
@@ -177,20 +184,11 @@ def test_an_algorithm_at_least_another_is_as_exact_as_it():
     truth (check 1 between them, over every pair), by what each states of its arithmetic alone: its
     operands' significand digits, its parts and its accumulation. Every algorithm is at least itself, so a
     site asking its upstream's algorithm can always take it."""
-    shape = (64, 128, 32)
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (rng.standard_normal(shape[:2]).astype(np.float32),
-                rng.standard_normal(shape[1:]).astype(np.float32))
-
-    def product(preset):
-        return jax.jit(lambda x, y: jnp.dot(x, y, precision=preset, preferred_element_type=jnp.float32))
-
+    draw = functools.partial(_factors, (64, 128, 32))
     runs = []
     for preset in jax.lax.DotAlgorithmPreset:
         try:
-            product(preset)(*draw(0))
+            _product(preset)(*draw(0))
         except ValueError:  # this backend's dot_general refuses the algorithm
             continue
         if programs.dot_arithmetic(preset, jnp.float32, jnp.float32) is not None:
@@ -199,7 +197,7 @@ def test_an_algorithm_at_least_another_is_as_exact_as_it():
         admits = at_least(asked, jnp.float32)
         assert admits(asked)
         for chosen in filter(admits, runs):
-            assert_as_exact(product(chosen), product(asked), draw, f"{chosen.name}, at least {asked.name}",
+            assert_as_exact(_product(chosen), _product(asked), draw, f"{chosen.name}, at least {asked.name}",
                             seeds=8)
 
 

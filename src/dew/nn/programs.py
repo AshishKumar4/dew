@@ -254,13 +254,14 @@ def _digits(dtype) -> int:
 def _significand(side) -> int:
     """The significand digits of a lowered dot algorithm's precision type `side`, its implicit one counted:
     TF32's ten stored and its one, the one such type no dtype lowers to; any other's by the float dtype JAX
-    lowers to it (`mlir.dtype_to_ir_type`), no list of types' digits beside the dtypes' own."""
+    lowers to it (`mlir.dtype_to_ir_type`), no list of types' digits beside the dtypes' own. JAX's float
+    dtypes are read from its internal `jax._src.dtypes._float_types`, which a bump of the pinned JAX checks."""
     from jax.extend.mlir import ir
     from jax.interpreters import mlir
 
     if isinstance(side, ir.FloatTF32Type):
         return 11
-    for dtype in dtypes._float_types:
+    for dtype in map(np.dtype, dtypes._float_types):
         if mlir.dtype_to_ir_type(dtype) == side:
             return _digits(dtype)
     raise ValueError(f"no float dtype lowers to the dot algorithm's precision type {side}")
