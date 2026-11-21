@@ -1741,6 +1741,64 @@ def test_a_distillations_streamed_price_reads_its_teachers_banks():
     assert distilled > alone, links
 
 
+PREPARED_HOST = """
+import json
+import sys
+import threading
+
+import jax.numpy as jnp
+import numpy as np
+from test_host_training import HOST, streaming_decoder
+
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.options import owned_program
+from dew.training.ahead import prepare_host_step
+
+trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
+trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
+tokens = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
+stop = threading.Event()
+
+
+def tripled(values):
+    return values * 3 + 1
+
+
+def beside():
+    # A program of its own, compiled again and again through Dew's compile point on a thread of its own while
+    # the startup runs (where asked).
+    size = 1
+    while not stop.is_set():
+        size += 1
+        owned_program(tripled)(jnp.zeros(size))
+
+
+thread = threading.Thread(target=beside, name="beside")
+if sys.argv[1] == "beside":
+    thread.start()
+try:
+    startup = prepare_host_step(trainer, {"text": tokens})
+finally:
+    stop.set()
+    if thread.is_alive():
+        thread.join()
+print(json.dumps({"programs": startup.programs, "threads": sorted({each.thread for each in startup.spent}),
+                  "names": sorted(startup.names), "by_backend": startup.by_backend}))
+"""
+"""A host step prepared for one compile-only H100 in a fresh process, its XLA flags stated at its launch (the
+autotuner's level 0: a run that tunes nothing), with a thread compiling a program of its own beside it where
+argv[1] is `beside`: its startup's programs, the threads they were compiled on, their names and its count by
+backend."""
+
+
+def prepared_untuned(beside: bool = False) -> dict:
+    """`PREPARED_HOST` run as a run that tunes nothing prepares it (`process_support.fresh`)."""
+    from process_support import fresh
+
+    untuned = f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0".strip()
+    return fresh(PREPARED_HOST, "beside" if beside else "alone", flags=untuned, platforms="cpu")
+
+
 def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here(tmp_path, monkeypatch):
     """A host step prepared for GPUs this process lacks (one compile-only H100, `prepare_host_step`), over its
     fresh state's shapes, compiles the accelerator's programs for them as a device will run them
@@ -1763,11 +1821,9 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
     monkeypatch.setenv("XLA_FLAGS", unstated)
     with pytest.raises(report.Untuned):
         prepare_host_step(trainer, {"text": tokens})
-    monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=0")
-    trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
-    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
-    startup = prepare_host_step(trainer, {"text": tokens})
-    assert startup.by_backend["gpu"]["programs"] > 0 and startup.by_backend["cpu"]["programs"] > 0, startup
+    # Prepared in a process launched as one that tunes nothing, its XLA at level 0 from its start (row 10568).
+    startup = prepared_untuned()["by_backend"]
+    assert startup["gpu"]["programs"] > 0 and startup["cpu"]["programs"] > 0, startup
     # A configured run compiling ahead reaches it (`AheadTarget.compiled`, row 8380), a step of many programs
     # into the cache its run reads, refused a file to save it to.
     from dew.training.ahead import AheadTarget
@@ -2084,44 +2140,14 @@ def test_a_part_stating_no_host_link_prices_no_streamed_step():
     assert not trainer.host_master and trainer.layout_choice.refused is not None
 
 
-def test_a_host_startups_ledger_holds_its_own_compiles_and_no_other_threads(monkeypatch):
+def test_a_host_startups_ledger_holds_its_own_compiles_and_no_other_threads():
     """A host step's startup reads what it compiled from the one ledger of JAX's events
     (`telemetry.compiles.Ledger`), each compile through Dew's compile point its span (`spanning`) and the
     startup's own by its block (`owning`): a program another thread compiles through Dew's compile point
     meanwhile, outside the startup's context, is none of its compiles, by name, by backend or in all (row
-    8382: a second ledger, `options.Spent`, kept them apart instead)."""
-    import threading
-
-    from dew.nn.kernels.generation import compile_only_gpus
-    from dew.nn.kernels.options import owned_program
-    from dew.training.ahead import prepare_host_step
-
-    # Prepared where its run tunes nothing (the autotuner's level 0), so no GPU run's choices are needed
-    # (`prepare_host_step` compiles for the devices to run, `report.for_devices`).
-    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0".strip())
-    trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
-    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
-    tokens = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
-    stop = threading.Event()
-
-    def tripled(values):
-        return values * 3 + 1
-
-    def beside():
-        # A program of its own, compiled again and again through Dew's compile point on a thread of its own
-        # while the startup runs.
-        size = 1
-        while not stop.is_set():
-            size += 1
-            owned_program(tripled)(jnp.zeros(size))
-
-    thread = threading.Thread(target=beside, name="beside")
-    thread.start()
-    try:
-        startup = prepare_host_step(trainer, {"text": tokens})
-    finally:
-        stop.set()
-        thread.join()
-    assert startup.programs > 0 and all(each.thread != "beside" for each in startup.spent), startup.names
-    assert not any(name.endswith("tripled") for name in startup.names), startup.names
-    assert startup.programs == sum(backend["programs"] for backend in startup.by_backend.values())
+    8382: a second ledger, `options.Spent`, kept them apart instead). Prepared in a process launched as one
+    whose run tunes nothing (row 10568), so no GPU run's choices are needed (`report.for_devices`)."""
+    startup = prepared_untuned(beside=True)
+    assert startup["programs"] > 0 and "beside" not in startup["threads"], startup["names"]
+    assert not any(name.endswith("tripled") for name in startup["names"]), startup["names"]
+    assert startup["programs"] == sum(backend["programs"] for backend in startup["by_backend"].values())
