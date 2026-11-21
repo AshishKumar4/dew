@@ -910,12 +910,11 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
 
 EDITED_FORWARD = """
 import jax
-import dew._cache
-from dew._cache import package_digest
+from dew.nn.kernels.templates import report as edited_report
 
-# Dew's code edited outside the launch's kernels: its digest another, its kernels the same.
-edited = package_digest()[::-1]
-dew._cache.package_digest = lambda: edited
+# The kernels' code edited outside the launch's kernels: its digest another, the launch's kernels the same.
+edited = edited_report.kernels_code()[::-1]
+edited_report.kernels_code = lambda: edited
 certifying = []
 
 
@@ -928,7 +927,7 @@ jax.monitoring.register_event_duration_secs_listener(heard)
 """ + CERTIFIED_FORWARD.replace("print(json.dumps([[", "print(json.dumps([certifying, *[[", 1).replace(
     "for found in report.certifications()]))", "for found in report.certifications()]]))", 1)
 """`CERTIFIED_FORWARD` in a Dew tree edited outside the launch's kernels (its code's digest another,
-`dew._cache.package_digest`), first naming each certification program it compiled."""
+`report.kernels_code`), first naming each certification program it compiled."""
 
 
 @COMPILES_ON_CPU

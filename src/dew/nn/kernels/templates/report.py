@@ -857,8 +857,8 @@ def _lowered_verdict_key(calls) -> str | None:
 def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
     """What decides a launch's certification for a compile target (the store's file, `verdict_target`,
     `tuning.stored_verdict`) before it traces, as its stored verdict's key: the launch's `identity`
-    (`_identity`, the same in every process), its config, whether reverse mode runs it, Dew's code
-    (`package_digest`: a Dew edit certifies again), the installed JAX, jaxlib and CUDA plugins, whose Mosaic
+    (`_identity`, the same in every process), its config, whether reverse mode runs it, the kernels' code
+    (`kernels_code`: an edit of it certifies again), the installed JAX, jaxlib and CUDA plugins, whose Mosaic
     GPU and XLA lower and compile it (the Pallas lowering cache's seal of them), the ptxas that assembles it
     (`_assemblers`), and the environment a kernel's lowering and compile read (that cache's policy). None
     where the installation has no seal (an edited or a source install of JAX), whose code no key states: its
@@ -866,15 +866,25 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
-    from dew._cache import package_digest
     from dew.nn.kernels.tuning import encoded
 
     installed = seal().digest
     if installed is None:
         return None
-    stated = [package_digest(), installed.hex(), _assemblers(), identity, encoded(config), reverse,
+    stated = [kernels_code(), installed.hex(), _assemblers(), identity, encoded(config), reverse,
               _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
+
+@functools.cache
+def kernels_code() -> str:
+    """The digest of the code a launch's certification and its choices are a function of
+    (`dew._code.code_digest`): every module of `dew.nn.kernels`, each op's, each template's and each GPU
+    family's (`mosaic_sm80`, `mosaic_sm90`, ...) among them, and every module their code can import, so an
+    edit of Dew's code elsewhere (a model's, a trainer's) keeps every stored verdict and choice (row 10743)."""
+    from dew._code import code_digest, every_module
+
+    return code_digest(*every_module("dew.nn.kernels"))
 
 
 @functools.cache

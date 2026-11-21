@@ -179,12 +179,10 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
-    from dew._cache import package_digest
-
     installed = seal().digest
     if installed is None:
         return None
-    stated = [package_digest(), installed.hex(), report._identity(op, ba), target.generation,
+    stated = [report.kernels_code(), installed.hex(), report._identity(op, ba), target.generation,
               target.multiprocessors, tuning.encoded(candidates), _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
