@@ -635,3 +635,41 @@ def test_identical_scale_smem_bodies_keep_independent_emission_work():
     gc.collect()
     fixed = emission.emitted(closed, 1, "wg").roles[0].fixed
     assert fixed == work, fixed
+
+
+def test_launch_seconds_shares_sm_units_overlaps_paths_and_prices_integer_work():
+    """`cost.launch_seconds` (rows 10793, 10809, 10810):
+    1. Integer-only `Work` at `programs = multiprocessors + 1` and `resident = 1` prices launch latency
+       plus two waves of per-program integer work at one SM's integer rate.
+    2. Co-resident programs (`resident = 2`) share one SM's throughput units (`ceil(n / SMs)` times
+       per-program unit time, not divided by `resident`) while overlapping dependent paths (`ceil(n /
+       (SMs * resident))` waves of `path`)."""
+    target = generation.gpu_target("sm90")
+    sms = target.multiprocessors
+    assert sms is not None
+    launch = target.launch_seconds or 0.0
+    sm_rates = cost.rates(target, device=False)
+    assert sm_rates.integer is not None and sm_rates.tensor is not None
+
+    # 1. Integer-only work across sms + 1 programs (two waves on the busiest SM).
+    total_int = 1e11
+    programs = sms + 1
+    expected_int = launch + 2.0 * (total_int / programs) / sm_rates.integer
+    got_int = cost.launch_seconds(Work(integer_operations=total_int, kernels=1.0), programs, target,
+                                  resident=1)
+    assert got_int == pytest.approx(expected_int, rel=1e-12), (got_int, expected_int)
+
+    # 2. Throughput-bound work: 176 programs on 132 SMs takes 2 programs on the busiest SM even at
+    #    resident=2 (co-resident programs share one SM's tensor cores, not 2x peak).
+    total_flops = 1e12
+    expected_tput = launch + 2.0 * (total_flops / 176) / sm_rates.tensor
+    got_tput_r1 = cost.launch_seconds(Work(flops=total_flops, kernels=1.0), 176, target, resident=1)
+    got_tput_r2 = cost.launch_seconds(Work(flops=total_flops, kernels=1.0), 176, target, resident=2)
+    assert got_tput_r1 == pytest.approx(expected_tput, rel=1e-12)
+    assert got_tput_r2 == pytest.approx(expected_tput, rel=1e-12)
+
+    # 3. Latency/path-bound work: resident=2 overlaps the two programs on the busiest SM into 1 wave.
+    path_work = Work(span=1e4, kernels=1.0)
+    got_path_r1 = cost.launch_seconds(path_work, 176, target, resident=1)
+    got_path_r2 = cost.launch_seconds(path_work, 176, target, resident=2)
+    assert got_path_r2 < got_path_r1, (got_path_r2, got_path_r1)

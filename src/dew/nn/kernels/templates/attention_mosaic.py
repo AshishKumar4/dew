@@ -149,29 +149,6 @@ def _launch_programs(kernel) -> int:
     return math.prod(kernel.params["grid_mapping"].grid)
 
 
-def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget, *,
-                    resident: int = 1) -> float:
-    """A launch's seconds on `target`: the longer of its quantized waves (`ceil(programs / (SMs * resident))`
-    times one program's `cost.walked`, plus launch latency) and the whole launch across the device
-    (`cost.seconds`), no constant (rows 6216, 6710)."""
-    count = max(programs, 1)
-    per_program = dataclasses.replace(
-        work,
-        flops=work.flops / count,
-        operations=work.operations / count,
-        exponentials=work.exponentials / count,
-        conversions=work.conversions / count,
-        device_bytes=work.device_bytes / count,
-        shared_bytes=work.shared_bytes / count,
-        tf32_flops=work.tf32_flops / count,
-        fp8_flops=work.fp8_flops / count,
-        kernels=0,
-    )
-    processors = target.multiprocessors or 1
-    waves = math.ceil(count / (processors * max(resident, 1)))
-    return max(waves * cost.walked(per_program, target) + (target.launch_seconds or 0.0),
-               cost.seconds(work, target))
-
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
     """What decides `op`'s priced consumer count on `target` (`tuning.stored_choice`), keyed as
@@ -850,7 +827,7 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def _price_config(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
                       ) -> float | None:
-        """Price `config`'s main launch on `target` (`_launch_seconds` over `emission.work_of`), traced
+        """Price `config`'s main launch on `target` (`cost.launch_seconds` over `emission.work_of`), traced
         through `tuning.lowered_once` under `report.launching` so the winning count's trace is held."""
         names = ("query", "key", "value", "start", "end", "query_ids", "key_ids", "score_params",
                  "output_params", "initial", "drop", "table", "sources", "scales", "query_params")
@@ -875,7 +852,7 @@ class MosaicForward(_Mainloop[Tiles]):
             work = emission.work_of(kernel)
             if work is None:
                 return None
-            total += _launch_seconds(work, _launch_programs(kernel), target, resident=resident)
+            total += cost.launch_seconds(work, _launch_programs(kernel), target, resident=resident)
         return total
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget) -> Tiles:

@@ -623,7 +623,7 @@ def resumable(spec: Forward, state: Partial) -> Partial:
     """A finished state (`finished_merged`'s: its output normalized, its maximum in `spec`'s units) as a
     call's initial state takes it (`initial_state`'s inverse): its sums unnormalized at its natural maximum,
     a state of no mass the walk's start, which adds nothing to a merge."""
-    held = state.total > 0
+    held = means.holding(state.total)
     return Partial(means.resumed(state.acc, state.total), jnp.where(held, spec.naturalized(state.m), LEAST),
                    state.total)
 
@@ -1909,7 +1909,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     largest (`Forward.largest`), or at fp32's where `held` (an fp32 call's walk, `quotient`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
-        out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
+        out = jnp.where(expand(means.holding(state.total), state.acc), state.acc, 0.0)
     else:
         acc, total = dropped_total(spec, state.acc, state.total)
         state = state._replace(acc=acc, total=total)

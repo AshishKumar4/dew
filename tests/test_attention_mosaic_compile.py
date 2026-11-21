@@ -1576,27 +1576,30 @@ def test_an_a100_d128_and_d256_forward_use_whole_row_warps_and_high_residency():
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-def test_launch_seconds_prices_wave_quantization_and_residency():
-    """`_launch_seconds` prices quantized waves (`ceil(programs / (SMs * resident))`) so a config spilling
-    into a second sparse wave on Hopper (176 programs at 1 resident on 132 SMs) is priced slower than a
-    single full wave at 2 resident (256 programs on 132*2=264 slots, row 6216)."""
-    from dew.nn.kernels.templates import cost
-
-    target = generation.gpu_target("sm90")
-    work = cost.Work(flops=1e11, operations=1e9, exponentials=1e8, device_bytes=1e7, shared_bytes=1e7)
-    two_waves = attention_mosaic._launch_seconds(work, 176, target, resident=1)
-    one_wave = attention_mosaic._launch_seconds(work, 256, target, resident=2)
-    assert one_wave < two_waves, (one_wave, two_waves)
-
-
-def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
-    """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) and default 16-bit dot preset
-    (`_jax_nn_algorithm`) through `dew.algebra.error.product_precision` (row 5473)."""
-    from dew.nn import attention
-    from dew.nn.kernels.templates import attention_algebra as algebra
-
+@COMPILES_ON_CPU
+def test_fp32_forward_derives_parted_wgmma_and_consumer_choice_uses_launch_seconds():
+    """An accurate fp32 forward on sm90 derives its 3-part bf16 wgmma plan from
+    `dew.algebra.error.product_precision` (row 5473) and compiles without spills, while a split bf16
+    forward derives its consumer count via `cost.launch_seconds` (row 10811)."""
+    spans = template.spans(512, 512, 1, causal=True)
     with generation.assumed("sm90"):
-        assert algebra.bf16_part_count(accurate=True) == 3
-        assert algebra.bf16_part_count(accurate=False) == 1
-        assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-        assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
+        target = generation.gpu_target()
+        q32 = jax.ShapeDtypeStruct((1, 512, 8, 64), jnp.float32)
+        op32, args32 = attention_mosaic._forward_call(q32, q32, q32, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+        ba32 = op32.bind(*args32, residuals=template.Kept.NONE, interpret=False)
+        cfg32 = op32.derived(ba32, target)
+        assert cfg32 is not None and op32.parts == 3, (op32.parts, cfg32)
+
+        q16 = jax.ShapeDtypeStruct((2, 512, 32, 128), jnp.bfloat16)
+        k16 = jax.ShapeDtypeStruct((2, 512, 8, 128), jnp.bfloat16)
+        op16, args16 = attention_mosaic._forward_call(q16, k16, k16, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+        ba16 = op16.bind(*args16, residuals=template.Kept.SPLIT, interpret=False)
+        cfg16 = op16.derived(ba16, target)
+        assert cfg16 is not None and cfg16.consumers == 2, cfg16
+
+        found = compile_mosaic_kernels([
+            KernelCase("sm90-fp32-3part", lambda: op32.lowering(ba32, cfg32)),
+        ], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

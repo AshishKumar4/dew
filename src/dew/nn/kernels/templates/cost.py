@@ -136,13 +136,13 @@ class Work:
     operations: float = 0.0
     exponentials: float = 0.0
     conversions: float = 0.0
-    device_bytes: float = 0.0
+    device_bytes: float = dataclasses.field(default=0.0, metadata={"issued": False})
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
-    span: float = 0.0
+    span: float = dataclasses.field(default=0.0, metadata={"issued": False})
     fp8_flops: float = 0.0
-    kernels: float = 0.0
-    kept_bytes: float = 0.0
+    kernels: float = dataclasses.field(default=0.0, metadata={"issued": False})
+    kept_bytes: float = dataclasses.field(default=0.0, metadata={"issued": False})
     """The bytes XLA's fusion moves between the vector registers and the on-chip memory its kernels keep their
     operands and results in (`dew.algebra.cost.work`'s: a leaf's read once, a reduction's and a product's
     result written once and read once): a TPU's VMEM, at its rate (`GpuTarget.vmem_rate`); a GPU's on-chip
@@ -150,7 +150,7 @@ class Work:
     integer_operations: float = 0.0
     """32-bit integer operations a CUDA multiprocessor's ALU issues (add, shift, logic, comparison), beside
     its fp32 lanes at its own rate (`Architecture.integer_per_clock`)."""
-    chains: tuple[Chain, ...] = ()
+    chains: tuple[Chain, ...] = dataclasses.field(default=(), metadata={"issued": False})
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
@@ -161,6 +161,13 @@ class Work:
         chains = (_kept(self.chains + other.chains) if self.chains and other.chains
                   else self.chains or other.chains)
         return Work(**summed, span=max(self.span, other.span), chains=chains)
+
+
+ISSUED_UNITS = tuple(field.name for field in dataclasses.fields(Work)
+                     if field.metadata.get("issued", True))
+"""The units of `Work` a kernel's body issues, derived from `Work`'s fields (every field not marked
+`issued=False`): a launch's programs share each alike beside `device_bytes` (`launch_seconds`), so a unit
+added to `Work` is shared automatically without a hand-maintained list (rows 10793, 10809)."""
 
 
 class Rates(NamedTuple):
@@ -299,3 +306,22 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     launch = target.launch_seconds or 0.0
     worked = max(*units(work, rates(target, device=True))[0], path(work, target))
     return worked + work.kernels * launch
+
+
+def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
+                   resident: int = 1) -> float:
+    """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
+    multiprocessor: the longer of the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs
+    sharing one multiprocessor's units), its overlapped latency waves (`ceil(n / (SMs * resident))` waves of
+    `path`), plus launch latency, against the whole launch's device bound (`seconds`). Co-resident programs
+    share one multiprocessor's throughput units rather than multiplying its peak by `resident`, while
+    overlapping their dependent paths (rows 6216, 10809, 10810)."""
+    count = max(programs, 1)
+    shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
+    per_program = dataclasses.replace(work, **shared, kernels=0)
+    processors = target.multiprocessors or 1
+    per_sm = math.ceil(count / processors)
+    waves = math.ceil(count / (processors * max(resident, 1)))
+    unit_seconds = max(units(per_program, rates(target, device=False))[0])
+    wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
+    return max(wave_seconds + (target.launch_seconds or 0.0), seconds(work, target))
