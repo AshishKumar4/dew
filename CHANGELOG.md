@@ -172,8 +172,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post117 and, on Linux x86_64 and aarch64, its own jaxlib build
-  0.12.0.1.post117, with its CUDA and PJRT plugins 0.12.0.1.post117 (post96's until now). A GPU compile takes a
+- Dew requires its JAX build 0.12.0.1.post118 and, on Linux x86_64 and aarch64, its own jaxlib build
+  0.12.0.1.post118, with its CUDA and PJRT plugins 0.12.0.1.post118 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
   executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the buffers
@@ -220,7 +220,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   own of (row 9808); and a CPU executable read back from the compilation cache keeps one collective communicator
   across a while loop's body, a call's and a conditional's branches and the sequence holding them, where ranks
   entered a loop's all-reduce and an all-gather beside it in different orders until their rendezvous timed out (row
-  10128: a sharded Mamba step's cached program). Elsewhere jaxlib stays the stock 0.12.0.1.
+  10128: a sharded Mamba step's cached program); and XLA shares a buffer between a value and an instruction that
+  reads it only where every position it reads the value through allows it, where a fusion reading a value both
+  directly and through a reversed view wrote its result over the value it still read, half such a sum wrong on a
+  CPU and on a GPU (upstream openxla/xla#51490). Elsewhere jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes
