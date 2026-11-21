@@ -1594,7 +1594,7 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         read['matrix'] = decoded.decode(index, slots, interpret)
         family.published()
         decoded.met()
-    rows_of, oriented = _views(slots, read, matrices, mine_rows, transpose_lhs, transpose_rhs)
+    oriented = _oriented(read, matrices, transpose_rhs)
     # This warpgroup's half of the rows, held in registers where a step rewrites them: a packed matrix's
     # decoded, or the prologue's transform of its slot.
     left = None
@@ -1621,6 +1621,7 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
                 for total, name in zip(accumulators, matrices, strict=True))
         return nothing, tuple(issued(acc, lambda acc=acc, name=name, left=left: family.register_products(
             acc, (left,), oriented[name])) for acc, name in zip(accumulators, matrices, strict=True))
+    rows_of = _rows_of(slots, matrices, mine_rows, transpose_lhs)
     if summed:
         scale = None if scaling is None else scaling(index, slots)
         return nothing, tuple(
@@ -1651,17 +1652,20 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         for acc, name in zip(accumulators, matrices, strict=True))
 
 
-def _views(slots, read, matrices: dict, mine_rows, transpose_lhs: bool, transpose_rhs: bool) -> tuple:
-    """Dew: a `_gmm_step`'s operands from its slots, `read` its matrices' (a packed matrix's decoded): each
-    matrix's rows, this warpgroup's half of the rows' stage (the only half its MMA reads, a `[depth, rows]`
-    stage's transposed) or the joined rows' for the paired matrix (`matrices`' stream), and each matrix as
-    its product reads it."""
+def _oriented(read, matrices: dict, transpose_rhs: bool) -> dict:
+    """Dew: a `_gmm_step`'s matrices as its products read them, `read` their slots (a packed matrix's
+    decoded)."""
+    return {name: read[name].transpose((1, 0)) if transpose_rhs else read[name] for name in matrices}
+
+
+def _rows_of(slots, matrices: dict, mine_rows, transpose_lhs: bool) -> dict:
+    """Dew: each of a `_gmm_step`'s matrices' rows: this warpgroup's half of the rows' stage (the only half
+    its MMA reads, a `[depth, rows]` stage's transposed), or the joined rows' for the paired matrix
+    (`matrices`' stream)."""
     stage = slots['rows']
     mine = stage.at[:, mine_rows].transpose((1, 0)) if transpose_lhs else stage.at[mine_rows]
-    rows_of = {name: mine if stream == 'rows' else slots[stream].at[mine_rows]
-               for name, stream in matrices.items()}
-    oriented = {name: read[name].transpose((1, 0)) if transpose_rhs else read[name] for name in matrices}
-    return rows_of, oriented
+    return {name: mine if stream == 'rows' else slots[stream].at[mine_rows]
+            for name, stream in matrices.items()}
 
 
 def _gmm_prefetch(family: mosaic.Family, step: functools.partial) -> Callable | None:
@@ -1677,9 +1681,10 @@ def _gmm_prefetch(family: mosaic.Family, step: functools.partial) -> Callable | 
         return None
 
     def prefetch(slots):
-        rows_of, oriented = _views(slots, slots, keywords['matrices'], keywords['mine_rows'],
-                                   keywords['transpose_lhs'], keywords['transpose_rhs'])
-        (name,) = keywords['matrices']
+        matrices = keywords['matrices']
+        (name,) = matrices
+        rows_of = _rows_of(slots, matrices, keywords['mine_rows'], keywords['transpose_lhs'])
+        oriented = _oriented(slots, matrices, keywords['transpose_rhs'])
         return family.first_fragments(rows_of[name], oriented[name])
 
     return prefetch
