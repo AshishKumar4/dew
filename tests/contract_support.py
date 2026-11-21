@@ -338,10 +338,9 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
             continue
         site = f"{label}, {name}, on training's mesh of two"
 
-        # The mesh's run a placement and the program run there, compiled once an order (each seed's draw of
-        # one shape), which the gate runs as given (`as_given`).
-        program = jax.jit(lambda primals, direction, cotangent, name=name: orders(
-            fn, primals, direction, cotangent)[name]())
+        # The mesh's run a placement and the program run there (`_mesh_program`), which the gate runs as given
+        # (`as_given`).
+        program = _mesh_program(fn, name)
 
         @as_given
         def on(primals, direction, cotangent, program=program, name=name, site=site):
@@ -365,6 +364,15 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
         truth_of = None if truth_fn is None else truth
         count = seeds_for(off, draw, site, truth_fn=truth_of, dew_fn=on) if seeds is None else seeds
         assert_as_exact(on, off, draw, site, seeds=count, truth_fn=truth_of)
+
+
+@functools.lru_cache(maxsize=256)
+def _mesh_program(fn, name: str):
+    """Order `name` of `fn` (`orders`) as one jitted program of its primals, direction and cotangent, made
+    once a function and an order: compiled once a shape, each seed's draw and each of a cell's edges (`EDGES`,
+    one shape at three scales) running it (rows 9806, 9807, 10132: the convex mean's mesh runs compiled each
+    order again at every edge, a third of its cell)."""
+    return jax.jit(lambda primals, direction, cotangent: orders(fn, primals, direction, cotangent)[name]())
 
 
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
