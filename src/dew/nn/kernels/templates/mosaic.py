@@ -1963,12 +1963,6 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     (`held_walked`)."""
 
     @property
-    def derived_consumers(self) -> int:
-        """The compute roles a forward's derivation tries first (`attention_mosaic._derived`), at most
-        `consumers`: the count its programs run fastest at where measured (`Wgmma`'s), else `consumers`."""
-        return self.consumers
-
-    @property
     def register_step(self) -> int:
         """The allocator's registers per thread in one step (`generation.Multiprocessor.register_step`,
         setmaxnreg's eight-register granularity). A compile gate tests admits at their actual cap, refusals
