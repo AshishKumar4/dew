@@ -238,8 +238,9 @@ def _own_preset(dtype: jnp.dtype) -> jax.lax.DotAlgorithmPreset | None:
 
     def own(preset: jax.lax.DotAlgorithmPreset) -> bool:
         arithmetic = dot_arithmetic(preset, dtype, dtype)
-        return (arithmetic.operand_bits == (width, width) and arithmetic.operations == 1
-                and arithmetic.accumulation_bits == 32 and not arithmetic.imprecise)
+        return (arithmetic is not None and arithmetic.operand_bits == (width, width)
+                and arithmetic.operations == 1 and arithmetic.accumulation_bits == 32
+                and not arithmetic.imprecise)
 
     (found,) = (preset for preset in dot_algorithms(dtype) if own(preset))
     return found
