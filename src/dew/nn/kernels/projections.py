@@ -43,7 +43,6 @@ from dew.nn.sharding import (
     logical_spec,
     on_shards,
     placed_layout,
-    seen_whole,
     shard_shapes,
 )
 
@@ -382,7 +381,7 @@ def dot_general(xla, path: tuple | None = None):
             if launched(rows, rhs, out_dtype, precision):
                 out = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return added(out.reshape(*lhs.shape[:-1], rhs.shape[1]))
-        elif not kwargs and lhs.dtype == rhs.dtype and batch[0] and seen_whole(lhs) and seen_whole(rhs):
+        elif not kwargs and lhs.dtype == rhs.dtype and batch[0] and not automatic_axes():
             # A batched projection's members as uniform groups (`grouped_rows`, Appendix C row 4): one
             # grouped GEMM where a launch takes any of its products, as a dense one's (DeepSeek V4's
             # `o_a_proj`, a `DenseGeneral` over its groups; spec alignment SA20261119pm F36).
@@ -538,14 +537,15 @@ def launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: Precision
     routes reported again at every call: a model's projections ask the same question at every layer's
     trace (row 3213: a warm start spent 10.9 of its 75.6 seconds selecting)."""
     rows_type, matrix_type = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (rows, matrix))
-    whole = seen_whole(rows) and seen_whole(matrix)
+    whole = not automatic_axes()
     return launches(rows_type, matrix_type, out_dtype, precision, whole=whole)
 
 
 def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, precision: PrecisionLike, *,
              whole: bool) -> bool:
-    """`launched` of a product's operands by their shapes and dtypes, where they are seen `whole`
-    (`seen_whole`): a product formed later in the call (a fused MLP's down product, `dew.nn.gated_mlp`)."""
+    """`launched` of a product's operands by their shapes and dtypes, where a launch sees them `whole` (no
+    automatic mesh axis splits them): a product formed later in the call (a fused MLP's down product,
+    `dew.nn.gated_mlp`)."""
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole, generation.gpu_target(),
                             _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value)
