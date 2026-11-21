@@ -1089,7 +1089,7 @@ def test_a_refused_launch_states_its_model_beside_the_assemblers_registers():
                   if miss.op == type(op).__name__ and miss.config == config]
         budget = op.register_budget(config)
     assert len(missed) == len(spilling), (missed, spilling)
-    refused_by_ptxas = [(miss.frame or 0) > 0 or (miss.registers or 0) > budget or bool(miss.serialized)
+    refused_by_ptxas = [(miss.spilled or 0) > 0 or (miss.registers or 0) > budget or bool(miss.serialized)
                         for miss in missed]
     assert all(refused_by_ptxas), (missed, budget)
     assert all(miss.modelled is not None and miss.stepped for miss in missed), missed

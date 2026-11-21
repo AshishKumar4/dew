@@ -1381,7 +1381,7 @@ def test_a_run_refuses_a_kernel_whose_warpgroup_products_ptxas_serialized_as_a_s
     with generation.assumed("sm90"), report.refusals():
         report.kept(first, relower=lambda: first, read=lambda executable: noted)
         misses = report.misses()
-    assert misses and all(miss.serialized == ("C7512",) and not miss.frame for miss in misses), misses
+    assert misses and all(miss.serialized == ("C7512",) and not miss.spilled for miss in misses), misses
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])

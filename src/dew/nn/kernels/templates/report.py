@@ -1,6 +1,6 @@
 """What Mosaic GPU's compiles say of each kernel, what the templates' resource models are checked against.
-A run's compile (`compiled`, owner 10-29, bible §6) reads each kernel's registers a thread and its stack
-frame from the binary its executable carries (`binaries`): a launch whose kernel spills is refused
+A run's compile (`compiled`, owner 10-29, bible §6) reads each kernel's registers a thread and the bytes it
+spills from the binary its executable carries (`binaries`): a launch whose kernel spills is refused
 (`refused`) and its program lowered again, where the launch's derivation takes the next config by its own
 rule, until none spills or the launch has none left (`settled`), each such refusal a model miss (`misses`).
 The CPU suite's compile gate reads the binaries too, beside the resource estimate Pallas prints as it lowers
@@ -104,6 +104,10 @@ ASSEMBLER_NOTES = 13
 """The `MosaicGpuKernelProto` field of what ptxas noted of a loss of performance as it assembled the kernel
 (`assembler_notes`, Dew's JAX build's mosaic-gpu-kernel-facts), each note a message of its code (1) and its
 message (2) (`AssemblerNote`)."""
+SPILLED_BYTES = 100
+"""The `MosaicGpuKernelProto` field of the bytes ptxas spilled as it assembled the kernel, its functions'
+spill stores and loads (the proto's `spilled_bytes`, Dew's JAX build's mosaic-gpu-kernel-spills), present
+where ptxas measured them, a zero among them (`Binary.spilled`)."""
 CUSTOM_KERNEL_THUNK = 36
 """The `ThunkProto` field of a custom kernel's thunk, a Pallas-Triton launch's (`CustomKernelThunkProto`): its
 kernel (3, `CustomKernelProto`), whose loader spec (2) holds its cubin (2, `CudaCubinProto`; 1) and which
@@ -112,7 +116,8 @@ ELF = b"\x7fELF"
 """A cubin's first bytes."""
 REGISTER_COUNT, FRAME_SIZE, MAX_THREADS = 0x2F, 0x11, 0x05
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
-(EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill."""
+(EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill beside
+its own locals (libdevice's sinf range reduction's 32-byte array, row 9649)."""
 
 _log = logging.getLogger("dew.kernels")
 
@@ -287,19 +292,19 @@ class Exhausted(ValueError):
 class Miss:
     """A kernel a run's compile refused (`Binary.refused`: spilling, or its warpgroup MMAs serialized), or a
     program whose block XLA refused (`compiled`): its kernel's name, its launch's op and config (None where
-    no launch of this process traced it), its registers and its stack frame's bytes a thread
-    (`Binary.frame`) or the shared bytes it asked (`shared`), and whether its launch's config was refused
-    and its program lowered again (`stepped`)."""
+    no launch of this process traced it), its registers and the bytes it spills a thread (`Binary.spills`)
+    or the shared bytes it asked (`shared`), and whether its launch's config was refused and its program
+    lowered again (`stepped`)."""
     kernel: str
     op: str | None
     config: Hashable | None
     registers: int | None
-    frame: int | None
+    spilled: int | None
     stepped: bool
     shared: int | None = None
     serialized: tuple[str, ...] = ()
     """The codes of ptxas's notes of its warpgroup MMAs serialized (`SERIALIZED`), a reason it was refused
-    beside a spill (`frame`)."""
+    beside a spill (`spilled`)."""
     modelled: int | None = None
     """The registers a consumer thread holds as its launch's model stated them (`RegisterModel.registers`,
     `named`), beside the assembler's (`registers`); None where its launch stated none."""
@@ -309,7 +314,7 @@ class Miss:
         """Why its kernel was refused, as a log and a plan state it."""
         if self.shared is not None:
             return f"its block asks {self.shared} shared bytes"
-        reasons = ([f"spills to a {self.frame}-byte stack frame"] if self.frame else []) + (
+        reasons = ([f"spills {self.spilled} bytes"] if self.spilled else []) + (
             [f"serializes its warpgroup MMAs ({', '.join(self.serialized)})"] if self.serialized else [])
         return " and ".join(reasons) or "is refused"
 
@@ -2009,7 +2014,7 @@ def _recorded(found: list, *, stepped: bool) -> None:
         stated = None if report.launch is None else traced(report.launch)
         model = None if stated is None else stated.kernels.get(report.kernel)
         miss = Miss(report.kernel, None if launch is None else launch.op,
-                    None if launch is None else launch.config, report.registers, report.frame,
+                    None if launch is None else launch.config, report.registers, report.spills,
                     stepped and launch is not None,
                     serialized=tuple(note.code for note in report.notes if note.code in SERIALIZED),
                     modelled=None if model is None else model.registers)
@@ -2043,17 +2048,24 @@ class AssemblerNote:
     message: str
 
 
-def refuses(frame: int, codes: Collection[str]) -> bool:
-    """Whether a kernel the assembler built with a `frame`-byte stack frame, noting `codes`
+def spilled_bytes(frame: int, spilled: int | None) -> int:
+    """The bytes a kernel spills a thread: ptxas's measure where its record states one (`spilled`,
+    `SPILLED_BYTES`), else its `frame`-byte stack frame, which holds every byte it spills beside its locals'
+    bytes."""
+    return frame if spilled is None else spilled
+
+
+def refuses(spilled: int, codes: Collection[str]) -> bool:
+    """Whether a kernel the assembler built spilling `spilled` bytes (`Binary.spills`), noting `codes`
     (`ASSEMBLER_NOTES`' codes), is refused for its config: it spills, or its warpgroup MMAs were serialized
     (`SERIALIZED`). Certification's verdict (`Binary.refused`) and the compile gate's alike."""
-    return bool(frame) or bool(SERIALIZED & set(codes))
+    return bool(spilled) or bool(SERIALIZED & set(codes))
 
 @dataclasses.dataclass(frozen=True)
 class Binary:
     """A Mosaic GPU or Pallas-Triton kernel's binary as its executable carries it (`binaries`): its name less
     the launch it carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its
-    stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), the
+    stack frame's bytes a thread, which hold its spills and its locals (`REGISTER_COUNT`, `FRAME_SIZE`), the
     dynamic shared memory its launch asks for (a Mosaic kernel proto's `smem_bytes`, a custom kernel's
     `shared_memory_bytes`), None where its proto states none, and, read `decoded`, what its machine code
     breaks of the SASS rules (`sass_findings_of`), None where no disassembler read it."""
@@ -2086,6 +2098,14 @@ class Binary:
     """Whether its decoded SASS issues Blackwell tensor-memory ops (`_uses_tmem`); None undecoded."""
     index: str | None = None
     """XLA uniquification suffix (`__1`) where a second cubin shares `(kernel, launch)`; None otherwise."""
+    spilled: int | None = None
+    """The bytes ptxas spilled as it assembled it, as its record states them (`SPILLED_BYTES`, a Mosaic GPU
+    kernel's); None where its record states none (a Pallas-Triton kernel's)."""
+
+    @property
+    def spills(self) -> int:
+        """The bytes it spills a thread (`spilled_bytes`)."""
+        return spilled_bytes(self.frame, self.spilled)
 
     @property
     def launched(self) -> str | None:
@@ -2096,7 +2116,7 @@ class Binary:
     @property
     def refused(self) -> bool:
         """Whether its config is refused for it (`refuses`)."""
-        return refuses(self.frame, [note.code for note in self.notes])
+        return refuses(self.spills, [note.code for note in self.notes])
 
 
 def binaries(executable: jax.stages.Compiled, *, decoded: bool = False, spills: bool = False) -> list[Binary]:
@@ -2231,11 +2251,11 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
     version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, whose
     `SHARED_BYTES` its launch's dynamic shared memory, whose `CALLER_METADATA` the launch its call carried
-    (`launch_metadata`), the launch its name states where it carries none, and whose `ASSEMBLER_NOTES` what
-    ptxas noted of a loss of performance), and how many Mosaic GPU custom calls it names
-    (`MOSAIC_TARGET`, a custom call thunk's target). A message holding neither the target's bytes nor an ELF's
-    holds neither, and is not parsed: most of a program's thunks and their messages (a 4B decoder's step read
-    223,561 messages, 1.8 of its compile point's 3.5 seconds)."""
+    (`launch_metadata`), the launch its name states where it carries none, whose `ASSEMBLER_NOTES` what
+    ptxas noted of a loss of performance and whose `SPILLED_BYTES` what it spilled), and how many Mosaic GPU
+    custom calls it names (`MOSAIC_TARGET`, a custom call thunk's target). A message holding neither the
+    target's bytes nor an ELF's holds neither, and is not parsed: most of a program's thunks and their
+    messages (a 4B decoder's step read 223,561 messages, 1.8 of its compile point's 3.5 seconds)."""
     if MOSAIC_TARGET not in message and ELF not in message:
         return [], 0
     fields = proto_fields(message)
@@ -2247,7 +2267,10 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
         stated_caller = caller[0].decode() if len(caller) == 1 and isinstance(caller[0], bytes) else None
         notes = tuple(AssemblerNote(*(part[0].decode() for part in (note.get(1, [b""]), note.get(2, [b""]))))
                       for note in map(proto_fields, fields.get(ASSEMBLER_NOTES, [])))
-        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills, kind="mosaic_gpu"),
+        spilled = fields.get(SPILLED_BYTES, [])
+        measured = spilled[0] if len(spilled) == 1 and isinstance(spilled[0], int) else None
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills, kind="mosaic_gpu",
+                                            spilled=measured),
                                     shared=stated,
                                     caller=stated_caller, notes=notes)], 0
     found, calls = [], 0
@@ -2263,12 +2286,13 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
 
 
 def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False, *,
-            kind: str = "mosaic_gpu") -> Binary:
-    """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers,
-    frame and threads (`REGISTER_COUNT`, `FRAME_SIZE`, `MAX_THREADS`; a Mosaic module compiles one kernel
-    function), `decoded` its SASS findings (`sass_findings_of`), and its register reconfiguration
-    (`reconfigured`) and, where it spills, the roles its spill stands in (`spilled_roles`) wherever its one
-    listing is read (`sass_listing`: `decoded`, or `spills` where it spills)."""
+            kind: str = "mosaic_gpu", spilled: int | None = None) -> Binary:
+    """The `Binary` of the kernel `function` from its cubin `elf` and the bytes its record states ptxas
+    spilled (`spilled`, None where it states none): its `.nv.info` attributes' registers, frame and threads
+    (`REGISTER_COUNT`, `FRAME_SIZE`, `MAX_THREADS`; a Mosaic module compiles one kernel function), `decoded`
+    its SASS findings (`sass_findings_of`), and its register reconfiguration (`reconfigured`) and, where it
+    spills (`Binary.spills`), the roles its spill stands in (`spilled_roles`) wherever its one listing is
+    read (`sass_listing`: `decoded`, or `spills` where it spills)."""
     (sections_at,) = struct.unpack_from("<Q", elf, 0x28)
     entry, count, names = struct.unpack_from("<HHH", elf, 0x3A)
     headers = [struct.unpack_from("<IIQQQQIIQQ", elf, sections_at + index * entry) for index in range(count)]
@@ -2296,15 +2320,16 @@ def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = Fal
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
     frame = stated.get(FRAME_SIZE, 0)
-    listing = sass_listing(elf) if decoded or (spills and frame) else None
+    spilling = spilled_bytes(frame, spilled)
+    listing = sass_listing(elf) if decoded or (spills and spilling) else None
     decreased, raised = (None, None) if listing is None else reconfigured(listing)
     sass = (None if listing is None else sass_findings_of(listing)) if decoded else ()
     uses_tmem = None if listing is None else _uses_tmem(listing)
     kernel, launch, index = kernel_of(function)
     return Binary(kernel, launch, stated[REGISTER_COUNT], frame, kind=kind, sass=sass,
-                  spilled_in=(None if listing is None else spilled_roles(listing)) if frame else (),
+                  spilled_in=(None if listing is None else spilled_roles(listing)) if spilling else (),
                   threads=stated.get(MAX_THREADS), decreased=decreased, raised=raised,
-                  uses_tmem=uses_tmem, index=index)
+                  uses_tmem=uses_tmem, index=index, spilled=spilled)
 
 
 def disassembler() -> Path | None:

@@ -582,13 +582,15 @@ def _cubin(registers: int, frame: int) -> bytes:
     return header + names + info + b"".join(sections)
 
 
-def _kernel_proto(name: str, registers: int, frame: int, notes: tuple[tuple[str, str], ...] = ()) -> bytes:
-    """A `MosaicGpuKernelProto`: its version, binary, kernel name, launch's shared memory and what ptxas noted
-    of a loss of performance (each a code and a message)."""
+def _kernel_proto(name: str, registers: int, frame: int, notes: tuple[tuple[str, str], ...] = (),
+                  spilled: int | None = None) -> bytes:
+    """A `MosaicGpuKernelProto`: its version, binary, kernel name, launch's shared memory, what ptxas noted
+    of a loss of performance (each a code and a message) and the bytes it spilled, where measured."""
     return (_field(1, 4) + _field(8, _cubin(registers, frame))
             + _field(9, f"{name}_mosaic_gpu_kernel".encode()) + _field(10, 1024)
             + b"".join(_field(13, _field(1, code.encode()) + _field(2, message.encode()))
-                       for code, message in notes))
+                       for code, message in notes)
+            + (b"" if spilled is None else _field(report.SPILLED_BYTES, spilled)))
 
 
 def _thunk(calls: int, kernels: list[bytes]) -> bytes:
@@ -608,6 +610,17 @@ def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_n
     assert read == [("dew_gmm", "0123456789", 168, 0, 1024), ("dew_tgmm", None, 255, 344, 1024)]
     with pytest.raises(ValueError):
         report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
+
+
+def test_a_kernel_is_refused_for_what_ptxas_spilled_not_for_its_stack_frame():
+    """A kernel whose stack frame holds its own locals and nothing spilled (a prologue's sine: libdevice's
+    range reduction keeps a 32-byte array, row 9649), as ptxas measured it (`report.SPILLED_BYTES`), is
+    certified; one that spilled is refused; one a build measured nothing of is held to its frame, which
+    holds every byte it spills."""
+    kernels = report.thunk_kernels(_thunk(3, [_kernel_proto("dew_gmm", 168, 32, spilled=0),
+                                              _kernel_proto("dew_tgmm", 255, 96, spilled=64),
+                                              _kernel_proto("dew_added", 168, 32)]))
+    assert [(kernel.spills, kernel.refused) for kernel in kernels] == [(0, False), (64, True), (32, True)]
 
 
 def test_a_kernels_assembler_notes_are_read_from_its_compiled_call():
@@ -678,7 +691,7 @@ def test_a_programs_spilling_triton_launch_is_recorded_with_no_mosaic_kernel_bes
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.compiled(lowered(), relower=lowered)
-        missed = [(miss.kernel, miss.frame > 0) for miss in report.misses()]
+        missed = [(miss.kernel, miss.spilled > 0) for miss in report.misses()]
     assert missed == [("dew_softmax", True)]
 
 
@@ -731,7 +744,7 @@ def test_a_launch_spilling_at_two_configs_steps_down_alone_and_its_program_compi
         report.compiled(lowered(), relower=lowered)
         misses = report.misses()
     assert [miss.stepped for miss in misses] == [True, True], misses
-    assert len({miss.config for miss in misses}) == 2 and all(miss.frame for miss in misses), misses
+    assert len({miss.config for miss in misses}) == 2 and all(miss.spilled for miss in misses), misses
     assert compiles.count == 1
 
 
@@ -987,7 +1000,7 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(consta
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
         compiled = jax.jit(program).trace(spec, spec).lower().compile()
     found = report.binaries(compiled)
-    assert len(found) == 2 and all(binary.registers > 0 and not binary.frame for binary in found)
+    assert len(found) == 2 and all(binary.registers > 0 and not binary.spills for binary in found)
     launched = [(binary.kernel, binary.launch) for binary in found if binary.launch]
     assert launched == [("dew_added", "0123456789")]
 

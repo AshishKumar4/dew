@@ -848,7 +848,7 @@ def test_a_b200s_gathered_launch_certifies_its_tcgen05_tile_at_its_first_compile
         certified = report.certifications()[before:]
     assert (tile.family.startswith("tcgen05"), tile.block_m, tile.block_n) == (True, 128, 128), tile
     assert tile.producers.of(launch.KERNEL) is not None, tile
-    assert len(certified) == 1, [(each.config, [b.frame for b in each.refused]) for each in certified]
+    assert len(certified) == 1, [(each.config, [b.spills for b in each.refused]) for each in certified]
     assert not certified[-1].refused
 
 
@@ -906,7 +906,7 @@ def test_an_h100s_gathered_launch_certifies_its_tile_at_its_first_compile(name):
         tile = launch.taken(arguments)
         certified = report.certifications()[before:]
     assert tile.producers.of(launch.KERNEL) is None, tile
-    assert len(certified) == 1, [(each.config, [b.frame for b in each.refused]) for each in certified]
+    assert len(certified) == 1, [(each.config, [b.spills for b in each.refused]) for each in certified]
     assert not certified[-1].refused
 
 
