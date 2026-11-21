@@ -1927,9 +1927,12 @@ class DecoderRunConfig(RunConfig):
             return None
         from dew.nn.cross_pass import CrossPass
 
-        stated = {"block_size": self.loop_message_block_size, "rank": self.loop_message_rank}
-        return CrossPass(**{name: value for name, value in stated.items() if value is not None},
-                         additive=self.loop_message_additive)
+        spec = CrossPass(additive=self.loop_message_additive)
+        if self.loop_message_block_size is not None:
+            spec = dataclasses.replace(spec, block_size=self.loop_message_block_size)
+        if self.loop_message_rank is not None:
+            spec = dataclasses.replace(spec, rank=self.loop_message_rank)
+        return spec
 
 
 def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
