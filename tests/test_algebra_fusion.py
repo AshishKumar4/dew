@@ -388,6 +388,33 @@ def test_a_neighbour_costing_the_launch_a_program_stays_outside_it():
             (route.choice, route.kernel) for route in found]
 
 
+def normed_and_terms(x, scale, w, *terms):
+    """An RMS norm feeding a bf16 projection (the norm the product's prologue, as a measured cell times it) whose
+    consumers read float32 arrays of its product's shape (`terms`), each a multiply-add."""
+    wide = x.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(wide * wide, axis=-1, keepdims=True) + 1e-6)
+    out = jnp.dot((wide * inverse * scale).astype(x.dtype), w, preferred_element_type=jnp.float32)
+    for first, second in zip(terms[::2], terms[1::2], strict=True):
+        out = out * first + second
+    return out.astype(jnp.bfloat16)
+
+
+def test_a_neighbour_costing_a_selected_launch_a_program_stays_outside_it():
+    """KERNEL-TEMPLATES-13 (row 9032) where the selector, no call, takes the template: on an A100, the normed
+    q/k/v projection of Qwen3.5-0.8B (its prologue's cell measured the template faster, the product unnormed
+    XLA's dot) whose consumers read four float32 arrays of its product's shape is not fused, its launch at one
+    program a multiprocessor where the template's launch of the product alone takes two; with two arrays,
+    which keep its programs, it is."""
+    x, scale = jax.ShapeDtypeStruct((12288, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((1024,), jnp.float32)
+    w, term = jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16), jax.ShapeDtypeStruct((12288, 5120), jnp.float32)
+    with generation.assumed("sm80"):
+        for terms, fuses in (((term,) * 4, False), ((term,) * 2, True)):
+            with generation.routes() as found:
+                jax.jit(algebra.rewritten(normed_and_terms, kernels=True)).trace(x, scale, w, *terms)
+            fused = any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found)
+            assert fused == fuses, (len(terms), [(route.choice, route.kernel) for route in found])
+
+
 def named_gate(x, w, up):
     """A gate projection named for remat (`checkpoint_name`, as Dew's models name gate_proj) and its SwiGLU
     with `up` after it, the activation written entry by entry (`jax.nn.silu`'s own derivative rule is a call
