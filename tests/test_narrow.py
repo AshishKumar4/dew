@@ -773,12 +773,12 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
     assert run.plan["split"] == 2, run.plan["probes"]
 
 
-def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_them_helped(monkeypatch):
+def test_a_plan_a_rung_above_that_fits_with_its_copies_keeps_them(monkeypatch):
     """A window of one step that recomputes nothing holds about as much without its copies as with them:
-    its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
-    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
-    reaches holds them dropped where dropping them left the step less short, and back where it did not
-    (train 857 F2): once a plan fits, a run compiles no other."""
+    its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its own
+    rung neither way, the plan asks the remat rungs with its copies first (`FitSearch.recomputing`, row
+    6740) and settles the first that fits, its copies kept, none dropped: once a plan fits, a run compiles
+    no other."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -791,18 +791,11 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_t
     state, _, trainer = trained(copies=True)
     probes, plan = trainer.plan["probes"], trainer.plan
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
-    at_base = {key: base[key] for key in rung}
-    # Its own rung, with its copies and without them, both short: what dropping them freed, before any
-    # recomputation was asked.
-    own = {probe["narrow"]: probe for probe in probes if {key: probe[key] for key in rung} == at_base}
-    with_copies, without = own[True], own[False]
-    assert not with_copies["fits"] and not without["fits"]
-    assert all(probe["remat"] == base["remat"] for probe in probes[:probes.index(without) + 1])
-    # The plan, a rung above, holds them dropped where dropping them left the step less short, and back where
-    # it did not, and the run trains on the plan it found.
-    kept = without["headroom"] <= with_copies["headroom"]
-    assert {key: plan[key] for key in rung} != at_base and probes[-1]["fits"] is True
-    assert plan["narrow"] is kept and (state.compute is None) is not kept
+    # Its own rung short with its copies, then each remat rung asked with them until one fits.
+    assert not probes[0]["fits"] and all(probe["narrow"] for probe in probes), probes
+    assert probes[-1]["fits"] is True and plan["remat"] != base["remat"], probes
+    assert {key: plan[key] for key in rung} != {key: base[key] for key in rung}
+    assert plan["narrow"] is True and state.compute is not None
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=2)
