@@ -171,6 +171,10 @@ FOREIGN |= {"dew.quantization": ("dew.training",),
                              "dew.inputs.spec"), ("dew.interop",)),
             # Primitive owners register Pallas Triton lowerings lazily on first pallas_call (row 9794).
             **dict.fromkeys(("dew.nn.precision", "dew.nn.derivatives"), ("jax._src.pallas.triton",))}
+
+# An activation's every user (a schedule's flow among them) loads no kernel until it asks a fused product
+# (`dew.nn.activations.gated_product`), so a toolkit edit re-keys none of its tests (row 6740's cache warmth).
+FOREIGN |= {"dew.nn.activations": ("dew.nn.kernels",)}
 # Attention routing and linear layers load no GPU template mainloop or ring machinery on import: the
 # mainloops import inside the functions that derive or launch them (FS-IMPORT-CHAIN).
 _ATTENTION_MAINLOOPS = (
@@ -188,6 +192,7 @@ FOREIGN |= dict.fromkeys(
      "dew.nn.kv_cache"),
     _ATTENTION_MAINLOOPS,
 )
+
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
 def test_a_module_imports_its_own_domain_alone(module):
