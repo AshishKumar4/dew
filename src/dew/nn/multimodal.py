@@ -33,6 +33,7 @@ from dew.nn.wrapping import DecoderWrapper
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.cross_pass import CrossPass
     from dew.nn.dex import DifferentialExtension
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
@@ -662,11 +663,11 @@ class MultimodalTransformer(DecoderWrapper):
                     backprop_steps: int | None = None, remat: bool | None = None,
                     implicit: bool | None = None, exit_gate: bool | None = None,
                     exit_threshold: float | None = None, exits: bool | None = None,
-                    theta_passes: int | None = None) -> Self | None:
+                    theta_passes: int | None = None, messages: CrossPass | None = None) -> Self | None:
         language_model = self.language_model.with_passes(steps, layers, backprop_steps=backprop_steps,
                                                          remat=remat, implicit=implicit, exit_gate=exit_gate,
                                                          exit_threshold=exit_threshold, exits=exits,
-                                                         theta_passes=theta_passes)
+                                                         theta_passes=theta_passes, messages=messages)
         return None if language_model is None else self._over(language_model)
 
     @nn.nowrap

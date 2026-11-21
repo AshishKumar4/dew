@@ -61,6 +61,7 @@ from dew.quantization import LinearProducts
 from ..activations import GatedActivation
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..cross_attention import CrossBlocks, crossed_flops
+from ..cross_pass import CrossPass
 from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex, folded
 from ..dspark import DSpark
 from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
@@ -821,6 +822,7 @@ class CausalTransformer(LinearProducts):
             self.hc_head = stream_head(hc, self.emb_features, self.norm_eps, name='hc_head')
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
+                                             normalize_values=self.attention_residuals.normalize_values,
                                              name='output_res')
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
@@ -876,8 +878,17 @@ class CausalTransformer(LinearProducts):
                                    else None),
                 attention_norm=index > 0 or self.first_attention_norm,
                 dex=None if self.dex is None else self.dex.layer(index),
-                streams=layer_streams(self.hyper_connections, index, self.num_layers, self.loop is not None))
+                streams=layer_streams(self.hyper_connections, index, self.num_layers, self.loop is not None),
+                messaged=self._messaged(index))
             for index, layer_type in enumerate(types))
+
+    @nn.nowrap
+    def _messaged(self, index: int) -> bool:
+        """Whether layer `index` is in a looped block that passes messages (`Loop.messages`)."""
+        if self.loop is None or self.loop.messages is None:
+            return False
+        first, end = self.loop.layers or (0, self.num_layers)
+        return first <= index < end
 
     @nn.nowrap
     def _block(self, specs: tuple[LayerSpec, ...], mixer_spec, factories, wiring: BlockWiring,
@@ -936,6 +947,7 @@ class CausalTransformer(LinearProducts):
             hyper_connections=None if spec.streams is None else self.hyper_connections,
             streams_at_ends=(False, False) if spec.streams is None else spec.streams,
             residual_site=spec.residual_site,
+            cross_pass=self.loop.messages if spec.messaged and self.loop is not None else None,
             dropout_rate=self.dropout_rate,
             remat=self.remat,
             dtype=self.dtype,
@@ -1429,11 +1441,18 @@ class CausalTransformer(LinearProducts):
         return normed.astype(wide) / jnp.asarray(self.logits_scaling, wide)
 
     def stack(self, x, *, train: bool, decode: bool, per_layer_input, attention_metadata=None,
-              span: tuple[int, int] | None = None):
+              span: tuple[int, int] | None = None, prior_bank=None):
         """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages
-        (`decoder_stages.stack`)."""
+        (`decoder_stages.stack`), each layer of a looped block that passes messages reading `prior_bank`
+        (`Loop.messages`)."""
         return decoder_stages.stack(self, x, train=train, decode=decode, per_layer_input=per_layer_input,
-                                    attention_metadata=attention_metadata, span=span)
+                                    attention_metadata=attention_metadata, span=span, prior_bank=prior_bank)
+
+    def residual_summary(self, x) -> jax.Array:
+        """The `[B, S, D]` summary of the residual `x` a block of a looped pass leaves its pass after
+        (`Loop.messages`): the stream itself, or under attention residuals the block's partial sum, the
+        last slot of the depth state."""
+        return x if self.attention_residuals is None else x[:, :, -1]
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """Where the run a pipeline over `stages` (or one stage's scan) stacks is stored in `store`, the
@@ -1658,27 +1677,39 @@ class CausalTransformer(LinearProducts):
                     backprop_steps: int | None = None, remat: bool | None = None,
                     implicit: bool | None = None, exit_gate: bool | None = None,
                     exit_threshold: float | None = None, exits: bool | None = None,
-                    theta_passes: int | None = None) -> Self | None:
+                    theta_passes: int | None = None, messages: CrossPass | None = None) -> Self | None:
         """This model with its loop run `steps` times (None keeps its count), over the block `layers`
         where given (None keeps its block). `backprop_steps` sets how many final passes train through,
         `remat` checkpoints each pass, `implicit` takes each later pass by the θ-method, and `exit_gate`,
-        `exit_threshold` and `exits` weigh, take and give each pass's exit, and `theta_passes` gives an
-        implicit loop a θ row for each later pass of that many (`Loop`); None keeps its own.
+        `exit_threshold` and `exits` weigh, take and give each pass's exit, `theta_passes` gives an
+        implicit loop a θ row for each later pass of that many, and `messages` couples its passes through
+        their block summaries (`Loop`); None keeps its own.
 
         A model with no loop gains one over `layers`, with no norm between its
         passes, so one pass computes the model as it was, and every count does
-        where it is implicit; None when it has no loop and the two do not both
-        say what to add."""
+        where it is implicit or passes messages; None when it has no loop and the
+        two do not both say what to add. Messages join only a loop of one pass
+        (refused otherwise), whose later passes they then define."""
         stated = {'backprop_steps': backprop_steps, 'remat': remat, 'implicit': implicit,
                   'exit_gate': exit_gate, 'exit_threshold': exit_threshold, 'exits': exits,
-                  'theta_passes': theta_passes}
+                  'theta_passes': theta_passes, 'messages': messages}
         options = {name: value for name, value in stated.items() if value is not None}
         if self.loop is None:
             if steps is None or layers is None:
                 return None
             return self.clone(loop=Loop(steps, step_norm=False, layers=layers, **options))
+        if messages is not None and self.loop.messages is None:
+            if self.loop.steps > 1:
+                # Its later passes read the pass before's output; a loop passing messages reads the
+                # block's input, which would change what it computes at the merges' draw.
+                raise ValueError(f"this decoder already loops its block {self.loop.steps} times over the "
+                                 "pass before's output, and a loop passing messages enters every pass at the "
+                                 "block's input: add messages to a decoder that runs its block once")
+            # A loop of one pass never ran its step norm; its passes now enter at the block's input.
+            options['step_norm'] = False
         return self.clone(loop=dataclasses.replace(self.loop, steps=steps or self.loop.steps,
                                                    layers=layers or self.loop.layers, **options))
+
     @nn.nowrap
     def projected(self, params, *, updated: bool):
         """`ProjectsParameters`: before a training step's update, every AltUp layer's prediction

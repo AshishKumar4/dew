@@ -413,6 +413,10 @@ dew.config.DecoderRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
 dew.config.MetricConfig
   name: str
   fields: JsonDict = builtins.dict()
@@ -561,6 +565,10 @@ dew.config.lm.LMRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
   tokenizer: str = 'byte'
   prompt: str = ''
   max_new_tokens: int = 128
@@ -687,6 +695,10 @@ dew.decision.config.DecisionRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
   pretrained: str = 'convaiinnovations/laya'
   subfolder: str | None = None
   revision: str | None = None
