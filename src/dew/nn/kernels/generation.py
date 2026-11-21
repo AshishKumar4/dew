@@ -1662,9 +1662,15 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         def transposed(residuals, cotangent):
             operands, saved = residuals
             if live_cotangents:
-                return list(jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live))))
-            pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, None))
-            return [pulled_back[index] for index in live]
+                cotangents = list(jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live))))
+            else:
+                pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, None))
+                cotangents = [pulled_back[index] for index in live]
+            # Each operand's cotangent typed as the operand varies (`summed_to_operand`): a kernel computes
+            # each device's partial from its own operands, varying where any of them does.
+            leaves = jax.tree.leaves(operands)
+            return [summed_to_operand(each, leaves[index])
+                    for each, index in zip(cotangents, live, strict=True)]
 
         moving = [directions[index] for index in live]
         # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s
@@ -1689,6 +1695,22 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     return contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
+
+
+def summed_to_operand(cotangent, operand):
+    """`cotangent` summed over each manual axis it varies over that `operand` does not: the cotangent of an
+    operand every device of a checked manual map holds the same of (`dew.nn.sharding.checked`), from a kernel
+    whose result varies over every axis an operand varies over (`launches._typed`, row 9808), is each device's
+    partial, and the operand's whole cotangent their sum over those devices, typed as the operand varies, as
+    JAX's own transposes give a replicated operand's (row 10526: a GEMM template's kernel gradient for a
+    replicated matrix reached `ad.ct_check` varying over the map's axis). Outside a checked map, and for an
+    operand varying as its cotangent does, `cotangent` as it is."""
+    import jax
+
+    if cotangent is None or operand is None:
+        return cotangent
+    axes = tuple(sorted(jax.typeof(cotangent).mat.varying - jax.typeof(operand).mat.varying))
+    return jax.lax.psum(cotangent, axes) if axes else cotangent
 
 
 def unbroadcast(cotangent, shape: tuple[int, ...]):

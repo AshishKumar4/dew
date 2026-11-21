@@ -993,7 +993,7 @@ def _typed(backward, parameters: int = 0):
             inputs, formed = with_gradients_formed(local[:-parameters], local[-parameters:])
             local = (*inputs, *formed)
         return tuple(gradient if gradient is None or operand is None
-                     else _summed_to(gradient, operand).astype(jax.typeof(operand).dtype)
+                     else generation.summed_to_operand(gradient, operand).astype(jax.typeof(operand).dtype)
                      for gradient, operand in zip(local, operands, strict=True))
     return typed
 
@@ -1001,12 +1001,6 @@ def _typed(backward, parameters: int = 0):
 def _shard_axes(gradient: jax.Array, operand: jax.Array) -> tuple[str, ...]:
     """The manual axes `gradient` varies over that `operand` does not: its shards' partials to sum."""
     return tuple(sorted(jax.typeof(gradient).mat.varying - jax.typeof(operand).mat.varying))
-
-
-def _summed_to(gradient: jax.Array, operand: jax.Array) -> jax.Array:
-    """`gradient` summed over each manual axis it varies over that `operand` does not (`_shard_axes`)."""
-    axes = _shard_axes(gradient, operand)
-    return jax.lax.psum(gradient, axes) if axes else gradient
 
 
 class _Norm(NamedTuple):
