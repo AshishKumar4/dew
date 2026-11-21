@@ -84,9 +84,10 @@ def test_a_reload_of_host_weights_places_them_once_on_the_served_placement():
 
     server = ScoringServer.from_task(Named("a"), weights(1.0))
     host = {"w": np.full((), 2.0, np.float64)}
+    source = jax.tree_util.tree_flatten_with_path(
+        jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), weights(1.0)))[0]
     with jax.transfer_guard("disallow_explicit"):
-        checked = normalized(host, jax.tree_util.tree_flatten_with_path(
-            jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), weights(1.0)))[0])
+        checked = normalized(host, source)
     assert isinstance(checked["w"], np.ndarray) and checked["w"].dtype == np.float32
     server.reload(Named("b"), host)
     host["w"][...] = 3.0
