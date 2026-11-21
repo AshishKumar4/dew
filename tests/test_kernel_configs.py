@@ -605,10 +605,12 @@ class GemmCase(NamedTuple):
 
 
 def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False,
-                         form: str | None = None) -> list[GemmCase]:
+                         form: str | None = None, settled: bool = False) -> list[GemmCase]:
     """Each GEMM Mosaic launch form a `generation_name` GPU runs at the projection `shape`
     (`GEMM_SHAPES`, `_gemm_forms`), at the one tile its launch derives from the generation's facts
-    (`Template.derived`); each a family's mainloop only where it takes the call
+    (`Template.derived`), or with `settled` the one it settles on (`KernelOp.taken`: certification refusing a
+    derived tile whose kernels spill and the derivation stepping down, as a run's compile does; none, the
+    call off the template, where every tile spills); each a family's mainloop only where it takes the call
     (`Template.eligible`). With `every_consumer_count`, each form at one consumer and at the family's most
     (`Family.consumers`) where that tile is legal instead, each case named with its count (`x1`, `x2`).
     With `form`, that form's alone. Each a record (`GemmCase`)."""
@@ -620,7 +622,9 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             ba = launch.bind(*args, **options)
             if not launch.eligible(ba, target):
                 continue
-            config = launch.derived(ba, target)
+            config = launch.taken(ba) if settled else launch.derived(ba, target)
+            if config is None:
+                continue
             configs = {(f"{name} {config}", None): config}
             if every_consumer_count:
                 family = pricing.family_of(config, jnp.bfloat16)
@@ -730,11 +734,11 @@ def _gate_forms(generation_name: str) -> set[str]:
 
 @functools.cache
 def _gate_cases(generation_name: str, form: str) -> list:
-    """A form's cases at every projection (`_gemm_mainloop_cases`), each distinct kernel once
-    (`GemmCase.kernel`)."""
+    """A form's cases at every projection, each at the tile its launch settles on
+    (`_gemm_mainloop_cases`' `settled`), each distinct kernel once (`GemmCase.kernel`)."""
     found = {}
     for shape in GEMM_SHAPES:
-        for case in _gemm_mainloop_cases(generation_name, shape, form=form):
+        for case in _gemm_mainloop_cases(generation_name, shape, form=form, settled=True):
             found.setdefault(case.kernel, case)
     return list(found.values())
 
@@ -752,7 +756,8 @@ def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> lis
 @pytest.mark.parametrize(("generation_name", "form"), _by_form(gate_generations(stated=True), _gate_forms))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, form):
     """Every distinct GEMM Mosaic GPU kernel of a form a generation runs at a real projection (`_gate_cases`),
-    a test each form, at the tile its launch derives from the generation's facts, compiled by Mosaic for a
+    a test each form, at the tile its launch settles on from the generation's facts (certification refusing
+    a derived tile whose kernels spill, as a run's compile does), compiled by Mosaic for a
     compile-only device of the generation on
     this CPU through ptxas, with the JAX this checkout pins. Required launches must spill nothing; compiler
     errors and missing reports fail any. Beside them, each launch of the
