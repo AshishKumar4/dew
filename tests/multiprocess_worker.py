@@ -1090,7 +1090,7 @@ def mode_stage_save(args) -> dict:
         value = np.full((4,), np.nan if rank == 1 else 1.0, np.float32)
         flags.append(jax.make_array_from_single_device_arrays(
             value.shape, sharding, [jax.device_put(value, device) for device in devices
-                                    if device.process_index == jax.process_index()]))
+                                    if device.process_index == jax.process_index()], dtype=value.dtype))
     read = finite_flags(flags)
 
     from test_stage_local import ADAM, decoder, stream, trainer
