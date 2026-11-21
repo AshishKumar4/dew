@@ -723,6 +723,30 @@ def settled_aside(aside: Aside) -> None:
                    stepped=each.op.remaining(each.arguments) is not None)
 
 
+def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
+                     program: Callable[[T], jax.stages.Lowered | None]) -> T:
+    """`lower()`'s value, the launches its trace reaches certified aside (`certifying_aside`, settled as it
+    ends: `settled_aside`), and `relower()`'s afresh for as long as its program (`program`, None where it
+    holds none) launches a refused config (`refused_in`), each refused launch's derivation stepping past its
+    config and certifying the next in turn: its own certifications' refusals, or another caller's committed
+    after its trace took the config (row 8603: another thread's drain left a program compiling at it). A
+    relowering that launches a config refused before again (a derivation reading no refusal, a pin's) is its
+    compile's to read (`settled`). Every trace a compile point settles lowers through it: a program's own
+    (`options.OuterProgram`) and a step's planner's and fit check's (`planning.FitSearch.lowering`), whose
+    launches certified in turn took 64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324)."""
+    with certifying_aside() as aside:
+        value = lower()
+    settled_aside(aside)
+    seen: set = set()
+    while ((lowered := program(value)) is not None and (refused := refused_in(lowered))
+           and not refused & seen):
+        seen |= refused
+        with certifying_aside() as aside:
+            value = relower()
+        settled_aside(aside)
+    return value
+
+
 def _refused_before(op, arguments: tokamax.BoundArguments) -> bool:
     """Whether `op`'s launch of `arguments` had a config refused in this context (`refused_launches`)."""
     identity = _identity(op, arguments)

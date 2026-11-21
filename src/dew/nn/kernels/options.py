@@ -830,16 +830,8 @@ class OuterProgram:
         read (`report.settled`)."""
         from dew.nn.kernels.templates import report
 
-        with report.certifying_aside() as aside:
-            lowered = self.lower(*args, **kwargs)
-        report.settled_aside(aside)
-        seen: set = set()
-        while (refused := report.refused_in(lowered)) and not refused & seen:
-            seen |= refused
-            with report.certifying_aside() as aside:
-                lowered = self._relowered(args, kwargs, relowered)
-            report.settled_aside(aside)
-        return lowered
+        return report.lowered_aside(lambda: self.lower(*args, **kwargs),
+                                    lambda: self._relowered(args, kwargs, relowered), lambda lowered: lowered)
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on

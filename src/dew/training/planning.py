@@ -938,9 +938,15 @@ class FitSearch[LossT, EffectsT]:
         return candidate.held + (self.unplaced or 0)
 
     def lowering(self, split: int) -> Candidate:
-        """The step at `split` at the objective's rung and the search's `narrow`, lowered."""
+        """The step at `split` at the objective's rung and the search's `narrow`, lowered, the launches its
+        trace reaches certified aside and the step lowered afresh while it launches a refused config
+        (`report.lowered_aside`)."""
+        from dew.nn.kernels.templates import report
+
         with spending() as spent:
-            lowered = self.lower(split, self.narrow, self.ns_group)
+            lowered = report.lowered_aside(lambda: self.lower(split, self.narrow, self.ns_group),
+                                           lambda: self.relowering(split),
+                                           lambda candidate: candidate.program)
         return dataclasses.replace(lowered, spent=spent)
 
     def relowering(self, split: int) -> Candidate:

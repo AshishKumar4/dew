@@ -918,9 +918,13 @@ class Trainer(Generic[Loss, Effects]):
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1, *,
                     objective: Objective[Loss, Effects]):
         """The loss's program (`dew.training.transaction.traced_loss`, which narrow copies read) and its
-        shapes."""
+        shapes, the launches its trace reaches certified aside (`report.certifying_aside`), as the step's own
+        trace takes them."""
         loss, (variables, *rest) = traced_loss(objective, state, window, split)
-        return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
+        with report.certifying_aside() as aside:
+            shaped = jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
+        report.settled_aside(aside)
+        return shaped
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
                                  split: int = 1, shape_only=False, donor: Accumulation | None = None,
