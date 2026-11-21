@@ -129,6 +129,9 @@ class Lane:
     'rna', rounded to TF32 to nearest, a tie away from zero, first (`cvt.rna.tf32.f32`,
     `Family.rounds_tf32`: mma.sync's); 'read', read as TF32 from its fp32 register by the instruction, no
     conversion stated (warpgroup MMA's), which encloses either of the others."""
+    pairs_tf32: Literal["plain", "rna", "read"] | None = None
+    """How the intra walk's factored pairs take a one-part fp32 operand, their own issuer's
+    (`intra.pairs_family`, mma.sync's on every target), where it differs from `tf32`; None where the same."""
 
 
 def fp32(iv: Iv, lane: Lane) -> Iv:

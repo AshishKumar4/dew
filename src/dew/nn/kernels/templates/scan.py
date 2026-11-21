@@ -135,8 +135,9 @@ def compensated_columns(pairs) -> None:
     Pallas store a row at a time met the warpgroup at each, 44% of a running prefix's warp time an emulated
     GH200's (M-JS-145e). Additions alone, so no multiply contracts into them."""
     elements = math.prod(pairs.shape[1:])
-    # Each element's two words read and written, and its compensated add's twelve additions.
-    body = emission.stating(lambda ref: Work(operations=12 * elements, shared_bytes=16 * elements))(
+    # Each element's two words read and written, and its compensated add's fourteen additions (two TwoSums'
+    # six and the dropped part's two).
+    body = emission.stating(lambda ref: Work(operations=14 * elements, shared_bytes=16 * elements))(
         lambda ctx, ref: _compensated_columns(ref))
     plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(body)(pairs)
 

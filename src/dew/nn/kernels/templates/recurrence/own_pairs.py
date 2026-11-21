@@ -1,5 +1,5 @@
 """Each sub-chunk's own pairs under a decay a key dimension, launches of their own beside the factored walks
-(`intra._intra_walk`, `key_backward._key_pairs_back`): the forward's bands (`algebra.key_diagonal_bands`)
+(`intra._sub_chunk_walk`, `key_backward._key_pairs_back`): the forward's bands (`algebra.key_diagonal_bands`)
 and the backward's transpose (`algebra.key_diagonal_pairs_back`), no products on the tensor cores, as
 fla_kda's token-parallel diagonal (chunk_kda_fwd_intra_token_parallel) and its gradient. In the walks, an
 H100's Kimi Linear intra launch took 1982 us against 492 and its pairs' backward 2268 against 672, each at 248

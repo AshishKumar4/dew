@@ -1619,9 +1619,8 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     certification reads too, `report.Binary.refused`) at a config not refused before, its launch refused
     (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
-    derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
-    first derivation, before any compile); the plans and launches held apart are those of the cases
-    returned."""
+    derives none and leaves the template. `refused` holds the calls the template refuses, at its first
+    derivation or a retry's; the plans and launches held apart are those of the cases returned."""
     from kernel_compile import compile_mosaic_kernels
 
     launched: dict = {}
@@ -1650,7 +1649,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         plans.clear()
         apart.clear()
         launched.clear()
-        cases = compiled_cases(target, plans, [], apart, only=group, launched=launched)
+        cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
         found = compile_mosaic_kernels(cases, target)
     return cases, found
 

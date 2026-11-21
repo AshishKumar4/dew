@@ -703,8 +703,8 @@ def gated_up(prefix: tuple, reference: tuple, index: jax.Array, place) -> jax.Ar
 
 def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, prefix: tuple,
                     at: Callable[[int], tuple], staged: Callable[[jax.Array, int | None, int | None], Tile],
-                    *, chunk: int, scales: Sequence[float], sub: int = SUB,
-                    sliced: bool = False) -> list[Callable[[], list[tuple]]]:
+                    *, chunk: int, scales: Sequence[float],
+                    sub: int = SUB) -> list[Callable[[], list[tuple]]]:
     """A chunk's pairs under a decay a key dimension, one key block's, as the products whose sum they are, a
     sub-chunk at a time: for each sub-chunk past the first a callable forming its products, one `(name, lhs,
     rhs)` ('pairs') for each of `rows` (each forming its row when called: the queries, the write-gated keys;
@@ -715,11 +715,15 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
     chunk's `token`, a column's vectors; each row set's gated rows are scaled by its of `scales` (the scores'
     the attention scale), so the sums a mainloop holds are its pairs scaled. Each pair's decay splits at `s`'s
     first token `G_s`, as fla_kda's inter-sub-chunk products split it: `exp2(g_i - G_s) exp2(G_s - g_j)`, each
-    exponent at most zero (`decay`). For each sub-chunk `s` past the first, one product a row set: the rows of
-    `s` gated down to `G_s`, zero on every other row, against every key before `s` gated up to `G_s`
-    (`gated_up`), zero from `s` on, a whole chunk of rows against a whole chunk of keys (read transposed),
-    each operand staged once where `staged(value, s, r)` puts it (the keys' `r` None, every row set's products
-    reading them). A row set's products sum into one accumulator, which a mainloop may hold across its key
+    exponent at most zero (`decay`). For each sub-chunk `s` past the first, one product a row set: its rows of
+    the row set gated down to `G_s` (`sub` of them, `[sub, C]` a row set and sub-chunk: fla_kda's
+    inter-sub-chunk blocks, a sub-chunk's row of them a product, on an issuer whose products take `sub` rows,
+    mma.sync's) against every key before `s` gated up to `G_s` (`gated_up`), zero from `s` on, a whole chunk
+    of keys (read transposed): each row set's gated rows staged once (`staged(value, None, r)`, whichever
+    sub-chunk's products are formed first) and each sub-chunk's keys where `staged(value, s, None)` puts
+    them. A whole chunk of rows masked to a sub-chunk's took 3.7 times fla's inter-sub-chunk launch on an
+    A100's mma.sync (1508 us against chunk_kda_fwd_kernel_inter_solve_fused's 356, M-JS-144-a100). A row
+    set's products sum into one accumulator a sub-chunk, which a mainloop may hold across its key
     blocks, read once; formed a sub-chunk at a time, a caller issues each sub-chunk's products once its
     operands are staged, their MMAs running under the next sub-chunk's forming, where every operand staged
     before any product was issued, a B200's intra walk's compute warps waited on their products' commit at its
@@ -731,14 +735,7 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
     and 355 (M-JS-24). A sub-chunk's own pairs factored too, the queries and keys decay-scaled around its
     first token and taken on the tensor cores, put a packed document's first token's output, a row of 2.5e-5
     where `q . k` cancels, at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay
-    (row 5194, M-JS-48w).
-
-    `sliced`, an issuer whose products take `sub` rows (mma.sync's): each row set's gated rows staged once
-    (`staged(value, None, r)`) and each sub-chunk's product its `sub` rows of them alone against the same
-    keys, `[sub, C]` a row set and sub-chunk, its rows of the chunk's pairs (fla_kda's inter-sub-chunk blocks,
-    a sub-chunk's row of them a product): a quarter of the rows' products and staging, where a whole chunk of
-    rows masked to a sub-chunk's took 3.7 times fla's inter-sub-chunk launch on an A100's mma.sync (1508 us
-    against chunk_kda_fwd_kernel_inter_solve_fused's 356, M-JS-144-a100)."""
+    (row 5194, M-JS-48w)."""
     index, _ = _grid(prefix[0].shape)
     blocks = chunk // sub
     # Every row gated down to its own sub-chunk's first token.
@@ -749,12 +746,10 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
 
     def formed(s: int) -> list[tuple]:
         raised = staged(keys * gated_up(prefix, at(s * sub), index, s * sub), s, None).T
-        if sliced:
-            # The gated rows staged with the first sub-chunk's keys, read a sub-chunk's rows at a time.
-            whole.extend(staged(value, None, r) for r, value in enumerate(gated) if s == 1)
-            return [("pairs", tile.rows(s * sub, sub), raised) for tile in whole]
-        mine = (index >= s * sub) & (index < (s + 1) * sub)
-        return [("pairs", staged(jnp.where(mine, value, 0.0), s, r), raised) for r, value in enumerate(gated)]
+        # The gated rows staged with the first products formed, read a sub-chunk's rows at a time.
+        if not whole:
+            whole.extend(staged(value, None, r) for r, value in enumerate(gated))
+        return [("pairs", tile.rows(s * sub, sub), raised) for tile in whole]
 
     return [functools.partial(formed, s) for s in range(1, blocks)]
 
@@ -858,7 +853,7 @@ def write_gated(tile: jax.Array, strengths: jax.Array) -> jax.Array:
 
 
 def columns_before(found: jax.Array, start: int) -> jax.Array:
-    """A sub-chunk's row block of a system's pairs `found` `[SUB, C]` (`key_block_pairs`' `sliced`, rows
+    """A sub-chunk's row block of a system's pairs `found` `[SUB, C]` (`key_block_pairs`', rows
     from `start` on) below the chunk's diagonal: its columns before `start`, zero from it on, as
     `strictly_lower` keeps them."""
     return jnp.where(_grid(found.shape)[1] < start, found, 0.0)

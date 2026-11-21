@@ -417,11 +417,14 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     tokens = np.arange(size)
     own = (tokens[:, None] // SUB) == (tokens[None, :] // SUB)
 
+    # The pairs of sub-chunks issued by their own bundle (`Lane.pairs_tf32`).
+    paired = dataclasses.replace(lane, tf32=lane.pairs_tf32 or lane.tf32)
+
     def pairs(rows: Iv) -> Iv:
         """Each sub-chunk's own pairs (`key_diagonal`) and the pairs of sub-chunks (`key_pairs`), each zero
         where the other is taken, so their sum exact."""
         within = key_diagonal(rows, step.k, exponents, lane)
-        return where(own, within, key_pairs(rows, step.k, exponents, lane))
+        return where(own, within, key_pairs(rows, step.k, exponents, paired))
 
     writes = fp32(mul(point(step.k), point(np.asarray(step.beta)[:, None])), lane)
     system = where(_lags(size) > 0, pairs(writes), zeros)
@@ -440,7 +443,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     # across the key blocks), the rest and its sign the read sums'; each sub-chunk's own scaled once summed
     # (`algebra.band_masked`).
     shrinking, growing = min(abs(scale), 1.0), math.copysign(max(abs(scale), 1.0), scale)
-    crossed = fp32(mul(key_pairs(point(step.q), step.k, exponents, lane, shrinking),
+    crossed = fp32(mul(key_pairs(point(step.q), step.k, exponents, paired, shrinking),
                        point(np.float32(growing))), lane)
     within = fp32(mul(key_diagonal(point(step.q), step.k, exponents, lane), factor), lane)
     scores = staged(where(_lags(size) >= 0, where(own, within, crossed), zeros), lane)
@@ -529,6 +532,9 @@ class Run:
     tf32: Literal["plain", "rna", "read"]
     """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
     the launches were interpreted."""
+    pairs_tf32: Literal["plain", "rna", "read"]
+    """How the intra walk's factored pairs take one (`Lane.pairs_tf32`): their bundle's issuer's
+    (`intra.pairs_family`), or plain where interpreted."""
     trained: bool
     """Whether the template trains the call (`Mosaic.trains`): its records the training forward's, the primal
     of the route's VJP, and its fast backward the template's; else the inference forward's."""
@@ -778,6 +784,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                pairing=intra.pairing_parts(family, held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained),
+               pairs_tf32=tf32_conversion(intra.pairs_family(generation.gpu_target().generation, dtype)
+                                          or family),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -837,7 +845,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32)
+                               merged=run.merged, tf32=run.tf32, pairs_tf32=run.pairs_tf32)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1378,7 +1386,7 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32)
+                               merged=run.merged, tf32=run.tf32, pairs_tf32=run.pairs_tf32)
 
     def stored(iv: Iv, dtype) -> Iv:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
