@@ -167,8 +167,9 @@ def host_gpus(generation: str, topology: str | Path, count: int, share: float = 
     attached: XLA compiles over them as over that host's GPUs, the SKU's memory, clocks and multiprocessors
     its own, so a program compiled here keys the persistent cache as that host's compile of it does (its
     backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
-    canonical target (`compile_only_gpus`) keys another entry: the 80 GB A100 it names against a 40 GB
-    host's. Each is admitted at `share`, the pool's share in the host's run (`StatedGpu`)."""
+    canonical target (`compile_only_gpus`) keys another entry: the least memory of the generation's parts
+    it states (an A100's 40 GB, `GpuTarget.memory`) against an 80 GB host's. Each is admitted at `share`,
+    the pool's share in the host's run (`StatedGpu`)."""
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)

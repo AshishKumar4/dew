@@ -401,8 +401,11 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
         # An operand of one element along an axis the result spans is broadcast along it, as the
         # equation reads it: laid out to the result's axes of more than one element (`_broadcast`).
         inner = [_broadcast(value, out.shape, squeezed) if jnp.ndim(value) else value for value in operands]
-    core_shape = jax.eval_shape(lambda *values: equation.primitive.bind(*values, **params), *inner).shape
-    inner_equation = equation.replace(params=params, outvars=[jcore.Var(out.update(shape=core_shape))])
+    # Its erased value's type, its sharding's spec of that value's rank (an Explicit mesh's: the whole
+    # result's spec on it raised).
+    core = jax.eval_shape(lambda *values: equation.primitive.bind(*values, **params), *inner)
+    inner_equation = equation.replace(params=params, outvars=[jcore.Var(out.update(shape=core.shape,
+                                                                                  sharding=core.sharding))])
     core = _normal(inner_equation, inner, widened, laid)[0]
     return [_unsqueezed(core, out.shape, squeezed)]
 
@@ -536,9 +539,10 @@ def _lifted(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
             if value in laid}) != 1:
         return None
     (shape, dimensions), = layouts
-    inner = equation.replace(outvars=[jcore.Var(equation.outvars[0].aval.update(
-        shape=jnp.shape(next(source for source, value in zip(sources, operands, strict=True)
-                             if value in laid))))])
+    source = jax.typeof(next(source for source, value in zip(sources, operands, strict=True)
+                             if value in laid))
+    inner = equation.replace(outvars=[jcore.Var(equation.outvars[0].aval.update(shape=source.shape,
+                                                                                 sharding=source.sharding))])
     made = _normal(inner, sources, widened, laid)[0]
     spread = jax.lax.broadcast_in_dim(made, shape, dimensions)
     laid[spread] = (made, (shape, dimensions))

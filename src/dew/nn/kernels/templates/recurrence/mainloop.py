@@ -1273,7 +1273,10 @@ def _key_unit(call: Call, *, contracted: bool) -> int:
     delta attention's intra walk at tcgen05's 32 held one program a multiprocessor at 240 registers, its
     scores and system two launches, where at 16 an H100's merged walk holds two (180 registers)."""
     family = call.family
-    return family.narrowest_depth(jnp.bfloat16) if contracted else family.narrowest_columns(jnp.bfloat16)
+    narrowest = family.narrowest_depth(jnp.bfloat16) if contracted else family.narrowest_columns(jnp.bfloat16)
+    # Its values laid in the family's layouts, whose column atom a block fills whole (`Issuer.atom_columns`:
+    # a sub-chunk's mma.sync rows, `intra.sub_chunked`, tile 32 columns).
+    return max(narrowest, family.atom_columns)
 
 
 def _key_blocks(call: Call, *, contracted: bool) -> list[int]:

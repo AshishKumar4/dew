@@ -55,13 +55,28 @@ TPU_PASSES = {"DEFAULT": 1, "HIGH": 3, "HIGHEST": 6}
 """The bfloat16 passes a TPU's matrix units multiply fp32 operands in, by precision (`jax.lax.Precision`'s own
 statement: "On TPU: performs float32 computations in bfloat16", "in 3 bfloat16 passes", "in 6 bfloat16")."""
 
+TPU_ALGORITHMS = {jax.lax.DotAlgorithmPreset.BF16_BF16_F32: "DEFAULT",
+                  jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3: "HIGH",
+                  jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6: "HIGHEST"}
+"""The dot algorithms XLA:TPU compiles, each as the precision it lowers to (`TPU_PASSES`'): over fp32
+operands on a v5e, the bfloat16 preset as the default's one pass, X3 as `operand_precision={high,high}` and
+X6 as `{highest,highest}`. It refuses every other preset, F16's, BF16_BF16_BF16, X9, TF32's, F32_F32_F32 and
+F64's ("UNIMPLEMENTED: Dot algorithm ... is not supported"; measurement M-JS-160, row 10845), and no other
+algorithm is shown to compile there."""
+
+_UNRUN = "unpriced_operations"
+"""The `Work` field an algorithm its target does not run is told in (`TPU_ALGORITHMS`): work at no rate, so
+no form is cheaper for taking it (`dew.algebra.cost.cheaper`), its price never a TPU's zero seconds."""
+
 
 def product_mode(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype,
                  target: generation.GpuTarget) -> tuple[str, int]:
     """The `Work` field a product of operands of those dtypes at `precision` on `target` is told in
-    (`_MODES`), and the passes it multiplies in: where `precision` names a dot algorithm, that algorithm's as
-    JAX lowers it (`programs.dot_arithmetic`: TF32's, a 16-bit or an 8-bit precision's whatever the operands'
-    storage, each over its primitive operations, an X3's three; any other on the CUDA cores); else the
+    (`_MODES`), and the passes it multiplies in: where `precision` names a dot algorithm, on a TPU its
+    bfloat16 passes where XLA:TPU compiles it, else none it runs (`TPU_ALGORITHMS`, `_UNRUN`), elsewhere
+    that algorithm's as JAX lowers it (`programs.dot_arithmetic`: TF32's, a 16-bit or an 8-bit precision's
+    whatever the operands' storage, each over its primitive operations, an X3's three; any other on the CUDA
+    cores); else the
     operands': 16-bit operands' 16-bit mode, FP8 operands' 8-bit mode (`eight`), fp32 operands' on a TPU its
     matrix units' bfloat16 passes (`TPU_PASSES`, a pair of precisions at its higher's), elsewhere TF32 at the
     default precision (the product declaration's, `declared`) and IEEE fp32 above it; any other operand's on
@@ -69,6 +84,10 @@ def product_mode(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype,
     through `emission.operation_work`) and a chunk form's (`dew.algebra.cost.product_work`); a TPU kernel
     body's product is its counter's own (`emission._Counting`), whose passes Mosaic TPU's lowering decides."""
     arithmetic = programs.dot_arithmetic(precision, lhs_dtype, rhs_dtype)
+    if arithmetic is not None and generation.tpu(target):
+        named = programs.canonical_precision(precision)
+        taken = TPU_ALGORITHMS.get(named) if isinstance(named, jax.lax.DotAlgorithmPreset) else None
+        return (_MODES["16bit"], TPU_PASSES[taken]) if taken is not None else (_UNRUN, 1)
     if arithmetic is not None:
         bits = set(arithmetic.operand_bits)
         mode = "tf32" if arithmetic.tf32 else "16bit" if bits == {16} else "8bit" if bits == {8} else "fp32"

@@ -266,7 +266,8 @@ def test_an_imported_helper_that_returns_an_error_is_compared_as_a_local_one_is(
 
 def test_the_gate_compares_floats_and_scripts_outside_tests_and_tools_are_not_read(lint, tmp_path):
     body = "import numpy as np\nnp.testing.assert_allclose(a, b, rtol=1e-5)\n"
-    assert not list(lint.tolerances(_module(lint, tmp_path, "tests/reference_error.py", body)))
+    gate = body + "__accuracy_gate__ = True\n"
+    assert not list(lint.tolerances(_module(lint, tmp_path, "tests/reference_error.py", gate)))
     assert not list(lint.tolerances(_module(lint, tmp_path, "examples/run.py", body)))
     assert list(lint.tolerances(_module(lint, tmp_path, "tools/report.py", body)))
 
