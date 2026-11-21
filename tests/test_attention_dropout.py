@@ -418,9 +418,9 @@ def test_a_near_total_fp16_draw_keeps_its_one_kept_weight_finite_on_every_path(f
 def test_the_mosaic_dropping_walk_refuses_fp16_weights_past_fp16s_largest():
     """At the fp16 witness's rate, 1 - 2^-16, a kept weight's multiplier, 2^16, passes fp16's largest, which
     the Mosaic dropping backward's dV sums in place take no scaled part of (`attention.drops_in_place`): its
-    legality rule refuses an fp16 call there, forward and backward, and takes a bf16 one and an fp16 one at an
-    ordinary rate (the plain-JAX mainloop takes the witness, above); it refuses an fp16 call from a state
-    whose multiplier is no power of two and takes a bf16 one and an fp16 one at a rate of 1/2."""
+    legality rule refuses an fp16 backward there while accepting the forward (row 9507), and takes a bf16
+    call and an fp16 one at an ordinary rate; it refuses an fp16 backward from a state whose multiplier is no
+    power of two while accepting the forward, a bf16 call, and an fp16 one at a rate of 1/2."""
     near_total = hooked(seed_words(0), ROWS, HEADS, 1.0 - 2.0 ** -16)
 
     def refusal(dtype, hooks, backward):
@@ -433,11 +433,13 @@ def test_the_mosaic_dropping_walk_refuses_fp16_weights_past_fp16s_largest():
                              jnp.zeros((ROWS, HEADS, 1, WIDTH)))
     resumed = dataclasses.replace(hooked(seed_words(0), ROWS, HEADS), initial=state)
     halved = dataclasses.replace(hooked(seed_words(0), ROWS, HEADS, 0.5), initial=state)
+    assert refusal(jnp.float16, near_total, backward=False) is None
+    assert refusal(jnp.float16, resumed, backward=False) is None
+    assert refusal(jnp.float16, near_total, backward=True).code == "dropout_rate"
+    assert refusal(jnp.float16, resumed, backward=True).code == "dropout_rate"
     for backward in (False, True):
-        assert refusal(jnp.float16, near_total, backward).code == "dropout_rate"
         assert refusal(jnp.bfloat16, near_total, backward) is None
         assert refusal(jnp.float16, hooked(seed_words(0), ROWS, HEADS), backward) is None
-        assert refusal(jnp.float16, resumed, backward).code == "dropout_rate"
         assert refusal(jnp.bfloat16, resumed, backward) is None
         assert refusal(jnp.float16, halved, backward) is None
 
@@ -617,6 +619,48 @@ def test_a_mosaic_dropping_backwards_kept_anchor_keeps_its_tiny_product():
     ours, reference = _mosaic_gradients(spans, hooks)
     assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
                     "a dropping kept anchor's tiny product", seeds=FEWEST_SEEDS)
+
+
+@pytest.mark.parametrize(("rate", "with_initial"), [(0.25, True), (1.0 - 3.0 * 2.0 ** -17, False)],
+                         ids=["fp16-rate0.25-initial", "fp16-rate-past-binade"])
+def test_a_mosaic_fp16_dropping_forward_with_initial_or_past_binade_is_eligible_and_on_par(
+        rate, with_initial):
+    """Row 9507: an fp16 Mosaic dropping forward at rate 0.25 with an initial state (non-power-of-two
+    multiplier beside a walk of no headroom) or at rate 1 - 3*2^-17 without one (weights past fp16's
+    largest binade, traced row-scaled `product.Scaled` parts) stays eligible on Hopper and holds check 1
+    interpreted against the float64 reference."""
+    words = jnp.asarray([3181759654, 0], jnp.uint32)
+    spans = template.spans(1, 2, 1)
+    sinks = jnp.array([0.5], jnp.float32) if with_initial else None
+    initial = None if sinks is None else template.sinks(sinks, 1, 1, WIDTH)
+    hooks = dataclasses.replace(hooked(words, 1, 1, rate), initial=initial)
+    with generation.assumed("sm90"):
+        query = jnp.zeros((1, 1, 1, WIDTH), jnp.float16).at[..., 0].set(1)
+        key = jnp.zeros((1, 2, 1, WIDTH), jnp.float16).at[0, 1, 0, 0].set(-0.5)
+        value = jnp.ones((1, 2, 1, WIDTH), jnp.float16)
+        op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        assert op.declined(ba, generation.gpu_target()) is None
+        assert op.derived(ba, generation.gpu_target()) is not None
+
+        def ours(q, k, v):
+            return attention_mosaic.forward(q, k, v, spans, hooks, interpret=True)
+
+        def reference(q, k, v):
+            return template.reference(q, k, v, spans, hooks)
+
+        value_scale = 2.0 ** -14 if rate > 0.5 else 1.0
+
+        def draw(seed):
+            streams = jax.random.split(jax.random.key(seed), 3)
+            q = jax.random.normal(streams[0], (1, 1, 1, WIDTH), jnp.float16)
+            k = jax.random.normal(streams[1], (1, 2, 1, WIDTH), jnp.float16)
+            v = (jax.random.normal(streams[2], (1, 2, 1, WIDTH), jnp.float32) * value_scale).astype(
+                jnp.float16)
+            return q, k, v
+        assert_as_exact(ours, reference, draw, f"fp16 mosaic drop rate={rate} initial={with_initial}",
+                        seeds=FEWEST_SEEDS)
 
 
 def test_split_delta_keeps_tiny_others_when_anchor_times_multiplier_overflows():

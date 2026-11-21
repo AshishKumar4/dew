@@ -428,14 +428,17 @@ class _Issuing(NamedTuple):
     interpret: bool
 
 
-def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
-    """`acc` with each of `parts`' products with `rhs`, a tile in shared memory, issued into it in place
-    (`operands.Issuer`'s carried accumulator), each part's left operand in registers and formed as it is
-    taken (`algebra.formed_parts`); an fp16 part's (`product.Scaled`) its own accumulator, restored by its
-    row's power of two (`algebra.restored`) and added in."""
+def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool, *,
+                shape: tuple[int, int] | None = None):
+    """`acc`, or a fresh fp32 accumulator of `shape` where None, with each of `parts`' products with `rhs`,
+    a tile in shared memory, issued into it in place (`operands.Issuer`'s carried accumulator), each part's
+    left operand in registers and formed as it is taken (`algebra.formed_parts`); an fp16 part's
+    (`product.Scaled`) its own accumulator, restored by its row's power of two (`algebra.restored`) and
+    added in."""
     issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
     right = operands.Parts((rhs,), rhs.dtype)
-    return issuer.summed((("part", part, right) for part in parts), into=acc)
+    products = (("part", part, right) for part in parts)
+    return issuer.summed(products, shape) if acc is None else issuer.summed(products, into=acc)
 
 
 def issued_pairs(family: mosaic.Family, acc, pairs: Iterable, interpret: bool, *,
@@ -596,6 +599,16 @@ ROUNDED = Refusal('rounds', "a quantized model's weights round at their row's ma
 """Why the mainloops take a quantized call's forward alone, of neither a dropping nor a resumed call."""
 
 
+def scaled_drop(dtype, drop, initial) -> bool:
+    """Whether a dropping call's forward products leave in-place accumulation (`_accumulated`, row 9507):
+    weights past `dtype`'s largest binade (traced row-scaled `product.Scaled` parts, `drops_in_place`) or an
+    initial state beside a walk of no headroom at a non-power-of-two multiplier (`sums_units`)."""
+    if drop is None:
+        return False
+    return (not drops_in_place(dtype, drop.reach)
+            or (initial is not None and not algebra.headroom(dtype) and drop.bound != drop.reach))
+
+
 def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool,
             family: mosaic.Family) -> Refusal | None:
     """Why this mainloop takes no call of `dtype` operands, head widths `width` and `value_width` and `hooks`
@@ -606,20 +619,13 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.rounds is not None and (backward or hooks.drop is not None or hooks.initial is not None):
         return ROUNDED
-    if (hooks.drop is not None and hooks.initial is not None and not algebra.headroom(dtype)
+    if (backward and hooks.drop is not None and hooks.initial is not None and not algebra.headroom(dtype)
             and hooks.drop.bound != hooks.drop.reach):
-        # A state's sums beside a walk of no headroom hold the multiplier itself, each tile's products taken
-        # down to it where it is no power of two (`sums_units`; a rate of 1/2 takes none, the base review of
-        # e2b671ce9, F3), which sums accumulated in place do not take: the plain-JAX mainloop takes the call.
-        # A scaled walk for such a call (its state's own headroom) would take it.
-        return Refusal('dropout_rate', f"the Mosaic dropping walk takes no initial state beside "
+        return Refusal('dropout_rate', f"the Mosaic dropping backward takes no initial state beside "
                        f"{jnp.dtype(dtype).name} values, whose walk has no headroom")
-    if hooks.drop is not None and not drops_in_place(dtype, hooks.drop.reach):
-        # Dropped weights past the dtype's largest binade would take scaled parts (the forward's in its sums'
-        # units, `algebra.kept_parts`; the backward's for dV's product), which its sums in place do not take
-        # back (`mosaic.unscaled_part`).
-        return Refusal('dropout_rate', f"the Mosaic dropping walk takes {jnp.dtype(dtype).name} weights "
-                       f"within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
+    if backward and hooks.drop is not None and not drops_in_place(dtype, hooks.drop.reach):
+        return Refusal('dropout_rate', f"the Mosaic dropping backward takes {jnp.dtype(dtype).name} "
+                       f"weights within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
                        f"{hooks.drop.rate:g})")
     if jnp.dtype(dtype) not in sixteen:
         return Refusal('dtype', f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}")
@@ -1820,7 +1826,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
                       natural: bool = False, params: tuple = (), width: int | None = None,
                       parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
                       per_span: int = 1, merged: bool = False, started: bool = False,
-                      dropped: bool = False, weight_parts: int = 1) -> int:
+                      dropped: bool = False, weight_parts: int = 1, scaled_products: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -1899,7 +1905,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if scaled:
         step, scaled_terms = _scaled_step(family, step, logits, weights, (block_q, value_width, jnp.float32),
                                           block_k=block_k, parts=parts, dtype=dtype, residuals=residuals)
-    phases = [step]
+    phases = [step + ([(block_q, value_width, jnp.float32)] if scaled_products and not scaled else [])]
     if family.operands_in_registers:
         # Its weights relaid as the values' product's left operand (`MmaIssuer._left`), a copy in each warp
         # along the columns (`Family.lhs_copies`), beside the step's logits, where `_products` holds a
@@ -2072,6 +2078,7 @@ class ForwardRegisters:
     started: bool = False
     dropped: bool = False
     weight_parts: int = 1
+    scaled_products: bool = False
     prologue: tuple | None = None
     """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
     parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
@@ -2094,7 +2101,8 @@ class ForwardRegisters:
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
             scaled=self.scaled, codes=self.codes,
             positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started,
-            dropped=self.dropped, weight_parts=self.weight_parts))
+            dropped=self.dropped, weight_parts=self.weight_parts,
+            scaled_products=self.scaled_products))
 
 
 def value_columns(padded: int, columns: int | None) -> int:
