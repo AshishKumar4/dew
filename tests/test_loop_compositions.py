@@ -31,7 +31,7 @@ COMPOSED = [
                          ids=lambda value: "on" if value else "off")
 def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copies, gated):
     """A bf16 decoder of three layers whose middle one loops `CAP` passes, its features composed: it plans
-    and takes four steps, two microbatches an update, committing two updates (`updates`), each loss finite; it holds
+    and takes four steps, two microbatches an update, committing two (`updates`), each loss finite; it holds
     narrow copies where they are on and none where off; and a drawn pass count steps more than one count,
     each microbatch's loss, with every feature on, that of the program a run fixed at its count compiles
     from the same state (its copies or its weights read whole the same values)."""
