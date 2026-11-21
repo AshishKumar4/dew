@@ -54,7 +54,8 @@ from jax.sharding import PartitionSpec
 from dew.algebra import scaled
 from dew.algebra.scaled import Scaled
 from dew.nn.derivatives import contracted
-from dew.nn.precision import correctly_rounded_divide, two_product, two_sum
+from dew.nn.float_bits import exact_power2
+from dew.nn.precision import correctly_rounded_divide, power2, two_product, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,8 +93,8 @@ _FACTOR_REACH = max(-FLOOR, CEILING) + 1
 places beside it under the construct's 2^24 (`scaled.REACH`)."""
 
 _REACH = 1 << 23
-"""The bound of every exponent a ratio places by (`scaled.scaled_by`): a term's (a factor's and its other
-factors'), and a sum's beneath its largest."""
+"""The bound of every exponent a ratio places by (`dew.nn.precision.power2`): a term's (a factor's and its
+other factors'), and a sum's beneath its largest."""
 
 
 def _laid(array: jax.Array, like: jax.Array) -> jax.Array:
@@ -359,7 +360,7 @@ def _renormalized(high, low, exponent, dtype):
     """A double float `(high, low)` at `exponent` with its high part moved into [1, 2), its low part and its
     exponent by the same power of two (exact)."""
     moved = scaled.scaled(high)
-    return moved.significand, low * scaled.power2(-moved.exponent, dtype), exponent + moved.exponent
+    return moved.significand, low * exact_power2(-moved.exponent, dtype), exponent + moved.exponent
 
 
 _NONE = np.iinfo(np.int32).min // 4
@@ -483,8 +484,8 @@ def _placing(summands, axes, ceiling, carry):
     exponents = [jnp.where(exponent < ceiling, exponent, _NONE) for _, _, exponent in summands]
     moved = jnp.maximum(top, _folded(jnp.maximum, [_halved(jnp.maximum, exponent, axes)
                                                     for exponent in exponents]))
-    magnitude = scaled.scaled_by(magnitude, top - moved, _REACH) + _folded(jnp.add, [
-        _halved(jnp.add, scaled.scaled_by(jnp.abs(high) + jnp.abs(low), exponent - moved, _REACH), axes)
+    magnitude = power2(magnitude, top - moved, reach=_REACH) + _folded(jnp.add, [
+        _halved(jnp.add, power2(jnp.abs(high) + jnp.abs(low), exponent - moved, reach=_REACH), axes)
         for (high, low, _), exponent in zip(summands, exponents, strict=True)])
     return moved, magnitude
 
@@ -503,7 +504,7 @@ def _summing(summands, axes, top, ceiling, form: scaled.Format, carry):
               for each, (_, _, exponent) in zip(present, summands, strict=True)]
 
     def placed(index):
-        return [jnp.where(each, scaled.scaled_by(summand[index], summand[2] - top + placement, _REACH), 0.0)
+        return [jnp.where(each, power2(summand[index], summand[2] - top + placement, reach=_REACH), 0.0)
                 for each, summand in zip(inside, summands, strict=True)]
 
     pairs = [_halved_compensated(each, axes) for each in placed(0)]
@@ -669,7 +670,7 @@ def _joined(a, b):
     a, b = _normal(*a), _normal(*b)
     exponents = [jnp.where(high != 0, exponent, _NONE) for high, _, exponent in (a, b)]
     top = jnp.maximum(*exponents)
-    moved = [(scaled.scaled_by(high, exponent - top, _REACH), scaled.scaled_by(low, exponent - top, _REACH))
+    moved = [(power2(high, exponent - top, reach=_REACH), power2(low, exponent - top, reach=_REACH))
              for (high, low, _), exponent in zip((a, b), exponents, strict=True)]
     high, error = two_sum(moved[0][0], moved[1][0])
     high, low = two_sum(high, error + moved[0][1] + moved[1][1])
@@ -679,7 +680,7 @@ def _joined(a, b):
 def _normal(high, low, exponent):
     """A double float `(high, low)` at `exponent` with its high part moved into [1, 2) (exact)."""
     moved = scaled.scaled(high)
-    return moved.significand, scaled.scaled_by(low, -moved.exponent, _REACH), exponent + moved.exponent
+    return moved.significand, power2(low, -moved.exponent, reach=_REACH), exponent + moved.exponent
 
 
 def _quotient(numerator, denominator):
@@ -821,7 +822,7 @@ def _landed(summed, dtype) -> jax.Array:
     """A ratio's value before it lands (`_ratio_sum`'s) landed once into `dtype`, its residual with it (a
     quotient's `1 / (1 + 2^-24)`, the review's F3), a zero as +0."""
     high, low, exponent = summed
-    landed = scaled.scaled_by(high + low, exponent, _REACH).astype(dtype)
+    landed = power2(high + low, exponent, reach=_REACH).astype(dtype)
     return jnp.where(landed == 0, jnp.zeros_like(landed), landed)
 
 
