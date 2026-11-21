@@ -203,6 +203,12 @@ def pytest_runtest_makereport(item, call):
         report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
                                                       f"computes before its first check-1 site, at {where}: "
                                                       "its run runs it unprepared")
+    elif call.when == "call" and judged_on_zeros(call.excinfo):
+        # A check of what its prepared sites and arms gave, each finished: zeros in a prepare, which judges
+        # nothing (`judged_on_zeros`); its run judges it, as a flow's cell's (`gpu_flow._deferred`).
+        report = outcome.get_result()
+        report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
+                                                      "checked its prepare's zeros: its run judges it")
     # A map task's sites of this test, written as its manifest once its call is done, whatever it ended in
     # (`map_judge.manifested`): its judge judges the test from them. Only a test that loaded the map judge
     # reached a site.
@@ -325,6 +331,22 @@ def pytest_runtest_setup(item):
     # (rows 8310, 8097); its run runs it as any test's.
     if tier_wire.preparing() and (declared := item.get_closest_marker("compiles_at_run")) is not None:
         pytest.skip(f"compiles at run: {declared.kwargs['reason']}")
+
+
+def judged_on_zeros(excinfo) -> bool:
+    """Whether a test's failure (`excinfo`, None where it passed) is a check of what its GPU tier part's
+    prepare gave, in a prepare whose every site and arm the test began finished (`truths_ahead.COMPILED`'s
+    `tried` and `done`): an assertion, its programs all compiled, over the zeros a prepared arm gives in a
+    prepare (`reference_error.ahead_arm`), which judges nothing, its run judging it (rows 10169 on: a cell
+    asserting a product's value failed its file's prepare). A missing program (`truths_ahead.MissingTruth`) is
+    no such check, nor a failure before any site or arm (`pytest_runtest_makereport`'s unprepared)."""
+    if excinfo is None or not tier_wire.preparing() or not excinfo.errisinstance(AssertionError):
+        return False
+    import truths_ahead
+
+    store = truths_ahead.COMPILED.get()
+    return (not excinfo.errisinstance(truths_ahead.MissingTruth) and store is not None and store.prepare
+            and bool(store.tried) and store.tried <= store.done)
 
 
 def _sites_store(item) -> Path | None:

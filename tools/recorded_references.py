@@ -248,10 +248,18 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
 
     recorded, live = _arms_of(label, record, dew, judged=judged, weighed=scale is not None)
     reference, arm = (live, recorded) if judged else (recorded, live)
+
+    def sizing(stage: str):
+        """A line a doubling, flushed: a long recording (a GPU's, chunked) shows how far its sizing is."""
+        def told(count: int, index: int, counts: int) -> None:
+            print(f"{label}: {stage} sizing at {count} seeds ({index} of at most {counts}, from {start})",
+                  flush=True)
+        return told
+
     try:
         confirmed = seeds_for(reference, recorded_draw, label, start=start,
                               truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                              dew_fn=arm, examples=examples)
+                              dew_fn=arm, examples=examples, progress=sizing("its"))
     except Inconclusive:
         # A weighed site whose unweighted sizing never resolves declares the cap (docs/design/testing.md).
         if scale is None:
@@ -265,7 +273,7 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     if scaled is not None:
         weighed = seeds_for(recorded, recorded_draw, label, start=start,
                             truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                            dew_fn=live, conditioning=True,
+                            dew_fn=live, conditioning=True, progress=sizing("its weighed"),
                             conditioning_scale=lambda inputs, seed: scaled(int(inputs[0])))
         # The weighed check draws its own stages' seeds from the first, as the unweighted check does.
         kept = max(kept, staged_units(weighed))

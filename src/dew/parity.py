@@ -1865,13 +1865,20 @@ def judge(draw, seeds: int, label: str, *, examples: bool = False,
         raise Inconclusive(unresolved)
 
 
+Sized = Callable[[int, int, int], None]
+"""A sizing's progress (`_sized_count`'s `progress`): told each count it draws for, before it draws, with
+that count's place among the counts it may try and their number (its doublings from its start to `most`)."""
+
+
 def seeds_for(draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
-              examples: bool = False, conditioning: Conditioning | None = None) -> int:
+              examples: bool = False, conditioning: Conditioning | None = None,
+              progress: Sized | None = None) -> int:
     """The seeds `judge` declares over `draw`: ours paired with the reference on sizing seeds from
-    SIZING_FROM on, which no verdict draws (`_sized_count`), weighed as `judge` is with `conditioning`."""
+    SIZING_FROM on, which no verdict draws (`_sized_count`, told its `progress`), weighed as `judge` is with
+    `conditioning`."""
     drawn = _drawn_over(draw, examples, conditioning)
     return _sized_count(lambda first, stop: drawn(SIZING_FROM + first, SIZING_FROM + stop), label,
-                        start=start, most=most, paired=True)
+                        start=start, most=most, paired=True, progress=progress)
 
 
 def _leaf_examples(examples: list, start: int, count: int, index: int) -> list[np.ndarray] | None:
@@ -1940,22 +1947,30 @@ def _unresolved(label: str, measure: float, message: str) -> Inconclusive:
     return Inconclusive([Finding(label, "inconclusive", measure, message)])
 
 
-def _sized_count(drawn, label: str, *, start: int, most: int, paired: bool) -> int:
+def _sized_count(drawn, label: str, *, start: int, most: int, paired: bool, progress: Sized | None = None
+                 ) -> int:
     """`seeds_for`'s count over `drawn(start, stop)`, the draws of sizing seeds start to stop (`_Draws`):
     doubling from `start`, the first whose draws resolve every leaf on its own block and the next
     (`_confirmed`), paired (Dew's errors against the reference's) or the reference compared with itself
     (each block twice the count); where paired, the leaves the pooled ratio leaves unresolved within `most`
-    sized by their typical draw on the draws held. Fails past `most`."""
+    sized by their typical draw on the draws held. Fails past `most`. `progress`, where given, is told each
+    count before its draws are drawn (`Sized`): a long sizing, a recording's, shows how far it is."""
     count = max(start, FEWEST_SEEDS)
     if count > most:
         raise AssertionError(f"{label}: sizing starts at {count} seeds, past the {most} it may take; "
                              f"give the site more pilots or start lower")
+    counts = (most // count).bit_length()
+
+    def told(at: int) -> None:
+        if progress is not None:
+            progress(at, (at // max(start, FEWEST_SEEDS)).bit_length(), counts)
 
     def through(count: int) -> int:
         """The sizing seeds a count's draws run to: its block and the confirming one, each twice the count
         for the reference compared with itself."""
         return 2 * (count if paired else 2 * count)
 
+    told(count)
     held = drawn(0, through(count))
     while True:
         wide = _confirmed(held.names, held.theirs, count, held.mine if paired else None)
@@ -1964,6 +1979,7 @@ def _sized_count(drawn, label: str, *, start: int, most: int, paired: bool) -> i
         count *= 2
         if count > most:
             break
+        told(count)
         held = held.joined(drawn(len(held.theirs), through(count)))
     if paired:
         # The leaves the pooled ratio does not size within `most`, its draws ruled by their largest (each arm

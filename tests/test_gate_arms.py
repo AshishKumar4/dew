@@ -319,6 +319,36 @@ def test_a_gpu_parts_prepare_skips_what_its_run_skips_by_backend(monkeypatch):
     conftest.pytest_runtest_setup(_Marked())
 
 
+def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch):
+    """In a GPU tier part's prepare, an assertion a test makes once every site and arm it began finished
+    checks the zeros its prepared arms gave (`reference_error.ahead_arm`), which judge nothing: its prepare
+    passes it to its run (tests/conftest.py's `judged_on_zeros`; rows 10169 on: a cell asserting a product's
+    value failed its file's prepare). A missing program is no such check, nor is a failure whose arm did not
+    finish, nor one outside a prepare."""
+    import types
+
+    import conftest
+    import tier_wire
+    import truths_ahead
+
+    with pytest.raises(AssertionError) as checked:
+        raise AssertionError
+    with pytest.raises(truths_ahead.MissingTruth) as missing:
+        raise truths_ahead.MissingTruth
+    store = types.SimpleNamespace(prepare=True, tried={"an arm"}, done={"an arm"})
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    token = truths_ahead.COMPILED.set(store)
+    try:
+        assert conftest.judged_on_zeros(checked)
+        assert not conftest.judged_on_zeros(missing)
+        store.done = set()
+        assert not conftest.judged_on_zeros(checked)
+    finally:
+        truths_ahead.COMPILED.reset(token)
+    monkeypatch.delenv(tier_wire.PREPARE)
+    assert not conftest.judged_on_zeros(checked)
+
+
 def test_a_gpu_parts_prepare_skips_a_test_declared_to_compile_at_run(monkeypatch):
     """A behavioral GPU test with no check-1 site that declares its programs compiled at its run
     (`compiles_at_run`) is skipped by its part's prepare, which has nothing of it to compile ahead, and run
