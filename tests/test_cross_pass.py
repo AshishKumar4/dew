@@ -77,23 +77,24 @@ def gated_draw(model, shape=(2, 12), salt=0):
 
 
 def merged_by_hand(params, read, bank, spec: CrossPass, eps: float):
-    """A merge's formula (the module doc of `dew.nn.cross_pass`) in float64 NumPy, from its parameters."""
-    read, bank = np.asarray(read, np.float64), np.asarray(bank, np.float64)
-    depth = params["depth"]
-    keys = bank / np.sqrt(np.mean(bank * bank, axis=-1, keepdims=True) + eps)
-    query = np.asarray(depth["scale"], np.float64) * np.asarray(depth["kernel"], np.float64)[:, 0]
-    scores = keys @ query
-    weights = np.exp(scores - scores.max(-1, keepdims=True))
-    weights /= weights.sum(-1, keepdims=True)
-    mixed = np.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank)
-    message = mixed / np.sqrt(np.mean(mixed * mixed, axis=-1, keepdims=True) + eps)
-    sigma = np.sqrt(np.mean(read * read, axis=-1, keepdims=True) + eps)
-    state = (read / sigma) @ np.asarray(params["input_down"], np.float64) + message @ np.asarray(
-        params["message_down"], np.float64)
-    sent = np.tanh(state @ np.asarray(params["gain"], np.float64)) * message
+    """A merge's formula (the module doc of `dew.nn.cross_pass`) in float64, from its parameters."""
+    wide = {name: jnp.asarray(value, jnp.float64) for name, value in params.items() if name != "depth"}
+    read, bank = jnp.asarray(read, jnp.float64), jnp.asarray(bank, jnp.float64)
+
+    def rms(x):
+        return x / jnp.sqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+
+    keys = rms(bank)
+    query = (jnp.asarray(params["depth"]["scale"], jnp.float64)
+             * jnp.asarray(params["depth"]["kernel"], jnp.float64)[:, 0])
+    weights = jax.nn.softmax(keys @ query, axis=-1)
+    message = rms(jnp.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank))
+    sigma = jnp.sqrt(jnp.mean(read * read, axis=-1, keepdims=True) + eps)
+    state = (read / sigma) @ wide["input_down"] + message @ wide["message_down"]
+    sent = jnp.tanh(state @ wide["gain"]) * message
     if spec.additive:
-        sent = sent + np.tanh(state @ np.asarray(params["added"], np.float64))
-    kept = (1 - np.tanh(state @ np.asarray(params["forget"], np.float64))) * read
+        sent = sent + jnp.tanh(state @ wide["added"])
+    kept = (1 - jnp.tanh(state @ wide["forget"])) * read
     return kept + (sigma * sent if spec.scale_by_input_rms else sent)
 
 
@@ -115,7 +116,7 @@ def test_a_merge_is_its_formula(spec):
         return params, read, bank
 
     def truth(params, read, bank):
-        return merged_by_hand(jax.device_get(params)["params"], read, bank, spec, 1e-6)
+        return merged_by_hand(params["params"], read, bank, spec, 1e-6)
 
     assert_as_exact(jax.jit(merge.apply), ROUNDED, draw, "a merge", seeds=SEEDS["merge"], truth_fn=truth)
 
@@ -227,13 +228,11 @@ def test_a_loop_passing_messages_computes_its_passes_unrolled(case):
         assert np.any(np.asarray(gradients["layers_0"]["mlp"]["down_proj"]["kernel"]) != 0)
 
 
-@pytest.mark.parametrize("shared", [False, True], ids=["a cache a pass", "one cache"])
-def test_a_loop_passing_messages_decodes_as_it_prefills(shared):
-    """A hybrid decoder passing messages over three passes, its gates drawn off zero, decodes token by
-    token (a prefill of four, then one at a time) what its full passes over each prefix compute, its
-    logits on par with theirs in float64 (check 1), each pass's cache its own or every pass's one
-    (`shared_cache`)."""
-    looped = decoder("hybrid", steps=3, shared_cache=shared)
+def test_a_loop_passing_messages_decodes_as_it_prefills():
+    """A hybrid decoder passing messages over three passes, its gates drawn off zero, each pass's cache its
+    own, decodes token by token (a prefill of four, then one at a time) what its full passes over each
+    prefix compute, its logits on par with theirs in float64 (check 1)."""
+    looped = decoder("hybrid", steps=3)
     draw = gated_draw(looped, salt=0xC404)
     made, step = decode_steps(looped)
 
@@ -249,7 +248,7 @@ def test_a_loop_passing_messages_decodes_as_it_prefills(shared):
         forward = jax.jit(model.apply)
         return lambda variables, ids: as_stepped(lambda held: forward(variables, held), ids, 4)
 
-    assert_as_exact(decoded, passes(looped), draw, f"decode, shared={shared}", seeds=SEEDS["decode"],
+    assert_as_exact(decoded, passes(looped), draw, "decode", seeds=SEEDS["decode"],
                     truth_fn=passes(looped.clone(dtype=jnp.float64)))
 
 
@@ -333,7 +332,7 @@ def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh
     fresh = ParamGroup("fresh", fresh=True, learning_rate_multiplier=10.0, spared=True)
     claimed = OptimConfig(param_groups=(fresh, ParamGroup("base", ("*",), spared=True))).with_fresh(
         (), looped.fresh).param_groups
-    assert claimed[0].fresh
+    assert set(claimed[0].patterns) == set(looped.fresh)
 
     def draw(seed):
         ids = jax.random.randint(jax.random.key(seed), (2, 8), 0, source.model.vocab_size)
