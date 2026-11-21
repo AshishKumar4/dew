@@ -264,7 +264,15 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     # count, its issuer's rows at least, where no tile of them all holds (a 48-row training walk's scaled op
     # on mma.sync held 278 registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`,
     # et-sm86scaled). The first that holds is the config: legality steps down, nothing is ranked (design §7).
-    heights = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
+    if not family.budgets_registers and rows is None:
+        # TPU has no per-thread register cap: widen held rows up to copy_extent (512 fwd, 256 bwd) to
+        # cut K/V HBM reads 4x and match Splash's 512x512 tiling within v5e's 16 MiB VMEM (row 10152).
+        cap = family.copy_extent or (4 * unit)
+        tpu_top = cap if overlapped else min(cap, 2 * unit)
+        heights = [h for h in (4 * unit, 2 * unit)
+                   if h <= tpu_top and padded(h, 1) - padded(unit, 1) <= held // 8]
+    else:
+        heights = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
     heights.append(unit)
     fewer = range(unit - family.rows, 0, -family.rows) if rows is None and few_rows(family, held) else ()
     order = ((unit, [count for count in counts(unit) if count > 1]), *((height, [1]) for height in heights),
