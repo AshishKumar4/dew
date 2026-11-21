@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import raw_leaf
 from scipy import integrate, optimize, special, stats
 from test_pass_weights import looped, phased_trainer
 
@@ -181,11 +182,6 @@ def token_batch(seed: int = 2) -> dict:
     return {"text": jnp.asarray(token_draw(seed))}
 
 
-def held(leaf):
-    """A state's leaf as its bits compare: a key's words (`jax.random.key_data`), any other leaf itself."""
-    return jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf
-
-
 def words(key) -> tuple[int, ...]:
     """A key's words, as a draw reads them."""
     return tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
@@ -226,7 +222,7 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
         np.testing.assert_array_equal(np.asarray(loss), np.asarray(own_loss), err_msg=f"microbatch {index}")
         for name, value in jax.device_get(metrics).items():
             np.testing.assert_array_equal(value, jax.device_get(own_metrics)[name], err_msg=f"{index} {name}")
-        ours, theirs = (jax.tree_util.tree_flatten_with_path(jax.device_get(jax.tree.map(held, tree)))[0]
+        ours, theirs = (jax.tree_util.tree_flatten_with_path(jax.device_get(jax.tree.map(raw_leaf, tree)))[0]
                         for tree in (state, own))
         unlike = [jax.tree_util.keystr(path) for (path, a), (_, b) in zip(ours, theirs, strict=True)
                   if not np.array_equal(a, b)]
