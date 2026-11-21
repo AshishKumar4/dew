@@ -65,11 +65,8 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     NATURAL_NAME,
     SplitOutput,
     _codes_of,
-    _copy_costs_more,
     _forward_allocations,
-    _inference_walk,
-    _plain_forward,
-    _trained_forward,
+    _plain_walk,
     _training_walk,
     certified_walk,
     column_slices,
@@ -629,31 +626,35 @@ class MosaicForward(_Mainloop[Tiles]):
         scaled = (self.scaled or (self.cached(table, sources, scales) and not self.bounded)) and not decides
         return hooks, spans, decides, family, products, form, scaled
 
-    def _main_launch(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params,
-                     initial, drop=None, table=None, sources=None, scales=None, query_params=(), *,
-                     residuals: Kept, interpret: bool, config: Tiles, pricing: bool = False):
-        """The main forward launch at `config` without its guarded rewalk (`_inference_walk` /
-        `_training_walk`): traced by `_price_config` through `tuning.lowered_once` so the winning count's
-        trace is held and reused by `_fwd`."""
-        hooks, spans, decides, family, products, form, scaled = self._walk_setup(
-            query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial, drop,
-            table, sources, scales, query_params, residuals=residuals, interpret=interpret, config=config,
-            pricing=pricing)
+    def _walk_dispatch(self, query, key, value, spans, hooks, *, residuals: Kept, family, products, form,
+                       scaled: bool, decides: bool, table, sources, scales):
+        """Single residual-dispatch owner returning `(spec, launch, finished, in_place)` for both
+        `_main_launch` and `_fwd` (row 10677)."""
         match residuals:
             case Kept.SPLIT:
                 if scales is not None:
                     raise NotImplementedError("a quantized cache's keys are read by inference alone")
-                spec, launch, _ = _training_walk(query, key, value, spans, hooks, scaled=scaled, **form)
+                spec, launch, finished = _training_walk(query, key, value, spans, hooks, scaled=scaled, **form)
+                return spec, launch, finished, False
             case Kept.NONE | Kept.OUTPUT:
-                in_key = self.reads_key_slot(family)
-                in_place = family.rewalks and not in_key and (
-                    self.masked or (hooks.output_mod is None and _copy_costs_more(query, value)))
-                spec, launch, _ = _inference_walk(
-                    query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
-                    out_dtype=self.out_dtype, masked=self.masked, splits=self.splits, table=table,
-                    sources=sources, subtracted=self.subtracted, scales=scales, parts=self.parts,
-                    scaled=scaled, decides=decides, in_key=in_key, products=products, flagged=in_place,
-                    **form)
+                return _plain_walk(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
+                                   out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
+                                   table=table, sources=sources, subtracted=self.subtracted, scales=scales,
+                                   parts=self.parts, scaled=scaled, decides=decides,
+                                   in_key=self.reads_key_slot(family), products=products, **form)
+
+    def _main_launch(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params,
+                     initial, drop=None, table=None, sources=None, scales=None, query_params=(), *,
+                     residuals: Kept, interpret: bool, config: Tiles, pricing: bool = False):
+        """The main forward launch at `config` without its guarded rewalk (`_walk_dispatch`): traced by
+        `_price_config` through `tuning.lowered_once` so the winning count's trace is held and reused."""
+        hooks, spans, decides, family, products, form, scaled = self._walk_setup(
+            query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial, drop,
+            table, sources, scales, query_params, residuals=residuals, interpret=interpret, config=config,
+            pricing=pricing)
+        spec, launch, _, _ = self._walk_dispatch(query, key, value, spans, hooks, residuals=residuals,
+                                                 family=family, products=products, form=form, scaled=scaled,
+                                                 decides=decides, table=table, sources=sources, scales=scales)
         return launch(spec, None)
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
@@ -668,18 +669,10 @@ class MosaicForward(_Mainloop[Tiles]):
             raise NotImplementedError(reason)
 
         def launched():
-            match residuals:
-                case Kept.SPLIT:
-                    if scales is not None:
-                        raise NotImplementedError("a quantized cache's keys are read by inference alone")
-                    return _trained_forward(query, key, value, spans, hooks, scaled=scaled, **form)
-                case Kept.NONE | Kept.OUTPUT:
-                    # The inference walk, its rows beside the output where it keeps them.
-                    return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
-                                          out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
-                                          table=table, sources=sources, subtracted=self.subtracted,
-                                          scales=scales, parts=self.parts, scaled=scaled, decides=decides,
-                                          in_key=self.reads_key_slot(family), products=products, **form)
+            spec, launch, finished, in_place = self._walk_dispatch(
+                query, key, value, spans, hooks, residuals=residuals, family=family, products=products,
+                form=form, scaled=scaled, decides=decides, table=table, sources=sources, scales=scales)
+            return finished(algebra.walked_launches(spec, launch, in_place=in_place))
 
         if scaled or decides or self.bounded or hooks.rounds is not None or not algebra.headroom(value.dtype):
             return launched(), None

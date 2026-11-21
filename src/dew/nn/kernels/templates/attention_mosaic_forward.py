@@ -323,12 +323,10 @@ def relays(family: mosaic.Family, tiles: Tiles, *, peaks: bool = False) -> bool:
     return not peaks and family.relay_bytes(tiles.block_q, tiles.block_k) > 0
 
 
-def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                   masked: bool = False, **walk):
-    """`MosaicForward`'s launch without residuals (`_inference_walk`), its launches walked by the fold's guard
-    (`algebra.walked_launches`): a `masked` walk's rewalk in place (its launch's programs that walk
-    nothing write nothing, so it declares no output of its own), which takes no output hook, whose rows XLA
-    forms past the launch from its whole output."""
+def _plain_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                masked: bool = False, **walk):
+    """Return `(spec, launch, finished, in_place)` for an inference forward walk (`_inference_walk`), the one
+    owner of the `in_place` rewalk rule shared by `_plain_forward`, `_fwd`, and `_main_launch` (row 10677)."""
     if masked and hooks.output_mod is not None:
         raise ValueError("a masked walk rewalks in place, which an output hook formed past its launch does "
                          "not take")
@@ -340,6 +338,13 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         masked or (hooks.output_mod is None and _copy_costs_more(query, value)))
     spec, launch, finished = _inference_walk(query, key, value, spans, hooks, masked=masked, flagged=in_place,
                                              **walk)
+    return spec, launch, finished, in_place
+
+
+def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                   masked: bool = False, **walk):
+    """`MosaicForward`'s launch without residuals (`_plain_walk`), walked by the fold's guard."""
+    spec, launch, finished, in_place = _plain_walk(query, key, value, spans, hooks, masked=masked, **walk)
     return finished(algebra.walked_launches(spec, launch, in_place=in_place))
 
 

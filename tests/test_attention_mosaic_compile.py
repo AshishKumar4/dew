@@ -1711,3 +1711,27 @@ def test_forward_pricing_aligns_with_m_fs_15_sm90_and_sm80_receipts():
             lambda cfg: cfg.block_k <= 64, overlapped=True,
             walks=attention_mosaic_program.walked_extents, choose=choose, residency=fake_res)
         assert seen and any(c.block_k == 64 for c in seen[0]) and any(c.block_k == 32 for c in seen[0]), seen
+
+
+@COMPILES_ON_CPU
+def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
+    """Row 10682: fused dK/dV at width 64 derives and compiles spill-free on sm80 and sm100."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    spans = template.spans(512, 512, 1, causal=True)
+    for gen in ("sm80", "sm100"):
+        with generation.assumed(gen):
+            target = generation.gpu_target()
+            q = jax.ShapeDtypeStruct((1, 512, 4, 64), jnp.bfloat16)
+            m = jax.ShapeDtypeStruct((1, 4, 512), jnp.float32)
+            op, args = attention_mosaic._backward_call(q, q, q, q, spans, None, scale=None,
+                                                       natural=attention_mosaic.NATURAL,
+                                                       residuals=(q, m, m))
+            ba = op.bind(*args, interpret=False)
+            cfg = op.derived(ba, target)
+            assert cfg is not None and cfg.fused, (gen, cfg)
+            found = compile_mosaic_kernels([
+                KernelCase(f"{gen}-fused-d64", lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)),
+            ], gen)
+            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
