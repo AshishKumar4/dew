@@ -408,9 +408,17 @@ def described(root: str, event: str | None = None, args: tuple = (), starting=No
     return one_line(said)
 
 
+def noted(writing: Callable[[], None]) -> None:
+    """A reason written (`writing`), evidence only: its failure fails nothing, its start's marker written."""
+    try:
+        writing()
+    except Exception:  # noqa: BLE001, S110 - evidence only
+        pass
+
+
 def one_line(said: str) -> str:
-    """A reason as a log line holds it: one line, any text escaped, at most 240 characters."""
-    return " ".join(said.encode("utf-8", "backslashreplace").decode().split())[:240]
+    """A reason as a log line holds it: one line, ASCII, anything else escaped, at most 240 characters."""
+    return " ".join(said.encode("ascii", "backslashreplace").decode("ascii").split())[:240]
 
 
 def _recorders_or_process_modules(filename: str) -> bool:
@@ -636,7 +644,7 @@ def follow() -> None:
                 log.write(f"start\t{kind}\n")
             elif kind == "unfollowed":
                 write("unfollowed", 1)
-                write("why", described(root, event, args))
+                noted(lambda: write("why", described(root, event, args)))
 
     def closing() -> None:
         write("ended", time.time())
@@ -646,7 +654,8 @@ def follow() -> None:
     atexit.register(closing)
     if holder is not None:
         write("unfollowed", 1)
-        write("why", one_line(f"its recorder's monitoring tool {FOLLOWER_TOOL} held by {holder}"))
+        held_by = f"its recorder's monitoring tool {FOLLOWER_TOOL} held by {holder}"
+        noted(lambda: write("why", one_line(held_by)))
         return
     sys.meta_path.insert(0, imports(lambda item: write("file", item)))
     sys.meta_path.append(missed(lambda item: write("file", item), root))
