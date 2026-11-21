@@ -130,13 +130,13 @@ def test_finite_predictions_guide_finitely(guidance, conditional, unconditional,
     np.testing.assert_array_equal(clean, np.full(clean.shape, guided, clean.dtype))
 
 
-def apg_flushes_a_lane_scaled_below_the_least_normal():
+def apg_keeps_a_lane_scaled_below_the_least_normal():
     """APG at a scale of 2, eta 0 and no clipping over a conditional `[2^120, 0]` and an unconditional `[0,
-    -2^-7]`: its direction `[2^120, 2^-7]` scaled by its row's power of two puts its second lane at
-    2^-128, below float32's least normal, which the projection flushes to zero of its sign on every device
-    (`precision.power2`'s flushing), so its orthogonal component there is zero and the guided row `[0,
-    -2^-7]`, where `jnp.ldexp` flushed it on a CPU and a GPU kept it, `+2^-7` there (row 9710). Compiled
-    as one program (`ahead_arm`), a GPU numerics cell too (tests/test_gpu_numerics.py)."""
+    -2^-7]`: its direction `[2^120, 2^-7]` has the orthogonal component `[0, 2^-7]`, so the guided row is
+    `[0, 2^-7]`, exactly (Diffusers' float64 projection rounds to it), on every device, where the
+    direction's row scaling put that lane at 2^-128, below float32's least normal, which a CPU flushed and
+    a GPU kept, guiding `-2^-7` on the one and `+2^-7` on the other (row 9710). Compiled as one program
+    (`ahead_arm`), a GPU numerics cell too (tests/test_gpu_numerics.py)."""
     from reference_error import ahead_arm
 
     process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
@@ -151,13 +151,13 @@ def apg_flushes_a_lane_scaled_below_the_least_normal():
 
     found = np.asarray(ahead_arm(jax.jit(guided), "APG over a lane scaled below the least normal")(
         np.asarray([[2.0 ** 120, 0.0]], np.float32), np.asarray([[0.0, -2.0 ** -7]], np.float32)))
-    np.testing.assert_array_equal(found.view(np.uint32), np.asarray([[0.0, -2.0 ** -7]], np.float32).view(
+    np.testing.assert_array_equal(found.view(np.uint32), np.asarray([[0.0, 2.0 ** -7]], np.float32).view(
         np.uint32))
 
 
-def test_apg_flushes_a_lane_scaled_below_the_least_normal():
-    """`apg_flushes_a_lane_scaled_below_the_least_normal` on the CPU."""
-    apg_flushes_a_lane_scaled_below_the_least_normal()
+def test_apg_keeps_a_lane_scaled_below_the_least_normal():
+    """`apg_keeps_a_lane_scaled_below_the_least_normal` on the CPU."""
+    apg_keeps_a_lane_scaled_below_the_least_normal()
 
 
 def test_apg_momentum_carries_a_direction_past_half_precision():
