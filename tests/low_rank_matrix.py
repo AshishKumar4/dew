@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import drawn_on_the_host
 from flax import linen as nn
 from gpu_flow import cell
 from jax.sharding import Mesh
@@ -151,12 +152,9 @@ def an_adapted_projections_training_step_is_on_par(case: tuple[str, ...]) -> Non
     on par with them apart (check 1): the output and the gradients of the factors and the input, from the
     projection in float64. The routes it records run `low_rank` `fused` and every other choice at XLA."""
     combination = dict(zip(AXES["low_rank"], case, strict=True))
-    # Its frozen base formed on the host's CPU and held as NumPy's, as a site's draws are
-    # (`arm_arithmetic.drawn_on_the_host`): a GPU tier's prepare computes on no other device (its default a
-    # compile-only GPU's, row 8022).
-    with jax.default_device(jax.devices("cpu")[0]):
-        model, variables = _adapted(combination)
-    variables = jax.device_get(variables)
+    # Its frozen base formed on the host's CPU and held as NumPy's: a GPU tier's prepare computes on no other
+    # device (its default a compile-only GPU's, row 8022).
+    model, variables = drawn_on_the_host(_adapted, combination, held=True)
     truth = _truth(combination, variables)
     draw = _drawn(combination, variables)
     with generation.routes() as routes:

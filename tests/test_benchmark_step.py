@@ -401,3 +401,20 @@ def test_a_window_reads_invalid_where_any_of_its_steps_went_non_finite_not_only_
     assert compiled.nonfinite() == 2
     compiled.taken.append((jnp.float32(0.4), jnp.asarray(1, dtype=bool)))
     assert compiled.nonfinite() == 0
+
+
+def test_a_benchmarks_rows_reach_a_tracker_after_its_cases_one_step_a_case(tmp_path):
+    """`--tracked` logs each case's row, its numbers by its architecture, into a tracker once every case is
+    measured, one step a case in order: an operational run's MFU and step time where a training run's land
+    (row 285); a row's text and flags are no metric."""
+    from dew.training.tracker import LocalTracker
+
+    step = load("benchmark_step")
+    rows = [{"architecture": "simple_dit", "ms_per_step": 12.5, "mfu": 0.31, "device_kind": "cpu",
+             "fixed_batch": False},
+            {"architecture": "unet", "ms_per_step": 30.0, "mfu": None, "devices": 1}]
+    step.tracked(rows, LocalTracker(tmp_path))
+    logged = [json.loads(line) for line in (tmp_path / "scalars.jsonl").read_text().splitlines()]
+    assert [(entry["step"], entry["scalars"]) for entry in logged] == [
+        (0, {"simple_dit/ms_per_step": 12.5, "simple_dit/mfu": 0.31}),
+        (1, {"unet/ms_per_step": 30.0, "unet/devices": 1.0})]

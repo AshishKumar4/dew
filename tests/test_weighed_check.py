@@ -19,6 +19,9 @@ from rounding_bound import rounding_scale
 
 from dew import parity
 
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
+
 ROWS, HALF = 1, 16
 
 WEIGHED_SEEDS = 8

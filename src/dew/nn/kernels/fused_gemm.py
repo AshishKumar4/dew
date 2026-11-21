@@ -249,7 +249,7 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     if rates.tensor is None:
         return None, None
     product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands,
-                                        precision=region.precision)
+                                        precision=region.precision, on=target)
     operands = region.operand_bytes
     written = region.rows * region.width * jnp.dtype(region.result).itemsize
     launch = target.launch_seconds or 0.0

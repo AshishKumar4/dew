@@ -78,8 +78,8 @@ def builds_sentence(project: dict) -> list[str]:
         f"jax-cuda{cuda}-{part}" for cuda in (12, 13) for part in ("plugin", "pjrt"))).rpartition(".")[2]
     compiling = agreed(optional["kernel-compile"],
                        ("jax-cuda12-plugin", "jax-cuda12-pjrt")).rpartition(".")[2]
-    dews = pinned([each for each in dependencies if "sys_platform == 'linux'" in each], "jaxlib")
-    stock = pinned([each for each in dependencies if "sys_platform != 'linux'" in each], "jaxlib")
+    dews = agreed([each for each in dependencies if "sys_platform == 'linux'" in each], ("jaxlib",))
+    stock = agreed([each for each in dependencies if "sys_platform != 'linux'" in each], ("jaxlib",))
     libtpu = agreed(optional["tpu"], ("libtpu",)).removesuffix(".*")
     return [f"Dew's CUDA and PJRT plugins are {plugins}'s on x86_64 and aarch64 (a GH200's Grace) alike, "
             f"and the `kernel-compile` extra's (x86_64 only) are {compiling}'s. On Linux x86_64 and aarch64 "

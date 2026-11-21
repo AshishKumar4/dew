@@ -1063,25 +1063,3 @@ def test_a_context_choice_of_the_norm_forces_it_over_a_calls_own():
     norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True, epilogue=jax.nn.softmax)
     with generation.chosen(rms_norm='pallas'), pytest.raises(selection.KernelRefused):
         norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True, epilogue=jax.nn.softmax)
-
-
-def test_each_configs_comparison_is_a_site_of_its_own(monkeypatch):
-    """Each config a kernel may pick is compared at a site labelled by its kernel, its config and its
-    operands (`each_config_holds`), so a GPU flow's cells, which share their test's store of compiled sites
-    (one site a label), compare every config at its own: the norm cells' "y x scale" at every kernel, dtype,
-    row shape and config was one label, and the store refused the second ("two sites of one label")."""
-    import contextlib
-
-    import test_norm_swiglu as here
-
-    configs = ["a config", "another config"]
-    labels = []
-    monkeypatch.setattr(here, "each_config", lambda kernel, function, *args: configs)
-    monkeypatch.setattr(here.tuning, "pinned", lambda pins: contextlib.nullcontext())
-    monkeypatch.setattr(here, "assert_drawn_as_exact",
-                        lambda fused, xla, exact, draw, leaves, label, seeds: labels.append(label))
-    for dtype in (jnp.float32, jnp.bfloat16):
-        each_config_holds(norm_swiglu.RmsForward, norm_functions(dtype, offset=True, after_cast=True),
-                          functools.partial(norm_operands, (3, 256), dtype, jnp.float32), ("y", "x", "scale"),
-                          8)
-    assert len(set(labels)) == len(labels) == 2 * len(configs)

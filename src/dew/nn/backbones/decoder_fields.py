@@ -22,6 +22,7 @@ from ..rope import rope_scaling_from_record
 from .decoder_block import remat_policy
 
 if TYPE_CHECKING:
+    from ..cross_pass import CrossPass
     from .causal_transformer import CausalTransformer
     from .layer_plan import ResolvedKind
 
@@ -153,6 +154,37 @@ def _ngpt(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
             raise ValueError(f"nGPT's gains and unit norms are the attention's and the dense gated "
                              f"feed-forward's; {layer_type!r} runs {mixer!r}")
 
+def _messaged_blocks(model: CausalTransformer, kinds: Mapping[str, ResolvedKind],
+                     messages: CrossPass) -> None:
+    """Refuse a loop passing messages (`Loop.messages`) where its blocks' summaries are not one stream's:
+    hyper-connections and AltUp carry several, a provider's store would break at a block's end, and under
+    attention residuals a block's summary is the depth state's partial sum, whole only where the message
+    blocks are the depth blocks."""
+    if model.hyper_connections is not None or model.altup is not None:
+        raise ValueError("a loop passing messages summarizes each block by its one residual stream, and "
+                         "hyper-connections and AltUp carry several")
+    publishing = [layer_type for layer_type, kind in sorted(kinds.items())
+                  if (mixer := kind.mixer or model.layer_mixer) is not None
+                  and mixer.publishes(kv_shared=False)]
+    if model.sharing_layers or publishing:
+        raise ValueError("a loop passing messages runs its block's layers a message block at a time, and a "
+                         "layer leaving keys, values or publications for a later one would leave them across "
+                         "a block's end: kv_shared_layers and publishing mixers take no messages")
+    residuals, loop = model.attention_residuals, model.loop
+    assert loop is not None
+    if residuals is not None and loop.exiting:
+        raise ValueError("under attention residuals a pass's state is the depth state, which only the last "
+                         "pass collapses through the output site: a loop passing messages over them exits at "
+                         "its last pass alone (no exit gate or exits)")
+    first, _ = loop.layers or (0, model.num_layers)
+    if residuals is not None and (first % residuals.block_size
+                                  or messages.block_size != residuals.block_size):
+        raise ValueError(f"under attention residuals a message block's summary is its depth block's partial "
+                         f"sum, so the message blocks are the depth blocks: block_size "
+                         f"{residuals.block_size} from a layer they open, got block_size "
+                         f"{messages.block_size} from layer {first}")
+
+
 def _ranged_streams(model: CausalTransformer):
     """Streams over a range of layers (`HyperConnections.hc_layers`) lie inside the stack. V4's depths
     read the streams the trunk ends with (`streams_end_stack`), which a range ending before the trunk's
@@ -201,11 +233,17 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
             raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
     _kinds(model, kinds)
     _ranged_streams(model)
+    messages = None if model.loop is None else model.loop.messages
     carried = [name for name in ("altup", "hyper_connections", "attention_residuals", "dspark")
-               if getattr(model, name) is not None and not _plain_between_passes(model, name)]
+               if getattr(model, name) is not None and not _plain_between_passes(model, name)
+               # A loop passing messages enters every pass at the block's input, so its passes refill the
+               # depth state's slots alike (`_messaged_blocks`).
+               and not (messages is not None and name == "attention_residuals")]
     if model.loop is not None and carried:
         raise ValueError(f"a loop norms the one residual between its passes, and {carried} carry "
                          "others beside it; a model with them runs its stack once (loop=None)")
+    if messages is not None:
+        _messaged_blocks(model, kinds, messages)
     if model.loop is not None and model.loop.layers is not None:
         if model.loop.layers[1] > model.num_layers:
             raise ValueError(f"the loop's block {model.loop.layers} ends past layer {model.num_layers}")

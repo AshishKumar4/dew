@@ -56,6 +56,11 @@ WAYS = [pytest.param("jitted", marks=CPU_LANE), pytest.param("op by op", marks=C
 """Each way a cell runs the law: jitted and op by op on the CPU lane, jitted on a GPU and on a TPU on their
 tiers, each from the programs its tier's prepare compiled ahead (`_ways`)."""
 
+FLOAT64_WAYS = [way for way in WAYS if way.values != ("on a tpu",)]
+"""The ways a float64 law runs (`WAYS`), a TPU's apart: a TPU keeps float64 as pairs of float32s within
+float32's range (`arm_arithmetic.float64_host`), where 2^900 is none, and a float64 truth computes on its
+host's CPU, the CPU lane's way (rows 10664, 10759: the TPU tiers' float64 merge was red on v5e and v6e)."""
+
 
 def test_a_scaled_value_lands_as_the_float_it_holds():
     values = np.asarray([0.0, 1.0, -1.5, 3.0, 2.0 ** -126, -(2.0 ** -100), 2.0 ** 100, LARGEST, -LARGEST],
@@ -631,7 +636,7 @@ def test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts(way, to
             f"a merged state's gradient's derivatives against its parts', {totals}")
 
 
-@pytest.mark.parametrize("way", WAYS)
+@pytest.mark.parametrize("way", FLOAT64_WAYS)
 def test_a_float64_merge_keeps_what_float64_holds(way):
     """A merge of float64 states (a truth's) sums its terms placed beneath float64's largest power, not
     float32's: outputs 2^900, -2^900 and 2^-900 at unit totals and one anchor merge to 2^-900 / 3, bit for

@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
+from arm_arithmetic import drawn_on_the_host
 from generation_support import TOPOLOGY, node_target
 from gpu_flow import Cell, run_cells
 from model_support import float64_twin
@@ -381,9 +382,9 @@ def drawn(flow: ModelFlow):
     run's its prepare's (`PARAMS`)."""
     if TRUTHS in os.environ and not preparing():
         return pickle.loads((store_of(flow) / PARAMS).read_bytes())
-    with jax.default_device(jax.devices("cpu")[0]):
-        initialized = jax.jit(flow.model.init)(jax.random.key(5461), *flow.initialized())
-        return jax.device_get(flow.taken(initialized))
+    return drawn_on_the_host(lambda seed: flow.taken(jax.jit(flow.model.init)(jax.random.key(seed),
+                                                                              *flow.initialized())),
+                             5461, held=True)
 
 
 KINDS = Flow.kinds

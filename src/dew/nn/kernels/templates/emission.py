@@ -14,7 +14,7 @@ import dataclasses
 import functools
 import math
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -28,8 +28,10 @@ from jax._src.state import primitives as state, types as state_types
 from jax.experimental import pallas as pl
 
 from dew.nn import derivatives, precision, programs
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import resources
 from dew.nn.kernels.templates.cost import ISSUED_UNITS, Chain, Stated, Work, followed
+from dew.nn.kernels.templates.product import product_mode
 
 
 class Unpriced(ValueError):
@@ -499,14 +501,9 @@ class _Counting:
         if (primitive is lax.select_n_p and programs.integral_scalar(values[0])
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
-        if primitive in _OPERATIONS:
-            self.add(_operated(equation))
-        elif primitive in _REDUCTIONS:
-            self.add(Work(operations=_elements(equation.invars[0].aval)))
-        elif primitive in SPECIAL_FUNCTIONS:
-            self.add(Work(exponentials=sum(_elements(v.aval) for v in equation.outvars)))
-        elif primitive is lax.convert_element_type_p:
-            self.add(Work(conversions=sum(_elements(v.aval) for v in equation.outvars)))
+        if primitive in _ARITHMETIC:
+            self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
+                                    [variable.aval for variable in equation.outvars], params))
         elif primitive in _PRODUCTS:
             self.add(_product(equation))
         elif primitive is gpu.mma_p:
@@ -526,7 +523,12 @@ class _Counting:
             value = params["args_tree"].unflatten([variable.aval for variable in equation.invars])[2]
             self.add(Work(device_bytes=_bytes(value)))
         elif primitive is lax.dot_general_p:
-            # A TPU core's product on its MXU: `2 m n k`, its output's elements over its contracted ones.
+            # A TPU core's product on its MXU: `2 m n k`, its output's elements over its contracted ones,
+            # one pass in its operands' mode. Not `product_mode`'s passes: Mosaic TPU lowers a body's product
+            # at the default precision with no contract precision, its own default, HIGH as `bf16x3` and
+            # HIGHEST as `fp32` (jax/_src/pallas/mosaic/lowering.py, `_dot_general_lowering_rule`, at the
+            # pin), and the passes its default and its fp32 take are unmeasured, where XLA states its own
+            # (`TPU_PASSES`).
             (contracted, _), _ = params["dimension_numbers"]
             lhs = equation.invars[0].aval
             self.add(_tensor(lhs.dtype, 2 * _elements(equation.outvars[0].aval)
@@ -736,15 +738,53 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
     return traced.jaxpr, traced.consts
 
 
-def _operated(equation) -> Work:
-    """An elementwise operation's work, one an output element: on the integer units where its operands are
-    integers or predicates (logic, shifts, integer arithmetic and comparisons: the ALU's LOP3, SHF, IADD3,
-    ISETP and PLOP3, `Work.integer_operations`), else on the fp32 lanes. Its last operand's type is its
-    operands' (a select's arms', its predicate first)."""
-    count = sum(_elements(variable.aval) for variable in equation.outvars)
-    dtype = jnp.dtype(equation.invars[-1].aval.dtype)
+def _operated(primitive, inputs: Sequence, outputs: Sequence) -> Work:
+    """An elementwise operation's work, one an output element, a clamp's two (a maximum and a minimum: no
+    instruction bounds a value on both sides, and every lowering, XLA's, Mosaic GPU's and Triton's, issues
+    both): on the integer units where its operands are integers or predicates (logic, shifts, integer
+    arithmetic and comparisons: the ALU's LOP3, SHF, IADD3, ISETP and PLOP3, `Work.integer_operations`), else
+    on the fp32 lanes. Its last operand's type is its operands' (a select's arms', its predicate first)."""
+    count = sum(_elements(aval) for aval in outputs) * (2 if primitive is lax.clamp_p else 1)
+    dtype = jnp.dtype(inputs[-1].dtype)
     integral = jnp.issubdtype(dtype, jnp.integer) or dtype == jnp.bool_
     return Work(integer_operations=count) if integral else Work(operations=count)
+
+
+_ARITHMETIC = _OPERATIONS | _REDUCTIONS | SPECIAL_FUNCTIONS | {lax.convert_element_type_p}
+"""The primitives a kernel body's count prices by `operation_work`: its elementwise arithmetic, a product
+apart (`_Counting.equation`'s, a TPU core's)."""
+
+
+def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mapping,
+                   target: generation.GpuTarget | None = None) -> Work:
+    """What one equation of `primitive` computes over operands and results of the avals `inputs` and
+    `outputs` (each its shape and dtype), with `params`, on `target` (the process's own, or the one it
+    assumes, where None: `generation.gpu_target`): the one rule the counter prices a kernel body's
+    elementwise arithmetic by (`emitted`) and the algebra a term (`dew.algebra.cost.work`). An elementwise
+    operation's work (`_operated`); a reduction's one operation an input element; a special function's
+    exponentials and a conversion's conversions, one an output element; a product's `2 m n k`, its output's
+    elements over its contracted ones, in the mode and passes XLA multiplies it in on `target`
+    (`product.product_mode`: on a TPU, an fp32 product's bfloat16 passes); what moves and computes nothing
+    nothing (`_FREE`: a layout change, a barrier); any other primitive's output elements unpriced
+    (`Work.unpriced_operations`)."""
+    if primitive in _OPERATIONS:
+        return _operated(primitive, inputs, outputs)
+    if primitive in _REDUCTIONS:
+        return Work(operations=_elements(inputs[0]))
+    if primitive in SPECIAL_FUNCTIONS:
+        return Work(exponentials=sum(_elements(aval) for aval in outputs))
+    if primitive is lax.convert_element_type_p:
+        return Work(conversions=sum(_elements(aval) for aval in outputs))
+    if primitive is lax.dot_general_p:
+        (contracted, _), _ = params["dimension_numbers"]
+        lhs, rhs = inputs[:2]
+        field, passes = product_mode(params.get("precision"), lhs.dtype, rhs.dtype,
+                                     target or generation.gpu_target())
+        flops = 2 * _elements(outputs[0]) * math.prod(lhs.shape[dimension] for dimension in contracted)
+        return dataclasses.replace(Work(), **{field: flops * passes})
+    if primitive in _FREE:
+        return Work()
+    return Work(unpriced_operations=sum(_elements(aval) for aval in outputs))
 
 
 def _then(first: Work, then: Work) -> Work:
