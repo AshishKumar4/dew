@@ -1067,13 +1067,15 @@ def test_a_plan_at_a_rings_depth_is_the_trace_at_that_depth(target, name):
             assert deepened == traced, (stages, kind)
 
 
-@pytest.mark.parametrize('kernel', ['recurrence_output', 'recurrence_states', 'recurrence_reverse'],
+@pytest.mark.parametrize('kernel', ['recurrence_alone_output', 'recurrence_states', 'recurrence_reverse'],
                          ids=['forward', 'training forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     """A compile that refused the 27B gated delta net's derived tiles on an H100 (`report.refused_at`: a
-    kernel spilled), its forward's output launch, its training forward's states or its backward's: the
-    derivation steps the refused tiles down, which the call takes (`fits`); a refusal of the joined tiles once
-    matched none of the rules' candidates, and the call found none (`Unfitted`)."""
+    kernel spilled), its forward alone's output launch (`mainloop.named`), its training forward's states or
+    its backward's: the derivation steps the refused tiles down, which the call takes (`fits`); a refusal of
+    the joined tiles once matched none of the rules' candidates, and the call found none (`Unfitted`). The
+    forward alone's refusal steps its own tiles alone (`Tiles.forward`): its launches ran the training
+    forward's work under the same names, and its spill stepped the training call's tiles too (row 10559)."""
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
     bound = template.MOSAIC.bind(*args, None, bound=1.0)
     with report.refusals(), generation.assumed('sm90'):
@@ -1085,6 +1087,9 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
         legal = stepped is not None and template.MOSAIC.legal(bound, stepped, target)
     # The call takes legal tiles other than the refused ones.
     assert legal and stepped != first and taken == (stepped,)
+    if kernel == 'recurrence_alone_output':
+        assert dataclasses.replace(stepped, forward=None) == dataclasses.replace(first, forward=None), (
+            first, stepped)
 
 
 @pytest.mark.parametrize('product', ['forward', 'fast backward'])

@@ -490,4 +490,6 @@ def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
                                                                        training_forward=training)]
 
         forward, trained = names(tiles.forward or tiles, training=False), names(tiles, training=True)
-    assert forward == trained, (forward, trained)
+    # Named apart, a forward alone's (`mainloop.named`).
+    alone = [name.replace('recurrence', 'recurrence_alone', 1) for name in trained]
+    assert forward == alone, (forward, trained)

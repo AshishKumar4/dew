@@ -320,11 +320,15 @@ class Call:
     """Its tiles' (`Tiles.producers`)."""
     residents: resources.Residents = dataclasses.field(default_factory=resources.Residents)
     """Its tiles' (`Tiles.residents`)."""
+    alone: bool = False
+    """Whether it is a forward no gradient follows, keeping nothing (`chunk_forward.kept_forward`'s `keeps`):
+    its launches named apart (`named`), so a compile's refusal of one is the forward's alone and not a
+    training call's at its tiles, whose forward runs launches of the same work (row 10559)."""
 
     def producer(self, launching: Callable) -> int | None:
         """The registers the producer of the launch `launching` makes (`launch_kernel`'s, named for it)
         lowers to (`Tiles.producers`), None at the least."""
-        return self.producers.of(f"recurrence{launching.__name__}")
+        return self.producers.of(named(f"recurrence{launching.__name__}", self))
 
     def at(self, kernels: Collection[str]) -> "Call":
         """What a launch building `kernels` is given of it: all of it but the other launches' producers and
@@ -682,11 +686,20 @@ STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype", "solves")
 and its constants; its every other argument an array or None."""
 
 
+def named(name: str, call: "Call | None") -> str:
+    """The kernel `name` (`recurrence...`) as `call` launches it: a forward alone's `recurrence_alone...`
+    (`Call.alone`), a prefix no other launch's name starts, as the template matches a kernel to its launch
+    (`template._owner`, the longest name it starts with)."""
+    return name.replace("recurrence", "recurrence_alone", 1) if call is not None and call.alone else name
+
+
 def building(kernels: Callable[[Callable], Collection[str]]) -> Callable[[Callable], Callable]:
     """`lowered_once` for launches building the `kernels` of their function: each given its call and tiles
-    narrowed to those kernels' producers (`Call.at`, `Tiles.at`)."""
+    narrowed to those kernels' producers (`Call.at`, `Tiles.at`), named as its call launches them
+    (`named`)."""
     return tuning.lowered_once(STATIC, configured=("call", "tiles"), at="tiles",
-                               kernels=lambda launch, given: kernels(launch),
+                               kernels=lambda launch, given: [named(kernel, given.get("call"))
+                                                              for kernel in kernels(launch)],
                                unless=lambda: PLANNED.get() is not None)
 
 
@@ -911,7 +924,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     sums its walk holds across its steps (`mosaic.Walk.sums`), which a family keeping them in memory of its
     own scopes there (`Issuer.keeps_sums`)."""
     family = call.family
-    name = name or f"recurrence{program.__qualname__.split('.')[0]}"
+    name = named(name or f"recurrence{program.__qualname__.split('.')[0]}", call)
     producer = call.producers.of(name)
     staging = halves_tiled(family, staging)
     registers = held.registers(family, addressed(staging, landing or {}))

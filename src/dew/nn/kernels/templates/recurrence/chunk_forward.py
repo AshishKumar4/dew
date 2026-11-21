@@ -341,7 +341,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, apart=apart,
                 values_gated=values_gated, unit_keys=unit_keys, producers=tiles.producers,
-                residents=tiles.residents)
+                residents=tiles.residents, alone=not keeps)
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
     landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)

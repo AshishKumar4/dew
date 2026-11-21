@@ -695,7 +695,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             # forward's spilling scan once refused its whole value block where a shallower ring held
             # (Nemotron-H 4B's on sm100).
             # A forward alone's launches are named apart from a training call's (`mainloop.Call.alone`), so a
-            # kernel's name says which product ran it.
+            # refused kernel's name says which product ran it: each product steps its own tiles.
             spilled = report.refused_at(self, ba, joined)
             products = ((refused[True], trained, self.launches(ba, joined, target, backward=True), spilled),
                         (refused[False], forward,
