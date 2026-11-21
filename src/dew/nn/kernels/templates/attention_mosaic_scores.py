@@ -167,12 +167,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
         rows = tuple(_read(row) for row in rows)
         coords = _read(coords)
     if walk.scaled:
-        q_scaled = by_power(family.tile_of(q_slot), walk.spec.prescale)
-        if family.products_overlap and q_slot.shape[-1] <= 128 and not walk.interpret:
-            s, dp = family.product_pair(q_scaled, held, do_slot, values_t, shape)
-        else:
-            s = family.registers_product(q_scaled, held)
-            dp = family.product(do_slot, values_t, shape)
+        s = family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
+        dp = family.product(do_slot, values_t, shape)
     else:
         s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
     tile_coords = _read(coords)
