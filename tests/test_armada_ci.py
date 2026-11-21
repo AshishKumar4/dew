@@ -2348,33 +2348,6 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
     assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
 
 
-def run_options(tmp_path: Path, ref: str, policy: str, option: str) -> list[str]:
-    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy` (`suite_step`)."""
-    calls = suite_step(tmp_path / ref.replace("/", "-"), ref, "", policy, 2)
-    [run] = [call for call in calls if call[0] == "run"]
-    return [word for word in run if word.startswith(option)]
-
-
-def test_a_base_push_runs_above_every_lanes_run_and_no_higher_than_main(tmp_path):
-    """A push to base/kernels runs its suite above a lane's run, with the suite's ordinary deadline, so it is
-    graded: at a lane's whole-suite priority (-10) with the background deadline it waited behind every train,
-    precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs that started from
-    2026-11-09 to 11-12 (the owner's rule, 2026-11-01: every push to base is graded, a red its committer's the
-    same day); and at a targeted run's 0 its judges' draws waited out their deadline behind lane work
-    (2026-11-16). It runs no higher than main's own push, below which trains keep theirs (the queue's gates on
-    the hub set a train's, runbooks/hub.md)."""
-    def level(ref: str) -> int:
-        # armada's default where the workflow names none.
-        given = run_options(tmp_path, ref, "off", "--priority")
-        return int(given[0].partition("=")[2]) if given else 0
-
-    assert level("fix/lane") < level("base/kernels") <= level("main")
-    # A base push, on the pool armada gives it, has the suite's ordinary deadline: main's.
-    assert (run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline")
-            == run_options(tmp_path / "main-deadline", "main", "on", "--deadline"))
-    assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
-
-
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
     """A test whose own seconds in a task's run pass the group target (.armada.json's `target`) is flagged
     from the verdict's rows, as no cut can bring its group within the target (bible §7: every test past the

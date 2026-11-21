@@ -88,8 +88,7 @@ A GPU-touching change is qualified by its row; where it lands and when each run 
 
 | Destination | Change | Qualification |
 |---|---|---|
-| `base/kernels` | Kernel and template pieces | Hardware-free, on each push: interpret-mode check 1 for every mainloop, stability, deviceless compilation and the resource checks, which qualify without hardware; what certifies a launch's own compile is kernel-templates.md §7's. |
-| `main`, from `base/kernels` | Composed kernel base | The GPU tier and the no-regression window on every gating type. |
+| `main` | Kernel and template pieces | Hardware-free, in each train: interpret-mode check 1 for every mainloop, stability, deviceless compilation and the resource checks, which qualify without hardware; what certifies a launch's own compile is kernel-templates.md §7's. Then the GPU tier and the no-regression window on every gating type. |
 | `main` | Hopper-only path | The native H100 run. |
 | `main` | Other changes reaching GPU-specific behavior | The native tier on the affected target types. |
 
