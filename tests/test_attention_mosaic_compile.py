@@ -1726,7 +1726,7 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
             q = jax.ShapeDtypeStruct((1, 512, 4, 64), jnp.bfloat16)
             m = jax.ShapeDtypeStruct((1, 4, 512), jnp.float32)
             op, args = attention_mosaic._backward_call(q, q, q, q, spans, None, scale=None,
-                                                       natural=attention_mosaic.NATURAL,
+                                                       natural=attention_mosaic.NATURAL, accurate=False,
                                                        residuals=(q, m, m))
             ba = op.bind(*args, interpret=False)
             cfg = op.derived(ba, target)
