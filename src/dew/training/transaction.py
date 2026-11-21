@@ -29,6 +29,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
+from dew._coordination import from_every_process
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
@@ -682,25 +683,44 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
     program spans two meshes (a CPU-owned run's host companion and its accelerator), which hands back one
     flag for them all and, only where it is false, each leaf's; a leaf in host memory (a layout's
     pinned-host field) brought to its devices' memory one leaf at a time (`fetched`). A flag a leaf, read
-    each check, took 0.19 s a check of the 4B's 1,493 leaves on a GH200 (UB-6861-FIT2)."""
+    each check, took 0.19 s a check of the 4B's 1,493 leaves on a GH200 (UB-6861-FIT2). A placement no device
+    of this process's holds (a pipeline stage's mesh another process's devices make, `StageLocal.saved`) is
+    read by the processes that hold it, and every process takes their verdicts in one round, so each answers
+    alike (row 10780: each rank read each stage's scalar, those outside a stage holding none of it)."""
     groups: dict[tuple, list[int]] = {}
     for index, leaf in enumerate(leaves):
         sharding = leaf.sharding
         groups.setdefault((frozenset(sharding.device_set), sharding.memory_kind), []).append(index)
-    flags: list[bool] = [True] * len(leaves)
+    # Each placement's flags as this process read them, None where it holds none of its devices (on any
+    # backend: a CPU-owned state's companion mesh is no default backend's).
+    read: list[list[bool] | None] = []
     for (_, memory), members in groups.items():
-        if memory not in (None, "device"):
-            for index in members:
-                leaf = leaves[index]
-                flags[index] = bool(program(leaf_finite)(fetched(leaf, leaf.sharding)))
-            continue
-        held = [leaves[index] for index in members]
-        if bool(program(all_finite)(held)):
-            continue
-        read = jax.device_get(program(_finite_each)(held))
-        for index, finite in zip(members, read, strict=True):
+        if not leaves[members[0]].sharding.addressable_devices:
+            read.append(None)
+        elif memory not in (None, "device"):
+            read.append([_held_flag(program(leaf_finite)(fetched(leaves[index], leaves[index].sharding)))
+                         for index in members])
+        else:
+            held = [leaves[index] for index in members]
+            read.append([True] * len(members) if _held_flag(program(all_finite)(held)) else
+                        [_held_flag(finite) for finite in program(_finite_each)(held)])
+    # The round decided alike on every process, by which processes each placement spans.
+    if any({device.process_index for device in devices} != set(range(jax.process_count()))
+           for devices, _ in groups):
+        every = from_every_process(read)
+        read = [next(flags for flags in (rank[at] for rank in every) if flags is not None)
+                for at in range(len(read))]
+    flags: list[bool] = [True] * len(leaves)
+    for members, held in zip(groups.values(), read, strict=True):
+        assert held is not None, "a placement no process holds a device of"
+        for index, finite in zip(members, held, strict=True):
             flags[index] = bool(finite)
     return flags
+
+
+def _held_flag(finite: jax.Array) -> bool:
+    """A verdict replicated over its placement's devices, read from one this process holds."""
+    return bool(jax.device_get(finite.addressable_data(0)))
 
 
 def compact_qk(tree, calls: bool = False):
