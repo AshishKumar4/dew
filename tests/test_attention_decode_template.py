@@ -7,9 +7,8 @@ past the fold's reach, and the builders' inverse (`unpacked` of `packed`) and th
 covering each row's keys.
 """
 
-import itertools
-
 import dataclasses
+import itertools
 
 import jax
 import jax.numpy as jnp
