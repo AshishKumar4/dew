@@ -535,7 +535,7 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     denominators stacked, `[2, B, H, S, Qp]`, each slice's its own, which its caller merges where they lie
     (`merged.merged_split`)."""
     out, *rows_of = walked
-    (out,) = head_layout(family, out)
+    out = head_layout(family, out)
     if splits > 1:
         stacked = rows_of[0]
         return (out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
@@ -1522,7 +1522,7 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             interpret=interpret, certified=True, into=held, registered=registered,
             tmem_columns=tmem_columns)
     out, rows, sums = (jax.freeze(ref) for ref in held)
-    (out,) = head_layout(family, out)
+    out = head_layout(family, out)
     queries, width = call.queries, value.shape[3]
     return out[:, :queries, :, :width], rows[..., :queries], sums[:, :, :, :queries, :width]
 
@@ -2177,10 +2177,9 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                                           reduces=reduces, products=products,
                                                           over_rings=True))
               if family.budgets_registers else None)
+    query = head_layout(family, query)
     if page is None:
-        query, key, value = head_layout(family, query, key, value)
-    else:
-        (query,) = head_layout(family, query)
+        key, value = head_layout(family, key), head_layout(family, value)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,

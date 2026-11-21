@@ -336,11 +336,11 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
-    query, key, value, dout = head_layout(family, query, key, value, dout)
+    query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     dq, dk, dv = _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
                                grouped=grouped)
-    return head_layout(family, dq, dk, dv)
+    return head_layout(family, dq), head_layout(family, dk), head_layout(family, dv)
 
 def _fused_called(launch: Callable, operands: tuple, grads: tuple, *, copies: int, grouped: bool
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:

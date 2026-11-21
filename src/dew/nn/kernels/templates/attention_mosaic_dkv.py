@@ -699,7 +699,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     graded, buffers, groups = _graded(score_params, kinds, shares, query.shape, key.shape[1],
                                       adds_vectors=family.adds_vectors)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
-    (scaled_in,) = head_layout(family, None if program.tiles.staged_logits else scaled)
+    scaled_in = None if program.tiles.staged_logits else head_layout(family, scaled)
     leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop, scaled_in))
     tiled = Kind.TILE in graded
 
@@ -792,10 +792,10 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             _summed_stored(family, summed, _shared_views(family, outputs, grads, graded, block_k), consumers,
                            walk.interpret)
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
-    query, key, value, dout = head_layout(family, query, key, value, dout)
-    result = _dkv_launched(walk, launch, (query, key, value, dout, peak, total, anchor, delta, key_index,
-                                          *leaves), graded, buffers, groups)
-    return (*head_layout(family, *result[:2]), *result[2:])
+    query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
+    grads = _dkv_launched(walk, launch, (query, key, value, dout, peak, total, anchor, delta, key_index,
+                                         *leaves), graded, buffers, groups)
+    return (head_layout(family, grads[0]), head_layout(family, grads[1]), *grads[2:])
 
 
 def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:

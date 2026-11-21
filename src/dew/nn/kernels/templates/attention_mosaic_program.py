@@ -1733,13 +1733,10 @@ def head_slice(family: mosaic.Family, row, head, span) -> tuple:
     return (row, head, span) if family.copies_tiled_rows else (row, span, head)
 
 
-def head_layout(family: mosaic.Family, *arrays):
-    """Swap sequence and head axes of `arrays` (`[B, S, H, D]` <-> `[B, H, S, D]`) for a head-first TPU
-    family (`Family.copies_tiled_rows`), leaving non-TPU arrays and `None` untouched."""
-    if not family.copies_tiled_rows:
-        return arrays
-    return tuple(None if arr is None else jnp.swapaxes(arr, 1, 2) for arr in arrays)
-
+def head_layout(family: mosaic.Family, array: jax.Array) -> jax.Array:
+    """Swap sequence and head axes of `array` (`[B, S, H, D]` <-> `[B, H, S, D]`) for a head-first TPU
+    family (`Family.copies_tiled_rows`), leaving non-TPU arrays untouched."""
+    return jnp.swapaxes(array, 1, 2) if family.copies_tiled_rows else array
 
 def _views_of(family: mosaic.Family, refs: dict, row, head) -> dict:
     """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each operand's `[S, D]`

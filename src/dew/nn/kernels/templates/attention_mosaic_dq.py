@@ -380,7 +380,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                     tile_walk=TileWalk((queries, key.shape[1]), (block_q, block_k), consumers,
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))
-    query, key, value, dout = head_layout(family, query, key, value, dout)
+    query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     out = launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
-    return *head_layout(family, dq, keyed), rows
+    return head_layout(family, dq), None if keyed is None else head_layout(family, keyed), rows
