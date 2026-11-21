@@ -162,7 +162,7 @@ def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
     def admits(preset):
         try:
             _product(preset)(*draw(0))
-        except ValueError:  # this backend's dot_general refuses the algorithm
+        except (ValueError, jax.errors.JaxRuntimeError):  # JAX's check refuses it, or a GPU's compile
             return False
         try:
             assert_as_exact(_product(preset), _product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
@@ -196,7 +196,7 @@ def test_an_algorithm_at_least_another_is_as_exact_as_it():
     for preset in jax.lax.DotAlgorithmPreset:
         try:
             _product(preset)(*draw(0))
-        except ValueError:  # this backend's dot_general refuses the algorithm
+        except (ValueError, jax.errors.JaxRuntimeError):  # JAX's check refuses it, or a GPU's compile
             continue
         if programs.dot_arithmetic(preset, jnp.float32, jnp.float32) is not None:
             runs.append(preset)
