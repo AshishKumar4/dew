@@ -1328,7 +1328,7 @@ class Checkpoints:
         holders = frozenset(index for index, step in enumerate(steps) if step == newest)
         recorded = self._from_holder(holders, lambda: (self._open_local().metadata(newest).custom_metadata
                                                        or {}).get("grids"))
-        grids = None if recorded is None else tuple(from_record(Grid, grid) for grid in recorded)
+        grids = tuple(from_record(Grid, grid) for grid in recorded) if isinstance(recorded, list) else None
         if grids is None or not _covered(grids, holders):
             return None
         self._recovery = newest, holders, grids

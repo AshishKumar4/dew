@@ -113,8 +113,9 @@ def _from_replicas(tree, grids: Sequence[Grid], holders: frozenset[int]):
         if not isinstance(leaf, jax.Array):
             return leaf
         placed = leaf.sharding
-        assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`Grid.of`)"
+        assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`Grid.each`)"
         mesh, split = placed.mesh, tuple(_split_axes(placed.spec))
+        assert isinstance(mesh, jax.sharding.Mesh), "a covered save places on concrete meshes (`Grid.each`)"
         # Every axis the copies lie along, those of one device too, so the sum is replicated as its
         # placement says.
         along = tuple(name for name in mesh.axis_names if name not in split)
