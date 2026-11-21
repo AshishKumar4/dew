@@ -650,3 +650,28 @@ def test_a_sampled_runs_step_compiled_ahead_holds_every_count(tmp_path):
     assert all(loaded.at_count(count).program == program for count, program in programs.items())
     with pytest.raises(ValueError):
         loaded.at_count(CAP)
+
+
+def test_a_sampled_runs_split_step_compiled_ahead_holds_the_whole_its_run_runs(monkeypatch):
+    """A run that draws its pass count per microbatch, its step read in two parts and compiled ahead for
+    compile-only GPUs: the whole its parts' outputs run through is compiled ahead as its run builds it,
+    each part counting its own work (`StepCompiler.whole_program`), so the run finds it compiled (row
+    7983: the build ahead compiled the whole of a step whose parts count none, a program the run then
+    compiled again)."""
+    from test_compile_ahead import gpus
+
+    from dew.training import MeshSpec, planning
+    from dew.training.ahead import compile_ahead
+
+    built = []
+    whole = planning.whole_step
+
+    def recorded(*arguments, parted_work=False, **options):
+        built.append(parted_work)
+        return whole(*arguments, parted_work=parted_work, **options)
+
+    monkeypatch.setattr(planning, "whole_step", recorded)
+    trainer = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, split=2,
+                             mesh=MeshSpec().build(gpus("sm90")))
+    compile_ahead(trainer, {"text": token_draw()})
+    assert built and all(built), built
