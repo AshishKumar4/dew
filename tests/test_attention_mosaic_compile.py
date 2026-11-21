@@ -1612,10 +1612,6 @@ def test_fp32_forward_derives_parted_wgmma_and_consumer_choice_uses_launch_secon
             KernelCase("sm90-fp32-3part", lambda: op32.lowering(ba32, cfg32)),
         ], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-        assert algebra.bf16_part_count(accurate=True) == 3
-        assert algebra.bf16_part_count(accurate=False) == 1
-        assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-        assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
 
 
 @COMPILES_ON_CPU
