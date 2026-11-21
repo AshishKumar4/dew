@@ -48,15 +48,15 @@ import numpy as np
 from jax.interpreters import ad
 
 from dew.algebra import scaled
-from dew.algebra.ratios import Ratio, _ratio_sum, ratio
+from dew.algebra.ratios import Ratio, ratio, _ratio_sum
 from dew.algebra.windows import (
     Units,
-    _Sum,
     _arrays,
     _laid_to,
     _landed,
     _quotient,
     _streamed,
+    _Sum,
     _without_axis,
 )
 from dew.nn.derivatives import contracted
