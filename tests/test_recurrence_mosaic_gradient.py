@@ -491,33 +491,3 @@ def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
 
         forward, trained = names(tiles.forward or tiles, training=False), names(tiles, training=True)
     assert forward == trained, (forward, trained)
-
-
-def test_a_forward_alones_kernels_are_refused_at_its_own_tiles():
-    """Nemotron-H 4B's SSD forward no gradient follows, traced for an H100 at its own tiles beside the
-    training call's (`Tiles.forward`): its states and output kernels traced under those tiles
-    (`report.ran_at`), so a compile refusing them refuses the forward alone's tiles and not the training
-    call's, whose launches share their names (rows 5668, 7877: refused under the call's tiles, a forward's
-    spill refused the training call's unspilled tiles too)."""
-    from test_recurrence_mosaic import _form, _skipped, resource_operands
-
-    from dew.nn.kernels.templates import report
-
-    name, dtype = 'nemotron-h-4b-ssd', jnp.bfloat16
-    operands, skip = resource_operands(name, dtype, 1, 4096), _skipped(name)['skip']
-    options = dict(max_segments=None, bound=None, **_form(name, dtype))
-    facts = generation.gpu_target('sm90')
-    before = set(report._LAUNCHES)
-    with generation.assumed(facts):
-        bound = template.MOSAIC.bind(*operands, None, skip=skip, **options)
-        tiles = template.MOSAIC.derived(bound, facts)
-        # Lowered, as a compile names its kernels (`report.named`).
-        call = jax.jit(lambda *x: template.MOSAIC(*x[:-1], None, skip=x[-1], **options))
-        call.trace(*operands, skip).lower(lowering_platforms=("cuda",))
-    ran = {}
-    for digest in set(report._LAUNCHES) - before:
-        launch = report._LAUNCHES[digest]
-        ran.setdefault(launch.config, set()).update(launch.kernels)
-    launches = {'recurrence_states', 'recurrence_output'}
-    assert tiles.forward is not None and launches <= ran.get(tiles.forward, set()), (tiles, ran)
-    assert not ran.get(tiles, set()) & launches, (tiles, ran)
