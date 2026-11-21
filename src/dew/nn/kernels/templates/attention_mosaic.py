@@ -111,7 +111,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     refused,
     scaled_drop,
-    scopes_products,
     score_places,
     split_queries,
     stagings,
