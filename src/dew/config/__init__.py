@@ -49,7 +49,7 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.config.earlier import earlier_run
+from dew.config.earlier import LAYOUT_UNSETTABLE, earlier_run
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.config.trainer import (
@@ -925,8 +925,9 @@ class RunConfig:
 
     def record(self) -> dict[str, JSON]:
         """The run's class record: its class by its alias in `dew.registry.runs`, or by its import path
-        where the table holds none, and its fields (`to_dict`)."""
-        return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict()}
+        where the table holds none, and its fields (`to_dict`); beside them, that it states its trainer's
+        layout as this Dew does (`LAYOUT_UNSETTABLE`), which `earlier_run` reads and takes off."""
+        return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict(), LAYOUT_UNSETTABLE: True}
 
     def source_keywords(self, *, frozen: bool) -> SourceOptionsKeywords:
         """`Pretrained.load`'s keywords for the source the run starts from: what it builds of it
@@ -1142,7 +1143,9 @@ class RunConfig:
                              "a RunConfig in Python and trained with run() writes a run.json that rebuilds "
                              "it (docs/recipes.md, Python experiments)")
         registry.import_trusted(record, trust)
-        named = registry.class_record(record)
+        # Read in this Dew's shapes, whatever the record says of them beside its fields (`earlier_run`).
+        named = registry.class_record({key: value for key, value in record.items()
+                                       if key != LAYOUT_UNSETTABLE})
         if named is None:
             raise ValueError('a run record is its class and its fields, {"class": ..., "fields": ...}')
         run_class = registry.runs[named[0]]

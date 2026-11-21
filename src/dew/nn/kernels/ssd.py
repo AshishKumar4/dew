@@ -272,7 +272,7 @@ def _opened(given_ref, table, entry, load, add, document, zero):
 
     key, value, weight = (ref[document] for ref in entry)
     # Its terms' outer products summed aligned to the largest, which may leave fp32's range where the
-    # sum is in it (`precision.aligned_sum`).
+    # sum is in it (`aligned.aligned_sum`).
     return taken + entry_write(key, value, weight, values_first=True)
 
 
@@ -623,88 +623,12 @@ def _ssd_scan(x, b, c, a, state, forked, chunk_size: int, platform: str,
                           held=held)[:2])
 
 
-def _ssd_portable_forked(x, b, c, a, state, forked, chunk_size: int, held: int):
-    """Pure-JAX forked chunk scan reusing `_chunk_forward`, `_windowed`, `_opened`, and `_segment_count`
-    with no cross-layer import (rows 7874, 7875; base review e488dc198 F2, F5)."""
-    batch, total, heads, head_dim = x.shape
-    chunks, state_size = total // chunk_size, b.shape[-1]
-    tokens, given, entry = _forked_blocks(forked, heads, chunk_size)
-    xs = jnp.moveaxis(x.reshape(batch, chunks, chunk_size, heads, head_dim), (1, 3), (2, 1))
-    bs = jnp.moveaxis(b.reshape(batch, chunks, chunk_size, heads, state_size), (1, 3), (2, 1))
-    cs = jnp.moveaxis(c.reshape(batch, chunks, chunk_size, heads, state_size), (1, 3), (2, 1))
-    as_ = jnp.moveaxis(a.reshape(batch, chunks, chunk_size, heads), (1, 3), (2, 1))
-
-    def walk_head(x_h, b_h, c_h, a_h, st_h, given_h, entry_h, tok_b):
-        loads_b, stores_b, begun_b, adds_b = tok_b
-        table0 = jnp.zeros((held, head_dim, state_size), st_h.dtype) if held else None
-
-        def chunk_step(carry, inputs):
-            carried, table = carry
-            cx, cb, cc, ca, cl, cs_, cbeg, cadd = inputs
-            segments = _segment_count(cl, chunk_size)
-
-            def seg_step(_, seg_state):
-                y_acc, leaving, origin, tbl = seg_state
-                after = _segment_after(cl, origin, chunk_size)
-                through = after - jnp.int32(1)
-                load = cl[0, origin]
-                mem = jnp.where(load < 0, carried,
-                                _opened(given_h, tbl, entry_h, load, cadd[0, origin], cbeg[0, origin],
-                                        jnp.zeros_like(carried)))
-                operands, inside = _windowed(cx, cb, cc, ca, origin, through)
-                out, left = _chunk_forward(*operands, mem)
-                if tbl is not None:
-                    store = cs_[0, through]
-                    for slot in range(held):
-                        tbl = tbl.at[slot].set(jnp.where(store == slot + 1, left, tbl[slot]))
-                return (jnp.where(inside, out, y_acc), jnp.where(through == chunk_size - 1, left, leaving),
-                        after, tbl)
-
-            y_c, left_c, _, tbl_out = jax.lax.fori_loop(
-                0, segments, seg_step,
-                (jnp.zeros_like(cx), carried, jnp.int32(0), table))
-            return (left_c, tbl_out), y_c
-
-        (final_h, _), ys_h = jax.lax.scan(
-            chunk_step, (st_h, table0), (x_h, b_h, c_h, a_h, loads_b, stores_b, begun_b, adds_b))
-        return ys_h, final_h
-
-    def walk_row(x_r, b_r, c_r, a_r, st_r, given_r, entry_r, tok_r):
-        return jax.vmap(walk_head, in_axes=(0, 0, 0, 0, 0, 0, 0 if entry_r is not None else None, None))(
-            x_r, b_r, c_r, a_r, st_r, given_r, entry_r, tok_r)
-
-    entry_in = entry if entry else None
-    ys, final = jax.vmap(walk_row)(xs, bs, cs, as_, state, given, entry_in, tokens)
-    return jnp.moveaxis(ys.reshape(batch, heads, total, head_dim), 1, 2), final
-
-
-def _ssd_portable(x, b, c, a, state, forked, chunk_size: int, held: int) -> tuple[jax.Array, jax.Array]:
-    """Pure-JAX chunked SSD scan reusing `_chunk_forward` (plain and forked) so forward mode and higher-order
-    derivatives through `_chunk_scan` combine reads and decays before forming any carry with no cross-layer
-    import (rows 7874, 7875; base review e488dc198 F2, F5)."""
-    if forked is not None:
-        return _ssd_portable_forked(x, b, c, a, state, forked, chunk_size, held)
-    batch, total, heads, head_dim = x.shape
-    chunks, state_size = total // chunk_size, b.shape[-1]
-    xs = jnp.moveaxis(x.reshape(batch, chunks, chunk_size, heads, head_dim), (1, 3), (0, 2))
-    bs = jnp.moveaxis(b.reshape(batch, chunks, chunk_size, heads, state_size), (1, 3), (0, 2))
-    cs = jnp.moveaxis(c.reshape(batch, chunks, chunk_size, heads, state_size), (1, 3), (0, 2))
-    as_ = jnp.moveaxis(a.reshape(batch, chunks, chunk_size, heads), (1, 3), (0, 2))
-
-    def step(carry, chunk_args):
-        cx, cb, cc, ca = chunk_args
-        cy, nxt = jax.vmap(jax.vmap(_chunk_forward))(cx, cb, cc, ca, carry)
-        return nxt, cy
-
-    final, ys = jax.lax.scan(step, state, (xs, bs, cs, as_))
-    return jnp.moveaxis(ys, (0, 2), (1, 3)).reshape(batch, total, heads, head_dim), final
-
-
 @functools.cache
 def _ssd_rule(chunk_size: int, platform: str, held: int):
-    """`_chunk_scan`'s rule via `generation.linear_tangent`: forward and reverse run the TPU Pallas kernels
-    (`ssd_forward`, `ssd_backward`), while forward mode and higher-order derivatives differentiate through
-    `_ssd_portable` (rows 7874, 7875)."""
+    """`_chunk_scan`'s first-order reverse-mode rule (`derivatives.declared_derivative`): its forward and
+    backward the TPU Pallas kernels (`ssd_forward`, `ssd_backward`). Forward mode and every higher order are
+    its route's: the products' wrapper (`recurrence_chunk._per_product`) takes them through the portable
+    chunked op, as it does every kernel's (row 9698)."""
     def primal(x, b, c, a, state, forked):
         return _ssd_scan(x, b, c, a, state, forked, chunk_size, platform, held)
 
@@ -712,11 +636,10 @@ def _ssd_rule(chunk_size: int, platform: str, held: int):
         y, final, *kept = _forward(x, b, c, a, state, chunk_size, platform, keep_entered=True,
                                    forked=forked, held=held)
         table, entered = (kept[0], kept[1]) if forked is not None and held else (None, kept[0])
-        return (y, final), (entered, table)
+        return (y, final), ((entered, table), (x, b, c, a, forked))
 
-    def backward(saved, operands, cotangent):
-        x, b, c, a, _, forked = operands
-        entered, table = saved
+    def backward(saved, cotangent):
+        (entered, table), (x, b, c, a, forked) = saved
         dy, dfinal = cotangent
         dx, db, dc, da, dstate, *dforked = _backward(x, b, c, a, entered, dy, dfinal, chunk_size, platform,
                                                      forked=forked, table=table, held=held)
@@ -733,16 +656,12 @@ def _ssd_rule(chunk_size: int, platform: str, held: int):
             dtaken = (jnp.swapaxes(dforked[0], 1, 2).astype(given.dtype), no_tokens, dentry)
         return dx, db, dc, da, dstate, dtaken
 
-    def portable(x, b, c, a, state, forked):
-        return _ssd_portable(x, b, c, a, state, forked, chunk_size, held)
-
     return derivatives.contracted("test_the_tpu_ssd_scan_holds_its_orders")(
-        generation.linear_tangent(forward, backward, portable, kind=derivatives.KernelGlue(),
-                                  primal=primal))
+        derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward))
 
 
 def _chunk_scan(x, b, c, a, state, forked, chunk_size: int, platform: str,
                 held: int = 0) -> tuple[jax.Array, ...]:
-    """Run the chunked SSD scan on the Pallas kernel for `platform`, with every derivative order via
-    `generation.linear_tangent` (rows 7874, 7875)."""
+    """Run the chunked SSD scan on the Pallas kernel for `platform`, reverse mode its own (`_ssd_rule`), every
+    other order its route's (`recurrence_chunk._ssd_tpu` under `_per_product`)."""
     return _ssd_rule(chunk_size, platform, held)(x, b, c, a, state, forked)

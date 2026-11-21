@@ -1293,10 +1293,10 @@ def _gemm_on_a_tpu_core():
     expected)` at small integers, so each product is exact in fp32: a dense forward with a bias epilogue,
     the grouped forward (three groups, one empty, rows past the routed ones zero) with its matrices stored
     as they come and transposed, and the grouped kernel gradient."""
-    from dew.nn.kernels.templates.gemm import mosaic_gpu
+    from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
 
     rows, depth, width = 384, 512, 256
-    tiles = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family="mxu")
+    tiles = tiling.Tiles(128, 128, 128, 2, 1, family="mxu")
     keys = jax.random.split(jax.random.key(4), 4)
     x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
     w = jax.random.randint(keys[1], (3, depth, width), -3, 4).astype(jnp.bfloat16)

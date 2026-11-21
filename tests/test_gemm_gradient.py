@@ -12,16 +12,16 @@ from generation_support import INTERPRETS
 
 from dew.nn.kernels import generation, grouped_launch, grouped_matmul
 from dew.nn.kernels.templates import mosaic_sm90
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
 
 pytestmark = pytest.mark.kernel
 
 DENSE_GRADIENT_TILES = {
-    "wgmma, four stages": mosaic_gpu.Tiles(128, 128, 64, 4, 1, warpgroups=2, family='wgmma'),
-    "wgmma, three stages": mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma'),
-    "wgmma fed": mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family=mosaic_sm90.FED.name),
-    "mma.sync": mosaic_gpu.Tiles(128, 64, 32, 3, 1, family='mma.sync'),
-    "tcgen05": mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05'),
+    "wgmma, four stages": tiling.Tiles(128, 128, 64, 4, 1, warpgroups=2, family='wgmma'),
+    "wgmma, three stages": tiling.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma'),
+    "wgmma fed": tiling.Tiles(128, 128, 64, 3, 1, warpgroups=2, family=mosaic_sm90.FED.name),
+    "mma.sync": tiling.Tiles(128, 64, 32, 3, 1, family='mma.sync'),
+    "tcgen05": tiling.Tiles(128, 128, 64, 4, 1, family='tcgen05'),
 }
 """A dense kernel gradient's tiles on each family: wgmma's rings of four and three stages, walked a rotation a
 trip into bf16 and a step a trip exactly summed; its consumers feeding their own rings; mma.sync's, whose
@@ -99,7 +99,7 @@ def test_a_split_kernel_gradient_reads_each_groups_side_operand_at_its_own_group
     rows, depth, width = 256, 64, 128
     x, dy = jnp.ones((rows, depth), jnp.bfloat16), jnp.ones((rows, width), jnp.bfloat16)
     scales = jnp.asarray([[1.0] * depth, [2.0] * depth], jnp.float32)
-    tiles = mosaic_gpu.Tiles(64, 128, 64, 2, 1, family='wgmma')
+    tiles = tiling.Tiles(64, 128, 64, 2, 1, family='wgmma')
 
     def scaled(stage, scale):
         return (stage * scale).astype(stage.dtype)

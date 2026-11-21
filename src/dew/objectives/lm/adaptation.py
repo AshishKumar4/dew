@@ -38,7 +38,7 @@ import functools
 import itertools
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -59,22 +59,9 @@ from dew.batch import (
 from dew.nn.continuum import HeadTerms, LevelTerms, level_names
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
-from dew.nn.progress import ReadsProgress
 from dew.nn.projections import projection_groups
-from dew.nn.protocols import (
-    Bounded,
-    CacheCapacity,
-    Generating,
-    Layered,
-    ProjectionGroup,
-    ReplacesTokens,
-    Serving,
-    SteppedInContext,
-    block_chunks_of,
-)
-
-if TYPE_CHECKING:
-    from dew.nn.kv_cache import KVCache
+from dew.nn.protocols import Bounded, CacheCapacity, Layered, ProjectionGroup, Serving, SteppedInContext
+from dew.nn.wrapping import DecoderHooks
 
 
 @dataclasses.dataclass(frozen=True)
@@ -767,7 +754,7 @@ IN_CONTEXT = "in_context"
 the model's own."""
 
 
-class InContextDecoder(nn.Module):
+class InContextDecoder(DecoderHooks):
     """`model` decoding with its continuum level stepped in context as its training forward steps it
     (`adapted_scores` under `adaptation`): the model a language model that adapts in context generates
     with (row 9066).
@@ -785,13 +772,14 @@ class InContextDecoder(nn.Module):
     draws, its windows counted from its first real token. A call that does not decode reads its tokens
     so from a chain that has read none.
 
-    It answers the hooks a generation reads (`dew.nn.protocols`) as `model` does, but for what its
-    chain cannot follow: a strategy that rejects or reorders drawn tokens (`DrawsAlone`), a mixed call's
-    or a shared prefix's rows (`Serving`), a packed or forked request, an adapter set's per-row adapters;
-    each refused by name. A damped step reads bounds over the whole sequence, which a decode has not
-    seen, and a stacked adaptation steps the trunk, whose cache a decode keeps: neither decodes
-    (`decoded_alone`)."""
+    It answers the hooks a generation reads (`dew.nn.protocols`) as `model` does (`DecoderHooks`, over
+    `model`, whose variables it reads at its own root), but for what its chain cannot follow: a strategy that
+    rejects or reorders drawn tokens (`DrawsAlone`), a mixed call's or a shared prefix's rows (`Serving`), a
+    packed or forked request, an adapter set's per-row adapters; each refused by name. A damped step reads
+    bounds over the whole sequence, which a decode has not seen, and a stacked adaptation steps the trunk,
+    whose cache a decode keeps: neither decodes (`decoded_alone`)."""
 
+    wraps: ClassVar[str] = "model"
     model: nn.Module
     adaptation: ChunkAdaptation
     pad_id: int | None = None
@@ -815,67 +803,10 @@ class InContextDecoder(nn.Module):
         return "its rows' levels step with every token they read, past what a cache's cursor rewinds"
 
     @property
-    def max_seq_len(self) -> int:
-        """`model`'s (`dew.nn.protocols.Bounded`)."""
-        return self.model.max_seq_len
-
-    @property
-    def vocab_size(self) -> int:
-        """`model`'s (`dew.nn.protocols.StatesVocabulary`)."""
-        return self.model.vocab_size
-
-    @property
-    def kv_cache(self) -> KVCache:
-        """`model`'s cache layout (`dew.nn.protocols.Layered`), which its trunk keeps."""
-        return self.model.kv_cache
-
-    @property
     def cache_rebuild_position(self) -> int | None:
         """`model`'s (`dew.nn.protocols.Serving`): a row crossing it rebuilds its whole cache, its chain's
         too, from its history (`dew.sampling.text.empty_cache`); None where `model` serves none."""
         return self.model.cache_rebuild_position if isinstance(self.model, Serving) else None
-
-    @property
-    def replaced_ids(self) -> frozenset[int]:
-        """The ids `model` replaces before its table reads them (`dew.nn.protocols.ReplacesTokens`), which
-        a generation's ids may hold past its vocabulary; none where it replaces none."""
-        return self.model.replaced_ids if isinstance(self.model, ReplacesTokens) else frozenset()
-
-    @property
-    def replaces_media(self) -> bool:
-        """Whether `model` replaces the id at a slot media fill (`dew.nn.protocols.ReplacesTokens`)."""
-        return isinstance(self.model, ReplacesTokens) and self.model.replaces_media
-
-    @nn.nowrap
-    def _over(self, model: nn.Module) -> InContextDecoder:
-        """This decoder over `model` in place of its own."""
-        return self.clone(model=model)
-
-    @nn.nowrap
-    def with_cache_capacity(self, capacity: int) -> InContextDecoder:
-        """`dew.nn.protocols.CacheCapacity`, `model`'s."""
-        return self._over(self.model.with_cache_capacity(capacity))
-
-    @nn.nowrap
-    def with_kv_cache(self, layout: KVCache) -> InContextDecoder:
-        """`dew.nn.protocols.Layered`, `model`'s."""
-        return self._over(self.model.with_kv_cache(layout))
-
-    @nn.nowrap
-    def reads_progress(self) -> bool:
-        """`model`'s trunk's (`dew.nn.progress.ReadsProgress`): a call's `progress` goes to the trunk, as
-        the training forward's does."""
-        return isinstance(self.model, ReadsProgress) and self.model.reads_progress()
-
-    @nn.nowrap
-    def generation_refusal(self) -> str | None:
-        """`model`'s (`dew.nn.protocols.Generating`)."""
-        return self.model.generation_refusal() if isinstance(self.model, Generating) else None
-
-    @nn.nowrap
-    def block_chunks(self) -> tuple[int | None, ...]:
-        """`model`'s trunk layers that read blocks (`dew.nn.protocols.BlockReading`)."""
-        return block_chunks_of(self.model)
 
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:

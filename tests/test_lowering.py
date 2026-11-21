@@ -320,10 +320,10 @@ def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
     """The grouped GEMM's two launches on a TPU core (the template's, on the MXU's bundle), lowered for a TPU
     on this CPU, state their products' FLOPs (`templates.cost.estimate`), which the kernel report and the
     FLOP count both read."""
-    from dew.nn.kernels.templates.gemm import mosaic_gpu
+    from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
     from dew.telemetry.instrumentation import hlo_flops
 
-    tiles = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family='mxu')
+    tiles = tiling.Tiles(128, 128, 128, 2, 1, family='mxu')
     lhs, rhs = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128),
                                                                                     jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((2,), jnp.int32)

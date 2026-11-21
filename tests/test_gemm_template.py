@@ -30,7 +30,7 @@ from dew.nn.kernels import (
     tuning,
 )
 from dew.nn.kernels.templates import cost, mosaic_sm90, product, resources, tail
-from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 
 pytestmark = pytest.mark.kernel
@@ -258,7 +258,7 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
 
 
-COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma')
+COOPERATIVE = tiling.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma')
 """A tile two consumer warpgroups compute, on one multiprocessor."""
 
 FED = dataclasses.replace(COOPERATIVE, family=mosaic_sm90.FED.name)
@@ -278,7 +278,7 @@ def test_a_family_that_takes_no_pingpong_refuses_it():
     past the primed stages none; and tcgen05's persistent walk, whose accumulators turn by tile."""
     with pytest.raises(ValueError):
         dataclasses.replace(FED, pingpong=True)
-    tcgen05 = pricing.family_of(mosaic_gpu.Tiles(128, 128, 64, 3, 1, family="tcgen05"), jnp.bfloat16)
+    tcgen05 = pricing.family_of(tiling.Tiles(128, 128, 64, 3, 1, family="tcgen05"), jnp.bfloat16)
     for family in (mosaic_sm90.FED, tcgen05):
         with pytest.raises(ValueError):
             family.persist_scratch(2, pingpong=True)
@@ -305,7 +305,7 @@ def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     a_cooperative_tile_holds_check_1_with_its_hooks(case, forward)
 
 
-def a_cooperative_tile_holds_check_1_with_its_hooks(case: str, forward: mosaic_gpu.Tiles) -> None:
+def a_cooperative_tile_holds_check_1_with_its_hooks(case: str, forward: tiling.Tiles) -> None:
     """`test_a_cooperative_tile_holds_check_1_with_its_hooks`'s check at one case and forward tile,
     interpreted on a CPU and compiled on a Hopper GPU."""
     spec = CASES[case]
@@ -795,7 +795,7 @@ def test_a_hoppers_split_decode_product_holds_check_1():
     def plain(x, w, wide=jnp.float32, out=jnp.bfloat16):
         return jnp.dot(x.astype(wide), w.astype(wide)).astype(out)
 
-    split = mosaic_gpu.Tiles(64, 256, 64, 2, 2, warpgroups=1, family="wgmma", splits=4)
+    split = tiling.Tiles(64, 256, 64, 2, 2, warpgroups=1, family="wgmma", splits=4)
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), \
             tuning.pinned({grouped_matmul.MosaicGmm: split}):
         assert_as_exact(dew, jax.jit(plain), draw, f"split {rows}x{depth}x{width}", seeds=SEEDS,
@@ -1074,8 +1074,8 @@ def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic()
     alone = dataclasses.replace(COOPERATIVE, warpgroups=1)
     assert (pricing.step_shared_bytes(alone, wgmma, (2, 2))
             == pricing.step_shared_bytes(COOPERATIVE, wgmma, (2, 2)))
-    one_cta = mosaic_gpu.Tiles(128, 128, 64, 6, 8, warpgroups=1, family="tcgen05")
-    pair = mosaic_gpu.Tiles(128, 128, 64, 5, 8, warpgroups=1, cluster=2, family="tcgen05.pair")
+    one_cta = tiling.Tiles(128, 128, 64, 6, 8, warpgroups=1, family="tcgen05")
+    pair = tiling.Tiles(128, 128, 64, 5, 8, warpgroups=1, cluster=2, family="tcgen05.pair")
 
     def per_flop(tiles, target):
         family = pricing.family_of(tiles, jnp.bfloat16)
@@ -1083,7 +1083,7 @@ def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic()
         return pricing.step_seconds(tiles, target, (2, 2)) / flops
 
     assert per_flop(pair, b200) < per_flop(one_cta, b200)
-    cooperative = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
+    cooperative = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
     tensor = cost.rates(h100, device=False).tensor
     assert pricing.step_seconds(cooperative, h100, (2, 2)) == 2 * 128 * 256 * 64 / tensor
     walk = pricing.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2), stored=2,
@@ -1118,7 +1118,7 @@ def test_a_decoded_operand_moves_its_stage_its_decoders_reads_and_each_decoded_c
     packed bytes twice, staged and read by its decoders, and the products read none of it; a decode into a
     stage each consumer keeps its own moves one more read of the packed stage and one more decoded stage than
     one its consumers share."""
-    tiles = mosaic_gpu.Tiles(128, 128, 256, 3, 1, warpgroups=2, family="wgmma")
+    tiles = tiling.Tiles(128, 128, 256, 3, 1, warpgroups=2, family="wgmma")
     family = pricing.family_of(tiles, jnp.bfloat16)
     packed, stage = 0.5 + 1 / 16, 2
     left, right = tiles.block_m * tiles.block_k, tiles.block_n * tiles.block_k
@@ -1280,7 +1280,7 @@ def test_a_dense_products_depth_split_sums_its_partials_once(generation_name, tr
     shape = (width, depth) if transpose_rhs else (depth, width)
     w = jax.random.randint(keys[1], shape, -3, 4).astype(jnp.bfloat16)
     tiles = (COOPERATIVE if generation_name == "sm90"
-             else mosaic_gpu.Tiles(128, 128, 64, 3, 1, family="mma.sync"))
+             else tiling.Tiles(128, 128, 64, 3, 1, family="mma.sync"))
 
     def dew(splits, out_dtype=jnp.bfloat16, **hooks):
         return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32),
@@ -1823,10 +1823,10 @@ def test_a_tpu_launch_takes_a_legal_pin_and_names_why_it_refuses_another():
         target = generation.gpu_target()
         derived = launch.derived(ba, target)
         assert derived.family == "mxu" and launch.pinnable(ba, derived)
-        short = mosaic_gpu.Tiles(64, 128, 128, 2, 1, family='mxu')
+        short = tiling.Tiles(64, 128, 128, 2, 1, family='mxu')
         assert not launch.pinnable(ba, short)
         assert launch.unpinnable(ba, short)
-        assert launch.unpinnable(ba, mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'))
+        assert launch.unpinnable(ba, tiling.Tiles(64, 64, 64, 2, 1, family='wgmma'))
 
 
 @pytest.mark.parametrize("side_dtype", [jnp.float32, jnp.bfloat16])
@@ -1853,7 +1853,7 @@ def test_the_hooked_tpu_launches_lower_for_a_v5e(launch, side_dtype):
     assumed, mesh = _on_a_v5e()
     with assumed, mesh:
         ba, target = launch.bind(*args, **options), generation.gpu_target()
-        least = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family='mxu')
+        least = tiling.Tiles(128, 128, 128, 2, 1, family='mxu')
         assert launch.legal(ba, least, target) == (jnp.dtype(side_dtype).itemsize == 4)
         for config in {launch.derived(ba, target), *([least] if launch.legal(ba, least, target) else [])}:
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
@@ -1957,7 +1957,7 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
     with the plain program's over the draws (check 1), truth the plain program's in float64 (eagerly: the
     interpreter's ordered callbacks)."""
     sizes = jnp.asarray(SIDE_SIZES)
-    common = {"tiles": mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'), "out_dtype": jnp.float32,
+    common = {"tiles": tiling.Tiles(64, 64, 64, 2, 1, family='wgmma'), "out_dtype": jnp.float32,
               "multiprocessors": 1,
               "interpret": grouped_launch.INTERPRETED}
     for hook, layout, transposed in SIDE_LAYOUTS:
@@ -1979,7 +1979,7 @@ def test_a_split_kernel_gradient_holds_check_1(splits):
     no whole step, an empty group among them and one of a row, with more runs than some groups have blocks:
     each group's gradient on par with XLA's over the draws (check 1), truth float64's."""
     sizes = jnp.asarray(SIZES)
-    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1, splits=splits, family='wgmma')
+    tiles = tiling.Tiles(64, 64, 64, 2, 1, splits=splits, family='wgmma')
 
     def split(x, dy):
         return mosaic_gpu.tgmm(x, dy, sizes, tiles=tiles, out_dtype=jnp.float32, multiprocessors=1,
@@ -2007,7 +2007,7 @@ def test_a_dense_split_kernel_gradient_reads_its_runs_as_loaded_and_holds_check_
     float64's."""
     with generation.assumed(generation_name):
         family = "tcgen05" if generation_name == "sm100" else "wgmma"
-        tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, splits=splits, family=family)
+        tiles = tiling.Tiles(128, 128, 64, 2, 1, splits=splits, family=family)
 
         def split(x, dy):
             return mosaic_gpu.tgmm(x, dy, jnp.asarray([ROWS], jnp.int32), tiles=tiles, out_dtype=jnp.float32,
@@ -2052,7 +2052,7 @@ def test_an_ampere_kernel_gradient_at_a_two_row_warp_step_holds_check_1(generati
     truth float64's. Its output is bf16, whose one rounding hides the tensor cores' in-order sums, so they
     are not promoted and the tile's one accumulator fills its registers (an fp32 output's running sum beside
     it holds no 128 x 128 tile: `templates.product.promoted`)."""
-    tiles = mosaic_gpu.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync")
+    tiles = tiling.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync")
 
     def ampere(x, dy):
         return gemm.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.bfloat16, precision="default",
@@ -2075,7 +2075,7 @@ def test_an_ampere_fp32_kernel_gradient_promotes_its_sums_a_window_at_a_time():
     cores' sum of each added into the running sum at the window's end; M-FS-4): groups of three steps (a
     short window), five (a whole one and a step) and four (one whole), an empty one and one of a row among
     them (`SIZES`), on par with XLA's over the draws (check 1), truth float64's."""
-    tiles = mosaic_gpu.Tiles(64, 64, 32, 2, 1, warpgroups=1, family="mma.sync")
+    tiles = tiling.Tiles(64, 64, 32, 2, 1, warpgroups=1, family="mma.sync")
 
     def ampere(x, dy):
         return gemm.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision="default",
@@ -2106,7 +2106,7 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
     plain kernel gradient over the draws (check 1), truth the plain kernel gradient in float64."""
     # One tile both ways, a step of EXACT_STEP rows.
     tiles = {grouped_triton.Tgmm: grouped_launch.Tile(64, 128, 64, 4, 2),
-             grouped_matmul.MosaicTgmm: mosaic_gpu.Tiles(64, 128, 64, 2, 1, family='wgmma')}
+             grouped_matmul.MosaicTgmm: tiling.Tiles(64, 128, 64, 2, 1, family='wgmma')}
     launches = ("triton", "mosaic") if generation_name == "sm90" else ("triton",)
     for launch, group_sizes, precision in itertools.product(launches, (SIZES, None),
                                                             ("highest", "default")):
@@ -2165,7 +2165,7 @@ def test_a_tile_states_a_schedule_the_kernels_run():
     for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4},
                    {"warpgroups": 2, "stages": 1}):
         with pytest.raises(ValueError):
-            mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1,
+            tiling.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1,
                                 "family": "wgmma"} | fields)
 
 
@@ -2221,8 +2221,8 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
                                interpret_on_cpu=True)
 
     calls = ((forward, (x, w), "mosaic", grouped_matmul.MosaicGmm,
-              mosaic_gpu.Tiles(64, 64, 64, 1, 1, family='wgmma'),
-              mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma')),
+              tiling.Tiles(64, 64, 64, 1, 1, family='wgmma'),
+              tiling.Tiles(64, 64, 64, 2, 1, family='wgmma')),
              (gradient, (x, dy), "triton", grouped_triton.Tgmm, grouped_launch.Tile(128, 128, 64, 4, 3),
               grouped_launch.Tile(64, 128, 64, 4, 3)))
     for run, args, named, launch, refused, legal in calls:
@@ -2279,7 +2279,7 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         [tile] = launch.fitting(exact, target)
         budget = pricing.family_of(tile, jnp.bfloat16).registers(tile.warpgroups)
         assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < budget
-        narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2, family='wgmma')
+        narrow, wide = (tiling.Tiles(128, width, 64, 2, 1, warpgroups=2, family='wgmma')
                         for width in (128, 256))
         assert launch.legal(exact, narrow, target) and launch.legal(plain, narrow, target)  # 128 a thread
         assert not launch.legal(exact, wide, target) and launch.legal(plain, wide, target)  # 256
@@ -2460,7 +2460,7 @@ def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name
     multiprocessors = generation.gpu_target(generation_name).multiprocessors
 
     def case(stages):
-        tiles = mosaic_gpu.Tiles(128, 64, 64, stages, 1, family=family)
+        tiles = tiling.Tiles(128, 64, 64, stages, 1, family=family)
 
         def call():
             if product == "forward":
@@ -2486,7 +2486,7 @@ def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name
     launch = grouped_matmul.MosaicGmm() if product == "forward" else grouped_matmul.MosaicTgmm()
     options = ({"out_dtype": "bfloat16", "trans_rhs": False} if product == "forward"
                else {"out_dtype": "float32", "dense": True})
-    tiles = mosaic_gpu.Tiles(128, 64, 64, 2, 1, family=family)
+    tiles = tiling.Tiles(128, 64, 64, 2, 1, family=family)
     target = generation.gpu_target(generation_name)
     with generation.assumed(generation_name):
         bound = launch.bind(*shapes, interpret=False, **options)

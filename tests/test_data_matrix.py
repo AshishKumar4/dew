@@ -107,6 +107,11 @@ def saved_at_third_step(run: Path, directory: Path) -> None:
                     ignore=lambda at, names: [str(2 * STEPS)] if Path(at).name == "matrix" else [])
 
 
+# A row's two resumes, on the count that saved it and on the other, share its saving pool (`trained`) in one
+# CI group, but where the pair outgrows the group target (the streamed rejecting rows read by four, the
+# published packed rows, the indexed cached rows saved by one), each runs its own.
+@pytest.mark.shared_setup("trained", by=r"^(?!streamed,nocache,rejecting,rows-|indexed,published,rejecting,"
+                                       r"packed-|indexed,cache,all,rows-)[a-z,]+-saved-by-[0-9]-then-[0-9]")
 @pytest.mark.parametrize("resumed_by", ["same", "other"])
 @pytest.mark.parametrize("cell, saved_by, other", ROWS,
                          ids=[f"{cell}-saved-by-{saved}-then-{other}" for cell, saved, other in ROWS])

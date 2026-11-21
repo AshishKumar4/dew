@@ -93,6 +93,7 @@ from dew.nn.precision import (
     correctly_rounded_divide,
     float32_einsum,
     twice_scaled,
+    uncontracted,
 )
 from dew.nn.sharding import abstract
 
@@ -767,7 +768,7 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     multiplier = declared(reciprocal(safe) * E4M3_MAX)
     scale = reciprocal(multiplier)
     # The composed GPU forward must round this product before the FP8 cast.
-    quotients = jax.lax.optimization_barrier(values * multiplier)
+    (quotients,) = uncontracted(values * multiplier)
     broadcast_shape = (1,) * values.ndim
     quantized = _cast(qwix, quotients, jnp.float8_e4m3fn)
     quantized = quantized.replace(scale=scale.reshape(broadcast_shape))

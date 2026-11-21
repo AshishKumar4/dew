@@ -44,8 +44,6 @@ from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
 
-# The aligned sum is `dew.nn.aligned`'s; its callers read it here too.
-from dew.nn.aligned import aligned_sum as aligned_sum
 from dew.nn.derivatives import (
     Protected,
     bound_span,
@@ -96,6 +94,7 @@ __all__ = [
     "bf16_logits",
     "bf16_product",
     "biased",
+    "biased_value",
     "capped_logits",
     "compensated_add",
     "compensated_difference",
@@ -269,10 +268,12 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     return _biased(product, bias)
 
 
-def _biased_value(product: jax.Array, bias: jax.Array) -> jax.Array:
+def biased_value(product: jax.Array, bias: jax.Array) -> jax.Array:
     """`biased`'s value: `product` plus `bias` spread at fp32 (`broadcast_summed`) over the product's
     trailing axes, as flax's layers reshape it, so no rank is promoted implicitly; rounded back, it adds as
-    flax adds it (XLA folds the round trip, so the product and bias fuse as before)."""
+    flax adds it (XLA folds the round trip, so the product and bias fuse as before). Differentiated as it
+    is, its bias's gradient sums at fp32 (`broadcast_summed`'s): a projection's rule over its product and
+    bias together reads it so (`dew.nn.kernels.projections.dot_general`'s `bias`)."""
     dtype = jnp.result_type(product, bias)
     leading = product.ndim - bias.ndim
     spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)), dtype=dtype)
@@ -290,7 +291,7 @@ def _biased_tangent(primals, tangents):
     product, bias = primals
     d_product, d_bias = tangents
     d_product, d_bias = with_tangents_formed(d_product, d_bias)
-    value = _biased_value(product, bias)
+    value = biased_value(product, bias)
     dtype = value.dtype
     leading = product.ndim - bias.ndim
     terms = ([] if isinstance(d_product, SymbolicZero) else [d_product.astype(dtype)]) + (
@@ -303,7 +304,7 @@ def _biased_tangent(primals, tangents):
 
 
 _biased = contracted("test_a_biased_sum_holds_every_order")(
-    declared_tangent(Protected(), _biased_value, _biased_tangent, symbolic_zeros=True))
+    declared_tangent(Protected(), biased_value, _biased_tangent, symbolic_zeros=True))
 
 
 def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...], *,
@@ -1695,6 +1696,27 @@ correctly_rounded_divide_p.def_impl(_correctly_rounded_divide)
 correctly_rounded_divide_p.def_effectful_abstract_eval(jax.lax.div_p.abstract_eval)
 mlir.register_lowering(correctly_rounded_divide_p,
                        mlir.lower_fun(_correctly_rounded_divide, multiple_results=False))
+
+
+@functools.cache
+def triton_lowerings() -> None:
+    """Register `correctly_rounded_divide_p`'s Pallas Triton lowering lazily
+    (`dew.nn.kernels.launches.pallas_call`, row 9794) so importing `precision` loads no Pallas Triton
+    machinery."""
+    from jax._src.pallas.triton import lowering as triton_lowering
+    from jax.experimental.pallas import triton as pltriton
+
+    def divided(numerator, denominator):
+        numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
+        [quotient] = pltriton.elementwise_inline_asm(
+            "div.rn.f32 $0, $1, $2;", args=[numerator, denominator], constraints="=r,r,r", pack=1,
+            result_shape_dtypes=[jax.ShapeDtypeStruct(numerator.shape, numerator.dtype)])
+        return quotient
+
+    triton_lowering.register_lowering(correctly_rounded_divide_p)(
+        triton_lowering.lower_fun(divided, multiple_results=False))
+
+
 batching.defbroadcasting(correctly_rounded_divide_p)
 correctly_rounded_divide_p.elementwise = True
 # It rounds the quotient to float32 whatever its operands' dtype: at a wider width it is the quotient.

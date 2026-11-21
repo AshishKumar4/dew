@@ -3,8 +3,7 @@
 `aligned_sum` returns the exact sum of its terms' exact products, rounded once to nearest, ties to even. Its
 tangent and transpose are formed as its value is. `aligned_cotangents` returns the cotangents its transpose
 gives each factor, for a backward that takes no autodiff. Both run integer arithmetic on the factors' bits
-(`dew.nn.float_bits`), so a Pallas TPU kernel forms them in place. `dew.nn.precision` re-exports
-`aligned_sum`."""
+(`dew.nn.float_bits`), so a Pallas TPU kernel forms them in place."""
 
 from __future__ import annotations
 
@@ -248,10 +247,12 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
 
 
 def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
-    """The digits `_nearest` walks: a kernel's every one, else the nonzero limbs' and a carry's room."""
+    """The digits `_nearest` walks: a kernel's every one, and every one where a limb may lie across devices
+    (`_may_split`: the extrema of independent sums' limbs would be a collective across their shards, row
+    8841), else the nonzero limbs' and a carry's room."""
     from dew.nn.kernels.launches import interpreting
 
-    if interpreting() is not None:
+    if interpreting() is not None or _may_split(limb for product, _, _ in parts for limb in product.limbs):
         return 0, levels
     ints = jnp.dtype(f"int{limits.bits}")
     width = 2 * split_bits(limits.dtype)[2]
@@ -265,6 +266,19 @@ def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
     first = jnp.clip((least - lowest) // digit, 0, levels)
     last = jnp.clip((most + count.bit_length() + 2 - lowest) // digit + 2, 0, levels)
     return first, jnp.maximum(first, last)
+
+
+def _may_split(limbs) -> bool:
+    """Whether a limb may lie across devices: its type's sharding names a mesh axis (an Explicit one), or
+    the trace's mesh or its type's has an Auto axis of more than one device, which the compiler may split it
+    over and its type does not state."""
+    def split(mesh) -> bool:
+        return any(kind == jax.sharding.AxisType.Auto and size > 1
+                   for kind, size in zip(mesh.axis_types, mesh.axis_sizes, strict=True))
+
+    kinds = [jax.typeof(limb).sharding for limb in limbs]
+    return split(jax.sharding.get_abstract_mesh()) or any(
+        split(kind.mesh) or any(entry is not None for entry in kind.spec) for kind in kinds)
 
 
 def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> jax.Array:

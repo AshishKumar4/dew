@@ -251,7 +251,8 @@ class FourierEmbedding(nn.Module):
         # 2 pi times the table is one rounded vector, as it was when the table
         # was a trace-time constant. Without the barrier XLA folds the 2 pi
         # into whatever scalar the caller scaled `x` by (EDM's 1/4) and the
-        # sin/cos arguments round differently.
+        # sin/cos arguments round differently. A fence against that reassociation, which no marking of a
+        # multiply-add's contraction stands in for (`precision.uncontracted`'s), so the barrier itself.
         angular = jax.lax.optimization_barrier(2 * jnp.pi * self.frequencies.value)
         return sinusoids(x[:, None] * angular[None, :])
 

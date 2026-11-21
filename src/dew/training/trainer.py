@@ -751,18 +751,19 @@ class Trainer(Generic[Loss, Effects]):
         self._ahead_handed = None
 
     def _started(self, resume: Resume = "auto", known: Resumed | None = None) -> Start:
-        """What placing the state reads before it places anything: the objective's held tree and
-        the key, resolved once, so that the shapes and the values are the same inputs through the
-        same overridable method and the objective is asked for what it holds exactly once; the
-        state's shapes; the checkpoint a run resumes from as `resume` says (`Checkpoints.resumed`), the
-        one every process agrees; and the placement of the state, once its checks pass (`_validated`)."""
+        """What placing the state reads before it places anything: the objective's held tree and the key,
+        resolved once (the shapes and the values one input through one overridable method, the objective
+        asked once for what it holds); the state's shapes; the checkpoint a run resumes from as `resume` says
+        (`Checkpoints.resumed`), every process's alike; and its placement once checked (`_validated`)."""
         initializer, key = self.objective.initializer, self.key
         self._handed_ahead()
         if self.host_master:
             from dew.distributed.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
-        # Its kernels certified on the GPU the run targets, outside the mesh its step traces under (row 6824).
-        with report.targeting(self.device_mesh):
+        # Its kernels certified on the GPU the run targets, outside the mesh its step traces under (row 6824);
+        # a host step's start traced on the CPU companion it is built on (`placed_host`, row 10569).
+        with report.targeting(self.device_mesh), (jax.default_device(self.state_mesh.local_devices[0])
+                                                  if self.host_master else contextlib.nullcontext()):
             stated = self._step_key(self.objective, self._compiler)
             draw = traced_draw(self._staged_start, initializer, key, HELD_APART,
                                stated and (stated, self._start_owner()))
@@ -2486,8 +2487,7 @@ class Trainer(Generic[Loss, Effects]):
         The record's type names the phase, so a rank that failed to report is heard about at the report the
         pool was making, not at the next collective. `after` is the work the record reports, run first inside
         the same agreement: a rank whose work fails after its own coordination rounds (a checkpoint's position
-        gather, then its write) meets its
-        peers at this report, rather than skip it while they wait there."""
+        gather, then its write) meets its peers at this report, rather than skip it while they wait there."""
         def send() -> None:
             if after is not None:
                 after()

@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, tail as tail_of
 
 if TYPE_CHECKING:
-    from dew.nn.kernels.templates.gemm.mosaic_gpu import Tiles
+    from dew.nn.kernels.templates.gemm.tiling import Tiles
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:

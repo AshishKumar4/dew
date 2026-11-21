@@ -39,7 +39,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.linear import fork_start, forked_scan, over_sequence, sequence_entered, sequence_split
+from dew.nn.linear import Heads, fork_start, forked_scan, over_sequence, sequence_entered, sequence_split
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -182,9 +182,11 @@ class LightningAttention(nn.Module):
         if shards > 1:
             # Each shard runs its slice from the memory the earlier ones leave it (`_sequence_memory`); a
             # call split so is no decode call and holds no cache (`sequence_split`).
+            # Its heads split too, each its own memory (`Heads`).
             out = over_sequence(functools.partial(_sequence_memory, chunk_size=self.chunk_size,
                                                   max_segments=tokens.max_segments),
-                                shards, (query, key, value, log_decay, tokens.starts), ())
+                                shards, (query, key, value, log_decay, tokens.starts), (),
+                                heads=Heads(self.num_heads, self.num_heads, dict.fromkeys(range(4), 2)))
         else:
             if held is not None and length == 1:
                 out, _, final = recurrence.step_reference(LIGHTNING, recurrence.Step(

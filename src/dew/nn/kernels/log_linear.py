@@ -62,7 +62,7 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
     # Each token's position in its document, which its levels' blocks align to.
     positions = tokens - first
     documents = 1 if starts is None else length if max_segments is None else max_segments
-    out = _within(q, k, v, g, weights, positions, scale=scale, documents=documents)
+    out = _within(q, k, v, g, weights, positions, scale=scale, documents=documents, packed=starts is not None)
     hooks = recurrence.Hooks(decay='scalar', delta=False, scale=scale)
     for level in range(WITHIN.bit_length(), levels(length)):
         half = 1 << (level - 1)
@@ -79,25 +79,43 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
     return out.astype(dtype)
 
 
-def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
+def _within(q, k, v, g, weights, positions, *, scale: float, documents: int, packed: bool):
     """The pairs within each `WITHIN`-aligned block of a document's `positions` `[B, T]`, levels zero to
     `log2 WITHIN`: each token laid at its block's slot (a row's blocks in order, at most `ceil(T / WITHIN)`
     and its `documents` more), each block's reads the derived scan's (`scan.spread`, its decays
     `scan.between`), each pair's read times its query's weight of the pair's level, its output read back at
-    each token's slot."""
+    each token's slot; where no document is `packed` the row's tokens are its slots, its blocks the row padded
+    to whole blocks (a scatter and a gather of every operand and the output took 1.7 ms of a GH200's 4.7 ms
+    forward at Kimi's 64 value heads over 4096 tokens, M-JS-146ll)."""
     rows, length, groups, _ = q.shape
-    heads, offset = v.shape[2], positions % WITHIN
-    count = min(length, -(-length // WITHIN) + documents)
-    # A token's slot: its block (a row's blocks in order, one opening at each multiple of WITHIN) and offset.
-    slot = (jnp.cumsum(offset == 0, axis=1) - 1) * WITHIN + offset
-    each = jnp.arange(rows)[:, None]
+    heads = v.shape[2]
+    if packed:
+        offset = positions % WITHIN
+        count = min(length, -(-length // WITHIN) + documents)
+        # A token's slot: its block (a row's blocks in order, one opening at each multiple of WITHIN) and its
+        # offset.
+        slot = (jnp.cumsum(offset == 0, axis=1) - 1) * WITHIN + offset
+        each = jnp.arange(rows)[:, None]
 
-    def laid(x):
-        blocks = jnp.zeros((rows, count * WITHIN, *x.shape[2:]), x.dtype).at[each, slot].set(x)
-        return blocks.reshape(rows * count, WITHIN, *x.shape[2:])
+        def laid(x):
+            return jnp.zeros((rows, count * WITHIN, *x.shape[2:]), x.dtype).at[each, slot].set(x)
+
+        def unlaid(x):
+            return x[each, slot]
+    else:
+        count = -(-length // WITHIN)
+
+        def laid(x):
+            return jnp.pad(x, [(0, 0), (0, count * WITHIN - length), *[(0, 0)] * (x.ndim - 2)])
+
+        def unlaid(x):
+            return x[:, :length]
+
+    def blocked(x):
+        return laid(x).reshape(rows * count, WITHIN, *x.shape[2:])
 
     q, k = (jnp.repeat(x, heads // groups, axis=2) for x in (q, k))
-    q, k, v, g, weights = (laid(x) for x in (q, k, v, g, weights))
+    q, k, v, g, weights = (blocked(x) for x in (q, k, v, g, weights))
     # A pair's level: zero for a token's own key, else the bit length of their offsets' XOR (the exponent
     # `frexp` gives, 1 for 1, 0 for 0); past the sequence's levels, a pair of slots no token takes.
     offsets = np.arange(WITHIN)
@@ -109,4 +127,4 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
 
     # A block's heads, then every row's blocks.
     out = jax.vmap(jax.vmap(head, in_axes=1, out_axes=1))(q, k, v, g, weights)
-    return (scale * out).reshape(rows, count * WITHIN, heads, -1)[each, slot]
+    return unlaid((scale * out).reshape(rows, count * WITHIN, heads, -1))

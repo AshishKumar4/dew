@@ -1,5 +1,5 @@
 """A launch's body as every Mosaic GPU family's kernel builds it (`mosaic.kernel`, `Family.kernel`): run in
-Pallas's interpreter or natively (`interpreted`, and `interpreting` while its body traces, which every
+Pallas's interpreter or natively (`interpreted`; `launches.interpreting` while its body traces, which every
 family's products read), a dependent launch waiting for the one before it where the GPU has grid dependency
 control (`waits`, `dependent`), with its L2 prefetches issued before that wait (`prefetched`)."""
 
@@ -58,14 +58,6 @@ def dependent(entry: Callable, interpret, *, prefetched: Callable | None = None)
         plgpu.griddepcontrol_launch_dependents()
 
     return body
-
-
-def interpreting() -> bool:
-    """Whether the launch whose program is tracing runs in Pallas's interpreter (`launches.interpreting`): a
-    family's products issue no instruction the interpreter lacks there (mma.sync's sums,
-    `mosaic_sm80.Mma.products`), whatever a caller states (row 5209's A100 backward: products called with no
-    interpret flag issued mma.sync's)."""
-    return bool(launches.interpreting())
 
 
 def subnormals[T](compute: Callable[..., T], dtype) -> T:
