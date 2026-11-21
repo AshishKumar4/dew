@@ -155,7 +155,7 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
 
 
 def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, store_tiles, shares, part,
-              logits_stage, add_dq, index, slots, carry, accumulators):
+              logits_stage, add_dq, index, slots, carry, accumulators, *, masked: bool = True):
     """A dK/dV consumer's query tile `index`, its keys the tile's rows (`[bk, bq]`, FlashAttention 3's order,
     hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's SdP_swapAB): its scores `K Qᵀ` (the call's power taken after
     the product) and score cotangents from the query and output cotangent slots (`slots`) and its resident
@@ -198,13 +198,12 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
-    read = walk.places_read(masked=True)
+    read = walk.places_read(masked=masked)
     fused = add_dq is not None
     coords = coords_of(q_first, shape=shape, read=read)
     narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s, slots=slots), s, dp,
                                         rows_of(q_first, count),
-                                        (do_slot.dtype, q_slot.dtype), one_part=fused)
-    # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
+                                        (do_slot.dtype, q_slot.dtype), one_part=fused, masked=masked)
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = issued_into(family, dv_acc, narrowed if isinstance(narrowed, tuple) else (narrowed,), do_columns,
@@ -750,8 +749,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                         dq_ref, fused_stages),
                                   statistics=rows_of)
             # Each consumer's walk over the key block's readers (`Family.walk_own`).
-            run = (program.whole_run(k_first, q_steps, spans_of)
-                   if placing and consumers == placed.TURNS else None)
+            run = program.whole_run(k_first, q_steps, spans_of)
             key_sums, (dk, dv) = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(

@@ -158,9 +158,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    coords = (functools.partial(coords_of, q_first, read=walk.places_read(masked=masked))
-              if family.operands_in_registers
-              else coords_of(q_first, read=walk.places_read(masked=masked)))
+    coords = functools.partial(coords_of, q_first, read=walk.places_read(masked=masked))
     if q_slot.dtype == jnp.float16:
         return _sixteen_step(walk, k_smem, staged, add_dq, slots, carry, accumulators, q_first, _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
@@ -168,23 +166,17 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
                                   whole(index), shape, masked=masked)
     cotangents_staged = staged.at[1]
-    if not family.operands_in_registers:
-        # Stage P and dS before dQ so narrowed frees before dQ allocates, then fire dV and dK asynchronously
-        # so add_dq (register->SMEM copy + TMA reduceAdd) runs concurrently with dV and dK wgmma (row 5272).
-        family.staged(narrowed, staged.at[0])
-        family.staged(part, cotangents_staged)
-        dq = family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]))
-        dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
-        dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
-        add_dq(q_first, dq)
-        return carry, (dk_acc, dv_acc)
+    # Stage P and dS before dV/dK so narrowed and part free before products; on shared-memory-operand
+    # families (wgmma), issue dQ before dV/dK so add_dq overlaps with async dV/dK wgmma (row 5272).
     family.staged(narrowed, staged.at[0])
     family.staged(part, cotangents_staged)
+    dq = (None if family.operands_in_registers
+          else family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
     dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
-    # added into dQ: the query tile's other key blocks add theirs.
-    add_dq(q_first, family.looped_product(cotangents_staged, k_smem,
-                                          (tiles.block_q, k_smem.shape[-1])))
+    if dq is None:
+        dq = family.looped_product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]))
+    add_dq(q_first, dq)
     return carry, (dk_acc, dv_acc)
 
 def _sixteen_step(walk: _Backward, k_smem, staged, add_dq, slots, carry, accumulators, q_first,
@@ -239,10 +231,7 @@ def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, s
         def read(index, name, ref):
             return (family.rows_of(slots[name]) if index < streamed
                     else _rows(family, ref, row, head, first, block_q))
-        if family.operands_in_registers:
-            return tuple(functools.partial(read, index, name, ref)
-                         for index, (name, ref) in enumerate(zip(names, refs, strict=True)))
-        return tuple(read(index, name, ref)
+        return tuple(functools.partial(read, index, name, ref)
                      for index, (name, ref) in enumerate(zip(names, refs, strict=True)))
     return views, rows_of
 
