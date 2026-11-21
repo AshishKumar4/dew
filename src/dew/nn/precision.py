@@ -485,7 +485,8 @@ def _exp_value(base2: bool, x) -> jax.Array:
     return power2(summed, n, reach=150)
 
 
-def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
+def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None, *,
+           flushing: bool = False) -> jax.Array:
     """`x * 2^k` for an integral `k` of any size, exactly wherever `x` and the result are normal values of
     its format (`x`'s, at least float32's, `at_least_fp32`), by exact powers of two of `k`'s sign
     (`exact_power2`), `k` held within `reach` (by default the format's saturating bound, 279 in float32):
@@ -499,7 +500,13 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     pullback, which applies the same factors in reverse before it sums a broadcast operand's cotangent
     (base review 44e282c4f F1).
     Within it, a caller stating its `reach` takes `k`'s two halves, each built as its product takes it, one
-    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half."""
+    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half.
+
+    `flushing` flushes a subnormal `x` and a subnormal result to zero of its sign on every backend (as
+    `jnp.ldexp` does on XLA's CPU), its tangent the same linear map: a caller whose value must not rest on
+    whether a device keeps subnormals (guidance's row scaling, row 9710)."""
+    if flushing:
+        return _flushed(power2(_flushed(jnp.asarray(x, at_least_fp32(jnp.asarray(x).dtype))), k, reach))
     # Held at least in float32: an 8-bit float promotes implicitly to nothing.
     dtype = at_least_fp32(jnp.asarray(x).dtype)
     x = jnp.asarray(x, dtype)
@@ -524,6 +531,12 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
                       jnp.clip((k * np.float32(0.5)).astype(jnp.int32), least, -least))
     side = exact_power2(outer, dtype)
     return x * side * exact_power2(k.astype(jnp.int32) - 2 * outer, dtype) * side
+
+
+def _flushed(x: jax.Array) -> jax.Array:
+    """`x` with each subnormal value zero of its sign (`x * 0`, which keeps the sign), its tangent flushed
+    alike: a linear map in `x`."""
+    return jnp.where(jnp.abs(x) < jnp.finfo(x.dtype).tiny, x * 0, x)
 
 
 def scalar_power2(x: jax.Array, k: jax.Array) -> jax.Array:

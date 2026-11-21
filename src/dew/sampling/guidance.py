@@ -45,7 +45,7 @@ from dew.batch import Variables
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.precision import at_least_fp32, compensated_add, summed_pairs, two_product
+from dew.nn.precision import at_least_fp32, compensated_add, power2, summed_pairs, two_product
 from dew.sampling.solvers.common import given
 
 Pair = tuple[jax.Array, jax.Array]
@@ -318,7 +318,7 @@ def _projected_components(direction, output):
     # Finite inputs cannot overflow either dot product before the quotient removes their scale.
     vector, vector_exponent = _row_scaled(vector)
     conditioned, output_exponent = _row_scaled(conditioned)
-    floor = jnp.ldexp(jnp.asarray(1e-24, dtype), -2 * output_exponent)
+    floor = power2(jnp.asarray(1e-24, dtype), -2 * output_exponent, flushing=True)
 
     def summed(left, right):
         high, low = summed_pairs(two_product(left, right), axes)
@@ -336,19 +336,21 @@ def _projected_components(direction, output):
     parallel, parallel_lo = two_product(quotient, conditioned)
     parallel_lo = parallel_lo + correction * conditioned
     orthogonal, orthogonal_lo = compensated_add((vector, jnp.zeros_like(vector)), (-parallel, -parallel_lo))
-    orthogonal = jnp.ldexp(orthogonal + orthogonal_lo, vector_exponent).astype(output.dtype)
-    parallel = jnp.ldexp(parallel + parallel_lo, vector_exponent).astype(output.dtype)
+    orthogonal = power2(orthogonal + orthogonal_lo, vector_exponent, flushing=True).astype(output.dtype)
+    parallel = power2(parallel + parallel_lo, vector_exponent, flushing=True).astype(output.dtype)
     return orthogonal, parallel
 
 
 def _row_scaled(vector: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Each row of `vector` over 2**exponent, its largest entry's power of two where that passes one, and
     the exponent: powers of two move the exponent exactly, so a row's products and squares formed over
-    the scaled row cannot overflow where what they form is finite."""
+    the scaled row cannot overflow where what they form is finite. A lane scaled below the least normal is
+    zero of its sign on every device (`precision.power2`'s flushing, as every scaling of the projection
+    takes it), where `jnp.ldexp` flushed it on a CPU alone and a GPU kept it (row 9710)."""
     axes = tuple(range(1, vector.ndim))
     _, exponent = jnp.frexp(jnp.max(jnp.abs(vector), axis=axes, keepdims=True))
     exponent = jnp.maximum(exponent, 0)
-    return jnp.ldexp(vector, -exponent), exponent
+    return power2(vector, -exponent, flushing=True), exponent
 
 
 def _clipped(vector: jax.Array, threshold: float) -> jax.Array:
@@ -357,7 +359,8 @@ def _clipped(vector: jax.Array, threshold: float) -> jax.Array:
     finite row whose norm passes the dtype's largest is still clipped to its threshold."""
     scaled, exponent = _row_scaled(vector)
     norm = jnp.sqrt(jnp.sum(jnp.square(scaled), axis=tuple(range(1, vector.ndim)), keepdims=True))
-    return vector * jnp.minimum(1.0, jnp.ldexp(jnp.asarray(threshold, vector.dtype), -exponent) / norm)
+    limit = power2(jnp.asarray(threshold, vector.dtype), -exponent, flushing=True)
+    return vector * jnp.minimum(1.0, limit / norm)
 
 
 @struct.dataclass

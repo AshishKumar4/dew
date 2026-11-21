@@ -17,6 +17,8 @@
   (test_float64_terms).
 - A multiply-add marked to round alone rounds each step, as precision's unbarriered transforms take it
   (test_no_contract).
+- APG's projection flushes a lane its row scaling puts below the least normal, as on a CPU
+  (test_guidance).
 """
 
 import functools
@@ -27,6 +29,7 @@ import test_audio as audio
 import test_chunked_cross_entropy as chunked_cross_entropy
 import test_float64_terms as float64_terms_tests
 import test_fp8_base as fp8_base
+import test_guidance as guidance_tests
 import test_lowering as lowering
 import test_moe_precision as moe_precision
 import test_no_contract as no_contract
@@ -65,6 +68,8 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
         Cell("a power of two's scaling rounds a subnormal result once on a GPU",
              precision_policy.power2_rounds_a_subnormal_result_once, fault=OWN),
         Cell("a flow's scaling rounds a subnormal result once on a GPU", _flow_scaling, fault=OWN),
+        Cell("APG flushes a lane scaled below the least normal on a GPU",
+             guidance_tests.apg_flushes_a_lane_scaled_below_the_least_normal, fault=OWN),
         Cell("a multiply-add marked to round alone rounds each step on a GPU",
              no_contract.a_marked_multiply_add_rounds_each_step, fault=OWN),
         *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",

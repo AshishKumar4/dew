@@ -130,6 +130,35 @@ def test_finite_predictions_guide_finitely(guidance, conditional, unconditional,
     np.testing.assert_array_equal(clean, np.full(clean.shape, guided, clean.dtype))
 
 
+def apg_flushes_a_lane_scaled_below_the_least_normal():
+    """APG at a scale of 2, eta 0 and no clipping over a conditional `[2^120, 0]` and an unconditional `[0,
+    -2^-7]`: its direction `[2^120, 2^-7]` scaled by its row's power of two puts its second lane at
+    2^-128, below float32's least normal, which the projection flushes to zero of its sign on every device
+    (`precision.power2`'s flushing), so its orthogonal component there is zero and the guided row `[0,
+    -2^-7]`, where `jnp.ldexp` flushed it on a CPU and a GPU kept it, `+2^-7` there (row 9710). Compiled
+    as one program (`ahead_arm`), a GPU numerics cell too (tests/test_gpu_numerics.py)."""
+    from reference_error import ahead_arm
+
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+
+    def guided(conditional, unconditional):
+        denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
+                                   {"prediction": unconditional})
+        walk = APG(2.0, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
+        x = jnp.zeros_like(conditional)
+        return walk.step(x, jnp.ones(1), 0, walk.init(x))[0]
+
+    found = np.asarray(ahead_arm(jax.jit(guided), "APG over a lane scaled below the least normal")(
+        np.asarray([[2.0 ** 120, 0.0]], np.float32), np.asarray([[0.0, -2.0 ** -7]], np.float32)))
+    np.testing.assert_array_equal(found.view(np.uint32), np.asarray([[0.0, -2.0 ** -7]], np.float32).view(
+        np.uint32))
+
+
+def test_apg_flushes_a_lane_scaled_below_the_least_normal():
+    """`apg_flushes_a_lane_scaled_below_the_least_normal` on the CPU."""
+    apg_flushes_a_lane_scaled_below_the_least_normal()
+
+
 def test_apg_momentum_carries_a_direction_past_half_precision():
     """APG's running average of the direction keeps a finite fp16 walk's direction of 80000, past fp16's
     largest, so the next step clips the averaged 120000 to the same 15 along it: both steps guide -40000 to
