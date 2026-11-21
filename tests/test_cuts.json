@@ -52,13 +52,9 @@
 "tests/test_algebra_scan.py::test_the_delta_rules_carry_from_a_ranged_state_computes_its_token_scan[kimi_delta]"
 ],
 "tests/test_architectures.py": [
-"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-1-step-fsdp-one device]",
-"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-2-steps-data-layout]",
-"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-2-steps-data-one device]",
 "tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[unet_3d-1-step-data-layout]",
-"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[unet_3d-2-steps-fsdp-layout]",
 "tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+deepseek_v2]",
-"tests/test_architectures.py::test_a_unet_from_a_json_record_generates_what_its_value_twin_does",
+"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+deepseek_v2-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+gemma3n-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+gemma4_moe-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+llama4-1-step-fsdp]",
@@ -67,12 +63,11 @@
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[hybrid_dit-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_encoder-1-step-fsdp]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_encoder-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-1-step-stage]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_mmdit-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_udit-1-step-data]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[uvit-2-steps-data]"
+"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[uvit-1-step-fsdp]",
+"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[video_dit-2-steps-data]"
 ],
 "tests/test_armada_ci.py": [
 "tests/test_armada_ci.py::test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requirement",
@@ -896,6 +891,9 @@
 "tests/test_attention_witness.py": [
 "tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-full]"
 ],
+"tests/test_autoencoder.py": [
+"tests/test_autoencoder.py::test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone[sd_vae]"
+],
 "tests/test_barren_reads.py": [
 "tests/test_barren_reads.py::test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_reads_on",
 "tests/test_barren_reads.py::test_a_mixture_of_corpora_each_kept_in_one_workers_inputs_reads_on[streamed]",
@@ -1207,9 +1205,6 @@
 "tests/test_counted_passes.py": [
 "tests/test_counted_passes.py::test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one_steps_its_batches"
 ],
-"tests/test_cpu_only_jax.py": [
-"tests/test_cpu_only_jax.py::test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not[prepare-cpu]"
-],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_cached_document_reads_its_own_context_without_it[the layer's attention]",
 "tests/test_cross_attention.py::test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it",
@@ -1462,55 +1457,24 @@
 "tests/test_decode_attention.py::test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config[32-window-natural-4]"
 ],
 "tests/test_decoder_export.py": [
-"tests/test_decoder_export.py::test_a_model_its_family_config_cannot_carry_is_refused_at_export[gemma4-ple-changed2]",
+"tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[deepseek_v2]",
 "tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[deepseek_v32]",
+"tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[deepseek_v3]",
 "tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[deepseek_v4]",
+"tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[glm4_moe]",
 "tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[glm5_next]",
 "tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[glm_moe_dsa]",
 "tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[kimi_k25]",
+"tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[kimi_k2]",
+"tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[mixtral]",
+"tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[qwen3_moe]",
 "tests/test_decoder_export.py::test_a_rotated_expert_index_writes_a_model_that_disagrees[qwen3_next]",
-"tests/test_decoder_export.py::test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did[native_geometry]",
+"tests/test_decoder_export.py::test_a_sharded_export_holds_a_few_shards_on_the_host",
 "tests/test_decoder_export.py::test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did[released]",
-"tests/test_decoder_export.py::test_a_standalone_glm5_exports_prediction_depths_whose_logits_are_its_own[released]",
-"tests/test_decoder_export.py::test_an_expert_index_past_the_stack_is_refused[deepseek_v4]",
-"tests/test_decoder_export.py::test_an_expert_index_past_the_stack_is_refused[glm5_next]",
-"tests/test_decoder_export.py::test_an_expert_index_past_the_stack_is_refused[glm_moe_dsa]",
-"tests/test_decoder_export.py::test_an_expert_index_past_the_stack_is_refused[mixtral]",
 "tests/test_decoder_export.py::test_deepseek_v4_trained_mtp_export_matches_reference",
-"tests/test_decoder_export.py::test_every_source_tensor_is_bound_or_retained_and_written_back[deepseek_v2]",
-"tests/test_decoder_export.py::test_every_source_tensor_is_bound_or_retained_and_written_back[deepseek_v4]",
-"tests/test_decoder_export.py::test_every_source_tensor_is_bound_or_retained_and_written_back[glm5_next]",
-"tests/test_decoder_export.py::test_every_source_tensor_is_bound_or_retained_and_written_back[glm_moe_dsa]",
-"tests/test_decoder_export.py::test_every_source_tensor_is_bound_or_retained_and_written_back[mamba2]",
-"tests/test_decoder_export.py::test_every_source_tensor_is_bound_or_retained_and_written_back[qwen3_next]",
-"tests/test_decoder_export.py::test_glm5_next_trained_prediction_depth_reads_its_export",
-"tests/test_decoder_export.py::test_standalone_gemma4_export_preserves_computation[gemma4-kvshare-frozen-False]",
-"tests/test_decoder_export.py::test_standalone_glm5_export_preserves_native_and_source_computation[released]",
-"tests/test_decoder_export.py::test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export[deepseek_v4]",
-"tests/test_decoder_export.py::test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export[glm4_moe]",
-"tests/test_decoder_export.py::test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export[glm5_next]",
-"tests/test_decoder_export.py::test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export[glm_moe_dsa]",
-"tests/test_decoder_export.py::test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export[kimi_k25]",
-"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[deepseek_v3]",
-"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[glm4_moe]",
-"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[glm_moe_dsa]",
-"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[gpt_neox]",
-"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[mixtral]",
-"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[qwen3_next]",
-"tests/test_decoder_export.py::test_the_gradients_match_the_reference_implementation[qwen3_next]",
-"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[deepseek_v2]",
-"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[deepseek_v4]",
-"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[glm4_moe]",
-"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[glm5_next]",
-"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[glm_moe_dsa]",
-"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[kimi_k2]",
-"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[qwen3_moe]",
-"tests/test_decoder_export.py::test_transformers_reads_the_trained_export[deepseek_v3]",
-"tests/test_decoder_export.py::test_transformers_reads_the_trained_export[glm4_moe]",
-"tests/test_decoder_export.py::test_transformers_reads_the_trained_export[glm5_next]",
-"tests/test_decoder_export.py::test_transformers_reads_the_trained_export[glm_moe_dsa]",
-"tests/test_decoder_export.py::test_transformers_reads_the_trained_export[llama4_text]",
-"tests/test_decoder_export.py::test_transformers_reads_the_trained_export[qwen3_next]"
+"tests/test_decoder_export.py::test_every_source_tensor_is_bound_or_retained_and_written_back[llama4_text]",
+"tests/test_decoder_export.py::test_every_source_tensor_is_bound_or_retained_and_written_back[olmo3]",
+"tests/test_decoder_export.py::test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors"
 ],
 "tests/test_decoder_remat.py": [
 "tests/test_decoder_remat.py::test_named_policies_train_the_same_model_as_full[False-minimal_offloaded]",
@@ -2324,9 +2288,6 @@
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[deepseek_widths]",
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[gemma4]"
 ],
-"tests/test_layout_counts.py": [
-"tests/test_layout_counts.py::test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read[first-fit-2-indexed]"
-],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
 ],
@@ -2774,28 +2735,28 @@
 "tests/test_narrow.py::test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recomputes"
 ],
 "tests/test_native_diffusion.py": [
+"tests/test_native_diffusion.py::test_an_autoencoder_the_pipeline_index_omits_exports_by_diffusers_names",
 "tests/test_native_diffusion.py::test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid[lms]",
 "tests/test_native_diffusion.py::test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid[shipped]",
 "tests/test_native_diffusion.py::test_caption_dropout_keeps_mask_conditioned_gradients",
+"tests/test_native_diffusion.py::test_checkpoint_policy_controls_omitted_negative_conditioning",
 "tests/test_native_diffusion.py::test_multilevel_unet_geometry_and_input_gradient[refiner]",
 "tests/test_native_diffusion.py::test_multilevel_unet_geometry_and_input_gradient[sd1]",
 "tests/test_native_diffusion.py::test_multilevel_unet_geometry_and_input_gradient[sd2]",
 "tests/test_native_diffusion.py::test_multilevel_unet_geometry_and_input_gradient[sdxl-inpaint]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[img2img-update]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[inpaint-update]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[refiner-update]",
+"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[img2img]",
+"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[inpaint]",
+"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[refiner]",
 "tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[safety-update]",
 "tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[safety-walk]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[sd-update]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[sd-walk]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl-img2img-update]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl-img2img-walk]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl-inpaint-update]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl-inpaint-walk]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl-update]",
-"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl-walk]",
+"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[sd]",
+"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl-img2img]",
+"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl-inpaint]",
+"tests/test_native_diffusion.py::test_native_bundle_trajectory_update_and_source_roundtrip[xl]",
 "tests/test_native_diffusion.py::test_native_solver_consumes_the_complete_source_grid[dpm]",
 "tests/test_native_diffusion.py::test_public_diffusion_export_preserves_mapped_snapshot_when_republished",
+"tests/test_native_diffusion.py::test_raw_and_prepared_native_inputs_agree[xl]",
+"tests/test_native_diffusion.py::test_source_roundtrip_preserves_generation_geometry",
 "tests/test_native_diffusion.py::test_the_sdxl_base_hands_its_partial_walk_to_the_refiner_as_diffusers_does"
 ],
 "tests/test_native_diffusion_edges.py": [
@@ -3299,6 +3260,9 @@
 "tests/test_ring_protocol.py::test_a_gathered_walk_over_the_load_warps_holds_every_property_in_every_interleaving[stages2-tiles3]",
 "tests/test_ring_protocol.py::test_a_load_warp_reading_entries_no_fill_wrote_is_caught",
 "tests/test_ring_protocol.py::test_the_ring_familys_walk_holds_every_property_in_every_interleaving[stages1-consumers2-tiles(3,)-inflight0-stepped]"
+],
+"tests/test_rl_contracts.py": [
+"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[DPOObjective]"
 ],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
