@@ -1707,7 +1707,7 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None, orders=None, examples: bool = False,
               conditioning: bool = False, conditioning_scale=None, followed=None, arms: tuple | None = None,
-              written: bool = False) -> int:
+              written: bool = False, progress=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
     (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
@@ -1741,7 +1741,8 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it.
     `arms`, where given, are the pair as compiled (Dew's and the reference's, a store's, `_stored_arms`; with
     `written` the reference's twin as written), taken in place of compiling them here, an arm computing in
-    NumPy refused where they were made."""
+    NumPy refused where they were made. `progress`, where given, is told each count before its draws are
+    drawn (`parity.Sized`)."""
     if COMPILED.get() is not None:
         raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths' programs no "
                          "prepare compiled")
@@ -1777,7 +1778,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None,
                       conditioning=weighing, followed=followed)[0]
 
-    return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None)
+    return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None, progress=progress)
 
 
 def recording(path) -> dict[str, np.ndarray]:
