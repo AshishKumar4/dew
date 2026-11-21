@@ -275,6 +275,18 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
     return _read(lowered, call, unrun=unrun)
 
 
+def read_operations[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each operation of a lowered program's StableHLO module, every region's (a
+    reduction's body among them, a function no run reaches too), each once, in the order JAX lowered them
+    (`_read`): the operations it makes something of."""
+    return [made for made, _ in _read(lowered, read, unrun=True)]
+
+
+def frontend_attributes(operation: ir.Operation) -> dict[str, str]:
+    """An operation's frontend attributes (`mhlo.frontend_attributes`), each its string."""
+    return _frontend(operation.attributes)
+
+
 def operations(lowered: jax.stages.Lowered) -> list[str]:
     """The name of every operation a lowered program's StableHLO module holds, as lowered (`_read`), each once
     (a collective a `shard_map` body issues among them, `stablehlo.all_gather`)."""

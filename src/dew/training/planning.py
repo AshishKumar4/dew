@@ -1009,7 +1009,8 @@ class FitSearch[LossT, EffectsT]:
         with spending(candidate) as spent:
             began = time.perf_counter()
             early, firsts, relowered = None, [], None
-            kept = held(self.compiled_key(candidate.lowered, options))
+            looked = self.compiled_key(candidate.lowered, options)
+            kept = held(looked)
             if ahead is not None:
                 executable, self.ahead = ahead.taken(candidate.lowered), None
             elif candidate.sampled is None and kept is not None:
@@ -1025,7 +1026,9 @@ class FitSearch[LossT, EffectsT]:
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
             fit, headroom = self.fitting(executable, candidate)
-            key = self.compiled_key(candidate.lowered, options)
+            # Its lowering's own key, derived again only where a spill relowered it.
+            key = looked if relowered is None or relowered.last is None else self.compiled_key(
+                candidate.lowered, options)
             if relowered is not None and executable is not None and (fit or self.provisional):
                 # Under the program it compiled: the relowered one past a spill, which a plan after it lowers
                 # directly, the spill's refusal held for the process. One that misses on the devices the

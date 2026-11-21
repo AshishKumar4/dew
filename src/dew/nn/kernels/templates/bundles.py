@@ -3,7 +3,7 @@ from shared components rather than one bundle a generation: a matrix issuer with
 execution (mma.sync's warps into registers, `mosaic_sm80.MmaIssuer`; wgmma's warpgroups into registers,
 `mosaic_sm90.WgmmaIssuer`; tcgen05's warp into tensor memory with its 2-CTA pairs and block scales,
 `mosaic_sm100.Tcgen05Issuer`; a TPU core's MXU) and a loader (cp.async, `mosaic_sm80.CpAsync`; TMA rings a
-producer fills, `mosaic.RingFamily`, multicast across a cluster; TMA rings their consumers fill,
+producer fills, `ring_family.RingFamily`, multicast across a cluster; TMA rings their consumers fill,
 `fed.ConsumerFed`; a TPU core's VMEM rings). Each composition reuses its components and overrides only what
 differs: `mosaic_sm80.Mma` (mma.sync on cp.async), `MmaFed` (mma.sync on consumer-fed TMA rings),
 `mosaic_sm90.WGMMA` and `FED` (wgmma on producer- and consumer-fed rings), `mosaic_sm100.RINGS`, `PAIR` and
@@ -24,7 +24,16 @@ from collections.abc import Callable
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import fed, mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100, mosaic_tpu, placed
+from dew.nn.kernels.templates import (
+    fed,
+    mosaic,
+    mosaic_sm80,
+    mosaic_sm90,
+    mosaic_sm100,
+    mosaic_tpu,
+    placed,
+    ring_family,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,14 +56,14 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
 
 
 @dataclasses.dataclass(frozen=True)
-class MmaProduced(mosaic_sm80.MmaIssuer, mosaic.RingFamily):
+class MmaProduced(mosaic_sm80.MmaIssuer, ring_family.RingFamily):
     """mma.sync's issuer and register home (`mosaic_sm80.MmaIssuer`) on TMA rings a producer warpgroup fills
-    (`mosaic.RingFamily`), on every device that moves its blocks by TMA (`legal`), composed from the two and
-    no template's: the layout a launch that streams through a producer takes on a device whose mma.sync has
-    no other (an attention backward's dQ launch, `attention_mosaic_program.runs_backward`, on consumer
+    (`ring_family.RingFamily`), on every device that moves its blocks by TMA (`legal`), composed from the two
+    and no template's: the layout a launch that streams through a producer takes on a device whose mma.sync
+    has no other (an attention backward's dQ launch, `attention_mosaic_program.runs_backward`, on consumer
     Blackwell, whose cp.async Mosaic lowers no wait for and whose fed layout holds no backward of Qwen3-8B's
-    widths). One consumer a program, as `MmaFed`'s; after it among mma.sync's compositions, so a launch
-    that derives on the fed layout keeps it, and taken by a launch that states it streams through a producer
+    widths). One consumer a program, as `MmaFed`'s; after it among mma.sync's compositions, so a launch that
+    derives on the fed layout keeps it, and taken by a launch that states it streams through a producer
     (`Launch.produced`) alone: a decode step, whose rows prefer mma.sync's 16 (`layouts`), would otherwise
     leave its own issuer's walk for this one on a Hopper or a B200 unmeasured, its fp32 parts past its model
     (the decode gate's six fp32 cells on sm90, sm100 and sm103)."""
@@ -151,7 +160,7 @@ def legal(family: mosaic.Family, architecture: generation.Architecture) -> bool:
     lowers for no TMA device), its cluster within the multiprocessors the device's multicast reaches
     (`Architecture.cluster`), its block-scaled products where its tensor instructions read such operands
     (`Architecture.block_scales`)."""
-    copies = {mosaic.RingFamily: True, mosaic_sm80.CpAsync: False}
+    copies = {ring_family.RingFamily: True, mosaic_sm80.CpAsync: False}
     by_tma = next((tma for loader, tma in copies.items() if isinstance(family, loader)), architecture.tma)
     return (by_tma == architecture.tma and family.cluster <= architecture.cluster
             and (architecture.block_scales or not family.block_formats))

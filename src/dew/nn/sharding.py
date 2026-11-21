@@ -545,18 +545,28 @@ def shard_shapes(operands: Sequence[jax.Array], specs) -> tuple[jax.ShapeDtypeSt
 
 def on_shards(local: Callable, spec: jax.sharding.PartitionSpec, operands: Sequence[jax.Array | None],
               whole: Collection[int] = (), out_specs=None, gathered: Mapping[int, jax.sharding.PartitionSpec]
-              = types.MappingProxyType({})):
+              = types.MappingProxyType({}), heads: Mapping[int, int] = types.MappingProxyType({}),
+              split: MeshAxes = None):
     """`local(*operands)` on each shard (`manual_map`), each operand placed by its role: as `spec` along its
     leading dimensions (a token mask `[B, S]` beside activations `[B, S, D]`), whole on every shard where
     its index is in `whole` (a weight or a conv's taps, whose gradient the transpose sums over the
     shards), where its parameter is placed (`gathered`, by index: a projection's weight where its layout
     puts it, `dew.distributed.placement.Layout.leaf_spec`) and gathered whole in the map, so its gradient
     leaves it summed over the shards and scattered back to that placement (the gather's transpose, a
-    reduce-scatter), or absent (None); the outputs placed as `out_specs`, `spec` unless given (row 1923: one
-    builder of a kernel's per-shard specs from its operands' roles)."""
-    specs = tuple(None if operand is None else gathered[index] if index in gathered
-                  else jax.sharding.PartitionSpec() if index in whole
-                  else jax.sharding.PartitionSpec(*spec[:operand.ndim])
+    reduce-scatter), or absent (None); and split over `split` along the dimension `heads` names by index
+    besides (a mixer's heads, a token's at 2 and a channel weight's at 0, `sequence_heads`); the outputs
+    placed as `out_specs`, `spec` unless given (row 1923: one builder of a kernel's per-shard specs from its
+    operands' roles)."""
+    def placed(index: int, operand: jax.Array) -> jax.sharding.PartitionSpec:
+        if index in gathered:
+            return gathered[index]
+        entries = [] if index in whole else list(spec[:operand.ndim])
+        if index in heads:
+            entries += [None] * (heads[index] + 1 - len(entries))
+            entries[heads[index]] = split
+        return jax.sharding.PartitionSpec(*entries)
+
+    specs = tuple(None if operand is None else placed(index, operand)
                   for index, operand in enumerate(operands))
 
     def held(*operands):
@@ -576,15 +586,36 @@ def _gathered_whole(operand: jax.Array, spec: jax.sharding.PartitionSpec) -> jax
 
 def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:
     """The mesh axes the rule table splits a `[B, T, H, ...]` activation's rows and heads over
-    (`HEADS`), its heads whole where their split does not divide the `groups` they read (a delta
-    rule's key heads, Mamba-2's B and C), so no group's gradient is summed across shards: a
+    (`HEADS`), its heads whole where their split does not divide the `groups` they read (`_dividing`): a
     per-shard kernel's placement (`manual_map`)."""
     spec = logical_spec(HEADS, shape)
     rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
+    return rows, _dividing(heads, groups)
+
+
+def sequence_heads(batch: int, length: int, heads: int, groups: int) -> tuple[MeshAxes, MeshAxes, MeshAxes]:
+    """The mesh axes a split over the sequence (`dew.nn.linear.over_sequence`) places a `[B, S, H, ...]`
+    activation's rows, sequence and heads over: the rows and the sequence as the rule table places a
+    `[batch, length, ...]` activation, the heads by their rule read with the axes those and a pipeline
+    stage's vmap hold set aside (a rule naming them takes what it has left, or its next where none), whole
+    where their split does not divide the `groups` they read (`_dividing`). The one statement of it for
+    every recurrent mixer's split: where a tensor axis held every head whole, each of its devices ran the
+    whole mixer's conv and scan (row 1437, train 1108's F1)."""
+    rows, sequence = logical_spec(("activation_batch", "activation_length"), (batch, length))
+    taken = {*mesh_axes(rows), *mesh_axes(sequence), *((STAGE_AXIS,) if in_pipeline_stage() else ())}
+    left = tuple((name, None if assignment is None else tuple(axis for axis in mesh_axes(assignment)
+                                                              if axis not in taken))
+                 for name, assignment in axis_rules())
+    split = mesh_axes((*logical_spec(("activation_heads",), (heads,), rules=left), None)[0])
+    return rows, sequence, _dividing(split or None, groups)
+
+
+def _dividing(heads: MeshAxes, groups: int) -> MeshAxes:
+    """`heads`, the mesh axes splitting a call's heads, where their split divides the `groups` its heads read
+    (a delta rule's key heads, Mamba-2's B and C), else None (the heads whole), so no group's gradient is
+    summed across shards."""
     mesh = jax.sharding.get_abstract_mesh()
-    if groups % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
-        heads = None
-    return rows, heads
+    return None if groups % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)) else heads
 
 
 def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:

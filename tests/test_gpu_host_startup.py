@@ -48,11 +48,14 @@ import jax
 from dew.distributed.batches import batch_shardings
 from dew.telemetry.compiles import executable_only
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+from dew.training.ahead import step_batch
 
 count_compilation_cache()
 trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
 state, _, _ = trainer.place()
-batch = {"text": jnp.asarray(TOKENS)}
+# The batch as `fit` hands its step one (`step_batch`), as the prepare compiled for it (rows 8372, 8446: the
+# raw batch made the start, the begun step and its end other programs than the prepared ones).
+batch = step_batch(trainer, {"text": jnp.asarray(TOKENS)})
 batch = jax.device_put(batch, batch_shardings(trainer.device_mesh, batch))
 before, at = compilation_cache_counts(), len(KEYED.programs)
 step = trainer.compile(state, batch)

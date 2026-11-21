@@ -43,17 +43,6 @@ TILES = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4,
 
 
 @pytest.fixture(autouse=True)
-def _released_as_each_test_ends():
-    """Each test's compiled executables released as it ends (`conftest.release`), where the file's releases
-    them at its end alone: a group of its merge cells holding every earlier cell's compiled programs, each a
-    jit and an as-written program over its seeds, was killed at 10 GiB on armada."""
-    import conftest
-
-    yield
-    conftest.release()
-
-
-@pytest.fixture(autouse=True)
 def _interpreted_as_an_a100():
     """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the frozen
     Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
@@ -1134,21 +1123,23 @@ def _scaled_masses(totals, *others):
     return tuple(jnp.ldexp(x, -exponent) for x in (totals, *others))
 
 
-def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int) -> None:
+def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int,
+                                run: str | None = None) -> None:
     """`ours` on par with `reference` against float64 (check 1), jitted and as written: its compiler
     rewrites a quotient divided again into one over the divisors' product, a division by a broadcast into a
     product with its reciprocal and a sum of products into one of unrounded products, so each order is held
     as written and as compiled. As written is op by op (`as_given`, which the gate runs uncompiled) where the
     draw reaches fp32's subnormals (`_reaches_subnormals`), which XLA's CPU keeps one primitive at a time and
     flushes in a compiled program (row 4023); compiled with no rewrite, its products held from any fused
-    multiply-add (`arm_arithmetic.as_written`, `products_held`, its own program run as given) for every
-    other draw, where op by op compiled each primitive of the merge's windows apart (the cotangent cell
-    6.81 GiB op by op, 1.28 jitted). The reference runs op by op, so none of those rewrites reaches the bar
-    it sets (row 6909: a compiled reference summing products shared Dew's error)."""
-    written = as_given(ours if getattr(draw, "reaches_subnormals", False)
-                       else jax.jit(products_held(ours), compiler_options=as_written()))
-    for program, run in ((jax.jit(ours), "jitted"), (written, "as written")):
-        assert_as_exact(program, as_given(reference), draw, f"{label} {run}", seeds=seeds)
+    multiply-add (`arm_arithmetic.as_written`, `products_held`, its own program run as given) for every other
+    draw, where op by op compiled each primitive of the merge's windows apart (the cotangent cell 6.81 GiB op
+    by op, 1.28 jitted). The reference runs op by op, so none of those rewrites reaches the bar it sets (row
+    6909: a compiled reference summing products shared Dew's error)."""
+    reaches = getattr(draw, "reaches_subnormals", False)
+    written = as_given(ours if reaches else jax.jit(products_held(ours), compiler_options=as_written()))
+    for program, mode in ((jax.jit(ours), "jitted"), (written, "as written")):
+        if run is None or run == mode:
+            assert_as_exact(program, as_given(reference), draw, f"{label} {mode}", seeds=seeds)
 
 
 @pytest.mark.parametrize("draw", [_masses_past_fp32s_largest, _masses_near_fp32s_largest],
@@ -1277,13 +1268,14 @@ def test_the_merges_derivative_as_to_its_denominators_is_on_par(draw):
                                 seeds=DERIVATIVE_SEEDS)
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("draw", [_opposite_near_largest, _subunit_masses_of_alternate_signs,
                                   _subunit_masses_under_large_outputs, _masses_past_fp32s_largest,
                                   _masses_near_fp32s_largest],
                          ids=["opposite-near-largest", "subunit-masses-of-alternate-signs",
                               "subunit-masses-under-large-outputs", "masses-past-fp32s-largest",
                               "masses-near-fp32s-largest"])
-def test_the_merges_derivative_along_its_denominators_is_on_par(draw):
+def test_the_merges_derivative_along_its_denominators_is_on_par(draw, run):
     """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along its
     denominators, every other one's direction an eighth of it, on par with the mean's own formed in fp32 as
     (sum(d o / L) - out sum(d / L)) over the masses' sum over L, a power of two near their largest
@@ -1305,7 +1297,7 @@ def test_the_merges_derivative_along_its_denominators_is_on_par(draw):
         return ((jnp.sum(directions * outputs) - out * jnp.sum(directions)) / jnp.sum(shares))[None, None]
 
     _on_par_jitted_and_op_by_op(ours, reference, draw, f"the merge's derivative along, {draw.__name__}",
-                                seeds=ALONG_SEEDS)
+                                seeds=ALONG_SEEDS, run=run)
 
 
 def _opposite_near_largest_over_unequal_masses(seed):
@@ -1339,12 +1331,13 @@ def _tiny_and_huge_masses_along_the_tiny(seed):
     return outputs, totals.astype(jnp.float32), jnp.zeros(2, jnp.float32).at[0].set(first)
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("draw", [_along_one_to_two(_opposite_near_largest_over_unequal_masses),
                                   _along_one_to_two(_subunit_masses_of_alternate_signs),
                                   _tiny_and_huge_masses_along_the_tiny],
                          ids=["opposite-near-largest-over-unequal-masses",
                               "subunit-masses-of-alternate-signs", "tiny-and-huge-masses-along-the-tiny"])
-def test_the_merges_derivative_along_its_outputs_is_on_par(draw):
+def test_the_merges_derivative_along_its_outputs_is_on_par(draw, run):
     """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along drawn
     directions of its outputs alone, on par with sum(w d) / sum(w) formed in fp32, against float64 (check
     1): its masses' tangents inactive form no term, where a zero times a mass coefficient past fp32's
@@ -1360,7 +1353,7 @@ def test_the_merges_derivative_along_its_outputs_is_on_par(draw):
 
     _on_par_jitted_and_op_by_op(ours, reference, draw,
                                 f"the merge's derivative along its outputs, {draw.__name__}",
-                                seeds=ALONG_SEEDS)
+                                seeds=ALONG_SEEDS, run=run)
 
 
 MERGE_EDGE_SEEDS = 512
@@ -1399,9 +1392,10 @@ def _a_subnormal_gap_along_units(seed):
     return outputs, totals.astype(jnp.float32), masses, along
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("draw", [_equal_outputs_along_large_directions, _a_subnormal_gap_along_units],
                          ids=["equal-outputs-along-large-directions", "a-subnormal-gap-along-units"])
-def test_the_merges_mixed_second_derivative_is_on_par(draw):
+def test_the_merges_mixed_second_derivative_is_on_par(draw, run):
     """The mixed second derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along
     drawn directions of its masses and its outputs, in both orders, on par with sum(dw (do - d out)) / W
     formed in fp32 over the masses' power of two (`_scaled_masses`), d out = sum(w do) / W, against float64
@@ -1426,7 +1420,7 @@ def test_the_merges_mixed_second_derivative_is_on_par(draw):
 
     _on_par_jitted_and_op_by_op(ours, reference, draw,
                                 f"the merge's mixed second derivative, {draw.__name__}",
-                                seeds=SECOND_ORDER_SEEDS)
+                                seeds=SECOND_ORDER_SEEDS, run=run)
 
 
 def _unit_masses_along_two(seed):
@@ -1482,13 +1476,14 @@ def _halves_over_masses(outputs, totals):
     return jnp.ldexp(outputs * 0.5 - out * 0.5, -exponent), summed
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("draw", [_unit_masses_along_two, _masses_past_2_127_along_their_own,
                                   _masses_near_2_126_along_least_normal,
                                   _unit_masses_under_small_outputs_along_2_127],
                          ids=["unit-masses-along-two", "masses-past-2^127-along-their-own",
                               "masses-near-2^126-along-least-normal",
                               "unit-masses-under-small-outputs-along-2^127"])
-def test_the_merges_derivative_along_drawn_directions_is_on_par(draw):
+def test_the_merges_derivative_along_drawn_directions_is_on_par(draw, run):
     """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along drawn
     tangents of its denominators, on par with sum(d (o - out)) / W formed in fp32 over the masses' power
     of two and the tangents' own, exactly (`_halves_over_masses`), against float64 (check 1): a forward
@@ -1507,7 +1502,7 @@ def test_the_merges_derivative_along_drawn_directions_is_on_par(draw):
 
     _on_par_jitted_and_op_by_op(ours, reference, draw,
                                 f"the merge's derivative along drawn directions, {draw.__name__}",
-                                seeds=MERGE_EDGE_SEEDS)
+                                seeds=MERGE_EDGE_SEEDS, run=run)
 
 
 def _masses_of_2_20_under_a_cotangent_of_16(seed):
@@ -1648,10 +1643,11 @@ def _subnormal_gap(seed):
             jax.random.normal(streams[4], ()))
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("order", ["mixed", "forward over reverse", "reverse over reverse"])
 @pytest.mark.parametrize("draw", [_zero_gap, _zero_mass, _subnormal_gap],
                          ids=["zero-gap", "zero-mass", "subnormal-gap"])
-def test_the_merges_derivatives_of_its_gradient_are_on_par(draw, order):
+def test_the_merges_derivatives_of_its_gradient_are_on_par(draw, order, run):
     """The derivatives of the gradient as to the masses of finished slices' merge (`algebra.finished_merged`,
     at one maximum) under a drawn cotangent c, each `order` its own program (one program of the three held
     an op-by-op run past 10 GiB): its jvp along drawn output directions d, c (d - sum(w d) / W) / W
@@ -1686,7 +1682,7 @@ def test_the_merges_derivatives_of_its_gradient_are_on_par(draw, order):
 
     _on_par_jitted_and_op_by_op(ours, reference, draw,
                                 f"the derivatives of the merge's gradient, {draw.__name__}, {order}",
-                                seeds=SECOND_ORDER_SEEDS)
+                                seeds=SECOND_ORDER_SEEDS, run=run)
 
 
 @_reaches_subnormals
@@ -1701,8 +1697,8 @@ def _slice_and_initial_near_fp32s_largest(seed):
 
 
 def test_a_decode_merge_from_an_initial_state_near_fp32s_largest_is_on_par():
-    """A split decode step's slice merged with the call's initial state (`algebra.merged_slices`, as
-    attention_decode merges them), both of masses from 2^126 to 2^127: on par with their outputs' convex
+    """A split decode step's slice merged with the call's initial state (`algebra.merged_state` + `finish`,
+    as attention_decode merges them), both of masses from 2^126 to 2^127: on par with their outputs' convex
     combination over the masses' power of two, the initial state's output its sums over its total, against
     float64 (check 1)."""
 
@@ -1710,8 +1706,9 @@ def test_a_decode_merge_from_an_initial_state_near_fp32s_largest_is_on_par():
         spec = algebra.Forward("spans", 1, ids=False, scale=1.0, natural=True, initial=True)
         initial = template.Initial(jnp.zeros((1, 1, 1)), totals[1].reshape(1, 1, 1),
                                    sums.reshape(1, 1, 1, 1))
-        return algebra.merged_slices(spec, outputs[0].reshape(1, 1, 1, 1, 1), jnp.zeros((1, 1, 1, 1)),
+        state = algebra.merged_state(spec, outputs[0].reshape(1, 1, 1, 1, 1), jnp.zeros((1, 1, 1, 1)),
                                      totals[0].reshape(1, 1, 1, 1), initial)
+        return algebra.finish(spec, state, initial=True, normalized=True)[0]
 
     def plain(outputs, totals, sums):
         shares, = _scaled_masses(totals)
@@ -1742,3 +1739,41 @@ def test_a_padded_query_walks_nothing_again_where_a_real_row_past_fp32_does(form
     later = jnp.asarray([0.0, 3.0, 1.0, 0.5, 2.0, 1e6, -jnp.inf, -jnp.inf], jnp.float32)
     sliced, _ = algebra.rewalks(spec, jnp.stack([maxima, later]))
     np.testing.assert_array_equal(np.asarray(sliced), [expected, [False] * 5 + [True, False, False]])
+
+
+def test_rescaled_uses_exact_power_of_two_constants_for_dropout_reach():
+    """`algebra.rescaled` scales a dropping call's bound by exact host power-of-two constants (row 10161),
+    never `jnp.exp2`, so the scaled bound is bitwise exact on XLA:CPU for both normal and wide reaches."""
+    for binades in (10, 50):
+        zero = jnp.int32(0)
+        drop = template.Draw((jnp.uint32(0), jnp.uint32(0)), zero, zero, 1.0 - 2.0 ** -binades)
+        assert np.log2(drop.reach) == binades
+        prior = jnp.array([1.5], jnp.float32)
+        state = algebra.Partial(jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32),
+                                jnp.ones((1,), jnp.float32),
+                                algebra.Scale(jnp.zeros((1,), jnp.float32), prior))
+        scale = jax.jit(lambda s, d=drop: algebra.rescaled(s, jnp.ones((1,), jnp.float32),
+                                                           lambda: jnp.zeros((1,), jnp.float32), d))(state)
+        assert scale is not None
+        np.testing.assert_array_equal(np.asarray(scale.bound), np.array([np.float32(1.5)], np.float32))
+    # Static exponents past fp32's normal range [-126, 127] split into exact normal host multiplies.
+    big = jnp.array([np.float32(1.5 * 2.0 ** 120)], jnp.float32)
+    down = jax.jit(lambda x: algebra.taken_back(x, -140))(big)
+    up = jax.jit(lambda x: algebra.taken_back(x, 140))(down)
+    np.testing.assert_array_equal(np.asarray(down), np.array([np.float32(1.5 * 2.0 ** -20)], np.float32))
+    np.testing.assert_array_equal(np.asarray(up), np.asarray(big))
+
+
+def test_taken_back_avoids_double_rounding_and_quotient_preserves_large_total_tangent():
+    """`taken_back` uses balanced normal factors so wide negative exponents do not double-round at the
+    subnormal boundary (row 10161), and `output_of` preserves finite tangents when total >= 2^126."""
+    x = jnp.array([np.nextafter(np.float32(2.0 ** 15), np.float32(np.inf))], jnp.float32)
+    got = jax.jit(lambda v: algebra.taken_back(v, -140))(x)
+    expected = np.nextafter(np.float32(2.0 ** -125), np.float32(np.inf))
+    np.testing.assert_array_equal(np.asarray(got), np.array([expected], np.float32))
+
+    big = jnp.array([np.float32(2.0 ** 126)], jnp.float32)
+    val, tan = jax.jit(lambda a, d: jax.jvp(
+        lambda u: algebra.output_of(u, d, guarded=False), (a,), (a,)))(big[:, None], big)
+    np.testing.assert_array_equal(np.asarray(val), np.ones((1, 1), np.float32))
+    np.testing.assert_array_equal(np.asarray(tan), np.ones((1, 1), np.float32))

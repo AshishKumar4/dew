@@ -57,13 +57,24 @@ RUN_SEEDS = 64
 """Check 1's declared seeds for a run updating in its backward against the whole step's update, sized by
 `seeds_for` paired on armada: the two updates share the layers' weights and moments, and the reference
 compared with itself does not resolve within 512 seeds."""
+RUN_CONDITIONING = 8
+"""The weighed check's declared seeds for the same site (`seeds_for(..., conditioning=True)` on armada):
+adamw's first step moves a weight by its rate times g / (|g| + eps), so at a gradient a few eps across the
+update turns on the gradient's last bits; where the unweighted check stays undecided, or one element rules
+a worst row, each element is weighed by the whole step's own rounding there (row 8752: a norm scale's
+element at seed 170, whose two float32 gradients were 1.98e-8 and 1.30e-8 from float64, ruled its row's
+worst on CUDA, the reference's own arithmetic against itself deciding the same rule red in 3 of 8 runs,
+row 10145)."""
 
 
-def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
+@pytest.mark.parametrize("barriered", [False, True], ids=["marked", "barriered"])
+def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would(barriered):
     """A scanned run of three layers that updates in its backward (`dew.nn.in_backward.scanned_run`) under
     adamw, each layer's update the optimizer's on the layer alone, moves each layer's weights as adamw's
     update of the whole tree a layer at a time moves them, on par with it (check 1): two programs, the scanned
-    one never holding the run's gradient whole, a layer below reading the layer above as its forward did."""
+    one never holding the run's gradient whole, a layer below reading the layer above as its forward did. On
+    both paths of precision's error-free transforms: their arithmetic marked to round alone, and behind a
+    barrier (`dew._cache.BARRIERED`, row 8378)."""
     from dew.nn import in_backward
 
     scanned = decoder(scan=True)
@@ -103,9 +114,12 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
     def draw(seed):
         return (jax.random.randint(jax.random.key(seed), (2, SEQ), 0, VOCAB),)
 
-    assert_as_exact(jax.jit(in_backward_step), dew_path(jax.jit(whole_step(plain, layered))), draw,
-                    "a run updating in its backward", seeds=RUN_SEEDS,
-                    truth_fn=jax.jit(whole_step(wide, widened(layered))))
+    from dew import _cache
+
+    with _cache.BARRIERED(new_value=barriered):
+        assert_as_exact(jax.jit(in_backward_step), dew_path(jax.jit(whole_step(plain, layered))), draw,
+                        "a run updating in its backward", seeds=RUN_SEEDS,
+                        truth_fn=jax.jit(whole_step(wide, widened(layered))), conditioning=RUN_CONDITIONING)
 
 
 SHARED_SEEDS = 64

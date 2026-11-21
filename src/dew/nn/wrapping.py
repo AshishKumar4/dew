@@ -16,10 +16,14 @@ from flax.typing import Dtype
 
 from dew.batch import Variables, part, thaw
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
+from dew.nn.progress import ReadsProgress
 from dew.nn.protocols import (
     ComputesIn,
     CrossAttending,
+    Generating,
+    HookedDecoder,
     OutputTable,
+    ReplacesTokens,
     VocabularyRows,
     block_chunks_of,
     forward_method,
@@ -28,6 +32,7 @@ from dew.nn.protocols import (
 )
 
 __all__ = [
+    "DecoderHooks",
     "DecoderWrapper",
     "HeadedModel",
 ]
@@ -39,41 +44,92 @@ if TYPE_CHECKING:
     from dew.nn.kv_cache import KVCache
 
 
-class DecoderWrapper(nn.Module):
-    """The hooks a module around one decoder answers as the decoder does: its geometry, its
-    banks and cache under the wrapper's field, a clone over the decoder each hook returns, and the
-    decoder's projection of its own parameters. A subclass names the field (`wraps`) and keeps
-    its own modules beside it as they are."""
+class DecoderHooks(nn.Module):
+    """The hooks a module around one decoder answers as its decoder does wherever it reads that decoder
+    whole (`DecoderWrapper`'s, and a decoder whose variables it reads at its own root, an in-context
+    adapting one's, `dew.objectives.lm.adaptation.InContextDecoder`): its bounds, its vocabulary and the ids
+    it replaces, its cache's layout and capacity, a clone over the decoder each hook returns, what a
+    generation refuses, whether it reads a run's progress and the layers that read blocks, each read
+    through the protocol the decoder states (`HookedDecoder`, and `Generating`, `ReadsProgress`,
+    `ReplacesTokens` where it states them). A class names the field that holds the decoder (`wraps`)."""
 
     wraps: ClassVar[str]
-    """The field that holds the decoder, the name its parameters sit under in the wrapper's tree."""
+    """The field that holds the decoder."""
 
     @property
-    def _decoder(self) -> CausalTransformer:
+    def _hooked(self) -> HookedDecoder:
         return getattr(self, self.wraps)
 
     @nn.nowrap
     def _over(self, decoder) -> Self:
         """The wrapper over `decoder` in place of its own, its other modules as they are."""
         return self.clone(**{self.wraps: decoder})
-
     @nn.nowrap
     def reads_progress(self) -> bool:
         """Whether its decoder's computation changes over a run (`dew.nn.progress.ReadsProgress`), which
         a run's objective then passes or refuses."""
-        return self._decoder.reads_progress()
+        return isinstance(self._hooked, ReadsProgress) and self._hooked.reads_progress()
+
+    @property
+    def vocab_size(self) -> int:
+        return self._hooked.vocab_size
+
+    @property
+    def max_seq_len(self) -> int | None:
+        return self._hooked.max_seq_len
+
+    @property
+    def replaced_ids(self) -> frozenset[int]:
+        """The ids its decoder replaces before its table reads them (`dew.nn.protocols.ReplacesTokens`),
+        none where it replaces none."""
+        return self._hooked.replaced_ids if isinstance(self._hooked, ReplacesTokens) else frozenset()
+
+    @property
+    def replaces_media(self) -> bool:
+        """Whether its decoder replaces the id at a slot media fill (`dew.nn.protocols.ReplacesTokens`)."""
+        return isinstance(self._hooked, ReplacesTokens) and self._hooked.replaces_media
+
+    @property
+    def kv_cache(self) -> KVCache:
+        return self._hooked.kv_cache
+
+    @nn.nowrap
+    def with_cache_capacity(self, capacity: int) -> Self:
+        return self._over(self._hooked.with_cache_capacity(capacity))
+
+    @nn.nowrap
+    def with_kv_cache(self, layout: KVCache) -> Self:
+        return self._over(self._hooked.with_kv_cache(layout))
+
+    @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        return self._hooked.generation_refusal() if isinstance(self._hooked, Generating) else None
+
+    @nn.nowrap
+    def block_chunks(self) -> tuple[int | None, ...]:
+        """The decoder's trunk layers that read blocks, by their attention chunk (`BlockReading`); the
+        wrapper's own modules read none."""
+        return block_chunks_of(self._hooked)
+
+
+class DecoderWrapper(DecoderHooks):
+    """The hooks a module around one decoder answers as the decoder does (`DecoderHooks`), and beside
+    them its geometry, its banks and stages under the wrapper's field, and the decoder's projection of its
+    own parameters. A subclass names the field (`wraps`), the name the decoder's parameters sit under in the
+    wrapper's tree, and keeps its own modules beside it as they are."""
+
+    @property
+    def _decoder(self) -> CausalTransformer:
+        return getattr(self, self.wraps)
+
+    @property
+    def max_seq_len(self) -> int:
+        """The decoder's, which a causal transformer states (`DecoderHooks`' a protocol's, unstated)."""
+        return self._decoder.max_seq_len
 
     @nn.nowrap
     def replicated_flops(self, stages: int, lengths) -> float:
         return self._decoder.replicated_flops(stages, lengths)
-
-    @property
-    def vocab_size(self) -> int:
-        return self._decoder.vocab_size
-
-    @property
-    def max_seq_len(self) -> int:
-        return self._decoder.max_seq_len
 
     @property
     def position_capacity(self) -> int | None:
@@ -106,20 +162,8 @@ class DecoderWrapper(nn.Module):
         return nested_sites(self.wraps, self._decoder.stage_sites(part(store, self.wraps), stages))
 
     @property
-    def kv_cache(self) -> KVCache:
-        return self._decoder.kv_cache
-
-    @property
     def keeps_triton_gemm(self) -> bool:
         return self._decoder.keeps_triton_gemm
-
-    @nn.nowrap
-    def with_cache_capacity(self, capacity: int) -> Self:
-        return self._over(self._decoder.with_cache_capacity(capacity))
-
-    @nn.nowrap
-    def with_kv_cache(self, layout: KVCache) -> Self:
-        return self._over(self._decoder.with_kv_cache(layout))
 
     @nn.nowrap
     def projected(self, params, *, updated: bool):
@@ -130,22 +174,12 @@ class DecoderWrapper(nn.Module):
         return {**params, self.wraps: self._decoder.projected(params[self.wraps], updated=updated)}
 
     @nn.nowrap
-    def generation_refusal(self) -> str | None:
-        return self._decoder.generation_refusal()
-
-    @nn.nowrap
     def fork_refusal(self, train: bool = False) -> str | None:
         return self._decoder.fork_refusal(train)
 
     @nn.nowrap
     def prefix_sharing_refusal(self, train: bool = False) -> str | None:
         return self._decoder.prefix_sharing_refusal(train)
-
-    @nn.nowrap
-    def block_chunks(self) -> tuple[int | None, ...]:
-        """The decoder's trunk layers that read blocks, by their attention chunk (`BlockReading`); the
-        wrapper's own modules read none."""
-        return block_chunks_of(self._decoder)
 
     @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:

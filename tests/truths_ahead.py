@@ -34,6 +34,7 @@ import dataclasses
 import functools
 import hashlib
 import inspect
+import io
 import json
 import logging
 import os
@@ -77,6 +78,41 @@ summary, not drift."""
 DEFERRED = "deferred.json"
 """A test's record, in its store, of a GPU flow's cell its prepare deferred to its run (`unprepared`'s, as
 `UNPREPARED`'s), which its run serves from the store beside it and then records unprepared."""
+
+
+@dataclasses.dataclass(frozen=True)
+class HeldName:
+    """A function a site's held record holds that no module holds (a local hook a launch took, `Seen.held`),
+    as its run reads it: by its module and qualified name (`_held_bytes`). Its run reports the launch and
+    calls the program its prepare compiled, never the hook; a call of it is refused."""
+
+    name: str
+
+    def __call__(self, *args, **kwargs):
+        raise MissingTruth(f"{self.name}: a function its prepare held by its name alone, which its run does "
+                           "not call")
+
+
+class _HeldPickler(pickle.Pickler):
+    """A site's held record pickled as pickle pickles it, but a function pickle names by no module
+    (`HeldName`): a local hook of a launch (a GEMM prologue's, a derivative's span) is no function its run
+    calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing ahead)."""
+
+    def reducer_override(self, obj):
+        if not isinstance(obj, types.FunctionType):
+            return NotImplemented
+        try:
+            pickle.dumps(obj)
+        except (pickle.PicklingError, AttributeError):
+            return HeldName, (f"{obj.__module__}.{obj.__qualname__}",)
+        return NotImplemented
+
+
+def _held_bytes(held: dict) -> bytes:
+    """`held` as its site's store keeps it (`_HeldPickler`)."""
+    written = io.BytesIO()
+    _HeldPickler(written).dump(held)
+    return written.getvalue()
 
 
 def named(role: str, inputs) -> str:
@@ -226,7 +262,7 @@ class CompiledTruths:
             shutil.rmtree(site)
             raise
         built.save(site / PROGRAMS)
-        (site / HELD).write_bytes(pickle.dumps(dict(held)))
+        (site / HELD).write_bytes(_held_bytes(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
                   if executable.memory is not None}
         (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
@@ -534,7 +570,7 @@ def _mutable_known(value, known: dict[int, Any], walking: set[int], at: str) -> 
     wherever it lies, inside another or beside an alias of itself (the review's: a dict read its record
     trace-filled in a prepare, empty in its run)."""
     from dew._sources import function_reads
-    from dew._stated import stated
+    from dew._stated import library_function, stated
 
     if id(value) in walking:
         return
@@ -549,9 +585,11 @@ def _mutable_known(value, known: dict[int, Any], walking: set[int], at: str) -> 
     elif isinstance(value, tuple):
         parts = value
     elif isinstance(value, types.FunctionType):
+        # A library's function, its globals its module's (`dew._stated.library_function`), as its statement
+        # walks it: its closure and defaults, a user's function and what it reads among them.
         cells, read = function_reads(value)
-        parts = (*cells.values(), *read.values(), *(value.__defaults__ or ()),
-                 *(value.__kwdefaults__ or {}).values())
+        parts = (*cells.values(), *(() if library_function(value) else read.values()),
+                 *(value.__defaults__ or ()), *(value.__kwdefaults__ or {}).values())
     elif (wrapped := getattr(value, "__wrapped__", None)) is not None:
         parts = (wrapped,)
     else:

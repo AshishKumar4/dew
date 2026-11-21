@@ -529,8 +529,9 @@ def _decided(identity: Hashable, decide: Callable[[], RegionDecision]) -> Region
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     """Whether the region is fused (`fused_gemm.analysis`): its product's launch the template's (its
     selector's choice, or a call's, `generation.chosen`), its prologue and epilogue the kernel's, nothing
-    refused, and its fused seconds less than its unfused ones; and whether its launch may be the template's
-    without its prologue (`RegionDecision`). The prices are a roofline on the part's rates
+    refused, its fused seconds less than its unfused ones, and its launch keeping with them the residency it
+    takes without (`fused_gemm.Analysis.resident`: KERNEL-TEMPLATES-13, row 9032); and whether its launch may
+    be the template's without its prologue (`RegionDecision`). The prices are a roofline on the part's rates
     (each stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a cell where the
     launch measured slower than XLA's dot (`grouped_matmul.DECLARED`, every dense cell: DENSE1, 1.05 to 2.9
     times XLA's) they favour fusion more than measurement does, so a region whose launch the selector gives
@@ -556,8 +557,10 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     # written whole and read back).
     stages = (*routes, *([found.epilogue] if found.epilogue is not None else []))
     priced = found.fused_seconds is not None and found.unfused_seconds is not None
-    return RegionDecision(all(map(kernel, stages)) and priced and found.fused_seconds < found.unfused_seconds,
-                          launchable, launched)
+    # A neighbour joins the kernel only where the kernel with it keeps its residency (KERNEL-TEMPLATES-13, row
+    # 9032: `fused_gemm.Analysis.resident`); refused for it, the region is still weighed without its stages.
+    return RegionDecision(all(map(kernel, stages)) and priced and found.fused_seconds < found.unfused_seconds
+                          and found.resident, launchable, launched)
 
 
 def _xla_whatever_its_prologue(launch) -> bool:

@@ -160,13 +160,19 @@ class Prepared:
     hooks): its `source`, a function of a tile and its side tiles, and what runs, `run`, its program
     rewritten by the algebra pass where it is traced, or a form its consumer derived from a program the
     pass already rewrote (`prepared_as`). Equal, hashed, keyed (`program`, `_held_key`) and stored
-    (`encoded`) as its source, so an op holding it compares, keys and stores as it did."""
+    (`encoded`) as its source, so an op holding it compares, keys and stores as it did. Pickled as its
+    source, rebuilt by the constructor that made it (`__reduce__`): a stored truth holds no closure."""
 
     source: Callable
     run: Callable = dataclasses.field(compare=False, repr=False)
 
     def __call__(self, *args, **kwargs):
         return self.run(*args, **kwargs)
+
+    def __reduce__(self):
+        # The pass's closure pickles as no function its module holds: a launch a GPU tier part's prepare held
+        # (`Seen.held`) is its run's (rows 9582 on).
+        return (prepared_as if self.run is self.source else prepared, (self.source,))
 
 
 def prepared(hook):
@@ -685,14 +691,16 @@ class KernelOp(tokamax.Op):
         return pick.fastest_config
 
     def _certified(self, ba: tokamax.BoundArguments, config: Hashable, *,
-                   offered: Callable[[], Hashable | None] | None = None) -> Hashable | None:
+                   offered: Callable[[], Hashable | None] | None = None,
+                   decided: Hashable | None = None) -> Hashable | None:
         """The derived `config`, or, where its kernels spill as the GPU assembles them alone
         (`report.certified`), each refused (`report.refuse_launch`, so its legality
         refuses it) and its misses recorded (`report.missed`: stepped where the next was derived),
         and the next in turn: a rung of it that holds (`_climbed`), else what the launch offers now
         (`offered`, its derivation's `remaining` unless a caller launches another form of its configs, a
-        decode's streamed tile): the first whose kernels hold, None where nothing is offered past the
-        refused. An offer of a refused config again (its legality reads no refusal) has it kept, its
+        decode's streamed tile): the first whose kernels hold, `decided` uncertified where `offered` steps
+        back to that already-decided terminal offer (recorded as stepped), or None where nothing is offered
+        past the refused. An offer of a refused config again (its legality reads no refusal) has it kept, its
         program's compile left to read it (`report.settled`). A pinned or a tuned pick is a measured
         choice, not certified here: its program's compile reads it."""
         offered = offered or functools.partial(self.remaining, ba)
@@ -712,6 +720,8 @@ class KernelOp(tokamax.Op):
                     stepped is not None and stepped not in seen))
             if stepped is None:
                 return None
+            if decided is not None and stepped == decided:
+                return decided
             config = stepped
         return config
 
@@ -851,7 +861,7 @@ class KernelOp(tokamax.Op):
         def shaped(name: str, value):
             if name in self.ROWS and value is not None:
                 return bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
-            return _shapes(value)
+            return shapes(value)
         return tokamax.BoundArguments(_identity(self), {name: shaped(name, value)
                                                         for name, value in ba.arguments.items()})
 
@@ -1420,42 +1430,76 @@ def _verdicts_path(target: str) -> str:
     return _cache.kernel_picks_path(f"certified {target}")
 
 
-def stored_verdict(target: str, key: str) -> Rebuilt | None:
-    """Certification's verdict of the launch `key` names, its kernels assembled for `target`
-    (`report.certified`), an
-    accepted config's or a refused one's, as stored (`_verdicts_path`) and rebuilt (`decoded`), read once a
-    process; none where none is stored, or this checkout cannot rebuild it (`Unreadable`: it certifies
-    again)."""
-    with _LOADING:
-        if target not in _VERDICTS:
-            _VERDICTS[target] = {entry["certified"]: entry["verdict"]
+def _stored_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, value_field: str,
+                  target: str, key: str, label: str, *, path: str | None = None) -> Rebuilt | None:
+    """Read `key` from `path` (or `_verdicts_path(target)`, cached in `cache`) and decode it."""
+    if path is not None:
+        found = next((entry[value_field] for entry in _stored(path)
+                      if isinstance(entry, dict) and entry.get(key_field) == key), None)
+    else:
+        with _LOADING:
+            if target not in cache:
+                cache[target] = {entry[key_field]: entry[value_field]
                                  for entry in _stored(_verdicts_path(target))
-                                 if isinstance(entry, dict) and "certified" in entry}
-        found = _VERDICTS[target].get(key)
+                                 if isinstance(entry, dict) and key_field in entry}
+            found = cache[target].get(key)
     try:
         return None if found is None else decoded(found)
     except Unreadable as unread:
-        _log.warning("a certification verdict stored for %s is not this checkout's, so its launch certifies "
-                     "again: %s", target, unread)
+        _log.warning("a %s stored for %s is not this checkout's, so its launch runs again: %s",
+                     label, target, unread)
         return None
 
 
-def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
+def _store_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, value_field: str,
+                 target: str, key: str, value: Hashable | dict[str, tuple[str, report.Binary]], *,
+                 path: str | None = None) -> None:
+    """Atomically write `{key_field: key, value_field: encoded(value)}` to `path` (or `_verdicts_path`)."""
+    written = encoded(value)
+    dest = _verdicts_path(target) if path is None else path
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with filelock.FileLock(dest + '.lock'):
+        kept = [entry for entry in _stored(dest)
+                if not (isinstance(entry, dict) and entry.get(key_field) == key)]
+        write_atomically(dest, json.dumps({"target": target,
+                                           "data": [*kept, {key_field: key, value_field: written}]}))
+    if path is None:
+        with _LOADING:
+            cache.setdefault(target, {})[key] = written
+
+
+def stored_verdict(target: str, key: str, *, path: str | None = None) -> Rebuilt | None:
+    """Certification's verdict of the launch `key` names, its kernels assembled for `target`
+    (`report.certified`), an accepted config's or a refused one's, as stored (`_verdicts_path`) and rebuilt
+    (`decoded`), read once a process; none where none is stored, or this checkout cannot rebuild it."""
+    return _stored_entry(_VERDICTS, "certified", "verdict", target, key, "certification verdict", path=path)
+
+
+def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, report.Binary]], *,
+                  path: str | None = None) -> None:
     """`verdict` stored for the launch `key` names, its kernels assembled for `target` (`_verdicts_path`), as
     the picks are (`encoded`), one writer at a time, the file replaced whole."""
-    written = encoded(verdict)
-    path = _verdicts_path(target)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with filelock.FileLock(path + '.lock'):
-        kept = [entry for entry in _stored(path)
-                if not (isinstance(entry, dict) and entry.get("certified") == key)]
-        write_atomically(path, json.dumps({"target": target,
-                                           "data": [*kept, {"certified": key, "verdict": written}]}))
-    with _LOADING:
-        _VERDICTS.setdefault(target, {})[key] = written
+    _store_entry(_VERDICTS, "certified", "verdict", target, key, verdict, path=path)
 
 
-def _shapes(value):
+_CHOICES: dict[str, dict[str, _records.JSON]] = {}
+"""Each compile target's derived choices this process read from its store or stored there
+(`stored_choice`), by key, beside its certification verdicts (`_verdicts_path`)."""
+
+
+def stored_choice(target: str, key: str, *, path: str | None = None) -> Rebuilt | None:
+    """A derived choice stored for `key` on `target` (`store_choice`), beside its certification verdicts
+    (`_verdicts_path`), read once a process; none where none is stored or this checkout cannot rebuild it."""
+    return _stored_entry(_CHOICES, "priced", "choice", target, key, "derived choice", path=path)
+
+
+def store_choice(target: str, key: str, choice: Hashable, *, path: str | None = None) -> None:
+    """`choice` stored for `key` on `target` beside its certification verdicts (`_verdicts_path`), one writer
+    at a time, the file replaced whole."""
+    _store_entry(_CHOICES, "priced", "choice", target, key, choice, path=path)
+
+
+def shapes(value):
     """`value`'s arrays as their shapes and dtypes, its other parts as they are: NumPy operands (an unpacked
     delta rule's chunk and span descriptors) as JAX's, a tracer as the value it stands for."""
     return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
@@ -1479,7 +1523,7 @@ class Seen(list[Launch]):
         the trace that made it."""
         kept = Seen()
         kept.extend(self)
-        kept.taken.extend((config, tokamax.BoundArguments(ba.op, {name: _shapes(value)
+        kept.taken.extend((config, tokamax.BoundArguments(ba.op, {name: shapes(value)
                                                                  for name, value in ba.arguments.items()}))
                           for config, ba in self.taken)
         return kept

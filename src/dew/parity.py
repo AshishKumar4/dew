@@ -624,7 +624,9 @@ shared; armada vq-g17-calib against vq-g17-calib-base): with k up to 24 (rows ru
 it fails at most 2 of 32,000 runs, where the width's factor alone failed up to 154 of 4,000; with k up to
 4, which holds the shares about the cutoff, at most 14 of 32,000 (1 row of 3 values, k apart), where the
 width's factor alone failed 185, and 0 to 3 at 16 values. Dew's worst row must be ruled too, so a row of
-Dew's spread over its values (a row fault) keeps its width's factor beside a reference one value rules. A
+Dew's spread over its values (a row fault) keeps its width's factor beside a reference one value rules. At
+a site that declares its weighed check, a worst row one element of Dew's rules alone defers to it
+(`_judgement`'s `deferring`, row 10145). A
 Gaussian row of eight values or more is almost never ruled; rows of three or four values sometimes are,
 where a fault ruled alike is refused less often. A value's own error in a ruled row is check 2's to bound.
 A stacked-examples site's paired rows keep their width's factor (`_judgement`), and a recording's summary,
@@ -1055,6 +1057,12 @@ class _Draws:
                 return row_factor(1)
         return row_factor(width)
 
+    def ruled(self, index: int) -> bool:
+        """Whether one element carries past RULED_SHARE of Dew's worst row of leaf `index` over these draws
+        (`factor`'s first condition alone); a share unknown is not."""
+        mine = int(np.argmax(self.worst[:, index, 0]))
+        return bool(self.held_shares()[mine, index, 0] > RULED_SHARE)
+
     def held_shares(self) -> np.ndarray:
         """`shares`, every cell unknown (NaN) where none was kept, so draws join and pick per cell."""
         return np.full(self.worst.shape, np.nan) if self.shares is None else self.shares
@@ -1451,12 +1459,18 @@ def _below_one(draws: _Draws, index: int, leaf: str, tails: tuple[float, float],
 
 def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL), *,
                contained: bool = True, typical: bool = False, ratio_rule=None,
-               power: int = 1) -> tuple[list[Finding], list[Finding]]:
+               power: int = 1, deferring: bool = False) -> tuple[list[Finding], list[Finding]]:
     """Check 1's findings over `draws` (`assert_as_exact`): each leaf its pooled ratio fails (`ratio_rule`:
     by default over PARITY, `_at_parity`; under the FP8 products' contract not below a named arm,
     `_below_one`), a row or a value it fails, and each leaf its draws leave inconclusive; with `typical` (a
     final verdict), a leaf its pooled ratio leaves inconclusive passed by its typical draw where that
-    decides. Every factor is raised to `power`: WRITTEN against a reference as written, else one."""
+    decides. Every factor is raised to `power`: WRITTEN against a reference as written, else one. With
+    `deferring` (a site that declares its weighed check, `check1_judge.Verdict.defers_to`), a worst row past
+    its factor that one element of Dew's rules (`_Draws.ruled`) is left unresolved, for that check to judge
+    in units of the reference's rounding there: at an element its computation amplifies (a step's update of
+    a gradient a few of its epsilons across), the two arms' errors are two values' alike, and the reference's
+    worst row lies at another element wherever its own error there was the smaller, so RULED_SHARE's
+    both-ruled factor does not apply (row 10145: equally exact arms decided red in 3 of 8 runs)."""
     rule = ratio_rule or functools.partial(_at_parity, limit=PARITY ** power)
     over, unresolved = [], []
     for index, name in enumerate(draws.names):
@@ -1490,10 +1504,17 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         factor = draws.factor(index) ** power
         if paired is None and not my_row <= math.log(factor) + their_row:
-            over.append(Finding(leaf, "row", my_row - their_row,
-                                f"{leaf}: the worst row over {count} seeds is {_shown(my_row)} from float64 "
-                                f"over its size, the reference's {_shown(their_row)}, allowed "
-                                f"{_shown(math.log(factor) + their_row)} ({factor} times it)"))
+            said = (f"{leaf}: the worst row over {count} seeds is {_shown(my_row)} from float64 over its "
+                    f"size, the reference's {_shown(their_row)}, allowed "
+                    f"{_shown(math.log(factor) + their_row)} ({factor} times it)")
+            if deferring and draws.ruled(index):
+                # One element rules Dew's worst row at a site whose computation amplifies its rounding
+                # unevenly: its weighed check judges that element in units of the reference's rounding there
+                # (RULED_SHARE, row 10145).
+                unresolved.append(Finding(leaf, "inconclusive", my_row - their_row,
+                                          f"{said}, one element ruling it: deferred to the weighed check"))
+            else:
+                over.append(Finding(leaf, "row", my_row - their_row, said))
         zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows], ROW_FACTOR ** power)
         if zero:
             # The measure is the worst of them, the first the example.
@@ -1514,7 +1535,8 @@ def needs_second_stage(draws: _Draws, label: str, *, ratio_rule=None, power: int
 
 
 def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True, ratio_rule=None,
-            further: bool | None = None, power: int = 1) -> tuple[list[Finding], list[Finding], int]:
+            further: bool | None = None, power: int = 1,
+            deferring: bool = False) -> tuple[list[Finding], list[Finding], int]:
     """Check 1's two pre-declared stages over `drawn(start, stop)`, the draws of seeds start to stop: at
     `seeds`, a site whose every leaf passes (`_judgement`: its ratio by `ratio_rule`, its rows and values,
     every factor to `power`) passes; any leaf that does not draws the second stage, REDRAW times as many
@@ -1522,7 +1544,8 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True, ratio_rule
     leaves left inconclusive and the stage reached. `further`, where given, is the site's own decision over
     every reference it compares (`check1_judge._verdicts`): each judged on the range any of them draws. With
     `two_stage` false, the procedure before it, for comparison: tails PREVIOUS_TAILS, the interval as it is,
-    only a leaf whose ratio is over PARITY drawing again."""
+    only a leaf whose ratio is over PARITY drawing again. `deferring`, a site that declares its weighed check
+    (`_judgement`'s): a worst row one element of Dew's rules is left to that check."""
     tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
     draws = drawn(0, seeds)
     if further is None and two_stage:
@@ -1535,7 +1558,7 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True, ratio_rule
     # The stage drawn by the pooled ratio alone; the final verdict's leaves it leaves inconclusive asked of
     # their typical draw (`_judgement`'s `typical`).
     return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage, ratio_rule=ratio_rule,
-                        power=power), 2 if further else 1)
+                        power=power, deferring=deferring), 2 if further else 1)
 
 
 # Check 1's conditioning (ledger 1714): a site declares the weighed check's own seeds beside its `seeds`;

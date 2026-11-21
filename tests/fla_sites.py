@@ -7,7 +7,8 @@ on a GPU and records (tests/fixtures/fla/gdn_seeded.npz), and the rule's hooks.
 - `walk/<geometry>`: a two-role walk's one sequence, values 64 wide (test_recurrence_mosaic_gradient).
 - `near two`: write gates near two on aligned keys (test_recurrence_mosaic).
 - `stability/<name>/<regime>/<product>`: test_recurrence_stability's regimes of the delta rule with a decay,
-  the forward's draws and the gradient's (`stressed`, `cotangents`).
+  and of a write gate without it under a decay a head (fla-core's `chunk_simple_gla`, its keys gated), the
+  forward's draws and the gradient's (`stressed`, `cotangents`).
 - `rwkv6/<dtype>/<layout>`: RWKV6's recurrence (`RWKV6`: a decay a key dimension, read before its update,
   its own write weighed), test_recurrence_chunk's draws of one sequence and of packed documents, against
   fla-core's `chunk_rwkv6`.
@@ -27,7 +28,23 @@ from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk
 
 RECORDED = Path(__file__).resolve().parent / "fixtures" / "fla" / "gdn_seeded.npz"
-"""fla-core's recording at every site (tools/fla_gdn_reference.py)."""
+"""fla-core's recording at every site of its delta rules and RWKV6 (tools/fla_gdn_reference.py)."""
+
+SIMPLE_RECORDED = Path(__file__).resolve().parent / "fixtures" / "fla" / "simple_gla_seeded.npz"
+"""fla-core's recording at every site of its simple GLA (`simple_gla`), recorded after `RECORDED`'s sites
+under a provenance of its own (its truth fla's naive simple GLA), so a site added to one recording leaves the
+other's pinned recording as it stands."""
+
+
+def simple_gla(hooks) -> bool:
+    """Whether fla-core's simple GLA runs a site's form: a write gate without the delta rule under a decay a
+    head (`chunk_simple_gla`, its keys gated)."""
+    return hooks.write_gate and not hooks.delta and hooks.decay == 'scalar'
+
+
+def recorded_at(site: str) -> Path:
+    """The recording that holds `site` (`RECORDED` or `SIMPLE_RECORDED`)."""
+    return SIMPLE_RECORDED if simple_gla(sites()[site].hooks) else RECORDED
 
 LEAVES = ("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
 """A recorded site's leaves: the output and final memory, then each operand's gradient."""
@@ -256,9 +273,10 @@ def the_template_is_as_exact_as_fla(rule: Callable[[Chunk], tuple], site: str,
     from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
     from test_recurrence_chunk import token_by_token
 
-    seeds, hooks = declared_seeds(RECORDED)[site], sites()[site].hooks
+    held = recorded_at(site)
+    seeds, hooks = declared_seeds(held)[site], sites()[site].hooks
     draw, reference, truth = indexed_recording(
-        recording(RECORDED), site, seeds, inputs_of=sites()[site].arrays, leaves=leaves,
+        recording(held), site, seeds, inputs_of=sites()[site].arrays, leaves=leaves,
         truth_fn=jax.jit(lambda arrays: ruled(functools.partial(token_by_token, hooks), arrays, leaves)))
 
     def run(index, arrays):

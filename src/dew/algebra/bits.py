@@ -821,9 +821,10 @@ E2M1 = Minifloat(exponent=2, mantissa=1, bias=1, largest=0x7, nan=None)
 def decoded(codes: jax.Array, minifloat: Minifloat) -> jax.Array:
     """`minifloat` codes (uint32 a code) as float32, exactly, by integer arithmetic: a normal code's exponent
     (rebiased to fp32's) and mantissa moved into an fp32 pattern, a subnormal code's mantissa times its
-    place (2^(1 - bias - mantissa bits)), its sign kept, each field read from the format. No conversion
+    place (2^(1 - bias - mantissa bits)), its sign kept, and non-finite codes mapped to +-inf or NaN from
+    the format's own `nan`/`largest` fields (bitwise XLA's cast on every code, row 8549). No conversion
     instruction, which an older family lacks (an A100's ptxas refused the FP8 cvt, sm89's
-    `cvt ... .e4m3x2`). A NaN code reads as the largest exponent's value it spells (e4m3fn's 0x7F as 480)."""
+    `cvt ... .e4m3x2`)."""
     word = jnp.uint32
     exponent = (codes >> word(minifloat.mantissa)) & word((1 << minifloat.exponent) - 1)
     mantissa = codes & word((1 << minifloat.mantissa) - 1)
@@ -832,7 +833,15 @@ def decoded(codes: jax.Array, minifloat: Minifloat) -> jax.Array:
     normal = jax.lax.bitcast_convert_type(sign | raised | (mantissa << word(23 - minifloat.mantissa)),
                                           jnp.float32)
     subnormal = mantissa.astype(jnp.float32) * jnp.float32(2.0 ** (1 - minifloat.bias - minifloat.mantissa))
-    return jnp.where(exponent == 0, jnp.where(sign != 0, -subnormal, subnormal), normal)
+    value = jnp.where(exponent == 0, jnp.where(sign != 0, -subnormal, subnormal), normal)
+    if minifloat.nan is not None:
+        magnitude = codes & word((1 << (minifloat.width - 1)) - 1)
+        inf_code = ((1 << minifloat.exponent) - 1) << minifloat.mantissa
+        if inf_code > minifloat.largest:
+            inf = jax.lax.bitcast_convert_type(sign | word(0x7F800000), jnp.float32)
+            value = jnp.where(magnitude == word(inf_code), inf, value)
+        value = jnp.where(magnitude > word(max(minifloat.largest, inf_code)), jnp.float32(jnp.nan), value)
+    return value
 
 
 def encoded[Words: (np.ndarray, jax.Array)](x: Words, minifloat: Minifloat, xp=jnp) -> Words:

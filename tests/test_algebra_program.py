@@ -952,6 +952,21 @@ def test_xlas_schedule_on_a_tpu_prices_what_its_kernels_keep_in_vmem(target_name
     assert product.kept_bytes in kernel_cost.units(product, unmeasured)[1]
 
 
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_a_tpu_tile_walks_staged_bytes_are_priced_at_its_vmem_rate(target_name):
+    """A Pallas TPU template's staged bytes (`Work.shared_bytes`, its tiles copied into VMEM) are priced on
+    on-chip memory's unit at the chip's VMEM rate in a tile walk (`templates.cost.rates`, `device=False`: the
+    chip its one multiprocessor), where they were work no rate priced and a TPU template's forms were
+    compared without them (row 8729); a TPU no one measured leaves them unpriced."""
+    tpu, unmeasured = generation.TARGETS[target_name], generation.TARGETS["v4"]
+    staged = kernel_cost.Work(shared_bytes=4.0 * 512 * 1024)
+    on_chip = 3
+    priced, unpriced = kernel_cost.units(staged, kernel_cost.rates(tpu, device=False))
+    assert priced[on_chip] == staged.shared_bytes / tpu.vmem_rate
+    assert not any(unpriced)
+    assert staged.shared_bytes in kernel_cost.units(staged, kernel_cost.rates(unmeasured, device=False))[1]
+
+
 def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     """A scan's chunk form on a v5e (`linear_scan.derive` under XLA's schedule, as `scan` derives it) keeps
     its products' results and a token step's state on chip (`Work.kept_bytes`), which the TPU's VMEM rate

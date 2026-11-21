@@ -158,6 +158,30 @@ def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed(
     assert on_a_gpu == plain != on_a_cpu
 
 
+def _summed(x, w):
+    """A loss whose gradient an arm takes (the library-function arm witness's)."""
+    return jnp.sum(x @ w)
+
+
+def _scaled_sum(x, w):
+    """Another loss (the library-function arm witness's)."""
+    return jnp.sum(x @ w) * 2.0
+
+
+def test_an_arm_of_a_librarys_function_over_the_users_is_named_by_the_users_function():
+    """An arm that is a library's function over the user's (`jax.grad`'s, its closure the loss) is named by
+    what it holds (`truths_ahead.arm_role`): the containers it reads walked through the user's code and the
+    library's closures, not the library's module state (its registries, whose entries no statement holds,
+    rows 10064 on: every gradient arm ran unprepared), so one loss's arm is named alike twice and another
+    loss's apart."""
+    from truths_ahead import arm_role
+
+    one = arm_role("dew", jax.jit(jax.grad(_summed, argnums=(0, 1))), "a gradient")
+    assert one is not None
+    assert arm_role("dew", jax.jit(jax.grad(_summed, argnums=(0, 1))), "a gradient again") == one
+    assert arm_role("dew", jax.jit(jax.grad(_scaled_sum, argnums=(0, 1))), "another gradient") != one
+
+
 def test_the_arms_arithmetic_is_that_of_where_their_calls_are_placed():
     """Check 1 runs its arms in the arithmetic of where the context places their calls
     (`arm_arithmetic.summed_as_run`): placed on the CPU lane, its fp32 sums (`FP32_SUMS`); placed on a GPU,
@@ -214,6 +238,33 @@ def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
     np.testing.assert_array_equal(np.asarray(made[0][0]), np.asarray(made[1][0]))
 
 
+def test_an_arm_whose_launch_takes_a_local_hook_runs_from_its_store(tmp_path):
+    """An arm whose launch takes a hook no module holds (a lambda epilogue, which the launch its prepare's
+    trace took holds, `tuning.Seen.held`) prepares into its store and runs from it, computing what it does
+    outside a part, nothing unprepared: its held record keeps the hook by its name (`truths_ahead.HeldName`),
+    which its run never calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing
+    ahead)."""
+    from truths_ahead import UNPREPARED
+
+    sizes = np.asarray([128, 128], np.int32)
+    rng = np.random.default_rng(9584)
+    x = rng.standard_normal((256, 128)).astype(np.float32)
+    w = rng.standard_normal((2, 128, 64)).astype(np.float32)
+
+    def doubled(x, w):
+        return gemm.gemm(x.astype(jnp.bfloat16), w.astype(jnp.bfloat16), jnp.asarray(sizes),
+                         epilogue=lambda acc: acc * 2, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"):
+        expected = np.asarray(ahead_arm(doubled, "a doubled product")(x, w))
+        with compiled_truths(tmp_path, prepare=True, stamp="hooked"):
+            ahead_arm(doubled, "a doubled product, stored")(x, w)
+        with compiled_truths(tmp_path, prepare=False, stamp="hooked"):
+            found = np.asarray(ahead_arm(doubled, "a doubled product, stored")(x, w))
+    assert not (tmp_path / UNPREPARED).exists(), (tmp_path / UNPREPARED).read_text()
+    np.testing.assert_array_equal(found, expected)
+
+
 def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_refuses_another(tmp_path):
     """An arm with no site called twice in one prepare at one program (two draws of one shape): the second
     call gives the first's zeros and launches, compiling nothing again, and a call of its label at other
@@ -237,3 +288,32 @@ def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_ref
     for x, made in zip(draws, ran, strict=True):
         np.testing.assert_array_equal(np.asarray(made), x * 2)
 
+
+
+class _Marked:
+    """A test's markers as pytest's item reads them (`get_closest_marker`), the conftest's hook's only read
+    of it (the backend-skip witness's)."""
+
+    def __init__(self, *names: str):
+        self.names = names
+
+    def get_closest_marker(self, name: str):
+        return getattr(pytest.mark, name).mark if name in self.names else None
+
+
+def test_a_gpu_parts_prepare_skips_what_its_run_skips_by_backend(monkeypatch):
+    """A GPU tier part's prepare (`tier_wire.preparing`) skips a test its GPU run skips by its backend
+    marker, a TPU's or the CPU lane's, and prepares one marked for a GPU or unmarked (tests/conftest.py's
+    `pytest_runtest_setup`): prepared where its run skips it, a test computed there and was filed
+    unprepared (row 10169's cells, the TPU's ways of test_algebra_scaled)."""
+    import lane_environment
+    import conftest
+    import tier_wire
+
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.delenv(lane_environment.USERS_ARITHMETIC, raising=False)
+    for backend in ("tpu", "cpu"):
+        with pytest.raises(pytest.skip.Exception):
+            conftest.pytest_runtest_setup(_Marked(backend))
+    conftest.pytest_runtest_setup(_Marked("gpu"))
+    conftest.pytest_runtest_setup(_Marked())

@@ -32,6 +32,7 @@ from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import (
+    at_least_fp32,
     compensated_add,
     compensated_sum,
     exact_float32,
@@ -70,15 +71,36 @@ def portable_einsum(subscripts: str, *operands):
     return float32_einsum(subscripts, *operands, precision=STATE_PRECISION)
 
 
-def suffix_sums(x: jax.Array) -> jax.Array:
+def suffix_sums(x: jax.Array, *, scanned: bool = False) -> jax.Array:
     """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a
-    chunk's tokens), in float32: a product with the chunk's upper triangle of ones (`portable_einsum`, its
-    ones exact in every form a product splits `x` into), one dot. As a reversed cumulative sum, XLA's GPU
-    reduce-window summed each position's window apart: Kimi delta attention's decay gradient's, the one
-    cumulative sum its training traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114)."""
-    size = x.shape[-2]
-    upper = jnp.triu(jnp.ones((size, size), jnp.float32))
-    return portable_einsum('ij,...jt->...it', upper, x.astype(jnp.float32))
+    chunk's tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle
+    of ones (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot. As a
+    reversed cumulative sum, XLA's GPU reduce-window summed each position's window apart: Kimi delta
+    attention's decay gradient's, the one cumulative sum its training traces, took 0.336 ms of its 5.806 ms
+    on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum: a term no position's sum takes
+    meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite one NaN in every sum (a
+    turned gradient's entering-memory term of 2^126 times its cotangent, `templates.recurrence.turned`)."""
+    x = _wide(x)
+    if scanned:
+        return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
+    upper = jnp.triu(jnp.ones((x.shape[-2],) * 2, x.dtype))
+    return portable_einsum('ij,...jt->...it', upper, x)
+
+
+def sums_before(x: jax.Array) -> jax.Array:
+    """Each position's sum over its chunk's positions before it, along `x`'s second-last axis, in at least
+    float32 (`suffix_sums`' exclusive prefix twin, as `scanned`): a cumulative sum shifted a position, each
+    sum of the earlier terms alone, a later term meeting none of its arithmetic, where an inclusive sum less
+    its own term lost a small sum beside a large term to its rounding (a chunk's last writer's whole weight
+    beside its earlier ones' exp(-30) each, Mamba-3's turns' gradient's worst row 3.75 from float64 over its
+    size)."""
+    summed = jnp.cumsum(_wide(x), axis=-2)
+    return jnp.concatenate([jnp.zeros_like(summed[..., :1, :]), summed[..., :-1, :]], axis=-2)
+
+
+def _wide(x: jax.Array) -> jax.Array:
+    """`x` in at least float32, a float64 truth's own."""
+    return x.astype(at_least_fp32(x.dtype))
 
 
 LOG2_E = math.log2(math.e)

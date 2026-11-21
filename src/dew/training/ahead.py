@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, allocator_limit, device_memory, stated_share
+from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
@@ -684,14 +684,13 @@ def programs_need(device, programs: Iterable[tuple[CompiledMemory | None, int, i
     first call builds, admitted as the planner admits a step (`memory.admission`, `memory.needed`) and read
     as the limit that GPU's pool holds (`allocator_limit` at its stated share). None for a device of no GPU
     pool (a TPU's, whose topology states its own) and where a program states no memory."""
-    from dew.training.memory import admission, needed
+    from dew.training.memory import admission, least_limit
 
     programs = list(programs)
     stated = [(memory, held, built) for memory, held, built in programs if memory is not None]
     if device.platform != "gpu" or not programs or len(stated) < len(programs):
         return None
-    return max(allocator_limit(needed(device, *admission(memory, held, built)), stated_share(device))
-               for memory, held, built in stated)
+    return least_limit(device, [admission(memory, held, built) for memory, held, built in stated])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -888,12 +887,15 @@ def keeping() -> Iterator[Keeping]:
         programs.save("scoring.dew-aot")
 
     A later process of the same target hands them back (`kept`). A program compiled before the block, or
-    taken within it, is not among them. The block compiles with JAX's persistent cache off
-    (`dew._cache.uncached`): an executable XLA loaded from that cache serializes without its kernels (on a
-    CPU it then loads and fails at its first call, "Function ... not found"; plain JAX, 2026-11-09), so
-    each kept one is compiled here."""
+    taken within it, is not among them. On a CPU the block compiles with JAX's persistent cache off
+    (`dew._cache.uncached`): an executable XLA:CPU loaded from that cache serializes without its kernels (it
+    then loads and fails at its first call, "Function ... not found"; plain JAX, 2026-11-09), so each kept
+    one is compiled here. A GPU's served from the cache serializes whole, its Pallas kernels among it (row
+    6641: served, saved and run in a third process on a GH200, M-MC-30b), so a GPU process keeping its
+    programs reads the cache as any compile does, where it compiled each again."""
     kept = Keeping()
-    with uncached(), options.keeping(kept.heard):
+    served_whole = jax.default_backend() != "cpu"
+    with contextlib.nullcontext() if served_whole else uncached(), options.keeping(kept.heard):
         yield kept
 
 
@@ -1181,8 +1183,7 @@ class AheadTarget:
             # Into a cache a device run reads as tuned, as a device step's (below): a program no device run
             # has tuned is counted, its run compiling it on its GPU, never a traceback (row 9693).
             try:
-                with report.for_devices():
-                    return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
+                return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
             except report.Untuned as refused:
                 # Named as every untuned program is (`program_name`), a host step's VJP results stating no
                 # form.
@@ -1562,33 +1563,39 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     capacity = stated_limit(devices)
     # The GPU XLA compiles for, as its compile-only devices state it.
     stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity)
-    start = trainer._started()
-    if start.resume is not None and trainer.checkpoints is not None:
-        # A resumed run's step compiles at the rung its checkpoint records and the split its state was saved
-        # at (a checkpoint keeps a window only part filled, `dew.state.without_empty_window`), as its resume
-        # would: a split-2 checkpoint compiled at split 1 was another program than the resume's.
-        from dew.training.compiler import resumed_stepping
-
-        trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
-        resumed = resumed_stepping(
-            trainer._stepping(), trainer.checkpoints.window_size(start.resume),
-            held=start.abstract.window is not None, pools=start.abstract.window is not None,
-            replicas=start.abstract.inner is not None and start.resume > 0)
-        trainer._shape = resumed.shape
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(devices) <= _HOSTS_GPUS
-    # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
-    trainer.phase_passes.at(batch)
     # Each launch's derived config certified on one of the compile-only devices it compiles for
     # (`report.certified`), as a run on that GPU certifies it: the cache it prepares holds that run's.
     certifying = contextlib.nullcontext() if on_tpus else report.certifying(devices[0])
     # A library that reads the GPU it is traced for (JAX's cuDNN attention gates, row 5894) reads the
     # target's from the concrete mesh the step traces on (`Trainer._traced_on`); made the process's default
     # device besides, the compile-only GPU changed the program a run on that GPU compiles first, which then
-    # refused the step (row 6163).
-    with assumed(on, portable=portable), certifying, trainer.phase_passes.scoped(trainer, trainer._compiler):
-        yield _Targeted(devices, generation, capacity, start)
+    # refused the step (row 6163). The start is traced within it too, as a run on that GPU traces it: traced
+    # before, in a build that sees no GPU, its initializer's launches took the CPU's routes and certified
+    # nothing, so the run certified them on its GPU (rows 7322, 8299: five init-shape launches).
+    # A host step's start runs on its CPU companion (`Trainer._started`), traced as that run traces it.
+    start = trainer._started() if trainer.host_master else None
+    with assumed(on, portable=portable), certifying:
+        start = trainer._started() if start is None else start
+        if start.resume is not None and trainer.checkpoints is not None:
+            # A resumed run's step compiles at the rung its checkpoint records and the split its state was
+            # saved at (a checkpoint keeps a window only part filled, `dew.state.without_empty_window`), as
+            # its resume would: a split-2 checkpoint compiled at split 1 was another program than its
+            # resume's.
+            from dew.training.compiler import resumed_stepping
+
+            trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
+            resumed = resumed_stepping(
+                trainer._stepping(), trainer.checkpoints.window_size(start.resume),
+                held=start.abstract.window is not None, pools=start.abstract.window is not None,
+                replicas=start.abstract.inner is not None and start.resume > 0)
+            trainer._shape = resumed.shape
+        # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
+        trainer.phase_passes.at(batch)
+        with trainer.phase_passes.scoped(trainer, trainer._compiler):
+            yield _Targeted(devices, generation, capacity, start)
 
 
 def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
@@ -1617,13 +1624,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
             counts = {count: _held_ahead(each) for count, each in admitted.items()}
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
-    # The sampled step as the search compiled it, its program what it lowered then (the plan unreleased, its
-    # lowering held), digested as the step's is: a program no file can hold is refused by name.
-    sampled = None
-    if planned.sampled is not None:
-        if planned.sampled.lowered is None:
-            raise ValueError("the sampled step's plan was released before it was compiled ahead")
-        sampled = AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
+    # The sampled step as the search compiled it, as a count's is (`_sampled_ahead`).
+    sampled = _sampled_ahead(planned)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     held = [compiled, *starts.values(), *(each.executable for each in admitted.values()),
@@ -1662,13 +1664,22 @@ def _step_need(planned: Planned, counts: Iterable[Planned], starts: Mapping[str,
 
 def _held_ahead(planned: Planned) -> tuple[AheadProgram, AheadProgram | None]:
     """A sampled pass count's step admitted at its cap's plan (`StepCompiler.admitted_counts`), and its
-    sampled step where the run inspects, as programs compiled ahead (`AheadOfTime.counts`)."""
+    sampled step where the run inspects (`_sampled_ahead`), as programs compiled ahead
+    (`AheadOfTime.counts`)."""
     step = AheadProgram.of(program_digest(planned.candidate.lowered), planned.executable)
+    return step, _sampled_ahead(planned)
+
+
+def _sampled_ahead(planned: Planned) -> AheadProgram | None:
+    """A step's sampled step where the run inspects, as a program compiled ahead: the cap's
+    (`AheadOfTime.sampled`) and a count's (`_held_ahead`). Its program is what the search lowered (the plan
+    unreleased, its lowering held), digested as the step's is: a program no file can hold is refused by
+    name."""
     if planned.sampled is None:
-        return step, None
+        return None
     if planned.sampled.lowered is None:
-        raise ValueError("a count's sampled step was released before it was compiled ahead")
-    return step, AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
+        raise ValueError("a sampled step's plan was released before it was compiled ahead")
+    return AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
 
 
 def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> HostStartup:
@@ -1677,12 +1688,18 @@ def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch:
     fresh state's and `batch`'s shapes as its run's startup does (`StepCompiler._compile_host`), its CPU
     companion this process's CPUs: JAX's persistent cache, keyed by what each program lowers to under its
     options and target, then holds each, and the run's startup on those GPUs reads them, compiling none
-    (training.md's warm start; Main's choice for row 7908: no file, the shared cache). What the pass
-    compiled, by backend (`HostStartup`)."""
+    (training.md's warm start; Main's choice for row 7908: no file, the shared cache). Its GPU programs are
+    compiled for the devices to run (`report.for_devices`), each taking the tuned choices a run of the GPU
+    left, `report.Untuned` where none has and the run tunes. What the pass compiled, by backend
+    (`HostStartup`)."""
     if not trainer.host_master:
         raise ValueError("prepare_host_step prepares a step that keeps its variables on the host "
                          "(Layout(host=('variables',))); compile a device step ahead with compile_ahead")
-    with _targeted(trainer, batch, what="prepare_host_step", platforms=(frozenset({"gpu"}),)) as targeted:
+    # For a device to run, as its run compiles them there (`report.for_devices`): every option a device's
+    # compile takes, so each program keys the persistent cache alike (rows 8372, 8446: compiled as read
+    # offline, its programs took no CUB sort mode, which the run's took, and the run missed them).
+    with report.for_devices(), _targeted(trainer, batch, what="prepare_host_step",
+                                         platforms=(frozenset({"gpu"}),)) as targeted:
         return trainer._compiler.prepared_host(trainer._stepping(), targeted.start.abstract,
                                                step_batch(trainer, batch))
 
