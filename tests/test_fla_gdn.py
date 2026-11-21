@@ -73,7 +73,7 @@ def assert_kernel_on_par(kernel, reference, draw, label: str) -> None:
     outputs instead (`the_port_is_as_exact_as_fla`). A 16-bit call's products are exact either way, and its
     kernel is held here natively too: the GPU tier's fla cells run in fp32 alone (`FLA_DTYPES`)."""
     if not INTERPRETED and jnp.dtype(label.split()[2]) == jnp.float32:
-        pytest.skip("an fp32 kernel's expression in XLA holds the same roundings as the interpreted port alone")
+        pytest.skip("an fp32 kernel's XLA expression holds the same roundings as the interpreted port alone")
 
     def laid(arm):
         return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), jax.eval_shape(arm, *draw(0)))
