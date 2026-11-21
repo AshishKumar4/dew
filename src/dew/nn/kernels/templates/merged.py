@@ -39,6 +39,7 @@ from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import attention_algebra as algebra, cost, emission, mosaic
 from dew.nn.kernels.templates.attention import Initial, ungrouped_rows
 
+
 def _trimmed(padded, stacked, *, queries: int, width: int) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A split walk's padded outputs `padded` `[B, S, R, H, Dv]` and stacked maxima and denominators `stacked`
     `[2, B, H, S, R]` at their first `queries` rows and `width` columns: the slices' outputs, maxima and

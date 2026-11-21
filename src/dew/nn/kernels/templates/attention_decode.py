@@ -345,7 +345,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
             state = algebra.merged_state(spec, out, maximum, total, initial)
         else:
-            # The slices merged where the launch wrote them (`merged.merged_finished` / `merged.merged_split`).
+            # The slices merged where the launch wrote them (`merged_finished` / `merged_split`).
             assert isinstance(walked_out, attention_mosaic.SplitOutput)
             if finished:
                 return merged.merged_finished(spec, walked_out.padded, walked_out.stacked, queries=queries,
