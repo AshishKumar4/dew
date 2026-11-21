@@ -354,10 +354,14 @@ def stored(parts, views, *, smem, wait: bool = True) -> None:
     chunk of its columns at a time where `smem` is narrower (`chunked`), the buffer reused once its copy
     has read it; the last copy waited for unless `wait` is false, when it stays in flight, one store group
     (`Family.store_wait`)."""
-    pieces = [piece for part, view in zip(parts, views, strict=True) for piece in chunked(part, view, smem)]
+    pieces = [piece for part, view in zip(parts, views, strict=True)
+              for piece in ([(part, view)] if callable(part) else chunked(part, view, smem))]
     last = len(pieces) - 1
     for index, (part, view) in enumerate(pieces):
-        smem[...] = part.astype(smem.dtype)
+        if callable(part):
+            part(smem)
+        else:
+            smem[...] = part.astype(smem.dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(smem, view)
         if index < last:

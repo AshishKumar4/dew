@@ -780,7 +780,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 else:
                     view[...] = part.astype(view.dtype)
                 continue
-            plgpu.store(smem, part.astype(smem.dtype), optimized=False)
+            if callable(part):
+                part(smem)
+            else:
+                plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]
             stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))

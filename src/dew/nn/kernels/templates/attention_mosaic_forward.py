@@ -1583,23 +1583,26 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
         elif (hooks.output_mod is None and keep is None and family.budgets_registers
               and state.acc.shape[-1] > 128):
-            # Chunk wide (>128) register epilogues by `stores.staged_columns` so `state.acc` and `output`
-            # fit without spilling on sm90/sm80 d256 forward (row 5272, 10864).
+            # Chunk wide (>128) register epilogues by `stores.staged_columns` into `stage`, then flush once
+            # through `family.stored` so `state.acc` and `output` fit without spilling (rows 5272, 10864).
             width = state.acc.shape[-1]
             chunk = stores.staged_columns(width, (out_view.dtype,))
             maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
 
-            def store_chunks(stage):
-                for col in range(0, width, chunk):
-                    sl = pl.ds(col, chunk)
-                    piece = state._replace(acc=state.acc[:, col:col + chunk])
-                    out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
-                                               held=program.parts > 1)[0]
-                    sub_stage = None if stage is None else stage.at[:, sl]
-                    family.stored((out_chunk,), (out_view.at[:, sl],), smem=sub_stage,
-                                  wait=col + chunk == width)
+            def write_chunks(smem):
+                with family.staged_together():
+                    for col in range(0, width, chunk):
+                        sl = pl.ds(col, chunk)
+                        piece = state._replace(acc=state.acc[:, col:col + chunk])
+                        out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
+                                                   held=program.parts > 1)[0]
+                        if smem is None:
+                            out_view[:, sl] = out_chunk.astype(out_view.dtype)
+                        else:
+                            family.staged(out_chunk, smem.at[:, sl])
 
-            out_stage(store_chunks)
+            out_stage(lambda stage: write_chunks(None) if stage is None
+                      else family.stored((write_chunks,), (out_view,), smem=stage))
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,
