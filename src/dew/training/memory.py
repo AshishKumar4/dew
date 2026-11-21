@@ -716,7 +716,7 @@ def step_footprint(arguments, lowered: jax.stages.Lowered, devices: Iterable) ->
     carrying its sharding): its arguments' bytes on it, each rounded up to a pool's allocation, and its
     outputs' less those of the arguments it donates. An output of no stated sharding counts whole."""
     leaves = jax.tree.leaves(arguments)
-    donated = [info.donated for info in jax.tree.leaves(lowered.args_info)]
+    donated = [argument.donated for argument in jax.tree.leaves(lowered.args_info)]
     outputs = jax.tree.leaves(lowered.out_info)
     unit = ALLOCATION_BYTES
     footprint = {}
@@ -786,16 +786,17 @@ class LiveSet:
         for buffer in live:
             if buffer.kind == "parameter":
                 continue
-            if any(dimension is None for dimension in buffer.dims):
+            dimensions = [dimension for dimension in buffer.dims if dimension is not None]
+            if len(dimensions) < len(buffer.dims):
                 unknown += buffer.bytes
                 vocabulary += buffer.bytes
                 continue
-            if any(dimension & rows for dimension in buffer.dims):
+            if any(dimension & rows for dimension in dimensions):
                 scaled += buffer.bytes
             # A buffer whose size descends from no argument (a GEMM's workspace, sized by its call) can
             # change with the head's tile as well.
-            if tables is not None and (not any(buffer.dims) or any(dimension & tables
-                                                                   for dimension in buffer.dims)):
+            if tables is not None and (not any(dimensions) or any(dimension & tables
+                                                                  for dimension in dimensions)):
                 vocabulary += buffer.bytes
         return LiveSet(scaled, unknown, None if tables is None else vocabulary)
 

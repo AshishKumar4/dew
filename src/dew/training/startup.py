@@ -168,7 +168,8 @@ def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "
     return agreed_same("newest checkpoint", continued)
 
 
-def computation_differs(trainer: "Trainer", checkpoints: "Checkpoints", step: int) -> list[str]:
+def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", checkpoints: "Checkpoints",
+                                         step: int) -> list[str]:
     """Where the computation `checkpoints`' `step` trained and `trainer`'s differ (`differing_records`):
     their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
     a pass count's sampled law among it, row 10783)."""

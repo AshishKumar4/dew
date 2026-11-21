@@ -2140,3 +2140,32 @@ def test_a_records_holdout_over_a_stream_filled_generation_of_a_part_or_a_concat
     uncached = [_tags(tagged(part)) for part in parts]
     assert all(uncached)
     assert [_tags(tagged(part).cache(generation)) for part in parts] == uncached
+
+
+def test_a_streamed_token_mix_of_published_generations_logs_the_targets_it_delivered_of_each(tmp_path):
+    """A mix by tokens of two published generations, each stating its rows and valid targets, its members
+    read as streams and weighed by the counts they state, logs the valid targets it delivered of each
+    (`data/weighed_tokens/<member>`), each row's tokens less the one no target follows, as a mix of
+    targets read as they come does (row 10784: the stated mix's streams counted none)."""
+    import itertools
+
+    from test_data_mixtures import READ, TEXTS, published_tokens
+
+    from dew.data import mix
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.text import Tokenize
+
+    members = [published_tokens(tmp_path, name, tag).prefetch() for name, tag in (("short", 1), ("long", 2))]
+    chain = mix(members, weights=[1, 3], by="tokens").repeat().batch(1)
+    loader = compile(chain, read="streamed", loading=READ)
+    reader = loader.train(DataPartition())
+    try:
+        ids = [int(identity) for batch in itertools.islice(reader, 40) for identity in batch["id"]]
+        statistics = loader.statistics()
+    finally:
+        reader.close()
+    for name, tag in (("short", 1), ("long", 2)):
+        targets = len(Tokenize().map({"text": TEXTS[name]})["text"]) - 1
+        delivered = sum(identity // 1000 == tag for identity in ids)
+        assert delivered and statistics[f"data/weighed_tokens/{name}"] == targets * delivered, statistics
