@@ -2126,6 +2126,12 @@ class Metric(Protocol[S]):
     def name(self) -> str: ...
 
     @property
+    def fields(self) -> tuple[str, ...]:
+        """The batch fields it reads beside its artifact (`dew.eval.common.Mean.fields`, FID's reference
+        images), which every split it scores holds from its first batch (row 10561); none for most."""
+        ...
+
+    @property
     def reads(self) -> type:
         """The scoring artifact type this metric reads."""
         ...

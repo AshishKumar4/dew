@@ -15,12 +15,13 @@ import functools
 import itertools
 import math
 from collections.abc import Collection, Hashable, Iterator, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import ClassVar, Protocol
 
 import numpy as np
 from flax import linen as nn
 
+from dew._records import JSON
 from dew.batch import PHASE, Batch
 from dew.nn.protocols import Looped, Looping
 from dew.objectives.base import Objective
@@ -124,6 +125,14 @@ class PhasePasses[L, E]:
             raise ValueError(f"a batch of the run's phase {phase} meets phase_passes of {len(self.counts)} "
                              "phase(s): one count a phase")
         return self.counts[phase]
+
+    def training_record(self, objective: Objective[L, E]) -> dict[str, JSON]:
+        """What a run's steps compute beside its model, as a checkpoint records it and a resume holds it to
+        (`dew.training.startup.computation_differs`): `objective`'s settings (`Objective.training_record`),
+        and the law a pass count drawn per microbatch follows (`SampledPasses`), whose change would draw
+        another schedule of passes from the same key and positions (row 10783)."""
+        sampled = {} if self.sampled is None else {"sampled_passes": asdict(self.sampled)}
+        return {**objective.training_record(), **sampled}
 
     def drawn_count(self) -> int | None:
         """The count the step being compiled runs where the run draws one per microbatch

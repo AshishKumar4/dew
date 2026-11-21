@@ -134,15 +134,28 @@ def test_a_caption_condition_holds_its_captions_at_the_widths_its_encoder_tokeni
     """A condition that reads captions holds them as its encoder tokenizes them, each field a row as wide as
     its context: a batch whose captions an encoder of another context tokenized is refused as the run admits
     it, before a step, and one its own encoder tokenized passes (row 9063: only the field's presence was
-    checked, and the encoder read captions at whatever width they came)."""
+    checked, and the encoder read captions at whatever width they came). The widths are derived once a
+    spec, however many batches it checks (row 10564: a tokenize, or a chat template's render, every step)."""
     from dew.inputs import CharTable
 
+    tokenized = []
+
+    class Counted(CharTable):
+        """A character table that counts the captions it tokenizes."""
+
+        def tokenize(self, texts):
+            tokenized.append(texts)
+            return super().tokenize(texts)
+
     spec = InputSpec(sample=Field("image", (8, 8, 3)),
-                     conditions={"textcontext": Condition(CharTable.from_pretrained(tokens=8))})
+                     conditions={"textcontext": Condition(Counted.from_pretrained(tokens=8))})
     image, captions = np.zeros((2, 8, 8, 3), np.float32), ["a cat", "a dog"]
-    spec.check({"image": image, "text": CharTable.from_pretrained(tokens=8).tokenize(captions)})
+    own = {"image": image, "text": CharTable.from_pretrained(tokens=8).tokenize(captions)}
+    for _ in range(3):
+        spec.check(own)
     with pytest.raises(ValueError):
         spec.check({"image": image, "text": CharTable.from_pretrained(tokens=4).tokenize(captions)})
+    assert len(tokenized) == 1, tokenized
 
 
 class Echo(ConditionEncoder[str, TextContext]):

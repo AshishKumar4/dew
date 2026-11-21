@@ -1049,6 +1049,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     from dew.nn.backbones.dit import SimpleDiT
 
     class PixelMean:
+        fields = ()
         name = "pixel_mean"
         reads = ImageGrid
 

@@ -24,6 +24,17 @@ SIZES_BEST_FIT = (3, 7, 6, 2, 4, 5, 7, 1, 5, 6, 7, 2, 3, 8, 1, 4)
 """Documents a best-fit pack places, each its own letter."""
 
 
+def windows(chain, read) -> list[tuple[list[int], list[int], list[int]]]:
+    """One pass of `chain` read as `read` says, in order (a validation read's): each window's tokens,
+    segments and positions."""
+    reader = validation(chain, batch=1, read=read, loading=READ)(DataPartition())
+    try:
+        return [(np.asarray(batch["text"])[0].tolist(), batch["text_coordinates"].segments[0].tolist(),
+                 batch["text_coordinates"].positions[0].tolist()) for batch in reader]
+    finally:
+        reader.close()
+
+
 @pytest.mark.parametrize("bins, segments, sizes", [
     (3, None, SIZES_BEST_FIT), (2, 2, SIZES_BEST_FIT), (4, 3, SIZES_BEST_FIT),
     # Empty documents fill a window's documents to its cap, which grain still gives an empty one.
@@ -47,15 +58,6 @@ def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_pack
     generation = publish(packed, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
                                        shard_bytes=256 * 1024), read="indexed", loading=READ)
 
-    def windows(chain, read) -> list[tuple[list[int], list[int], list[int]]]:
-        # One pass, in order (a validation read's): each window's tokens, segments and positions.
-        reader = validation(chain, batch=1, read=read, loading=READ)(DataPartition())
-        try:
-            return [(np.asarray(batch["text"])[0].tolist(), batch["text_coordinates"].segments[0].tolist(),
-                     batch["text_coordinates"].positions[0].tolist()) for batch in reader]
-        finally:
-            reader.close()
-
     reference = BestFitPackIterDataset(
         grain.MapDataset.source([{"text": np.frombuffer(text.encode(), np.uint8).astype(np.int32)}
                                  for text in texts]).to_iter_dataset(), length_struct={"text": 9},
@@ -68,10 +70,26 @@ def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_pack
     published = windows(prefix.cache(generation).pack(9, bins=bins, segments=segments, policy="best-fit"),
                         "indexed")
     assert published == grains
-    assert windows(packed, "memory") == grains
+    # Planned unpublished too, by index and in memory, by the one placement (row 10737).
+    assert windows(packed, "memory") == grains and windows(packed, "indexed") == grains
     chunked = prefix.flat_map(Chunks(9)).pack(9, bins=bins, segments=segments, policy="best-fit")
     assert windows(prefix.cache(generation).flat_map(Chunks(9)).pack(
         9, bins=bins, segments=segments, policy="best-fit"), "indexed") == windows(chunked, "memory")
+
+
+@pytest.mark.parametrize("segments", [2, None])
+def test_a_chunk_step_after_a_first_fit_generation_holding_an_empty_document_reads_as_written(tmp_path,
+                                                                                             segments):
+    """A first-fit generation of documents of 3, 0 and 3 characters, published with its plan, read through a
+    chunk step written after it: the chunk step drops the empty document the plan places, so the chain reads
+    as written, the windows the same chain chunked without the cache packs (row 10736: the plan stood in, its
+    first window the first document and the empty one, where the chain packs both documents in one)."""
+    prefix = Pipeline(Memory(tuple({"text": text} for text in ("aaa", "", "ccc")))).map(Tokenize())
+    generation = publish(prefix.pack(9, bins=1, segments=segments), Cache(str(tmp_path / "cache")),
+                         read="indexed", loading=READ)
+    chunked = prefix.flat_map(Chunks(9)).pack(9, bins=1, segments=segments)
+    assert windows(prefix.cache(generation).flat_map(Chunks(9)).pack(9, bins=1, segments=segments),
+                   "indexed") == windows(chunked, "memory")
 
 
 def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tmp_path):

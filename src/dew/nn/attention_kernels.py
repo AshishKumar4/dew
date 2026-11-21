@@ -653,7 +653,7 @@ def _dense_peak_of(rows: int, queries: int, heads: int, keys: int, kv_heads: int
     with report.read_offline():
         compiled = report.xla_compiled(options.jit(_dense_step(causal)).lower(query, key, key, query), None)
     memory = compiled_memory(compiled)
-    return None if memory is None else memory.argument + memory.output - memory.alias + memory.temp
+    return None if memory is None else memory.summed
 
 
 TEMPLATE_SUPPORTS = (

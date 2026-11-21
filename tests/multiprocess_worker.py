@@ -887,6 +887,7 @@ class GlobalMean:
     The trainer gathers every field before metrics run on process zero, so
     the scalar covers the complete coordinated global batch.
     """
+    fields = ()
 
     name = "global_mean"
 
@@ -1139,6 +1140,7 @@ def _evaluation_parts(case: _EvaluationCase):
             return preview
 
     class Ratio:
+        fields = ()
         name, reads = "mean", Representations
 
         def __call__(self, artifact, batch):
@@ -1270,6 +1272,7 @@ def mode_evaluation_replicas(args) -> dict:
             return Representations(features=batch["x"], labels=batch["x"][:, 0])
 
     class Count:
+        fields = ()
         name, reads = "count", Representations
 
         def __call__(self, artifact, batch):

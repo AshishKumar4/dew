@@ -36,5 +36,11 @@ def default(train, held) -> DecisionRunConfig:
     return DecisionRunConfig(data=asked(train).shuffle().repeat().batch(32), validation=asked(held).batch(32))
 
 
+def main(argv: list[str] | None = None, table=None):
+    """Run the recipe on `argv`, the process's own command line where None, over `table`'s training and
+    held-out rows, BANKING77's where None, and return the run's last state."""
+    return DecisionRunConfig.cli(argv, default=default(*(banking77() if table is None else table))).run()
+
+
 if __name__ == "__main__":
-    DecisionRunConfig.cli(default=default(*banking77())).run()
+    main()

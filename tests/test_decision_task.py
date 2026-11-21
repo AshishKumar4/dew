@@ -841,6 +841,7 @@ MESH_SEEDS = 8
 class Recorded:
     """A metric that records each answered question's probabilities over its real options as a pass
     evaluates them (`Answered`), in the pass's order, and scores nothing."""
+    fields = ()
 
     found: list
     name = "recorded"

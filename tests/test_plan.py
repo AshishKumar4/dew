@@ -161,10 +161,10 @@ def test_every_process_keeps_or_drops_the_narrow_copies_together():
 
 def test_a_start_whose_head_alone_fits_tiled_settles_it_at_no_recomputation(monkeypatch):
     """A decoder whose 4,096-word head's logits are most of its step, read whole and without narrow copies,
-    given room for its step with that head tiled and recomputing nothing: no remat rung at its whole head
-    fits, so past them the search climbs the whole ladder from its own rung and settles the tiled head at no
-    recomputation, not a recomputing rung's (row 6740's order: the ladder read from the start's rung, not
-    from the last remat rung asked)."""
+    given room for its step with that head tiled and recomputing nothing: the search asks the tiled head at
+    no recomputation before any remat rung, the start's miss short of no more than the head held at its
+    peak, and settles it, compiling no recomputing rung (row 10817: the cheapest rung that fits, where the
+    order of row 6740 asked every remat rung at the whole head first)."""
     from dew.nn.kernels.generation import chosen
 
     def decoder():
@@ -179,7 +179,7 @@ def test_a_start_whose_head_alone_fits_tiled_settles_it_at_no_recomputation(monk
         state, _, _ = trainer.place()
         trainer.compile(state, BATCH, Trials(state, BATCH))
     probes = trainer.plan["probes"]
-    assert any(probe["remat"] is not None for probe in probes), probes
+    assert all(probe["remat"] is None for probe in probes), probes
     assert trainer.plan["head_tile"] is not None and trainer.plan["remat"] is None, probes
 
 
@@ -652,27 +652,17 @@ def test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle(tmp_path, s
         np.testing.assert_array_equal(np.asarray(guided_leaf), np.asarray(unguided_leaf))
 
 
-def test_the_executable_a_profile_replaces_goes_with_its_program():
+@pytest.mark.parametrize("earlier", [False, True])
+def test_the_executable_a_profile_replaces_goes_with_its_program(earlier):
     """Under AutoPGLE a profile of the admitted step's runs compiles its program again, and the run keeps
     the guided executable alone: once the compile returns, the one the plan was admitted with is freed
     and the backend holds as many executables as it did with that one alive, though JAX keeps every
     executable it compiled of a program while the program's lowering lives. A handoff that kept the
-    admitted executable, or kept both, would hold one more."""
-    with autopgle(2):
-        trainer = lm()
-        state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
-    assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
-    assert trials.unguided is not None and trials.unguided() is None
-    live = live_executables()
-    assert live == trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
-                                                            holding(live - trials.live))
-
-
-def test_a_guided_compile_releases_an_earlier_trainers_unguided_executable():
-    """A trainer under AutoPGLE whose unguided step an earlier trainer of the same program compiled takes
-    that step, compiles the guided one, and lets the unguided go: no lowering the earlier trainer kept holds
-    it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
-    trained(lm(), steps=0)
+    admitted executable, or kept both, would hold one more. Where an `earlier` trainer of the same program
+    compiled the unguided step, the trainer takes it and lets it go too: no lowering the earlier trainer kept
+    holds it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
+    if earlier:
+        trained(lm(), steps=0)
     with autopgle(2):
         trainer = lm()
         state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
@@ -1354,7 +1344,7 @@ H100 = 2 ** 40
 
 
 def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, request
-            ) -> tuple[list, int, tuple, tuple | None, tuple | None, list[tuple]] | None:
+            ) -> tuple[list, int, tuple, tuple] | None:
     """A census shape's step at four microbatches on `target` ('cpu', its devices' memory stated through
     `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): the places of the fit
     ladder in its order (`recompute_more`: at each remat rung its head's rungs, then the next), as the
@@ -1422,29 +1412,15 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
             return refused.probes[0].fits
 
     if request.node.get_closest_marker("shards") is None:
-        # Each place's fit compiled where it is asked, once (no place past the one sought is compiled).
-        fitted = functools.cache(fits)
+        lightest = next((place for moves, place in enumerate(places) if fits(moves)), None)
     else:
         walked = sharded(f"{request.node.name} walk", lambda start, stop: [fits(moves) for moves in
                                                                             range(start, stop)], len(places))
         if walked is None:
             return None
         found = [fit for part in walked for fit in part]
-        fitted = found.__getitem__
-    # The remat rungs past the start's at the run's own head, in order: what a tight start asks next.
-    preferred = [moves for moves, place in enumerate(places)
-                 if moves and place[0] is None and place[2] != places[0][2]]
-    settled = next((at for at, moves in enumerate(preferred) if fitted(moves)), None)
-    recomputing = None if settled is None else places[preferred[settled]]
-    # What a tight start asks, a probe a place at its fixed split: its own rung, then each remat rung at its
-    # own head and options up to the first that fits.
-    asks = None if settled is None else [places[0], *(places[moves] for moves in preferred[:settled + 1])]
-    lightest = None if recomputing is not None else next(
-        (place for moves, place in enumerate(places) if fitted(moves)), None)
-    trainer = planned(0, room)
-    probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
-              for probe in trainer.plan["probes"]]
-    return places, room, placed(trainer), lightest, asks, probes
+        lightest = next((place for place, fit in zip(places, found, strict=True) if fit), None)
+    return places, room, placed(planned(0, room)), lightest
 
 
 CENSUS = {
@@ -1466,11 +1442,12 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request):
-    """A start whose step does not fit at its own rung asks the remat rungs at its own head first and
-    settles the first of them that fits (row 6740: a tight cold start's second compile), where an
-    exhaustive walk compiling each place of the ladder in the same room finds one fits, and the lightest
-    place it finds fits where none of them does, the decoder on the CPU and for a compile-only H100, the
-    scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
+    """A start whose step does not fit at its own rung climbs the ladder in its order, each rung asked, and
+    settles the first that fits: no later than the first place of the ladder an exhaustive walk compiles
+    under the step's own options and finds fits in the same room, and that place where the plan is no rung
+    of XLA's default options, which the walk does not compile (a GPU's step under them can fit a place
+    earlier: its Triton GEMM fusions hold fewer temporaries), the decoder on the CPU and for a compile-only
+    H100, the scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
     in 418 s of a train's call time past the train's bound (row 7414), and the CPU's walk is the decoder's.
     What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder needed more recomputing
     its scans and convolutions too than not), so a search that passed over a rung for one seen to miss
@@ -1482,18 +1459,10 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
         climb = climbed(monkeypatch, target, fields, batch, room_of, request)
     if climb is None:
         return
-    ladder, room, plan, lightest, asks, probes = climb
-    if asks is not None:
-        # A tight start asks its own rung, then the remat rungs at its own head and options in order, and
-        # settles the first of them that fits: no head or options rung compiled on the way (row 6740).
-        assert probes == [(*place[:3], False) for place in asks], (probes, asks)
-        assert plan == probes[-1], (plan, probes)
-    else:
-        # Where no remat rung at its own head fits, the whole ladder: no later than the lightest place the
-        # walk (under the step's own options alone) finds fits, a rung of XLA's defaults maybe earlier.
-        places = [place[:3] for place in ladder]
-        assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (
-            ladder, room, plan, probes)
+    ladder, room, plan, lightest = climb
+    places = [place[:3] for place in ladder]
+    assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (ladder, room, plan)
+    assert plan[3] or plan == lightest, (ladder, room, plan, lightest)
 
 
 def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss(
@@ -1558,14 +1527,44 @@ def test_a_step_the_fit_check_admits_is_within_the_limit_its_compile_stops_at():
     from model_support import memory_limited_to
 
     from dew.nn.kernels.generation import compile_only_gpus
-    from dew.training.memory import compile_limit
+    from dew.training.memory import Footprint, compile_limit
 
     room, held, built = 96_395_591_680, 21_975_318_136, 21_975_318_136
     summed = 63_111_557_912 + 63_110_666_810 - 63_110_643_844 + 18_894_096_952
     devices = compile_only_gpus("sm90", 1, memory_limited_to(room))
-    assert compile_limit(devices, held, built) >= summed
+    footprint = {device: Footprint(63_111_557_912, 63_110_666_810 - 63_110_643_844) for device in devices}
+    assert compile_limit(devices, held, built, footprint) >= summed
     batch = 2**20
-    assert compile_limit(devices, held + batch, built) == compile_limit(devices, held, built) - batch
+    assert (compile_limit(devices, held + batch, built, footprint)
+            == compile_limit(devices, held, built, footprint) - batch)
+
+
+@pytest.mark.parametrize("strands", [False, True])
+def test_a_compiles_limit_is_the_largest_sum_of_a_step_the_fit_check_admits(monkeypatch, strands):
+    """The bytes past which a plan's GPU compile stops (`compile_limit`) are the fit check's own arithmetic
+    solved for XLA's sum: a step whose temporaries bring that sum to the limit is admitted and one byte
+    more is not, its allocator stranding its temporaries (the room past its arguments and new outputs held
+    for two of them) or not. A GH200's 4B step (UB-6740-TWINS2: 55.5 GB of arguments, 39.3 GB of
+    temporaries, 11,774 bytes of new outputs) summed within the GPU's 96.4 GB, its compile run to its code,
+    and stranded did not fit: its compile stops after buffer assignment where its allocator strands."""
+    import os
+
+    from model_support import memory_limited_to
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.memory import Footprint, admitted, compile_limit
+
+    partitioning = f"--xla_gpu_enable_allocator_spatial_partitioning={str(strands).lower()}"
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} {partitioning}")
+    room, arguments, outputs, held = 96_395_591_680, 55_536_257_084, 11_774, 2**20
+    temporaries = 39_324_237_872
+    devices = compile_only_gpus("sm90", 1, memory_limited_to(room))
+    limit = compile_limit(devices, held, 0, {device: Footprint(arguments, outputs) for device in devices})
+    assert limit is not None
+    most = limit - arguments - outputs
+    assert admitted(devices, arguments, outputs + held, most) >= 0
+    assert admitted(devices, arguments, outputs + held, most + 1) < 0
+    assert (arguments + outputs + temporaries > limit) is strands, (limit, strands)
 
 
 def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():
@@ -1690,6 +1689,49 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
     # A typed PRNG key by its key data, its key type beside it (train 1019's review, F1).
     first, second = (key(Displayed(4, held=jax.random.key(seed))) for seed in (0, 1))
     assert first is not None and first == key(Displayed(4, held=jax.random.key(0))) != second
+
+
+def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):
+    """A flag given twice is read by its last value, so a rung record's key states the flags in their order:
+    two orders of one flag's two values compute apart and key apart (row 10797: sorted, they were one key),
+    and the same order keys alike."""
+    import os
+
+    from dew.training.rungs import rung_key
+
+    trainer = lm()
+    state, _, _ = trainer.place()
+    flags = os.environ.get("XLA_FLAGS", "")
+
+    def key(*settings):
+        monkeypatch.setenv("XLA_FLAGS", " ".join((flags, *settings)))
+        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)
+
+    autotune_on, autotune_off = "--xla_gpu_autotune_level=4", "--xla_gpu_autotune_level=0"
+    first = key(autotune_on, autotune_off)
+    assert first is not None and first == key(autotune_on, autotune_off) != key(autotune_off, autotune_on)
+
+
+SCALE = 2
+"""A module setting the wrapped function below reads."""
+
+
+def test_a_users_function_wrapped_as_a_librarys_states_the_globals_it_reads(monkeypatch):
+    """A user's function that names a library's as the one it wraps (`functools.wraps`, which copies the
+    library's module onto it) is the user's by the globals it was defined in, so its statement holds the
+    module setting it reads, and a change to that setting states another function (row 10554: taken as the
+    library's, its globals were dropped, and a rung record or truth store keyed a stale entry)."""
+    import json
+
+    from dew._stated import stated
+
+    @functools.wraps(json.dumps)
+    def scaled(value):
+        return value * SCALE
+
+    before = stated(scaled, "a wrapped function")
+    monkeypatch.setitem(globals(), "SCALE", 3)
+    assert stated(scaled, "a wrapped function") != before
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
