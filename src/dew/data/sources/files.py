@@ -15,8 +15,8 @@ import re
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
-from functools import cached_property, lru_cache, partial
+from dataclasses import dataclass, field
+from functools import cached_property, lru_cache
 from pathlib import PurePosixPath
 from typing import BinaryIO, Literal, get_args
 from urllib.parse import urlsplit
@@ -962,50 +962,7 @@ class Files(Dataset):
                               for start, stop in itertools.pairwise(cuts))
         divisible = self.kind in ("jsonl", "text") and not any(
             infer_compression(url.lower()) for url in self.paths)
-        shards = tuple(shards)
-        # A line store's ranges count their records from its offset index, looked for only by a read that
-        # needs the rows (row 9051: a streamed map_with_index places each record as its indexed read does).
-        counted = partial(self._indexed_rows, shards) if self.kind in ("jsonl", "text", "csv") else None
-        return ShardManifest(shards, self._read_shard, self._subdivided if divisible else None,
-                             counted=counted)
-
-    def _record_offsets(self) -> tuple[np.ndarray, ...] | None:
-        """Each file's record starts in file order, as its provisioned offset index states them (an index a
-        file, read as written; or the store's one index, each record naming its file, read where its rows
-        stand in the order the files read them), or None where the index orders them otherwise, which
-        no streamed range's count could follow."""
-        with contextlib.closing(_IndexedLines(self)) as indexed:
-            if self.index is None:
-                tables = [np.asarray(table["offset"]) for table in indexed.tables]
-            else:
-                (table,) = indexed.tables
-                files = np.asarray(table["shard"])
-                if np.any(np.diff(files.astype(np.int64)) < 0):
-                    return None
-                # Each file's run of rows, the files in their order (checked above).
-                bounds = np.searchsorted(files, np.arange(len(self.paths) + 1))
-                offsets = np.asarray(table["offset"])
-                tables = [offsets[start:stop] for start, stop in itertools.pairwise(bounds)]
-        if any(np.any(np.diff(offsets.astype(np.int64)) <= 0) for offsets in tables):
-            return None
-        return tuple(tables)
-
-    def _indexed_rows(self, shards: Sequence[Shard], reads: int = 1) -> tuple[int | None, ...]:
-        """The records each of `shards` reads, those that start in its range (`_Lines`), counted from the
-        files' provisioned offset indexes (`_record_offsets`): none read from the files. None each where no
-        index is provisioned or it orders the records otherwise than the files. `reads` is a read's threads
-        (`ShardManifest.counted`)."""
-        del reads
-        offsets = self._record_offsets() if self.supports("indexed") else None
-        if offsets is None:
-            return (None,) * len(shards)
-        numbers = {url: number for number, url in enumerate(self.paths)}
-        rows = []
-        for shard in shards:
-            starts = offsets[numbers[shard.uri]]
-            stop = len(starts) if shard.stop is None else int(np.searchsorted(starts, shard.stop))
-            rows.append(stop - int(np.searchsorted(starts, shard.start)))
-        return tuple(rows)
+        return ShardManifest(tuple(shards), self._read_shard, self._subdivided if divisible else None)
 
     def _by_file(self) -> ShardManifest:
         """A Parquet store's files as its shards, each read row group by row
@@ -1089,11 +1046,6 @@ class Files(Dataset):
         if len(shards) < count:
             raise ValueError(f"{self.describe()} holds {len(shards)} records for {count} readers × workers; "
                              "read it with fewer")
-        if self.__dict__.get("indexes_present"):
-            # A store whose index a read has found states its parts' rows from it too (row 9051); one that no
-            # read has looked for an index for is cut without looking (`supports`).
-            shards = [replace(shard, rows=rows) for shard, rows in zip(shards, self._indexed_rows(shards),
-                                                                        strict=True)]
         return tuple(shards)
 
     def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:

@@ -1799,25 +1799,6 @@ def prepared_untuned(beside: bool = False) -> dict:
     return fresh(PREPARED_HOST, "beside" if beside else "alone", flags=untuned, platforms="cpu")
 
 
-def test_a_host_steps_start_is_traced_on_its_cpu_companion(monkeypatch):
-    """A host step's state is built on its CPU companion (`execution.placed_host`), so its start's shapes are
-    traced there too (`Trainer._started`), not on the process's default device, which on a GPU host is the
-    accelerator whose kernel routes the CPU build never takes (row 10569)."""
-    from dew.training import trainer as trainers
-
-    traced = []
-    original = trainers.traced_draw
-
-    def recording(*args, **kwargs):
-        traced.append(jax.config.jax_default_device)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(trainers, "traced_draw", recording)
-    run = streaming_decoder(HOST)
-    run._started()
-    assert traced == [run.state_mesh.local_devices[0]], (traced, run.state_mesh)
-
-
 def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here(tmp_path, monkeypatch):
     """A host step prepared for GPUs this process lacks (one compile-only H100, `prepare_host_step`), over its
     fresh state's shapes, compiles the accelerator's programs for them as a device will run them

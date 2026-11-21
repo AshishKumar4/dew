@@ -158,8 +158,7 @@ def _subdivided(manifests: Sequence[ShardManifest], count: int) -> tuple[Shard, 
                    else manifest.subdivide(count) for manifest in manifests)
 
 
-def _counted(manifests: Sequence[ShardManifest], reads: int) -> tuple[int | None, ...]:
+def _counted(manifests: Sequence[ShardManifest], reads: int) -> tuple[int, ...]:
     """The rows of each shard of the stores `manifests` name, one store after another, each store's as it
-    counts them, `reads` at once (`ShardManifest.sized`); None where a store counts none of a shard's (a
-    line store with no offset index), which no read takes for zero rows."""
-    return tuple(shard.rows for manifest in manifests for shard in manifest.sized(reads).shards)
+    counts them, `reads` at once (`ShardManifest.sized`)."""
+    return tuple(int(shard.rows or 0) for manifest in manifests for shard in manifest.sized(reads).shards)
