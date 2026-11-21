@@ -1254,7 +1254,8 @@ def test_a_ragged_grouped_forward_at_its_derived_tile_is_its_groups_products(gpu
         target = generation.gpu_target()
         tile = launch.derived(arguments, target)
         got = gemm.gemm(rows, matrices, jnp.asarray(sizes), out_dtype=jnp.float32, interpret_on_cpu=True)
-    assert launch.legal(arguments, tile, target), tile
+        # Judged where the launch plans it, the GPU it derives for.
+        assert launch.legal(arguments, tile, target), tile
     group_of = np.repeat(np.arange(8), sizes)
     exact = np.einsum("rk,rkn->rn", np.asarray(rows, np.float64), np.asarray(matrices, np.float64)[group_of])
     np.testing.assert_array_equal(np.asarray(got, np.float64), exact)
