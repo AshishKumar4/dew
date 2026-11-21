@@ -319,14 +319,14 @@ def test_a_gpu_parts_prepare_skips_what_its_run_skips_by_backend(monkeypatch):
     conftest.pytest_runtest_setup(_Marked())
 
 
-def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch):
-    """In a GPU tier part's prepare, an assertion a test makes once every site and arm it began finished
-    checks the zeros its prepared arms gave (`reference_error.ahead_arm`), which judge nothing: its prepare
-    passes it to its run (tests/conftest.py's `judged_on_zeros`; rows 10169 on: a cell asserting a product's
-    value failed its file's prepare). A missing program is no such check, nor is a failure whose arm did not
-    finish, nor one outside a prepare."""
-    import types
-
+def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch, tmp_path):
+    """In a GPU tier part's prepare, a failure a test or a flow's cell raises once every site and arm it
+    began finished checks the zeros its prepared arms gave (`reference_error.ahead_arm`), which judge
+    nothing: its prepare passes it to its run, by one rule for both (`CompiledTruths.judged_its_zeros`,
+    tests/conftest.py's `judged_on_zeros`; rows 10169 on: a cell asserting a product's value failed its
+    file's prepare; row 10731: the test's rule took assertions alone, the cell's any error). A missing program
+    is no such check, nor is a failure whose arm did not finish, one before any arm, nor one outside a
+    prepare."""
     import conftest
     import store_wire
     import tier_wire
@@ -334,14 +334,18 @@ def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch):
 
     with pytest.raises(AssertionError) as checked:
         raise AssertionError
+    with pytest.raises(ValueError) as computed:
+        raise ValueError
     with pytest.raises(truths_ahead.MissingTruth) as missing:
         raise truths_ahead.MissingTruth
-    store = types.SimpleNamespace(prepare=True, tried={"an arm"}, done={"an arm"})
+    store = truths_ahead.CompiledTruths(tmp_path, prepare=True, stamp="a", tried={"an arm"}, done={"an arm"})
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     token = store_wire.COMPILED.set(store)
     try:
-        assert conftest.judged_on_zeros(checked)
+        assert conftest.judged_on_zeros(checked) and conftest.judged_on_zeros(computed)
         assert not conftest.judged_on_zeros(missing)
+        # A cell's rule reads the sites it tried itself: none since `before`, no check of its zeros.
+        assert not store.judged_its_zeros(checked.value, frozenset({"an arm"}))
         store.done = set()
         assert not conftest.judged_on_zeros(checked)
     finally:
