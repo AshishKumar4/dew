@@ -9,7 +9,7 @@ import contextvars
 import dataclasses
 import functools
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -616,3 +616,33 @@ def _refuse_owned_policies(compile, *arms) -> None:
             raise TypeError(f"{getattr(inner, '__qualname__', repr(inner))} is compiled without YNNPACK's "
                             f"fusions, beside an arm run as given, where the gate compiles Dew's arm with "
                             f"them: pass it plain, and the gate compiles it as the pairing asks")
+
+
+def _written_references(reference_fn, also: Mapping) -> list[tuple[str | None, Callable]]:
+    """The references a site's accuracy claim also holds Dew's arm against compiled as written
+    (`arm_forms._bounded`, `arm_forms._written_twin`), each by its name (the site's own None), in its draws'
+    order."""
+    return [(name, fn) for name, fn in ((None, reference_fn), *also.items()) if _bounded(fn)]
+
+
+def _written_role(name: str | None) -> str:
+    """The role of reference `name`'s twin compiled as written in a site's store (`_written_references`)."""
+    return "written" if name is None else f"written {name}"
+
+
+def _holds_program(fn) -> bool:
+    """Whether arm `fn`, within a run-to-run declaration and a window loop, is one the store holds programs
+    of (`_compile_arms`): none an arm the gate runs as given or one running Dew's own programs."""
+    while isinstance(fn, (_RunToRun, _Windowed)):
+        fn = fn.fn
+    return not (_given(fn) or getattr(fn, "dew_programs", False))
+
+
+def drawn_on_the_host(inputs_of: Callable, seed: int):
+    """`inputs_of(seed)` drawn on the host's CPU, as a recording's inputs were, whatever device the test runs
+    on: jax.random's draws are the same bits on every device but its normal's float transform is not (a
+    recorded site's seed drawn on an H100 had another digest than on the CPU, the recording's, in 157 of the
+    recurrence GPU flow's cells, draw-digest at 996fa29f1), so a draw on the test's device would not be the
+    recorded inputs. The arrays then go to the device where the run reads them."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        return inputs_of(seed)

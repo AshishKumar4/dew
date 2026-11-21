@@ -364,3 +364,22 @@ def test_a_gpu_parts_prepare_skips_a_test_declared_to_compile_at_run(monkeypatch
         conftest.pytest_runtest_setup(_Marked("gpu", "compiles_at_run"))
     monkeypatch.delenv(tier_wire.PREPARE)
     conftest.pytest_runtest_setup(_Marked("compiles_at_run"))
+
+
+def test_a_check_one_site_outside_a_gpu_part_loads_none_of_the_stores_machinery():
+    """`reference_error`, every check-1 site's module, loads none of the truths store's machinery
+    (tests/truths_ahead.py, tests/arm_store.py) until a store is open (`store_wire.COMPILED`, a GPU tier
+    part's prepare or run): the CPU lane's tests, which open none, never load it, so its churn re-keys none
+    of their rows (the test cache keys a row on each module its test loads; 359 test files loaded it through
+    reference_error)."""
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = ("import json, sys, reference_error\n"
+            "print(json.dumps(sorted({'truths_ahead', 'arm_store'} & set(sys.modules))))")
+    done = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent, capture_output=True,
+                          text=True, check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert json.loads(done.stdout.splitlines()[-1]) == []

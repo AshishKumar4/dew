@@ -29,7 +29,6 @@ recording) has no program, and runs as given."""
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import dataclasses
 import functools
 import hashlib
@@ -47,6 +46,7 @@ from typing import Any
 
 import jax
 import numpy as np
+from store_wire import COMPILED, SITE_IN_PROGRESS
 from tool_support import load
 
 
@@ -380,15 +380,6 @@ def admitted_needs(arms: Sequence[dict[str, int]], truths: Sequence[dict[str, in
             *(admitted_as(CompiledMemory(**memory), state) for memory in truths)]
 
 
-COMPILED: contextvars.ContextVar[CompiledTruths | None] = contextvars.ContextVar("truths_ahead_store",
-                                                                                default=None)
-"""The store open (`compiled_truths`), None outside one."""
-
-SITE_IN_PROGRESS: contextvars.ContextVar[str | None] = contextvars.ContextVar("truths_ahead_site",
-                                                                              default=None)
-"""The label of the check-1 site whose truths are computed (`judged`), None outside one."""
-
-
 READ: list[Path] = []
 """Each store this process's runs read, in order (`compiled_truths`): a test's own and a flow's alike, whose
 records of what its run compiled on its GPU (`AT_RUN`, `UNPREPARED`) the run's summary names
@@ -430,16 +421,6 @@ def prepared(directory: Path, *, stamp: str, target) -> Iterator[CompiledTruths]
     finally:
         arms, truths = compiled_memory(directory, arms=True), compiled_memory(directory)
         tier_wire.unit_needs(admitted_needs(arms, truths))
-
-
-@contextlib.contextmanager
-def judged(label: str) -> Iterator[None]:
-    """Within the block, site `label`'s truths are computed (`running`)."""
-    token = SITE_IN_PROGRESS.set(label)
-    try:
-        yield
-    finally:
-        SITE_IN_PROGRESS.reset(token)
 
 
 PARENT = "DEW_PARENT_STORE"
@@ -485,9 +466,10 @@ def of_the_parent() -> Iterator[CompiledTruths | None]:
 
 def reading() -> tuple[CompiledTruths, str] | None:
     """The store a run reads the site in progress from, and its label: where a run reads a store
-    (`compiled_truths(prepare=False)`) within a site (`judged`) its prepare reached, else None. A site its
-    prepare did not reach (a cell its prepare skipped, one computing past an earlier site) runs unprepared,
-    recorded (`CompiledTruths.unprepared`); one prepared at another stamp is a red (`MissingTruth`)."""
+    (`compiled_truths(prepare=False)`) within a site (`store_wire.judged`) its prepare reached, else None. A
+    site its prepare did not reach (a cell its prepare skipped, one computing past an earlier site) runs
+    unprepared, recorded (`CompiledTruths.unprepared`); one prepared at another stamp is a red
+    (`MissingTruth`)."""
     store, label = COMPILED.get(), SITE_IN_PROGRESS.get()
     if store is None or store.prepare or label is None:
         return None
