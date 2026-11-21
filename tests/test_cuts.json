@@ -132,7 +132,7 @@
 ],
 "tests/test_attention_dropout.py": [
 "tests/test_attention_dropout.py::test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term[training-mosaic]",
-"tests/test_attention_dropout.py::test_an_fp16_output_whose_fp32_quotient_is_its_overflow_midpoint_narrows_below_it[training-mosaic]"
+"tests/test_attention_dropout.py::test_split_delta_keeps_tiny_others_when_anchor_times_multiplier_overflows"
 ],
 "tests/test_attention_mosaic.py": [
 "tests/test_attention_mosaic.py::test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpreted[sm80-128-default]",
@@ -464,28 +464,28 @@
 "tests/test_attention_route.py::test_the_accurate_form_is_one_option_away"
 ],
 "tests/test_attention_stability.py": [
-"tests/test_attention_stability.py::test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form[a share in bf16's subnormal band, the denominator's rest in a later tile-normalized first]",
-"tests/test_attention_stability.py::test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient[float32]",
-"tests/test_attention_stability.py::test_gradients_at_a_scale_far_below_one_are_on_par[default-triton-float32]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a decode step's sink near fp32's largest and one key-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a resumed state of a large denominator-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a row of small values beside one that overflows in its tile, float32-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a sink near fp32's largest and one key-triton]",
+"tests/test_attention_stability.py::test_an_fp16_mean_of_values_at_fp16s_largest_is_finite[decode-inference-a sink]",
+"tests/test_attention_stability.py::test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient[bfloat16]",
+"tests/test_attention_stability.py::test_gradients_at_a_scale_far_below_one_are_on_par[default-portable-bfloat16]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a decode step's sink and one key-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a product past fp32's largest before a small scale, float32-portable]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a row of no keys-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a share in bf16's subnormal band on a value near its largest-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a sink near fp32's largest at scale 1/4-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a small weight on a large value, bfloat16-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a small weight on a large value, float32-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share of an overflowing row, bfloat16-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share of an overflowing row, float32-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a tiny value beside an overflowing column at equal weights-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a weight at the exponent's edge on a large value, float32-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[fp16 values near their largest beside a state near fp32's largest-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[logits near 1e30-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/2, cotangents near 2**125-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values at fp32's largest over 256 equal keys-portable]",
-"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a resumed state of a large denominator]",
-"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[keys an ulp apart, float32]",
-"tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[a share in bf16's subnormal band on a value near its largest]",
-"tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[ties at scale 1/2]",
-"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[a subnormal share beside 255 equal weights, bfloat16]",
-"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[values near fp32's largest over 2 equal keys]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[fp16 values near their largest beside a state near fp32's largest-portable]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys near fp32's largest at equal logits-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[small values beside unseen ones near fp32's largest, float32-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/4, cotangents near 2**125-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values near fp32's largest over 256 equal keys-portable]",
+"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a small weight on a large value, bfloat16]",
+"tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[a row of small values beside one that overflows in its tile, float32]",
+"tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[values at fp32's largest over 2 equal keys]",
+"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[a tiny value beside an overflowing column at equal weights]",
 "tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a row of small values beside one that overflows in its tile, float32]",
 "tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a subnormal share of an overflowing row, float32]",
 "tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[fp16 values near their largest beside a state near fp32's largest]",
@@ -518,23 +518,23 @@
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-step-32x32]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-bf16-forward-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp16-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp32-step-64x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-forward-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-step-64x64]",
-"tests/test_attention_triton.py::test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block[64]",
-"tests/test_attention_triton.py::test_one_run_a_query_is_the_interval_the_frozen_mainloop_walks[Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_over_every_call_form[causal-window-Tiles(block_q=128, block_k=64, warps=4, stages=2)-default]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=128, block_k=64, warps=4, stages=2)-default]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[alibi-float32-default]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[resumed-float32-default]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[softcap-sinks-alibi-bfloat16-default]",
+"tests/test_attention_triton.py::test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block[128]",
+"tests/test_attention_triton.py::test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound[bfloat16]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two[80-48-portable]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_over_every_call_form[full-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-window]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[key-bias-bfloat16-accurate]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[sinks-bfloat16-accurate]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[softcap-sinks-alibi-float16-default]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm120-backward]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm120-forward]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm86-backward]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm86-forward]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two[128-128-portable]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[documents-lengths]",
-"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-window-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)]"
+"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[gate-bfloat16-fold]",
+"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-chunk-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
+"tests/test_attention_triton.py::test_the_plain_backward_is_on_par_over_runs[runs-window-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]"
 ],
 "tests/test_attention_witness.py": [
 "tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-full]"
@@ -561,7 +561,8 @@
 "tests/test_benchmark_step.py::test_a_window_reads_invalid_where_any_of_its_steps_went_non_finite_not_only_its_last"
 ],
 "tests/test_bf16_reference.py": [
-"tests/test_bf16_reference.py::test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does[llama-tiny]"
+"tests/test_bf16_reference.py::test_a_decoder_is_as_exact_as_its_reference[mixtral-tiny-bfloat16]",
+"tests/test_bf16_reference.py::test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16"
 ],
 "tests/test_block_diffusion.py": [
 "tests/test_block_diffusion.py::test_a_canvas_reads_its_cache_alike_paged_or_dense[int8]",
@@ -1281,6 +1282,9 @@
 "tests/test_dory.py::test_packed_documents_read_only_themselves_through_every_pass[reference]",
 "tests/test_dory.py::test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count[2]",
 "tests/test_dory.py::test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums"
+],
+"tests/test_dpo.py": [
+"tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[gated delta net hybrid-shared]"
 ],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-replay]",
@@ -3240,9 +3244,6 @@
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[default-chunk]",
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk]"
 ],
-"tests/test_stage_blocks.py": [
-"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
-],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
 "tests/test_stage_local.py::test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one",
@@ -3476,6 +3477,9 @@
 "tests/test_wan_source.py": [
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
+],
+"tests/test_wan_vae.py": [
+"tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
 ],
 "tests/test_weighed_check.py": [
 "tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
