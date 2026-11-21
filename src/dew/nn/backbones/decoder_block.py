@@ -1009,10 +1009,8 @@ class DecoderBlock(nn.Module):
 
     @nn.nowrap
     def _cross_pass_merges(self, spec: CrossPass) -> dict[str, CrossPassMerge]:
-        """A message merge for each of its mixer's input sites and its feed-forward's (`cross_pass`)."""
-        if self.hyper_connections is not None or self.altup is not None or self.wiring.normed_residual:
-            raise ValueError("a looped pass merges its message into a sublayer's input and leaves the one "
-                             "residual stream as it is: no hyper-connections, AltUp or normed residual")
+        """A message merge for each of its mixer's input sites and its feed-forward's (`cross_pass`), on the
+        one residual stream its model's checks hold it to (`decoder_fields._messaged_blocks`)."""
         eps = spec.norm_eps if spec.norm_eps is not None else self._stated_eps('cross-pass messages')
         return {site: CrossPassMerge(spec, self.emb_features, eps, name=f'{MERGE_PREFIX}{site}')
                 for site in (*self._mixer_sites(), *(('mlp',) if self.feedforward is not None else ()))}
