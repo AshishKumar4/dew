@@ -205,7 +205,7 @@ def test_an_algorithm_at_least_another_is_as_exact_as_it():
         assert admits(asked)
         for chosen in filter(admits, runs):
             assert_as_exact(_product(chosen), _product(asked), draw, f"{chosen.name}, at least {asked.name}",
-                            seeds=8)
+                            seeds=8, truth_fn=_product(jax.lax.DotAlgorithmPreset.F64_F64_F64))
 
 
 def cancelled(seed):
