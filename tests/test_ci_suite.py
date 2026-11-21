@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def suite_maps(checkout: Path, tmp_path: Path) -> list[list[str]]:
-    """The words of each map tools/ci/suite.sh sends from `checkout`, its gangs run (no PROVEN, no GANGLESS),
+    """The words of each map tools/ci/suite.sh sends from `checkout`, its gangs run (no PROVEN),
     the armada CLI stood in for: each call's words, one call a line; its verdict green, so no suite runs."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -23,8 +23,7 @@ def suite_maps(checkout: Path, tmp_path: Path) -> list[list[str]]:
     (tmp_path / "calls").unlink(missing_ok=True)
     environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "ARMADA": "armada",
                    "OUT": str(tmp_path / "out")}
-    for name in ("PROVEN", "GANGLESS"):
-        environment.pop(name, None)
+    environment.pop("PROVEN", None)
     ran = subprocess.run(["bash", "tools/ci/suite.sh", "a" * 40], cwd=checkout, capture_output=True,
                          text=True, timeout=300, env=environment)
     maps = [line.split() for line in (tmp_path / "calls").read_text().splitlines() if line.startswith("map ")]

@@ -160,15 +160,21 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
                           truth_fn=plain, plain_fn=plain, seeds=8)
 
 
-@pytest.mark.parametrize("taken", list(ORDER_SETS))
+MERGE_ORDER_SETS = {**{name: taken for name, taken in ORDER_SETS.items() if name != "second orders, staged"},
+                    **{order: (order,) for order in ORDER_SETS["second orders, staged"]}}
+"""The padded merge's order sets (`ORDER_SETS`), each staged second order a case of its own: the three in one
+took 193 s at normal operands, past a group's 120 s (row 9799)."""
+
+
+@pytest.mark.parametrize("taken", list(MERGE_ORDER_SETS))
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
     """`merged.merged_padded` (a split decode step's slices merged where its launch wrote them; its value one
     launch on a GPU, its tangent the law's path's, a custom JVP): every order runs, finite wherever float64
     is a normal float32 and the plain merge (`attention_oracle.plain_merged`, independent of the law) is, at
     padded outputs and maxima near float32's ends, two slices' totals drawn positive, the plain merge its
-    truth; each order set a case of its own (`ORDER_SETS`: every order in one case, the law's path its plain
-    formula and truth, held its group to 1,798 s)."""
+    truth; each order set a case of its own (`MERGE_ORDER_SETS`: every order in one case, the law's path its
+    plain formula and truth, held its group to 1,798 s)."""
     spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
 
     def inputs(seed: int, scale: float) -> tuple:
@@ -185,7 +191,7 @@ def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
 
     plain = functools.partial(plain_merged, rate=1.0, queries=2, width=8)
     assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge} ({taken})", truth_fn=plain,
-                          plain_fn=plain, seeds=FEWEST_SEEDS, taking=ORDER_SETS[taken])
+                          plain_fn=plain, seeds=FEWEST_SEEDS, taking=MERGE_ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("edge", EDGES)

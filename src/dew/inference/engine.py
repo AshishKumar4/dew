@@ -55,9 +55,10 @@ def settled[T](future: Future[T], outcome: T | BaseException) -> None:
 
 def normalized(variables: Variables, source: list) -> Variables:
     """`variables` checked against the served tree's leaves `source` (`tree_flatten_with_path` of
-    their shapes) and cast to their dtypes: the tree must match leaf for leaf in path and shape, and
-    a leaf that is not floating point must match its dtype too, so the compiled programs keep running
-    without a recompile."""
+    their shapes): the tree must match leaf for leaf in path and shape, and a leaf that is not floating
+    point must match its dtype too, so the compiled programs keep running without a recompile. Each leaf
+    is cast to the served dtype where it is, a host leaf on the host and a device array on its devices:
+    nothing is placed here, `reloaded` placing each leaf once, on the served placement (row 10799)."""
     # A frozen and a plain mapping flatten to different tree structures but
     # the same leaf paths, so the paths are what must match.
     incoming, incoming_structure = jax.tree_util.tree_flatten_with_path(variables)
@@ -71,8 +72,8 @@ def normalized(variables: Variables, source: list) -> Variables:
                 f"a reloaded leaf is {kind}{list(np.shape(new))}, "
                 f"the served leaf {served_kind}{list(np.shape(old))}")
     return jax.tree.unflatten(
-        incoming_structure, [jnp.asarray(np.asarray(new, dtype=old.dtype)
-                                         if isinstance(new, np.ndarray) else new, dtype=old.dtype)
+        incoming_structure, [jnp.asarray(new, dtype=old.dtype) if isinstance(new, jax.Array)
+                             else np.asarray(new, dtype=old.dtype)
                              for (_, new), (_, old) in zip(incoming, source, strict=True)])
 
 
@@ -84,9 +85,14 @@ def reloaded(incoming: Variables, served: Variables) -> Variables:
     served_leaves, structure = jax.tree_util.tree_flatten_with_path(served)
     for (_, new), (_, old) in zip(incoming_leaves, served_leaves, strict=True):
         served_kind = jnp.result_type(old)
+        placement = old.sharding if isinstance(old, jax.Array) else None
+        if not isinstance(new, jax.Array):
+            # A host leaf placed once, from a buffer of its own: a placement on a CPU may alias the host
+            # array it is given, which the caller may change after the reload.
+            leaves.append(jax.device_put(np.array(new, dtype=served_kind, copy=True), placement))
+            continue
         # A placement can alias a shard of the caller's array; the copy
         # owns its buffer whatever the caller donates next.
-        placement = old.sharding if isinstance(old, jax.Array) else None
         leaves.append(jnp.array(jax.device_put(new, placement), dtype=served_kind, copy=True))
     return jax.tree.unflatten(structure, leaves)
 

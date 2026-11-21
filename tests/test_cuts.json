@@ -130,20 +130,9 @@
 "tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm90-128]",
 "tests/test_attention_decode_template.py::test_every_output_a_decode_steps_launches_declare_is_written_interpreted[one-query-no-rewalk]"
 ],
-"tests/test_attention_derived.py": [
-"tests/test_attention_derived.py::test_the_derived_backward_is_on_par_in_every_cell[full-keys-first-normalized-weights]"
-],
 "tests/test_attention_dropout.py": [
 "tests/test_attention_dropout.py::test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term[training-mosaic]",
 "tests/test_attention_dropout.py::test_an_fp16_output_whose_fp32_quotient_is_its_overflow_midpoint_narrows_below_it[training-mosaic]"
-],
-"tests/test_attention_metamorphic.py": [
-"tests/test_attention_metamorphic.py::test_a_causal_calls_first_queries_are_the_call_cut_to_them",
-"tests/test_attention_metamorphic.py::test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted[1]",
-"tests/test_attention_metamorphic.py::test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted[8]",
-"tests/test_attention_metamorphic.py::test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted",
-"tests/test_attention_metamorphic.py::test_a_full_calls_output_is_its_keys_permuted_together_with_their_values",
-"tests/test_attention_metamorphic.py::test_slices_whose_outputs_sum_past_fp32s_largest_merge_to_their_attention_interpreted"
 ],
 "tests/test_attention_mosaic.py": [
 "tests/test_attention_mosaic.py::test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpreted[sm80-128-default]",
@@ -306,7 +295,7 @@
 "tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm100]",
 "tests/test_attention_mosaic_compile.py::test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free[e4m3fn]",
 "tests/test_attention_mosaic_compile.py::test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free[sm80]",
-"tests/test_attention_mosaic_compile.py::test_each_attention_launch_states_its_outputs_dimensions_for_an_h100[accurate]",
+"tests/test_attention_mosaic_compile.py::test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free[sm90]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[decision-inference]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[decision-training]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[step-inference]",
@@ -324,7 +313,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-64-fast]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-128-acc]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-128-fast]",
-"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-256-fast]",
+"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-256-acc]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-64-acc]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-64-fast]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm89-128-acc]",
@@ -570,10 +559,6 @@
 "tests/test_benchmark_step.py::test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer[sd3_transformer-False]",
 "tests/test_benchmark_step.py::test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer[unet_2d_condition-False]",
 "tests/test_benchmark_step.py::test_a_window_reads_invalid_where_any_of_its_steps_went_non_finite_not_only_its_last"
-],
-"tests/test_bf16_reference.py": [
-"tests/test_bf16_reference.py::test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does[llama-tiny]",
-"tests/test_bf16_reference.py::test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16"
 ],
 "tests/test_block_diffusion.py": [
 "tests/test_block_diffusion.py::test_a_canvas_reads_its_cache_alike_paged_or_dense[int8]",
@@ -1909,8 +1894,8 @@
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
 ],
-"tests/test_lfm3.py": [
-"tests/test_lfm3.py::test_plain_and_looped_lfm3_train_through_a_decision_run[looped]"
+"tests/test_level_stacking.py": [
+"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
 ],
 "tests/test_linear_attention.py": [
 "tests/test_linear_attention.py::test_a_cached_layer_traced_for_a_jvp_decodes_its_token[plain]",
@@ -2686,8 +2671,8 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-minimax-text-01-lightning-float32-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-qwen3.5-27b-gdn-bfloat16-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-qwen3.5-27b-gdn-float32-forward-packed]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-kimi-linear-kda-bfloat16-forward-packed]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-qwen3.5-27b-gdn-bfloat16-forward]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-kimi-linear-kda-bfloat16-forward]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-qwen3.5-27b-gdn-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-a write gate-bfloat16-forward-variant-1]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-kimi-linear-kda-bfloat16-training-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-minimax-text-01-lightning-bfloat16-training-packed]",
@@ -2767,10 +2752,6 @@
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-spread gates-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-steep then mild-None]",
 "tests/test_recurrence_template_stability.py::test_the_narrow_gated_delta_gradient_compiles_for_an_h100"
-],
-"tests/test_recurrence_witness.py": [
-"tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
-"tests/test_recurrence_witness.py::test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches"
 ],
 "tests/test_recurrent_sequence_split.py": [
 "tests/test_recurrent_sequence_split.py::test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones[kimi delta attention-empty_shard_packed-default rules]",

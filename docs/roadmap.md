@@ -17,7 +17,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - One attention algebra: state, visibility, hooks. [1293]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
-- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900, 10742]
+- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900, 10742, 10805]
 - Convolution repairs above their owner. [5665]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -69,7 +69,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- The saved data plan as recorded rules, one last version, and the resume modes. [10569]
+- The saved data plan as recorded rules, one last version, and the resume modes. [10569, 10814, 10816]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 
@@ -82,6 +82,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
+- Prelude-anchored cross-pass message passing on Loop. [10806]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - An NVFP4 source's weights served packed, algebra.md §7.4's prepare step. [8550]
 - Dory: the release qualified and its tests' oracles. [596]
