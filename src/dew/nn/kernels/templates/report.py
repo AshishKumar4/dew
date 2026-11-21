@@ -345,11 +345,13 @@ def _provenance(op, arguments: tokamax.BoundArguments) -> frozenset[str] | None:
     tile alone (`attention.hook_program`), and no value names the code a wrapper calls."""
     from dew._code import defining_modules
 
-    values = [*_parts(op), *(part for name, value in arguments.arguments.items() if name in op.HOOKS
-                             for part in _parts(value))]
+    fields = ([getattr(op, field.name) for field in dataclasses.fields(op)]
+              if dataclasses.is_dataclass(op) else [])
+    hooks = [value for name, value in arguments.arguments.items() if name in op.HOOKS]
+    values = [part for value in (*fields, *hooks) for part in _parts(value)]
     if any(callable(value) and not isinstance(value, type) for value in values):
         return None
-    return defining_modules(values)
+    return defining_modules([type(op), *values])
 
 
 def _parts(value) -> Iterator[object]:

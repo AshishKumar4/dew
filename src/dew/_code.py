@@ -24,7 +24,7 @@ import hashlib
 import json
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 from dew._builds import dew_cache_dir
@@ -109,7 +109,7 @@ def code_digest(*roots: str) -> str:
             raise LookupError(f"{module}, which the code of {', '.join(roots)} imports, has no source file")
         relative = path.relative_to(SOURCE)
         if relative != Path("dew", VERSION_FILE):
-            digest.update(relative.as_posix().encode() + b"\0" + path.read_bytes())
+            digest.update(relative.as_posix().encode() + b"\0" + _source(module))
     return digest.hexdigest()
 
 
@@ -133,17 +133,24 @@ def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ..
     named = hashlib.sha256(json.dumps(roots).encode()).hexdigest()[:16]
     python = "{}.{}".format(*sys.version_info[:2])
     kept = Path(dew_cache_dir()) / "code" / f"{whole}-{python}-{named}.json"
-    unchanged = package_digest.__wrapped__() == whole
+    unchanged = _unchanged()
     with contextlib.suppress(FileNotFoundError, ValueError):
         found = json.loads(kept.read_text())
         if unchanged and _sound(found, roots):
             return frozenset(found["modules"]), tuple(found["sites"])
     modules, sites = closure(*roots)
-    if unchanged and package_digest.__wrapped__() == whole:
+    if unchanged:
         kept.parent.mkdir(parents=True, exist_ok=True)
         write_atomically(kept, json.dumps({"roots": list(roots), "modules": sorted(modules),
                                            "sites": list(sites)}))
     return modules, sites
+
+
+@functools.cache
+def _unchanged() -> bool:
+    """Whether the package's files are those its digest this process read names (`package_digest`): where
+    not, a file changed since, and no closure is read from Dew's cache or kept there."""
+    return package_digest.__wrapped__() == package_digest()
 
 
 def _sound(found: JSON, roots: tuple[str, ...]) -> bool:
@@ -197,23 +204,38 @@ def _ours(module: str) -> set[str]:
 
 
 @functools.cache
-def _tree(module: str) -> ast.Module:
+@functools.cache
+def _source(module: str) -> bytes:
+    """`module`'s source as this process first read it: the bytes its closure was walked from and its
+    digest hashes, one snapshot however the file changes after."""
     path = _path(module)
     if path is None:
         raise LookupError(f"no module of Dew's is named {module}")
-    tree = ast.parse(path.read_bytes(), str(path))
-    tree.body = [kept for node in tree.body
-                 for kept in (node.orelse if _guarded(tree, node) else [node])]
+    return path.read_bytes()
+
+
+@functools.cache
+def _tree(module: str) -> ast.Module:
+    tree = ast.parse(_source(module), str(_path(module)))
+    tree.body = list(_running(tree, tree.body))
     return tree
 
 
-def _guarded(tree: ast.Module, node: ast.stmt) -> bool:
+def _running(tree: ast.Module, body: list[ast.stmt]) -> Iterator[ast.stmt]:
+    """A module's top-level statements that run: an `if TYPE_CHECKING:` (`_guarded`) replaced by its `else`,
+    itself so read."""
+    for node in body:
+        if isinstance(node, ast.If) and _guarded(tree, node):
+            yield from _running(tree, node.orelse)
+        else:
+            yield node
+
+
+def _guarded(tree: ast.Module, node: ast.If) -> bool:
     """Whether `node`, a statement of a module's top level, is an `if TYPE_CHECKING:`, whose body never
     runs: its test `TYPE_CHECKING` as the module imports it from `typing`, or `typing.TYPE_CHECKING` with
     `typing` imported, each bound by that import alone. One nested deeper, or under any other binding, is
     kept whole, both branches read."""
-    if not isinstance(node, ast.If):
-        return False
     bindings = [target for each in ast.walk(tree) for target in _bound(each)]
     if isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
         imported = any(isinstance(each, ast.ImportFrom) and each.module == "typing"
@@ -243,6 +265,14 @@ def _bound(node: ast.AST) -> list[str]:
         return [node.id]
     if isinstance(node, ast.arg):
         return [node.arg]
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+        return [node.name]
+    if isinstance(node, ast.MatchMapping) and node.rest is not None:
+        return [node.rest]
+    if isinstance(node, ast.ExceptHandler) and node.name is not None:
+        return [node.name]
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return list(node.names)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return [node.name]
     return []
@@ -341,7 +371,7 @@ class _Imports(ast.NodeVisitor):
         self.modules: set[str] = set()
         self.sites: set[str] = set()
         self.aliases: dict[str, set[str]] = {}
-        self.importers = {"__import__"}
+        self.importers = {"__import__": "__import__"}
         self.within: list[str] = []
         self.read_whole: set[int] = set()
         self.calling: set[int] = set()
@@ -399,7 +429,7 @@ class _Imports(ast.NodeVisitor):
                 self.whole(base)
                 continue
             if base in ("importlib", "builtins") and alias.name in _IMPORTERS:
-                self.importers.add(alias.asname or alias.name)
+                self.importers[alias.asname or alias.name] = alias.name
             if base == "sys" and alias.name == "modules":
                 self.site(ast.Name("sys.modules"))
             found = self.attribute(base, alias.name)
@@ -432,7 +462,8 @@ class _Imports(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in _IMPORTERS and id(node) not in self.calling:
             self.site(node)
-        if ast.unparse(node) == "sys.modules":
+        if node.attr == "modules" and isinstance(node.value, ast.Name) and "sys" in self.aliases.get(
+                node.value.id, set()):
             self.site(node)
         if id(node) not in self.read_whole:
             for module in self.resolved(node):
@@ -466,6 +497,11 @@ class _Imports(ast.NodeVisitor):
         elif called == "getattr" and len(node.args) >= 2:
             self.read_whole.add(id(node.args[0]))
             name = node.args[1]
+            stated = name.value if isinstance(name, ast.Constant) and isinstance(name.value, str) else None
+            reflective = isinstance(node.args[0], ast.Name) and self.aliases.get(node.args[0].id, set()) & {
+                "sys", "importlib", "builtins"}
+            if reflective and (stated is None or stated in {"modules", *_IMPORTERS}):
+                self.site(node)
             for module in self.resolved(node.args[0]):
                 if isinstance(name, ast.Constant) and isinstance(name.value, str):
                     if (found := self.attribute(module, name.value)) is not None:
@@ -486,6 +522,10 @@ class _Imports(ast.NodeVisitor):
             found = None if base is None else self.relative(found, base)
         within = ".".join(self.within) or "<module>"
         site = f"{self.module}:{within}:{'' if name is None else ast.unparse(name)}"
+        builtin = ast.unparse(node.func).rpartition(".")[2] == "__import__" or (
+            isinstance(node.func, ast.Name) and self.importers.get(node.func.id) == "__import__")
+        if builtin:
+            found = self.builtin(node, found, keywords)
         if found is not None:
             self.read(found)
             return found
@@ -495,6 +535,23 @@ class _Imports(ast.NodeVisitor):
         for dotted in selected or ():
             self.read(dotted.rpartition(".")[0])
         return None
+
+    def builtin(self, node: ast.Call, found: str | None, keywords: dict[str | None, ast.expr]) -> str | None:
+        """What `__import__(name, globals, locals, fromlist, level)` imports, `found` its name: each name of
+        `fromlist` read from it as `from` reads one; None, a site, for a level other than 0 or a fromlist
+        no literal states."""
+        level = node.args[4] if len(node.args) > 4 else keywords.get("level")
+        fromlist = node.args[3] if len(node.args) > 3 else keywords.get("fromlist")
+        absolute = level is None or (isinstance(level, ast.Constant) and level.value == 0)
+        if found is None or not absolute:
+            return None
+        names = [] if fromlist is None else _literal(fromlist)
+        if not isinstance(names, list):
+            return None
+        for name in names:
+            if (attribute := self.attribute(found, name)) is not None:
+                self.read(attribute)
+        return found
 
     def selected(self, table: str) -> list[str] | None:
         """The dotted names (`module.function`) the literal table `table` of this module holds, None where
