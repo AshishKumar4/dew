@@ -15,6 +15,10 @@ from jax.sharding import Mesh, PartitionSpec as P
 from dew._accuracy import reduction_bound, within
 
 
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
+
+
 def loss_of(keys, query, values):
     scores = jnp.einsum("bd,bkd->bk", query, keys)
     return jnp.sum(jax.nn.softmax(scores, axis=-1)[..., None] * values)

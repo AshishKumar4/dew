@@ -33,6 +33,10 @@ import numpy as np
 from dew.batch import unboxed
 from dew.nn.sharding import boxed, boxed_axes, current_boxes, declared_axes, parameter_path
 
+
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
+
 # mHC's small mappings stay replicated; a production 'embed' declaration
 # would change their placement. Their columns concatenate residual streams.
 COMPOSITE_RESIDUAL_AXES = {("attn_hc", "fn"): 1, ("ffn_hc", "fn"): 1, ("hc_head", "hc_fn"): 1}

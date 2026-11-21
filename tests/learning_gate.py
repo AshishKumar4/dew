@@ -32,6 +32,10 @@ from map_judge import sharded
 from sampling_gate import FALSE_RED
 from scipy import stats
 
+
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
+
 LEVEL = 1e-9
 """The chance a trainer whose units meet a claim exactly at its old margin, on average, passes it: one
 verdict in a billion, the rate check 1's conversions state for a law, nominal for contrasts near

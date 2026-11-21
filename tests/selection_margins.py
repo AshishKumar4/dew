@@ -13,6 +13,10 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
+
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
+
 MARGIN = 1e-5
 """The least selection margin a draw admits (`margin`), relative to the scale of what is selected: above
 the distance float32 rounding moves a selection's inputs from their float64 values, so every float32

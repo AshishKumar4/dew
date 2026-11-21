@@ -18,6 +18,10 @@ from dew.nn import programs
 from dew.nn.precision import FP32_SUMS
 
 
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
+
+
 def float64_host() -> jax.Device | None:
     """The device this process's float64 truths compute on where its accelerators only emulate float64: a
     TPU's host CPU. A TPU keeps float64 as a dtype but computes it as pairs of float32s, within float32's
