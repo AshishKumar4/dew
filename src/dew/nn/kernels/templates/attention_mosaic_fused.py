@@ -11,7 +11,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked, stores
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    mosaic,
+    outputs,
+    resources,
+    stacked,
+    stores,
+)
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
@@ -45,18 +52,19 @@ read on every fast-form step, while `anchor` and `chosen` are unused in plain bf
 
 
 def streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                        reduced: int) -> int:
-    """How many of its query tiles' statistics (`_STREAM_ORDER`, `peak`/`total`/`delta` first) the fused
-    launch at `config` streams beside them: where its copies move a vector (`Transport.copies_vectors`), the
-    most whose rings its block holds beside its own allocations (the GPU's `shared_limit`, `launch_scope`);
+                        reduced: int, allocations_of: Callable[..., tuple[list, dict]] | None = None) -> int:
+    """How many of its query tiles' statistics (`_STREAM_ORDER`, `peak`/`total`/`delta` first) a fused or
+    shared-keys launch at `config` streams beside them: where its copies move a vector
+    (`Transport.copies_vectors`), the most whose rings its block holds beside its own allocations
+    (`allocations_of`, defaulting to `_fused_allocations`, against the GPU's `shared_limit`, `launch_scope`);
     a step reads the rest from global memory (`_rows`). `reduced` the launch's warpgroups reserving reduction
     scratch (`reducing`: a score hook's)."""
     if not family.copies_vectors:
         return 0
     limit = generation.gpu_target().shared_limit
+    allocator = _fused_allocations if allocations_of is None else allocations_of
     for count in range(len(_STREAM_ORDER), 0, -1):
-        allocations = _fused_allocations(family, config, width, dtype, stages, streamed=count,
-                                         reduced=reduced)
+        allocations = allocator(family, config, width, dtype, stages, streamed=count, reduced=reduced)
         if limit is None or resources.shared_bytes(
                 family, launch_scope(family, allocations, reduced, reduces=False)) <= limit:
             return count

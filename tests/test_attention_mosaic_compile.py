@@ -1672,8 +1672,9 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
             assert cfg is not None and cfg.fused, (label, cfg)
             family = attention_mosaic.bundle_of(cfg, jnp.bfloat16)
             if cfg.shared_keys:
-                assert attention_mosaic_coop.coop_streamed_statistics(
-                    family, cfg, width, jnp.bfloat16, cfg.stages, reduced=0) >= 2, (label, cfg)
+                assert attention_mosaic_fused.streamed_statistics(
+                    family, cfg, width, jnp.bfloat16, cfg.stages, reduced=0,
+                    allocations_of=attention_mosaic_coop._coop_allocations) >= 2, (label, cfg)
             else:
                 assert attention_mosaic_fused.streamed_statistics(
                     family, cfg, width, jnp.bfloat16, cfg.stages, reduced=0) >= 3, (label, cfg)

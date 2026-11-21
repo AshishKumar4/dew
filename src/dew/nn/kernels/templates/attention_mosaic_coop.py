@@ -26,6 +26,7 @@ from dew.nn.kernels.templates.attention_mosaic_fused import (
     _STREAM_ORDER,
     _statistics,
     staged_parts,
+    streamed_statistics,
     walked_sums,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -47,21 +48,6 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _rescaled_parts,
     _tile_scores,
 )
-
-
-def coop_streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                             reduced: int) -> int:
-    """How many of its query tiles' statistics (`_STREAM_ORDER`, `peak`/`total`/`delta` first) the
-    shared-keys launch at `config` streams beside them within `shared_limit` (row 5272)."""
-    if not family.copies_vectors:
-        return 0
-    limit = generation.gpu_target().shared_limit
-    for count in range(len(_STREAM_ORDER), 0, -1):
-        allocations = _coop_allocations(family, config, width, dtype, stages, streamed=count, reduced=reduced)
-        if limit is None or resources.shared_bytes(
-                family, launch_scope(family, allocations, reduced, reduces=False)) <= limit:
-            return count
-    return 0
 
 
 def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
@@ -86,7 +72,8 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     if parts > 1:
         scoped.append(family.staged_memory((2, consumers, block_q), jnp.float32))
     if streamed is None:
-        streamed = coop_streamed_statistics(family, config, width, dtype, stages, reduced=reduced)
+        streamed = streamed_statistics(family, config, width, dtype, stages, reduced=reduced,
+                                       allocations_of=_coop_allocations)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
               **{name: ((block_q,), STATISTICS[name]) for name in _STREAM_ORDER[:streamed]}}
     return scoped, family.streams(blocks, stages, consumers)
@@ -268,8 +255,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
 
     stages = min(program.tiles.stages, q_steps)
     reduced = reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1)
-    stats_streamed = coop_streamed_statistics(family, program.tiles, width, query.dtype, stages,
-                                              reduced=reduced)
+    stats_streamed = streamed_statistics(family, program.tiles, width, query.dtype, stages, reduced=reduced,
+                                         allocations_of=_coop_allocations)
     scoped, rings = _coop_allocations(family, program.tiles, width, query.dtype, stages,
                                       reduced=reduced, streamed=stats_streamed)
 
