@@ -337,3 +337,39 @@ def _one_launch(name: str, *, slices: int, width: int) -> None:
     with generation.assumed(name):
         (record,) = compile_kernels([KernelCase("merge", lambda: (merge, (padded, stacked)))], name)
     assert "error" not in record and record["thunks"] == ["merged_padded"], record
+
+
+def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
+    """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (row 8845):
+    one kernel, span `3 * chunks` (1 joining pass + 2 `_windows` passes), valid unmasked device bytes
+    excluding masked tail slices and tail channels, and row-stat stores charged once per row even when a row
+    splits across multiple channel blocks."""
+    target = generation.gpu_target("sm90")
+    spec = SPECS["fold"]
+
+    def expected_bytes(batch: int, slices: int, queries: int, heads: int, width: int, block: int) -> float:
+        channels = 1 << (width - 1).bit_length()
+        blocks = channels // block
+        rows = batch * queries * heads
+        return float(rows * ((3 * slices + 1) * width * 4 + (blocks * 3 * slices + 1) * 8))
+
+    # 1-chunk (slices=8), 4-chunk (slices=32), irregular tail (slices=9, width=96), and multi-block (1 row).
+    cases = [
+        (2, 8, 16, 8, 4, 128, 1),
+        (2, 32, 16, 8, 4, 128, 4),
+        (2, 9, 16, 8, 4, 96, 2),
+        (1, 8, 8, 1, 1, 128, 1),
+    ]
+    for batch, slices, padded_q, heads, queries, width, chunks in cases:
+        padded = jax.ShapeDtypeStruct((batch, slices, padded_q, heads, width), jnp.float32)
+        stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, padded_q), jnp.float32)
+        block = merged._channel_block(spec, padded, stacked, queries, width, target)
+        work = merged.launch_work(spec, padded, stacked, queries, width, target)
+        assert work.kernels == 1.0
+        assert work.span == float(3 * chunks)
+        assert work.device_bytes == expected_bytes(batch, slices, queries, heads, width, block)
+    # The 1-row 128-wide case splits across multiple channel blocks on an H100 (row 8439), exercising the
+    # single-stat-store-per-row accounting directly.
+    small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
+    small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
+    assert merged._channel_block(spec, small_p, small_s, 1, 128, target) < 128
