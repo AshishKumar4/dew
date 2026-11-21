@@ -21,29 +21,40 @@ SIZES = (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)
 
 
 @pytest.mark.parametrize("bins, segments", [(3, None), (2, 2), (4, 3)])
-def test_a_published_best_fit_pack_reads_the_windows_its_streamed_pack_packs(tmp_path, bins, segments):
+def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_packs(tmp_path, bins, segments):
     """A best-fit pack of whole documents is published (row 9053: refused before) with the plan grain's
-    best-fit packer places them by (`tokens.BestFit`): read back by index, it is window for window, in order,
-    what the same pack packs as it streams the documents (grain's `BestFitPackIterDataset`), and what a memory
-    read packs."""
-    sizes = (3, 7, 6, 2, 4, 5, 7, 1, 5, 6, 7, 2, 3)
-    source = Memory(tuple({"text": "x" * size} for size in sizes))
-    prefix = Pipeline(source).map(Tokenize())
-    packed = prefix.pack(9, bins=bins, segments=segments, policy="best-fit")
+    best-fit packer places them by (`tokens.BestFit`): read back by index, it holds window for window, in
+    order, the documents grain's `BestFitPackIterDataset` packs from them with its bins emitted in order, as a
+    memory read of the pack does."""
+    import grain
+    from grain.experimental import BestFitPackIterDataset
+
+    sizes = (3, 7, 6, 2, 4, 5, 7, 1, 5, 6, 7, 2, 3, 8, 1, 4)
+    documents = tuple({"text": (np.arange(size) + 100 * index + 1).astype(np.int32)}
+                      for index, size in enumerate(sizes))
+    packed = Pipeline(Memory(documents)).pack(9, bins=bins, segments=segments, policy="best-fit")
     generation = publish(packed, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
                                        shard_bytes=256 * 1024), read="indexed", loading=READ)
 
-    def windows(chain, read):
+    def held(tokens) -> list[int]:
+        """The documents a window's tokens are of, in their order."""
+        return list(dict.fromkeys(int(token) // 100 for token in np.ravel(tokens) if token))
+
+    def windows(chain, read) -> list[list[int]]:
         # One pass, in order (a validation read's).
         reader = validation(chain, batch=1, read=read, loading=READ)(DataPartition())
         try:
-            return [[np.asarray(leaf).tolist() for leaf in jax.tree.leaves(batch)] for batch in reader]
+            return [held(batch["text"]) for batch in reader]
         finally:
             reader.close()
 
-    published = windows(prefix.cache(generation).pack(9, bins=bins, segments=segments, policy="best-fit"),
-                        "indexed")
-    assert published == windows(packed, "streamed") == windows(packed, "memory")
+    grains = [held(window["text"]) for window in BestFitPackIterDataset(
+        grain.MapDataset.source(list(documents)).to_iter_dataset(), length_struct={"text": 9},
+        num_packing_bins=bins, shuffle_bins=False, max_sequences_per_bin=segments)]
+    published = windows(Pipeline(Memory(documents)).cache(generation).pack(
+        9, bins=bins, segments=segments, policy="best-fit"), "indexed")
+    assert published == grains, (published, grains)
+    assert windows(packed, "memory") == grains
 
 
 def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tmp_path):
