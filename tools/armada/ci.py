@@ -2125,8 +2125,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     # a 5.84 GiB pool, which ran out).
     [total] = ((int(whole) - int(kept)) * 2 ** 20 for whole, kept in
                (answer.split(",") for answer in gpu_query("memory.total,memory.reserved")))
-    # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, dew-ops'
-    # session `settings`): its processes may take what one process takes by JAX's own default (row 2570).
+    # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, its
+    # session's settings): its processes may take what one process takes by JAX's own default (row 2570).
     budget = float(os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", WHOLE_GPU)) * total
     held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))

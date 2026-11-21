@@ -1,7 +1,7 @@
 """The short conv's kernels (dew.nn.kernels.short_conv) against `causal_conv1d`'s XLA arithmetic.
 
 Host tests interpret the kernels at small shapes, where they hold the runs a program walks, the pieces
-it writes and each gradient to `xla_conv1d`, with the float64 conv as the truth. The kernel lab's GPU
+it writes and each gradient to `xla_conv1d`, with the float64 conv as the truth. The GPU
 tier runs them on the GPU, with the training shapes' tests: there each output's and gradient's float64
 distance is held to XLA's own by tests/reference_error.py's rule.
 """

@@ -29,7 +29,7 @@ def test_an_object_round_trips_a_miss_is_none_and_a_listing_pages_to_its_end(cac
 
 
 def test_a_callers_own_sender_carries_every_request_with_the_workers_protocol(cache_worker):
-    """A caller's sender (dew-ops' pooled one) sends what the Store builds: each request with the token and
+    """A caller's sender (a pooled one) sends what the Store builds: each request with the token and
     the caller's User-Agent, its answers read as the standard library's are."""
     url, _, _ = cache_worker
     sent = []

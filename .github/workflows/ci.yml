@@ -6,8 +6,7 @@ name: CI
 
 on:
   push:
-    # A train's CI is the land queue's (dew-ops queue/gates.py, from the same tools/ci scripts), on the hub (dew-ops
-    # runbooks/hub.md). Main's push, the hub's mirror of it, finds the queue's proof of a tip it published; a direct
+    # A train's CI is the land queue's (from the same tools/ci scripts), on the hub. Main's push, the hub's mirror of it, finds the queue's proof of a tip it published; a direct
     # push to main is its tip's only test. base/kernels is retired: the hub refuses its pushes (row 10798).
     branches: [ "main" ]
   pull_request:
@@ -40,7 +39,7 @@ env:
   # grades a task's kill for memory as a red row of its own beside its rows (armada 84a05a4; 2026-11-16: a
   # killed test may report none), and which leaves a run ungraded where a judge's map tasks never ran for want
   # of capacity, never red (armada 0da5300). The pin is armada's main, never a branch off an older pin:
-  # dew-ops runs the pinned client too (its `pack` stages a hub-only commit for a TPU run), and 0da5300, cut
+  # the GPU fleet runs the pinned client too (its `pack` stages a hub-only commit for a TPU run), and 0da5300, cut
   # from bc61de0, had none (2026-11-16: every hub-only Colab run failed after booking from 23:39Z). And
   # which asks again, within one outage budget, a refusal that made nothing, keeps a run's deadline its one
   # end, sizes a task by the cap it runs under and keys a pinned job's environment by its pin (armada 41bff47,

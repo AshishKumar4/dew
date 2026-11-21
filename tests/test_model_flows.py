@@ -733,11 +733,11 @@ def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags(held):
     opens, with a host device (one configured for a GPU of none failed every GPU part's prepare: "Could not
     determine process_index").
 
-    The prepare's environment is the one its node and lane give it, mirrored, as Dew reads nothing of dew-ops
-    (dew-ops reads Dew's `tier_wire`, never the reverse): dew-ops' session hides every GPU from every job's
-    prepare (dewops/node/session.py's prepare environment, `"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS":
-    "cpu"`, line 2388 at ops 945f3032f), and the lane's prepare names itself (tools/armada/ci.py,
-    `gpu_prepared`: `JAX_PLATFORMS` cpu and `tier_wire.PREPARE`)."""
+    The prepare's environment is the one its node and lane give it, mirrored, as Dew reads nothing of the GPU
+    fleet's code (the fleet reads Dew's `tier_wire`, never the reverse): a GPU node's session hides every GPU
+    from every job's prepare (its prepare environment, `"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"`),
+    and the lane's prepare names itself (tools/armada/ci.py, `gpu_prepared`: `JAX_PLATFORMS` cpu and
+    `tier_wire.PREPARE`)."""
     import lane_environment
 
     from dew.training.ahead import computation_flags
