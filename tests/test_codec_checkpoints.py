@@ -171,7 +171,6 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
     bytes."""
     from flax.traverse_util import flatten_dict
     from reference_error import assert_as_exact
-    from safetensors.numpy import load_file
 
     from dew.nn.kernels.formats import NvFp4
     from dew.quantization import QUANTIZATION, decoded_banks
@@ -185,7 +184,7 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
     assert all(path[-1] == "kernel" for path in banks)
     params = flatten_dict(dict(packed.variables["params"]))
     assert not set(banks) & set(params)
-    stored = load_file(str(source / "model.safetensors"))
+    stored = {name: np.asarray(value) for name, value in read_weights(source).items()}
     dense = decoded_banks(packed.variables)
     held = flatten_dict(dict(dense["params"]))
     for path in banks:
