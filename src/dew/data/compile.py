@@ -172,11 +172,13 @@ from dew.data.readers import GRAIN, Replayed, _CanonicalPass, _Host, _PerShare, 
 from dew.data.sources.base import (
     Read,
     Rows,
+    ShardManifest,
     Source,
     View,
     _consumed,
     beneath,
     materialized,
+    stream_manifest,
     tokenizer_contract,
 )
 from dew.data.steps.generic import Coordinated
@@ -314,6 +316,10 @@ class _Facts(View[Source]):
     def records(self, read: Read) -> Records:
         held = None if self.held is None else self.held.records
         return held if read == "memory" and held is not None else self.source.records(read)
+
+    def positioned_manifest(self) -> ShardManifest:
+        """Its source's shards for a stream that numbers its rows (`stream_manifest`)."""
+        return stream_manifest(self.source, positioned=True)
 
     @functools.cached_property
     def _lengths(self) -> np.ndarray | None:
@@ -512,7 +518,8 @@ def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
         elif identified(json_value(source.fingerprint(), "source")):
             # The `shards` fact: the shards a stream reads in turn (`ShardManifest.digest`), of a store
             # that states its content (a store given no name names its shards by no content of its own).
-            arrays[f"{index}/shards"] = source.manifest().digest
+            arrays[f"{index}/shards"] = stream_manifest(
+                source, positioned=any(isinstance(stage, MapWithIndex) for stage in leaf.stages)).digest
         metadata = source.metadata()
         if "valid_targets" in metadata:
             arrays[f"{index}/valid_targets"] = fingerprint(

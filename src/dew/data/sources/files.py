@@ -51,7 +51,7 @@ from dew.data.storage import (
     on_gcs,
 )
 
-from .base import Read, Shard, ShardManifest, preparing, source_record, url_label
+from .base import Read, Shard, ShardManifest, _single_indexed_manifest, preparing, source_record, url_label
 from .index import ArrayIndex
 
 type Format = Literal[
@@ -925,6 +925,19 @@ class Files(Dataset):
         if self.kind != "parquet":
             return self._listed_files[number]
         return self._footers.fragment(self, number).subset(row_group_ids=[group])
+
+    def positioned_manifest(self) -> ShardManifest:
+        """Its shards for a stream that numbers its rows (`dew.data.sources.base.stream_manifest`): a text
+        store's records as its offset index lists them (`records`' indexed read), each row at its index
+        there, in parts of whole records each stating its rows, as many as its readers ask
+        (`_single_indexed_manifest`); its own shards (`manifest`) where it holds no such index, or reads
+        its records otherwise (row 9051: its byte ranges state no rows, which a positioned stream needs).
+        Its index, its producer's or one `provision` wrote, is what its indexed read reads, so both reads
+        number the same records alike."""
+        if (self.kind not in ("jsonl", "text", "csv") or self.where is not None or not self.paths
+                or any(infer_compression(url.lower()) for url in self.paths) or not self.supports("indexed")):
+            return self.manifest()
+        return _single_indexed_manifest(self, self.describe())
 
     def manifest(self) -> ShardManifest:
         """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a fill

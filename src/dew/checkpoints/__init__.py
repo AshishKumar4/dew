@@ -1248,7 +1248,8 @@ class Checkpoints:
             # A step's items (`ROLES`), or the one item of a step an earlier Dew wrote or a mapping's.
             self._manager = ocp.CheckpointManager(
                 self.directory, options=options,
-                item_handlers={name: _handler() for name in (*ROLES, ONE_ITEM)})
+                item_handlers={**{name: _handler() for name in (*ROLES, ONE_ITEM)},
+                               EXPORTED: ocp.StandardCheckpointHandler()})
             for step in self._manager.all_steps():
                 if not self._complete(step):
                     continue

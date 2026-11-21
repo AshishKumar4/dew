@@ -157,6 +157,7 @@ from dew.data.pipeline import (
 from dew.data.plan import Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import _Sequential, bounded as shards_bounded, bounded_places, cut, streamed
+from dew.data.sources import base
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
@@ -1529,9 +1530,8 @@ class _Build:
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
             return mixed_indexed(mapped, source)
-        # A streamed mix saves each member's position under its key, so a member that joins starts and one
-        # that left is dropped while the others resume (`Plan.check`); a mix of stated counts weighs each
-        # member's targets as it accepts them, as `TokenDeficit` does as it draws (row 10784).
+        # A streamed mix saves each member's position under its key (`Plan.check`); a mix of stated counts
+        # weighs each member's targets as it accepts them, as `TokenDeficit` does as it draws (row 10784).
         stated = self.lowering.order.get("shares") == STATED_SHARES
         weighed: _Counter = {"tokens": source.tokens} if source.tokens is not None and stated else {}
         streams = [build.accepted(_as_iter(parent, build.loading), _name(child), _label(child), **weighed)
@@ -1686,7 +1686,7 @@ class _Build:
         cache, interleave = self.lowering.cache, self.lowering.interleave
         start = 0 if cache is None else cache + 1
         transparent = cache is not None and _transparent(pipeline, cache)
-        shards = source.manifest()
+        shards = base.stream_manifest(source, positioned=last >= 0 and (cache is None or last < cache))
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
