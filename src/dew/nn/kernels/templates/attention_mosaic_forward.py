@@ -1595,6 +1595,26 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
+        elif (hooks.output_mod is None and keep is None and family.budgets_registers
+              and state.acc.shape[-1] > 128 and state.acc.shape[-1] % 128 == 0):
+            # Chunk wide (>128) register epilogues into 128-column slices so `state.acc` and `output`
+            # (`quotient` + `midpoint_settled`) are never live together across all 256+ columns
+            # (256+ registers > 255 -> 96-112 B spill on sm90/sm80 d256 forward, row 5272).
+            maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
+
+            def store_chunks(stage):
+                width = state.acc.shape[-1]
+                for col in range(0, width, 128):
+                    chunk = state._replace(acc=state.acc[:, col:col + 128])
+                    out_chunk = algebra.finish(spec, chunk, initial=hooked.initial is not None,
+                                               held=program.parts > 1)[0]
+                    sl = pl.ds(col, 128)
+                    chunk_stage = (None if stage is None
+                                   else stage.at[:, sl] if stage.shape[-1] == width else stage)
+                    family.stored((out_chunk,), (out_view.at[:, sl],), smem=chunk_stage,
+                                  wait=col + 128 >= width)
+
+            out_stage(store_chunks)
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,

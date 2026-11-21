@@ -1670,3 +1670,31 @@ def test_forward_pricing_aligns_with_m_fs_15_sm90_and_sm80_receipts():
             lambda cfg: cfg.block_k <= 64, overlapped=True,
             walks=attention_mosaic_program.walked_extents, choose=choose, residency=fake_res)
         assert seen and any(c.block_k == 64 for c in seen[0]) and any(c.block_k == 32 for c in seen[0]), seen
+
+
+@COMPILES_ON_CPU
+def test_sm90_and_sm80_d256_forward_fit_single_launch_without_spills():
+    """Row 5272: chunking wide (>128) register epilogues lets d256 bf16 causal forward (inference and
+    training) derive and compile at `columns=None` (1 launch, 0 spills) on sm90 and sm80 instead of
+    spilling 96-112 bytes in `algebra.finish` and falling back to 2-launch `columns=128`."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    spans = template.spans(4096, 4096, 1, causal=True)
+    for gen in ("sm90", "sm80"):
+        with generation.assumed(gen):
+            target = generation.gpu_target()
+            q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
+            k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
+            op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+            cases = []
+            for label, residuals in (("infer", template.Kept.NONE), ("train", template.Kept.OUTPUT)):
+                ba = op.bind(*args, residuals=residuals, interpret=False)
+                cfg = op.derived(ba, target)
+                assert cfg is not None, (gen, label)
+                assert cfg.columns is None, (gen, label, cfg)
+                cases.append(KernelCase(f"{gen}-d256-{label}",
+                                        lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)))
+            found = compile_mosaic_kernels(cases, gen)
+            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
