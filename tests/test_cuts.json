@@ -293,7 +293,7 @@
 "tests/test_attention_mosaic_compile.py::test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block[accurate]",
 "tests/test_attention_mosaic_compile.py::test_an_fp16_backward_compiles_spill_free_as_its_model_decides[128]",
 "tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm100]",
-"tests/test_attention_mosaic_compile.py::test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free[e4m3fn]",
+"tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm90]",
 "tests/test_attention_mosaic_compile.py::test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free[sm80]",
 "tests/test_attention_mosaic_compile.py::test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free[sm90]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[decision-inference]",
@@ -1423,6 +1423,9 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate[a fresh group]"
 ],
+"tests/test_gated_mlp.py": [
+"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm100]"
+],
 "tests/test_gemm_degenerate.py": [
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[depth no step divides-hooked]",
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[depth no step divides-paired]",
@@ -1918,9 +1921,6 @@
 "tests/test_linear_attention.py::test_the_layer_decodes_as_it_prefills",
 "tests/test_linear_attention.py::test_the_masked_conv_matches_the_token_scan[False-a paused row beside a full one]",
 "tests/test_linear_attention.py::test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound"
-],
-"tests/test_live_bridge.py": [
-"tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
 ],
 "tests/test_lm_objective.py": [
 "tests/test_lm_objective.py::test_evaluation_correctness_is_the_same_full_forward_argmax",
