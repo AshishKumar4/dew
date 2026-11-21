@@ -756,9 +756,8 @@ class _GroupedRows(_WrappingDataset):
         self._lock = threading.Lock()
 
     def __getstate__(self) -> dict:
-        # Its grouping alone travels to a worker (Grain's `mp_prefetch` pickles the dataset graph): the
-        # groups it made and the lock over them are this process's, each worker making and holding its own
-        # (row 10781: a lock and cached futures failed cloudpickle before the first batch).
+        # Its grouping alone travels to a worker (`mp_prefetch` pickles the graph), each process making its
+        # own groups under its own lock (row 10781: they failed to pickle before the first batch).
         state = dict(self.__dict__)
         del state["_lock"], state["_made"]
         return state
