@@ -21,15 +21,17 @@ def _merged(outputs, totals, anchors):
     return means.merged_output(outputs, totals, anchors, windows.Units(), 0)
 
 
-_SHARING = {"its first orders and its gradient's gradient": ("first orders", "grad of grad"),
-            "its gradient's forward derivatives": ("jvp of grad", "second jvp", "second orders, staged")}
+_SHARING = {
+    "its first orders and its gradient's derivatives": ("first orders", "grad of grad", "jvp of grad"),
+    "its second forward derivative and its staged orders": ("second jvp", "second orders, staged")}
 CELLS = {**_SHARING, "its other orders": tuple(name for name in ORDER_SETS
                                                if all(name not in names for names in _SHARING.values()))}
 """The contract's order sets (`contract_support.ORDER_SETS`, the one partition of its orders) in three cells:
-the sets whose programs share the gradient's beside it, and every other (the scanned one, and any set added),
-so no order goes untaken (row 10676: a second hand partition of the orders). A cell of the first orders, the
-nested and the scanned took 205 s, past the group's bound, and the six sets a cell each compiled their shared
-programs six times over, 640 s in all (rows 9806, 10132, 10685)."""
+the first orders beside the gradient's two derivatives, which share its programs; the second forward
+derivative beside the staged orders; and every other (the scanned one, and any set added), so no order goes
+untaken (row 10676: a second hand partition of the orders). A cell of the first orders, the nested and the
+scanned took 205 s, past the group's bound, and the six sets a cell each compiled their shared programs six
+times over, 640 s in all (rows 9806, 10132, 10685)."""
 
 
 @pytest.mark.parametrize("taken", CELLS)
