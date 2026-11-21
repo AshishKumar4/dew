@@ -5,6 +5,7 @@ it repeats; at drawn gates it computes the passes unrolled from the stack's own 
 recomputed and decoded alike; and it trains, resumes and loads as a loop does (check 1 throughout)."""
 
 import dataclasses
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +20,7 @@ from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
-from dew.nn.cross_pass import CrossPass, CrossPassMerge
+from dew.nn.cross_pass import MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
 
 VOCAB = 37
 
@@ -44,19 +45,25 @@ MESSAGES = CrossPass(block_size=2, rank=4)
 def decoder(form: str, **loop) -> CausalTransformer:
     """A tiny decoder of four layers in `form`: attention alone ('attention'), a hybrid of gated delta nets
     and attention ('hybrid'), attention under Kimi K3's attention residuals in blocks of two ('depth'), or
-    six attention layers scanned as one run (`scan_layers`, 'scanned'); its block [`first`, end) looped as
-    `loop` says where it says anything, passing `MESSAGES`."""
+    six attention layers scanned as one run (`scan_layers`, 'scanned'), or a hybrid whose block of four is
+    two periods of a delta net and an attention layer, scanned (a periodic run, 'periodic'); its block
+    [`first`, end) looped as `loop` says where it says anything, passing `MESSAGES` (blocks of four where
+    scanned)."""
     fields = {"vocab_size": VOCAB, **TINY_DECODER, "num_layers": 4, "attention_impl": "reference",
               "tie_embeddings": False}
     if form == "scanned":
         fields |= {"num_layers": 6, "scan_layers": True}
+    if form == "periodic":
+        fields |= {"num_layers": 5, "scan_layers": True, "kinds": DELTA_NETS,
+                   "layer_types": ("full_attention",) + ("linear_attention", "full_attention") * 2}
     if form == "hybrid":
         fields |= {"layer_types": ("linear_attention", "full_attention") * 2, "kinds": DELTA_NETS}
     if form == "depth":
         fields |= {"attention_residuals": AttentionResiduals(block_size=2)}
     if loop:
-        block = {"depth": (2, 4), "scanned": (1, 6)}.get(form, (1, 4))
-        messages = dataclasses.replace(MESSAGES, block_size=4) if form == "scanned" else MESSAGES
+        block = {"depth": (2, 4), "scanned": (1, 6), "periodic": (1, 5)}.get(form, (1, 4))
+        scanned = form in ("scanned", "periodic")
+        messages = dataclasses.replace(MESSAGES, block_size=4) if scanned else MESSAGES
         loop = {"messages": messages, "step_norm": False, "layers": block, **loop}
         fields["loop"] = Loop(**loop)
     return CausalTransformer(**fields)
@@ -171,7 +178,7 @@ def _results(forward):
     return jax.jit(run)
 
 
-@pytest.mark.parametrize("form", ["attention", "hybrid", "depth"])
+@pytest.mark.parametrize("form", ["attention", "hybrid", "depth", "one pass gaining messages"])
 @pytest.mark.parametrize("steps", [1, 2, 3])
 def test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repeats(form, steps):
     """A decoder whose block passes messages, its merges as drawn (gates at zero), computes the decoder
@@ -179,7 +186,12 @@ def test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repea
     gradients apart, on par with the decoder's own in float64 (check 1), whether its layers attend, mix a
     hybrid's delta nets or read Kimi K3's depth residuals, one pass or more (two a later pass traced
     alone, three a scan of them); at one pass bit for bit."""
-    plain, looped = decoder(form), decoder(form, steps=steps)
+    if form == "one pass gaining messages":
+        # A loop of one pass, its step norm as `Loop` defaults it, gaining messages (`with_passes`).
+        plain = decoder("attention")
+        looped = dataclasses.replace(plain, loop=Loop(1, layers=(1, 4))).with_passes(steps, messages=MESSAGES)
+    else:
+        plain, looped = decoder(form), decoder(form, steps=steps)
     draw = with_logit_cotangent(model_draw(looped, (2, 12), VOCAB), VOCAB, 0xC401 + steps)
     if steps == 1:
         variables, ids, _ = draw(0)
@@ -276,12 +288,13 @@ def test_a_loop_passing_messages_decodes_as_it_prefills():
                     truth_fn=passes(looped.clone(dtype=jnp.float64)))
 
 
-def test_a_shared_cache_prefills_as_a_cache_a_pass_does():
+@pytest.mark.parametrize("form", ["hybrid", "periodic"])
+def test_a_shared_cache_prefills_as_a_cache_a_pass_does(form):
     """A hybrid decoder passing messages over four passes, its gates drawn off zero, prefills with one
     cache its passes share (`shared_cache`, each pass starting from the cache the step found) what it
     prefills with a cache a pass, bit for bit: the bank crosses its scanned passes as it crosses them
-    apart."""
-    models = [decoder("hybrid", steps=4, shared_cache=shared) for shared in (True, False)]
+    apart, its block's layers one at a time or a periodic run of two periods (`PipelineStage`)."""
+    models = [decoder(form, steps=4, shared_cache=shared) for shared in (True, False)]
     variables, ids = gated_draw(models[0], salt=0xC407)(0)
     prefilled = []
     for model in models:
@@ -393,6 +406,22 @@ def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh
                     seeds=SEEDS["retrofitted"], truth_fn=plain(jnp.float64))
     with pytest.raises(ValueError):
         looped.export()
+
+
+def test_a_source_written_in_its_own_bindings_refuses_its_export_once_it_passes_messages():
+    """A source whose family writes it back in the bindings it was read from (Mixtral's,
+    `preserve_source_layout`) exports as it loaded; gaining a loop passing messages (`with_passes`), whose
+    merges its format holds none of, its export is refused rather than written without them."""
+    from dew.interop import Pretrained
+
+    source = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "mixtral-tiny", dtype="float32",
+                             attention_impl="reference")
+    assert source.export()
+    layers = source.model.num_layers
+    looped = source.with_model(source.model.with_passes(2, (1, layers), messages=MESSAGES), key=4)
+    with pytest.raises(ValueError) as refused:
+        looped.export()
+    assert refused.value.args == (MESSAGES_UNWRITTEN,)
 
 
 def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies():

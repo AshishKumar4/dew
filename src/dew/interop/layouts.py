@@ -727,6 +727,26 @@ CROSSING_UNWRITTEN = ("the source's format holds no cross-attention layers; a ru
 """Why a decoder that reads a context through cross-attention is written in no family's layout."""
 
 
+def refuse_extensions(model: nn.Module, params) -> None:
+    """Refuse writing `model` with `params` in a family's layout where it extends its source with what no
+    family's format holds: cross-attention (`CROSSING_UNWRITTEN`), a loop's cross-pass messages
+    (`dew.nn.cross_pass.MESSAGES_UNWRITTEN`), or attention residuals whose values it normalizes
+    (`dew.nn.attention_residuals.NORMALIZED_UNWRITTEN`); a run's checkpoint or native release keeps each."""
+    from dew.nn.attention_residuals import NORMALIZED_UNWRITTEN
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.cross_pass import MESSAGES_UNWRITTEN, holds_merges
+    from dew.nn.protocols import CrossAttending, MediaWrapper
+
+    if isinstance(model, CrossAttending) and model.cross_attention is not None:
+        raise ValueError(CROSSING_UNWRITTEN)
+    if holds_merges(params):
+        raise ValueError(MESSAGES_UNWRITTEN)
+    decoder = model.language_model if isinstance(model, MediaWrapper) else model
+    residuals = decoder.attention_residuals if isinstance(decoder, CausalTransformer) else None
+    if residuals is not None and residuals.normalize_values:
+        raise ValueError(NORMALIZED_UNWRITTEN)
+
+
 def source_layout(model: nn.Module, *,
                   config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
     """The layout `model` is written in as its family's release, or what it cannot write (`Unwritable`):

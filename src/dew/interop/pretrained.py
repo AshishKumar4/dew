@@ -54,7 +54,7 @@ from dew.interop.generation_config import (
     source_cache,
     source_decoding,
 )
-from dew.interop.layouts import CROSSING_UNWRITTEN, SourceLayout, Unwritable
+from dew.interop.layouts import SourceLayout, Unwritable, refuse_extensions
 from dew.interop.pipeline_assembly import (
     SourceTask,
     assemble_pipeline,
@@ -439,24 +439,22 @@ class Pretrained:
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
                           else None)
             from dew.interop.layouts import source_layout
+            from dew.nn.protocols import CrossAttending
 
-            if isinstance(model, MediaWrapper):
-                bundle = PretrainedDecoder.carrying(model, variables, tokenizer=tokenizer,
-                                                    generation_config=generation)
+            laid = model if isinstance(model, MediaWrapper) else from_record(CausalTransformer, model)
+            crossing = isinstance(laid, CrossAttending) and laid.cross_attention is not None
+            stated = source_layout(laid.with_cross_attention(None) if crossing else laid)
+            if isinstance(stated, Unwritable):
+                # No family's layout writes it (a wrapper's or a decoder's alike): the run's own model,
+                # in Dew's layout, which a run starts from and whose export states the layout's reason.
+                bundle = PretrainedDecoder(laid, variables, None, {}, None, model_config.fields,
+                                           dict(decoders.GENERATION_DEFAULTS) if generation is None
+                                           else generation,
+                                           export_adapter=_unwritten(stated), tokenizer=tokenizer)
             else:
-                decoder = from_record(CausalTransformer, model)
-                stated = source_layout(decoder.with_cross_attention(None))
-                if isinstance(stated, Unwritable):
-                    # No family's layout writes it: the run's own model, in Dew's layout, which a run
-                    # starts from and whose export states the layout's reason.
-                    bundle = PretrainedDecoder(decoder, variables, None, {}, None, model_config.fields,
-                                               dict(decoders.GENERATION_DEFAULTS) if generation is None
-                                               else generation,
-                                               export_adapter=_unwritten(stated), tokenizer=tokenizer)
-                else:
-                    # Resolved once: the bundle is written in the layout just found.
-                    bundle = PretrainedDecoder.carrying(decoder, variables, tokenizer=tokenizer,
-                                                        generation_config=generation, layout=stated)
+                # Resolved once: the bundle is written in the layout just found.
+                bundle = PretrainedDecoder.carrying(laid, variables, tokenizer=tokenizer,
+                                                    generation_config=generation, layout=stated)
             bundle = replace(bundle, processor=processor)
             if isinstance(held, MaskedSettings):
                 # A masked run's model is a decoder: no wrapper denoises.
@@ -702,6 +700,7 @@ class Pretrained:
         loop's) starts them as a fresh model would. A model that declares none is this source's own; one
         that declares none of a parameter the source holds is refused, naming it, its weights unread."""
         from dew.batch import merge, thaw
+        from dew.nn.cross_pass import MERGE_PREFIX
         from dew.optim import parameter_name
 
         held = {("params", *path) for path in flatten_dict(dict(thaw(self.variables).get("params", {})))}
@@ -711,12 +710,13 @@ class Pretrained:
             dropped = sorted("/".join(path[1:]) for path in held - named)
             raise ValueError(f"this {type(model).__name__} reads none of the source's {dropped[:6]}: a "
                              "model in its place keeps every parameter it holds")
-        # A parameter drawn fresh beside the loaded weights (a loop's merges at one rank) is read again at
-        # the shape the new model declares, or refused: kept at another shape it would not apply.
+        # A parameter drawn beside a source's own (drawn fresh, or a loop's merges, whatever drew them) is
+        # read again at the shape the new model declares, or refused: kept at another it would not apply.
         loaded = flatten_dict(dict(unboxed(thaw(self.variables)).get("params", {})))
         drawing = flatten_dict(dict(unboxed(declared).get("params", {})))
         reshaped = sorted(name for path, leaf in drawing.items()
-                          if (name := "/".join(path)) in self.fresh and path in loaded
+                          if path in loaded and ((name := "/".join(path)) in self.fresh
+                                                 or any(key.startswith(MERGE_PREFIX) for key in path))
                           and np.shape(loaded[path]) != leaf.shape)
         if reshaped:
             raise ValueError(f"this {type(model).__name__} declares {reshaped[:6]}, drawn fresh beside the "
@@ -814,12 +814,9 @@ class Pretrained:
         """
         from dew.batch import thaw
         from dew.nn.backbones.layer_names import stored_layers
-        from dew.nn.cross_pass import MESSAGES_UNWRITTEN, holds_merges
         from dew.nn.projections import unpacked
-        from dew.nn.protocols import CrossAttending, Differential
+        from dew.nn.protocols import Differential
 
-        if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
-            raise ValueError(CROSSING_UNWRITTEN)
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.
@@ -828,8 +825,7 @@ class Pretrained:
         # A packed load's expert banks are written as the dense matrices they hold (`decoded_expert_banks`),
         # which the source's format encodes back.
         held = unboxed(decoded_expert_banks(self.variables if variables is None else variables))
-        if holds_merges(held):
-            raise ValueError(MESSAGES_UNWRITTEN)
+        refuse_extensions(self.model, held)
         values = unpacked(self.model, stored_layers(self.model, held, banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)

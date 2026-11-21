@@ -1024,10 +1024,15 @@ class DecoderBlock(nn.Module):
         return self.self_attn.input_sites if isinstance(self.self_attn, InputSites) else ('mixer',)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
-        """The packed groups its mixer and its feed-forward declare (`ProjectionSites`); a looped pass
-        whose sites read inputs of their own projects each through the packed group apart
-        (`ProjectionGroup.apart`)."""
-        return declared_groups(self.self_attn, *([self.mlp] if self.feedforward is not None else []))
+        """The packed groups its mixer and its feed-forward declare (`ProjectionSites`). A mixer whose
+        sites read inputs of their own in a looped pass (`cross_pass`) declares its group only where its
+        tree holds it packed already, so a server packs none anew (each later pass would run the packed
+        product once a site, `ProjectionGroup.apart`) and a packed tree still unpacks and reloads."""
+        mixer = declared_groups(self.self_attn)
+        if self.cross_pass is not None and len(self._mixer_sites()) > 1:
+            held = self.self_attn.variables.get('params', {})
+            mixer = tuple(group for group in mixer if group.packed in held)
+        return (*mixer, *declared_groups(*([self.mlp] if self.feedforward is not None else [])))
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> CacheSpec:

@@ -1698,12 +1698,15 @@ class CausalTransformer(LinearProducts):
             if steps is None or layers is None:
                 return None
             return self.clone(loop=Loop(steps, step_norm=False, layers=layers, **options))
-        if messages is not None and self.loop.messages is None and self.loop.steps > 1:
-            # Its later passes read the pass before's output; a loop passing messages reads the block's
-            # input, which would change what it computes at the merges' draw.
-            raise ValueError(f"this decoder already loops its block {self.loop.steps} times over the pass "
-                             "before's output, and a loop passing messages enters every pass at the block's "
-                             "input: add messages to a decoder that runs its block once")
+        if messages is not None and self.loop.messages is None:
+            if self.loop.steps > 1:
+                # Its later passes read the pass before's output; a loop passing messages reads the
+                # block's input, which would change what it computes at the merges' draw.
+                raise ValueError(f"this decoder already loops its block {self.loop.steps} times over the "
+                                 "pass before's output, and a loop passing messages enters every pass at the "
+                                 "block's input: add messages to a decoder that runs its block once")
+            # A loop of one pass never ran its step norm; its passes now enter at the block's input.
+            options['step_norm'] = False
         return self.clone(loop=dataclasses.replace(self.loop, steps=steps or self.loop.steps,
                                                    layers=layers or self.loop.layers, **options))
 

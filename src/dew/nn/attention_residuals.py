@@ -55,6 +55,12 @@ class AttentionResiduals:
                             normalize_values=self.normalize_values)
 
 
+NORMALIZED_UNWRITTEN = ("the source's format mixes its attention residuals' values as they are, and this "
+                        "decoder normalizes them (AttentionResiduals.normalize_values); a run's checkpoint "
+                        "or release keeps it")
+"""Why a decoder normalizing its residuals' values is written in no family's layout (`Pretrained.export`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class ResidualSite:
     """One layer's static place in the depth mixture.
