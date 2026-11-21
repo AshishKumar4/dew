@@ -537,6 +537,26 @@ def test_a_name_on_a_products_rows_stays_outside_its_prologue():
     assert not [equation for equation in traced.jaxpr.jaxpr.eqns if equation.primitive is jax.lax.sin_p]
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_product_mapped_per_shard_runs_the_template_and_computes_as_written():
+    """A projection, its bias and a scale (`biased`) mapped per shard (`jax.shard_map` over rows split two
+    ways, each device's program its own rows' product, as `dew.nn.sharding.on_shards` maps a layer) under
+    the pass on an H100 whose template a call names: the map's body is rewritten in the map's own context,
+    so its product runs the template's launch per shard (row 6578: an opaque body ran XLA's dot), and the
+    program computes as written, as every program under the pass does (`assert_equal`)."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows, whole = PartitionSpec("data"), PartitionSpec()
+    mapped = jax.shard_map(biased, mesh=mesh, in_specs=(rows, whole, whole, rows), out_specs=rows)
+    operands = draw()
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
+        assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+        assert_equal(under_the_pass(mapped, *operands), as_written(mapped, *operands))
+
+
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
     """A start-like program (row 6783): a region that makes a parameter and computes a grouped product from
     it, as a flax init's block makes its parameters inside its forward (here a checkpointed one), the
@@ -1612,3 +1632,31 @@ def test_a_gated_product_across_a_barrier_is_never_fused(barred):
     assert fused and not crossed
     if barred is checkpointed_swiglu:
         assert any(equation.primitive is primitives.remat_p for equation in equations(made.jaxpr.jaxpr))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_products_written_casts_are_replayed_as_written():
+    """A manual mesh's product of row-split operands by a scale and a weight the program cast to vary itself
+    (`pcast`, JAX writing no cast of its own: `jax_auto_pcast` off) under the pass on an H100 whose template
+    a call names: the fusion analysis's replay of the region binds each operand as the program typed it, the
+    casts' results among them (row 6578's review, F2: a cast replayed as the value it cast, the multiply's
+    operands varied apart and JAX refused it), its product the template's launch per shard, and the program
+    computes as written."""
+    from jax._src import config as jax_config
+    from jax.sharding import Mesh, PartitionSpec
+
+    def scaled_product(x, w, scale):
+        scale, w = (jax.lax.pcast(value, ("data",), to="varying") for value in (scale, w))
+        return (x * scale) @ w
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows, whole = PartitionSpec("data"), PartitionSpec()
+    mapped = jax.shard_map(scaled_product, mesh=mesh, in_specs=(rows, whole, whole), out_specs=rows)
+    x, w, *_ = draw()
+    operands = (x, w, jnp.bfloat16(2))
+    with (jax_config.auto_pcast(new_val=False), generation.assumed("sm90"),
+          generation.chosen(grouped_matmul="mosaic")):
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
+        assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+        assert_equal(under_the_pass(mapped, *operands), as_written(mapped, *operands))
