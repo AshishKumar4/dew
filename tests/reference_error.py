@@ -128,10 +128,7 @@ from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 from truths_ahead import COMPILED, CompiledTruths, arm_role, judged, named, reading, running
 
 from dew._accuracy import distance, reduction_bound, within
-from dew.algebra import passes
 from dew.nn import programs
-from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import report
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -652,6 +649,11 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     for seed in range(staged_units(seeds)):
         inputs = drawn_on_the_host(draw, seed)
         shaped.setdefault(named("truth", widened(inputs)), inputs)
+
+    # The algebra's switch and the kernels' report read where a site prepares, never at load: a test of the
+    # gate imports no kernel (the test cache keys a row on every module it loads).
+    from dew.algebra import passes
+    from dew.nn.kernels.templates import report
 
     programs, held = {}, {}
     with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
@@ -1931,6 +1933,8 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
         return called
 
     def with_launches(*inputs):
+        from dew.nn.kernels import tuning
+
         with tuning.seen() as found:
             outputs = called(*inputs)
         return outputs, found.held()

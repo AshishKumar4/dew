@@ -25,8 +25,6 @@ import numpy as np
 from arm_arithmetic import on_float64_device, widened
 from float64_terms import float64_signed_sums
 
-from dew.nn.kernels import generation
-
 LEAST = float(np.finfo(np.float32).tiny)
 """Float32's least normal value: a held position's truth is at least it (testing.md's derivative
 contracts)."""
@@ -385,6 +383,8 @@ def assert_drawn_contract(fn, inputs, scale: float, label: str, **options) -> No
 def on_a_tpu(fn):
     """`fn` traced as for a TPU (an assumed v5e, `generation.assumed`): the forms Dew takes there, its own
     where a TPU's backend is not accurate enough (`precision.accurate_exp`), run on this host."""
+    from dew.nn.kernels import generation
+
     @functools.wraps(fn)
     def run(*args, **kwargs):
         with generation.assumed("v5e"):
