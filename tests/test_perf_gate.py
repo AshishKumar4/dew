@@ -525,7 +525,12 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
     planning takes half as long again regresses past COMPILE_FLOOR, and a step whose compile is refused (a
     kernel this host cannot lower, `selection.Unlowerable`) is a round not run, failing the gate as the
     gate's own; each sample's selected plan is kept. A step sized for another device is not compiled for
-    this kind."""
+    this kind. The step's own compile (its traces, lowerings and compiles), the initializer's fresh state
+    (`start`) and the algebra are each a gated row, the whole planning shown beside them: a head whose
+    initializer's compile alone grew regresses its start row, failing the gate there (train 1104's review
+    F3), and leaves its step level; a base whose tree keeps no start apart compares none of its parts, so a
+    compile moved into the planning reads as no part's regression (6740: dit and finetune read as regressed
+    once the initializer's compile entered it)."""
     from types import SimpleNamespace
 
     built, _ = standing_in_environments(gate, monkeypatch)
@@ -545,7 +550,8 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
         # remats by a structured policy.
         plan = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"} if head else None,
                 "head_tile": [1024, 2] if head else None}
-        parts = {"traced": 6.0, "lowered": 2.0, "compiled": 30.0 if head else 18.0, "algebra": 4.0}
+        parts = {"traced": 6.0, "lowered": 2.0, "compiled": 18.0, "start": 18.0 if head else 2.0,
+                 "algebra": 4.0}
         printed = json.dumps({"seconds": 48.0 if head else 32.0, "parts": parts,
                               "plan": {key: plan.get(key) for key in command[-1].split(",")}})
         return subprocess.CompletedProcess(command, 0, f"compiling\n{printed}\n", "")
@@ -560,7 +566,8 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
     results = json.loads(out.read_text())
     assert results["target"] == {"kind": kind, "generation": "sm90", "capacity_gib": gib, "lock": "cuda12"}
     dense, moe = "compile lm-dense 4x1024 (xla attention)", "compile lm-moe 4x1024 (xla attention)"
-    assert [row["name"] for row in results["rows"]] == [dense, moe]
+    assert [row["name"] for row in results["rows"]] == [
+        f"{name}{part}" for name in (dense, moe) for part in (" step", "", " start", " algebra")]
     assert len(compiled) == 2 * 3 * 6
     selected = ",".join(gate.SELECTED)
     assert {tuple(argv) for _, argv, _, _ in compiled} == {("sm90", str(gib << 30), "xla", selected)}
@@ -572,23 +579,31 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
     verdicts = tmp_path / "verdicts.json"
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False, verdicts=str(verdicts))) == 1
     judged = json.loads(verdicts.read_text())["rows"]
-    assert {name: row["state"] for name, row in judged.items()} == {dense: "regressed", moe: "incomplete"}
+    assert {name: (row["state"], row["gated"]) for name, row in judged.items()} == {
+        f"{dense} step": ("level", True), dense: ("regressed", False), f"{dense} start": ("regressed", True),
+        f"{dense} algebra": ("level", True),
+        **{f"{moe}{part}": ("incomplete", part != "") for part in (" step", "", " start", " algebra")}}
     # Each arm's selected configurations beside the verdict, structured values kept: why its planning moved.
     tiled = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"}, "head_tile": [1024, 2],
              "head_fused": None, "xla_defaults": None, "narrow": None}
     assert judged[dense]["plans"]["head"] == [tiled] * 6
     assert judged[dense]["plans"]["base"][0]["remat"] is None
     # Each arm's planning by its parts beside the verdict, and which part moved said in its state (row 6108).
-    assert len(judged[dense]["parts"]["head"]) == 6 and judged[dense]["parts"]["head"][0]["compiled"] == 30.0
+    assert len(judged[dense]["parts"]["head"]) == 6 and judged[dense]["parts"]["head"][0]["start"] == 18.0
+    # A tree before `start` was kept apart mixes it into its step's parts: its step is no measurement, so a
+    # base of that tree compares no step.
+    mixed = gate.compile_samples(dense, 32.0, {"traced": 6.0, "lowered": 2.0, "compiled": 20.0})
+    assert mixed[dense] == 32.0
+    assert not any(gate.measured(mixed[f"{dense} {part}"]) for part in ("step", *gate.SHOWN_PARTS))
     table = tmp_path / "table.md"
     gate.report(SimpleNamespace(results=out, table=str(table), claim=False, verdicts=None))
-    [line] = [line for line in table.read_text().splitlines() if line.startswith(f"| {dense} ")]
-    assert "compiled 18.00/30.00" in line and "traced 6.00/6.00" in line
+    [line] = [line for line in table.read_text().splitlines() if line.startswith(f"| {dense} |")]
+    assert "start 2.00/18.00" in line and "compiled 18.00/18.00" in line
     a100 = SimpleNamespace(**{**vars(args), "kind": "a100", "rounds": 1, "only": ["finetune"],
                               "out": str(tmp_path / "a100.json")})
     assert gate.compile_battery(a100) == 0
-    assert [row["name"] for row in json.loads(Path(a100.out).read_text())["rows"]] == [
-        "compile finetune-1.7b 1x2048 (xla attention)"]
+    assert [row["name"] for row in json.loads(Path(a100.out).read_text())["rows"]][:2] == [
+        "compile finetune-1.7b 1x2048 (xla attention) step", "compile finetune-1.7b 1x2048 (xla attention)"]
     monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4")
     with pytest.raises(SystemExit):
         gate.compile_battery(args)
@@ -625,7 +640,7 @@ def test_a_step_compiled_ahead_for_an_absent_gpu_is_a_sample_of_its_planners_sec
     assert isinstance(seconds, float) and seconds > 0
     assert set(plan) == set(gate.SELECTED) and plan["split"] == 1
     # Its seconds by their parts: JAX's traces, lowerings and compiles, and the algebra's passes.
-    assert set(parts) == {"traced", "lowered", "compiled", "algebra"} and parts["compiled"] > 0
+    assert set(parts) == {"traced", "lowered", "compiled", "algebra", "start"} and parts["compiled"] > 0
 
 
 def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:

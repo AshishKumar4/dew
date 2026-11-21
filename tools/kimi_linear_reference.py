@@ -59,6 +59,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -75,6 +76,10 @@ from kimi_k3_reference import (
     write_truth,
 )
 from reference_source import config_lookups, hub_modules, record_padding
+
+COHORT = "kimi-linear"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 REVISION = "e1df551a447157d4658b573f9a695d57658590e9"
@@ -159,12 +164,11 @@ def remote_modules():
     `auto_docstring` the identity while they import (the first of the changes above)."""
     import transformers.utils
 
-    documented = transformers.utils.auto_docstring
-    transformers.utils.auto_docstring = lambda obj=None, **kwargs: obj if obj is not None else (lambda inner: inner)
-    try:
+    def identity(obj=None, **kwargs):
+        return obj if obj is not None else (lambda inner: inner)
+
+    with patch.object(transformers.utils, "auto_docstring", identity):
         return hub_modules("kimi_linear_remote", REPO, REVISION, REMOTE)
-    finally:
-        transformers.utils.auto_docstring = documented
 
 
 def record_released_padding() -> None:

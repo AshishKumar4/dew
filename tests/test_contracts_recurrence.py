@@ -13,12 +13,15 @@ import pytest
 from contract_support import (
     EDGES,
     FORWARD_ORDERS,
+    ORDER_SETS,
     REVERSE_ONLY,
     assert_contract,
+    assert_drawn_contract,
     normal_draw,
     normal_float32,
-    orders,
 )
+from generation_support import interprets
+from map_judge import marked_seeds
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, scan
@@ -55,13 +58,13 @@ def test_a_run_updating_in_its_backward_moves_as_its_step_would(edge):
             return in_backward.scanned_run(("layers_0_2",), layer, {"kernel": kernel}, None, {}, norms, x,
                                            None, (None,))
 
-    def draw(seed):
-        primals = normal_draw(4796 + 4096 * seed, (3, 4, 4), (2, 4), scale=EDGES[edge])
-        direction = normal_draw(4797 + 4096 * seed, (3, 4, 4), (2, 4), scale=EDGES[edge])
+    def draw(seed, scale):
+        primals = normal_draw(4796 + 4096 * seed, (3, 4, 4), (2, 4), scale=scale)
+        direction = normal_draw(4797 + 4096 * seed, (3, 4, 4), (2, 4), scale=scale)
         return primals, direction, normal_draw(4798 + 4096 * seed, (2, 4))[0]
 
-    assert_contract(run, *draw(0), f"a run updating in its backward {edge}", without=REVERSE_ONLY,
-                    draw=measured(edge, draw))
+    assert_drawn_contract(run, draw, EDGES[edge], f"a run updating in its backward {edge}",
+                          without=REVERSE_ONLY)
 
 
 def seeded_key(seed: int) -> jax.Array:
@@ -73,13 +76,7 @@ def seeded_key(seed: int) -> jax.Array:
         return jax.random.key(seed)
 
 
-def measured(edge: str, draw):
-    """A cell's seeded `draw` where check 1 measures it on the mesh (`assert_contract`'s `draw`): its normal
-    domain alone, where float32 holds every value; an edge's mesh run is held to the contract's own rule at
-    the cell's inputs."""
-    return draw if edge == "normal" else None
-
-INTERPRETED = jax.default_backend() != "gpu"
+INTERPRETED = interprets()
 """The ported kernels interpret off a GPU."""
 
 
@@ -133,21 +130,6 @@ def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=Non
     return jnp.moveaxis(out, 1, 2)
 
 
-ORDER_SETS = {"first orders": ("primal", "jvp", "vjp"), "jvp of grad": ("jvp of grad",),
-              "second jvp": ("second jvp",), "grad of grad": ("grad of grad",),
-              "second orders, staged": ("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit",
-                                        "jvp of grad, scanned")}
-"""The contract's orders (`contract_support.orders`) a case of the chunked delta rule takes at once: all ten
-in one case took 127 to 156 s near float32's largest, each order's program compiled for itself (row
-4433); the three second orders in one case 172 s over packed documents there (row 5348), so each is a case
-of its own."""
-
-
-def outside(taken: str) -> tuple[str, ...]:
-    """The orders outside `taken`'s set (`ORDER_SETS`), which its case leaves to the others."""
-    return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in ORDER_SETS[taken])
-
-
 INTERPRETED_REMAT = ("jvp of grad, remat", "second jvp, remat") if INTERPRETED else ()
 """The orders a kernel Mosaic GPU's interpreter runs takes on no CPU: JAX's checkpoint takes no ordered
 effect, which the interpreter's callbacks carry (`NotImplementedError: Effects not supported in AD of
@@ -172,12 +154,11 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     gradient. Reverse over reverse at 2^63 retains the owner's accepted overflow-only difference (ledger
     2470)."""
     rows, length, heads, width = 1, 37, 2, 8
-    scale = DELTA_RULE_EDGES[edge]
     # The documents a constant of the site, its draws' operands about them.
     marked = jax.random.bernoulli(jax.random.split(jax.random.key(1861), 8)[5], 0.1, (rows, length))
     starts = marked if packed else None
 
-    def draw(seed):
+    def draw(seed, scale):
         keys = jax.random.split(seeded_key(1861 + 4096 * seed), 8)
         query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * scale for k in keys[:3])
         g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
@@ -197,12 +178,11 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
 
     plain = (functools.partial(precedent_chunked, chunk_size=16, starts=starts) if edge == "near the largest"
              else recurrence)
-    primals, direction, cotangent = draw(0)
     # Each order one program (`jax.jit`): run op by op, an order's eager dispatch compiled 2,570 programs of
     # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
-    assert_contract(jax.jit(rule), primals, direction, cotangent, f"the chunked delta rule {edge}",
-                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=outside(taken),
-                    draw=measured(edge, draw))
+    assert_drawn_contract(jax.jit(rule), draw, DELTA_RULE_EDGES[edge], f"the chunked delta rule {edge}",
+                          truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain),
+                          taking=ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("order", ("jvp", "vjp", "jvp of grad", "grad of grad"))
@@ -229,13 +209,8 @@ def test_the_chunked_delta_rules_reader_scale_holds_every_order(order):
             recurrence_chunk.Tiles(16), query, key, value, g[..., 0], beta, None, starts,
             scale=width ** -0.5, delta=True, dtype=query.dtype)[0]
 
-    narrow = jax.tree.map(np.asarray, jax.jit(orders(rule, primals, direction, cotangent)[order])())
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda x: x.astype(jnp.float64), (primals, direction, cotangent))
-        truth = jax.tree.map(np.asarray, jax.jit(orders(rule, *wide)[order])())
-    for index, (made, exact) in enumerate(zip(jax.tree.leaves(narrow), jax.tree.leaves(truth), strict=True)):
-        held = normal_float32(exact) & np.isfinite(exact)
-        assert np.all(np.isfinite(made[held])), (order, index, np.argwhere(held & ~np.isfinite(made)))
+    assert_contract(jax.jit(rule), primals, direction, cotangent,
+                    f"the chunked delta rule's reader scale ({order})", taking=(order,))
 
 
 def test_the_chunked_delta_rules_reader_scale_precedes_a_small_write():
@@ -252,12 +227,12 @@ def test_the_chunked_delta_rules_reader_scale_precedes_a_small_write():
             recurrence_chunk.Tiles(16), *operands, scale=8 ** -0.5, delta=True,
             dtype=operands[0].dtype)[0]
 
-    narrow = jax.jit(lambda *x: jax.jvp(rule, x, direction)[1])(*primals)
     with jax.enable_x64(new_val=True):
         wide, along = jax.tree.map(lambda x: x.astype(jnp.float64), (primals, direction))
         truth = np.asarray(jax.jit(lambda *x: jax.jvp(rule, x, along)[1])(*wide))
     assert np.all(normal_float32(truth) & np.isfinite(truth))
-    assert np.all(np.isfinite(np.asarray(narrow)))
+    assert_contract(jax.jit(rule), primals, direction, jnp.ones_like(primals[0]),
+                    "the chunked delta rule's reader scale before a small write", taking=("jvp",))
 
 
 def plain_delta_rule(query, key, value, g, beta, state, scale):
@@ -308,7 +283,7 @@ def test_a_split_convs_bias_holds_its_orders(edge):
     not run (`FORWARD_ORDERS`, a custom VJP's)."""
     from sequence_split_support import SPLIT_ROWS
 
-    from dew.nn.linear import held_conv1d, over_sequence, sequence_conv
+    from dew.nn.linear import Heads, held_conv1d, over_sequence, sequence_conv
     from dew.training import MeshSpec
 
     valid, segments = (jnp.asarray(np.broadcast_to(field, (2, 32))) for field in SPLIT_ROWS["packed"])
@@ -319,7 +294,7 @@ def test_a_split_convs_bias_holds_its_orders(edge):
     def split(mixed, bias):
         return over_sequence(lambda mixed, valid, segments, taps, bias: sequence_conv(
             mixed, taps, bias, segments, valid), 4, (mixed, valid, segments),
-            (taps.astype(mixed.dtype), bias))
+            (taps.astype(mixed.dtype), bias), heads=Heads(8, 8, {0: 2, 3: 0, 4: 0}))
 
     def whole(mixed, bias):
         return held_conv1d(mixed, taps.astype(mixed.dtype), valid, bias=bias, segments=segments)[0]
@@ -336,13 +311,13 @@ def test_a_convs_bias_holds_every_order(edge):
     sum, row 1710): every order runs, finite wherever float64 is a normal float32 and the plain broadcast
     is."""
     conv_bias = short_conv.conv_bias
-    def draw(seed):
-        return (normal_draw(1710 + 4096 * seed, (8,), scale=EDGES[edge]),
-                normal_draw(1711 + 4096 * seed, (8,), scale=EDGES[edge]),
+    def draw(seed, scale):
+        return (normal_draw(1710 + 4096 * seed, (8,), scale=scale),
+                normal_draw(1711 + 4096 * seed, (8,), scale=scale),
                 normal_draw(1712 + 4096 * seed, (2, 5, 8))[0])
 
-    assert_contract(lambda bias: conv_bias(bias, (2, 5)), *draw(0), f"a conv's bias {edge}",
-                    plain_fn=lambda bias: jnp.broadcast_to(bias, (2, 5, 8)), draw=measured(edge, draw))
+    assert_drawn_contract(lambda bias: conv_bias(bias, (2, 5)), draw, EDGES[edge], f"a conv's bias {edge}",
+                          plain_fn=lambda bias: jnp.broadcast_to(bias, (2, 5, 8)))
 
 
 # The ports near float32's largest: their reverse derivatives are NaN at entries the recurrence keeps finite,
@@ -358,9 +333,9 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
     portable math (`_per_product`, row 2655), from a zero memory: each order of `taken`'s set finite
     wherever float64 is a normal float32 and the delta rule a token at a time is (`plain_delta_rule`, in
     float64 the truth), at queries, keys and values whose products near float32's least normal."""
-    def draw(seed):
+    def draw(seed, scale):
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
-            2661 + per_key + 4096 * seed, EDGES[edge], key_heads=2, value_heads=2, width=64, length=64,
+            2661 + per_key + 4096 * seed, scale, key_heads=2, value_heads=2, width=64, length=64,
             per_key=per_key)
         return (query, key, value, g, beta), direction[:5], normal_draw(2663 + 4096 * seed, value.shape)[0]
 
@@ -373,9 +348,9 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
     def recurrent(*operands):
         return plain_delta_rule(*operands, memory.astype(operands[0].dtype), 64 ** -0.5)[0]
 
-    assert_contract(jax.jit(ported), *draw(0),
-                    f"the {'kda' if per_key else 'gdn'} port {edge}", truth_fn=jax.jit(recurrent),
-                    plain_fn=jax.jit(recurrent), without=outside(taken), draw=measured(edge, draw))
+    assert_drawn_contract(jax.jit(ported), draw, EDGES[edge],
+                          f"the {'kda' if per_key else 'gdn'} port {edge}", truth_fn=jax.jit(recurrent),
+                          plain_fn=jax.jit(recurrent), taking=ORDER_SETS[taken])
 
 
 # The template rule near float32's largest: its reverse derivative is NaN at entries fla's chunked form keeps
@@ -390,17 +365,15 @@ def test_the_template_rule_holds_its_orders(edge, taken):
     its domain), from a zero memory: each order of `taken`'s set finite wherever float64 is a normal float32
     and the delta rule a token at a time is (`plain_delta_rule`), at queries and values whose products near
     float32's least normal."""
-    def draw(seed):
+    def draw(seed, scale):
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
-            2664 + 4096 * seed, EDGES[edge], key_heads=1, value_heads=1, width=64, length=64,
+            2664 + 4096 * seed, scale, key_heads=1, value_heads=1, width=64, length=64,
             per_key=False, unit_keys=True)
         primals = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16), g,
                    beta.astype(jnp.bfloat16))
         direction = tuple(along.astype(operand.dtype)
                           for along, operand in zip(direction, primals, strict=False))
         return primals, direction, normal_draw(2665 + 4096 * seed, value.shape)[0]
-
-    primals, direction, cotangent = draw(0)
 
     def rule(*operands):
         with generation.chosen(gated_delta_rule="mosaic_gpu"):
@@ -410,32 +383,74 @@ def test_the_template_rule_holds_its_orders(edge, taken):
         operands = tuple(x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in operands)
         return plain_delta_rule(*operands, jnp.zeros((1, 1, 64, 64), operands[0].dtype), 64 ** -0.5)[0]
 
-    assert_contract(jax.jit(rule), primals, direction, cotangent, f"the template rule {edge}",
-                    truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
-                    without=outside(taken) + INTERPRETED_REMAT, draw=measured(edge, draw))
+    assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"the template rule {edge}",
+                          truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
+                          taking=ORDER_SETS[taken], without=INTERPRETED_REMAT)
+
+
+EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]
+"""The edges whose cells measure no draws (`contract_support.assert_drawn_contract`): the normal domain's,
+which check 1 measures, are cells of their own, their declared seeds sharded across CI's map tasks
+(`check1_shards`): sized each run, a normal case took 382 to 720 s (rows 8414, 8488, 8525, 8552, 8553,
+8558); each of their sites sizes 8 (a qualification run at f05f038f8, jsf-qual6)."""
 
 
 @pytest.mark.parametrize("taken", list(ORDER_SETS))
-@pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("edge", EDGES_BEYOND)
 def test_the_selective_scan_holds_its_orders(edge, taken):
+    """`assert_selective_contract` at an edge of float32's range."""
+    assert_selective_contract(edge, ORDER_SETS[taken])
+
+
+CHECK1_SHARDS = {
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[first-orders]": {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad]": {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[second-jvp]": {"seeds": 8, "per_task": 8},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[grad-of-grad]": {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[second-orders-staged]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad-scanned]":
+        {"seeds": 8, "per_task": 4},
+}
+"""The selective scan's normal-draw sites, an order set each (`ORDER_SETS`), by node id, a literal the CI plan
+reads as it reads a mark's (tools/armada/ci.py): a map task compiles a set's programs once for its draws (an
+interpreted second order's 60 to 170 s, then 30 to 40 s a draw: the five sets in two tasks of four draws each
+ran past 20 minutes a task, a set's eight draws in one 141 to 421 s), four draws a task but the second jvp's
+eight."""
+
+
+def normal_order_cases() -> list:
+    """`ORDER_SETS` as the selective scan's normal-draw parameters, each marked from `CHECK1_SHARDS`."""
+    test = "test_the_selective_scan_holds_its_orders_over_normal_draws"
+    cases = [(taken, taken.replace(",", "").replace(" ", "-")) for taken in ORDER_SETS]
+    return [pytest.param(taken, id=ident,
+                         marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{ident}]"]))
+            for taken, ident in cases]
+
+
+@pytest.mark.parametrize("taken", normal_order_cases())
+def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
+    """`assert_selective_contract` in the normal domain over an order set (`ORDER_SETS`), check 1 over its
+    declared draws (`CHECK1_SHARDS`); the remat orders, which an interpreted kernel takes none of
+    (`INTERPRETED_REMAT`), beside the nested one."""
+    assert_selective_contract("normal", ORDER_SETS[taken], seeds=marked_seeds(request))
+
+
+def assert_selective_contract(edge: str, taken: tuple[str, ...], seeds: int | None = None) -> None:
     """Mamba's selective scan on the recurrence template (`selective.selective_scan`, a custom VJP over its
     forward and backward launches, interpreted off a GPU) as every caller reaches it: the scan's route with
     the template named (`recurrence_chunk.selective_scan`), whose products' wrapper takes every order through
     the portable scan (`_per_product`, row 2655), fp32 over one block of 128 channels and 16 states from no
-    state: each order of `taken`'s set finite wherever float64 is a normal float32 and the portable scan is
+    state: each order of `taken` finite wherever float64 is a normal float32 and the portable scan is
     (`dew.nn.mixers.mamba.selective_scan`, in float64 the truth), at inputs and skips scaled to the edge."""
     from dew.nn.mixers.mamba import selective_scan as portable
 
-    scale = EDGES[edge]
-
-    def draw(seed):
+    def draw(seed, scale):
         x, dt, a, b, c, skip = normal_draw(2977 + 4096 * seed, (1, 64, 128), (1, 64, 128), (128, 16),
                                            (1, 64, 16), (1, 64, 16), (128,))
         primals = (x * scale, jax.nn.softplus(dt - 3.0), -jnp.exp(0.5 * a), b, c, skip)
         drawn = normal_draw(2978 + 4096 * seed, *(operand.shape for operand in primals))
         return primals, (drawn[0] * scale, *drawn[1:]), normal_draw(2979 + 4096 * seed, x.shape)[0]
-
-    primals, direction, cotangent = draw(0)
 
     def scanned(*operands):
         with generation.chosen(selective_scan="mosaic_gpu"):
@@ -444,9 +459,9 @@ def test_the_selective_scan_holds_its_orders(edge, taken):
     def plain(*operands):
         return portable(*operands, None, None, chunk_size=32)[0]
 
-    assert_contract(jax.jit(scanned), primals, direction, cotangent, f"the selective scan {edge}",
-                    truth_fn=jax.jit(plain), plain_fn=jax.jit(plain),
-                    without=outside(taken) + INTERPRETED_REMAT, draw=measured(edge, draw))
+    assert_drawn_contract(jax.jit(scanned), draw, EDGES[edge], f"the selective scan {edge}",
+                          truth_fn=jax.jit(plain), plain_fn=jax.jit(plain),
+                          taking=taken, without=INTERPRETED_REMAT, seeds=seeds)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -458,9 +473,9 @@ def test_the_chunked_op_holds_every_order(edge):
     token at a time with its skip is (`plain_delta_rule`, in float64 the truth), at queries, keys and values
     whose products near float32's ends; near float32's largest wherever fla's own chunked form with the skip
     is (`precedent_chunked`, as the portable rule's edge: ledger 2470)."""
-    def draw(seed):
+    def draw(seed, scale):
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
-            2664 + 4096 * seed, EDGES[edge], key_heads=2, value_heads=2, width=8, length=12,
+            2664 + 4096 * seed, scale, key_heads=2, value_heads=2, width=8, length=12,
             per_key=False)
         (skip,) = normal_draw(2667 + 4096 * seed, (2,))
         (skip_direction,) = normal_draw(2668 + 4096 * seed, (2,))
@@ -480,22 +495,31 @@ def test_the_chunked_op_holds_every_order(edge):
     def precedent(query, key, value, g, beta, skip):
         return precedent_chunked(query, key, value, g[..., None], beta, chunk_size=4) + skip[:, None] * value
 
-    assert_contract(chunked, *draw(0), f"the chunked op {edge}", truth_fn=recurrent,
-                    plain_fn=precedent if edge == "near the largest" else recurrent,
-                    draw=measured(edge, draw))
+    assert_drawn_contract(chunked, draw, EDGES[edge], f"the chunked op {edge}", truth_fn=recurrent,
+                          plain_fn=precedent if edge == "near the largest" else recurrent)
 
-
-@pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("edge", EDGES_BEYOND)
 def test_the_decode_step_holds_every_order(edge):
+    """`assert_decode_contract` at an edge of float32's range."""
+    assert_decode_contract(edge)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_decode_step_holds_every_order_over_normal_draws(request):
+    """`assert_decode_contract` in the normal domain, check 1 over its declared draws."""
+    assert_decode_contract("normal", seeds=marked_seeds(request))
+
+
+def assert_decode_contract(edge: str, seeds: int | None = None) -> None:
     """A decode token in one launch (`recurrence.step`, the launch differentiated through its reference by
     `generation.linear_tangent`; interpreted off a GPU), the gated delta rule with a decay a head and the
     skip: every order of its output and updated memory finite wherever float64 is a normal float32 and the
     token's update as the rule states it is (`plain_delta_rule` over one token), at queries, keys, values
     and memory whose products near float32's ends, at a model's 128 keys and values a head (the launch's
     warpgroup takes a value column a thread)."""
-    def draw(seed):
+    def draw(seed, scale):
         (query, key, value, g, beta, state), direction, cotangent = delta_rule_draw(
-            2669 + 4096 * seed, EDGES[edge], key_heads=1, value_heads=2, width=128, length=1,
+            2669 + 4096 * seed, scale, key_heads=1, value_heads=2, width=128, length=1,
             per_key=False)
         (skip,) = normal_draw(2672 + 4096 * seed, (2,))
         (skip_direction,) = normal_draw(2673 + 4096 * seed, (2,))
@@ -513,9 +537,9 @@ def test_the_decode_step_holds_every_order(edge):
         out, final = plain_delta_rule(query, key, value, g, beta, state, 1.0)
         return out[:, 0] + skip[:, None] * value[:, 0], final
 
-    assert_contract(flattened(stepped), *draw(0), f"the decode step {edge}",
-                    truth_fn=flattened(plain), plain_fn=flattened(plain), without=INTERPRETED_REMAT,
-                    draw=measured(edge, draw))
+    assert_drawn_contract(flattened(stepped), draw, EDGES[edge], f"the decode step {edge}",
+                          truth_fn=flattened(plain), plain_fn=flattened(plain), without=INTERPRETED_REMAT,
+                          seeds=seeds)
 
 
 def ssd_draw(seed: int, scale: float, rows: int = 1):
@@ -542,18 +566,16 @@ def test_the_ssd_port_holds_its_orders(edge, taken):
     (`_per_product`, row 2655): each order of `taken`'s set finite wherever float64 is a normal float32 and
     the recurrence a token at a time is (`plain_ssd`), at inputs, gates and states whose products near
     float32's least normal."""
-    def draw(seed):
-        return ssd_draw(2674 + 4096 * seed, EDGES[edge])
-
-    primals, direction, cotangent = draw(0)
+    def draw(seed, scale):
+        return ssd_draw(2674 + 4096 * seed, scale)
 
     def ported(*operands):
         with generation.chosen(ssd="pallas"):
             return chunk_ssd(*operands, chunk_size=64)
 
-    assert_contract(jax.jit(ported), primals, direction, cotangent, f"the ssd port {edge}",
-                    truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd), without=outside(taken),
-                    draw=measured(edge, draw))
+    assert_drawn_contract(jax.jit(ported), draw, EDGES[edge], f"the ssd port {edge}",
+                          truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd),
+                          taking=ORDER_SETS[taken])
 
 
 # A TPU's scan near float32's largest is out of its contract: at the 2^63 draw 23 of the 731 outputs float64
@@ -569,10 +591,9 @@ def test_the_tpu_ssd_scan_holds_its_orders(edge):
     (`_per_product`, row 2655), which a CPU cannot reach: its selector takes the kernel on a TPU alone, and
     under an assumed one it lowers the kernel itself (`ssd._interpreting`). Two rows, which a mesh's data axis
     splits as the rated scan launches the kernel (`recurrence_chunk.ssd_specs`)."""
-    def draw(seed):
+    def draw(seed, scale):
         # The kernel's operands: the inputs scaled by their steps, each group's gates a head's, `A dt`.
-        (x, steps, decay, b, c, _, state), direction, cotangent = ssd_draw(2677 + 4096 * seed,
-                                                                           EDGES[edge], rows=2)
+        (x, steps, decay, b, c, _, state), direction, cotangent = ssd_draw(2677 + 4096 * seed, scale, rows=2)
         heads = tuple(jnp.repeat(t, 2, axis=2) for t in (b, c))
         primals = (x * steps[..., None], *heads, steps * decay, state)
         along = (direction[0], *(jnp.repeat(t, 2, axis=2) for t in direction[3:5]), direction[1],
@@ -586,8 +607,8 @@ def test_the_tpu_ssd_scan_holds_its_orders(edge):
 
         return manual_map(local, *recurrence_chunk.ssd_specs(x.shape))(x, b, c, a, state, None)
 
-    assert_contract(tpu, *draw(0), f"the TPU ssd scan {edge}", truth_fn=stepwise_scan, plain_fn=stepwise_scan,
-                    without=REVERSE_ONLY, draw=measured(edge, draw))
+    assert_drawn_contract(tpu, draw, EDGES[edge], f"the TPU ssd scan {edge}", truth_fn=stepwise_scan,
+                          plain_fn=stepwise_scan, without=REVERSE_ONLY)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -598,9 +619,7 @@ def test_the_short_conv_holds_every_order(edge):
     normal float32 and the causal depthwise conv as its definition sums it is, at inputs and taps whose
     products near float32's ends. Two rows, which a mesh's data axis splits as the layer launches the kernels
     per shard of its rows (`linear._per_row_shard`)."""
-    scale = EDGES[edge]
-
-    def draw(seed):
+    def draw(seed, scale):
         # A warpgroup's channels, the kernels' block (`templates.recurrence.conv.fits`).
         x, taps, bias = normal_draw(2677 + 4096 * seed, (2, 12, 128), (128, 4), (128,))
         primals = (x * scale, taps, bias * scale)
@@ -620,9 +639,8 @@ def test_the_short_conv_holds_every_order(edge):
         summed = sum(padded[:, tap:tap + x.shape[1]] * taps[:, tap] for tap in range(width)) + bias
         return jax.nn.silu(summed)
 
-    assert_contract(kernel, *draw(0), f"the short conv {edge}", truth_fn=plain, plain_fn=plain,
-                    without=INTERPRETED_REMAT, draw=measured(edge, draw))
-
+    assert_drawn_contract(kernel, draw, EDGES[edge], f"the short conv {edge}", truth_fn=plain,
+                          plain_fn=plain, without=INTERPRETED_REMAT)
 
 def _gated(h, q, k, v, g, beta):
     """The delta rule decayed per key, each key's old value corrected toward the new one: `g` a scalar (the
@@ -640,18 +658,18 @@ def _read(h, q, k, v, g, beta):
 # Near float32's largest a chunk's corrections' overlaps (keys' products near 2^126 against states as large)
 # overflow at entries the token recurrence's float64 keeps normal, as fla's chunked form's do at the same
 # entries (ledger 2470, `precedent_chunked`).
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated_delta", "kimi_delta"])
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
+def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge, taken):
     """`dew.algebra.scan`'s chunk forms of the delta rule, its decay a scalar (the gated delta rule) or each
     key's own (Kimi's delta attention), walked over three chunks from a zero state through their custom
     derivatives (the decays' range sums, `_decays_of`; the solve's inverse, `_lowered`): every order,
     forward mode among them, finite wherever float64 is a normal float32 and the token-by-token scan's are,
-    at unit queries, keys and values and at ones whose products near float32's least normal."""
+    at unit queries, keys and values and at ones whose products near float32's least normal, an order set a
+    case (`ORDER_SETS`)."""
     tokens, chunk, keys_, values = 24, 8, 4, 6
-    scale = EDGES[edge]
-
-    def draw(seed):
+    def draw(seed, scale):
         draws = jax.random.split(seeded_key(3311 + per_key + 4096 * seed), 7)
         q, k, v = (jax.random.normal(d, (tokens, n)) * scale
                    for d, n in zip(draws[:3], (keys_, keys_, values), strict=True))
@@ -681,9 +699,9 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
             return h, _read(h, *token)
         return jax.lax.scan(one, jnp.zeros((keys_, values), q.dtype), (q, k, v, g, beta))[1]
 
-    assert_contract(derived, *draw(0), f"the derived delta rule {edge}", truth_fn=tokenwise,
-                    plain_fn=tokenwise, draw=measured(edge, draw))
-
+    scanned = jax.jit(tokenwise)
+    assert_drawn_contract(jax.jit(derived), draw, EDGES[edge], f"the derived delta rule {edge}",
+                          truth_fn=scanned, plain_fn=scanned, taking=ORDER_SETS[taken])
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_derived_delta_rules_chunk_adjoint_holds_its_orders(edge):
@@ -764,30 +782,31 @@ def _turned_plainly(query, key, value, turn):
     return out, scan.rotated(held, cos[:, -1, :, None], -sin[:, -1, :, None], axis=-2)
 
 
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_turned_template_call_holds_every_order(edge):
+def test_a_turned_template_call_holds_every_order(edge, taken):
     """A turned call on the template (`templates.recurrence.turned.call`: its keys and queries in their
     documents' frames, its turns' gradient in the crossing form) over a plain launch of the template's
     arithmetic (`_framed_scores`), its keys, queries and values at `edge` and its turns of up to 3 radians:
-    each order it runs (reverse, its rule a custom one) finite where the plain formula's is
-    (`_turned_plainly`, its float64 the truth; row 7419)."""
+    every order finite where the plain formula's is (`_turned_plainly`, its float64 the truth; row 7419),
+    forward mode through its launch's own tangent (row 8573), an order set a case (`ORDER_SETS`)."""
     shapes = ((1, 40, 1, 6),) * 2 + ((1, 40, 1, 2),)
-    def draw(seed):
-        operands = normal_draw(7419 + 4096 * seed, *shapes, scale=EDGES[edge])
+    def draw(seed, scale):
+        operands = normal_draw(7419 + 4096 * seed, *shapes, scale=scale)
         turns = np.random.default_rng(7419 + 4096 * seed).uniform(-3.0, 3.0, (1, 40, 1, 2))
         turn = jnp.asarray(turns, jnp.float32)
-        return ((*operands, turn), normal_draw(7420 + 4096 * seed, *shapes, (1, 40, 1, 2), scale=EDGES[edge]),
+        return ((*operands, turn), normal_draw(7420 + 4096 * seed, *shapes, (1, 40, 1, 2), scale=scale),
                 normal_draw(7421 + 4096 * seed, (1, 40, 1, 2), (1, 1, 6, 2)))
     ones, decays = jnp.ones((1, 40, 1), jnp.float32), jnp.full((1, 40, 1), -0.05, jnp.float32)
 
-    def launch(query, key, value, g, beta, state, skip, entry, turning):
-        del g, beta, state, skip, entry, turning
+    def launch(context, query, key, value, g, beta, state, skip, entry, turning):
+        del context, g, beta, state, skip, entry, turning
         return _framed_scores(query, key, value, TURNED_STARTS)
 
     def rule(query, key, value, turn):
         return turned.call(launch, query, key, value, decays, ones, None, None, turn, TURNED_STARTS,
                            scale=1.0, group=1)
 
-    assert_contract(rule, *draw(0), f"a turned template call {edge}",
-                    truth_fn=_turned_plainly, plain_fn=_turned_plainly, without=REVERSE_ONLY,
-                    draw=measured(edge, draw))
+    plainly = jax.jit(_turned_plainly)
+    assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"a turned template call {edge}",
+                          truth_fn=plainly, plain_fn=plainly, taking=ORDER_SETS[taken])

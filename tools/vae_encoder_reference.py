@@ -23,7 +23,7 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 import torch
-from diffusers import AutoencoderKL
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 
 CONFIG = {"in_channels": 3, "out_channels": 3, "latent_channels": 4,
           "down_block_types": ["DownEncoderBlock2D"] * 2, "up_block_types": ["UpDecoderBlock2D"] * 2,
@@ -31,6 +31,13 @@ CONFIG = {"in_channels": 3, "out_channels": 3, "latent_channels": 4,
 SIZE = 17
 SEED = 67
 
+
+
+def autoencoder() -> AutoencoderKL:
+    """The VAE of `CONFIG`."""
+    model = AutoencoderKL.from_config(CONFIG)
+    assert isinstance(model, AutoencoderKL)  # No return_unused_kwargs.
+    return model
 
 def walk(encoder, image, probe, dtype):
     """The moments at `dtype`, and the gradients of `sum(moments * probe)` with
@@ -54,7 +61,7 @@ def main():
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
     torch.set_num_threads(1)
-    encoder, _ = seeded(lambda: AutoencoderKL.from_config(CONFIG).encoder.eval(), SEED)
+    encoder, _ = seeded(lambda: autoencoder().encoder.eval(), SEED)
     arrays = {f"param.{name}": value.detach().numpy().astype(ml_dtypes.bfloat16).view(np.uint16)
               for name, value in encoder.named_parameters()}
     meta = {"diffusers": __import__("diffusers").__version__, "torch": torch.__version__, "config": CONFIG,

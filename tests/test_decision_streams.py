@@ -197,11 +197,11 @@ def test_a_multimodal_backbones_row_in_streams_reads_as_its_text_decoders():
     np.testing.assert_array_equal(states(text_only=False), states(text_only=True))
 
 
-LETTERED_SEEDS = 128
+LETTERED_STREAM_SEEDS = 128
 """Check 1's declared seeds for packed lettered rows in two streams against each row alone, sized by
 `seeds_for` with the packed windows as `dew_fn`: 8 on 2026-10-30, again at base 7853cfdf6 (job
 20261109062353-1a4d7ce5), whose 8 left the verdict's 40 Inconclusive (a pooled ratio's interval [0.901,
-1.580]). The joint rows' 16 (`seeds_for`, 2026-10-30) are their mark's (`marked_seeds`)."""
+1.580]). The joint rows' 16 (`seeds_for`, 2026-10-30) are their mark's (`marked_seeds`, row 8577)."""
 
 
 @pytest.mark.parametrize("layout", [
@@ -216,7 +216,7 @@ def test_packed_rows_in_two_streams_decide_each_row_as_the_row_alone(layout, req
     own, through the unmodified objective: each row's tokens read its own streams and no other row's, the
     real options' logits on par from float64 (check 1, over drawn parameters)."""
     name = "joint" if layout is JOINT else "lettered"
-    seeds = marked_seeds(request) if layout is JOINT else LETTERED_SEEDS
+    seeds = marked_seeds(request) if layout is JOINT else LETTERED_STREAM_SEEDS
     assert_packed_as_alone(in_streams(layout, segments=3), in_streams(layout, segments=1), examples(layout),
                            f"packed {name} rows in two streams", seeds)
 

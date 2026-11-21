@@ -13,9 +13,9 @@ roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
 import collections
+import contextlib
 import dataclasses
 import functools
-import math
 import types
 from collections.abc import Callable
 
@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 from fla_sites import RECORDED, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, lowers
+from identity_cover import COVER_PRECISION, IDENTITY_COVER
 from kernel_compile import gate_generations
 from reference_error import assert_as_exact, declared_seeds
 from test_recurrence_chunk import (
@@ -48,13 +49,14 @@ from test_recurrence_chunk import (
     unit,
 )
 
-from dew.nn.kernels import chunked_launch, generation, recurrence
+from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding, recomputed_memory
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
+from tools import benchmark_recurrence
 
 pytestmark = pytest.mark.kernel
 
@@ -105,9 +107,8 @@ a drawn test of its own (`drawn_forward`) but the 16-bit call under a decay a ke
 and final memory test_recurrence_mosaic_gradient's cell judges on the same recorded site (`fla_sites.ruled`'s
 leaves) by the same launches: under a decay a key dimension the inference forward is the training forward's
 launches keeping nothing (`chunk_forward.forward`, `kept_forward`'s `keeps`). Under a decay a head a 16-bit
-inference forward walks once (`walks_once`: one scan launch, its own rounded expression), so its ragged and
-packed cases are drawn tests of their own. Interpreted, the whole grid took 3.5 times these (2838 against
-805 seconds)."""
+call's ragged and packed cases are drawn tests of their own, at the forward's own tiles (`Tiles.forward`).
+Interpreted, the whole grid took 3.5 times these (2838 against 805 seconds)."""
 
 INTERPRETED_GRADIENT = frozenset({
     ('packed documents', 'bf16', 'kept'), ('a ragged length', 'bf16', 'kept'),
@@ -376,10 +377,12 @@ def test_the_mosaic_forward_over_a_ragged_length_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length."""
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=16)
+@pytest.mark.check1_shards(seeds=256, per_task=6)
 @drawn_forward('packed documents', 'bf16')
 def test_the_mosaic_forward_over_packed_documents_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents."""
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents: six draws a
+    task, a draw interpreted on sm100 15 to 17 s (sixteen took 236 to 272 s a shard, two of test_recurrence_
+    mosaic's groups past the task deadline, row 6745)."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)
@@ -585,58 +588,20 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
 
 
 @lowers("sm90")
-def test_a_turned_forked_call_lowers_for_a_gpu_under_a_mesh():
-    """A turned forked call (`Hooks.turns`, Mamba-3's: its documents' load rotation, `Forked.turning`) with
-    entry writes, through the public chunked op on the template, lowered for an H100 under a mesh, as
-    training runs every call (`jax.set_mesh`): each operand its shard spec (`_template_launch`), where the
-    load rotation took none and the specs' zip with the operands refused the call under any mesh (row
-    7973)."""
-    from test_recurrence_chunk import TURNED, entered_draw, entering_documents
+def test_a_forked_call_adding_a_slot_lowers_for_a_gpu_under_a_mesh():
+    """The gated delta rule's forked call whose documents add a second table slot (`Chunk.adds`), no entry
+    write, through the public chunked op on the template, lowered for an H100 under a mesh, as training runs
+    every call (`jax.set_mesh`): each operand its shard spec (`_template_launch`), where the added slots took
+    none and the specs' zip with the operands refused the call (base review 89250eb9c F1)."""
+    from test_recurrence_chunk import FORKED_TEMPLATE, entering_documents, narrowed_draw
 
-    operands = entering_documents(entered_draw(TURNED, 0, entries=True)[0])
+    hooks = FORKED_TEMPLATE[0]
+    # A 16-bit call, as the template trains it.
+    operands = entering_documents(narrowed_draw(hooks, 0)[0], added=True)
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(lambda given: chunk_on('mosaic_gpu', TURNED, given)).trace(operands).lower(
+        jax.jit(lambda given: chunk_on('mosaic_gpu', hooks, given)).trace(operands).lower(
             lowering_platforms=("cuda",))
-
-
-@COMPILES_ON_CPU
-def test_a_forward_only_turned_call_keeps_no_more_than_its_frames():
-    """A bf16 turned call (`Hooks.turns`, Mamba-3's) without a gradient, compiled for a compile-only H100: its
-    temporaries at most the same call's unturned and its frames' own: its keys and queries turned, in their
-    dtype, and per token and head its frames' double float, their relative one and their rotation (six fp32
-    numbers a pair, `turned.frames`, `_in_last_frame`), where the turned wrapper traced its launch's
-    pullback for any call and its forward took the training launches, which keep each chunk's memories and
-    inverses for a backward no one runs (audit KPM-04)."""
-    from kernel_compile import lowered_for
-
-    rows, length, heads, keys, values = 1, 1024, 2, 128, 128
-    hooks = dataclasses.replace(recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True),
-                                turns=2)
-    pairs = (jax.ShapeDtypeStruct((rows, length, heads, keys), jnp.bfloat16),) * 2
-    rest = (jax.ShapeDtypeStruct((rows, length, heads, values), jnp.bfloat16),
-            jax.ShapeDtypeStruct((rows, length, heads), jnp.float32),
-            jax.ShapeDtypeStruct((rows, length, heads), jnp.float32),
-            jax.ShapeDtypeStruct((heads,), jnp.float32))
-    turn = jax.ShapeDtypeStruct((rows, length, heads, 2), jnp.float32)
-    framed = 2 * math.prod(pairs[0].shape) * 2 + 6 * math.prod(turn.shape) * 4
-
-    def temporaries(fn, *operands) -> int:
-        """The compiled program's temporaries' bytes (`memory_analysis`)."""
-        analysis = lowered_for(fn, operands, "sm90").compile().memory_analysis()
-        assert analysis is not None
-        return analysis.temp_size_in_bytes
-
-    def called(hooks):
-        def call(query, key, value, g, beta, skip, *turn):
-            operands = Chunk(query, key, value, log_decay=g, beta=beta, skip=skip,
-                             turn=turn[0] if turn else None)
-            return chunk_on('mosaic_gpu', hooks, operands)[0]
-        return call
-
-    whole = temporaries(called(hooks), *pairs, *rest, turn)
-    unturned = temporaries(called(dataclasses.replace(hooks, turns=0)), *pairs, *rest)
-    assert whole <= unturned + framed
 
 
 def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
@@ -837,8 +802,11 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
     (the delta rule's fla, the rated scan's mamba_ssm) under the accurate forms, its fast forms' two parts
     (`mainloop.FAST_PARTS`) held to the recorded port instead
     (`the_mosaic_forward_is_as_exact_as_its_reference`): there they put the template 42 to 83 times the
-    fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
-    forms = 'accurate' if hooks.delta or hooks.rated else generation.numerics().forms
+    fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a);
+    and fla's simple GLA, lightning attention's, whose fast forms take fla's rounding
+    (`test_lightning_attentions_fast_forms_are_as_exact_as_flas_rounding_interpreted`)."""
+    upstream = hooks.delta or hooks.rated or recurrence_chunk.simple_gla(hooks)
+    forms = 'accurate' if upstream else generation.numerics().forms
     (sample,) = hooked_draw(hooks, packed, 0)
     if not formed(forms, taken)(sample, hooks):
         with pytest.raises(REFUSED):
@@ -849,6 +817,8 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
                     f'the mosaic forward, {hooks} packed={packed} under the {forms} forms',
                     seeds=HOOK_SEEDS[hooks, packed])
+
+
 
 
 GROUPED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='apart', ranks=2)
@@ -881,11 +851,12 @@ writes, and the state's first key pairs turned each token (`Hooks.turns`), two p
 def test_a_turned_call_on_the_template_is_on_par_with_the_portable_math_interpreted(packed):
     """A state that turns its key pairs (`TURNED`) through the chunked op on the template, its queries and
     keys turned into their documents' frames and its turns' gradient in the crossing form
-    (`templates.recurrence.turned`), against the portable math's (`scan.Scan.turn`, its turns' gradient the
-    replay's): output, final memory and every operand's gradient, the turns' among them, from float64 over
-    one sequence or packed documents each beginning a token's ranks (check 1, row 7419), its queries, keys,
-    values and write gate in bf16 under the run's fast forms, as the template's fast backward trains it
-    (`mainloop_backward.fast_backward_form`)."""
+    (`templates.recurrence.turned`), against the portable math's: output, final memory and every operand's
+    gradient from float64 over one sequence or packed documents each beginning a token's ranks (check 1, row
+    7419), its queries, keys, values and write gate in bf16 under the run's fast forms, as the template's fast
+    backward trains it (`mainloop_backward.fast_backward_form`). Both arms take the turns' gradient from one
+    crossing form (`turned.turn_gradient`), which the recurrence a token at a time holds
+    (test_recurrence_chunk's turned states), not this pair (row 7971)."""
     def on(route, operands, starts=None):
         return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
 
@@ -952,14 +923,25 @@ def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_inte
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed=True)
 
 
-RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
-                   'nemotron-h-4b-ssd': (8, 96, 128, 80, False),
-                   'a write gate': (2, 2, 64, 64, False),
-                   'a 192-wide value head': (16, 16, 128, 192, False)}
-"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`), an unrounded
-write gate, and a gated delta rule's value head 192 wide, whose training launches take whole staged blocks (a
-bf16 output gradient's 64-column swizzle; 96 columns cut one): key heads, value heads, key and value widths,
-and whether the decay is a key dimension's."""
+RESOURCE_SHAPES = {
+    **{name: (shape.key_heads, shape.value_heads, shape.key_width, shape.value_width, shape.kind == 'kda')
+       for name, shape in benchmark_recurrence.SHAPES.items()
+       if name in ('qwen3.5-27b-gdn', 'kimi-linear-kda', 'nemotron-h-4b-ssd', 'minimax-text-01-lightning')},
+    'a write gate': (2, 2, 64, 64, False), 'a 192-wide value head': (16, 16, 128, 192, False)}
+"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`, read there:
+a gated delta net's, Kimi delta attention's, an SSD's and MiniMax-Text-01's lightning layer), an unrounded
+write gate, and a gated delta rule's value head 192 wide, whose training launches take whole staged blocks
+(a bf16 output gradient's 64-column swizzle; 96 columns cut one): key heads, value heads, key and value
+widths, and whether the decay is a key dimension's."""
+
+WHOLE = frozenset({'a write gate'})
+"""The gate's forms without the delta rule whose numbers the run's fast forms leave whole
+(`recurrence_chunk.chunk_rounding`): a write gate's, its intermediates in fp32's three parts, the accurate
+forms' launches every form without the delta rule takes under the accurate numerics."""
+
+RELEASED = frozenset({'minimax-text-01-lightning'})
+"""The gate's forms without the delta rule that take their release's numbers where the run's fast forms do
+(`recurrence_chunk.chunk_rounding`'s `released`): lightning attention's, fla's simple GLA."""
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
 """The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
@@ -984,10 +966,9 @@ def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.Shap
 @COMPILES_ON_CPU
 @lowers('sm90')
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
-    """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
-    at a variant's, each the forward's own (`_ran`): a kernel's name compiled under both launches
-    (`report.launching`) is gated on each launch's evidence, the variant's shared memory its own; a gate that
-    read a kernel by its name alone kept one launch's and dropped the other's."""
+    """The 27B gated delta net's forward launched twice in one program on an H100, at the first two variants'
+    distinct forward tiles (`_ran`): a kernel's name compiled under both launches (`report.launching`) is
+    gated on each launch's evidence, the second's shared memory its own; one read by its name kept one's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -997,7 +978,8 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=1.0)
     with generation.assumed(facts):
-        derived, variant = (_ran(tiles, training=False) for tiles in template.MOSAIC.variants(bound)[:2])
+        forwards = dict.fromkeys(_ran(tiles, training=False) for tiles in template.MOSAIC.variants(bound))
+        derived, variant = list(forwards)[:2]
 
     def call():
         def fn(*operands):
@@ -1085,13 +1067,14 @@ def test_a_plan_at_a_rings_depth_is_the_trace_at_that_depth(target, name):
             assert deepened == traced, (stages, kind)
 
 
-@pytest.mark.parametrize('kernel', ['recurrence_scan', 'recurrence_states', 'recurrence_reverse'],
+@pytest.mark.parametrize('kernel', ['recurrence_alone_output', 'recurrence_states', 'recurrence_reverse'],
                          ids=['forward', 'training forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     """A compile that refused the 27B gated delta net's derived tiles on an H100 (`report.refused_at`: a
-    kernel spilled), its forward's walk (`mainloop._scan`), its training forward's or its backward's: the
-    derivation steps the refused tiles down, which the call takes (`fits`); a refusal of the joined tiles once
-    matched none of the rules' candidates, and the call found none (`Unfitted`)."""
+    kernel spilled), its forward alone's output launch (`mainloop.named`), its training forward's states or
+    its backward's: the derivation steps the refused tiles down, which the call takes (`fits`); a refusal of
+    the joined tiles once matched none of the rules' candidates, and the call found none (`Unfitted`). The
+    forward alone's steps its own (`Tiles.forward`): named as the training forward's, it stepped both."""
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
     bound = template.MOSAIC.bind(*args, None, bound=1.0)
     with report.refusals(), generation.assumed('sm90'):
@@ -1103,6 +1086,9 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
         legal = stepped is not None and template.MOSAIC.legal(bound, stepped, target)
     # The call takes legal tiles other than the refused ones.
     assert legal and stepped != first and taken == (stepped,)
+    if kernel == 'recurrence_alone_output':
+        trained = [template.MOSAIC.launches(bound, each, target, backward=True) for each in (first, stepped)]
+        assert trained[0] == trained[1], (first, stepped)
 
 
 @pytest.mark.parametrize('product', ['forward', 'fast backward'])
@@ -1274,15 +1260,16 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                                                            ('qwen3.5-27b-gdn', jnp.float32),
                                                            ('kimi-linear-kda', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16),
+                                                           ('minimax-text-01-lightning', jnp.bfloat16),
                                                            ('a write gate', jnp.bfloat16),
                                                            ('a 192-wide value head', jnp.bfloat16)})
                and not (variant == TWO_ROLES and not (training and not packed))
                and not (isinstance(variant, int) and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
 geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
-gated delta rule in both and of Kimi delta attention, the SSD and the write gate in 16 bits (Kimi's keys, 128
-wide, past what an fp32 call takes under a decay a key dimension; the write gate's intermediates in fp32's
-three parts), and the 192-wide value head's 16-bit training pass alone;
+gated delta rule in both and of Kimi delta attention, the SSD, lightning attention and the write gate in 16
+bits (Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key dimension; lightning's and the
+write gate's intermediates in fp32's three parts), and the 192-wide value head's 16-bit training pass alone;
 one row's 16-bit forward at its derived tiles apart from
 each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none), and one
 row's training pass at its derived tiles apart from its walks at two roles (`TWO_ROLES`). One test
@@ -1295,9 +1282,13 @@ with its two-role walks 130.2 s on sm90 (train 630's CI, main f424ab7d8)."""
 def _form(name: str, dtype) -> dict:
     """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
     an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
-    wide, as Mamba-2's mixer reads its output (`chunk`'s fp32 `dtype`)."""
-    if name == 'a write gate':
+    wide, as Mamba-2's mixer reads its output (`chunk`'s fp32 `dtype`); lightning attention's at its
+    release's rounding as `chunk` takes it (`chunk_rounding`'s `released`), its write gated on the values."""
+    if name in WHOLE:
         return {'delta': False}
+    if name in RELEASED:
+        return {'delta': False, 'rounded': chunk_rounding(delta=False, dtype=dtype, released=True),
+                'values_gated': True}
     return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
 
@@ -1328,27 +1319,35 @@ def _two_roles(bound, derived, facts, *, packed: bool, training: bool) -> list:
         return []
     # As the derivation walks a call of two waves (`Mosaic._walked`): two roles only where they hold, and
     # a training call's only where its fast backward holds as it does at one.
-    two = template.MOSAIC._walked(bound, derived, facts, 2, training=training)
-    if two.walkers != 2:
-        return []
     with generation.assumed(facts):
+        two = template.MOSAIC._walked(bound, derived, facts, 2, training=training)
+        if two.walkers != 2:
+            return []
         return [(template.MOSAIC._settled(bound, two, facts), 'two roles ')]
 
 
 def _gate_call(name: str, dtype, given: list, starts, tiles, family, *, training: bool):
     """A gate case's call (`KernelCase`'s): `name`'s forward, or training step over the output's and final
-    memory's cotangents in `given`, at `tiles` on `family`, over packed documents where `starts` are given."""
+    memory's cotangents in `given`, at `tiles` on `family`, over packed documents where `starts` are given.
+    A training step runs as the template's call does (`Mosaic.launches`' backward): the forward keeping what
+    its backward takes (`chunk_forward.kept_forward`, its output launch the step's own) and the backward
+    taking it, each of its launches compiled as the step compiles it."""
     formed = {key: value for key, value in _form(name, dtype).items() if key != 'wide' or not training}
-    run = functools.partial(mainloop_backward.gradients if training else chunk_forward.forward, **formed,
-                            )
     skip = list(_skipped(name).values())
     packed = starts is not None
 
     def fn(*operands):
         *operands, documents = operands if packed else (*operands, None)
         *operands, fused = (*operands, None) if not skip else operands
-        return run(*operands, tiles=tiles, starts=documents, max_segments=8 if packed else None,
-                   family=family, skip=fused)
+        options = dict(tiles=tiles, starts=documents, max_segments=8 if packed else None, family=family,
+                       skip=fused, **formed)
+        if not training:
+            return chunk_forward.forward(*operands, **options)
+        *inputs, out_grad, final_grad = operands
+        out, final, (inverse, kept) = chunk_forward.kept_forward(*inputs, keeps=True, **options)
+        grads = mainloop_backward.gradients(*inputs, out_grad, final_grad, inverse=inverse, kept=kept,
+                                            **options)
+        return out, final, grads
 
     return fn, (*given, *skip, *([starts] if packed else []))
 
@@ -1497,6 +1496,26 @@ def resource_failures(cases: list, found: list, plans: dict, apart: dict) -> lis
     return failed + apart_failures([record for record in found if record['name'] in apart], apart)
 
 
+def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
+    """A kernel's refusal keeps the roles its spill stood in (`report.Refused`): refusals of one config that
+    differ in them alone are two derivations' inputs (`report.derivation_inputs`), whose ladders step
+    apart (`Mosaic._consumers_spilled`), and a plan handing its refusals to another process
+    (`refusal_entries` into `refuse`) states them again there (base review 60efbe75f F2: a cache key
+    without them stood for either)."""
+    bound = template.MOSAIC.bind(*resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256), None, bound=1.0)
+    tiles, kernel = mainloop.Tiles(32, 3, 128, 2, chunk=64), 'recurrence_output'
+    keys = []
+    for roles in ((report.CONSUMERS,), (report.PRODUCER,)):
+        with report.refusals(), generation.assumed('sm90'):
+            report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
+            keys.append(report.derivation_inputs(template.MOSAIC, bound, template.Mosaic.launched()))
+            handed = report.refusal_entries()
+        with report.refusals(), generation.assumed('sm90'):
+            report.refuse(handed)
+            assert report.spilled_in(template.MOSAIC, bound, tiles) == {kernel: roles}
+    assert keys[0] != keys[1]
+
+
 def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own():
     """`planned_failures` holds `recurrence_intra_solve` to its own launch's shared memory, not to the larger
     plan of `recurrence_intra`, whose name begins its own, and `recurrence_intra` to its own."""
@@ -1510,12 +1529,16 @@ def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_beg
     assert [failure.split(":")[0] for failure in failed] == ["case recurrence_intra_solve"]
 
 
+def group_name(group: tuple) -> str:
+    """A gate group's name (`GATE_GROUPS`): its geometry, dtype, product, documents and variant."""
+    name, dtype, training, packed, variant = group
+    return (f"{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
+            f"{'-packed' if packed else ''}{'' if variant is None else f'-variant-{variant}'}")
+
+
 def _gated(target: str, group: tuple):
     """The gate's test of `target` and `group`, named by them."""
-    name, dtype, training, packed, variant = group
-    label = (f"{target}-{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
-             f"{'-packed' if packed else ''}{'' if variant is None else f'-variant-{variant}'}")
-    return pytest.param(target, group, id=label)
+    return pytest.param(target, group, id=f"{target}-{group_name(group)}")
 
 
 @pytest.mark.parametrize('target, group', [_gated(target, group) for target in gate_generations(scoped=True)
@@ -1591,8 +1614,9 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
 
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
-    long as a required launch spills at a config not refused before, its launch refused
-    (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps a spilling
+    long as a required launch spills or serializes its warpgroup MMAs (`report.refuses`, which a run's
+    certification reads too, `report.Binary.refused`) at a config not refused before, its launch refused
+    (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
     derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
     first derivation, before any compile); the plans and launches held apart are those of the cases
@@ -1605,7 +1629,8 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     stepped: set = set()
     while True:
         spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
-                                if kernel.get("spilled") and kernel["kernel"] not in
+                                if report.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
+                                and kernel["kernel"] not in
                                 refused_kernels(record, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
         # A case refused once at a config, and again at the config its derivation then gives (a launch's
@@ -1629,10 +1654,45 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     return cases, found
 
 
+@pytest.mark.parametrize("first", [False, True], ids=["forward first", "gradient first"])
+def test_a_launchs_call_and_its_gradients_product_are_two_launches_in_either_order(first):
+    """A recurrence launch traced as its call runs it and as a gradient's product (`report.pulled`), in either
+    order in one process: each its own launch (`report.launch_digest`, its calls' caller), read back in its
+    own mode (`report.traced`, which a program's refusal's verdict keys on, `_held`), the two verdict keys
+    apart (`_verdict_key`). One digest for both, the registry kept the first mode, and a training program's
+    refusal was stored as the forward's verdict, a later start meeting it again by a whole-program compile
+    (the evening audit's KPM-01)."""
+    name, dtype = 'kimi-linear-kda', jnp.bfloat16
+    # A length of its own a parametrization: a launch identity neither order traced before.
+    length = 256 if first else 512
+    bound = template.MOSAIC.bind(*resource_operands(name, dtype, 1, length),
+                                 jax.ShapeDtypeStruct((1, length), jnp.bool_), max_segments=8, bound=1.0,
+                                 **_form(name, dtype))
+    tiles = mainloop.Tiles(32, 3, 128, 2, chunk=64)
+
+    def digest(reverse: bool) -> str:
+        with contextlib.ExitStack() as scope:
+            if reverse:
+                scope.enter_context(report.pulled())
+            with report.launching(template.MOSAIC, bound, tiles):
+                return report.launch_digest()
+
+    digests = {reverse: digest(reverse) for reverse in (first, not first)}
+    assert digests[False] != digests[True]
+    launches = {reverse: report.traced(found) for reverse, found in digests.items()}
+    assert {reverse: launch.reverse for reverse, launch in launches.items()} == {False: False, True: True}
+    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse)
+            for launch in launches.values()}
+    assert len(keys) == 2 or keys == {None}, keys
+
+
 @COMPILES_ON_CPU
 def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels():
     """A forward and its backward's recomputations can share kernel names at different resource sizes:
-    each name's model must cover both, while a model-refused launch remains a counterfactual."""
+    each name's model must cover both, while a model-refused launch remains a counterfactual. A launch whose
+    producer spills at the least climbs its ladder as a run's certification raises it (`Mosaic._raised`: a
+    producer's need is the assembler's alone, `resources.producer_floor`; sm100's decayed keys spilled 16
+    bytes in its producer at the least, row 6747), and holds there."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1642,17 +1702,29 @@ def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels(
     args = resource_operands(name, dtype, 1, 256)
     starts = jax.ShapeDtypeStruct((1, 256), jnp.bool_)
     bound = template.MOSAIC.bind(*args, starts, max_segments=8, bound=1.0, **_form(name, dtype))
-    tiles = mainloop.Tiles(32, 3, 128, 2, chunk=64)
-    launches = template.MOSAIC.launches(bound, tiles, facts, backward=True)
-    models = _models(launches, family, facts)
     given = [*args, jax.ShapeDtypeStruct(args[2].shape, dtype),
              jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
-    call = functools.partial(_gate_call, name, dtype, given, starts, tiles, family, training=True)
     label = 'packed key-decay training and its recomputations'
-    case = KernelCase(label, call, models)
-    apart = {label: {kernel for kernel, model in models.items()
-                     if model.registers is not None and model.registers > model.budget}}
-    found = compile_mosaic_kernels([case], 'sm100')
+
+    def compiled(tiles):
+        launches = template.MOSAIC.launches(bound, tiles, facts, backward=True)
+        models = _models(launches, family, facts)
+        call = functools.partial(_gate_call, name, dtype, given, starts, tiles, family, training=True)
+        case = KernelCase(label, call, models)
+        apart = {label: {kernel for kernel, model in models.items()
+                         if model.registers is not None and model.registers > model.budget}}
+        return case, launches, apart, compile_mosaic_kernels([case], 'sm100')
+
+    tiles = mainloop.Tiles(32, 3, 128, 2, chunk=64)
+    case, launches, apart, found = compiled(tiles)
+    while spilled := frozenset(kernel["kernel"] for kernel in found[0].get("kernels", ())
+                               if kernel.get("spilled")):
+        with generation.assumed(facts):
+            producers = template.MOSAIC._raised(bound, tiles, spilled, facts)
+        if producers is None:
+            break
+        tiles = dataclasses.replace(tiles, producers=producers)
+        case, launches, apart, found = compiled(tiles)
     assert resource_failures([case], found, {label: launches}, apart) == []
 
 
@@ -1666,9 +1738,9 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
     """`name`'s 16-bit call over a forked call's three documents a row, entering a table of a given memory
     and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
     template's derived tiles on `target` (a forward alone at its own, `_ran`), its forward or training pass
-    as a gate case (`KernelCase`): its operands laid from the chunks' edges and its table as the walks take it
-    (`template.forked_laid`). Returns the case (None where the template derives no tiles), the bound call, its
-    derived tiles and the same call unforked, bound."""
+    as a gate case (`KernelCase`): its documents laid as a packed call's and its table as the walks take
+    it (`template.forked_table`). Returns the case (None where the template derives no tiles), the bound
+    call, its derived tiles and the same call unforked, bound."""
     from fla_gdn_support import KernelCase
 
     facts = generation.gpu_target(target)
@@ -1689,25 +1761,27 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
         tiles = template.MOSAIC.derived(bound, facts)
     if tiles is None:
         return None, bound, tiles, unforked
-    laid, table = jax.eval_shape(lambda *x: template.forked_laid(*x, tiles.chunk)[:2], q, k, v, g, beta,
-                                 given, forked)
+    table, starts, firsts, _ = jax.eval_shape(
+        lambda given, forked: template.forked_table(given, forked, *q.shape[:2], tiles.chunk), given, forked)
+    segments = forked.loads.shape[1]
     formed = {key: value for key, value in _form(name, jnp.bfloat16).items() if key != 'wide' or not training}
-    cotangents = [jax.ShapeDtypeStruct(laid[2].shape, jnp.bfloat16), h0] if training else []
+    cotangents = [jax.ShapeDtypeStruct(v.shape, jnp.bfloat16), h0] if training else []
     tabled, laid_table = jax.tree.flatten(table)
 
     def call():
         def fn(*operands):
-            (q, k, v, g, beta), leaves, rest = (operands[:5], operands[5:5 + len(tabled)],
-                                                operands[5 + len(tabled):])
+            (q, k, v, g, beta, starts, firsts), leaves, rest = (operands[:7], operands[7:7 + len(tabled)],
+                                                                operands[7 + len(tabled):])
             *rest, fused = rest if skip else (*rest, None)
             forked = jax.tree.unflatten(laid_table, leaves)
+            documents = {'starts': starts, 'firsts': firsts, 'max_segments': segments}
             if training:
                 return mainloop_backward.gradients(q, k, v, g, beta, None, *rest, tiles=tiles, family=family,
-                                                   forked=forked, skip=fused, **formed)
+                                                   forked=forked, skip=fused, **documents, **formed)
             return chunk_forward.forward(q, k, v, g, beta, None, tiles=_ran(tiles, training=False),
-                                         family=family, forked=forked, skip=fused, **formed)
+                                         family=family, forked=forked, skip=fused, **documents, **formed)
 
-        return fn, (*laid, *tabled, *cotangents, *skip)
+        return fn, (q, k, v, g, beta, starts, firsts, *tabled, *cotangents, *skip)
 
     label = f"{name} bfloat16 {'training' if training else 'forward'} forked {_ran(tiles, training=training)}"
     return KernelCase(label, call), bound, tiles, unforked
@@ -1747,8 +1821,12 @@ def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, trainin
         if not spilling or tiles in stepped:
             break
         stepped.add(tiles)
+        # The roles each spill stood in, as a run's certification states them, which its ladder steps by.
+        spilled_in = {binary["kernel"]: None if binary["spilled_in"] is None else tuple(binary["spilled_in"])
+                      for record in found for binary in record.get("binaries", ())
+                      if binary["kernel"] in spilling}
         with generation.assumed(facts):
-            report.refuse_launch(template.MOSAIC, bound, tiles, spilling)
+            report.refuse_launch(template.MOSAIC, bound, tiles, spilling, spilled_in)
     assert mosaic_failures(found) == []
 
 
@@ -1784,22 +1862,24 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
 
 
 
-def _reverse_walk_certified(op=None) -> list:
-    """Qwen3.5-4B's gated delta net over its 12,288-token row lowered for a compile-only B200 as a training
-    step runs it (its gradient, certified as reverse mode runs it, `report.pulled`), through `op`'s
-    certification where given (`tuning.KernelOp._certified` of its derived tiles), else through the call's
-    route: the template's certifications it made and the configs it refused."""
+def _step_certified(target: str, rows: int, *, packed: bool, op=None) -> list:
+    """Qwen3.5-4B's gated delta net over `rows` rows of 12,288 tokens (`packed`: 17 documents a row) lowered
+    for a compile-only `target` as a training step runs it (its gradient, certified as reverse mode runs it,
+    `report.pulled`), through `op`'s certification where given (`tuning.KernelOp._certified` of its derived
+    tiles), else through the call's route: the template's certifications it made and the configs it
+    refused."""
     from dew.nn.kernels.generation import compile_only_gpus
 
     # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide.
     operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
-        ((1, 12288, 16, 128), jnp.bfloat16), ((1, 12288, 16, 128), jnp.bfloat16),
-        ((1, 12288, 32, 128), jnp.bfloat16), ((1, 12288, 32), jnp.float32), ((1, 12288, 32), jnp.bfloat16))]
-    options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
-               'rounded': True}
+        ((rows, 12288, 16, 128), jnp.bfloat16), ((rows, 12288, 16, 128), jnp.bfloat16),
+        ((rows, 12288, 32, 128), jnp.bfloat16), ((rows, 12288, 32), jnp.float32),
+        ((rows, 12288, 32), jnp.bfloat16))]
+    options = {'max_segments': 17 if packed else None, 'scale': None, 'delta': True, 'wide': False,
+               'bound': 1.0, 'rounded': True}
     before = {id(certified) for certified in report.certifications()}
-    with (report.refusals(), generation.assumed('sm100'), generation.chosen(gated_delta_rule='mosaic_gpu'),
-          report.certifying(compile_only_gpus('sm100')[0])):
+    with (report.refusals(), generation.assumed(target), generation.chosen(gated_delta_rule='mosaic_gpu'),
+          report.certifying(compile_only_gpus(target)[0])):
         # The template's rule called as the route's training product calls it, under reverse mode's
         # certification (`recurrence_chunk._per_product`'s `training`): `_route_loss` takes the rule itself.
         with report.pulled():
@@ -1814,18 +1894,67 @@ def _reverse_walk_certified(op=None) -> list:
             if id(each) not in before and each.op == type(op or template.MOSAIC).__name__], refused
 
 
-@lowers('sm100')
-def test_a_launch_whose_producer_must_rise_is_certified_at_its_ladders_top_in_one_compile():
-    """A training call whose reverse walk spills at setmaxnreg's least producer on a compile-only B200
-    (`_reverse_walk_certified`) is certified at its producer's top, its program's entry share (two
-    warpgroups, two programs a multiprocessor: 128), in one compile: every role holds the entry share and
-    no register moves. From the ladder's foot up, the walk's producer rose 24 to 80 over eight
-    certification compiles, 95 s of the 4B's cold start."""
-    from dew.nn.kernels.templates import resources
+def _reverse_walk_certified(op=None) -> list:
+    """The 4B training step over its one 12,288-token row on a compile-only B200 (`_step_certified`)."""
+    return _step_certified('sm100', 1, packed=False, op=op)
 
-    certified, _ = _reverse_walk_certified()
-    raised = [each.config.producers.of('recurrence_reverse') for each in certified]
-    assert [cap for cap in raised if cap is not None] == [resources.entry_registers(2, 2)], raised
+
+def _certified_bodies(certified: list) -> dict[str, list]:
+    """Each kernel's bodies `certified` compiled (each distinct module once, in order) with the binary its
+    certification read of each, by the kernel's name."""
+    found: dict[str, dict[str, object]] = collections.defaultdict(dict)
+    for each in certified:
+        for module, binary in each.kernels.values():
+            found[binary.kernel].setdefault(module, binary)
+    return {kernel: list(bodies.values()) for kernel, bodies in found.items()}
+
+
+def assert_a_start_certifies_each_kernel_at_most_twice(certified: list) -> None:
+    """Every kernel of a training step's start certified at most twice, the body it keeps unspilled: a
+    launch spilling at its producer's least takes its consumers' statement's share next
+    (`resources.stated_producer`), and a rung asked once is never asked again
+    (`resources.Producers.stepped`)."""
+    bodies = _certified_bodies(certified)
+    assert bodies and all(len(found) <= 2 and not found[-1].refused for found in bodies.values()), bodies
+
+
+@lowers('sm100')
+def test_a_b200_training_steps_start_certifies_each_kernel_at_most_twice():
+    """The 4B training step on a compile-only B200 (`_reverse_walk_certified`): every kernel certified at most
+    twice, none kept spilled. Its reverse walk spills 40 bytes at its producer's least and holds at its
+    consumers' statement's share; from the ladder's foot up it took eight, 95 s of the 4B's cold start."""
+    assert_a_start_certifies_each_kernel_at_most_twice(_reverse_walk_certified()[0])
+
+
+@lowers('sm90')
+def test_an_h100_training_steps_start_certifies_each_kernel_at_most_twice():
+    """The 4B training step over four packed rows on a compile-only H100 (`_step_certified`): every kernel
+    certified at most twice, none kept spilled. With its consumers raised to the whole pool beside the least
+    producer, ptxas spilled the output walk's tile index around the scores' warpgroup MMAs, which their
+    statement's share holds; from the top down that start took ten certifications in three rounds (row 6743).
+    Proposed first, the statements' shares traded the output walk's ladder for the scores' backward's."""
+    assert_a_start_certifies_each_kernel_at_most_twice(_step_certified('sm90', 4, packed=True)[0])
+
+
+@lowers('sm90')
+def test_a_write_gated_training_calls_start_certifies_its_consumers_spill_three_times_at_most():
+    """The unrounded write gate's forked training call (`forked_case`, no delta rule) at its derived tiles on
+    a compile-only H100, certified as reverse mode runs it (`tuning.KernelOp._certified`): its scores'
+    backward, which spills 16 bytes in its consumers' code at its producer's least, is certified there, at
+    its consumers' statement's share, and at a program fewer, which holds; every other kernel once, none
+    kept spilled. From its producer's top down, every rung spilled more in its consumers, and the ladder
+    compiled about a hundred rounds of the launch before the program fewer (row 6744)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    _, bound, tiles, _ = forked_case('sm90', 'a write gate', training=True)
+    before = {id(certified) for certified in report.certifications()}
+    with (report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]),
+          report.pulled()):
+        template.MOSAIC._certified(bound, tiles)
+    bodies = _certified_bodies([each for each in report.certifications() if id(each) not in before])
+    spilling = bodies.pop('recurrence_scores_back')
+    assert len(spilling) <= 3 and not spilling[-1].refused, spilling
+    assert bodies and all(len(found) == 1 and not found[-1].refused for found in bodies.values()), bodies
 
 
 @lowers('sm90')
@@ -1861,7 +1990,7 @@ def test_a_packed_training_step_certifies_the_launch_it_runs_once():
     """A delta rule's training step over packed rows that carry their documents' first slots (a packed
     layer's, `dew.batch.Coordinates.firsts`), lowered for a compile-only H100 through the call's route:
     each config its training launch certifies is certified once, its selector's call bound as the launch
-    binds on each shard (`recurrence_chunk.template_call`). Bound without the firsts, the selector certified
+    binds on each shard (`recurrence_chunk.template_bind`). Bound without the firsts, the selector certified
     a launch the step never ran beside the one it did (train 942's F2)."""
     from dew.nn.kernels.generation import compile_only_gpus
 
@@ -1939,14 +2068,14 @@ def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_on
 
 
 @lowers('sm80')
-def test_a_training_step_no_config_holds_moves_past_the_template_after_one_compile():
+def test_a_training_steps_gradient_lowers_after_one_certification_whatever_its_verdict():
     """The gated delta net's training step at its GPU flow's widths (tests/model_flows.py's Qwen3-Next-tiny: 2
-    key heads and 4 value heads of 128, 2 rows of 256 tokens, bf16) on a compile-only A100: its scores'
-    backward spills 8 bytes at 255 registers at every tiles the derivation offers, which plan it alike, so
-    one compile refuses them all (`Mosaic._refused`); the route's launch requirement reads the certified
-    answer (`Mosaic.holds`) and its gradient lowers by the next kernel, the template's start one
-    certification. It certified 32 tiles, 819 s, and raised Unfitted from inside the call (row 6816; row
-    6860 the coverage gap)."""
+    key heads and 4 value heads of 128, 2 rows of 256 tokens, bf16) on a compile-only A100: its gradient
+    lowers, by the template or, where the template's tiles do not hold, the next kernel, and the template's
+    start is one certification, as reverse mode runs it, whatever it answers: where no tiles held (its
+    scores' backward 8 bytes past 255 registers, row 6860), it certified 32 tiles, 819 s, and raised
+    Unfitted from inside the call (row 6816). Which route takes the call is the template's coverage (row
+    6860), not this test's."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -1963,7 +2092,7 @@ def test_a_training_step_no_config_holds_moves_past_the_template_after_one_compi
     # The training call's launch, certified as reverse mode runs it; its forward alone no step runs.
     certified = [each for each in report.certifications()
                  if id(each) not in before and each.op == type(template.MOSAIC).__name__]
-    assert len(certified) == 1 and certified[0].refused and certified[0].pulled, certified
+    assert len(certified) == 1 and certified[0].pulled, certified
 
 
 @lowers('sm90')
@@ -1992,7 +2121,7 @@ def test_a_training_step_the_fast_backward_does_not_take_certifies_no_gradient()
                 if id(each) not in before and each.op == type(template.MOSAIC).__name__]
 
 
-TOP_RUNG_LOWERED = """
+RUNG_LOWERED = """
 import collections, json
 from jax._src import monitoring
 from dew.training.runtime import ready_process
@@ -2007,20 +2136,21 @@ print(json.dumps({"served": dict(served), "kernels": [len(each.kernels) for each
                   "raised": [each.config.producers.of("recurrence_reverse") for each in certified]}))
 """
 """A process configured as a run's (`ready_process`: its compilation cache and its kernels' lowerings kept
-beside it) certifying the 4B reverse walk (`_reverse_walk_certified`): the lowering cache's hits and misses,
-each certification's kernels and its reverse walk's producer."""
+beside it) certifying the 4B reverse walk (`_reverse_walk_certified`), which spills at its producer's least
+and takes its ladder's next rung: the lowering cache's hits and misses, each certification's kernels and its
+reverse walk's producer."""
 
 
 @lowers('sm100')
-def test_a_ladders_top_reads_every_kernel_but_the_raised_one_from_the_lowering_cache(tmp_path):
-    """In a process that keeps its lowerings as a run does (`TOP_RUNG_LOWERED`), the reverse walk's top
+def test_a_ladders_rung_reads_every_kernel_but_the_raised_one_from_the_lowering_cache(tmp_path):
+    """In a process that keeps its lowerings as a run does (`RUNG_LOWERED`), the reverse walk's next
     rung lowers only the kernel its producer changed: every other kernel of the launch is the module it was
     at the floor (its identity, `report.named`), read back from the Pallas lowering cache, whose key holds no
     caller metadata (Dew's JAX build, post93). Named by their launch's whole config, each rung lowered all
     nine of the launch's kernels again in Python."""
     from process_support import fresh
 
-    found = fresh(TOP_RUNG_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
+    found = fresh(RUNG_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
     assert found["raised"][1:] and found["raised"][-1] is not None, found
     assert found["served"].get("hit", 0) >= found["kernels"][-1] - 1, found
 
@@ -2045,9 +2175,8 @@ device = _device(target).devices.flat[0]
 # Two rungs of a launch's producer ladder past a training case's tiles (`_ladders`).
 with generation.assumed(facts):
     label, bound, pulled, configs = next(
-        (unit[0], unit[1], unit[4], ladder) for unit in gate._identity_units(target)
-        if unit[3] == 'launch' and unit[4]
-        and len(ladder := gate._walked(unit[1], unit[2], 'launch', unit[5], facts)) >= 3)
+        (unit[0], unit[1], unit[4], unit[6]) for unit in gate._identity_units(target)
+        if unit[3] == 'launch' and unit[4] and len(unit[6]) >= 3)
 rungs = configs[1:3]
 programs = []
 with report.refusals(), generation.assumed(facts), report.certifying(device):
@@ -2066,7 +2195,8 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     found = report._misses_of([dataclasses.replace(binary, frame=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
-    stored = [tuning.stored_verdict(device.device_kind, report._verdict_key(identity, rung, refused.reverse))
+    stored = [tuning.stored_verdict(report.verdict_target(device),
+                                    report._verdict_key(identity, rung, refused.reverse))
               is not None for rung in rungs]
 print(json.dumps({"stored": stored}))
 """
@@ -2085,26 +2215,65 @@ def test_a_programs_refusal_is_stored_as_its_own_configs_verdict_whatever_body_n
     from process_support import fresh
 
     assert fresh(SHARED_NAME, cache_dir=tmp_path / "cache")["stored"] == [False, True]
+PROGRAM_LOWERED = """
+import collections, json
+import jax, jax.numpy as jnp, numpy as np
+from jax._src import monitoring
+from dew.nn.kernels import generation
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.templates import report
+from dew.training.runtime import ready_process
+import test_recurrence_mosaic as gate
+
+served = collections.Counter()
+monitoring.register_event_listener(
+    lambda event, **_: served.update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
+ready_process()
+# A step on one B200, compiled ahead for it: its program set on one compile-only device's mesh, as a trainer
+# sets its step's (`jax.set_mesh`).
+device = compile_only_gpus("sm100")[0]
+mesh = jax.sharding.Mesh(np.array([device]), ("data",))
+with jax.set_mesh(mesh):
+    certified, _ = gate._reverse_walk_certified()
+bodies = {kernel_hash for each in certified for kernel_hash, _ in each.kernels.values()}
+print(json.dumps({"served": dict(served), "bodies": len(bodies)}))
+"""
+"""A process configured as a run's (`ready_process`) certifying the 4B reverse walk's training call and
+lowering its program on one B200's mesh (`_reverse_walk_certified`): the lowering cache's hits and misses,
+and the kernel bodies its certifications compiled."""
+
+
+@lowers('sm100')
+def test_a_program_on_one_gpu_reads_back_every_kernel_its_certification_lowered(tmp_path):
+    """A training call certified on its own GPU and lowered in a program set on that one GPU's mesh
+    (`PROGRAM_LOWERED`): each kernel body is lowered once in Python, by its certification on the program's
+    mesh (`report._certifying_placement`), and the program reads it back from the lowering cache. On a mesh
+    of its own, certification lowered the call's nine kernels to jaxprs of other abstract values, and the
+    program lowered all nine again."""
+    from process_support import fresh
+
+    found = fresh(PROGRAM_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
+    assert found["served"].get("miss", 0) == found["bodies"], found
 
 
 @lowers('sm100')
 def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     """A ladder whose first rung the assembler rejects (the reverse walk's producer past its program's entry
-    share, the roles' setmaxnreg moves inverted: ptxas refuses the kernel) and whose next holds: the rejected
-    rung is refused as a spilling one is, and the derivation takes the one below it, never the one
-    certification could not read (`report.certified`'s None)."""
+    share, the roles' setmaxnreg moves inverted: ptxas refuses the kernel), the template's own rungs after it:
+    the rejected rung is refused as a spilling one is, and the derivation takes the template's rung that
+    holds, never the one certification could not read (`report.certified`'s None)."""
     from dew.nn.kernels.templates import resources
 
     class PastItsTop(type(template.MOSAIC)):
         def rungs(self, ba, config):
-            for cap in (232, 128):
-                yield template._limited(config, producers=resources.Producers((('recurrence_reverse', cap),)),
-                                        residents=config.residents)
+            yield template._limited(config, producers=resources.Producers((('recurrence_reverse', 232),)),
+                                    residents=config.residents)
+            yield from super().rungs(ba, config)
 
     certified, refused = _reverse_walk_certified(PastItsTop())
-    assert [each.config.producers.of('recurrence_reverse') for each in certified] == [None, 128], certified
+    taken = [each.config.producers.of('recurrence_reverse') for each in certified]
     caps = {config.producers.of('recurrence_reverse') for config in refused}
-    assert 232 in caps and 128 not in caps, caps
+    assert 232 in caps and 232 not in taken and not certified[-1].refused, (taken, caps)
 
 
 def _named_bodies(bound, config, target: str, *, training: bool) -> dict[str, str]:
@@ -2151,8 +2320,8 @@ def _reach(target: str, group: tuple) -> set:
                  for kind, _, launch in _rungs_of(bound, tiles, training, facts)}
     kind = 'two roles' if variant == TWO_ROLES else 'derived' if variant is None else 'a neighbour'
     # The arithmetic form a launch's emitted part reads (`_form`: the delta rule, the rounding), beside the
-    # operands' dtype: without it a cover could drop every write gate's group, whose unrounded walk emits a
-    # branch of its own (`mainloop._scan`'s).
+    # operands' dtype: without it a cover could drop every write gate's group, whose unrounded launches emit
+    # branches of their own.
     form = tuple(sorted(_form(name, dtype).items()))
     return (found | {('dtype', jnp.dtype(dtype).name), ('packed', packed), ('tiles', kind), ('form', form)}
             if found else found)
@@ -2170,46 +2339,76 @@ def _rungs_of(bound, tiles, training: bool, facts) -> list:
     return found
 
 
+LADDER_RUNGS = 3
+"""The rungs of a launch's producer ladder the identity test walks past its tiles (`_walked`): its first, the
+consumers' statement's share where it has one, else its top; its top; and the first below it. Each rung's
+cap is one setmaxnreg constant in that launch's producer and in no other launch's kernel, so the rungs past
+them hold no naming another does not: walked to the foot, a ladder of 14 configs of 16 kernels a config
+held one task 171 s (jsf-ideal2)."""
+
+
 def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
-    """A launch's ladder from a case's `tiles`: its tiles and each rung of its producer ladder
-    (`Mosaic._raised`, from its top down), a forward-apart launch's ('forward launch') its forward alone at
-    the case's tiles with that launch's forward producers alone at each rung (a pinned config's, which may set
-    the forward's caps apart from the call's)."""
+    """A launch's ladder from a case's `tiles`: its tiles and its producer ladder's first `LADDER_RUNGS`
+    (`Mosaic._raised`), a forward-apart launch's ('forward launch') its forward alone at the case's tiles
+    with that launch's forward producers alone at each rung (a pinned config's, which may set the forward's
+    caps apart from the call's)."""
     rungs, rung = [], tiles
-    while (up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
+    while len(rungs) < LADDER_RUNGS and (
+            up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
         rung = template._limited(rung, producers=up, residents=rung.residents)
         rungs.append(rung if kind == 'launch' else dataclasses.replace(
             tiles, forward=dataclasses.replace(tiles.forward, producers=rung.producers)))
     return [tiles, *rungs]
 
 
+
+
+def _cover(target: str) -> tuple[str, ...]:
+    """The gate groups that cover every launch and axis the gate reaches on `target` (`_reach`:
+    `GATE_GROUPS` taken in order where a group reaches what none before it did), by name."""
+    held, cover = set(), []
+    with (jax.default_matmul_precision(COVER_PRECISION), generation.assumed(generation.gpu_target(target)),
+          report.refusals()):
+        for group in GATE_GROUPS:
+            if found := _reach(target, group) - held:
+                held |= found
+                cover.append(group_name(group))
+    return tuple(cover)
+
+
+@pytest.mark.parametrize('target', gate_generations(scoped=True))
+def test_the_identity_tests_cover_is_its_targets_reach(target):
+    """The identity test's groups on `target` (`IDENTITY_COVER`) are the groups that reach every launch and
+    axis the gate reaches there (`_cover`): a change that moves the reach moves the cover, regenerated from
+    this test's message."""
+    found = _cover(target)
+    assert found == IDENTITY_COVER[target], f"IDENTITY_COVER[{target!r}] = {found!r}"
+
+
 @functools.cache
 def _identity_units(target: str) -> tuple:
-    """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, kernels)`, a
-    launch's ladder unwalked (`_rungs_of`) of every case of the gate's groups that cover every launch and axis
-    the gate reaches there (`_reach`: `GATE_GROUPS` taken in order where a group reaches what none before it
-    did), beside the kernels a config of its case lowers. Derived in each task, as collection cannot afford it
-    (6.0 to 8.0 s a target of the model alone, jsf-cover, in every CI task's collection), and held a process;
-    each task walks its own units' ladders alone (`_walked`): every case's walked in every task took 50 s of
-    each sm100 task (jsf-6547d)."""
+    """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, configs,
+    lowered)`, a launch's ladder (`_rungs_of`, walked by `_walked`) of every case of the groups that cover
+    the gate's reach there (`IDENTITY_COVER`), with the kernels its configs lower, which a task's time follows
+    (0.92 correlated over sm90's and sm100's tasks, where the kernels a config lowers alone were 0.29,
+    jsf-ideal2). Derived in each task, as collection cannot afford it, and held a process."""
     facts = generation.gpu_target(target)
-    held, units = set(), []
-    with generation.assumed(facts), report.refusals():
-        for group in GATE_GROUPS:
-            if not (found := _reach(target, group) - held):
-                continue
-            held |= found
+    units = []
+    covered = set(IDENTITY_COVER[target])
+    with jax.default_matmul_precision(COVER_PRECISION), generation.assumed(facts), report.refusals():
+        for group in (group for group in GATE_GROUPS if group_name(group) in covered):
             for label, bound, tiles, training in _cases(target, group):
                 for kind, pulled, launch in _rungs_of(bound, tiles, training, facts):
                     walked = tiles.forward if kind == 'forward launch' else tiles
                     kernels = len(template.MOSAIC.launches(bound, walked, facts, backward=pulled))
-                    units.append((label, bound, tiles, kind, pulled, launch, kernels))
+                    configs = tuple(_walked(bound, tiles, kind, launch, facts))
+                    units.append((label, bound, tiles, kind, pulled, launch, configs, kernels * len(configs)))
     return tuple(units)
 
 
 def _dealt(units: list, tasks: int, task: int) -> list:
     """The `task`-th of `tasks` tasks' share of `units` (`_identity_units`'): each case's units kept together
-    in parts of at most a task's even share of the kernels a ladder lowers a config, as every ladder of a case
+    in parts of at most a task's even share of the kernels their ladders lower, as every ladder of a case
     holds its tiles, lowered once a task, the parts packed by those kernels as the CI plan packs files
     (tools/armada/ci.py's `packed`, heaviest first into the lightest task). A name present at a case's tiles
     is compared against one body in every task holding that case; a name absent at the tiles that two parts in
@@ -2232,19 +2431,37 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TASKS = {'sm80': 3, 'sm86': 3, 'sm89': 3, 'sm90': 40, 'sm100': 44, 'sm120': 2}
-"""The tasks a target's identity units are dealt among (`_dealt`), a sharding size like a CI group count:
-dealt by the kernels a config lowers, not yet by their ladders' rungs, which only a walk counts, a task holds
-up to twice a target's mean, so its mean is about 60 s (jsf-6547e: sm90's tasks 16 to 171 s at 28, sm100's
-13 to 157 at 32; sm89's whole 260 s, sm80's 221, sm86's 201, sm120's 175). Every gate group lowered took
-13,478 s of train 878's CI, twelve of its tasks past the train's bound."""
+IDENTITY_TASKS = {'sm90': 14, 'sm100': 13, 'sm80': 2, 'sm86': 1, 'sm89': 1, 'sm120': 1}
+"""The shards a target's identity units are dealt among (`_dealt`): only how the work is split, every unit
+dealt to some shard whatever the count, and the count a function of the code alone, so a shard's units are its
+id's at one revision whatever a run's timings (row 7254: a count from the durations record moved each id's
+units, sm100's 44 to 52, where a cached task and a rerun one could cover different units). Each the target's
+identity seconds in tests/test_durations.json over 75 to 90 s a shard, under the 120 s group target with
+room, rounded up: each shard's process derives its cover's units whole (`IDENTITY_COVER`) before it deals,
+5.4 to 6.6 s on sm90 and sm100 (jsf-idcost4), so a shard more costs that setup and its process again, and
+moves which parts of a case are compared together (`_dealt`). Since the cover was read rather than derived
+(row 9697), main 84cba23c0's CI held sm90's 50 shards in 1088 s and sm100's 52 in 1033 (22 and 20 s a
+shard), where 4839 and 4682 s had held them deriving every group's reach; at these counts
+armada held sm90's 14 shards in 58 to 99 s each, 1095 s in all, and sm100's 13 in 70 to 106 s, 1056 s, all at
+once (jsf-idall). Regenerated by:
+    python3 -c 'import collections, json, math; seconds = collections.Counter()
+    for node, value in json.load(open("tests/test_durations.json")).items():
+        if "test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[" in node:
+            seconds[node.split("[", 1)[1].rsplit("-", 1)[0]] += value[0]
+    print({target: math.ceil(spent / 80) for target, spent in sorted(seconds.items())})'
+"""
+
+
+def identity_tasks(target: str) -> int:
+    """The tasks `target`'s identity units are dealt among (`IDENTITY_TASKS`)."""
+    return IDENTITY_TASKS.get(target, max(IDENTITY_TASKS.values()))
 
 
 @pytest.mark.parametrize('target, task', [pytest.param(target, task, id=f'{target}-{task}')
                                           for target in gate_generations(scoped=True)
-                                          for task in range(IDENTITY_TASKS[target])])
+                                          for task in range(identity_tasks(target))])
 def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target, task):
-    """The `task`-th share of `target`'s identity units (`_identity_units`, dealt among its `IDENTITY_TASKS`,
+    """The `task`-th share of `target`'s identity units (`_identity_units`, dealt among its `identity_tasks`,
     `_dealt`), each launch's ladder walked (`_walked`) and each config's kernels lowered afresh through their
     real names (`_named_bodies`, a config once however many ladders hold it): one name is one body across
     every config, each ladder holding its case's tiles beside its rungs, and along a ladder one body keeps one
@@ -2252,11 +2469,11 @@ def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target,
     facts = generation.gpu_target(target)
     bodies: dict[str, set[str]] = collections.defaultdict(set)
     lowered: dict[tuple, dict[str, str]] = {}
-    with generation.assumed(facts), report.refusals():
-        for label, bound, tiles, kind, pulled, launch, _ in _dealt(list(_identity_units(target)),
-                                                                     IDENTITY_TASKS[target], task):
+    with jax.default_matmul_precision(COVER_PRECISION), generation.assumed(facts), report.refusals():
+        for label, bound, _, _, pulled, _, configs, _ in _dealt(list(_identity_units(target)),
+                                                                 identity_tasks(target), task):
             named = []
-            for config in _walked(bound, tiles, kind, launch, facts):
+            for config in configs:
                 if (label, pulled, config) not in lowered:
                     lowered[label, pulled, config] = _named_bodies(bound, config, target, training=pulled)
                 named.append(lowered[label, pulled, config])
@@ -2278,6 +2495,6 @@ def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():
     """A kernel spilling under a launch name another launch's extends (`recurrence_intra_solve` beside
     `recurrence_intra`) is that longer launch's alone (`template._owners`), so only its producer rises."""
     launches = [types.SimpleNamespace(name=name)
-                for name in ('recurrence_intra', 'recurrence_intra_solve', 'recurrence_scan')]
-    owners = template._owners({'recurrence_intra_solve__l1f2', 'recurrence_scan__l3a4'}, launches)
-    assert owners == {'recurrence_intra_solve', 'recurrence_scan'}
+                for name in ('recurrence_intra', 'recurrence_intra_solve', 'recurrence_output')]
+    owners = template._owners({'recurrence_intra_solve__l1f2', 'recurrence_output__l3a4'}, launches)
+    assert owners == {'recurrence_intra_solve', 'recurrence_output'}

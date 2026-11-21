@@ -16,8 +16,8 @@ from low_precision_support import nvfp4
 
 from dew.algebra import bits
 from dew.nn import fake_quant
-from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
+from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
 
 
 def test_an_nvfp4_matrix_holds_its_codes_and_the_staged_order_reads_back():
@@ -85,12 +85,12 @@ def test_the_mainloop_decodes_an_nvfp4_stage_in_place(family):
     matrix, _ = nvfp4(6, 512, 128, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(7).integers(-3, 4, size=(136, 512)), jnp.bfloat16)
     expected = np.asarray(rows, np.float64) @ np.asarray(matrix.decoded(), np.float64)
-    tiles = mosaic_gpu.Tiles(64, 64, 256, 2, 1, family=family)
+    tiles = tiling.Tiles(64, 64, 256, 2, 1, family=family)
 
     def packed(step_tiles):
         return mosaic_gpu.gmm(rows, matrix.words[None], jnp.asarray([136], jnp.int32), tiles=step_tiles,
                               transpose_rhs=True, out_dtype=jnp.float32, multiprocessors=4,
-                              interpret=grouped_matmul.INTERPRETED, dense=True, scales=matrix.scales[None])
+                              interpret=grouped_launch.INTERPRETED, dense=True, scales=matrix.scales[None])
 
     with generation.assumed("sm90" if family == "wgmma" else "sm80"):
         np.testing.assert_array_equal(np.asarray(packed(tiles), np.float64), expected)
@@ -111,9 +111,9 @@ def test_the_mainloop_decodes_an_nvfp4_matrixs_rows_into_its_products_left_opera
 
     def swapped(family):
         return mosaic_gpu.gmm(matrix.words, rows[None], jnp.asarray([256], jnp.int32),
-                              tiles=mosaic_gpu.Tiles(128, 16, 256, 2, 1, warpgroups=2, family=family),
+                              tiles=tiling.Tiles(128, 16, 256, 2, 1, warpgroups=2, family=family),
                               transpose_rhs=True, out_dtype=jnp.float32, multiprocessors=4,
-                              interpret=grouped_matmul.INTERPRETED, dense=True, scales=matrix.scales,
+                              interpret=grouped_launch.INTERPRETED, dense=True, scales=matrix.scales,
                               packed_rows=True)
 
     with generation.assumed("sm90"):
@@ -131,7 +131,7 @@ def test_the_mainloops_nvfp4_stage_decode_lowers_for_cuda(family):
     scales = jax.ShapeDtypeStruct((1, 128, 512 // 16), jnp.float8_e4m3fn)
     rows = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
     name = "sm90" if family == "wgmma" else "sm80"
-    tiles = mosaic_gpu.Tiles(64, 64, 256, 2, 1, family=family)
+    tiles = tiling.Tiles(64, 64, 256, 2, 1, family=family)
 
     def packed(rows, words, scales):
         return mosaic_gpu.gmm(rows, words, jnp.asarray([256], jnp.int32), tiles=tiles, transpose_rhs=True,
@@ -149,7 +149,7 @@ def test_the_mainloops_nvfp4_rows_decode_lowers_for_hopper():
     words = jax.ShapeDtypeStruct((256, 512 // 8), jnp.uint32)
     scales = jax.ShapeDtypeStruct((256, 512 // 16), jnp.float8_e4m3fn)
     rows = jax.ShapeDtypeStruct((1, 16, 512), jnp.bfloat16)
-    tiles = mosaic_gpu.Tiles(128, 16, 256, 2, 1, warpgroups=2, family="wgmma")
+    tiles = tiling.Tiles(128, 16, 256, 2, 1, warpgroups=2, family="wgmma")
 
     def swapped(words, rows, scales):
         return mosaic_gpu.gmm(words, rows, jnp.asarray([256], jnp.int32), tiles=tiles, transpose_rhs=True,
@@ -186,6 +186,19 @@ def test_an_nvfp4_products_packed_kernel_is_its_decoded_product(generation_name)
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
 
 
+def test_an_nvfp4_products_packed_kernel_on_a_cpu_uninterpreted_is_its_decoded_product():
+    """`gemm.nvfp4_product` with its packed kernel named for an assumed H100 and not interpreted, in a CPU
+    process: its launch's branch is CUDA's alone (`gemm._dispatched`), the CPU's the decoded product, exact
+    here (small integer rows), where the launch lowered for the CPU raised "Only interpret mode is supported
+    on CPU backend" (row 8492: a packed product's per-shard cell)."""
+    matrix, values = nvfp4(8, 512, 128, scale=0.25)
+    rows = jnp.asarray(np.random.default_rng(11).integers(-3, 4, size=(96, 512)), jnp.float32)
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), generation.routes() as routes:
+        got = jax.jit(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32))(rows)
+    assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"packed"}, routes
+    np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
+
+
 @INTERPRETS
 def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
     """`gemm.nvfp4_product` at a decode step's 13 rows on an H100, its packed kernel named, derives a tile
@@ -195,7 +208,7 @@ def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
     exact in fp32."""
     matrix, values = nvfp4(13, 1024, 256, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(14).integers(-3, 4, size=(13, 1024)), jnp.float32)
-    swapped = mosaic_gpu.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
+    swapped = tiling.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
     launch = grouped_matmul.MosaicPackedGmm()
 
     def product(x, kernel):
@@ -227,26 +240,29 @@ def nvfp4_bank(seed: int, groups: int, depth: int, width: int) -> tuple[formats.
     return bank, np.stack([values for _, values in matrices])
 
 
+@pytest.mark.parametrize("sizes", [(40, 0, 72, 24), (0, 0, 0, 0)], ids=["ragged", "empty"])
 @pytest.mark.parametrize("kernel", ["packed", "xla"])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-def test_an_nvfp4_banks_grouped_product_is_its_values_product(generation_name, kernel):
+def test_an_nvfp4_banks_grouped_product_is_its_values_product(generation_name, kernel, sizes):
     """`gemm.nvfp4_product` of a bank of four experts' NVFP4 matrices (row 4516: each its own tensor scale)
-    over a ragged group table (one group empty, rows past the groups) through `kernel`: the packed kernel,
-    each tile decoding its group's expert's stages in place (interpreted), or the bank decoded once a call;
+    over a ragged group table (one group empty, rows past the groups), or a call of no rows, through
+    `kernel`: the packed kernel, each tile decoding its group's expert's stages in place (interpreted), or
+    the bank decoded once a call;
     exactly the float64 product of the values, small integer rows making every product and sum exact in
     fp32; the bank takes no gradient. A hang dumps every thread's stack (the packed walk was suspected of
     one on an empty group; NSPROBE-PK1 found it walks)."""
     faulthandler.dump_traceback_later(240, exit=True)
     bank, values = nvfp4_bank(11, 4, 512, 128)
-    sizes = np.asarray([40, 0, 72, 24])
-    rows = jnp.asarray(np.random.default_rng(12).integers(-3, 4, size=(140, 512)), jnp.float32)
+    sizes = np.asarray(sizes)
+    count = 140 if sizes.sum() else 0
+    rows = jnp.asarray(np.random.default_rng(12).integers(-3, 4, size=(count, 512)), jnp.float32)
     with generation.assumed(generation_name), generation.chosen(nvfp4=kernel), generation.routes() as routes:
         got = gemm.nvfp4_product(rows, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32,
                                  interpret_on_cpu=True)
     faulthandler.cancel_dump_traceback_later()
     assert {route.kernel for route in routes if route.choice == "nvfp4"} == {kernel}, routes
     starts = np.cumsum([0, *sizes])
-    truth = np.zeros((140, 128))
+    truth = np.zeros((count, 128))
     for group, (first, last) in enumerate(itertools.pairwise(starts)):
         truth[first:last] = np.asarray(rows[first:last], np.float64) @ values[group]
     np.testing.assert_array_equal(np.asarray(got, np.float64), truth)
@@ -347,3 +363,49 @@ def test_an_nvfp4_products_input_gradient_keeps_its_cotangents_precision():
         (d_rows,) = pullback(cotangent)
     assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"packed"}, routes
     np.testing.assert_array_equal(np.asarray(d_rows), np.full((8, 512), 1 / 512, np.float32))
+
+
+def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
+    """`formats.NvFp4` stores the version of the form its words are packed by (`formats.FORM`, the encoder's
+    digest, `bits.BitForm.version`; algebra.md 7.4, row 6101), a stacked bank's each layer, and a checkpoint
+    restore of words another encoder packed is refused (`NvFp4.checked`): written and read back with its
+    version, a bank restores; the same bank stored under another version is refused by name."""
+    from dew.checkpoints import Checkpoints
+
+    bank, _ = nvfp4_bank(3, 2, 256, 128)
+    assert bytes(np.asarray(bank.form)).hex() == bits.NVFP4_BFLOAT16_FORM.version
+    stacked = jax.tree.map(lambda *layers: jnp.stack(layers), bank, bank)
+    assert bytes(np.asarray(stacked.layer(jnp.int32(1)).form)).hex() == bits.NVFP4_BFLOAT16_FORM.version
+    other = dataclasses.replace(bank, form=np.frombuffer(bytes.fromhex("0" * 16), np.uint8).copy())
+    with pytest.raises(ValueError):
+        other.checked()
+
+    def template(of):
+        where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), of)
+
+    for name, written, refused in (("same", bank, False), ("other", other, True)):
+        checkpoints = Checkpoints(str(tmp_path / name))
+        checkpoints.save(1, {"bank": written})
+        checkpoints.wait()
+        if refused:
+            with pytest.raises(ValueError):
+                Checkpoints(str(tmp_path / name)).restore(template({"bank": written}))
+        else:
+            restored = Checkpoints(str(tmp_path / name)).restore(template({"bank": written}))[0]["bank"]
+            np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(written.words))
+    if len(jax.devices()) >= 2:
+        # Row 8958: a two-layer bank sharded by layer across two devices with a foreign digest on shard 1
+        # must be refused both locally (`checked()`) and through collective checkpoint restore.
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("layers",))
+        by_layer = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("layers"))
+        mixed = jax.tree.map(lambda *layers: jax.device_put(jnp.stack(layers), by_layer), bank, other)
+        with pytest.raises(ValueError):
+            mixed.checked()
+        sharded_ckpt = Checkpoints(str(tmp_path / "sharded_mixed"))
+        sharded_ckpt.save(1, {"bank": mixed})
+        sharded_ckpt.wait()
+        sharded_template = jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=by_layer), {"bank": mixed})
+        with pytest.raises(ValueError):
+            Checkpoints(str(tmp_path / "sharded_mixed")).restore(sharded_template)

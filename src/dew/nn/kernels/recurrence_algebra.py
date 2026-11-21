@@ -18,6 +18,7 @@ own dot."""
 
 import functools
 import math
+import operator
 from collections.abc import Callable, Sequence
 from typing import NamedTuple, Protocol
 
@@ -26,16 +27,18 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import derivatives
+from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2, raised_exactly
 from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
-from dew.nn.kernels.templates.attention_algebra import exact_power2, power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import (
+    at_least_fp32,
     compensated_add,
     compensated_sum,
     exact_float32,
     float32_einsum,
     float32_matmul,
+    power2,
     two_product,
 )
 
@@ -68,15 +71,36 @@ def portable_einsum(subscripts: str, *operands):
     return float32_einsum(subscripts, *operands, precision=STATE_PRECISION)
 
 
-def suffix_sums(x: jax.Array) -> jax.Array:
+def suffix_sums(x: jax.Array, *, scanned: bool = False) -> jax.Array:
     """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a
-    chunk's tokens), in float32: a product with the chunk's upper triangle of ones (`portable_einsum`, its
-    ones exact in every form a product splits `x` into), one dot. As a reversed cumulative sum, XLA's GPU
-    reduce-window summed each position's window apart: Kimi delta attention's decay gradient's, the one
-    cumulative sum its training traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114)."""
-    size = x.shape[-2]
-    upper = jnp.triu(jnp.ones((size, size), jnp.float32))
-    return portable_einsum('ij,...jt->...it', upper, x.astype(jnp.float32))
+    chunk's tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle
+    of ones (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot. As a
+    reversed cumulative sum, XLA's GPU reduce-window summed each position's window apart: Kimi delta
+    attention's decay gradient's, the one cumulative sum its training traces, took 0.336 ms of its 5.806 ms
+    on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum: a term no position's sum takes
+    meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite one NaN in every sum (a
+    turned gradient's entering-memory term of 2^126 times its cotangent, `templates.recurrence.turned`)."""
+    x = _wide(x)
+    if scanned:
+        return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
+    upper = jnp.triu(jnp.ones((x.shape[-2],) * 2, x.dtype))
+    return portable_einsum('ij,...jt->...it', upper, x)
+
+
+def sums_before(x: jax.Array) -> jax.Array:
+    """Each position's sum over its chunk's positions before it, along `x`'s second-last axis, in at least
+    float32 (`suffix_sums`' exclusive prefix twin, as `scanned`): a cumulative sum shifted a position, each
+    sum of the earlier terms alone, a later term meeting none of its arithmetic, where an inclusive sum less
+    its own term lost a small sum beside a large term to its rounding (a chunk's last writer's whole weight
+    beside its earlier ones' exp(-30) each, Mamba-3's turns' gradient's worst row 3.75 from float64 over its
+    size)."""
+    summed = jnp.cumsum(_wide(x), axis=-2)
+    return jnp.concatenate([jnp.zeros_like(summed[..., :1, :]), summed[..., :-1, :]], axis=-2)
+
+
+def _wide(x: jax.Array) -> jax.Array:
+    """`x` in at least float32, a float64 truth's own."""
+    return x.astype(at_least_fp32(x.dtype))
 
 
 LOG2_E = math.log2(math.e)
@@ -134,16 +158,16 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
 
 def raised(whole, part):
     """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer
-    `n = floor(whole)` an exact power of two (`attention_algebra.power2`, the attention template's) and its
+    `n = floor(whole)` an exact power of two (`precision.power2`) and its
     fraction `(whole - n) + part`, near [0, 1), through exp2. The exponent rounded to one fp32 lost up to half
     its ulp, 1.9e-6 near -43 (a pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the
     port's decay gradient under decays near zero 7 to 10 times the token-by-token recurrence's distance from
     float64; and exp2 of a whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2
-    the same way. Its power of two within twice 127 (`power2`'s two factors): the fraction's exp2 lies in
-    [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the two factors held an
-    A100's query_key launch spill-free where three spilled it (ledger 2519)."""
+    the same way. Its power of two within `TWO_FACTOR_REACH` (`power2`'s two factors, both normal powers): the
+    fraction's exp2 lies in [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the
+    two factors held an A100's query_key launch spill-free where three spilled it (ledger 2519)."""
     n = _floor(whole)
-    return power2(jnp.exp2((whole - n) + part), n, reach=2 * 127)
+    return power2(jnp.exp2((whole - n) + part), n, reach=TWO_FACTOR_REACH)
 
 
 def _floor(x):
@@ -715,7 +739,8 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
 
 
 
-def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub: int = SUB) -> list:
+def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub: int = SUB,
+                       unit_keys: bool = False) -> list:
     """Each sub-chunk's own pairs of one key block under a decay a key dimension, each its own decay, as a
     band `[C, sub]` a product: its row `i`'s column `e` the pair `(i, i - e)`, `sum_k r_ik k_(i-e)k
     exp2(g_ik - g_(i-e)k)`, zero where token `i - e` precedes `i`'s sub-chunk (fla_kda's token-parallel
@@ -732,7 +757,12 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     clip, a power of two and an exp2), a B200's Kimi Linear training spent 0.96 ms of an emulated 2.86 in this
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
     blocks, a launch's bands are placed by its caller (`placed_bands`): placed a key block and an offset at a
-    time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d)."""
+    time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d).
+    Where the keys are at most one in size (`unit_keys`, `mainloop.Call.unit_keys`), each row takes its
+    decay first instead, a multiply an element and a term's fused multiply-add (fla's token-parallel
+    diagonal folds it so, into the key): all the decayed row loses is below normal in the exact term too.
+    Unnormalised keys keep the row times the key first, which loses no term in range to the decay (row
+    7299; a decayed row lost 2^-100 against a key of 2^60, base review 6ce025bc7 F1)."""
     index, _ = _grid(rows[0].shape)
     lane = jax.lax.broadcasted_iota(jnp.int32, (index.shape[0], sub), 1)
     token = jax.lax.broadcasted_iota(jnp.int32, lane.shape, 0)
@@ -744,7 +774,18 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         return (tuple(band + jnp.where(column, jnp.sum(row * keys * pair, axis=1)[:, None], 0.0)
                       for band, row in zip(bands, rows, strict=True)), pair, decays)
 
+    def folded(e, carried):
+        # Each row's decay folded in: a multiply an element and a term's fused multiply-add, where keys at
+        # most one in size (`unit_keys`) make what the decayed row loses below normal in the exact term too.
+        bands, decayed, following = carried
+        keys, decays = shifted(e)
+        decayed, column = tuple(row * following for row in decayed), (lane == e) & (token % sub >= e)
+        return (tuple(band + jnp.where(column, jnp.sum(row * keys, axis=1)[:, None], 0.0)
+                      for band, row in zip(bands, decayed, strict=True)), decayed, decays)
+
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
+    if unit_keys:
+        return list(jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0])
     return list(jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0])
 
 
@@ -988,25 +1029,37 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     rows, _ = _grid(d_key.shape)
     d_decay = d_decay - keyed + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0)
     d_weight = summed([("memory_dw", value_grads(j), entered(j).T) for j in range(blocks)])
-    # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`.
-    d_gated = -(d_weight + issue("weights_merge", lower.T, d_weight.astype(dtype)))
+    # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`: cast `dw` once before both the diagonal and off-diagonal
+    # terms (and `d_system`) so its narrow rounding cancels across `(I + L)^T` and between `dbeta_m` and
+    # `dbeta_p` as fla's `dw = -dw.astype(dtype)` does (row 8716).
+    d_weight_narrow = d_weight.astype(dtype)
+    d_gated = -(d_weight_narrow.astype(jnp.float32) + issue("weights_merge", lower.T, d_weight_narrow))
     emit("dk", d_key + d_gated * decays * betas[:, None])
     gated = keys * decays
     gated_rows = Transposed(write_gated(gated, betas).astype(dtype))
-    system = system - issue("weights_merge", d_weight.astype(dtype), gated_rows)
+    system = system - issue("weights_merge", d_weight_narrow, gated_rows)
     emit("dg", d_decay + gated * d_gated * betas[:, None])
     d_betas = jnp.sum(d_gated * gated, axis=1)
     return system, d_betas
+
+
+def _wy_inverse_adjoint(d_system, lower, dtype, issue: Issue, *, right_label: str,
+                        left_label: str) -> jax.Array:
+    """Strictly lower `-(I + L)^T tril(d_system, -1) (I + L)^T`, casting each factor once before both its
+    diagonal identity and off-diagonal `lower.T` product so bf16 rounding cancels (row 8716, base review
+    b9f004f74 F5)."""
+    strict = _lags(d_system.shape) > 0
+    d_system = jnp.where(strict, d_system, 0.0).astype(dtype)
+    right = (d_system.astype(jnp.float32) + issue(right_label, d_system, lower.T)).astype(dtype)
+    return jnp.where(strict, -(right.astype(jnp.float32) + issue(left_label, lower.T, right)), 0.0)
 
 
 def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
     """The keys' system's gradient `[C, C]` fp32 of a chunk's from its inverse's `d_system` (`I + L`, `L`
     `lower`): `-(I + L)^T dA (I + L)^T`, strictly lower, each side's identity outside its product
     ('system_merge'), as fla_kda's wy_dqkg forms its `dA`."""
-    lag = _lags(d_system.shape)
-    d_system = jnp.where(lag > 0, d_system, 0.0)
-    right = d_system + issue("system_merge", d_system.astype(dtype), lower.T)
-    return jnp.where(lag > 0, -(right + issue("system_merge", lower.T, right.astype(dtype))), 0.0)
+    return _wy_inverse_adjoint(d_system, lower, dtype, issue, right_label="system_merge",
+                               left_label="system_merge")
 
 
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
@@ -1200,10 +1253,6 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     they give are `keys_gradient`'s and `values_gradient`'s. `dX`'s key and value blocks issued into one
     accumulator (`summed`, the mainloop's): an accumulator a block, an H100's launch at keys and values 256
     wide spilled 264 bytes a thread (wide-sm90 at 8d1145e66)."""
-    def transposed_inverse(m):
-        """`X^T m`, the diagonal outside the product."""
-        return m + issue("inverse_t", lower.T, m.astype(dtype))
-
     decay = raised(gate, low)
 
     def scaled(load, scale):
@@ -1213,21 +1262,21 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
              for c in range(columns)]
     valued = [("inverse_du", u_grads(j), scaled(functools.partial(values, j), beta)) for j in range(blocks)]
     d_x = summed(keyed + valued, shape=(lower.shape[0],) * 2)
-    lag = _lags(d_x.shape)
-    strict = lag > 0
-    d_x = jnp.where(strict, d_x, 0.0)
-    d_x = d_x + issue("inverse_l", d_x.astype(dtype), lower.T)
-    d_x = transposed_inverse(d_x)
+    strict = _lags(d_x.shape) > 0
+    d_l = _wy_inverse_adjoint(d_x, lower, dtype, issue, right_label="inverse_l", left_label="inverse_t")
     column_gate, column_low = (gate, low) if laid is None else laid
-    return jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
+    return jnp.where(strict, d_l * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
 def selective_decay(step, rate, kept=None):
-    """Mamba's selective scan's decay of a state by a token, `exp2(dt rate)` of its rate in base 2 (`A
-    log2(e)`), zero at a document's first token (`kept` 0, where given): the token and adjoint functions'
+    """Mamba's selective scan's decay of a state by a token, `exp(dt A)` of its `rate` `A`, as `exp2((dt A)
+    log2(e))`, zero at a document's first token (`kept` 0, where given): the one decay form of the scan's
+    every path (the template's forward and backward, the portable scan), the token and adjoint functions'
     `a` (`selective_token`, `selective_adjoint`), which the scan's schedules take a token or a block of
-    tokens at a time (`templates.recurrence.selective`)."""
-    decay = jnp.exp2(step * rate)
+    tokens at a time (`templates.recurrence.selective`). The rate is taken to base 2 after the step
+    multiplies it, so a rate past float32's range times a padded token's zero step is zero, not `0 * -inf`
+    (row 8491: A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN)."""
+    decay = jnp.exp2((step * rate) * LOG2_E)
     return decay if kept is None else decay * kept
 
 
@@ -1237,27 +1286,54 @@ def selective_token(states: list, decays: list, written, b: list) -> list:
     return [decay * state + written * b_n for state, decay, b_n in zip(states, decays, b, strict=True)]
 
 
+def pairwise_sum(terms: Sequence, *, combine=operator.add):
+    """Sum nonempty `terms` as an adjacent-pair balanced tree with odd-tail carry, shared by
+    `selective_read` and decode (`step.py`, base review da734bf54 F6, row 9080)."""
+    parts = list(terms)
+    while len(parts) > 1:
+        paired = [combine(x, y) for x, y in zip(parts[::2], parts[1::2], strict=False)]
+        parts = [*paired, *parts[len(parts) // 2 * 2:]]
+    return parts[0]
+
+
 def selective_read(states: list, c: list, skip, value):
     """A token's output of the selective scan, `y = sum_n C_n h_n + D x`, the states' terms summed as a
     balanced tree, its depth log2 of their count: summed in turn, the readout's 16 states put an fp32 scan's
     output 1.68 times the portable scan's distance from float64 where every decay is near zero, its own
     write the whole state (the interpreted regime test)."""
-    terms = [c_n * state for c_n, state in zip(c, states, strict=True)]
-    while len(terms) > 1:
-        paired = [x + y for x, y in zip(terms[::2], terms[1::2], strict=False)]
-        terms = [*paired, *terms[len(terms) // 2 * 2:]]
-    return terms[0] + skip * value
+    return pairwise_sum([c_n * state for c_n, state in zip(c, states, strict=True)]) + skip * value
 
 
-def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rate) -> tuple:
+_SELECTIVE_SUBNORMAL_STEP = 2.0 ** -100
+_SELECTIVE_DX_SCALE = 2.0 ** 64
+
+
+def selective_dx_scale(skip, dy, step):
+    """Derive once per block `(dx_init, dx_step, inv_scale)` for a selective scan backward's `dx` state sum:
+    on subnormal-step lanes (`|step| < 2^-100`) whose `skip * dy` fits below `2^60`, lift both `skip * dy`
+    and `step` by `2^64` via `float_bits.raised_exactly` (bit-safe on flush-to-zero backends, row 9089) and
+    return `inv_scale = 2^-64`; otherwise return `(skip * dy, step, 1.0)` (row 8722, base reviews da734bf54
+    F3, b65e3cab4 F8, b0601005b F6)."""
+    base = skip * dy
+    scaled = ((jnp.abs(step) < jnp.float32(_SELECTIVE_SUBNORMAL_STEP))
+              & (jnp.abs(base) < jnp.float32(2.0 ** 60)))
+    shift = jnp.where(scaled, jnp.int32(64), jnp.int32(0))
+    return (raised_exactly(base, shift),
+            raised_exactly(step, shift),
+            jnp.where(scaled, jnp.float32(1.0 / _SELECTIVE_DX_SCALE), jnp.float32(1.0)))
+
+
+def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rate, *, dx_step=None) -> tuple:
     """One state's gradients of the selective scan through a token, from the cotangent the token's state
     takes `cotangent` (`g_t = C_t dy_t + a_{t+1} g_{t+1}`, its read and what the tokens after pass back),
     the state before it `before` (`h_{t-1}`), its `decay` (`selective_decay`'s), `written` (`dt x B`), and the
-    token's `step`, `value`, `b`, `dy` and the state's `rate` (base 2): `(dx, ddt, dB, dC, drate)`, the
-    rate's a token's term its schedule sums. `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times
-    it, in the rate `dt ln(2)` (taken in `drate`'s sum's `ln(2)` where the rate's own is `A log2(e)`)."""
+    token's `step`, `value`, `b`, `dy` and the state's `rate` `A`: `(dx, ddt, dB, dC, drate)`, the rate's
+    a token's term its schedule sums. `exp(dt A)`'s derivative in `dt` is `A` times it, in `A` `dt` times
+    it. Where `dx_step` is given (`selective_dx_scale`), it scales only `dx`'s `step` factor so per-state
+    terms and `skip * dy` stay normal across the state sum (row 8722, base review b0601005b F6)."""
     through = cotangent * before * decay
-    return (cotangent * b * step, cotangent * b * value + through * (rate * math.log(2.0)),
+    d_written = cotangent * b
+    return (d_written * (step if dx_step is None else dx_step), d_written * value + through * rate,
             cotangent * step * value, dy * (decay * before + written), through * step)
 
 

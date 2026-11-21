@@ -512,9 +512,11 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     assert float(jnp.abs(closing(writer("flaxdiff_solver_reference").draw(0))["closed"]).max()) > 2
 
 
-@pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],
-                         ids=["rk4", "multistep"])
-def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
+@pytest.mark.parametrize("name,solver,barriered", [("rk4", RK4(), False),
+                                                    ("multistep", MultiStepDPM(), False),
+                                                    ("multistep", MultiStepDPM(), True)],
+                         ids=["rk4", "multistep", "multistep-barriered"])
+def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver, barriered):
     """`RK4` and `MultiStepDPM` are FlaxDiff's `RK4Sampler` and
     `MultiStepDPM` (AshishKumar4/FlaxDiff@15c55b0, run as published by
     tools/flaxdiff_solver_reference.py): from the same x_T over FlaxDiff's
@@ -523,10 +525,15 @@ def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
     in x, the latent after every interval, so every RK4 stage and each of the
     multistep's first, second and third order updates, and the gradient of
     the last one through the walk, on par with FlaxDiff's float32 run over
-    the recorded seeds (check 1). FlaxDiff's grid is Dew's own `times(12)`."""
+    the recorded seeds (check 1). FlaxDiff's grid is Dew's own `times(12)`. The multistep's error-free
+    transforms also on their barrier path (`dew._cache.BARRIERED`), which a jaxlib marking their arithmetic
+    to round alone otherwise leaves (row 8378)."""
+    from dew import _cache
+
     process, _ = karras_process()
     np.testing.assert_array_equal(process.times(12), recording(FLAXDIFF)["times"])
-    assert_on_par_with_flaxdiff(f"{name} walk", flaxdiff_walked(solver))
+    with _cache.BARRIERED(new_value=barriered):
+        assert_on_par_with_flaxdiff(f"{name} walk", flaxdiff_walked(solver))
 
 
 @pytest.mark.parametrize("solver", [DDIM(), Euler()], ids=lambda s: type(s).__name__)

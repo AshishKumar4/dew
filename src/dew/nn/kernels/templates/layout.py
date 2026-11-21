@@ -3,6 +3,7 @@ tiles in: a function written over `[rows, columns]` tiles run on tiles held the 
 taken axis for axis (`transposed`), so a score hook keeps its canonical query and key axes whichever way a
 program's products lay a tile out (the attention dK/dV program's keys-first `[bk, bq]`)."""
 
+import itertools
 from collections.abc import Callable
 from typing import Any
 
@@ -84,6 +85,26 @@ def _along(key: str) -> Callable:
 
 
 _cumulated = _along("axis")
+PLACEMENTS = (jax_core.primitives.reshard_p, jax.lax.sharding_constraint_p)
+"""The operations that place a value on a mesh and leave it as it is (each output its operand): a tile is
+placed already, so each is the identity where one is transposed (`_placed`) or walked (`dew.algebra.forms`):
+a GPU's trace of a plain program's attention holds a reshard in its score hook's nested call (rows 9570 and
+9571)."""
+
+
+def placed(eqn) -> bool:
+    """Whether `eqn` is a placement a hook may hold where a tile also runs it as written, one entry at a time
+    in a tile's legality (`_axis_free`, the Mosaic backward's `_entrywise`): a reshard, which JAX's Mosaic
+    rules lower; a sharding constraint has none, so a hook holding one stays refused there."""
+    return eqn.primitive is jax_core.primitives.reshard_p
+
+
+@_rule(*PLACEMENTS)
+def _placed(eqn, operand, **params):
+    # The identity, binding nothing, so no kernel's lowering meets a sharding inside a tile.
+    return operand
+
+
 RULES[jax.lax.concatenate_p] = _along("dimension")
 
 
@@ -154,17 +175,16 @@ def _custom(eqn, *operands, **params):
     def call(*values):
         return eqn.primitive.bind(*values, **eqn.primitive.get_bind_params(params))
 
-    floating = [index for index, aval in enumerate(traced)
-                if jax.numpy.issubdtype(aval.dtype, jax.numpy.inexact)]
+    # Its inexact operands, the ones a derivative moves: one bool an operand (`programs.holes`' mask).
+    floating = [jax.numpy.issubdtype(aval.dtype, jax.numpy.inexact) for aval in traced]
     primal = _program(eqn)
     if eqn.primitive is jax_core.primitives.custom_jvp_call_p:
         return _held_jvp(primal, call, traced, floating)(*operands)
 
     def pulled(*values_and_cotangents):
         values, given = values_and_cotangents[:len(traced)], values_and_cotangents[len(traced):]
-        _, pull = jax.vjp(lambda *chosen: call(*[chosen[floating.index(index)] if index in floating
-                                                  else value for index, value in enumerate(values)]),
-                          *(values[index] for index in floating))
+        moving, fill = programs.holes(values, floating)
+        _, pull = jax.vjp(lambda *chosen: call(*fill(chosen)), *moving)
         return pull(list(given))
 
     shapes = {aval.shape for aval in (*traced, *cotangents)} - {()}
@@ -177,31 +197,30 @@ def _custom(eqn, *operands, **params):
     def holding(*values):
         return _run(primal.jaxpr, primal.consts, values)
 
+    # The pullback's gradients, one an inexact operand, in the call's operand order, None at the others.
+    _, scattered = programs.holes((None,) * len(floating), floating, is_leaf=lambda leaf: leaf is None)
+
     def held_pullback(values, given):
-        grads = iter(_run(pullback.jaxpr, pullback.consts, [*values, *given]))
-        return tuple(next(grads) if index in floating else None for index in range(len(values)))
+        return tuple(scattered(_run(pullback.jaxpr, pullback.consts, [*values, *given])))
 
     held = contracted("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order")(
         declared_derivative(KernelGlue(), holding, lambda *values: (held(*values), values), held_pullback))
     return held(*operands)
 
 
-def _held_jvp(primal, call, traced: list, floating: list[int]) -> Callable:
-    """A custom JVP call (`call`, at `traced` avals, its inexact operands at `floating`) held entry for entry:
-    its program and its JVP's, both traced at its own shapes, run on the held tiles (`_run`); the JVP is the
-    call's own rule, so forward mode, its transpose and every higher order meet that rule as on the call."""
+def _held_jvp(primal, call, traced: list, floating: list[bool]) -> Callable:
+    """A custom JVP call (`call`, at `traced` avals, its inexact operands where `floating`) held entry for
+    entry: its program and its JVP's, both traced at its own shapes, run on the held tiles (`_run`); the JVP
+    is the call's own rule, so forward mode, its transpose and every higher order meet that rule as on the
+    call."""
     def tangent(*values_and_tangents):
         values, tangents = values_and_tangents[:len(traced)], values_and_tangents[len(traced):]
-
-        def chosen(*picked):
-            return call(*[picked[floating.index(index)] if index in floating else value
-                          for index, value in enumerate(values)])
-
-        picked = tuple(values[index] for index in floating)
-        outputs, output_tangents = jax.jvp(chosen, picked, tuple(tangents))
+        picked, fill = programs.holes(values, floating)
+        outputs, output_tangents = jax.jvp(lambda *chosen: call(*fill(chosen)), tuple(picked),
+                                           tuple(tangents))
         return [*outputs, *output_tangents]
 
-    tangents = jax.make_jaxpr(tangent)(*traced, *(traced[index] for index in floating))
+    tangents = jax.make_jaxpr(tangent)(*traced, *itertools.compress(traced, floating))
     shapes = {aval.shape for aval in traced} - {()}
     if len(shapes) > 1 or not all(_axis_free(program.jaxpr, *shapes) and not _tiles_in(program)
                                   for program in (primal, tangents)):
@@ -211,7 +230,7 @@ def _held_jvp(primal, call, traced: list, floating: list[int]) -> Callable:
         return _run(primal.jaxpr, primal.consts, values)
 
     def held_tangent(values, directions):
-        both = _run(tangents.jaxpr, tangents.consts, [*values, *(directions[index] for index in floating)])
+        both = _run(tangents.jaxpr, tangents.consts, [*values, *itertools.compress(directions, floating)])
         return both[:len(both) // 2], both[len(both) // 2:]
 
     return contracted("test_a_transposed_hooks_custom_derivative_holds_every_order")(
@@ -246,7 +265,7 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
             if not eqn.primitive.inlined_call or not all(
                     _axis_free(inner, shape) for inner in nested):
                 return False
-        elif not entrywise(eqn):
+        elif not (entrywise(eqn) or placed(eqn)):
             return False
     return True
 

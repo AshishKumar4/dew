@@ -250,8 +250,8 @@ def location(directory: str) -> epath.Path:
 class Envelope(TypedDict):
     """What a checkpoint of a run's state holds on every tier, as `Checkpoints.save` and `save_local` each
     take it, their own metadata beside it: the state as saved, its data position (`saved`), the partition
-    it was read by, the stop control, the rung, the artifact, the boxed axes and the rollout's tree
-    (`dew.training.Trainer`'s one envelope, row 4126)."""
+    it was read by, the stop control, the rung, the artifact, what its objective's loss computes
+    (`training`), the boxed axes and the rollout's tree (`dew.training.Trainer`'s one envelope, row 4126)."""
 
     state: TrainState
     saved: bytes | None
@@ -259,6 +259,7 @@ class Envelope(TypedDict):
     control: dict | None
     rung: JSON
     artifact: JSON
+    training: JSON
     boxed: Mapping[tuple[str, ...], LogicalAxes] | None
     rollout: Mapping[str, object] | None
 
@@ -509,6 +510,27 @@ def _refuse_reshaped(template, stored, where: str) -> None:
         raise ValueError(f"The checkpoint at {where} holds {', '.join(wrong[:6])}"
                          f"{f' and {len(wrong) - 6} more' if len(wrong) > 6 else ''}: restore it into "
                          f"the shapes it was written with.")
+
+
+def _packed_checked(tree) -> None:
+    """Refuse a restored tree holding a packed bank whose words another encoder packed (its stored form
+    version, `dew.nn.kernels.formats.NvFp4.checked`), gathering every packed leaf's form whole across
+    processes in one collective (`collective_host`, row 8958)."""
+    from dew._coordination import collective_host
+    from dew.nn.kernels.formats import NvFp4
+
+    packed = [(jax.tree_util.keystr(path, simple=True, separator="/"), leaf)
+              for path, leaf in jax.tree_util.tree_flatten_with_path(
+                  tree, is_leaf=lambda node: isinstance(node, NvFp4))[0]
+              if isinstance(leaf, NvFp4)]
+    if not packed:
+        return
+    forms = collective_host([leaf.form for _, leaf in packed], phase="packed forms")
+    for (name, leaf), form in zip(packed, forms, strict=True):
+        try:
+            leaf.checked(form)
+        except ValueError as error:
+            raise ValueError(f"{name}: {error}") from error
 
 
 def _paths(tree) -> set[str]:
@@ -1115,18 +1137,25 @@ class Checkpoints:
         process holds it.
 
         It is None when the step's objective declares no inference record."""
-        step = self.pinned(step)
-        custom = (self._step_metadata(step, local=True).custom_metadata or {} if step == self._local_latest()
-                  else self._custom(step))
-        return json_value(custom.get('artifact'), 'artifact')
+        return json_value(self._custom_of(self.pinned(step)).get('artifact'), 'artifact')
+
+    def training(self, step: int) -> JSON:
+        """What the objective's loss computed at `step` (`Objective.training_record`), which a resume holds
+        the run to (`dew.training.startup.computation_differs`); None for a step saved outside `fit` or before
+        Dew recorded it."""
+        return json_value(self._custom_of(step).get('training'), 'training')
 
     def control(self, step: int) -> dict:
-        if step == self._local_latest():
-            custom = self._step_metadata(step, local=True).custom_metadata or {}
-        else:
+        if step != self._local_latest():
             self.kept()
-            custom = self._custom(step)
-        return copy.deepcopy(custom.get('control', {}))
+        return copy.deepcopy(dict(record(self._custom_of(step).get('control', {}), 'control')))
+
+    def _custom_of(self, step: int) -> Mapping[str, object]:
+        """The custom metadata `step` was saved with, alone (`_custom`): the local step's as its process
+        holds it, a committed one's from the persistent directory."""
+        if step == self._local_latest():
+            return self._step_metadata(step, local=True).custom_metadata or {}
+        return self._custom(step)
 
     def _best_step(self, name: str | None) -> int | None:
         retained = self.kept()
@@ -1322,9 +1351,9 @@ class Checkpoints:
         """Return the newest committed step a resume can read, local or persistent (`_newest`)."""
         return self._newest(RESUME)
 
-    def _newest(self, reads: str) -> int | None:
-        """The newest committed step that holds what a reader of `reads` reads (`ROLES`), local or
-        persistent: a local step holds a whole state.
+    def _newest(self, reads: str | None) -> int | None:
+        """The newest committed step that holds what a reader of `reads` reads (`ROLES`), or any where None
+        (`occupied`), local or persistent: a local step holds a whole state.
 
         Asking opens and writes nothing: until this process writes, Orbax's
         step format lists the committed steps read-only, and once it has, its
@@ -1332,7 +1361,7 @@ class Checkpoints:
         steps = (self._manager.all_steps() if self._manager is not None
                  else [found.step for found in ocp.step.standard_name_format().find_all(self.directory)])
         found = (step for step in sorted(steps, reverse=True)
-                 if self._complete(step) and reads in self._roles_held(step))
+                 if self._complete(step) and (reads is None or reads in self._roles_held(step)))
         persistent = next(found, None)
         local = self._local_latest()
         if persistent is None or local is None:
@@ -1342,15 +1371,19 @@ class Checkpoints:
     def resumed(self, resume: Resume = "auto") -> int | None:
         """The step a run continues under `resume`, the `latest`, or None where it starts afresh:
         "auto" continues one where the directory holds it; "require" refuses a directory with none,
-        so a job that must continue never trains from scratch; "never" refuses one that holds a run,
-        which a run started afresh would write beside."""
+        so a job that must continue never trains from scratch; "never" refuses one that holds any step,
+        a model's alone (a weights-only save, which no resume reads) among them, which a run started
+        afresh would write beside. A trainer refuses, under "auto" too, a directory whose steps none of
+        which resumes are another run's (`dew.training.Trainer`'s one check of it, row 9019)."""
         latest = self.latest
         if resume == "require" and latest is None:
             raise ValueError(f"resume='require' continues a run, and {self.directory} holds no checkpoint "
                              "to continue")
-        if resume == "never" and latest is not None:
-            raise ValueError(f"resume='never' starts a run afresh, and {self.directory} holds one at step "
-                             f"{latest}; give the new run a directory of its own")
+        held = latest if latest is not None else self._newest(None)
+        if held is not None and resume == "never":
+            raise ValueError(f"resume={resume!r} starts a run afresh here, and {self.directory} holds a step "
+                             f"at {held}{'' if latest is not None else ' that no run resumes'}; give the new "
+                             "run a directory of its own")
         return latest
 
     @property
@@ -1396,6 +1429,7 @@ class Checkpoints:
         primary: str | None = None,
         rung: JSON = None,
         artifact: JSON = None,
+        training: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
         tokenizer: Tokenizer | None = None,
@@ -1412,7 +1446,8 @@ class Checkpoints:
         which the state holds unboxed; `variables` places with them. A mapping is
         written as it is, with `metrics`, `ranking` and `control` as a train state's are,
         and `restore` reads it back through a mapping template; it takes no
-        data position, share, weights-only split, rung or artifact. It is
+        data position, share, weights-only split, rung, artifact or training record (`training`, what the
+        objective's loss computes, `Objective.training_record`, which a resume compares). It is
         written whole at every step, without the store a train state's
         static collections go to (`FROZEN_STORE`), so large arrays no step
         changes are better kept out of it.
@@ -1436,51 +1471,40 @@ class Checkpoints:
         parameter for fp32 Adam moments and EMA, 84 GB at 7B parameters, on
         hosts that keep the state there because device memory is short.
         """
+        mapping = isinstance(state, Mapping)
+        if mapping and (saved is not None or share is not None or weights_only or rung is not None
+                        or artifact is not None or training is not None or rollout is not None
+                        or tokenizer is not None):
+            raise ValueError("a mapping is saved as it is: it takes no data position, share, weights-only "
+                             "split, rung, artifact, training record or rollout, which a train state's save "
+                             "records")
+        if not mapping:
+            # No tier writes a non-finite state, before any write or retention (`refuse_non_finite`).
+            from dew.training.transaction import refuse_non_finite
+            refuse_non_finite(state, step, lambda: self.latest)
         persistent = self._open()
         self._project()
-        mapping = isinstance(state, Mapping)
-        if not mapping:
-            self._identify_run()
-            # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
-            self._hold(artifact, tokenizer)
         if mapping:
-            if (saved is not None or share is not None or weights_only or rung is not None
-                    or artifact is not None or rollout is not None or tokenizer is not None):
-                raise ValueError("a mapping is saved as it is: it takes no data position, share, "
-                                 "weights-only split, rung, artifact or rollout, which a train state's save "
-                                 "records")
             profiles, state_tree, frozen, deltas = None, dict(state), {}, {}
             payloads = {ONE_ITEM: state_tree}
         else:
-            if weights_only and rollout is not None:
-                raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
-            state_tree = self._item(state, saved, share, rollout)
-            if weights_only:
-                from dew.state import MODEL_STATE
-                state_tree = {name: state_tree[name] for name in MODEL_STATE}
-            profiles = None if weights_only else _profiles_at(state_tree)
-            state_tree, frozen = self._frozen(state_tree)
-            state_tree, deltas = _with_ema_deltas(state_tree)
-            payloads = _in_payloads(state_tree, None if profiles is None else profiles[0])
+            self._identify_run()
+            # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
+            self._hold(artifact, tokenizer)
+            profiles, state_tree, frozen, deltas, payloads = self._state_items(state, saved, share, rollout,
+                                                                               weights_only)
         profile_metadata = None if profiles is None else {**_profile_record(profiles[1]),
                                                           'at': _named(profiles[0])}
         self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
-        scores = dict(metrics or {})
-        if weights_only:
-            scores['checkpoint/weights_only'] = 1.0
+        scores = {**(metrics or {}), **({'checkpoint/weights_only': 1.0} if weights_only else {})}
         rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
         rules = self._ranked(rankings, scores)
-        custom = {
-            **step_record(deltas, control, rung, artifact, boxed, state_tree),
-            "profiles": profile_metadata,
-            "rankings": rules,
-            "primary": primary or (rankings[0].metric if rankings else None),
-            "weights_only": weights_only,
-            "frozen": frozen,
-            "tree": mapping,
-        }
+        custom = {**step_record(deltas, control, rung, artifact, training, boxed, state_tree),
+                  "profiles": profile_metadata, "rankings": rules,
+                  "primary": primary or (rankings[0].metric if rankings else None),
+                  "weights_only": weights_only, "frozen": frozen, "tree": mapping}
         # The retention policy reads this step's record without waiting for its metadata to commit;
         # a save Orbax refuses leaves the step's committed record as it was, and one it takes replaces it.
         self._staged[step] = (copy.deepcopy(custom),
@@ -1784,6 +1808,23 @@ class Checkpoints:
             total = jax.tree.map(lambda leaf: np.mean(leaf, axis=0), total)
         return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)
 
+    def _state_items(self, state: TrainState, saved: bytes | None, share: DataPartition | None,
+                     rollout: Mapping[str, object] | None, weights_only: bool) -> tuple:
+        """`state`'s items as `save` writes them: its profiles where it records them, its tree less its
+        frozen trees and its EMA as deltas (`_with_ema_deltas`), those frozen trees, the deltas and the
+        payloads its items make (`_in_payloads`), its model alone where `weights_only`."""
+        if weights_only and rollout is not None:
+            raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
+        state_tree = self._item(state, saved, share, rollout)
+        if weights_only:
+            from dew.state import MODEL_STATE
+            state_tree = {name: state_tree[name] for name in MODEL_STATE}
+        profiles = None if weights_only else _profiles_at(state_tree)
+        state_tree, frozen = self._frozen(state_tree)
+        state_tree, deltas = _with_ema_deltas(state_tree)
+        return profiles, state_tree, frozen, deltas, _in_payloads(state_tree, None if profiles is None
+                                                                  else profiles[0])
+
     def save_local(
         self,
         step: int,
@@ -1794,6 +1835,7 @@ class Checkpoints:
         control: dict | None = None,
         rung: JSON = None,
         artifact: JSON = None,
+        training: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
     ) -> None:
@@ -1803,7 +1845,10 @@ class Checkpoints:
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The
         placement is saved with the state, which a pool's resume is held to
-        (`_check_placement`)."""
+        (`_check_placement`). A non-finite state is refused before the previous local step is touched
+        (`refuse_non_finite`): a local copy is the one a restarted node reads first."""
+        from dew.training.transaction import refuse_non_finite
+        refuse_non_finite(state, step, lambda: self.latest)
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
         grid = Grid.of({name: leaf for name, leaf in state_tree.items() if name != 'position'})
@@ -1825,7 +1870,7 @@ class Checkpoints:
                 args=ocp.args.PyTreeSave(state_tree),
                 force=True,
                 custom_metadata={
-                    **step_record(deltas, control, rung, artifact, boxed, state_tree),
+                    **step_record(deltas, control, rung, artifact, training, boxed, state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
                     "grid": None if grid is None else to_record(grid, Grid),
@@ -2195,6 +2240,7 @@ class Checkpoints:
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
         restored = _filled(placed, restored, step)
+        _packed_checked(restored)
         return restored, saved
 
     def _host_restored(self, step: int, snapshot, metadata, *, local: bool) -> dict:

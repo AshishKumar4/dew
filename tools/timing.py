@@ -187,11 +187,13 @@ class Process:
         self.child = subprocess.Popen([sys.executable, str(TOOLS / "timing.py"), "worker", "--clock", clock],
                                       cwd=tree, env=variables, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       text=True)
+        assert self.child.stdin is not None and self.child.stdout is not None  # Both piped above.
+        self.requests, self.answers = self.child.stdin, self.child.stdout
 
     def ask(self, request: dict) -> dict:
-        self.child.stdin.write(json.dumps(request) + "\n")
-        self.child.stdin.flush()
-        line = self.child.stdout.readline()
+        self.requests.write(json.dumps(request) + "\n")
+        self.requests.flush()
+        line = self.answers.readline()
         if not line:
             raise RuntimeError(f"the worker for {request.get('key', request['op'])} ended with "
                                f"{self.child.wait()}")
@@ -199,8 +201,8 @@ class Process:
 
     def close(self) -> None:
         with contextlib.suppress(BrokenPipeError):
-            self.child.stdin.write(json.dumps({"op": "quit"}) + "\n")
-            self.child.stdin.close()
+            self.requests.write(json.dumps({"op": "quit"}) + "\n")
+            self.requests.close()
         self.child.wait()
 
 
@@ -449,13 +451,20 @@ def summarized(manifest: dict, out: Path) -> None:
 
 WINDOW_MINUTES = 15
 """A window's minutes past its cases' own: its workers' start and its arms' builds."""
+PROFILED_MINUTES = 2
+"""A window's minutes for each cell and arm a case profiles (`profiled`): a process of its own, its compile
+and Nsight Compute's replays (M-EM-38's on an A100, 79-85 s each; LF-HSNCU's and LF-GDN-NCU's on a GH200,
+23-56 s)."""
 
 
 def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
     """One measurement window a GPU kind, as `dewops.node` takes them (`node submit`): each a timing
-    (`"kind"`), packed beside the node's other jobs and alone on its GPU around its rounds, at `ref`, running
-    this harness over that kind's manifest (beside the jobs' file, which stages it as $SESSION/extra/<its
-    name>), its minutes a minute for each 60 timed calls past `WINDOW_MINUTES` (the measurement lane batches
+    (`"kind"`), or a profile where any of its cases profiles, which a node runs with its GPU's performance
+    counters open (`dewops.node.dispatch`'s `"counters"`; row 4557: a profiling window submitted as a
+    timing ran Nsight Compute with them closed), packed beside the node's other jobs and alone on its GPU
+    around its rounds, at `ref`, running this harness over that kind's manifest (beside the jobs' file,
+    which stages it as $SESSION/extra/<its name>), its minutes a minute for each 60 timed calls and
+    `PROFILED_MINUTES` for each profiled cell and arm past `WINDOW_MINUTES` (the measurement lane batches
     every pending measurement of a kind into its window, bible §6)."""
     windows = []
     for kind, path in manifests.items():
@@ -463,14 +472,18 @@ def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
         calls = sum(len(case["cells"]) * (len(case["arms"]) + 1)
                     * (case.get("warmup", WARMUP) + case.get("rounds", ROUNDS)) * case.get("repeats", 5)
                     for case in manifest["cases"])
-        windows.append({"name": f"{name}-{kind}", "ref": ref, "gpu": kind, "kind": "timing",
-                        "minutes": WINDOW_MINUTES + math.ceil(calls / 60), "keep": [],
+        profiled = sum(len(case["cells"]) * len(case["arms"])
+                       for case in manifest["cases"] if "profile" in case)
+        windows.append({"name": f"{name}-{kind}", "ref": ref, "gpu": kind,
+                        "kind": "profile" if profiled else "timing",
+                        "minutes": WINDOW_MINUTES + math.ceil(calls / 60) + PROFILED_MINUTES * profiled,
+                        "keep": [],
                         "run": f'python tools/timing.py run "$SESSION/extra/{path.name}" --out "$OUT"'})
     return {"jobs": windows}
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     running = commands.add_parser("run")
     running.add_argument("manifest", type=Path)

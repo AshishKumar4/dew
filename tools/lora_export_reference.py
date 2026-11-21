@@ -46,6 +46,7 @@ import tarfile
 import tempfile
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -208,7 +209,7 @@ def _prediction(family: str, model, arrays: Mapping[str, np.ndarray], wide: bool
         output = model(hidden_states=tensor("latent").permute(0, 3, 1, 2), encoder_hidden_states=context,
                        pooled_projections=tensor("pooled"), timestep=times, return_dict=False)[0]
         return output.permute(0, 2, 3, 1).numpy()
-    from diffusers import FluxPipeline
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 
     # FLUX's own 2x2 latent packing, its inverse and its patches' ids, over Dew's channels-last latent.
     _, height, width, channels = latent.shape
@@ -227,18 +228,24 @@ def _pipeline(family: str, source: Path, dtype):
     """The family's Diffusers pipeline over its denoiser alone: the files
     adapt nothing else, and the tiny SD source declares Flax classes, whose
     pipeline loads no adapter, so its PyTorch UNet stands in a PyTorch one."""
-    import diffusers
+    from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
+    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
     if family == "sd":
-        unet = diffusers.UNet2DConditionModel.from_pretrained(source, subfolder="unet", torch_dtype=dtype)
-        scheduler = diffusers.DDIMScheduler.from_pretrained(source, subfolder="scheduler")
-        return diffusers.StableDiffusionPipeline(
+        unet = UNet2DConditionModel.from_pretrained(source, subfolder="unet", torch_dtype=dtype)
+        scheduler = DDIMScheduler.from_pretrained(source, subfolder="scheduler")
+        # The pipeline types every component as required, though it runs without its towers.
+        components: dict[str, Any] = dict(
             vae=None, text_encoder=None, tokenizer=None, unet=unet, scheduler=scheduler, safety_checker=None,
             feature_extractor=None, requires_safety_checker=False)
+        return StableDiffusionPipeline(**components)
     towers = {"flux": ("text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"),
               "sd3": ("text_encoder", "text_encoder_2", "text_encoder_3", "tokenizer", "tokenizer_2",
                       "tokenizer_3")}[family]
-    cls = {"flux": diffusers.FluxPipeline, "sd3": diffusers.StableDiffusion3Pipeline}[family]
+    cls = {"flux": FluxPipeline, "sd3": StableDiffusion3Pipeline}[family]
     return cls.from_pretrained(source, torch_dtype=dtype, **dict.fromkeys(towers))
 
 
@@ -257,7 +264,7 @@ def pipeline_outputs(family: str, adapter: Path, *, wide: bool):
     with source_directory(family) as source, precision(wide):
         pipes = [_pipeline(family, source, torch.float64 if wide else torch.float32) for _ in range(2)]
         for pipe in pipes:
-            pipe.load_lora_weights(adapter)
+            pipe.load_lora_weights(str(adapter))
             weights = load_file(str(adapter / "pytorch_lora_weights.safetensors"))
             assert_landed(getattr(pipe, component), weights, f"{component}.")
         pipes[1].fuse_lora()

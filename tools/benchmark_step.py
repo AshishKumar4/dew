@@ -424,7 +424,8 @@ def measured_row(case: Case, config: BenchmarkConfig) -> Row:
         (warm,), (row,) = (json.loads(Path(f"{out}.{stage}").read_text()) for stage in ("warm", "measure"))
     return {**row, "compile_seconds": warm["compile_seconds"],
             "compile_cached": warm["compile_cache_hits"] > 0, "compiled_while_measured": compiled,
-            "peak_device_bytes": None if peaks is None or None in peaks else max(peaks),
+            "peak_device_bytes": None if peaks is None or None in peaks else max(
+                peak for peak in peaks if peak is not None),
             "peak_bytes_by_device": peaks}
 
 
@@ -532,7 +533,8 @@ def timed_parts(step, state, parts: list[int]):
     waiter = threading.Thread(target=waited, name="timed-parts")
     started = time.perf_counter()
     waiter.start()
-    carry, dispatched = (state, None, None), []
+    carry: tuple[Any, Any, Any] = (state, None, None)
+    dispatched = []
     try:
         for size in parts:
             for _ in range(size):
@@ -745,7 +747,7 @@ def format_table(rows: list[Row]) -> str:
                 text = fmt.format(value * TABLE_SCALE.get(key, 1))
                 # A count shown as the bound it is (`BOUND_MARKS`).
                 if key in ("flops_per_step", "utilization"):
-                    text = BOUND_MARKS[row["utilization_bound"]] + text
+                    text = BOUND_MARKS[str(row["utilization_bound"])] + text
             else:
                 text = fmt.format(value)
             cells.append(text.ljust(width) if key == "architecture" else text.rjust(width))
@@ -852,4 +854,4 @@ def main(config: BenchmarkConfig) -> list[Row]:
 if __name__ == "__main__":
     # A row any of whose steps went non-finite fails the run, its rows written first.
     if invalid := [row["architecture"] for row in main(tyro.cli(BenchmarkConfig)) if not row["finite"]]:
-        sys.exit(f"steps went non-finite in {', '.join(invalid)}: no timing of theirs is a measurement")
+        sys.exit(f"steps went non-finite in {', '.join(map(str, invalid))}: no timing of theirs is a measurement")

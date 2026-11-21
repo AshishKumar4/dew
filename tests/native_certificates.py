@@ -2,27 +2,16 @@
 §9): a native GEMM's output held element by element to its exact products, accumulated in fp32 by the
 tensor cores' truncating adds in any order and rounded once into its output (`native_dot_holds`), its
 products' magnitudes as the tensor cores align them (`Terms`, `aligned`); TF32 operands as the hardware
-reads them (`tf32_operand`); exact sums a depth step at a time (`promoted_step_holds`); and a fault's
-refusals derived from its interval's separation from the call's (`separated`, `assert_refused`). Check
-2's per-primitive contracts are tests/certified.py's."""
+reads them (`op_certificates.tf32_operand`); exact sums a depth step at a time (`promoted_step_holds`);
+and a fault's refusals derived from its interval's separation from the call's (`separated`,
+`assert_refused`). Check 2's per-primitive contracts are tests/certified.py's."""
 
 import dataclasses
 import itertools
 
 import numpy as np
 from certified import allowance, rounded_on_lane
-from op_certificates import (
-    BFLOAT16,
-    FORMATS,
-    TFLOAT32,
-    Format,
-    exact_sum,
-    magnitude_sum,
-    rounded,
-    rounded_away,
-    truncated,
-    two_sum,
-)
+from op_certificates import BFLOAT16, FORMATS, Format, exact_sum, magnitude_sum, rounded, truncated, two_sum
 
 TRUNCATING = {name: dataclasses.replace(fmt, name=f"{name}, truncating adds", precision=fmt.precision - 1)
               for name, fmt in FORMATS.items()}
@@ -136,17 +125,6 @@ def assert_refused(held, apart, share: float) -> None:
     the elements, a share of the draw's products, which no order or tile the kernel legally takes moves."""
     held, apart = np.asarray(held), np.asarray(apart)
     assert not np.any(held & apart) and np.mean(apart) > share, np.mean(apart)
-
-
-def tf32_operand(values) -> np.ndarray:
-    """fp32 operands' values (as float64) as a tensor core multiplies them in a TF32 product (an fp32 product
-    at the default precision, src/dew/nn/kernels/templates/product.py): rounded to TF32 to nearest, a tie away
-    from zero (PTX's cvt.rna.tf32.f32), as the GEMM template's Triton launches read both operands of the
-    forward's, the input gradient's and the kernel gradient's products on an A100 and an H100 (row 2084, link
-    2: each of 38,400 values of each operand, 30% of them ties, read so, where 85% were their round to
-    nearest even and 35% their truncation). A product of two is exact in float64 (22 bits), as
-    `native_dot_holds` takes."""
-    return rounded_away(values, TFLOAT32)
 
 
 def promoted_step_ends(low, high, products, flushes: bool) -> tuple[np.ndarray, np.ndarray]:

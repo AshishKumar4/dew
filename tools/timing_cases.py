@@ -192,8 +192,9 @@ def flowed(cell: dict, implementation: str) -> tuple:
     flow, without = model_flows.flow_named(cell["flow"]), _left_out(implementation)
     model_flows.held_process(flow)
     flat, _ = model_flows.programs_of(flow)[f"{cell['kind']} dew"]
-    params, ids = flow.draw(0)
-    inputs = jax.device_put((*jax.tree.leaves(params), ids))
+    # The program's arguments: the parameters' leaves and the draw's inputs (`programs_of`'s order), a token
+    # flow's ids or a diffusion flow's latents, times and targets.
+    inputs = jax.device_put(jax.tree.leaves(flow.draw(0)))
     compiled = program(flat)
 
     def call(*arguments):

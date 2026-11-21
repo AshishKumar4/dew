@@ -6,7 +6,7 @@ or global memory that read that layout (`copied`, `coalesced`, `copied_swizzle`)
 into an accumulator's column vector (`rows_read`)."""
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from jax import dtypes, numpy as jnp
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
@@ -63,6 +63,40 @@ def swizzle_transforms(dtype, swizzle: int) -> tuple:
     tiled alone, a 16-byte swizzle being no permutation, which Mosaic GPU's swizzle transform refuses."""
     tiling = TILING((TILE_ROWS, swizzle_columns(dtype, swizzle)))
     return (tiling,) if swizzle < NARROWEST_SWIZZLE_BYTES else (tiling, SWIZZLE(swizzle))
+
+
+BANKS = 32
+"""Shared memory's banks, each 4 bytes wide: a warp's access takes one pass through them a phase of its lanes
+(`wavefronts`)."""
+
+
+def staged_address(row: int, column_bytes: int, row_bytes: int, swizzle: int) -> int:
+    """The byte offset of a block's `row` at `column_bytes` into it, its rows `row_bytes` long, staged at
+    `swizzle` bytes (`swizzle_transforms`: `TILE_ROWS`-row tiles a swizzle's row wide, laid row-major, each
+    16-byte chunk of a tile's row XORed by the row's place in the swizzle's span, TMA's and Mosaic GPU's
+    swizzle: address bits 4 up XORed by bits 7 up, as many as a swizzle's row holds chunks); plain where
+    `UNSWIZZLED`."""
+    if swizzle == UNSWIZZLED:
+        return row * row_bytes + column_bytes
+    tile = ((row // TILE_ROWS) * (row_bytes // swizzle) + column_bytes // swizzle) * TILE_ROWS * swizzle
+    offset = tile + (row % TILE_ROWS) * swizzle + column_bytes % swizzle
+    return offset ^ (((offset >> 7) & (swizzle // 16 - 1)) << 4)
+
+
+def wavefronts(addresses: Sequence[int], width: int) -> int:
+    """The passes through shared memory's banks a warp's access of `width` bytes a lane at `addresses` (one a
+    lane, in lane order) takes: its lanes in phases of a bank row's bytes (`BANKS` words) each, and a phase as
+    many passes as the most distinct words any one bank holds among its lanes' (a word two lanes share is
+    one, a broadcast). Its lanes' count of phases where no two words of a phase share a bank."""
+    phase = BANKS * 4 // width
+    passes = 0
+    for start in range(0, len(addresses), phase):
+        held: dict[int, set[int]] = {}
+        for address in addresses[start:start + phase]:
+            for word in range(address // 4, (address + width) // 4):
+                held.setdefault(word % BANKS, set()).add(word)
+        passes += max(len(words) for words in held.values())
+    return passes
 
 
 def plain(shape: tuple, dtype):

@@ -27,7 +27,10 @@ generation in the table: a family added there is a family the contract's tests r
 
 def _step_temp(generation_name: str, chosen: dict) -> int:
     """The temporaries a `LAYERS`-deep stack of dense products takes, its forward and its reverse, on a
-    compile-only device of `generation_name`, its products routed as `chosen` names (`generation.chosen`)."""
+    compile-only device of `generation_name` stating 32 MiB, below the step's need, so XLA's scheduler
+    holds the least it can and the temporaries are the route's alone (an H100's 80 GB let it hold the
+    declared cells' 117 MB against the template's 67 MB; a compile-only GPU stated 0 bytes before row
+    8768), its products routed as `chosen` names (`generation.chosen`)."""
     def loss(x, weights):
         for w in weights:
             x = jnp.tanh(gemm.gemm(x, w, None, out_dtype=jnp.bfloat16))
@@ -36,7 +39,7 @@ def _step_temp(generation_name: str, chosen: dict) -> int:
     shapes = (jax.ShapeDtypeStruct((ROWS, WIDTH), jnp.bfloat16),
               tuple(jax.ShapeDtypeStruct((WIDTH, WIDTH), jnp.bfloat16) for _ in range(LAYERS)))
     with generation.chosen(**chosen):
-        return lowered_for(jax.grad(loss, argnums=(0, 1)), shapes, generation_name).compile(
+        return lowered_for(jax.grad(loss, argnums=(0, 1)), shapes, generation_name, memory=2**25).compile(
             ).memory_analysis().temp_size_in_bytes
 
 

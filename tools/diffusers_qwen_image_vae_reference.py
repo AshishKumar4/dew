@@ -36,9 +36,14 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import drawn_wan_vae
+from reference_releases import commit
 from reference_vjp import recorded_vjp
 
-DIFFUSERS_COMMIT = "6256aa7666cedd47443adc8f82da9a10e110b09c"
+COHORT = "diffusers-qwen-image"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
+DIFFUSERS_COMMIT = commit("diffusers-qwen-image", "diffusers")
 CONFIG = {"base_dim": 4, "decoder_base_dim": 6, "z_dim": 8, "dim_mult": [1, 2, 2, 4, 4], "num_res_blocks": 1,
           "attn_scales": [], "temperal_downsample": [False, True, True, True], "dropout": 0.0,
           "is_residual": True, "in_channels": 4, "out_channels": 4, "patch_size": None,
@@ -50,13 +55,16 @@ SEED = 29
 
 def build(root: Path) -> dict[str, np.ndarray]:
     from diffusers.models.autoencoders.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
+    from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
     model, generator = drawn_wan_vae(AutoencoderKLQwenImage21, CONFIG, SEED, root / "vae")
     named = list(model.named_parameters())
 
     image = (torch.rand((BATCH, CONFIG["in_channels"], HEIGHT, WIDTH), generator=generator) * 2 - 1
              ).requires_grad_()
-    posterior = model.encode(image[:, :, None]).latent_dist
+    encoded = model.encode(image[:, :, None])
+    assert isinstance(encoded, AutoencoderKLOutput)  # return_dict's default.
+    posterior = encoded.latent_dist
     mean, std = posterior.mean[:, :, 0], posterior.std[:, :, 0]
     encoded = recorded_vjp("encode", {"probe_mean": mean, "probe_std": std}, {"image": image}, named,
                            generator)
@@ -83,7 +91,7 @@ def main(destination: str) -> None:
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
     arrays = build(root)
-    np.savez_compressed(root / "qwen_image_vae.npz", **arrays)
+    np.savez_compressed(root / "qwen_image_vae.npz", allow_pickle=False, **arrays)
     record = {"diffusers": diffusers.__version__, "commit": DIFFUSERS_COMMIT, "config": CONFIG,
               "batch": BATCH, "height": HEIGHT, "width": WIDTH, "seed": SEED}
     (root / "qwen_image_vae.json").write_text(json.dumps(record, indent=1) + "\n")

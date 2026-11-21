@@ -68,14 +68,6 @@ took the next token's share back off, which cancelled at a document's first toke
 times the recurrence's worst row from float64 (row 7402)."""
 
 
-def _within(starts, length: int, batch: int):
-    """Whether each token `[B, S]` continues its predecessor's document (False at a document's first token
-    and at the sequence's first)."""
-    if starts is None:
-        starts = jnp.zeros((batch, length), jnp.bool_)
-    return ~jnp.asarray(starts, jnp.bool_).at[:, 0].set(True)
-
-
 def _biased(value, bias):
     """`value` plus the parameter `bias` (broadcast against it) through the rule
     (`derivatives.portable_formed`): its reverse mode returns `value`'s cotangent only with the bias's
@@ -144,16 +136,14 @@ def _trapezoid(delta, real, resets):
     return weights, entering
 
 
-def _stepped(x, dt, B, C, lam, starts, valid):
-    """A call's working dtype (`at_least_fp32` of the operands'), its operands', whether each token
-    continues its document (`_within`), `dt` and `lam` in the working dtype, `dt` zero at a padded slot, and
-    its real tokens `[B, S]` (`valid`, every one where None)."""
+def _stepped(x, dt, B, C, lam, valid):
+    """A call's working dtype (`at_least_fp32` of the operands'), its operands', `dt` and `lam` in the working
+    dtype, `dt` zero at a padded slot, and its real tokens `[B, S]` (`valid`, every one where None)."""
     batch, length = x.shape[:2]
     work = at_least_fp32(jnp.result_type(x, B, C))
     dt, lam = (jnp.asarray(t, work) for t in (dt, lam))
     real = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
-    return (work, jnp.result_type(x, B, C), _within(starts, length, batch), jnp.where(real[..., None], dt, 0),
-            lam, real)
+    return work, jnp.result_type(x, B, C), jnp.where(real[..., None], dt, 0), lam, real
 
 
 def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, starts=None, valid=None,
@@ -172,7 +162,7 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
     (`_rank_terms`). Returns `(output [B, S, R, H, P], Carried)` in `at_least_fp32` of the operands'
     dtype."""
     batch, length, _, heads, _ = x.shape
-    work, operand, _, dt, lam, real = _stepped(x, dt, B, C, lam, starts, valid)
+    work, operand, dt, lam, real = _stepped(x, dt, B, C, lam, valid)
     # A document's first token enters no state: its turn and decay act on nothing, so neither enters the
     # chunked op, whose pairs would cancel them to rounding where the recurrence's gradient is exactly zero.
     resets = jnp.zeros((batch, length), bool) if starts is None else jnp.asarray(starts, bool)
@@ -252,7 +242,7 @@ def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, forked, starts,
     table. Returns `(output, None)`: a forked call leaves the carry as it was."""
     batch, length, _, heads, _ = x.shape
     loads, stores, held = forked
-    work, operand, _, dt, lam, real = _stepped(x, dt, B, C, lam, starts, valid)
+    work, operand, dt, lam, real = _stepped(x, dt, B, C, lam, valid)
     resets = jnp.asarray(starts, bool)
     documents = loads.shape[1]
     firsts = document_firsts(resets, documents)

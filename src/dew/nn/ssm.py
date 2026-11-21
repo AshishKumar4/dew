@@ -17,7 +17,6 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
-from dew.nn.derivatives import Protected, contracted, declared_tangent
 
 from .conv import Conv
 from .flops import conv_flops, projection_flops
@@ -27,58 +26,54 @@ from .precision import at_least_fp32, float32_dot_general, float32_einsum
 
 def affine_spans(left, right, multiply=operator.mul, add=operator.add):
     """Two consecutive spans of the affine recurrence `h_t = a_t h_(t-1) + b_t` as one,
-    `(a1, b1) then (a2, b2)` being `(a1 a2, a2 b1 + b2)`: the combine every associative scan of a
-    linear recurrence runs (Mamba's `combine_fn`, S5's), over native real or complex arrays, or
-    over real `(re, im)` pairs with `multiply` and `add` their complex product and sum
-    (`_pair_product`, `_pair_sum`)."""
+    `(a1, b1) then (a2, b2)` being `(a1 a2, a2 b1 + b2)`: the combine an associative scan of a linear
+    recurrence runs (S5's), over native real or complex arrays, or over real `(re, im)` pairs with
+    `multiply` and `add` their complex product and sum (`_pair_product`, `_pair_sum`)."""
     (a1, b1), (a2, b2) = left, right
     return multiply(a1, a2), add(multiply(a2, b1), b2)
 
 
 def affine_states(decay, write, entering, axis: int):
-    """The states `h_t = a_t h_(t-1) + b_t` along `axis` of decays `decay` (each at most one in magnitude)
-    and writes `write` from the state `entering` (`write`'s shape without `axis`): each span's writes summed
-    from a zero state by an associative scan (`affine_spans`), the entering state's decayed added after. A
-    span's writes from zero are a state less an earlier one decayed, so where they could pass float32's
-    largest though every state is within it (each recurrence's largest write times the scan's length at
-    least it) its writes and entering state are halved and its states doubled, exact for normal floats,
-    chosen by a select, not a branch (a cond's predicate cost an A100 0.45 ms a call): a state entering at
-    -1.9 2^127 under two writes of 2^127 [1, 1.9] each summed them to inf (row 8465). Its tangent is the
-    tangents' own recurrence through the plain scan, `h'_t = a_t h'_(t-1) + (a'_t h_(t-1) + b'_t)`, as the
-    scan's derivative takes them (spans of the tangents past the largest: row 8486)."""
-    return _states(axis)(decay, write, entering)
+    """The states `h_t = a_t h_(t-1) + b_t` along `axis` of decays `decay` (each at most one in magnitude) and
+    writes `write` from the state `entering` (`write`'s shape without `axis`): the recurrence a token at a
+    time over the axis (a chunk's tokens), straight-line code up to twice `UNROLLED` tokens (a longer axis's
+    interior a scan of such blocks, its compile bounded), so its arithmetic and JAX's derivative of it at
+    every order are the recurrence's own. An associative scan's spans of writes from a zero state passed
+    float32's largest where every state was within it (row 8465), and halved, its faint values beside them
+    flushed (row 8486); a scan's transpose formed its last carry's zero cotangent times an infinite state, NaN
+    at a second order (the head review of fd1a993b6)."""
+    decay, write = (jnp.moveaxis(t, axis, 0) for t in (decay, write))
+    if write.shape[0] <= 2 * UNROLLED:
+        return jnp.moveaxis(_tokens(decay, write, entering), 0, axis)
+    # The first and last blocks straight-line, the interior a scan of blocks: the first's states set the
+    # carry's dtype, and the scan's last carry is live in the straight-line last block, so its transpose
+    # forms no forced zero cotangent for it to meet an infinity with.
+    first = _tokens(decay[:UNROLLED], write[:UNROLLED], entering)
+    blocks = (write.shape[0] - UNROLLED - 1) // UNROLLED
+    end = UNROLLED * (blocks + 1)
+
+    def block(state, operands):
+        states = _tokens(operands[0], operands[1], state)
+        return states[-1], states
+
+    interior = tuple(t[UNROLLED:end].reshape(blocks, UNROLLED, *t.shape[1:]) for t in (decay, write))
+    carried, states = jax.lax.scan(block, first[-1], interior)
+    last = _tokens(decay[end:], write[end:], carried)
+    states = states.reshape(blocks * UNROLLED, *states.shape[2:])
+    return jnp.moveaxis(jnp.concatenate([first, states, last]), 0, axis)
 
 
-def _spans(decay, write, entering, axis: int):
-    """`affine_states`' plain form: the associative scan's spans from a zero state, the entering state's
-    decayed added after."""
-    decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=axis)
-    return decays * jnp.expand_dims(entering, axis) + writes
+UNROLLED = 64
+"""The tokens of a block `affine_states` runs straight-line (a long axis's interior a scan of them)."""
 
 
-def _halved(decay, write, entering, axis: int):
-    """`affine_states`' value: `_spans` of the writes and entering state halved where the writes could pass
-    float32's largest summed, the states doubled after; scaled by one elsewhere."""
-    reach = jnp.max(jnp.abs(write), axis=axis, keepdims=True) * write.shape[axis]
-    scale = jnp.where(reach >= jnp.finfo(write.dtype).max, 0.5, 1.0).astype(write.dtype)
-    return _spans(decay, write * scale, entering * jnp.squeeze(scale, axis), axis) / scale
-
-
-@functools.cache
-def _states(axis: int):
-    """`affine_states` along `axis`: `_halved`'s value, its tangent the plain scan of the tangents'
-    recurrence from the entering state's tangent."""
-    def tangent(primals, tangents):
-        decay, write, entering = primals
-        d_decay, d_write, d_entering = tangents
-        states = _states(axis)(decay, write, entering)
-        # Each token's state before it: the entering state's, then the states but the last.
-        earlier = jax.lax.slice_in_dim(states, 0, states.shape[axis] - 1, axis=axis)
-        before = jnp.concatenate([jnp.expand_dims(entering, axis), earlier], axis=axis)
-        return states, _spans(decay, d_decay * before + d_write, d_entering, axis)
-
-    return contracted("test_the_selective_scan_holds_its_orders")(
-        declared_tangent(Protected(), functools.partial(_halved, axis=axis), tangent))
+def _tokens(decay, write, entering):
+    """The recurrence over the leading axis of `decay` and `write`, a token at a time, straight-line."""
+    states, state = [], entering
+    for a, b in zip(decay, write, strict=True):
+        state = a * state + b
+        states.append(state)
+    return jnp.stack(states) if states else write
 
 
 def _pair_product(x, y):

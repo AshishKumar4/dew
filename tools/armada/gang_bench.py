@@ -116,7 +116,9 @@ def gradient_sync(mesh) -> dict:
                    out_shardings=replicated)
     timed = {}
     for name, summed in (("tuple", tupled), ("flat", flat)):
-        timed[f"{name}_all_reduces"] = summed.lower(rows).compile().as_text().count(" all-reduce(")
+        if (text := summed.lower(rows).compile().as_text()) is None:
+            raise RuntimeError(f"XLA gave no text of the {name} program to count its all-reduces in")
+        timed[f"{name}_all_reduces"] = text.count(" all-reduce(")
         timed[f"{name}_s"] = round(statistics.median(samples(summed, rows, warmup=1, repeats=3)), 3)
     return {"buffers": len(rows), "bytes": sum(4 * leaf.size for leaf in jax.tree.leaves(shapes)), **timed}
 

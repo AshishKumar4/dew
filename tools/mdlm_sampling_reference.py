@@ -74,9 +74,9 @@ def main() -> None:
     index = rows[:, len(PROMPT):] @ (MASK ** np.arange(RESPONSE - 1, -1, -1))
     counts = np.bincount(index, minlength=MASK ** RESPONSE)
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, prompt=PROMPT, response=np.asarray(RESPONSE), steps=np.asarray(STEPS),
-             rows=np.asarray(ROWS), counts=counts, commit=np.array(mdlm_reference.COMMIT),
-             **arrays)
+    np.savez(FIXTURE, allow_pickle=False, prompt=PROMPT, response=np.asarray(RESPONSE),
+             steps=np.asarray(STEPS), rows=np.asarray(ROWS), counts=counts,
+             commit=np.array(mdlm_reference.COMMIT), **arrays)
     print(f"{FIXTURE}: {np.count_nonzero(counts)} of {counts.size} responses drawn")
 
 

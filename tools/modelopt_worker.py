@@ -55,6 +55,9 @@ def nvfp4_qdq(x: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
     """The author's NVFP4 input quantization on the CPU (`NVFP4QTensor`): 16-value blocks, each scale its
     amax over 6 times the stored global scale in E4M3."""
     quantized, scale, double_scale = NVFP4QTensor.quantize(x, 16, weights_scaling_factor_2=global_scale)
+    # Its packed tensor: `quantize` returns the scaled tensor alone where asked to keep it high precision.
+    if not isinstance(quantized, NVFP4QTensor):
+        raise TypeError(f"NVFP4QTensor.quantize gave a {type(quantized).__name__}, not its packed tensor")
     return quantized.dequantize(scale=scale, double_scale=double_scale, block_sizes={-1: 16})
 
 

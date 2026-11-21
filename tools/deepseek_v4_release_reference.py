@@ -64,7 +64,7 @@ def fetched(release: str, path: str) -> Path:
 
 def e4m3(rng, shape) -> torch.Tensor:
     """Random E4M3FN codes, both NaN codes left out."""
-    codes = rng.integers(0, 0x7F, shape, dtype=np.uint8) | rng.choice(np.uint8([0, 0x80]), shape)
+    codes = rng.integers(0, 0x7F, shape, dtype=np.uint8) | rng.choice(np.array([0, 0x80], np.uint8), shape)
     return torch.from_numpy(codes).view(torch.float8_e4m3fn)
 
 

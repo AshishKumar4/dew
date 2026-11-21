@@ -50,6 +50,18 @@ def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_l
                          f"{tiles}")
 
 
+CONSUMER = "wgmma"
+"""The consumer the packed decode writes its registers for: the warpgroup MMA's register operand, whose
+fragment layout the transform declares (`bits.NVFP4_BFLOAT16.fragments`)."""
+
+LAYOUTS = {"wgmma": plgpu.Layout.WGMMA}
+"""Mosaic GPU's layout of each fragment a transform declares (`bits.BitTransform.fragments`' values)."""
+
+FRAGMENT = LAYOUTS[bits.NVFP4_BFLOAT16.fragments[CONSUMER]]
+"""The register layout the decode writes and its family's products read: the transform's declared
+fragment for `CONSUMER`, not one the decode chooses (algebra.md 7.4, row 6101)."""
+
+
 def refused(lhs, rhs, scales, tiles, family, *, packed_rows: bool, dense: bool, transpose_rhs: bool,
             transpose_lhs: bool, hooked: tuple, depth: int, width: int) -> None:
     """Dew: `gmm`'s refusal of a packed call (`scales`) its decode does not take: as its matrix (`taken`), or
@@ -70,7 +82,7 @@ def rows_taken(lhs, scales, tiles, family, *, dense: bool, transpose_rhs: bool, 
     decoded operand as any)."""
     if (not dense or lhs.dtype != jnp.uint32 or scales.shape != (lhs.shape[0], 8 * lhs.shape[1] // 16)
             or not transpose_rhs or tiles.block_k % NVFP4_STEP or tiles.block_m // tiles.warpgroups != 64
-            or family.layout != plgpu.Layout.WGMMA or any(hook is not None for hook in hooked)
+            or family.layout != FRAGMENT or any(hook is not None for hook in hooked)
             or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
         raise ValueError(f"an NVFP4 matrix's rows {lhs.shape} with scales {scales.shape} are a dense "
                          f"product's, its matrix read transposed, in 256-deep steps and 64 rows a "
@@ -162,11 +174,12 @@ def lanes(words, scales, interpret: bool):
     scale within bfloat16's range. Its registers lie in the warpgroup MMA's fragment layout, in which a
     column's scale is a column vector and a lane's slice a contiguous store (the strided layout found no
     assignment for this decode); interpreted, arrays."""
-    layout = None if interpret else plgpu.Layout.WGMMA
+    layout = None if interpret else FRAGMENT
 
     def loaded(ref):
         return ref[...] if layout is None else plgpu.load(ref, layout=layout, optimized=False)
-    owed = e4m3_values(loaded(scales)) * jnp.float32(1 / bits.NVFP4_OWED)
+    owed = bits.scales_decoded(jax.lax.bitcast_convert_type(loaded(scales), jnp.uint8)) * jnp.float32(
+        1 / bits.NVFP4_OWED)
     which = jax.lax.broadcasted_iota(jnp.int32, owed.shape, 1)
     for group, group_words in enumerate(words):
         for code, lane in enumerate(_nvfp4_lanes(loaded(group_words), layout)):
@@ -174,13 +187,6 @@ def lanes(words, scales, interpret: bool):
             # column slice of a register tile has no layout).
             scale = jnp.sum(jnp.where(which == 8 * group + code, owed, 0.0), axis=1)
             yield group, code, (lane * scale[:, None]).astype(jnp.bfloat16)
-
-
-def e4m3_values(codes: jax.Array) -> jax.Array:
-    """Dew: E4M3 codes (float8_e4m3fn) as float32 by the format's integer decode (`bits.decoded`), exactly,
-    with no FP8 conversion: an A100's ptxas refused the packed NVFP4 kernel's scales cast so (W8-a100,
-    M-NS-8). The NaN code (no block scale holds it) reads as 480."""
-    return bits.decoded(jax.lax.bitcast_convert_type(codes, jnp.uint8).astype(jnp.uint32), bits.E4M3)
 
 
 def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:

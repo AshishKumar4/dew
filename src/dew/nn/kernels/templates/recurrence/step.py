@@ -21,7 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import generation, recurrence, short_conv, tuning
+from dew.nn.kernels import generation, recurrence, recurrence_algebra, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, resources, scan
 from dew.nn.precision import (
     L2NORM_EPS,
@@ -544,10 +544,9 @@ def _summed_keys(key_width: int, read, term, like: jax.Array, count: int = 1):
         base = i * UNROLLED
         tiles = [read(base + u) for u in range(UNROLLED)]
         terms = [terms_of(base + u, tile) for u, tile in enumerate(tiles)]
-        while len(terms) > 1:
-            terms = [tuple(a + b for a, b in zip(terms[j], terms[j + 1], strict=True))
-                     for j in range(0, len(terms), 2)]
-        return tuple(_tree_added(held, i, found) for held, found in zip(partials, terms[0], strict=True))
+        reduced = recurrence_algebra.pairwise_sum(
+            terms, combine=lambda a, b: tuple(x + y for x, y in zip(a, b, strict=True)))
+        return tuple(_tree_added(held, i, found) for held, found in zip(partials, reduced, strict=True))
 
     turns = key_width // UNROLLED
     empty = tuple(tuple(jnp.zeros_like(like) for _ in range(turns.bit_length())) for _ in range(count))

@@ -50,9 +50,9 @@ resume."""
 
 @functools.cache
 def _oracle():
-    """The frozen capture's digest and input writers (`golden_records`), whose token stores the reference
-    read: the stores this test reads are the ones it wrote (`token_store`), and whose digest of a batch
-    (`digest`) this test reads Dew's by."""
+    """Copies of the frozen capture's digest and input writers (`golden_records`): the token stores the
+    reference read are the ones they write (`token_store`), and Dew's batches are read by their digest
+    (`digest`), the fixture holding both to the capture's own."""
     spec = importlib.util.spec_from_file_location("golden_records", ORACLE)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

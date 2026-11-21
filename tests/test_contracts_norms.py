@@ -12,6 +12,7 @@ from contract_support import EDGES, OWN_FORWARD_ORDERS, REVERSE_ONLY, assert_con
 
 from dew.nn import activations, ngpt, precision
 from dew.nn.activations import exact_gelu, gated_product
+from dew.nn.aligned import aligned_sum
 
 
 def joined(seam):
@@ -58,6 +59,50 @@ def test_accurate_exp_holds_every_order(edge):
     for base2, plain in ((False, jnp.exp), (True, jnp.exp2)):
         assert_contract(on_a_tpu(functools.partial(precision.accurate_exp, base2=base2)), (x,), (direction,),
                         cotangent, f"{plain.__name__} {edge}", truth_fn=plain, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_aligned_sum_holds_every_order(edge):
+    """`aligned.aligned_sum` of three-factor terms summed along an axis (a forked call's entry write, its
+    terms aligned to the largest before the sum, its tangent the terms' own): every order finite wherever
+    float64 is a normal float32 and the plain sum of products is."""
+    primals = normal_draw(7951, (2, 1, 1), (2, 6, 1), (2, 1, 5), scale=EDGES[edge])
+    directions = normal_draw(7952, (2, 1, 1), (2, 6, 1), (2, 1, 5), scale=EDGES[edge])
+    (cotangent,) = normal_draw(7953, (1, 6, 5))
+
+    def aligned(weight, value, key):
+        return aligned_sum([(weight, value, key)], axis=0)
+
+    def plain(weight, value, key):
+        return jnp.sum(weight * value * key, axis=0, keepdims=True)
+
+    assert_contract(aligned, primals, directions, cotangent, f"an aligned sum {edge}", truth_fn=plain,
+                    plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_exact_widening_holds_every_order(edge):
+    """`float_bits.widened_exactly` of bfloat16 to float32 (a subnormal set in float32's bits, a linear map
+    transposed as the cast back, row 8966): every order finite wherever float64 is a normal float32 and the
+    plain cast's is, and on training's mesh each order of a seed's draw on par with the float64 identity,
+    its own truth (base review 20ad463a7 F4)."""
+    from dew.nn.float_bits import widened_exactly
+
+    (x,) = normal_draw(8966, (4, 7), scale=EDGES[edge], dtype=jnp.bfloat16)
+    (direction,) = normal_draw(8967, x.shape, scale=EDGES[edge], dtype=jnp.bfloat16)
+    (cotangent,) = normal_draw(8968, x.shape)
+
+    def plain(x):
+        return x.astype(jnp.float32)
+
+    def draw(seed):
+        """A seed's bfloat16 operand and direction and its float32 cotangent at unit scale."""
+        return (normal_draw([8966, seed], (4, 7), dtype=jnp.bfloat16),
+                normal_draw([8967, seed], (4, 7), dtype=jnp.bfloat16), normal_draw([8968, seed], (4, 7))[0])
+
+    assert_contract(lambda x: widened_exactly(x, jnp.float32), (x,), (direction,), cotangent,
+                    f"an exact widening {edge}", truth_fn=lambda x: x, plain_fn=plain,
+                    draw=draw if edge == "normal" else None)
 
 
 @pytest.mark.parametrize("edge", EDGES)

@@ -1342,7 +1342,7 @@ class ExpertMLP(nn.Module):
         compute = expert_compute_dtype(x, *(kernel.stack if isinstance(kernel, Layered) else kernel
                                             for kernel in kernels), dtype=self.dtype)
         project = functools.partial(self._project, dtype=compute)
-        # Each leaf's axes: a packed bank's three its own (`quantization.expert_leaf_axes`).
+        # Each leaf's axes: a packed bank's four its own (`quantization.expert_leaf_axes`).
         axes = tuple(leaf for kernel, name in zip(kernels, names, strict=True)
                      for leaf in quantization.expert_leaf_axes(kernel, EXPERT_AXES[name]))
         slots = expert_dispatch(

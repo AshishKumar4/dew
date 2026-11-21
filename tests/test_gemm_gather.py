@@ -10,12 +10,14 @@ import jax.numpy as jnp
 import mx_matrix
 import numpy as np
 import pytest
+from gathered_walks import gathered_kernel
 from generation_support import cublas_compiled
+from jax.sharding import Mesh
 from reference_error import assert_as_exact, equations
 
-from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import product
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
+from dew.nn.kernels.templates import product, rings
+from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles, tiling
 
 SEEDS = 8
 """The gathered product's check-1 seeds, the template's grouped products' count."""
@@ -28,13 +30,13 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
     with generation.assumed("sm90"):
         a_gathered_product_is_on_par(interpret=True)
         a_gathered_product_is_on_par(interpret=True, paired=True, scattered=True)
-        a_deep_gathered_step_reads_its_rows_as_their_copy_would(grouped_matmul.INTERPRETED)
+        a_deep_gathered_step_reads_its_rows_as_their_copy_would(grouped_launch.INTERPRETED)
     tokens, table = jnp.zeros((200, 128), jnp.bfloat16), jnp.zeros((256,), jnp.int32)
     with generation.assumed("sm80"), pytest.raises(ValueError):
         mosaic_gpu.gmm(tokens, jnp.zeros((4, 128, 256), jnp.bfloat16),
                        jnp.asarray([70, 0, 129, 57], jnp.int32),
-                       tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), transpose_rhs=False,
-                       out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
+                       tiles=tiling.Tiles(128, 128, 32, 3, 1, family="mma.sync"), transpose_rhs=False,
+                       out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_launch.INTERPRETED,
                        gather=table)
 
 
@@ -42,7 +44,7 @@ def a_deep_gathered_step_reads_its_rows_as_their_copy_would(interpret):
     """A gathered product's 256-deep step, four swizzled tiles a row (its rows' copies, `rings.piece_copies`,
     the load barrier's arrivals: counted apart, the packed NVFP4 bank's gathered walk hung): bitwise the same
     tile's product of the rows gathered first, its groups ragged, one empty, rows past them."""
-    tiles = mosaic_gpu.Tiles(128, 128, 256, 2, 1, warpgroups=2, family='wgmma')
+    tiles = tiling.Tiles(128, 128, 256, 2, 1, warpgroups=2, family='wgmma')
     sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
     rng = np.random.default_rng(7)
     tokens = jnp.asarray(rng.integers(-3, 4, size=(200, 512)), jnp.bfloat16)
@@ -77,7 +79,7 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
     ruling of 2026-11-12, "Ofcourse Cublas parity!"), within 1.5 of the larger of the reference's error and
     cuBLAS's: XLA's default product there is a Triton fusion on mma.sync, whose running sum the template's
     read 1.658 times the error of (M-EM-19c), where cuBLAS's equals the template's."""
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+    tiles = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     # NumPy's, formed on no device: a GPU tier's prepare computes on none (its default a compile-only GPU's).
     sizes, depth = np.asarray([70, 0, 129, 51], np.int32), 128
     # A pair summed apart (into fp32 above the default precision) carries four accumulators, which the
@@ -147,7 +149,7 @@ def test_a_gathered_product_lowers_for_cuda(paired):
     """A gathered grouped product on a compile-only H100 lowers through Mosaic GPU: its producer's
     cp.async gather and its load barriers' lane-level arrivals and parity waits (`gathered.Ring`), plain and
     paired, the paired one's rows stored at a permutation's entries (`gathered.scattered_rows`)."""
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+    tiles = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
     product = functools.partial(mosaic_gpu.gmm, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
                                 out_dtypes=(jnp.bfloat16,) * 2 if paired else None, multiprocessors=132,
@@ -171,26 +173,137 @@ def test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_say
     mma.sync (no producer warpgroup), refused."""
     with generation.assumed(generation_name):
         tokens, cotangent, table = a_gathered_kernel_gradient_is_its_gathered_rows_gradient(
-            grouped_matmul.INTERPRETED, splits, tiles=KERNEL_GRADIENT_TILES[generation_name])
+            grouped_launch.INTERPRETED, splits, tiles=KERNEL_GRADIENT_TILES[generation_name])
     with generation.assumed("sm90"), pytest.raises(ValueError):
         mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
                         tiles=KERNEL_GRADIENT_TILES["sm90"], out_dtype=jnp.float32, multiprocessors=4,
-                        interpret=grouped_matmul.INTERPRETED, gather=(table, None),
+                        interpret=grouped_launch.INTERPRETED, gather=(table, None),
                         prologue=lambda rows: rows)
     with generation.assumed("sm80"), pytest.raises(ValueError):
         mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
-                        tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), out_dtype=jnp.float32,
-                        multiprocessors=4, interpret=grouped_matmul.INTERPRETED, gather=(table, None))
+                        tiles=tiling.Tiles(128, 128, 32, 3, 1, family="mma.sync"), out_dtype=jnp.float32,
+                        multiprocessors=4, interpret=grouped_launch.INTERPRETED, gather=(table, None))
 
 
-KERNEL_GRADIENT_TILES = {"sm90": mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
-                         "sm100": mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')}
+def test_a_gathered_kernel_gradients_last_step_addresses_no_step_past_it():
+    """A Blackwell's gathered kernel gradient of one step (64 rows, one group, a 64-entry identity table, the
+    128 x 128 x 64 tcgen05 tile), interpreted with every out-of-bounds read raised: its loads address no step
+    past the walk's last (`rings.Ahead.view` resolved by the load that reads a step ahead alone), and it is
+    on par with the gradient of its rows gathered first (check 1); resolved eagerly, the last step's next
+    view read `table[64]` (base review 103007773 F1)."""
+    strict = dataclasses.replace(grouped_launch.INTERPRETED, out_of_bounds_reads="raise")
+    table, sizes = jnp.arange(64, dtype=jnp.int32), jnp.asarray([64], jnp.int32)
+
+    def gathered(tokens):
+        return mosaic_gpu.tgmm(tokens, tokens, sizes, tiles=KERNEL_GRADIENT_TILES["sm100"],
+                               out_dtype=jnp.float32, multiprocessors=4, interpret=strict,
+                               gather=(table, None))
+
+    def first(tokens):
+        rows = tokens[table]
+        return jnp.dot(rows.T, rows, preferred_element_type=jnp.float32)[None]
+
+    def draw(seed):
+        return (np.random.default_rng([seed, 5]).normal(size=(64, 128)).astype(jnp.bfloat16),)
+
+    with generation.assumed("sm100"):
+        assert_as_exact(gathered, jax.jit(first), draw, "a one-step gathered kernel gradient, strictly read",
+                        seeds=SEEDS, truth_fn=lambda tokens: (tokens[table].T @ tokens[table])[None])
+
+
+def _strided_gathers(tokens, table, plain, at: int | None = None):
+    """`plain @ tokens[table[:, 0]]` a step of `STRIDED_BLOCK`'s rows at a time through a Blackwell's
+    gathered ring (`gathered_walks.gathered_kernel`), its table's column zero the ring's (`rings.Rows` over a
+    view of stride two): one tile; or, `at` given, every step's rows those of a flat `table` from entry `at`
+    (a Python int, past int32's reach where the table is:
+    `test_a_gathered_rings_steps_past_int32s_reach_lower_for_cuda`)."""
+    (height, width), rows = STRIDED_BLOCK, plain.shape[0]
+
+    def views(operands, tile):
+        del tile
+        x_gmem, table_gmem, w_gmem, _ = operands
+
+        def entries(step):
+            return (rings.Rows(table_gmem.at[:, 0], step * height, (0,), 1) if at is None
+                    else rings.Rows(table_gmem, at, (0,), 1))
+
+        return {"x": (x_gmem, entries), "w": (w_gmem, lambda step: (0, step))}
+
+    blocks = {"x": ((height, width), jnp.bfloat16), "w": ((rows, height), jnp.bfloat16)}
+    kernel = gathered_kernel(blocks, ("x",), (plain.shape[1] // height,), views, (rows, width), stages=2,
+                             out=jax.ShapeDtypeStruct((rows, width), jnp.float32), stored=True,
+                             name="strided_gathers")
+    return kernel(tokens, table, plain)
+
+
+STRIDED_BLOCK = (64, 64)
+"""`_strided_gathers`' gathered step: 64 rows, a tcgen05 product's least depth (eight 8-row tiles over the
+issuing warpgroup's load warps)."""
+
+
+def a_gathered_ring_reads_a_strided_tables_entries() -> None:
+    """A Blackwell's gathered ring (`gathered.Committed`: its load warps' gathers, each step's table entries
+    read a step ahead) whose table is column zero of a row-major int32 `[128, 2]` table, the first step's
+    rows `[0, 1]` and the second's `[1, 0]` (a view of stride two, `_strided_gathers`): the first step
+    gathers token 0's rows, the second token 1's. Two steps of 64 gathered rows times a plain block, on par
+    with the product of its rows gathered first (check 1); entries read at stride one gather the other token's
+    for half the rows (base review ae8a242ed F1), and the first step's entries read again for the second
+    gather token 0's (base review 51d5c0f0a F2). On this GPU (test_gpu_gemm's Blackwell cell): its load
+    warps' code runs on none other."""
+    (height, width), steps, rows = STRIDED_BLOCK, 2, 128
+    table = jnp.asarray(np.concatenate([np.tile([0, 1], (height, 1)), np.tile([1, 0], (height, 1))]),
+                        jnp.int32)
+
+    def gathered(tokens, plain):
+        return _strided_gathers(tokens, table, plain)
+
+    def first(tokens, plain):
+        return jnp.dot(plain, tokens[table[:, 0]], preferred_element_type=jnp.float32)
+
+    def draw(seed):
+        rng = np.random.default_rng([seed, 9])
+        return (rng.normal(size=(2, width)).astype(jnp.bfloat16),
+                rng.normal(size=(rows, steps * height)).astype(jnp.bfloat16))
+
+    with generation.assumed("sm100"):
+        assert_as_exact(gathered, jax.jit(first), draw, "a gathered ring over a strided table", seeds=SEEDS,
+                        truth_fn=lambda tokens, plain: plain @ tokens[table[:, 0]])
+
+
+def test_a_gathered_ring_over_a_strided_table_lowers_for_cuda():
+    """`a_gathered_ring_reads_a_strided_tables_entries`' kernel lowered for a B200 on this CPU, its table a
+    stride-two column, the load warps' entries addressed by it (`gathered.Held.filled`)."""
+    (height, width), steps, rows = STRIDED_BLOCK, 2, 128
+    shaped = jax.ShapeDtypeStruct
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(_strided_gathers).trace(
+            shaped((2, width), jnp.bfloat16), shaped((steps * height, 2), jnp.int32),
+            shaped((rows, steps * height), jnp.bfloat16)).lower(lowering_platforms=("cuda",))
+
+
+def test_a_gathered_rings_steps_past_int32s_reach_lower_for_cuda():
+    """`_strided_gathers` over a flat int32 table of 2^31 + 64 entries, both steps' rows from entry 2^31 (a
+    Python int), lowered for a B200 on this CPU: the next step's slice formed as the load's own (`pl.ds`,
+    the table's index type) where the walk has that step, no narrowing to int32 (base review ac90e3e16 F1:
+    `OverflowError` in tracing)."""
+    (height, width), rows = STRIDED_BLOCK, 128
+    shaped = jax.ShapeDtypeStruct
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_strided_gathers, at=2 ** 31)).trace(
+            shaped((2, width), jnp.bfloat16), shaped((2 ** 31 + height,), jnp.int32),
+            shaped((rows, 2 * height), jnp.bfloat16)).lower(lowering_platforms=("cuda",))
+
+
+KERNEL_GRADIENT_TILES = {"sm90": tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
+                         "sm100": tiling.Tiles(128, 128, 64, 4, 1, family='tcgen05')}
 """A gathered kernel gradient's tile on each family whose producer gathers its rings' rows: Hopper's
 producer warpgroup's cp.async gathers and Blackwell's load warp's TMA four-row gathers (row 1376)."""
 
 
 def a_gathered_kernel_gradient_is_its_gathered_rows_gradient(interpret=False, splits: int = 1,
-                                                            tiles: mosaic_gpu.Tiles | None = None) -> tuple:
+                                                            tiles: tiling.Tiles | None = None) -> tuple:
     """A kernel gradient's gathered operands (`mosaic_gpu.tgmm`'s `gather`, row 1376: the tokens a mixture of
     experts' slots read, and a scattered product's cotangent at its slots), bitwise the same tile's gradient
     of the rows gathered first, the tokens' rows alone and both operands', its groups ragged, one empty, rows
@@ -281,7 +394,7 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
     sizes = jnp.asarray([128, 0, 200], jnp.int32)
     options = {"out_dtype": jnp.bfloat16, "precision": "default", "interpret_on_cpu": interpret_on_cpu}
     # The template's launch named, its product at tcgen05's tile (`tuning.pinned`, a pin its legality checks).
-    tile = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+    tile = tiling.Tiles(128, 128, 64, 4, 1, family='tcgen05')
     with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
         got = jax.jit(lambda: gemm.gemm(tokens, matrices, sizes, gather=table, scatter=slots, **options))()
         apart = jax.jit(lambda: gemm.gemm(tokens[table], matrices, sizes, **options))()
@@ -295,10 +408,10 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
 
 def test_a_blackwells_gathered_product_lowers_for_cuda():
     """A gathered grouped product on a compile-only B200 lowers through Mosaic GPU on tcgen05's bundle: its
-    load warp's TMA four-row gathers into the swizzled ring (`gathered.tma_rows`), each slot released by its
+    load warp's TMA four-row gathers into the swizzled ring (`gathered.Gathers`), each slot released by its
     products' commit; and its kernel gradient's tables at the tile its launch derives for a wide and a
     32-column cotangent, one its launch takes (`legal`), on whichever family derives it."""
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+    tiles = tiling.Tiles(128, 128, 64, 4, 1, family='tcgen05')
     sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
 
     def gathered(tokens, matrices, table):
@@ -358,15 +471,15 @@ def test_a_blackwells_gathered_block_scaled_product_gathers_its_scales_by_its_ta
 
 def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
     """A gathered product's table, on a family whose loads past the rows are bounded (wgmma's TMA, compiled),
-    still extends to every row its schedule's tiles walk (`mosaic_gpu.row_extent`): the producer's threads
+    still extends to every row its schedule's tiles walk (`row_tiles.row_extent`): the producer's threads
     read a tile's entries by plain loads, which no TMA bounds; read past it, a GH200 faulted
     (CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+    tiles = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     table = jnp.zeros((256,), jnp.int32)
     tokens = jnp.zeros((200, 128), jnp.bfloat16)
     _, gathered, _, m, extent = mosaic_gpu._walked_rows(tokens, table, None, tiles, transpose_lhs=False,
                                                         dense=False, bounded=True)
-    assert gathered.shape[0] == extent == mosaic_gpu.row_extent(m, tiles.block_m) > m
+    assert gathered.shape[0] == extent == row_tiles.row_extent(m, tiles.block_m) > m
 
 
 def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
@@ -377,12 +490,12 @@ def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
     tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 512)), jnp.bfloat16)
     matrices = jnp.asarray(rng.integers(-3, 4, size=(4, 512, 256)), jnp.bfloat16)
     sizes = jnp.asarray([10, 0, 17, 9], jnp.int32)
-    tiles = mosaic_gpu.Tiles(64, 128, 64, 2, 1, warpgroups=1, family='wgmma')
+    tiles = tiling.Tiles(64, 128, 64, 2, 1, warpgroups=1, family='wgmma')
 
     def product(splits):
         return mosaic_gpu.gmm(tokens, matrices, sizes, tiles=dataclasses.replace(tiles, splits=splits),
                               transpose_rhs=False, out_dtype=jnp.float32, multiprocessors=4,
-                              interpret=grouped_matmul.INTERPRETED)
+                              interpret=grouped_launch.INTERPRETED)
 
     with generation.assumed("sm90"):
         np.testing.assert_array_equal(np.asarray(product(4)), np.asarray(product(1)))

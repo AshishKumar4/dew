@@ -102,7 +102,7 @@ def main() -> None:
             arrays[f"repa{suffix}"] = projection_loss([z], [mlp.to(dtype)(h)]).double().numpy()
             arrays[f"irepa{suffix}"] = projection_loss(
                 [zscore(z, alpha=GAMMA)], [conv.to(dtype)(h)]).double().numpy()
-    np.savez(FIXTURE / "losses.npz", **arrays)
+    np.savez(FIXTURE / "losses.npz", allow_pickle=False, **arrays)
     print(f"{FIXTURE}: REPA and iREPA projection losses")
 
 
@@ -227,7 +227,7 @@ def composed() -> None:
     for name, value in moved.items():
         truth = arrays[f"{name}_f64"]
         assert np.abs(value - truth).max() <= 1e-12 * np.abs(truth).max(), name
-    distances = {name: [distance(arrays[name], arrays[f"{name}_f64"])] for name in grads}
+    distances = {name: [distance(arrays[name], arrays[f"{name}_f64"])] for name in moved}
     for order in drawn[1:]:
         for name, value in run(torch.float32, order)[1].items():
             distances[name].append(distance(value, arrays[f"{name}_f64"]))

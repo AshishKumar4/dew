@@ -390,6 +390,12 @@ DERIVED = _context(default_value=False)
 hand-written ones, keyed on as `ALGEBRA` is: a program traced under one set of forms is never run under the
 other, and check 1 drives both (docs/design/algebra.md §6.9)."""
 
+BARRIERED = _context(default_value=False)
+"""Whether precision's error-free transforms hold their operands behind an optimization barrier where the
+running jaxlib marks their arithmetic uncontracted instead (`dew.nn.precision.rounding_alone`), keyed on as
+`ALGEBRA` is: the suite runs the barrier path on a lane whose jaxlib marks (row 8378), and a program traced
+on one path is never run on the other."""
+
 WHOLE = _context(default_value=False)
 """Whether a model runs its layer stack and sequences whole (`dew.nn.sharding.whole`), keyed on as `ALGEBRA`
 is: a trace reads it, so JAX's trace context holds it, and a program traced whole is never run staged."""
@@ -416,6 +422,17 @@ RECORDING = (KERNEL_SEEN, KERNEL_ROUTES)
 """The contexts a trace records into (`KERNEL_SEEN`, `KERNEL_ROUTES`): JAX keys its trace caches on their
 values' identities so a cached trace records again, and the program is the same under any of them, as
 the persistent cache's key reads none."""
+
+
+@contextlib.contextmanager
+def unrecorded() -> Iterator[None]:
+    """A block whose traces record into none of a trace's collections (`RECORDING`): a nested trace whose
+    launches and routes are its caller's to record (a portable walk under its dispatch's receipt) keys alike
+    under every receipt around it, so one cached trace serves them all, where each receipt's identity traced
+    it again (row 6740: a decision step's walk traced twice, 0.84 s against 0.30). A trace that records
+    launches or routes of its own is not one to run here: its records would be dropped."""
+    with KERNEL_SEEN(None), KERNEL_ROUTES(()):
+        yield
 
 KERNEL_PINS = _context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this

@@ -9,6 +9,10 @@ from __future__ import annotations
 import torch
 from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsProcessor
 
+COHORT = "vllm-dory"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 
 class Forced(LogitsProcessor):
     """Each step of a request whose `extra_args` name `forced` tokens and its `prompt` length draws

@@ -64,7 +64,9 @@ def main() -> None:
     # branch is never taken on these CPU tensors.
     ops["apply_repetition_penalties_cuda"] = None
     sys.modules["vllm"] = types.ModuleType("vllm")
-    sys.modules["vllm._custom_ops"] = types.SimpleNamespace(**ops)
+    custom_ops = types.ModuleType("vllm._custom_ops")
+    custom_ops.__dict__.update(ops)
+    sys.modules["vllm._custom_ops"] = custom_ops
     published = definitions(VLLM + "vllm/model_executor/layers/utils.py",
                             ("get_token_bin_counts_and_mask", "apply_penalties"), {"torch": torch})
     arrays = {"penalties": np.asarray(PENALTIES), "prompt": padded(PROMPTS).numpy(),
@@ -85,7 +87,7 @@ def main() -> None:
             scored(inputs["logits"], torch.float32), scored(inputs["logits"], torch.float64)),
             store_inputs=False, summary=True))
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
+    np.savez(FIXTURE, allow_pickle=False, **arrays)
     print(f"{FIXTURE}: {len(PENALTIES)} penalty pairs over {len(PROMPTS)} rows")
 
 

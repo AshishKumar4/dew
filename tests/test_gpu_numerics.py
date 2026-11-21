@@ -13,6 +13,10 @@
 - A GPU reports its block, multiprocessors, clock and memory bandwidth (test_lowering).
 - A Gemma-sized vocabulary's chunked cross entropy is as exact as the whole logits, its float64 truth at
   the seeds it needs (test_chunked_cross_entropy).
+- A Dense layer's float64 terms on a GPU host are its inputs' placement's own, CPU or GPU, in either order
+  (test_float64_terms).
+- A multiply-add marked to round alone rounds each step, as precision's unbarriered transforms take it
+  (test_no_contract).
 """
 
 import functools
@@ -21,14 +25,16 @@ import jax.numpy as jnp
 import pytest
 import test_audio as audio
 import test_chunked_cross_entropy as chunked_cross_entropy
+import test_float64_terms as float64_terms_tests
 import test_fp8_base as fp8_base
 import test_lowering as lowering
 import test_moe_precision as moe_precision
+import test_no_contract as no_contract
 import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
 from gpu_flow import Cell, covering, isolated, run_cells, when
 
-from dew.nn.kernels import grouped_matmul, norm_swiglu
+from dew.nn.kernels import grouped_matmul, grouped_triton, norm_swiglu
 from dew.nn.kernels.generation import triton_runs
 
 pytestmark = pytest.mark.gpu(reason="a GPU's own numerics, its kernels' configs and its driver's facts")
@@ -40,8 +46,15 @@ OWN = "the GPU's own arithmetic, facts or placement, which a CPU does not have"
 """Why a numerics cell stays on the GPU: what it holds is the device's own."""
 
 
+def _flow_scaling():
+    """`test_flow_grpo`'s flow-scaling cell, its module imported only where the cell runs (row 8971)."""
+    from test_flow_grpo import a_flows_scaling_rounds_a_subnormal_result_once
+
+    a_flows_scaling_rounds_a_subnormal_result_once()
+
+
 def numerics_cells(tmp_path_factory) -> list[Cell]:
-    """The GPU's own arithmetic and driver facts and its encoders' compiles."""
+    """The GPU's own arithmetic and driver facts, its encoders' compiles and a Dense layer's float64 terms."""
     return [
         Cell("the GPU divides fp32 to the nearest float",
              precision_policy.the_gpu_divides_fp32_to_the_nearest_float, fault=OWN),
@@ -49,6 +62,11 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              precision_policy.divides_as_ieee_division_at_its_edges, fault=OWN),
         Cell("a correctly rounded division is IEEE division's on a GPU dividing approximately",
              precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN),
+        Cell("a power of two's scaling rounds a subnormal result once on a GPU",
+             precision_policy.power2_rounds_a_subnormal_result_once, fault=OWN),
+        Cell("a flow's scaling rounds a subnormal result once on a GPU", _flow_scaling, fault=OWN),
+        Cell("a multiply-add marked to round alone rounds each step on a GPU",
+             no_contract.a_marked_multiply_add_rounds_each_step, fault=OWN),
         *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",
                functools.partial(precision_policy.compensated_primitives_hold_under_jit, shape), fault=OWN)
           for shape in precision_policy.COMPENSATED_SHAPES),
@@ -63,6 +81,13 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it, fault=OWN),
         Cell("a GPU reports its clock and memory bandwidth from its driver",
              lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver, fault=OWN),
+        # A GPU process walks a truth's terms where its values lie, from either placement in either order
+        # (`float64_terms.evaluated_on`: an unprepared site's, a steered walk's), each compiled evaluation
+        # keyed by its platform (row 8531).
+        Cell("a Dense layer's float64 terms are its placement's own on a GPU host",
+             isolated(tmp_path_factory)(
+                 float64_terms_tests.a_dense_layers_terms_are_its_placements_own_on_a_gpu_host, "placed"),
+             fault=OWN),
     ]
 
 
@@ -96,7 +121,7 @@ def grouped_cells(_) -> list[Cell]:
                    kernel, width, features)),
                generation, native={"kernel": kernel.__name__})
           for kernel, width, features, generation in (
-              (grouped_matmul.Gmm, 192, 320, None), (grouped_matmul.Tgmm, 192, 320, None),
+              (grouped_triton.Gmm, 192, 320, None), (grouped_triton.Tgmm, 192, 320, None),
               (grouped_matmul.MosaicGmm, 768, 768, "sm90"), (grouped_matmul.MosaicTgmm, 768, 768, "sm90"))),
         *(Cell(f"a projection on a GPU host's CPU runs without the Triton kernels: {implementation}",
                when(triton_runs(), pallas, functools.partial(

@@ -26,6 +26,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
@@ -38,6 +39,27 @@ BASE = dict(sample_size=16, patch_size=2, in_channels=4, num_layers=2, attention
             pooled_projection_dim=10, out_channels=4, pos_embed_max_size=8)
 TOKENS = 5
 SEED = 19
+
+if TYPE_CHECKING:
+    from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
+
+
+def position_buffer(model: SD3Transformer2DModel) -> torch.Tensor:
+    """The transformer's position buffer, which every config here holds (`pos_embed_max_size`)."""
+    buffer = model.pos_embed.pos_embed
+    assert buffer is not None  # pos_embed_max_size set.
+    return buffer
+
+
+def latents_of(pipe: StableDiffusion3Pipeline, **arguments: Any) -> torch.Tensor:
+    """The pipeline's latents for a call with `output_type="latent"` (`arguments`)."""
+    from diffusers.pipelines.stable_diffusion_3.pipeline_output import StableDiffusion3PipelineOutput
+
+    output = pipe(**arguments, output_type="latent", return_dict=True)
+    assert isinstance(output, StableDiffusion3PipelineOutput)  # return_dict=True.
+    assert isinstance(output.images, torch.Tensor)  # output_type="latent".
+    return output.images
 
 
 @dataclass(frozen=True)
@@ -67,8 +89,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     with torch.no_grad():
         # The buffer ships sin/cos values; perturbing the stored array means a
         # load that rebuilt it from the initializer would not match.
-        model.pos_embed.pos_embed.add_(
-            torch.randn_like(model.pos_embed.pos_embed, dtype=torch.float32) * 0.05)
+        position_buffer(model).add_(torch.randn_like(position_buffer(model), dtype=torch.float32) * 0.05)
     directory = root / name / "transformer"
     model.save_pretrained(directory, safe_serialization=True)
     generator = torch.Generator().manual_seed(SEED + 1)
@@ -93,7 +114,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
         "output": output.detach().numpy(), "probe": probe.numpy(),
         "grad_latent": grads[0].numpy(), "grad_context": grads[1].numpy(),
         "grad_pooled": grads[2].numpy(),
-        "position_buffer": model.pos_embed.pos_embed.detach().numpy(),
+        "position_buffer": position_buffer(model).detach().numpy(),
     }
     for (key, _), gradient in zip(named, grads[3:]):
         arrays[f"grad_param.{key}"] = gradient.numpy()
@@ -167,8 +188,10 @@ def flow_record(name: str, config: dict) -> dict[str, np.ndarray]:
                 cotangent = torch.randn(latent.shape, generator=generator, dtype=torch.float32)
                 latents = flow_walk(scheduler, latent, scheduler.sigmas)
                 (gradient,) = torch.autograd.grad((latents[-1] * cotangent).sum(), latent)
-                arrays[f"{tag}.sigmas"] = scheduler.sigmas.numpy()
-                arrays[f"{tag}.times"] = scheduler.timesteps.numpy()
+                sigmas, times = scheduler.sigmas, scheduler.timesteps
+                assert isinstance(sigmas, torch.Tensor) and isinstance(times, torch.Tensor)  # Once set.
+                arrays[f"{tag}.sigmas"] = sigmas.numpy()
+                arrays[f"{tag}.times"] = times.numpy()
                 arrays[f"{tag}.mu"] = np.asarray(kwargs.get("mu", np.nan), np.float64)
                 arrays[f"{tag}.x_T"] = latent.detach().numpy()
                 arrays[f"{tag}.latents"] = np.stack([v.detach().numpy() for v in latents])
@@ -202,7 +225,7 @@ def main(destination: str) -> None:
     record["flow"] = {"cases": sorted(FLOW_CASES), "steps": list(FLOW_STEPS),
                       "tokens": list(FLOW_TOKENS), "data_std": DATA_STD}
     pipeline = pipeline_record(root)
-    from diffusers import StableDiffusion3Pipeline
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
 
     defaults = inspect.signature(StableDiffusion3Pipeline.__call__).parameters
     record["pipeline"] = {"config": PIPELINE, "prompts": PROMPTS, "negatives": NEGATIVES,
@@ -210,9 +233,9 @@ def main(destination: str) -> None:
                           "guidance": PIPELINE_GUIDANCE, "size": PIPELINE_SIZE,
                           "default_steps": defaults["num_inference_steps"].default,
                           "default_guidance": defaults["guidance_scale"].default}
-    np.savez_compressed(root / "sd3_pipeline.npz", **pipeline)
-    np.savez_compressed(root / "sd3_flow.npz", **flow)
-    np.savez_compressed(root / "sd3_transformer.npz", **arrays)
+    np.savez_compressed(root / "sd3_pipeline.npz", allow_pickle=False, **pipeline)
+    np.savez_compressed(root / "sd3_flow.npz", allow_pickle=False, **flow)
+    np.savez_compressed(root / "sd3_transformer.npz", allow_pickle=False, **arrays)
     (root / "sd3_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")
@@ -227,7 +250,7 @@ def reload(directory: str, recorded: str) -> None:
     its tokenizer and the scheduler - and the actual transformer recomputes
     the forward the native model computed with the trained weights.
     """
-    from diffusers import StableDiffusion3Pipeline
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
 
     arrays = np.load(recorded)
     pipe = StableDiffusion3Pipeline.from_pretrained(directory, torch_dtype=torch.float32,
@@ -241,7 +264,7 @@ def reload(directory: str, recorded: str) -> None:
     native = arrays["native"]
     theirs = output.permute(0, 2, 3, 1).numpy()
     gap = float(np.abs(theirs - native).max() / max(1.0, float(np.abs(native).max())))
-    buffer = float(np.abs(model.pos_embed.pos_embed.detach().numpy() - arrays["buffer"]).max())
+    buffer = float(np.abs(position_buffer(model).detach().numpy() - arrays["buffer"]).max())
     trained = float(np.abs(model.proj_out.weight.detach().numpy().T - arrays["proj_out"]).max())
     print(f"reimported forward gap {gap:.3g}; position buffer gap {buffer:.3g}; "
           f"trained kernel gap {trained:.3g}")
@@ -263,10 +286,10 @@ def bundle(directory: str, destination: str) -> None:
 
 # G2/G4/G5: one tiny SD3 pipeline, saved the way a published checkpoint is
 # saved, walked through the source's own prompt encoding and its own call.
-PIPELINE = dict(sample_size=8, patch_size=2, in_channels=16, num_layers=2, attention_head_dim=8,
-                num_attention_heads=2, joint_attention_dim=32, caption_projection_dim=16,
-                pooled_projection_dim=10, out_channels=16, pos_embed_max_size=16,
-                qk_norm="rms_norm", dual_attention_layers=(0,))
+PIPELINE: dict[str, Any] = dict(
+    sample_size=8, patch_size=2, in_channels=16, num_layers=2, attention_head_dim=8, num_attention_heads=2,
+    joint_attention_dim=32, caption_projection_dim=16, pooled_projection_dim=10, out_channels=16,
+    pos_embed_max_size=16, qk_norm="rms_norm", dual_attention_layers=(0,))
 # Distinct text in every slot: the source routes `prompt` to CLIP-L,
 # `prompt_2` to CLIP-G and `prompt_3` to T5, so identical prompts would hide a
 # native encoder that crossed them.
@@ -322,8 +345,10 @@ def t5_tokenizer():
 
 
 def build_pipeline(root: Path, *, t5: bool):
-    from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, StableDiffusion3Pipeline
+    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
     from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
     from transformers import CLIPTextConfig, CLIPTextModelWithProjection, T5Config, T5EncoderModel
 
     directory = root / ("pipeline" if t5 else "pipeline_no_t5")
@@ -347,29 +372,34 @@ def build_pipeline(root: Path, *, t5: bool):
             vocab_size=len(T5_WORDS), d_model=PIPELINE["joint_attention_dim"], d_ff=64,
             num_layers=2, num_heads=2, d_kv=16, relative_attention_num_buckets=8,
             feed_forward_proj="gated-gelu")).eval()
-    vae = AutoencoderKL(in_channels=3, out_channels=3, block_out_channels=(4, 8),
-                        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D"),
-                        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D"),
-                        layers_per_block=1, latent_channels=PIPELINE["in_channels"],
-                        norm_num_groups=2, sample_size=PIPELINE_SIZE, shift_factor=0.0609,
-                        scaling_factor=1.5305, use_quant_conv=False,
-                        use_post_quant_conv=False).eval()
+    # AutoencoderKL's config as its own save writes it; its signature names a one-element tuple of each.
+    vae_config: dict[str, Any] = dict(
+        in_channels=3, out_channels=3, block_out_channels=(4, 8),
+        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D"),
+        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D"), layers_per_block=1,
+        latent_channels=PIPELINE["in_channels"], norm_num_groups=2, sample_size=PIPELINE_SIZE,
+        shift_factor=0.0609, scaling_factor=1.5305, use_quant_conv=False, use_post_quant_conv=False)
+    vae = AutoencoderKL(**vae_config).eval()
     transformer = SD3Transformer2DModel(**PIPELINE).eval()
     with torch.no_grad():
-        transformer.pos_embed.pos_embed.add_(
-            torch.randn_like(transformer.pos_embed.pos_embed, dtype=torch.float32) * 0.05)
-    pipe = StableDiffusion3Pipeline(
-        transformer=transformer, scheduler=FlowMatchEulerDiscreteScheduler(
-            num_train_timesteps=1000, shift=3.0),
-        vae=vae, text_encoder=towers[0], tokenizer=tokenizers[0],
-        text_encoder_2=towers[1], tokenizer_2=tokenizers[1],
-        text_encoder_3=encoder_3, tokenizer_3=tokenizer_3)
+        position_buffer(transformer).add_(
+            torch.randn_like(position_buffer(transformer), dtype=torch.float32) * 0.05)
+    # Without T5, its tower and tokenizer are None, which the pipeline takes though its signature names
+    # none.
+    components: dict[str, Any] = dict(
+        transformer=transformer,
+        scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=3.0),
+        vae=vae, text_encoder=towers[0], tokenizer=tokenizers[0], text_encoder_2=towers[1],
+        tokenizer_2=tokenizers[1], text_encoder_3=encoder_3, tokenizer_3=tokenizer_3)
+    pipe = StableDiffusion3Pipeline(**components)
     pipe.save_pretrained(directory, safe_serialization=True)
     pipe.set_progress_bar_config(disable=True)
     return pipe, directory
 
 
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:
+    from diffusers.pipelines.stable_diffusion_3.pipeline_output import StableDiffusion3PipelineOutput
+
     arrays: dict[str, np.ndarray] = {}
     for t5 in (True, False):
         label = "pipeline" if t5 else "pipeline_no_t5"
@@ -384,6 +414,9 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
                 negative_prompt_3=[row["third"] for row in NEGATIVES],
                 device=torch.device("cpu"), num_images_per_prompt=1,
                 do_classifier_free_guidance=True)
+        # Every embedding made: the prompts are given and guided.
+        assert embeds is not None and pooled is not None
+        assert negative_embeds is not None and negative_pooled is not None
         arrays[f"{label}.context"] = embeds.numpy()
         arrays[f"{label}.pooled"] = pooled.numpy()
         arrays[f"{label}.negative_context"] = negative_embeds.numpy()
@@ -392,36 +425,23 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
         latents = torch.randn((len(PROMPTS), PIPELINE["in_channels"],
                                PIPELINE_SIZE // 2 // PIPELINE["patch_size"] * PIPELINE["patch_size"],
                                PIPELINE_SIZE // 2), generator=generator, dtype=torch.float32)
+        prompts: dict[str, Any] = dict(
+            prompt=[row["text"] for row in PROMPTS], prompt_2=[row["second"] for row in PROMPTS],
+            prompt_3=[row["third"] for row in PROMPTS], negative_prompt=[row["text"] for row in NEGATIVES],
+            negative_prompt_2=[row["second"] for row in NEGATIVES],
+            negative_prompt_3=[row["third"] for row in NEGATIVES], height=PIPELINE_SIZE, width=PIPELINE_SIZE)
+        policy: dict[str, Any] = dict(num_inference_steps=PIPELINE_STEPS, guidance_scale=PIPELINE_GUIDANCE)
         with torch.no_grad():
-            walked = pipe(prompt=[row["text"] for row in PROMPTS],
-                          prompt_2=[row["second"] for row in PROMPTS],
-                          prompt_3=[row["third"] for row in PROMPTS],
-                          negative_prompt=[row["text"] for row in NEGATIVES],
-                          negative_prompt_2=[row["second"] for row in NEGATIVES],
-                          negative_prompt_3=[row["third"] for row in NEGATIVES],
-                          num_inference_steps=PIPELINE_STEPS, guidance_scale=PIPELINE_GUIDANCE,
-                          height=PIPELINE_SIZE, width=PIPELINE_SIZE,
-                          latents=latents.clone(), output_type="latent").images
-            images = pipe(prompt=[row["text"] for row in PROMPTS],
-                          prompt_2=[row["second"] for row in PROMPTS],
-                          prompt_3=[row["third"] for row in PROMPTS],
-                          negative_prompt=[row["text"] for row in NEGATIVES],
-                          negative_prompt_2=[row["second"] for row in NEGATIVES],
-                          negative_prompt_3=[row["third"] for row in NEGATIVES],
-                          num_inference_steps=PIPELINE_STEPS, guidance_scale=PIPELINE_GUIDANCE,
-                          height=PIPELINE_SIZE, width=PIPELINE_SIZE,
-                          latents=latents.clone(), output_type="np").images
-        with torch.no_grad():
+            walked = latents_of(pipe, **prompts, **policy, latents=latents.clone())
+            # The latents as a keyword its signature names no tensor type of (it names FloatTensor).
+            output = pipe(**prompts, **policy, **dict[str, Any](latents=latents.clone()), output_type="np",
+                          return_dict=True)
+            assert isinstance(output, StableDiffusion3PipelineOutput)  # return_dict=True.
+            images = output.images
+            assert isinstance(images, np.ndarray)  # output_type="np".
             # The same call with its policy omitted: the pipeline's own step
             # count and guidance scale, which a native task has to take too.
-            omitted = pipe(prompt=[row["text"] for row in PROMPTS],
-                           prompt_2=[row["second"] for row in PROMPTS],
-                           prompt_3=[row["third"] for row in PROMPTS],
-                           negative_prompt=[row["text"] for row in NEGATIVES],
-                           negative_prompt_2=[row["second"] for row in NEGATIVES],
-                           negative_prompt_3=[row["third"] for row in NEGATIVES],
-                           height=PIPELINE_SIZE, width=PIPELINE_SIZE,
-                           latents=latents.clone(), output_type="latent").images
+            omitted = latents_of(pipe, **prompts, latents=latents.clone())
         arrays[f"{label}.default_latents"] = omitted.permute(0, 2, 3, 1).numpy()
         arrays[f"{label}.x_T"] = latents.permute(0, 2, 3, 1).numpy()
         arrays[f"{label}.latents"] = walked.permute(0, 2, 3, 1).numpy()
@@ -429,6 +449,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
         print(f"{label}: context {tuple(embeds.shape)} pooled {tuple(pooled.shape)} "
               f"latents {tuple(walked.shape)} |image| <= {float(np.abs(images).max()):.4g}")
     return arrays
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "bundle":

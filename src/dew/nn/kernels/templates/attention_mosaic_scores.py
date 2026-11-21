@@ -24,11 +24,13 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Program,
     _streamed,
     _views_of,
+    head_slice,
     indexed_views,
     riding,
     score_stream,
     score_views,
 )
+from dew.nn.precision import scalar_power2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -204,13 +206,12 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
         return coords.queries(read(x), s) if coords.keys_first else read(x)
 
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
-    # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
-    # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
-    # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
-    # launch's instructions, ET-CONFLICTS-h100).
-    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
-    # The tile's weights and cotangents the derived forms' (`derived_cotangents`), in its forward's units
-    # (`how`) and form (`accurate`, its anchor keys an operand).
+    # A dropping anchor's centre can survive where its tile's product rounds to zero before the
+    # multiplier joins it. Take its self-difference as 0, as the accurate form does. The undropped
+    # fast form keeps FlashAttention 3's math (the select took 10.8% of fused dK/dV's instructions).
+    anchored = walk.accurate or multiplier is not None
+    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if anchored else None
+    # The tile's weights and cotangents the derived forms' (`derived_cotangents`).
     tiles = {"logits": logits, "products": dp, "peak": read(peak), "total": read(total),
              "anchor": read(anchor), "delta": read(delta)}
     if multiplier is not None:
@@ -220,18 +221,18 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     if at_anchor is not None:
         tiles["at_anchor"] = at_anchor
     forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, how,
-                               walk.accurate)
+                               walk.accurate, anchored=anchored)
     exponentials, weights, cotangents = forms.mapped(tiles)
     return exponentials, weights, cotangents, slopes, seen
 
 def _rescaled_parts(walk: _Backward, acc, shift, rhs, refs: tuple, staged: tuple = ()):
     """An fp16 step's accumulator `acc` (dV's or dK's) taken to its walk's new scale (`shift`,
-    `algebra.scaled_by`, a power of two at most 1) before its operand's two fp16 parts' products over `rhs`
-    issue into it from their staged `refs`; `staged` the parts each staged into its ref just before its
+    `precision.scalar_power2`, a power of two at most 1) before its operand's two fp16 parts' products over
+    `rhs` issue into it from their staged `refs`; `staged` the parts each staged into its ref just before its
     product (the fused launch's order, `attention_mosaic_fused._sixteen_step`), none where they are staged
     already (the cooperative launch's exchange, `attention_mosaic_coop._sixteen_step`)."""
     family = walk.program.family
-    acc = family.rescaled_products(acc, lambda value: algebra.scaled_by(value, shift), (), rhs,
+    acc = family.rescaled_products(acc, lambda value: scalar_power2(value, shift), (), rhs,
                                    walk.interpret)
     for index, ref in enumerate(refs):
         if staged:
@@ -259,7 +260,8 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
     dQ reduce runs off the consumers' path."""
     row, head = place
     rows = dq.shape[0]
-    view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
+    view = dq_ref.at[index if walk.interpret else 0,
+                     *head_slice(walk.program.family, row, head, pl.ds(q_first, rows))]
     if out_smem is None:
         walk.program.family.added(dq, view, walk.interpret, smem=None)
         return
@@ -280,7 +282,7 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     row, head = family.program_index("batch"), family.program_index("heads")
     pair = consumers * block_q
     refs, kinds = score
-    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+    views = _views_of(family, {"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
     if riding(family, kinds, "keys"):
         views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
     if spans is not None and spans.walk_count is not None:
@@ -299,6 +301,6 @@ def _query_tile_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: 
     """Consumer `index`'s query tile from `first` and its output cotangents, each `(ref, smem)` of `refs`
     and `smem` loaded whole against its `loaded` barrier at the program's batch row and head (`place`)."""
     row, head = place
-    rows = (row, pl.ds(first, smem[0].shape[1]), head)
+    rows = head_slice(family, row, head, pl.ds(first, smem[0].shape[1]))
     family.loaded(tuple((ref.at[rows], stage.at[index], barrier.at[index])
                         for ref, stage, barrier in zip(refs, smem, loaded, strict=True)))

@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import reference_worker
@@ -160,14 +161,16 @@ def generated(name: str, workspace: Path) -> None:
     def no_mask(module, inputs, logits):
         return logits.index_fill(-1, torch.tensor([mask]), float('-inf'))
 
-    model.lm_head.register_forward_hook(no_mask)
+    model.get_submodule("lm_head").register_forward_hook(no_mask)
+    # The release's own `generate`, which its remote code defines.
+    released: Any = model
     ids = np.setdiff1d(np.arange(GENERATE["eos_id"] + 1, config['vocab_size']), [config['mask_token_id']])
     rng = np.random.default_rng(1061)
     rows = []
     for length in PROMPTS:
         prompt = rng.choice(ids, length)
-        tokens = model.generate(inputs=torch.from_numpy(prompt[None]).long(), temperature=0.0, mask_id=mask,
-                                **GENERATE)
+        tokens = released.generate(inputs=torch.from_numpy(prompt[None]).long(), temperature=0.0,
+                                   mask_id=mask, **GENERATE)
         rows.append({"prompt": prompt.tolist(), "generated": tokens[0].tolist()})
     repo, revision = RELEASES[name][:2]
     record = {"reference": f"{repo}@{revision}", "transformers": transformers.__version__,

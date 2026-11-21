@@ -27,7 +27,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._position import unplaced
-from dew._records import JSON, integer, json_value
+from dew._records import JSON, integer, json_value, record
 from dew.batch import Batch
 from dew.data.analysis import (
     _VIEWS,
@@ -59,6 +59,7 @@ from dew.data.analysis import (
     _until,
     _volatile,
     _written,
+    draws,
     reach,
     written,
 )
@@ -105,7 +106,7 @@ from dew.data.lowering import (
     cache_prefix,
 )
 from dew.data.materialize import _materialize, _Memory
-from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed
+from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed, warn_rejections
 from dew.data.ordering import place_of
 from dew.data.phase_corpora import _alone_mixed, _corpora, _shared
 from dew.data.pipeline import (
@@ -534,6 +535,7 @@ def _prepared(
     automatic: str | None = None,
     examples: int | None = None,
     measured: _Measured | None = None,
+    sealing: bool = False,
 ) -> tuple[Pipeline, ...]:
     """The one preparation compile, iterate, validation and publish lower from.
 
@@ -548,11 +550,13 @@ def _prepared(
     each corpus's leading deterministic steps under `automatic` (`_automatic`). A training read bounded
     to `examples` source examples takes its bound as the objective's steps are placed, before any step
     runs, so no eager pass expands an example the bound counts (`_bounded`). Branches a run's widths
-    already measured this way (`measured`, `_measure`) are bound and laid out as they stand.
+    already measured this way (`measured`, `_measure`) are bound and laid out as they stand. A `sealing`
+    pass (a snapshot's) is scored, but draws as its records stand in the one order it seals: no draw of its
+    is held to a record's canonical index (row 10567).
     """
     if measured is None:
         measured = _measure(branches, read, provision=provision, training=training, objective=objective,
-                            counts=counts, automatic=automatic, examples=examples)
+                            counts=counts, automatic=automatic, examples=examples, sealing=sealing)
     branches, metadata = measured.branches, measured.metadata
     held = [not training or index > 0 for index in range(len(branches))]
     if metadata is not None:
@@ -566,7 +570,7 @@ def _prepared(
         trained = _row_tokens(branches[0])
         branches = tuple(_budgeted(branch, trained) for branch in branches)
     for branch, scored in zip(branches, held, strict=True):
-        _analyzed(branch, read, validation=scored)
+        _analyzed(branch, read, validation=scored, sealing=sealing)
     return branches
 
 
@@ -611,6 +615,7 @@ def _measure(
     examples: int | None = None,
     epochs: int | None = None,
     counting: bool = False,
+    sealing: bool = False,
 ) -> _Measured:
     """`_prepared`'s first part: each branch checked, its generations promoted and checked again, its
     sources provisioned and pinned, the objective's steps placed, a training read's bound taken, and with
@@ -620,10 +625,10 @@ def _measure(
         raise ValueError(f"unknown read mode {read!r}")
     held = [not training or index > 0 for index in range(len(branches))]
     for branch, scored in zip(branches, held, strict=True):
-        _analyzed(branch, read, validation=scored, promotion=True)
+        _analyzed(branch, read, validation=scored, promotion=True, sealing=sealing)
     branches = tuple(_promoted(branch) for branch in branches)
     for branch, scored in zip(branches, held, strict=True):
-        _analyzed(branch, read, validation=scored)
+        _analyzed(branch, read, validation=scored, sealing=sealing)
     _capabilities(branches, read, provision,
                   [branch for branch, scored in zip(branches, held, strict=True) if scored])
     branches = _pin_sources(branches, read)
@@ -662,7 +667,8 @@ def _measure(
         metadata = _metadata(branches, read)
         if read == "memory" and counts is not None:
             branches = tuple(
-                _materialize(_configured(branch, metadata, read, "source"), count, training=not scored)
+                _materialize(_configured(branch, metadata, read, "source"), count, training=not scored,
+                             sealing=sealing)
                 for branch, count, scored in zip(branches, counts, held, strict=True)
             )
             if training and not stored(branches[0]):
@@ -673,13 +679,13 @@ def _measure(
 
 
 def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
-          training: bool) -> tuple[Pipeline, ...]:
+          training: bool, sealing: bool = False) -> tuple[Pipeline, ...]:
     """Prepared branches as a memory read makes them, the first training where `training`: their
     first stages run and their rows held (`_materialize`), counted into `counts`, then the memory
     reads pinning took let go (`_released`); another read's as they are."""
     if read != "memory":
         return tuple(prepared)
-    made = tuple(_materialize(branch, count, training=training and not index)
+    made = tuple(_materialize(branch, count, training=training and not index, sealing=sealing)
                  for index, (branch, count) in enumerate(zip(prepared, counts, strict=True)))
     _released(prepared)
     return made
@@ -884,6 +890,8 @@ def _staged(
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
     original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
+    if read == "memory":
+        warn_rejections(counts, loading.warn_over)
     validation = scored[0] if scored else None
     # A memory read that kept none of the scored records scores none.
     if validation_counts and not any(count.accepted for count in validation_counts.values()):
@@ -1183,10 +1191,28 @@ def _compiled(
         statistics=statistics,
         batch_tokens=staged.batch_tokens,
         device=device,
+        fields=_fixed_fields(original, train_host),
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
     )
+
+
+def _fixed_fields(pipeline: Pipeline, host: Sequence[HostStep]) -> Mapping[str, tuple[int | None, ...]]:
+    """Each field's per-row shape the batches the training stream hands its step hold (`Loader.fields`), as
+    the facts state them (`Dataset.facts`): `pipeline`'s record stages, then the batch steps its reader runs
+    on the host (`host`: a pack's layout, the chain's own and the compile's), a step that does not say what
+    it makes leaving no field fixed; never a device step's, which the step runs after the check (row 9533:
+    a batch was held to a device crop it had not run, and without a host step's drop it had). The
+    producer's shape, which every batch is held to (docs/design/training.md, the producer's contract)."""
+    from dew.data.facts import _after, folded
+
+    records = dataclasses.replace(pipeline, stages=tuple(stage for stage in pipeline.stages
+                                                         if not isinstance(stage, MapBatch)))
+    made = functools.reduce(lambda facts, step: _after(MapBatch(step), facts), host, folded(records))
+    stated = made.get("fields", {})
+    return {name: tuple(shape) for name, shape in record(stated, "fields").items()
+            if isinstance(shape, list) and all(axis is None or isinstance(axis, int) for axis in shape)}
 
 
 def _bound_widths(pipeline: Pipeline) -> Mapping[str, object]:
@@ -1925,7 +1951,10 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     loading = (pipeline._loading or _DEFAULT_LOADING).unsized()
     if records is not None:
         pipeline = pipeline._then(Limit(records))
-        loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
+        # Serial where the chain states no loading; the loading it states reads as written (data.md, stats;
+        # row 9058: a stated one was read serially too, so a pass measured another reader than it asked).
+        if pipeline._loading is None:
+            loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
     if not pipeline.batched:
         pipeline = pipeline.batch(1, drop_remainder=False)
     counts: dict[str, CorpusCounts] = {}
@@ -1959,18 +1988,29 @@ def iterate(
     read: Read = "streamed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
+    seed: int | None = None,
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, in the process:
     automatic workers (`Loading.unsized`) and those the chain names (row 5735), whose turns would
-    interleave the records out of the order the pass publishes."""
+    interleave the records out of the order the pass publishes. A pass that seals what it makes (a
+    snapshot's, `seed` given) draws its random steps' values under `seed`, which the rows it seals keep
+    (row 9056: a video's clips drawn once and sealed); publication, whose cache a later pass writes
+    through, holds no draw."""
     loading = loading.unsized()
     pipeline = _in_process(pipeline)
-    if any(isinstance(stage, (RandomMap, BatchStage, MapBatch, Repeat)) for stage in _steps(pipeline)):
-        raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
-    (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
-                        training=False)
+    if (seed is None and draws(pipeline)) or any(isinstance(stage, (BatchStage, MapBatch, Repeat))
+                                                 for stage in _steps(pipeline)):
+        raise ValueError("publication needs deterministic, unbatched pipelines without repeat; a snapshot "
+                         "seals a random step's draws (`snapshot(url, seed=...)`)")
+    # A sealing pass draws as its records stand in the one order it seals them in, wherever its steps reorder
+    # or drop them before a draw (a filter, a shuffle): validation's rule, a draw keyed by the record's
+    # canonical index, is a scored split's, which a later pass must draw alike (row 10567).
+    sealing = seed is not None
+    (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},), sealing=sealing),
+                        read, ({},), training=False, sealing=sealing)
     # Publication reads records, unbatched.
-    build = _build(pipeline, read, loading, batch=1, training=False)
+    build = _build(pipeline, read, loading, batch=1, training=False, seed=0 if seed is None else seed,
+                   lowering=_analyzed(pipeline, read, validation=True, sealing=True) if sealing else None)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 

@@ -20,9 +20,10 @@ the output gated by `silu(z)` before `out_proj`. The decode step is
 checkpoint's: in_proj, conv1d/{weight,bias}, x_proj, dt_proj/{kernel,bias},
 A_log, D, out_proj.
 
-The scan runs in chunks of `chunk_size` tokens: within a chunk an
-associative scan over `(exp(dt A), dt B x)` pairs, the reference's
-`combine_fn` (231-234), and across chunks the carried `[B, D, N]` state.
+The scan runs in chunks of `chunk_size` tokens: within a chunk the
+recurrence over `(exp(dt A), dt B x)` a token at a time, unrolled
+(`ssm.affine_states`; the reference's `combine_fn`, 231-234, scans the
+same pairs associatively), and across chunks the carried `[B, D, N]` state.
 Mamba's block has no feed-forward (`MambaBlock`, 505-529: norm, mixer,
 residual), which `CausalTransformer` spells as an `mlp_features` of 0.
 """
@@ -39,6 +40,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.typing import DTypeLike
 
 from dew.nn.activations import silu
 from dew.nn.blocks import normal_kernel
@@ -49,6 +51,7 @@ from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
     DepthwiseConv1d,
+    Heads,
     held_scan,
     over_sequence,
     scan_cache,
@@ -60,13 +63,41 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
-from dew.nn.sharding import rows_like
+from dew.nn.sharding import explicit_spec, rows_like
 from dew.nn.ssm import affine_states
 
 CHUNK_SIZE = 64
-"""Tokens per associative scan. Each chunk materialises its `[B, C, D, N]`
-decays and writes, so the chunk bounds the scan's memory; the output does
-not depend on it."""
+"""Tokens per recurrence chunk (`ssm.affine_states`). Each chunk materialises
+its `[B, C, D, N]` decays and writes, so the chunk bounds the scan's memory;
+the output does not depend on it."""
+
+
+def _spread(t: jax.Array, channels: int) -> jax.Array:
+    """`t` `[B, C, N]` broadcast over `channels` as `[B, C, D, N]` by doubling concatenations, then sliced:
+    every order of its derivative transposes it with JAX's own rules as a balanced tree of halves, so B's
+    and C's gradients sum their channels pairwise, as the recurrence's autodiff reduces a token's, where a
+    broadcast's transpose became a dot of the channels in turn (row 8563); zeros past the channels, which
+    a slice's transpose pads, add exactly."""
+    spread = t[:, :, None, :]
+    while spread.shape[2] < channels:
+        spread = jnp.concatenate([spread, spread], axis=2)
+    return spread[:, :, :channels]
+
+
+def _readout(channels: int, states: jax.Array, C: jax.Array, *,
+             precision: jax.lax.PrecisionLike = recurrence_algebra.STATE_PRECISION,
+             preferred_element_type: DTypeLike | None = None) -> jax.Array:
+    """`sum_n C_n h_n` `[B, C, D]` of `states` `[B, C, D, N]` and `C` `[B, C, N]` spread over the channels
+    (`_spread`), placed as the states' batch dimensions are where an Explicit axis splits them, the
+    contracted states whole as `C` is: the readout's product at `STATE_PRECISION`."""
+    spread = _spread(C, channels)
+    placed = explicit_spec(states)
+    if placed is not None:
+        batch = jax.sharding.PartitionSpec(*tuple(placed.spec)[:3], None)
+        spread = jax.sharding.reshard(spread, jax.sharding.NamedSharding(placed.mesh, batch))
+    # At `STATE_PRECISION` but where the sum states its own (a wide CPU sum's, `accumulated`).
+    return jnp.einsum('bcdn,bcdn->bcd', states, spread, precision=precision,
+                      preferred_element_type=preferred_element_type)
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
@@ -106,13 +137,16 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
 
     def scanned(h, step):
         x_c, dt_c, B_c, C_c, reset_c = step   # [B, C, D] twice, [B, C, N] twice, [B, C]
-        # The kernels' decay (`recurrence_algebra.selective_decay`), its rate in base 2, zero at a reset.
-        decay = recurrence_algebra.selective_decay(dt_c[..., None], A * recurrence_algebra.LOG2_E,
-                                                   1.0 - reset_c[..., None, None].astype(work))
-        write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
-        # The reference's `combine_fn` (modeling_mamba.py:231-234), from the state entering the chunk.
+        # The kernels' decay (`recurrence_algebra.selective_decay`), zero at a reset.
+        kept = 1.0 - reset_c[..., None, None].astype(work)
+        decay = recurrence_algebra.selective_decay(dt_c[..., None], A, kept)
+        write = (dt_c * x_c)[..., None] * _spread(B_c, channels)
+        # The chunk's states a token at a time from the state entering it (`ssm.affine_states`).
         states = affine_states(decay, write, h, axis=1)
-        read = recurrence_algebra.portable_einsum('bcdn,bcn->bcd', states, C_c)
+        # The readout's contraction over the states as it was (`portable_einsum`'s, its accumulation policy),
+        # each channel its own batch: C spread over the channels inside the product, so a wide sum widens C
+        # itself and rounds its cotangent after the channels' tree.
+        read = accumulated(functools.partial(_readout, channels), states, C_c)
         return states[:, -1], read
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))
@@ -254,12 +288,16 @@ class Mamba(nn.Module):
             # Each shard convolves its slice reading the real tokens before it from the earlier ones
             # (`sequence_conv`); the step, B and C come token by token outside; each shard scans from
             # zero, then from the state the earlier ones leave it (`_sequence_scan`, `sequence_entered`).
+            # Each channel its own conv and state, split as heads are (`Heads`); B and C every channel's.
+            channels = self.intermediate_size
             convolved = over_sequence(functools.partial(_sequence_conv, dtype=wide), shards,
-                                      (mixed.astype(wide), tokens.segments, valid), (taps, bias))
+                                      (mixed.astype(wide), tokens.segments, valid), (taps, bias),
+                                      heads=Heads(channels, channels, {0: 2, 3: 0, 4: 0}))
             xs, step, B, C = self._projected(convolved, valid)
             out = over_sequence(functools.partial(_sequence_scan, chunk_size=self.chunk_size), shards,
                                 (xs, step, B, C, tokens.starts),
-                                (-accurate_exp(jnp.asarray(self.A_log, wide)), jnp.asarray(self.D, wide)))
+                                (-accurate_exp(jnp.asarray(self.A_log, wide)), jnp.asarray(self.D, wide)),
+                                heads=Heads(channels, channels, {0: 2, 1: 2, 5: 0, 6: 0}))
             # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'.
             out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         else:

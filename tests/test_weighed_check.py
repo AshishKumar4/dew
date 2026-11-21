@@ -324,6 +324,35 @@ def test_a_sharded_weighed_site_judges_its_weighed_check_from_its_own_map_tasks(
         monkeypatch.delenv(POOL)
 
 
+def test_a_compensated_sum_is_weighed_as_its_double_float_pair_rounds():
+    """Dew's compensated sum (`dew.nn.precision.compensated_sum`, a reduction whose combine is a double-float
+    pair's) is weighed by its pair's bound, `u |sum| + gamma_{n-1}^2 sum |x|` (row 9781: its reduction had no
+    rule and refused every program holding one, Gemma 3n's norms among them): of rows whose large terms
+    cancel, its scale is below a plain sum's, `(n - 1) u sum |x|`, at every row."""
+    from dew.nn.precision import compensated_sum
+
+    rng = np.random.default_rng(9781)
+    large = rng.uniform(1e5, 1e6, (8, 32))
+    x = jnp.asarray(np.concatenate([large, -large, rng.standard_normal((8, 64))], axis=1), jnp.float32)
+    _, compensated = rounding_scale(lambda x: compensated_sum(x, (1,)), x)
+    _, plain = rounding_scale(lambda x: jnp.sum(x, axis=1), x)
+    assert np.all(np.asarray(compensated) < np.asarray(plain))
+
+
+def test_a_power_of_a_float_rounds_as_its_exponent_takes_it():
+    """A float raised to a float power (`lax.pow`: Adam's bias correction, `1 - b**count`, row 8752 found its
+    step had no rule): at an integer exponent its value rounds `max(|e| - 1, 1)` times, as an integer power's
+    (`lax.integer_pow`) does, so its scale is the integer power's; at another, through `exp(e log x)`, by
+    the exponential's ulps and the logarithm's, more than once."""
+    x = jnp.asarray(np.linspace(0.5, 1.5, 64), jnp.float32)
+    _, powered = rounding_scale(lambda x: jax.lax.pow(x, jnp.float32(3)), x)
+    _, cubed = rounding_scale(lambda x: jax.lax.integer_pow(x, 3), x)
+    np.testing.assert_array_equal(np.asarray(powered), np.asarray(cubed))
+    _, fractional = rounding_scale(lambda x: jax.lax.pow(x, jnp.float32(0.5)), x)
+    _, rooted = rounding_scale(jnp.sqrt, x)
+    assert np.all(np.asarray(fractional) > np.asarray(rooted))
+
+
 def test_the_rounding_scale_knows_an_operation_by_its_object():
     """The rounding scale reads each operation's rule by JAX's primitive object: a user's primitive named
     `add`, which doubles its operand, has no rule and is refused, where its name's rule weighed it as one

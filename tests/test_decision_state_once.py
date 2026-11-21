@@ -55,7 +55,8 @@ QUESTIONS = {"team": Choice("Which team handles it?", ["cards", "loans", "fraud"
 """Questions of four options each, the readout's count, so each question's logits are a row of four."""
 STATE_ONCE_SEEDS = 16
 """Check 1's declared seeds for rows over one state against each question's own row: at 8, as the packed
-rows' of two streams (`LETTERED_SEEDS`), a question of two options' rows were left unresolved over 40."""
+lettered rows' of two streams were (`test_decision_streams.LETTERED_STREAM_SEEDS`), a question of two
+options' rows were left unresolved over 40."""
 
 
 def own_and_shared(layout=SHARED, state: str = STATES[2], questions=QUESTIONS):

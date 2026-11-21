@@ -35,6 +35,7 @@ from typing_extensions import TypeVar
 from dew._hashing import array_fingerprint
 from dew._records import finite
 from dew.batch import (
+    BLOCKS_FIELD,
     VALIDITY_FIELD,
     Coordinates,
     Variables,
@@ -68,6 +69,7 @@ from dew.nn.protocols import (
     BlockDrafting,
     Bounded,
     Decoding,
+    DrawsAlone,
     Exposing,
     Generating,
     Lacks,
@@ -445,9 +447,11 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot], adapters=adapters)
     if rebuild_position(model) is not None:
-        if cache is not None or logical is not None or inputs.conditioning:
+        # A rebuild replays a row's ids alone (`_rebuilt`), so a prompt's blocks would not reach it.
+        if (cache is not None or logical is not None or inputs.conditioning
+                or BLOCKS_FIELD in inputs.token_fields):
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
-                             'without custom coordinates')
+                             'without custom coordinates or blocks')
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
         slots = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1, -1)
         history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),
@@ -543,6 +547,28 @@ def crosses(original: int, lengths: jax.Array, following: jax.Array) -> jax.Arra
     """The rows a call taking them from `lengths` tokens to `following` carries past `original`, the
     position past which the model's cached keys go stale (`rebuild_position`)."""
     return (lengths <= original) & (following > original)
+
+
+def refuse_redrawn(model: nn.Module, strategy: Strategy | None) -> None:
+    """Refuse a strategy that reads tokens it then rejects or reorders (a speculative block's, a beam's)
+    for a decoder that draws a token a row at a time (`DrawsAlone`), naming its reason; no strategy is
+    `Sample`, which draws so."""
+    if isinstance(model, DrawsAlone) and strategy is not None and not isinstance(strategy, Sample):
+        raise ValueError(f"{type(strategy).__name__} reads tokens it then rejects or reorders, and "
+                         f"{model.draws_alone}: this decoder draws a token a row at a time (Sample)")
+
+
+def refuse_closed_holes(model: nn.Module, real: np.ndarray, closing: str) -> None:
+    """Refuse a prompt with a hole between its real tokens (`real`, the host's) for a decoder that draws a
+    token a row at a time (`DrawsAlone`), whose state steps by its tokens' adjacency, a hole breaking it,
+    where `closing` (a LongRoPE rebuild's replay, `_rebuilt`; a server's prefill) reads the row's ids with
+    its holes closed."""
+    if not isinstance(model, DrawsAlone):
+        return
+    held = np.cumsum(real, axis=1) > 0
+    if np.any(real[:, 1:] & ~real[:, :-1] & held[:, :-1]):
+        raise ValueError(f"{closing} reads a row's ids with its holes closed, and {model.draws_alone}: a "
+                         "prompt with a hole between its real tokens is refused")
 
 
 def _refuse_generation(model: nn.Module) -> None:
@@ -997,7 +1023,10 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     ids = local_rows(inputs.tokens)
     fields = {name: jax.tree.map(local_rows, value) for name, value in inputs.token_fields.items()}
     refuse_prefix(model, prefix, longest=None)
-    fields = with_served_blocks(fields, real_slots(fields, ids.shape, xp=np), prefix)
+    real = real_slots(fields, ids.shape, xp=np)
+    if rebuild_position(model) is not None:
+        refuse_closed_holes(model, real, "a LongRoPE rebuild")
+    fields = with_served_blocks(fields, real, prefix)
     conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
@@ -1006,6 +1035,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
         raise ValueError(f"trips must cover the budget of {max_new_tokens} tokens, got {trips}")
     prepared = _validated(model, ids, fields, conditioning, trips, sampling, n)
     components = resolve(sampling, logits, stopping, strategy)
+    refuse_redrawn(model, components[2])
     controls = (max_new_tokens, trips, n, sampling.pad) + ((_digest(components),) if pooled else ())
     return prepared, controls, components
 

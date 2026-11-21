@@ -14,7 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import launches, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stores, swizzling
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stacked, stores, swizzling
 from dew.nn.kernels.templates.attention_mosaic_fused import staged_parts, walked_sums
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -154,7 +154,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
     through one ring its consumers read (`_coop_step`), under the first pass's D and the forward's
     denominator; each consumer's share of the columns of dQ added a tile at a time, and of dK and dV into
     its key head's own (`Family.added`, zeros: a key head's query heads add theirs; dK's and dV's zeros one
-    ref of both, `mosaic.stacked_zeros`, row 3180).
+    ref of both, `stacked.zeros`, row 3180).
     Returns dQ `[B, Qp, H, D]`, dK and dV `[B, Kp, KV, D]`, fp32."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads = key.shape[1], key.shape[2]
@@ -166,17 +166,17 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
     leaves, treedef = jax.tree.flatten(spans)
     # dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
     shapes = [(batch, keys_padded, kv_heads, width)] * 2
-    groups = mosaic.stacked_groups(shapes)
+    groups = stacked.groups(shapes)
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, dkv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn, *exponents = refs
-        dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
+        dk_ref, dv_ref = stacked.views([dkv_ref], groups)
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, heads // kv_heads)
-        views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
+        views = _views_of(family, {"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
         k_first = family.program_index("k_tiles") * block_k
         lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
@@ -247,7 +247,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
                              2 * width + 2 * value.shape[-1]))
     # The accumulators' zeros this launch's own (`launches.filled`): unbound, every layer's were one buffer.
     dq = jax.new_ref(launches.filled((batch, queries, heads, width), jnp.float32, query, dout))
-    dkv = mosaic.stacked_zeros(shapes, groups, query, dout)
+    dkv = stacked.zeros(shapes, groups, query, dout)
     launch(query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq, *dkv)
-    dk, dv = mosaic.stacked_read(dkv, groups)
+    dk, dv = stacked.read(dkv, groups)
     return jax.freeze(dq), dk, dv

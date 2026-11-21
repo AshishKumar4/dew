@@ -69,9 +69,12 @@ def test_a_text_generation_and_an_rl_rollout_are_read_by_the_pass_unless_it_is_o
     objective = GRPOObjective(model, seq_len=7)
     params = nn.unbox(objective.init(jax.random.key(0)))
     sampling = Sampling(temperature=1.2, eos_token_ids=(3, 7), pad_token_id=12)
+    # The init's own program is read by the pass (`Objective.init`, one program outside a trace): what the
+    # generation with the pass off records is counted from after it.
+    drawn = len(passed())
     with algebra.passes(on=False):
         TextGeneration(model, params, sampling=sampling)([[1, 2, 3]], 3, key=0)
-    assert not passed()
+    assert len(passed()) == drawn
     generate = TextGeneration(model, params, sampling=sampling)
     names, passes = compiled_in(passed, lambda: generate([[1, 2, 3]], 3, key=0))
     assert names and passes >= len(names), (passes, names)

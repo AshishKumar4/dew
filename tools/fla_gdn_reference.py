@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """The fixture tests hold the recurrence template's gated delta rule to: fla-core's own
-`chunk_gated_delta_rule`, `chunk_kda` and `chunk_rwkv6` (its Triton kernels) on a CUDA GPU, forward and every
-gradient, at each site tests/fla_sites.py names, over the tests' own seeded draws.
+`chunk_gated_delta_rule`, `chunk_kda`, `chunk_rwkv6` and `chunk_simple_gla` (its Triton kernels) on a CUDA
+GPU, forward and every gradient, at each site tests/fla_sites.py names, over the tests' own seeded draws.
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla> <unit> <site>...
     PYTHONPATH=src:tests:tools python tools/fla_gdn_reference.py --merge <unit>...
 
-on a GPU, Dew's environment recording and a second Python with torch and fla-core (`--serve`, the
-"fla" cohort, tools/reference_releases.py) running fla and its reference, each run a unit of named sites
-(`--list` names them all), the units then merged. What lands is tests/fixtures/fla/gdn_seeded.npz, a
-summary recording (`record_case(..., summary=True)`): per site, seed and
-leaf, fla's distance from float64 at the site's inputs, which the test draws again (`Site.arrays`), and the
-truth's sketch, which Dew's float64 token recurrence is held to.
+on a GPU, Dew's environment recording and a second Python with torch and fla-core (`--serve`, the "fla"
+cohort, tools/reference_releases.py) running fla and its reference, each run a unit of named sites (`--list`
+names them all), the units then merged. What lands is tests/fixtures/fla/gdn_seeded.npz (fla's simple GLA's
+sites in simple_gla_seeded.npz, `fla_sites.SIMPLE_RECORDED`), a summary recording (`record_case(...,
+summary=True)`): per site, seed and leaf, fla's distance from float64 at the site's inputs, which the test
+draws again (`Site.arrays`), and the truth's sketch, which Dew's float64 token recurrence is held to.
 
 fla runs at its defaults (an fp32 call's products TF32, as the fast forms' bar is). Packed documents run as
 fla runs them, one flattened row of sequences (`cu_seqlens`), a row's first taking its entering memory
@@ -19,7 +19,9 @@ unless a document starts it. The oracle is fla's own reference, `naive_recurrent
 `naive_recurrent_kda` and `naive_recurrent_rwkv6` (fla/ops/*/naive.py, rwkv6/recurrent_naive.py), on each
 sequence in torch float64 (`_dew_torch.precision.float64`, which widens their fp32 casts) on the GPU, held at
 every seed to Dew's float64 token recurrence. RWKV6's sites (an own weight `own`, fla's `u`, and no write
-gate) take its `chunk_rwkv6(r, k, v, w, u)`, its naive reference laid `[B, H, T, K]` as it reads them.
+gate) take its `chunk_rwkv6(r, k, v, w, u)`, its naive reference laid `[B, H, T, K]` as it reads them. A
+write gate without the delta rule under a decay a head takes `chunk_simple_gla(q, k beta, v, g)`, its gate on
+its keys (the template's `gated_keys`), held to `naive_recurrent_simple_gla` alike.
 """
 
 import itertools
@@ -30,7 +32,41 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "fla"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "gdn_seeded.npz"
+"""The delta rules' recording (`fla_sites.RECORDED`), which a command but a merge names unread."""
+
+TRUTHS = {False: "fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch "
+                 "float64",
+          True: "fla's naive_recurrent_simple_gla on each sequence in torch float64"}
+"""Each recording's truth (`fla_sites.RECORDED`'s as its pinned units state it, `SIMPLE_RECORDED`'s, by
+whether its sites are fla's simple GLA's), the provenance its units must agree in to merge."""
+
+
+def recording_of(names) -> bool:
+    """Whether `names`' sites are fla's simple GLA's (`fla_sites.SIMPLE_RECORDED`'s) or the delta rules' and
+    RWKV6's (`RECORDED`'s): a unit records one recording's sites alone."""
+    from fla_sites import simple_gla, sites
+
+    kinds = {simple_gla(sites()[name].hooks) for name in names}
+    if len(kinds) != 1:
+        raise ValueError("a unit records fla's simple GLA's sites or the other sites, not both: "
+                         f"{sorted(names)}")
+    return kinds.pop()
+
+
+def fixture_of(units) -> Path:
+    """The recording a merge's `units` land in, by their sites (`recording_of`)."""
+    from fla_sites import RECORDED, SIMPLE_RECORDED
+
+    names = set()
+    for unit in units:
+        with np.load(unit, allow_pickle=False) as part:
+            names |= {key.split(".", 1)[0] for key in part if key != "provenance"}
+    return SIMPLE_RECORDED if recording_of(names) else RECORDED
 GRADIENTS = ("q", "k", "v", "g", "beta", "h0")
 """The delta rules' differentiated operands; RWKV6's take its own weight in the write gate's place."""
 
@@ -52,12 +88,13 @@ def sequences(arrays) -> list[tuple[int, int, int, bool]]:
 
 
 def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: bool,
-        gradients: bool = True) -> dict[str, np.ndarray]:
+        gradients: bool = True, simple: bool = False) -> dict[str, np.ndarray]:
     """`rule` (fla's chunked rule, or its naive reference with `per_sequence`) on a site's arrays: its rows'
     sequences flattened into one row (`cu_seqlens`), or each alone, the operands in `dtype` but the log decay
     and memory fp32 (in float64 for the reference), and with `gradients` the output's and final memory's
     gradients under the drawn cotangents; leaves as `fla_sites.LEAVES`, the output and final memory alone
-    without them."""
+    without them. A `simple` rule (fla's simple GLA) takes the write gate on its keys, `k beta`, which its
+    gradient's chain gives `beta`'s."""
     import torch
 
     wide = dtype == torch.float64
@@ -75,18 +112,22 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
         # Each value head its key head's queries and keys where the rule reads one a value head: fla's
         # naive references, and RWKV6's chunk, which takes no grouped heads.
         x = inputs[name][row:row + 1, start:end]
-        return x.repeat_interleave(group, dim=2) if (per_sequence or owned) and name in ("q", "k") else x
+        return (x.repeat_interleave(group, dim=2) if (per_sequence or owned or simple) and name in ("q", "k")
+                else x)
 
     def called(q, k, v, g, fifth, state, **flat):
         """The site's rule on one sequence's operands, or the flattened row's (`flat`: `cu_seqlens`):
-        RWKV6's (`own` its `u`, the naive reference reading `[B, H, T, K]`), the KDA's or the gated delta
-        rule's."""
+        RWKV6's (`own` its `u`, the naive reference reading `[B, H, T, K]`), the simple GLA's (`fifth` the
+        write gate, on its keys), the KDA's or the gated delta rule's."""
         if owned:
             if per_sequence:
                 out, final = rule(*(x.transpose(1, 2) for x in (q, k, v, g)), fifth, scale=scale,
                                   initial_state=state, output_final_state=True)
                 return out.transpose(1, 2), final
             return rule(q, k, v, g, fifth, scale=scale, initial_state=state, output_final_state=True, **flat)
+        if simple:
+            return rule(q, k * fifth.unsqueeze(-1), v, g, scale=scale, initial_state=state,
+                        output_final_state=True, **flat)
         if kda:
             return rule(q, k, v, g, fifth, scale=scale, initial_state=state, output_final_state=True, **flat)
         return rule(q, k, v, fifth, g, scale=scale, initial_state=state, output_final_state=True, **flat)
@@ -130,9 +171,9 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
 
 def serve() -> None:
     """The torch side (tools/reference_worker.py's protocol): each request a site's inputs with its `dtype`,
-    `kind` ('kda' or 'gdn'), `scale` and `leaves` ('all', or 'forward' for the output and final memory
-    alone), answered with fla's outputs and the reference's (`reference.<leaf>`, `truth.<leaf>`), after one
-    `ready` line of fla's, torch's and Triton's releases and the device."""
+    `kind` ('kda', 'gdn', 'rwkv6' or 'simple_gla'), `scale` and `leaves` ('all', or 'forward' for the output
+    and final memory alone), answered with fla's outputs and the reference's (`reference.<leaf>`,
+    `truth.<leaf>`), after one `ready` line of fla's, torch's and Triton's releases and the device."""
     import reference_worker
     import torch
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -141,6 +182,8 @@ def serve() -> None:
     from fla.ops.kda.naive import naive_recurrent_kda
     from fla.ops.rwkv6 import chunk_rwkv6
     from fla.ops.rwkv6.recurrent_naive import naive_recurrent_rwkv6
+    from fla.ops.simple_gla import chunk_simple_gla
+    from fla.ops.simple_gla.naive import naive_recurrent_simple_gla
     from reference_releases import require
 
     from _dew_torch.precision import float64
@@ -156,19 +199,20 @@ def serve() -> None:
     def answer(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         dtype, kind, leaves = (str(arrays.pop(name)) for name in ("dtype", "kind", "leaves"))
         scale = float(arrays.pop("scale"))
-        kda, gradients = kind == "kda", leaves == "all"
-        rule = {"kda": chunk_kda, "gdn": chunk_gated_delta_rule, "rwkv6": chunk_rwkv6}[kind]
+        kda, simple, gradients = kind == "kda", kind == "simple_gla", leaves == "all"
+        rule = {"kda": chunk_kda, "gdn": chunk_gated_delta_rule, "rwkv6": chunk_rwkv6,
+                "simple_gla": chunk_simple_gla}[kind]
         began = time.perf_counter()
         reference = run(arrays, kda=kda, scale=scale, rule=rule, dtype=getattr(torch, dtype), device="cuda",
-                        per_sequence=False, gradients=gradients)
+                        per_sequence=False, gradients=gradients, simple=simple)
         referenced = time.perf_counter()
         # The truth in float64 on the GPU: on the CPU its token loop and autograd took most of a site's
         # 1432 s for 320 draws (fla-record3-h100-f8fbb058d, the worker at a core's whole time).
         with float64():
             naive = {"kda": naive_recurrent_kda, "gdn": naive_recurrent_gated_delta_rule,
-                     "rwkv6": naive_recurrent_rwkv6}[kind]
+                     "rwkv6": naive_recurrent_rwkv6, "simple_gla": naive_recurrent_simple_gla}[kind]
             truth = run(arrays, kda=kda, scale=scale, rule=naive, dtype=torch.float64, device="cuda",
-                        per_sequence=True, gradients=gradients)
+                        per_sequence=True, gradients=gradients, simple=simple)
         print(f"timed fla {referenced - began:.3f} s truth {time.perf_counter() - referenced:.3f} s",
               file=sys.stderr, flush=True)
         return reference_worker.paired(reference, truth)
@@ -193,7 +237,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
     from dew.nn.kernels.selection import KernelRefused
 
     version, device = worker.started.split(maxsplit=1)
-    stored = {}
+    simple, stored = recording_of(names), {}
     for name in names:
         site, began = sites()[name], time.perf_counter()
         sample = site.arrays(0)
@@ -201,10 +245,16 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
 
         leaves = "all" if set(site.leaves) - {"out", "final"} else "forward"
 
-        def fla(arrays, dtype=dtype, kda=kda, scale=site.hooks.scale, leaves=leaves):
+        # The query's scale as the rule's prologue takes it (`recurrence._prologue`): its own, else an
+        # l2-normed query's keys' width's, else none.
+        hooks = site.hooks
+        scale = (hooks.scale if hooks.scale is not None else sample["k"].shape[-1] ** -0.5 if hooks.l2norm
+                 else 1.0)
+
+        def fla(arrays, dtype=dtype, kda=kda, scale=scale, leaves=leaves, delta=hooks.delta):
             request = {key: np.asarray(value, np.float32) if key != "starts" else value
                        for key, value in arrays.items()}
-            kind = "rwkv6" if "own" in arrays else "kda" if kda else "gdn"
+            kind = "rwkv6" if "own" in arrays else "kda" if kda else "gdn" if delta else "simple_gla"
             options = {"dtype": dtype, "kind": kind, "scale": scale, "leaves": leaves}
             request |= {name: np.asarray(value) for name, value in options.items()}
             return arms(worker.ask(request))
@@ -239,11 +289,10 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
         version, version, device.strip(),
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python> <unit> "
         "<site>...",
-        truth="fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch "
-              "float64",
+        truth=TRUTHS[simple],
         cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced "
                     "chain_roundings")
-    np.savez(out, **stored)
+    np.savez(out, allow_pickle=False, **stored)
     print(f"wrote {out}: {out.stat().st_size:,} bytes", flush=True)
 
 
@@ -251,8 +300,11 @@ def main() -> None:
     """The recorder's command line (`reference_worker.recording_command`), its sites `fla_sites`'s."""
     from reference_worker import recording_command
 
-    recording_command(__file__, "fla_sites", serve=serve, write_seeded=write_seeded,
-                      fixture=FIXTURE, license="MIT")
+    # A merge's recording read from its units' sites (`fixture_of`, which reads Dew's fla_sites); the
+    # worker's environment, fla's, holds no JAX, so nothing else here imports it.
+    fixture = fixture_of(sys.argv[2:]) if sys.argv[1:2] == ["--merge"] else FIXTURE
+    recording_command(__file__, "fla_sites", serve=serve, write_seeded=write_seeded, fixture=fixture,
+                      license="MIT")
 
 
 if __name__ == "__main__":

@@ -64,7 +64,6 @@ from dew.state import CHECKPOINTED, TokenCount, TrainState
 from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.runtime import Preempted
-from dew.training.trainer import refuse_non_finite
 
 
 def endless():
@@ -191,6 +190,7 @@ def test_a_runs_start_reports_each_phase_it_took_once():
     make_trainer(objective=Features(), tracker=quiet).fit(dataset(), steps=2, log_every=100)
     started = [name for _, scalars in quiet.scalars for name in scalars if name.startswith("startup/")]
     assert sorted(started) == sorted(seconds | {"startup/start_overlapped"})
+
 
 
 def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
@@ -1280,12 +1280,16 @@ def held_state(params, ema):
 
 
 def bit_patterns(shape, dtype, seed):
-    """Values drawn bit by bit, so NaN payloads and subnormals turn up, with
-    both zeros, a NaN of every payload bit set and the smallest subnormal first."""
+    """Finite values drawn bit by bit, so subnormals and every sign and mantissa turn up, with both zeros,
+    the largest magnitude of every mantissa bit set and the smallest subnormal first: a non-finite one has
+    the lowest bit of its all-ones exponent cleared, as no save writes a state holding one (row 9021)."""
     kind = np.dtype(f"u{np.dtype(dtype).itemsize}")
     bits = np.random.default_rng(seed).integers(0, np.iinfo(kind).max, size=shape,
                                                 dtype=kind, endpoint=True)
     bits.flat[:4] = [1 << (8 * kind.itemsize - 1), 0, np.iinfo(kind).max, 1]
+    lowest_exponent = kind.type(1 << int(jnp.finfo(dtype).nmant))
+    unfinite = ~np.isfinite(bits.view(dtype).astype(np.float32))
+    bits[unfinite] ^= lowest_exponent
     return bits.view(dtype)
 
 
@@ -1308,7 +1312,7 @@ def awkward_state():
 
 
 def test_the_ema_comes_back_bit_for_bit_however_it_is_read(tmp_path):
-    """Every NaN payload, signed zero and subnormal of the EMA survives a save,
+    """Every signed zero, subnormal and finite bit pattern of the EMA survives a save,
     read whole, typed, without the weights beside it, into pinned host memory
     and as the shapes the checkpoint reports."""
     state = awkward_state()
@@ -2426,7 +2430,17 @@ def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path
     assert resumed.checkpoints.latest == 2
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
-    refuse_non_finite(restored, 3, lambda: 2)
+    # A direct save of a non-finite state, on either tier, is refused at the writer before anything is
+    # written or rotated: the latest step stays the finite one (row 9021: it wrote, and a local save
+    # deleted the finite step it replaced).
+    poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), restored.variables)
+    with pytest.raises(RuntimeError):
+        resumed.checkpoints.save(3, restored.replace(variables=poisoned), None)
+    if tier == "local":
+        with pytest.raises(RuntimeError):
+            resumed.checkpoints.save_local(3, restored.replace(variables=poisoned), None)
+    resumed.checkpoints.wait()
+    assert resumed.checkpoints.latest == 2
 
 
 def test_a_trainers_refit_traces_its_step_and_start_once_and_another_trainers_its_own():

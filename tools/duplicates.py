@@ -470,7 +470,7 @@ pylint compares every two files, hashing both each time, which is quadratic in t
 def main(arguments: Sequence[str], forked: bool = False) -> int:
     """The gate, the text read in forked processes when `forked` (`forked_map`), as the script reads it; a
     caller in a process that may hold threads (a test, under JAX) reads it in its own."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", help="a commit: a structural copy fails if written in more places than at"
                                        " its merge-base with HEAD")
     parser.add_argument("--reading", choices=("text", "structure"),

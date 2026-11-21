@@ -38,16 +38,30 @@ import functools
 import itertools
 import math
 from collections.abc import Mapping
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.batch import document_ranks, document_starts, prefix_sum, real_slots, token_layout
+from dew.batch import (
+    BLOCKS_FIELD,
+    COORDINATES_FIELD,
+    Variables,
+    document_ranks,
+    document_starts,
+    prefix_sum,
+    real_slots,
+    thaw,
+    token_coordinates,
+    token_layout,
+)
 from dew.nn.continuum import HeadTerms, LevelTerms, level_names
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
-from dew.nn.protocols import SteppedInContext
+from dew.nn.projections import projection_groups
+from dew.nn.protocols import Bounded, CacheCapacity, Layered, ProjectionGroup, Serving, SteppedInContext
+from dew.nn.wrapping import DecoderHooks
 
 
 @dataclasses.dataclass(frozen=True)
@@ -425,11 +439,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     inputs = (*(sequence_blocks(value, block, leading=True) for value in (hidden, targets, weights)),
               sequence_blocks(jnp.pad(runs, edge, mode="edge"), block, leading=True),
               tuple(sequence_blocks(jnp.pad(key, edge, mode="edge"), block, leading=True) for key in keys))
-    zeros = tuple(jax.tree.map(jnp.zeros_like, level) for level in chain.started)
-    nothing = _gathered(jnp.zeros((rows, 1), bool), jnp.zeros((rows, 1, _WIDTH), at_least_fp32(hidden.dtype)))
-    # Before a row's first real token no run is open: run 0, window -1.
-    first = (chain.started, zeros, (nothing,) * len(starts), jnp.zeros((rows,), runs.dtype),
-             tuple(jnp.full((rows,), -1, key.dtype) for key in keys))
+    first = chain.first(at_least_fp32(hidden.dtype))
     (levels, partials, energies, _, _), (losses, top, log_z, whole) = jax.lax.scan(
         jax.checkpoint(functools.partial(chain.block, logits=logits)), first, inputs)
 
@@ -507,12 +517,18 @@ class _Chain:
         head = _head_terms(self.model.apply(self.variables, passed, method="head_bounds"))
         return jax.lax.stop_gradient(head), tuple(jax.lax.stop_gradient(level) for level in read)
 
-    def scored(self, versions, chosen, states, block_targets, block_weights):
-        """Each slot's losses, its states read through every level at its own of that level's `versions`
-        (`chosen`, per slot), in the chain's order; and, damped, each level's slot terms there
-        (`_slot_terms`)."""
-        from dew.objectives.lm.chunked import logits_cross_entropy
+    def first(self, dtype) -> tuple:
+        """The carry before a row's first real token (`block`'s): each level at its start, no gradient or
+        terms gathered (terms in `dtype`), and no run open, run 0 at window -1."""
+        count = len(self.starts)
+        zeros = tuple(jax.tree.map(jnp.zeros_like, level) for level in self.started)
+        nothing = _gathered(jnp.zeros((self.rows, 1), bool), jnp.zeros((self.rows, 1, _WIDTH), dtype))
+        return (self.started, zeros, (nothing,) * count, jnp.zeros((self.rows,), jnp.int32),
+                tuple(jnp.full((self.rows,), -1, jnp.int32) for _ in range(count)))
 
+    def read(self, versions, chosen, states) -> tuple[jax.Array, list]:
+        """`states` read through every level at its own of that level's `versions` (`chosen`, per slot),
+        in the chain's order; and, damped, each level's terms there."""
         passed, read = states, []
         for index in range(len(self.starts)):
             if self.adaptation.damped:
@@ -523,7 +539,19 @@ class _Chain:
             states_read = [jax.vmap(functools.partial(self.level_states, index))(version, passed)
                            for version in versions[index]]
             passed = _chosen_by(chosen[index], states_read)
-        block_logits = jnp.asarray(self.model.apply(self.variables, passed, method="head_logits"))
+        return passed, read
+
+    def logits(self, passed) -> jax.Array:
+        """The head's logits of `passed`, states read through every level (`read`)."""
+        return jnp.asarray(self.model.apply(self.variables, passed, method="head_logits"))
+
+    def scored(self, versions, chosen, states, block_targets, block_weights):
+        """Each slot's losses, its states read through every level at its own of that level's `versions`
+        (`chosen`, per slot, `read`); and, damped, each level's slot terms there (`_slot_terms`)."""
+        from dew.objectives.lm.chunked import logits_cross_entropy
+
+        passed, read = self.read(versions, chosen, states)
+        block_logits = self.logits(passed)
         losses, top, log_z = logits_cross_entropy(block_logits, block_targets, predict=self.predict)
         terms = None
         if self.adaptation.damped:
@@ -696,3 +724,247 @@ def _moved(reached: Mapping, started: Mapping, weights: jax.Array) -> Mapping:
     moves = jax.tree.map(lambda end, began: jnp.sum(jnp.where(
         counted.reshape(-1, *[1] * (end.ndim - 1)), end - began, 0), axis=0), reached, started)
     return jax.lax.stop_gradient({"moves": moves, "rows": jnp.sum(counted).astype(jnp.float32)})
+
+
+def decoded_alone(adaptation: ChunkAdaptation) -> str | None:
+    """Why `adaptation` decodes none (`InContextDecoder`): a damped step reads bounds over the whole
+    sequence, which a decode has not seen, and a stacked one steps the trunk, whose cache a decode keeps;
+    None where it decodes."""
+    if adaptation.damped:
+        return ("a damped step reads bounds over the whole sequence, which a decode has not seen: "
+                "generation steps an undamped adaptation alone")
+    if adaptation.layers:
+        return ("a stacked adaptation steps the trunk, whose cache a decode keeps: generation steps a level "
+                "on the final states alone")
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class InContext:
+    """How a run's generation steps its continuum level in context (`InContextDecoder`), as its saved task
+    records it (`dew.inference.tasks.TextSettings.adaptation`): its adaptation, and the id whose targets its
+    loss never counted (`LMObjective.pad_id`), which its level's steps take none of."""
+
+    adaptation: ChunkAdaptation
+    pad_id: int | None = None
+
+
+IN_CONTEXT = "in_context"
+"""The decode cache's entry an adapting decoder keeps its rows' chain in (`InContextDecoder`), beside
+the model's own."""
+
+
+class InContextDecoder(DecoderHooks):
+    """`model` decoding with its continuum level stepped in context as its training forward steps it
+    (`adapted_scores` under `adaptation`): the model a language model that adapts in context generates
+    with (row 9066).
+
+    Its trunk is `model`'s own, applied as `model` applies (an adapter's branch with it), over the
+    variables `model` reads and the decode cache `model` keeps. Beside that cache it keeps each row's
+    chain (`_Chain`'s scan carry: each level's version, its open window's gradient, the row's windows) and
+    its last real slot's states, which wait for their target, the row's next real token. Each real token
+    a call reads closes that slot as one block of the training scan (`_Chain.block`), a block of one
+    slot, so a window closed by the token steps its level as training steps it; the slot's target counts
+    where training's loss counts it (`scored_targets`): not the objective's padding id (`pad_id`), and
+    not a token of the slot's own block (a prefix run's prompt). The token's own slot is then read
+    through the versions it reads (`_Chain.opened`, `_Chain.read`), so a row's next token is drawn from
+    the logits its training forward gives that slot. A row is one document, its prompt and what it
+    draws, its windows counted from its first real token. A call that does not decode reads its tokens
+    so from a chain that has read none.
+
+    It answers the hooks a generation reads (`dew.nn.protocols`) as `model` does (`DecoderHooks`, over
+    `model`, whose variables it reads at its own root), but for what its chain cannot follow: a strategy that
+    rejects or reorders drawn tokens (`DrawsAlone`), a mixed call's or a shared prefix's rows (`Serving`), a
+    packed or forked request, an adapter set's per-row adapters; each refused by name. A damped step reads
+    bounds over the whole sequence, which a decode has not seen, and a stacked adaptation steps the trunk,
+    whose cache a decode keeps: neither decodes (`decoded_alone`)."""
+
+    wraps: ClassVar[str] = "model"
+    model: nn.Module
+    adaptation: ChunkAdaptation
+    pad_id: int | None = None
+    """The objective's padding id (`LMObjective.pad_id`), a target its loss never counts."""
+
+    def __post_init__(self):
+        refused = decoded_alone(self.adaptation)
+        if refused is not None:
+            raise ValueError(refused)
+        lacking = [protocol.__name__ for protocol in (Bounded, CacheCapacity, Layered)
+                   if not isinstance(self.model, protocol)]
+        if lacking:
+            raise ValueError(f"an adapting decoder generates over a decoder that states its bounds, its "
+                             f"cache's capacity and its layout, and {type(self.model).__name__} is no "
+                             f"{', '.join(lacking)}")
+        super().__post_init__()
+
+    @property
+    def draws_alone(self) -> str:
+        """Why it draws a token a row at a time (`dew.nn.protocols.DrawsAlone`)."""
+        return "its rows' levels step with every token they read, past what a cache's cursor rewinds"
+
+    @property
+    def cache_rebuild_position(self) -> int | None:
+        """`model`'s (`dew.nn.protocols.Serving`): a row crossing it rebuilds its whole cache, its chain's
+        too, from its history (`dew.sampling.text.empty_cache`); None where `model` serves none."""
+        return self.model.cache_rebuild_position if isinstance(self.model, Serving) else None
+
+    @nn.nowrap
+    def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
+        """The groups `model` packs over its own variables (`dew.nn.protocols.Serving`), by its own rules
+        (`projection_groups`): none where an adapter wraps it, and those alone its quantization selects as
+        their members."""
+        return projection_groups(self.model, variables)
+
+    @nn.nowrap
+    def mixed_admission_refusal(self) -> str | None:
+        """A mixed call packs requests into a row (`dew.nn.protocols.Serving`)."""
+        return "a row's level steps with its own tokens, which a mixed call packs with another request's"
+
+    @nn.nowrap
+    def split_prefill_refusal(self) -> str | None:
+        """A prefix another request cached (`dew.nn.protocols.Serving`)."""
+        return "a row's level steps with each token it reads, which a prefix another request cached does not"
+
+    def init_cache(self, batch_size: int, **fields):
+        """Open `model`'s decode cache for `batch_size` rows as `model` opens it (`fields` its own: an
+        adapter set's `adapters`) and each row's chain beside it, no slot waiting."""
+        _, opened = self.model.apply(self._read(), batch_size, method="init_cache", mutable=["cache"],
+                                     **fields)
+        # A model whose every mixer is tokenwise keeps no cache (`dew.sampling.text.empty_cache`).
+        for name, entry in dict(opened).get("cache", {}).items():
+            self.put_variable("cache", name, entry)
+        self.put_variable("cache", IN_CONTEXT, self._decode_opened(batch_size))
+
+    def _read(self) -> Variables:
+        """The variables `model` reads, its decode cache apart, its frozen leaves among its parameters
+        (`thaw`), as its training forward reads them."""
+        return thaw({name: tree for name, tree in self.variables.items() if name != "cache"})
+
+    def _decode_chain(self, rows: int) -> _Chain:
+        """The training scan's chain over `rows` rows (`adapted_scores`'s) at `model`'s variables, a
+        block a slot: no window opens inside one."""
+        variables = self._read()
+        start = _start(self.model, variables, self.adaptation)
+        names = level_names(start)
+        starts = (start,) if not names else tuple(start[name] for name in names)
+        return _Chain(self.model, variables, names, starts, self.adaptation, straddles=False, predict=False,
+                      rows=rows)
+
+    def _decode_opened(self, rows: int) -> dict:
+        """Each row's chain before its first real token (`_Chain.first`), no slot waiting: its states in
+        the widest float this process holds, which any final states' dtype round-trips through."""
+        widest = jax.dtypes.canonicalize_dtype(jnp.float64)
+        return {"chain": self._decode_chain(rows).first(jnp.float32),
+                "pending": jnp.zeros((rows, self.model.emb_features), widest),
+                "block": jnp.full((rows,), -1, jnp.int32), "count": jnp.zeros((rows,), jnp.int32)}
+
+    def __call__(self, tokens, decode: bool = False, positions=None, segment_ids=None, attention_mask=None,
+                 right_padded: bool = False, coordinates=None, **fields):
+        """The logits `[B, S, vocab]` of `tokens`' slots, each read through its row's levels as they stand
+        when it is read: decoding, past the rows' cache, else from a chain that has read nothing."""
+        laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
+                                 positions=positions, right_padded=right_padded)
+        return self._decoded(tokens, None, decode, laid, fields)
+
+    def states_and_logits_at(self, tokens, slots, decode: bool = False, positions=None, segment_ids=None,
+                             attention_mask=None, right_padded: bool = False, coordinates=None, **fields):
+        """No prediction states and the logits at `slots` alone, one a row (`[rows]`) or `[rows, K]`
+        (`dew.nn.protocols.Selective`): a prefill's, whose first draw reads one slot a row, keeps each read
+        slot's states past the levels and runs the head over those alone. Its prediction states would be a
+        draft's, and a decoder drawing a row at a time drafts nothing (`DrawsAlone`): it exposes none, so
+        its decode steps carry none."""
+        laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
+                                 positions=positions, right_padded=right_padded)
+        wanted = jnp.asarray(slots, jnp.int32).reshape(tokens.shape[0], -1)
+        logits = self._decoded(tokens, wanted, decode, laid, fields)
+        return None, logits[:, 0] if jnp.ndim(slots) == 1 else logits
+
+    def _decoded(self, tokens, wanted, decode: bool, laid, fields) -> jax.Array:
+        """`__call__`'s logits, or at the slots `wanted` names alone (`states_and_logits_at`)."""
+        if laid is not None and (laid.starts is not None or laid.forks is not None):
+            raise ValueError("a row decodes one document, its windows counted from its first real token: "
+                             "a packed or forked request steps none")
+        if fields.get("adapters") is not None:
+            raise ValueError("an adapter set's rows read their own adapters, which their levels' steps in "
+                             "context do not select")
+        if decode:
+            trunk = {name: entry for name, entry in self.variables["cache"].items() if name != IN_CONTEXT}
+            hidden, updated = self.model.apply({**self._read(), "cache": trunk}, tokens, decode=True,
+                                               coordinates=laid, method="hidden_states", mutable=["cache"],
+                                               **fields)
+            held = self.get_variable("cache", IN_CONTEXT)
+        else:
+            hidden = jnp.asarray(self.model.apply(self._read(), tokens, coordinates=laid,
+                                                  method="hidden_states", **fields))
+            updated = None
+            held = self._decode_opened(tokens.shape[0])
+        real = real_slots({} if laid is None else {COORDINATES_FIELD: laid}, tokens.shape[:2])
+        blocks = fields.get(BLOCKS_FIELD)
+        blocks = (jnp.full(tokens.shape[:2], -1, jnp.int32) if blocks is None
+                  else jnp.asarray(blocks, jnp.int32))
+        held, logits = self._scanned(held, hidden, tokens, real, blocks, wanted)
+        if updated is not None and self.is_mutable_collection("cache"):
+            for name, entry in updated["cache"].items():
+                self.put_variable("cache", name, entry)
+            self.put_variable("cache", IN_CONTEXT, held)
+        return logits
+
+    def _scanned(self, held: dict, hidden, tokens, real, blocks, wanted) -> tuple[dict, jax.Array]:
+        """The rows' chains `held` past `tokens`' slots, a slot at a time, and each slot's logits, or the
+        logits at the slots `wanted` (`[rows, K]`) names alone."""
+        rows, width = tokens.shape
+        chain = self._decode_chain(rows)
+        windows = self.adaptation.windows(len(chain.starts))
+        nothing = jnp.zeros((rows, 1), hidden.dtype)
+        runs = jnp.ones((rows, 1), jnp.int32)
+
+        def keyed(rank):
+            return tuple((rank // window)[:, None] for window in windows)
+
+        def passed(carry, states, token, count):
+            # A slot's states past the levels at the versions it reads, its target unknown.
+            versions, chosen, _, _ = chain.opened(carry, (states[:, None], token[:, None], nothing, runs,
+                                                          keyed(count)))
+            return chain.read(versions, chosen, states[:, None])[0][:, 0]
+
+        def stepped(state, adjacent, inputs):
+            # The waiting slot, closed with this token as its target, a block of the training scan, the
+            # target weighed where training's loss weighs it (`scored_targets`): the slot before it in the
+            # call real (at a call's first, the previous call's last, which a cursor continues), not the
+            # objective's padding id, and outside the waiting slot's block. Then this slot waits.
+            _, states, token, real, block = inputs
+            carry, count = state["chain"], state["count"]
+            closing = (count > 0) & real
+            counted = closing & adjacent & ~((state["block"] == block) & (block >= 0))
+            if self.pad_id is not None:
+                counted = counted & (token != self.pad_id)
+            waiting = state["pending"].astype(hidden.dtype)[:, None]
+            closed, _ = chain.block(carry, (waiting, token[:, None], counted[:, None].astype(hidden.dtype),
+                                            runs, keyed(count - 1)), logits=False)
+            carry = _where(closing, closed, carry)
+            pending = jnp.where(real[:, None], states.astype(state["pending"].dtype), state["pending"])
+            following = {"chain": carry, "pending": pending, "block": jnp.where(real, block, state["block"]),
+                         "count": count + real.astype(jnp.int32)}
+            return following, passed(carry, states, token, count)
+
+        def every(scanned, inputs):
+            state, adjacent = scanned
+            following, read = stepped(state, adjacent, inputs)
+            return (following, inputs[3]), chain.logits(read[:, None])[:, 0]
+
+        def selected(scanned, inputs):
+            # The slots a row reads keep their states past the levels, which the head reads after the scan.
+            state, adjacent, kept = scanned
+            following, read = stepped(state, adjacent, inputs)
+            chosen = wanted == inputs[0]
+            return (following, inputs[3], jnp.where(chosen[..., None], read[:, None], kept)), None
+
+        inputs = (jnp.arange(width), jnp.moveaxis(hidden, 1, 0), tokens.T, real.T, blocks.T)
+        first = jnp.ones((rows,), bool)
+        if wanted is None:
+            (held, _), logits = jax.lax.scan(every, (held, first), inputs)
+            return held, jnp.moveaxis(logits, 0, 1)
+        shape = jax.eval_shape(passed, held["chain"], hidden[:, 0], tokens[:, 0], held["count"])
+        kept = jnp.zeros((rows, wanted.shape[1], *shape.shape[1:]), shape.dtype)
+        (held, _, kept), _ = jax.lax.scan(selected, (held, first, kept), inputs)
+        return held, chain.logits(kept)

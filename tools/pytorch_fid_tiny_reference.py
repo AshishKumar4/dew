@@ -69,7 +69,8 @@ def build():
         built.append(inception)
         return inception.state_dict()
 
-    module.load_state_dict_from_url = own_state
+    # pytorch_fid's download, replaced by the tiny weights.
+    setattr(module, "load_state_dict_from_url", own_state)
     torch.manual_seed(SEED)
     model = module.InceptionV3(resize_input=True, normalize_input=True, use_fid_inception=True).eval()
     generator = torch.Generator().manual_seed(SEED + 1)

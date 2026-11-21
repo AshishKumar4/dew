@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, tail as tail_of
 
 if TYPE_CHECKING:
-    from dew.nn.kernels.templates.gemm.mosaic_gpu import Tiles
+    from dew.nn.kernels.templates.gemm.tiling import Tiles
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -47,7 +47,7 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
     and the right's) in their `decoded` forms; None where the target states no tensor rate. A pair's step is
     a CTA's: its rows by the pair's columns (`tile_columns`)."""
     rates = unit_cost.rates(target, device=False)
-    tensor, shared = rates[0], rates[5]
+    tensor, shared = rates.tensor, rates.shared
     if tensor is None:
         return None
     family = family_of(tiles, jnp.bfloat16)
@@ -123,16 +123,17 @@ def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int]) -> float:
 
 
 def split_count(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
-                multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
+                stored: float, multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
                 launch_seconds: float | None, partial_rows: int | None = None) -> int:
     """Dew: the slices a contraction of `rows` splits into at `tiles` (`Tiles.splits`: a kernel gradient's,
-    `tgmm`, and a swapped decode product's, `gmm`), derived from the call's extents and the device's facts
-    in MMA steps (`step_seconds`). Over a wave of P programs (`multiprocessors` x
-    `tiles.programs`) and `rows` in steps a group (on average), the busiest program walks ceil(O s / P) of
-    the O output tiles at ceil(steps / s) steps each at s slices, and streams as many shares of the operands
-    (`rows` of `depth` and of `width` at `itemsizes` bytes, each read once) at its multiprocessor's share
-    of `bandwidth`, beside that multiprocessor's other programs' shares (`SplitWalk.walk`): the walk is the
-    longer of the two, W unsplit. A split adds its fp32 partials' 2s + 1 passes over the output
+    `tgmm`, and a swapped decode product's, `gmm`), derived from the call's extents and the device's facts in
+    MMA steps (`step_seconds`). Over a wave of P programs (`multiprocessors` x `tiles.programs`) and `rows` in
+    steps a group (on average), the busiest program walks ceil(O s / P) of the O output tiles at ceil(steps /
+    s) steps each at s slices, and streams as many shares of the operands (`rows` of `depth` and of `width` at
+    `itemsizes` bytes, each read once) at its multiprocessor's share of `bandwidth`, beside that
+    multiprocessor's other programs' shares (`SplitWalk.walk`): the walk is the longer of the two, W unsplit.
+    Its epilogue stores the output (`stored` bytes an element: its dtype's and any epilogue operand's it
+    reads) after its tiles' products, split or not. A split adds its fp32 partials' 2s passes over the output
     (`partial_rows` of it where they hold fewer than its `groups` x `depth`: a decode step's experts' few
     rows), p steps each at `bandwidth`, and the launch their sum adds (`launch_seconds`, the part's measured
     launch in a program, row 3613; none where unmeasured). The count is the one the walk prices least
@@ -140,14 +141,14 @@ def split_count(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: in
     its runs sharing the steps whole (`split_runs`, as `gmm`'s runs share them): one where no split prices
     below the walk unsplit, where the device states no rate, or where the call has no whole tile. A closed
     form for its k whole waves (the last wave idling half a tile's slices on average) took counts the walk
-    itself priced above their neighbours: key's 2560 x 1024 kernel gradient over 24,576 rows on an A100 at
-    six slices, priced 485 us against four's 465 and two's 444, ran 1.02-1.04x four's time (M-EM-25). Its
-    steps priced at their MMA alone, a decode product's few tiles walked unsplit: an A100's 2048 x 2048
-    input gradient at 1-32 rows ran 12 programs on 108 multiprocessors, 2.8-3.0x XLA's 128 (M-NS-12, row
-    483), where its matrix's stream is the walk."""
+    itself priced above their neighbours: key's 2560 x 1024 kernel gradient over 24,576 rows on an A100 at six
+    slices, priced 485 us against four's 465 and two's 444, ran 1.02-1.04x four's time (M-EM-25). Its steps
+    priced at their MMA alone, a decode product's few tiles walked unsplit: an A100's 2048 x 2048 input
+    gradient at 1-32 rows ran 12 programs on 108 multiprocessors, 2.8-3.0x XLA's 128 (M-NS-12, row 483), where
+    its matrix's stream is the walk."""
     walk = split_walk(tiles, groups=groups, rows=rows, depth=depth, width=width, itemsizes=itemsizes,
-                      multiprocessors=multiprocessors, step_seconds=step_seconds, bandwidth=bandwidth,
-                      launch_seconds=launch_seconds, partial_rows=partial_rows)
+                      stored=stored, multiprocessors=multiprocessors, step_seconds=step_seconds,
+                      bandwidth=bandwidth, launch_seconds=launch_seconds, partial_rows=partial_rows)
     if walk is None:
         return 1
     steps = walk.steps
@@ -161,8 +162,8 @@ class SplitWalk:
     """Dew: a contraction's walk at a tile as `split_count` prices it (`split_walk`): its `output` tiles
     over a wave of `wave` programs (`multiprocessors` x the tile's programs), `steps` MMA steps a tile, each
     `step_seconds` long at a multiprocessor's whole tensor rate, its operands' `operand_bytes` streamed once
-    at `bandwidth`, and, split, its fp32 partials' passes over the output (`passes` steps each) and their
-    sum's `launch` (in steps)."""
+    at `bandwidth`, its epilogue's store of the output (`stored` steps), and, split, its fp32 partials'
+    passes over the output (`passes` steps each) and their sum's `launch` (in steps)."""
 
     output: int
     wave: int
@@ -173,6 +174,7 @@ class SplitWalk:
     step_seconds: float
     passes: float
     launch: float
+    stored: float
 
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
@@ -197,10 +199,14 @@ class SplitWalk:
         return max(busiest, stream)
 
     def seconds(self, splits: int) -> float:
-        """The call's time at `splits` slices a tile: its busiest program's walk and, split, its partials'
-        2s + 1 passes over the output and their sum's launch."""
-        added = (2 * splits + 1) * self.passes + self.launch if splits > 1 else 0.0
-        return (self.walk(splits) + added) * self.step_seconds
+        """The call's time at `splits` slices a tile: its busiest program's walk, its epilogue's store of the
+        output after its products (`stored`: a consumer stores its tile once its products are done), and,
+        split, its partials' 2s passes over the output and their sum's launch. Priced at its walk alone, a
+        GH200's input gradient of three 1024- and 4096-deep products chained through their fp32 output
+        (each adding the last's in its epilogue) took 1.145 ms against the 0.955 its walks priced, where one
+        6144-deep product, its output stored once, took the 0.855 its walk's 0.790 priced (M-EM-70d)."""
+        added = 2 * splits * self.passes + self.launch if splits > 1 else 0.0
+        return (self.walk(splits) + self.stored + added) * self.step_seconds
 
     def underfills(self, splits: int) -> bool:
         """Whether the call's programs at `splits` slices a tile fill less than one wave, so its time is its
@@ -209,12 +215,13 @@ class SplitWalk:
 
 
 def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
-               multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
+               stored: float, multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
                launch_seconds: float | None, partial_rows: int | None = None) -> SplitWalk | None:
     """Dew: the walk `split_count` prices at `tiles` (its arguments'), None where the device states no rate
     or the call has no whole tile: its wave every program a multiprocessor runs at once, its output tiles
     each program's (a pair's CTA's its rows by the pair's columns, `tile_columns`), `step_seconds` a step
-    at the multiprocessor's whole rate (`SplitWalk.walk` shares it among the programs running)."""
+    at the multiprocessor's whole rate (`SplitWalk.walk` shares it among the programs running), its output
+    stored at `stored` bytes an element (`SplitWalk.seconds`)."""
     columns = tile_columns(tiles, family_of(tiles, jnp.bfloat16))
     output = groups * -(-depth // tiles.block_m) * (width // columns)
     steps = -(-rows // max(groups, 1) // tiles.block_k)
@@ -224,16 +231,19 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
     return SplitWalk(output, multiprocessors * tiles.programs, steps, multiprocessors,
                      rows * (depth * itemsizes[0] + width * itemsizes[1]), bandwidth, step_seconds,
                      held * width * 4 / bandwidth / step_seconds,
-                     0.0 if launch_seconds is None else launch_seconds / step_seconds)
+                     0.0 if launch_seconds is None else launch_seconds / step_seconds,
+                     held * width * stored / bandwidth / step_seconds)
 
 
 def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,
-                       columns: int | None, held: int, operands: tuple, multiprocessors: int) -> dict:
+                       columns: int | None, held: int, operands: tuple, stored: float,
+                       multiprocessors: int) -> dict:
     """A decode-sized product's walk at `tiles` as `split_walk` and `split_count` price it (their keywords):
     swapped (`Tiles.swapped`), its matrix the rows, `width` of them, over its `depth`, the call's `rows` its
     `columns` padded to whole column units; else each active group's (at most `rows` of `groups`) one row
     tile over the depth, its partials `held` rows. `operands`, the bytes an element of the
-    products' left and right move from device memory and their decoded forms (`step_shared_bytes`)."""
+    products' left and right move from device memory and their decoded forms (`step_shared_bytes`);
+    `stored`, the bytes its epilogue moves an output element (`split_walk`'s)."""
     itemsizes, decoded = operands
     if tiles.swapped:
         assert columns is not None, "a swapped walk's columns are the call's rows, padded"
@@ -243,7 +253,7 @@ def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth:
         shape = {'groups': active, 'rows': depth * active, 'depth': tiles.block_m, 'width': width,
                  'partial_rows': held}
     unswapped = dataclasses.replace(tiles, swapped=False)
-    return {**shape, 'itemsizes': itemsizes, 'multiprocessors': multiprocessors,
+    return {**shape, 'itemsizes': itemsizes, 'stored': stored, 'multiprocessors': multiprocessors,
             'step_seconds': step_seconds(unswapped, target, itemsizes, decoded),
             'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds}
 

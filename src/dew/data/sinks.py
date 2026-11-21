@@ -229,6 +229,15 @@ def _streamed(chunks: Iterator[list[Batch | bytes | None]]) -> pa.RecordBatchRea
     return pa.RecordBatchReader.from_batches(schema, batches())
 
 
+def _drained(stream: pa.RecordBatchReader, native: _Parquet | Writer) -> None:
+    """Refuse an export whose writer returned with rows of `stream` unread: the manifest would commit a
+    prefix of the export as the whole of it (row 9014)."""
+    if next(iter(stream), None) is None:
+        return
+    raise ValueError(f"the export's writer {native!r} returned before reading every row; nothing is "
+                     "committed, so write the whole stream it is handed")
+
+
 def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
     """The files a writer left under `target`, each by its path under the export, `prefix` and its
     path under `target`, its bytes and digest, and the version its store holds it at (`Store.held_at`);
@@ -245,9 +254,10 @@ def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
     return files
 
 
-def passed(values: Source | Dataset) -> Iterator[Batch]:
+def passed(values: Source | Dataset, seed: int | None = None) -> Iterator[Batch]:
     """One pass over a store's or a chain's records, in their one order, as `export` writes them: a
-    store as a chain of it, by a read it supports, physical shards or none. Close it when done."""
+    store as a chain of it, by a read it supports, physical shards or none; a chain's random steps drawn
+    under `seed` where one is given (`compile.iterate`). Close it when done."""
     from dew.data.analysis import _preferred_read
     from dew.data.compile import iterate
     from dew.data.dataset import Loading
@@ -255,7 +265,7 @@ def passed(values: Source | Dataset) -> Iterator[Batch]:
 
     chain = values._chain() if isinstance(values, Dataset) else Pipeline(values)
     read = chain.mode or _preferred_read((chain,), provision=True)
-    return iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading()))
+    return iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading(), seed=seed))
 
 
 def export(
@@ -327,6 +337,7 @@ def export(
                 fs, directory = target.resolve()
                 fs.makedirs(directory, exist_ok=True)
                 native.write(stream, directory, _arrow_filesystem(fs))
+                _drained(stream, native)
             files, written = _written(target, f"shards/{writer}"), native.format
         # The rules other than every target's its rows were counted by, which a pack of them by a
         # plan of their lengths could not count (`dew.data.analysis._ruled`).

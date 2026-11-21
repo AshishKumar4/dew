@@ -98,7 +98,8 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     value among `known` (by its `id`) is what its caller says of it.
 
     An array of JAX's is its values and sharding (`_jax_array`); a function `jax.jit` wraps, what it wraps
-    and its options (`_jitted`). Refused, naming `at` and the value's type, for anything else: an object
+    and its options (`_jitted`); a program Dew's compile point compiles (`dew.jit`'s), its function and its
+    arguments (`_outer_program`). Refused, naming `at` and the value's type, for anything else: an object
     with no such form could differ between two processes with nothing in the identity to show it."""
     return _stated(value, at, known, ())
 
@@ -127,10 +128,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
         return _own(value, at, known, walking)
     if _sources.hand_written(getattr(value, "__wrapped__", None)):
-        # A callable that is no function and wraps one of the user's, a jitted one aside (`_computed`): what
-        # it holds beside the function (a cache's entries) is its type's, which nothing here states.
-        raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} wrapping a "
-                            "function of the user's own code")
+        return _wrapping_users(value, at, again)
     if (named := _named(value, at)) is not None:
         return named
     if isinstance(value, type):
@@ -198,12 +196,30 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
 
 
 
+def _wrapping_users(value, at: str, again: Callable[..., JSON]) -> JSON:
+    """A callable that is no function and wraps one of the user's, a jitted one aside (`_computed`): a
+    function with JAX's custom derivative is its function, its rules and the options a trace reads, as the
+    one module naming them reads it (`dew.nn.derivatives.custom_rule`, lint_slop's SLOP026; row 10087: an
+    arm holding a test's own rule ran unprepared). Refused for any other: what it holds beside the function
+    (a cache's entries) is its type's, which nothing here states."""
+    from dew.nn.derivatives import custom_rule
+
+    if (rule := custom_rule(value)) is not None:
+        kind, parts = rule
+        return [kind, [[name, again(part, at=f"{at} (its {name})")] for name, part in parts.items()]]
+    raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} wrapping a "
+                        "function of the user's own code")
+
+
 def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values a program computes from or with: an array (`_jax_array`), a function `jax.jit`
-    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`); None
-    for any other."""
+    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`), a
+    program Dew's compile point compiles, by its function and arguments (`_outer_program`); None for any
+    other."""
     if isinstance(value, jax.Array):
         return _jax_array(value, at, again)
+    if (program := _outer_program(value, at, again)) is not None:
+        return program
     if isinstance(value, PjitFunction):
         # A library's jitted function its module names (`jax.nn.silu`) is that name, as the library's code
         # is its version's; one wrapping the user's code is what it wraps, with its options.
@@ -211,6 +227,21 @@ def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
             return named
         return _jitted(value, at, again)
     return None
+
+
+def _outer_program(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """A program Dew's compile point compiles (`dew.nn.kernels.options.OuterProgram`: `dew.jit`'s,
+    `program`'s) by its kind, the function it compiles and the jit arguments it compiles it under (its
+    compiler options among them), each stated as any value is, and refused naming that part where it has no
+    form: never what it holds as it runs (its jit, its executables, their cache and its lock), which a process
+    holds of its own and which two equal programs hold apart. None for any other value."""
+    # The kernels' options read where a value calls for them, never at load (the algebra's account below).
+    from dew.nn.kernels.options import OuterProgram
+
+    if not isinstance(value, OuterProgram):
+        return None
+    return ["outer program", again(value.function, at=f"{at} (its function)"),
+            again(value.arguments, at=f"{at} (its arguments)")]
 
 
 def _jitted(value, at: str, again: Callable[..., JSON]) -> JSON:
@@ -329,7 +360,7 @@ def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     if (frames := _traceback(value)) is not None:
         return frames
     if isinstance(value, type(jax.tree.structure(()))):
-        return _tree(value, at, again)
+        return tree_shape(value, at, again)
     if isinstance(value, Format):
         return ["format", again(value.layout, at=f"{at}.layout"), again(value.sharding, at=f"{at}.sharding")]
     if value is Layout.AUTO:
@@ -374,16 +405,36 @@ def reads(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
     """What `function`'s body reads outside its arguments (`dew._sources.function_reads`), as an identity
     states it (`stated`): the cells it closed over, its defaults, and each name its code or the code nested
     in it reads that its globals hold or that is a loaded module of the user's. A trace bakes each such
-    value into its program, so one that differs is another call."""
+    value into its program, so one that differs is another call. A library's function (a local one
+    `_named` cannot name: `jax.checkpoint`'s, `jax.grad`'s) reads its module's globals as its installed
+    version holds them, which its module's record states (`_coded`, as a module's function `_named`
+    names), so they are not walked (`library_function`): its closure and defaults are, a user's function
+    among them (rows 10064 on: a library's caches among its globals, no arm holding Dew's SwiGLU had a
+    statement)."""
     within = (*walking, id(function))
     named = function.__qualname__
+    library = library_function(function)
     cells, read = _sources.function_reads(function)
-    return {"closure": {name: _stated(value, f"{at} ({named}'s closure, {name})", known, within)
-                        for name, value in sorted(cells.items())},
+
+    def closed(name: str, value) -> JSON:
+        if library and type(value) is object:
+            # A library's sentinel (`jax.vmap`'s axis name when none is given, its module's `object()`): no
+            # state but its identity, which its module's record and its cell's name state.
+            return ["a library's sentinel", function.__module__, named, name]
+        return _stated(value, f"{at} ({named}'s closure, {name})", known, within)
+
+    return {"closure": {name: closed(name, value) for name, value in sorted(cells.items())},
             "globals": {name: _stated(value, f"{at} ({named}'s global {name})", known, within)
-                        for name, value in sorted(read.items())},
+                        for name, value in sorted(read.items())} if not library else {},
             "defaults": _stated((function.__defaults__, function.__kwdefaults__),
                                 f"{at} ({named}'s defaults)", known, within)}
+
+
+def library_function(function: types.FunctionType) -> bool:
+    """Whether `function` is a library's: its module one of the user's own code is not (`own_source`: an
+    installed distribution's, the standard library's). A script's, a notebook's (`__main__` with no file)
+    and one no module holds are the user's."""
+    return function.__module__ not in (None, "__main__") and not _sources.own_source(function.__module__)
 
 
 def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
@@ -488,16 +539,17 @@ def _module_state(module: types.ModuleType, at: str, known: Mapping[int, JSON],
     return _members(module, at, known, (*walking, id(module)))
 
 
-def _tree(tree, at: str, again: Callable[..., JSON]) -> JSON:
+def tree_shape(tree, at: str, again: Callable[..., JSON]) -> JSON:
     """A tree's structure node by node: a leaf, or a node's type, the data it holds beside its children (a
-    mapping's keys, a custom node's static fields) and its children. Never as JAX prints it, which holds a
-    node's data by its printed form."""
+    mapping's keys, a custom node's static fields) and its children, each type and datum as `again` states
+    it (`stated`'s, or a kept draw's key's, `dew.objectives.drawn.held_signature`). Never as JAX prints it,
+    which holds a node's data by its printed form."""
     node = tree.node_data()
     if node is None:
         return "leaf" if tree.num_leaves else "none"
     kind, held = node
     return ["node", again(kind, at=at), again(held, at=f"{at} (a {kind.__qualname__}'s node data)"),
-            [_tree(child, at, again) for child in tree.children()]]
+            [tree_shape(child, at, again) for child in tree.children()]]
 
 
 def source_digest(path: Path) -> str:

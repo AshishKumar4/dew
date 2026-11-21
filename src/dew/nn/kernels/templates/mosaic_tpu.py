@@ -21,7 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import emission, handoffs, mosaic, outputs as stated_outputs, persistent
+from dew.nn.kernels.templates import emission, handoffs, mosaic, outputs as stated_outputs, persistent, rings
 from dew.nn.kernels.templates.cost import Stated
 
 STAGES = 2
@@ -137,7 +137,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
                              pltpu.SMEM((1,), ref.dtype))
 
     def key_magnitudes(self, tile) -> jax.Array:
-        return jnp.max(jnp.abs(tile[...]), axis=1).astype(jnp.float32)
+        held = jnp.abs(tile[...])
+        return jnp.max(jnp.where(held < jnp.inf, held, 0), axis=1).astype(jnp.float32)
 
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         del scratch, interpret
@@ -187,6 +188,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     consumers = 1
 
     bounded_loads = False  # a DMA past its operand's rows is refused, not filled with zeros
+    walks_once = True  # a once stream folded into its walked streams (`folded`), each step's block the one
 
     stores_through_registers = False
 
@@ -204,7 +206,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     copies_tiled_rows = True
 
-    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
+                  joined: tuple = ()) -> int:
         raise NotImplementedError("a TPU core budgets no registers: its values spill to VMEM")
 
     def column_unit(self, dtype) -> int:
@@ -231,13 +234,15 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
-               producer: int | None = None, shared: int | None = None,
-               moves: bool | None = None) -> Callable:
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
+               producer: int | None = None, shared: int | None = None, tmem: int = 0,
+               moves: bool | None = None, joined: tuple = ()) -> Callable:
+        handoffs.runs_alone(self.name, joined)
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
         # view prefetched ahead of a wait (a GPU's dependent launch); its compiler holds its values, no
         # register budget (`budgets_registers`).
-        del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, moves
+        del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, tmem, moves
+        del reduces
         if prefetched is not None:
             raise NotImplementedError("a TPU program is launched after the last; nothing is prefetched ahead")
         _one(consumers, clustered=cluster > 1)
@@ -252,7 +257,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
         def launched(*operands):
             # A table its programs read an element at a time in scalar memory, every other operand in HBM. A
-            # ref the launch adds into in place (`jax.new_ref`, `mosaic.stacked_zeros`) goes in as its value
+            # ref the launch adds into in place (`jax.new_ref`, `stacked.zeros`) goes in as its value
             # aliased to an output of its own (`input_output_aliases`), which the program reads and writes as
             # the ref, and which is written back into the ref after the call. Its programs run in turn
             # ("arbitrary"), so one's read-modify-write of a shared view (`added`) races no other's.
@@ -298,7 +303,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()) -> dict:
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()) -> dict:
+        del joined  # a pair a stream (`Family.streams`)
         # Each stream's ring of `STAGES` slots, whatever the stages asked: a DMA a step ahead hides a step's.
         del stages, swizzles
         if gathered:
@@ -309,6 +315,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return {name: {'slots': pltpu.VMEM((STAGES, *shape), dtype),
                        'sems': pltpu.SemaphoreType.DMA((STAGES,))}
                 for name, (shape, dtype) in blocks.items()}
+
+    def folded(self, allocated: dict, once: dict) -> dict:
+        return {**allocated, **once}
 
     def lifetimes(self, streams: dict, steps: int | None = None) -> tuple[tuple, tuple]:
         del steps
@@ -325,9 +334,18 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             raise ValueError("a TPU ring's streams take their views where they open (its walk copies)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi) -> None:
-        # No producer role: the walk issues its own copies.
-        del streams, views, lo, hi
+    def uniform(self, value: jax.Array) -> jax.Array:
+        # A core's scalar is its own: no lanes to read alike.
+        return value
+
+    def decided_scratch(self, consumers: int) -> dict:
+        # One core a program, its walk its one role: it decides a second walk alone (`after_walk.Decided`).
+        del consumers
+        return {}
+
+    def stream(self, streams, views, lo, hi, *, again=None) -> None:
+        # No producer role: the walk issues its own copies, a decided walk's second pass's too.
+        del streams, views, lo, hi, again
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
@@ -411,18 +429,18 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
                 for name in names:
                     streams.copy(name, index, slot).wait()
-                slots = mosaic.WholeSlots({name: streams.rings[name]['slots'].at[slot] for name in names})
+                slots = rings.WholeSlots({name: streams.rings[name]['slots'].at[slot] for name in names})
                 return step(index, slots, *carry)
 
             carry = lax.fori_loop(lo, hi, body, carry)
         return carry
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0) -> R:
         # One role a core: no partner reads a step it passes, so it walks its own steps alone.
         del views, wg, between
         lo, hi = own
-        return walk(streams, lo, hi, streamed[0])
+        return walk(streams, lo, hi, streamed[0] - counted)
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         # Its walk copies only the steps it reads: a passed step loads nothing.

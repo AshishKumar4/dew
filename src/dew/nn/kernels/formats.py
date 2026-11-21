@@ -10,11 +10,18 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import DTypeLike
 
 from dew.algebra import bits
+from dew.nn.float_bits import exact_power2
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, power2
+
+FORM = np.frombuffer(bytes.fromhex(bits.NVFP4_BFLOAT16_FORM.version), np.uint8)
+"""The version of the form an `NvFp4`'s words are packed by (`bits.BitForm.version`, its encoder's digest),
+as the bytes a matrix stores beside its words (`NvFp4.form`): words another encoder packed decode wrong by
+this Dew's form, so a load refuses them (`NvFp4.checked`; algebra.md 7.4, row 6101)."""
 
 
 @jax.tree_util.register_dataclass
@@ -35,6 +42,31 @@ class NvFp4:
     words: jax.Array | np.ndarray
     scales: jax.Array | np.ndarray
     scale: jax.Array | np.ndarray
+    form: jax.Array | np.ndarray = dataclasses.field(default_factory=FORM.copy)
+    """The version of the form its words were packed by (`FORM`'s bytes; a stack of banks' one a layer),
+    stored with them, so a checkpoint's words carry the encoder that packed them (`checked`)."""
+
+    def checked(self, form=None) -> "NvFp4":
+        """Itself, where its words are the checked-in form's (`FORM`), every layer's; refused otherwise:
+        words another encoder packed (a checkpoint an earlier Dew wrote) read wrong through this form's
+        decode, so they are repacked from the source weights, never decoded. A local host check of its
+        stored bytes (every addressable shard, or the gathered `form` a collective restore hands it,
+        row 8958)."""
+        target = self.form if form is None else form
+        pieces = ([shard.data for shard in target.addressable_shards]
+                  if isinstance(target, jax.Array) else [target])
+        found: set[str] = set()
+        for piece in pieces:
+            held = np.asarray(piece)
+            if held.ndim == 0 or held.shape[-1] != FORM.size:
+                raise ValueError(f"NVFP4 form digest sharded across its {FORM.size} bytes "
+                                 f"(shard shape {held.shape}); pass the gathered form to checked()")
+            found.update(bytes(row).hex() for row in held.reshape(-1, FORM.size))
+        if found != {FORM.tobytes().hex()}:
+            raise ValueError(f"NVFP4 words packed by form version {', '.join(sorted(found))}, where this Dew "
+                             f"decodes form version {FORM.tobytes().hex()}: repack them from the source "
+                             f"weights (`NvFp4.of`)")
+        return self
 
     @classmethod
     def quantized(cls, x: jax.Array) -> "NvFp4":
@@ -63,11 +95,11 @@ class NvFp4:
         words = _staged_words(codes, xp)
         return cls(xp.swapaxes(words, -1, -2), xp.swapaxes(scales, -1, -2), xp.asarray(scale, xp.float32))
 
-    def codes(self) -> jax.Array:
-        """Its codes' values (`[..., depth, width]` float32, each code's E2M1 value) in the depths' own
-        order."""
+    def codes(self, dtype: DTypeLike = jnp.float32) -> jax.Array:
+        """Its codes' values (`[..., depth, width]` in `dtype`, float32 by default, each code's E2M1 value) in
+        the depths' own order."""
         words = jnp.swapaxes(self.words, -1, -2)
-        staged = functools.partial(_codes, staged=True)
+        staged = functools.partial(_codes, dtype=dtype)
         # Each matrix's own, over every leading axis: a bank's groups, a stack of banks' layers before them.
         for _ in range(words.ndim - 2):
             staged = jax.vmap(staged)
@@ -76,7 +108,8 @@ class NvFp4:
     def decoded(self) -> jax.Array:
         """Its values over `bits.NVFP4_OWED` and the tensor scale, exactly, in bfloat16 (`[..., depth,
         width]`): each code times its block's scale over 2^8, as the mainloop's stage decode forms it."""
-        owed = jnp.swapaxes(self.scales, -1, -2).astype(jnp.float32) * jnp.float32(1 / bits.NVFP4_OWED)
+        owed = bits.scales_decoded(jax.lax.bitcast_convert_type(jnp.swapaxes(self.scales, -1, -2), jnp.uint8)
+                                   ) * jnp.float32(1 / bits.NVFP4_OWED)
         return (self.codes() * jnp.repeat(owed, 16, axis=-2)).astype(jnp.bfloat16)
 
     @property
@@ -94,7 +127,7 @@ class NvFp4:
         """A stack of banks' bank at layer `index` (a traced index): its fields led by a layers axis before
         their group axis (a scanned load's stacked banks, row 4861), each field's slice at it."""
         return NvFp4(*(jax.lax.dynamic_index_in_dim(jnp.asarray(field), index, keepdims=False)
-                       for field in (self.words, self.scales, self.scale)))
+                       for field in (self.words, self.scales, self.scale, self.form)))
 
     @property
     def factor(self) -> jax.Array:
@@ -128,12 +161,11 @@ def _e2m1_values(codes: jax.Array) -> jax.Array:
     return jnp.asarray(fake_quant.E2M1)[codes]
 
 
-def _codes(words: jax.Array, *, staged: bool = False) -> jax.Array:
-    """The codes' values of `words` (each its E2M1 value, float32 `[depth, width]`), in the depths' own order
-    where `staged` (`staged_rows`), else the words' own: `bits.nvfp4_decoded` at a block scale of 2^8."""
-    unit = jnp.full((words.shape[0] // 2, words.shape[1]), bits.NVFP4_OWED, jnp.float8_e4m3fn)
-    codes = bits.nvfp4_decoded(words, unit).astype(jnp.float32)
-    return codes[np.argsort(staged_rows(codes.shape[0]))] if staged else codes
+def _codes(words: jax.Array, dtype: DTypeLike = jnp.float32) -> jax.Array:
+    """The codes' values of staged `words` (each its E2M1 value in `dtype`, `[depth, width]`) in the depths'
+    own order (`staged_rows` undone): `bits.nvfp4_codes`, the one word-to-code decode (row 8718)."""
+    codes = bits.nvfp4_codes(words, dtype)
+    return codes[np.argsort(staged_rows(codes.shape[0]))]
 
 
 def _staged_words(codes, xp=jnp):
@@ -184,23 +216,30 @@ class MxFp8:
         scale = formats_of.MXFP8.scale
         bias = -jnp.finfo(scale).minexp
         exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
-        scales = jax.lax.bitcast_convert_type((exponent + bias).astype(jnp.uint8), scale)
-        # Each value over its scale as its exponent (`jnp.ldexp`), as `decoded` applies it: the least scale,
-        # a block of zeros' or of magnitudes under 2^-118, is float32's subnormal 2^-127, which a program
-        # that flushes subnormals (XLA's CPU, op by op or with its simplifier off) reads as zero, its zeros
-        # over it NaN (row 6931).
-        codes = fake_quant.fp8_codes(jnp.ldexp(blocks, -exponent)).reshape(x.shape)
+        # The power its scale is, set in E8M0's bits by the one owner of an exact power (`exact_power2`: every
+        # biased exponent a power, none a zero; its byte the exponent plus 127, which its int8 sum wraps to
+        # past 127 and its bitcast reads back; row 8832).
+        scales = exact_power2(exponent, scale)
+        # Each value over its scale as its exponent (`precision.power2`, the one owner of scaling by a power
+        # of two; row 8971), as `decoded` applies it: the least scale, a block of zeros' or of magnitudes
+        # under 2^-118, is float32's subnormal 2^-127, which a program that flushes subnormals (XLA's CPU, op
+        # by op or with its simplifier off) reads as zero, its zeros over it NaN (row 6931). A subnormal
+        # value a scale below 1 raises is kept where the backend keeps subnormals (`jnp.ldexp` flushed it).
+        codes = fake_quant.fp8_codes(power2(blocks, -exponent)).reshape(x.shape)
         return cls(codes.astype(jnp.float8_e4m3fn), scales[..., 0])
 
     def decoded(self, dtype=jnp.float32) -> jax.Array:
         """Its values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each code times
-        its block's scale."""
-        exponents = jax.lax.bitcast_convert_type(self.scales, jnp.uint8).astype(jnp.int32) - 127
-        # Each E8M0 scale applied as its exponent (`jnp.ldexp`, in two normal steps): a scale below
-        # float32's least normal (2**-128 for inputs near 2**-120) would read as zero where a device
-        # flushes subnormals, though the value it scales to is normal.
-        return jnp.ldexp(self.codes.astype(dtype),
-                         jnp.repeat(exponents, formats_of.MXFP8.depth, axis=-1))
+        its block's scale, an E8M0 byte 0xFF's block NaN (OCP MX 5.4.1: E8M0's one non-number)."""
+        held = jax.lax.bitcast_convert_type(self.scales, jnp.uint8)
+        exponents = jnp.repeat(held.astype(jnp.int32) - 127, formats_of.MXFP8.depth, axis=-1)
+        # Each E8M0 scale applied as its exponent (`precision.power2`, in normal powers of two): a scale
+        # below float32's least normal (2**-127 for inputs near 2**-120) would read as zero where a device
+        # flushes subnormals, though the value it scales to is normal; a subnormal value rounds once where
+        # the backend keeps subnormals (`jnp.ldexp` flushed it). Scaled at least in float32 (`power2`), then
+        # in `dtype` once, so a narrow one's range is its own.
+        values = power2(self.codes.astype(dtype), exponents).astype(dtype)
+        return jnp.where(exponents == 0xFF - 127, jnp.asarray(jnp.nan, dtype), values)
 
 
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:

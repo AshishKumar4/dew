@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import COMPILES_ON_CPU, lowers
+from generation_support import COMPILES_ON_CPU, here, interprets, lowers
 from reference_error import (
     FEWEST_SEEDS,
     as_given,
@@ -27,7 +27,14 @@ from reference_error import (
     run_to_run,
     with_gradients,
 )
-from selective_support import mamba_selective_side, selective_draw, selective_xla
+from selective_support import (
+    RATES_PAST_THE_RANGE,
+    mamba_selective_side,
+    rate_past_the_range,
+    selective_draw,
+    selective_xla,
+    stepwise,
+)
 from test_recurrence_chunk import ROUTES, on_route
 from upstream_support import upstream_arm
 
@@ -43,8 +50,9 @@ from dew.parity_stages import REDRAW
 
 pytestmark = pytest.mark.kernel
 
-INTERPRETED = jax.default_backend() != "gpu"
-"""The template interprets off a GPU, by the wgmma bundle, whose rings and barriers the interpreter models."""
+INTERPRETED = interprets()
+"""The template interprets off a GPU, by the wgmma bundle, whose rings and barriers the interpreter models;
+a GPU tier part's prepare states it as the node's GPU runs it (`generation_support.interprets`)."""
 
 SHAPES = {"interpreted": (1, 70, 256, 16), "falcon-mamba-7b": (2, 2048, 8192, 16)}
 """Each case's rows, tokens, channels and states: a ragged chunk over two channel blocks, and Falcon Mamba
@@ -119,12 +127,95 @@ def held_to(portable_arm, draws, starts, label: str, template_arm):
                         most=8 * MOST_SEEDS, keyed=lambda *args: args[:-1])
 
 
+@pytest.mark.parametrize("case", RATES_PAST_THE_RANGE)
+def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted(case):
+    """The template's output, final state and every input's gradient at a rate whose `A log2(e)` passes
+    float32's range over a ragged chunk (`selective_support.rate_past_the_range`, both vanishing decays and
+    `e^-3` decays at subnormal `dt = 2^-126`) on par from float64 with the recurrence a token at a time
+    (`selective_support.stepwise`, check 1; rows 8491, 8722)."""
+    template = functools.partial(selective.selective_scan, family=taken_family(jnp.float32),
+                                 interpret=INTERPRETED)
+    exact = jax.jit(with_gradients(stepwise))
+    assert_as_exact(jax.jit(with_gradients(template)), exact,
+                    functools.partial(rate_past_the_range, case),
+                    f"the selective template at a rate past float32's range, {case}", seeds=FEWEST_SEEDS,
+                    truth_fn=exact)
+
+
+@pytest.mark.parametrize("case", ("normal step", "zero step", "skip cancelling",
+                                  "subnormal skip cancelling", "subnormal step",
+                                  "decaying skip cancelling"))
+def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(case):
+    """Large `B` across four states on a selector-supported shape (`length=32`, `states=4`) through the
+    public `recurrence_chunk.selective_scan` route (`mosaic_gpu`) with normal (`2^-4`), zero (`0.0`),
+    skip-cancelling (`dt = 1`, `D = -2^127`, `A = 0` or `-3`), subnormal skip-cancelling (`dt = 2^-110`,
+    `D = -2^-10`, `B = (2^100, 2^71)`), or subnormal (`dt = 2^-130`, `B = (2^120, 0)`) steps: its output,
+    final state and every input's gradient on par from float64 with an independent range-safe reference
+    (check 1; rows 8722, 9072, 9089, base reviews b9f004f74 F7, da734bf54 F3, c486fe8d7 F1)."""
+    cases = ("normal step", "zero step", "skip cancelling", "subnormal skip cancelling", "subnormal step",
+             "decaying skip cancelling")
+
+    def draw(seed):
+        rng = np.random.default_rng([8722, seed, cases.index(case)])
+        length, channels, states = 32, 128, 4
+        x = np.zeros((1, length, channels), np.float32)
+        a = np.full((channels, states), -3.0 if case == "decaying skip cancelling" else 0.0, np.float32)
+        scale = rng.uniform(0.5, 1.0, (1, length, 2)).astype(np.float32)
+        b = np.zeros((1, length, states), np.float32)
+        b[:, :, :2] = (2.0 ** 127) * scale
+        c = np.zeros((1, length, states), np.float32)
+        c[:, :, :2] = 1.0
+        entering = np.zeros((1, channels, states), np.float32)
+        if case == "normal step":
+            dt = np.full((1, length, channels), 2.0 ** -4, np.float32)
+            skip = np.zeros((channels,), np.float32)
+        elif case == "zero step":
+            dt = np.zeros((1, length, channels), np.float32)
+            skip = np.zeros((channels,), np.float32)
+        elif case in ("skip cancelling", "decaying skip cancelling"):
+            factor = np.float32(rng.uniform(0.5, 1.0))
+            dt = np.ones((1, length, channels), np.float32)
+            skip = np.full((channels,), -(2.0 ** 127) * factor, np.float32)
+            b[:, :, :2] = (2.0 ** 127) * factor
+        elif case == "subnormal step":
+            factor = np.float32(rng.uniform(0.5, 1.0))
+            dt = np.full((1, length, channels), 2.0 ** -130, np.float32)
+            skip = np.zeros((channels,), np.float32)
+            b[:, :, 0] = (2.0 ** 120) * factor
+            b[:, :, 1] = 0.0
+        else:
+            factor = np.float32(rng.uniform(0.5, 1.0))
+            dt = np.full((1, length, channels), 2.0 ** -110, np.float32)
+            skip = np.full((channels,), -(2.0 ** -10) * factor, np.float32)
+            b[:, :, 0] = (2.0 ** 100) * factor
+            b[:, :, 1] = (2.0 ** 71) * factor
+        dy = np.zeros((1, length, channels), np.float32)
+        dy[:, -1, :] = 1.0
+        dfinal = np.zeros((1, channels, states), np.float32)
+        return (jnp.asarray(x), jnp.asarray(dt), jnp.asarray(a), jnp.asarray(b), jnp.asarray(c),
+                jnp.asarray(skip), jnp.asarray(entering), (jnp.asarray(dy), jnp.asarray(dfinal)))
+
+    def routed(*operands):
+        with generation.chosen(selective_scan="mosaic_gpu"):
+            return recurrence_chunk.selective_scan(*operands, None, portable=portable)
+
+    exact = jax.jit(with_gradients(stepwise))
+
+    def range_safe(*operands):
+        with jax.enable_x64(new_val=True):
+            out = exact(*jax.tree.map(lambda arr: arr.astype(jnp.float64), operands))
+        return jax.tree.map(lambda arr: arr.astype(jnp.float32), out)
+    reference = range_safe if case in ("subnormal skip cancelling", "subnormal step") else exact
+    assert_as_exact(jax.jit(with_gradients(routed)), reference, draw,
+                    f"the selective template at large B, {case}", seeds=FEWEST_SEEDS, truth_fn=exact)
+
+
 def taken_family(dtype) -> mosaic.Family:
     """The bundle the template takes here (`Selective._fwd`'s): the interpreted target's off a GPU, the
-    device's on one, so no launch runs a family the host's multiprocessor does not (an A100 interpreting
-    wgmma's raised its consumers' registers past what it takes, the promotion tier's row 5413)."""
-    return bundles.of(generation.interpreted_target().generation if INTERPRETED
-                      else generation.device_generation(), dtype)
+    device's on one (a GPU tier part's prepare the node's, `generation_support.here`), so no launch runs a
+    family the host's multiprocessor does not (an A100 interpreting wgmma's raised its consumers' registers
+    past what it takes, the promotion tier's row 5413)."""
+    return bundles.of(generation.interpreted_target().generation if INTERPRETED else here(), dtype)
 
 
 def the_template_is_as_exact_as_its_reference(case: str, packed: bool, dtype=jnp.bfloat16,
@@ -193,7 +284,7 @@ def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16,
 
 
 @pytest.mark.parametrize("layout", list(FORKED))
-@pytest.mark.check1_shards(seeds=8, per_task=4)
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_the_template_is_as_exact_over_a_forked_call_interpreted(layout):
     """`the_template_is_as_exact_over_a_forked_call` off a GPU, over one forward program's block of 128
     channels: its backward interprets a program a row's channel, and at the shape's 256 a draw took 621 s
@@ -261,7 +352,7 @@ def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_a
     the same over repeated runs of one compiled step, B's and C's too, which the default's atomic adds sum
     in whatever order their programs run (row 4448's declared contract)."""
     shape = (1, 256, 512, 16)
-    family = bundles.of(generation.device_generation(), jnp.float32)
+    family = bundles.of(here(), jnp.float32)
     template = functools.partial(selective.selective_scan, family=family)
     inputs, starts, dy = draw(jnp.float32, 0, *shape, packed=False)
     step = jax.jit(with_gradients(scanned(template, starts)))

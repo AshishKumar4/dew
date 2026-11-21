@@ -17,7 +17,6 @@ import hashlib
 import json
 import logging
 import threading
-import time
 import types
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -38,6 +37,7 @@ from dew._stated import Unestablished
 from dew.nn.kernels.generation import stated, traced_fact
 from dew.nn.nested import staged
 from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
+from dew.telemetry.compiles import Span, spanning
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -165,6 +165,13 @@ def program_digest(lowered: jax.stages.Lowered, options: jax.stages.CompilerOpti
     return hashlib.sha256(f"{_text_digest(lowered)}\n{trees}\n{types}{stated}".encode()).hexdigest()
 
 
+def program_name(lowered: jax.stages.Lowered) -> str:
+    """A program's one name where it is counted rather than kept (a step no device run has tuned,
+    `dew.training.ahead.CompiledAhead.untuned`): its digest as a file holds it (`stated_digest`), or its
+    text's where its trees state no form (a host step's VJP results)."""
+    return stated_digest(lowered) or _text_digest(lowered)
+
+
 def stated_digest(lowered: jax.stages.Lowered,
                   options: jax.stages.CompilerOptions | None = None) -> str | None:
     """`lowered`'s digest under `options` as a file of programs holds it (`program_digest`), None (logged,
@@ -206,20 +213,28 @@ type Kept = Callable[["OuterProgram", jax.stages.Lowered, jax.stages.Compiled], 
 """What hears each program the compile point compiles (`keeping`): the program, the lowering it compiled
 (its last relowering's, past a spill) and its executable."""
 
-_KEEPING: contextvars.ContextVar[Kept | None] = _cache.untraced(
-    contextvars.ContextVar("dew_keeping_programs", default=None))
+_KEEPING: contextvars.ContextVar[tuple[Kept, ...]] = _cache.untraced(
+    contextvars.ContextVar("dew_keeping_programs", default=()))
 
 
 @contextlib.contextmanager
 def keeping(kept: Kept) -> Iterator[None]:
     """Within the block, `kept` hears each executable Dew's compile point compiles (`OuterProgram.compiled`,
     `compiled_together`), with its lowering, on the thread that keeps it: what a save of a process's
-    programs reads (`dew.training.ahead.keeping`). One taken, compiled elsewhere, is not heard."""
-    token = _KEEPING.set(kept)
+    programs reads (`dew.training.ahead.keeping`). One taken, compiled elsewhere, is not heard. A block
+    within another is heard by both, the outer first (`_heard`): a run's programs kept within a save of its
+    process's are kept by each."""
+    token = _KEEPING.set((*_KEEPING.get(), kept))
     try:
         yield
     finally:
         _KEEPING.reset(token)
+
+
+def _heard(program: OuterProgram, lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> None:
+    """`executable`, `program`'s compile of `lowered`, heard by every `keeping` block this thread is in."""
+    for kept in _KEEPING.get():
+        kept(program, lowered, executable)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -297,34 +312,6 @@ def attempting(begun: Compiling | None) -> Iterator[None]:
 
 _COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = _cache.untraced(
     contextvars.ContextVar("dew_collected_programs", default=None))
-
-
-class Spent(NamedTuple):
-    """One compile through Dew's compile point within `spending`: its program (`OuterProgram.called`), the
-    platform it compiled for, and its seconds tracing and lowering, and compiling (the backend's, or a
-    read of JAX's persistent cache)."""
-
-    program: str
-    platform: str
-    lowered: float
-    compiled: float
-
-
-_SPENT: contextvars.ContextVar[list[Spent] | None] = _cache.untraced(
-    contextvars.ContextVar("dew_spent_compiles", default=None))
-
-
-@contextlib.contextmanager
-def spending() -> Iterator[list[Spent]]:
-    """Within the block, each compile through Dew's compile point (`OuterProgram.compiled`) is told to the
-    list it yields (`Spent`): what a run's startup compiled, by backend
-    (`dew.training.compiler.HostStartup`)."""
-    spent: list[Spent] = []
-    token = _SPENT.set(spent)
-    try:
-        yield spent
-    finally:
-        _SPENT.reset(token)
 
 
 def shapes_of(tree):
@@ -408,15 +395,30 @@ _RUNNING: contextvars.ContextVar[tuple[Around, ...]] = _cache.untraced(
     contextvars.ContextVar("dew_running_programs", default=()))
 
 
+def _ran(program: OuterProgram, executable: jax.stages.Compiled, args: tuple, kwargs: dict
+         ) -> contextlib.AbstractContextManager:
+    """The contexts every enclosing `running` block runs `executable`, `program`'s for these arguments,
+    inside, the outermost first, each entered here, at the call, not at the caller's `with`, which leaves
+    them; none outside any."""
+    if not (arounds := _RUNNING.get()):
+        return contextlib.nullcontext()
+    stack = contextlib.ExitStack()
+    with stack:
+        for around in arounds:
+            stack.enter_context(around(program, executable, args, kwargs))
+        return stack.pop_all()
+
+
 @contextlib.contextmanager
 def running(around: Around) -> Iterator[None]:
     """Within the block, each executable a call through Dew's compile point runs over arrays (one its
     program keeps, one compiled over shapes, one taken, or one compiled at the call) runs inside
     `around(program, executable, args, kwargs)`, and inside every enclosing block's, the outermost first: an
     admission that refuses it by raising as it enters (a host run's rollout's, `dew.training.rollout
-    .admitted`), or a profiled trial's record of what it ran (`dew.training.planning.Trials
-    .profiled_programs`). Nothing else of the call changes, and a call within `lowering`, which runs
-    nothing, enters none."""
+    .programs_admitted`), or a profiled trial's record of what it ran (`dew.training.planning.Trials
+    .profiled_programs`); an executable fetched to be called later (`OuterProgram.executable`) as it is
+    handed over. Nothing else of the call changes, and a call within `lowering`, which runs nothing, enters
+    none."""
     token = _RUNNING.set((*_RUNNING.get(), around))
     try:
         yield
@@ -501,9 +503,8 @@ def compiled_together() -> Iterator[None]:
     for call, executable in zip(held, executables, strict=True):
         call.program._keep(call.key, call.pending, executable, call.relowered)
     # Heard once every compile is settled, so a listener that raises leaves no call waiting.
-    if (kept := _KEEPING.get()) is not None:
-        for call, executable in zip(held, executables, strict=True):
-            kept(call.program, call.relowered[-1][1] if call.relowered else call.lowered, executable)
+    for call, executable in zip(held, executables, strict=True):
+        _heard(call.program, call.relowered[-1][1] if call.relowered else call.lowered, executable)
 
 _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_passing", default=False)
 """Whether an `OuterProgram`'s trace, which the algebra pass reads whole, encloses the current call."""
@@ -706,24 +707,24 @@ class OuterProgram:
         ready = self._ready.get(key)
         if ready is None:
             ready = self._shaped_for(key, args, kwargs) or self._kept(key, args, kwargs)
-        if not (arounds := _RUNNING.get()):
-            return ready(*dynamic, **named)
-        with contextlib.ExitStack() as stack:
-            for around in arounds:
-                stack.enter_context(around(self, ready, args, kwargs))
+        with _ran(self, ready, args, kwargs):
             return ready(*dynamic, **named)
 
     def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
         """The executable a compile within `collecting` made for a call alike in its abstract signature
         (`_shaped`), kept from here on under this call's `key` and run, tracing nothing; None where none
-        was made."""
+        was made. It stays held by its abstract signature too: a later call alike in it under another key
+        (an array its last step committed where the first call's was not, or placed under an equal sharding
+        of another object) runs it, where it compiled the program again (a host step's EMA update at its
+        second step)."""
         if not self._shaped:
             return None
         abstract = self.abstract_of(args, kwargs)
         with self._compiling:
-            held = self._shaped.pop(abstract, None)
+            held = self._shaped.get(abstract)
             if held is None:
                 return None
+            self._shaped.move_to_end(abstract)
             executable = held[0]
             settled: Future[jax.stages.Compiled] = Future()
             settled.set_result(executable)
@@ -734,13 +735,31 @@ class OuterProgram:
 
     def _bounded(self) -> None:
         """Hold no more than `CACHED` executables, kept (`_executables`) and compiled over shapes
-        (`_shaped`) together: the least recently made over shapes go first, then the least recently used
-        kept. Called with `_compiling` held."""
-        while len(self._executables) + len(self._shaped) > self.CACHED:
-            if self._shaped:
-                self._shaped.popitem(last=False)
-            else:
-                self._ready.pop(self._executables.popitem(last=False)[0], None)
+        (`_shaped`) together, one a call alike in its abstract signature runs too (`_shaped_for`) counted
+        once: the least recently made over shapes go first, then the least recently used kept. Called with
+        `_compiling` held."""
+        # Its executables at most `CACHED`, and the keys and abstract signatures that reach them at most twice
+        # that: a handed program reached under many keys holds no index without bound.
+        while self._held() > self.CACHED or len(self._executables) + len(self._shaped) > 2 * self.CACHED:
+            ready = {id(executable) for executable in self._ready.values()}
+            # The least recently made over shapes that no call runs yet, else the least recently used kept,
+            # with every entry over shapes of its executable no other key still runs.
+            unaliased = next((abstract for abstract, held in self._shaped.items()
+                              if id(held[0]) not in ready), None)
+            if unaliased is not None:
+                self._shaped.pop(unaliased)
+                continue
+            evicted = self._ready.pop(self._executables.popitem(last=False)[0], None)
+            if evicted is not None and all(executable is not evicted for executable in self._ready.values()):
+                for abstract in [abstract for abstract, held in self._shaped.items() if held[0] is evicted]:
+                    self._shaped.pop(abstract)
+
+    def _held(self) -> int:
+        """How many executables it holds, kept, compiling and compiled over shapes, each once however many
+        dispatch keys or abstract signatures run it."""
+        held = {id(executable) for executable in self._ready.values()}
+        held |= {id(entry[0]) for entry in self._shaped.values()}
+        return len(held) + sum(key not in self._ready for key in self._executables)
 
     @property
     def options(self) -> jax.stages.CompilerOptions | None:
@@ -759,10 +778,20 @@ class OuterProgram:
 
     def executable(self, *args, **kwargs) -> jax.stages.Compiled:
         """The executable a call with these arguments runs, compiled at the first: called with the dynamic
-        arguments alone, as a caller that calls it every step does, building no dispatch key."""
+        arguments alone, as a caller that calls it every step does, building no dispatch key, each call
+        within the contexts of the `running` blocks it runs in (`ran`)."""
         key, _, _ = self.key_of(args, kwargs)
         ready = self._ready.get(key)
         return self._kept(key, args, kwargs) if ready is None else ready
+
+    def ran(self, executable: jax.stages.Compiled, args: tuple, kwargs: dict
+            ) -> contextlib.AbstractContextManager:
+        """The contexts a call of `executable`, fetched for these arguments (`executable`), runs inside:
+        every enclosing `running` block's, entered here, as a call through the program enters them
+        (row 8480: a rollout's executables fetched once and called each step, `dew.rl.simulator`, `Fetched`,
+        a server's `dispatched`, ran past its admission and a trial's record). Its caller runs the
+        executable within it, each call."""
+        return _ran(self, executable, args, kwargs)
 
     def _reserved(self, key: Hashable) -> tuple[Future[jax.stages.Compiled], bool]:
         """The compile kept under `key` and whether this caller owns it: a future its owner settles
@@ -793,16 +822,23 @@ class OuterProgram:
 
     def _lowered_aside(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """The call's program lowered, its launches certified aside while it traces
-        (`report.certifying_aside`), and lowered afresh (`_relowered`) for as long as a certification
-        refuses, each refused launch's derivation stepping past its config and certifying the next in
-        turn."""
+        (`report.certifying_aside`), and lowered afresh (`_relowered`) for as long as it launches a refused
+        config (`report.refused_in`), each refused launch's derivation stepping past its config and certifying
+        the next in turn: its own certifications' refusals, or another caller's committed after its trace took
+        the config (row 8603: another thread's drain left this program compiling at it). A relowering that
+        launches a config refused before again (a derivation reading no refusal, a pin's) is its compile's to
+        read (`report.settled`)."""
         from dew.nn.kernels.templates import report
 
         with report.certifying_aside() as aside:
             lowered = self.lower(*args, **kwargs)
-        while report.settled_aside(aside):
+        report.settled_aside(aside)
+        seen: set = set()
+        while (refused := report.refused_in(lowered)) and not refused & seen:
+            seen |= refused
             with report.certifying_aside() as aside:
                 lowered = self._relowered(args, kwargs, relowered)
+            report.settled_aside(aside)
         return lowered
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
@@ -903,20 +939,29 @@ class OuterProgram:
 
     def _compiled_digested(self, *args, **kwargs) -> tuple[jax.stages.Compiled, str | None]:
         """`compiled`, and the digest its collection holds it by where it compiles within `collecting`
-        (None elsewhere, and for a program none can state)."""
+        (None elsewhere, and for a program none can state): its tracing, lowering and compile one compile's
+        work in JAX's events (`telemetry.compiles.spanning`), the backend its executable targets stated on
+        the span once it is compiled, which a ledger of what a block compiled reads by backend
+        (`dew.training.compiler.HostStartup`)."""
+        with spanning(self.called) as span:
+            executable, digest = self._compiled_spanned(span, args, kwargs)
+            span.executable = executable
+        return executable, digest
+
+    def _compiled_spanned(self, span: Span, args: tuple, kwargs: dict
+                          ) -> tuple[jax.stages.Compiled, str | None]:
+        """`_compiled_digested`'s compile, its `span` told whether it built its executable."""
         from dew.nn.kernels.templates import report
 
         relowered: Relowered = []
         # A call whose first compile was begun in a thread of its own (`compiling`), the same program over
         # the same abstract inputs, lowers nothing again: the begun lowering is its.
         begun = _ATTEMPTING.get()
-        began = time.perf_counter()
         if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
             lowered = begun.lowered
             begun.taken.set()
         else:
             lowered = self._lowered_aside(args, kwargs, relowered)
-        lowered_at = time.perf_counter()
         # A program compiled ahead or kept for this target runs as it was compiled (`taking`).
         if (ahead := taken(lowered, self.options)) is not None:
             return ahead(), None
@@ -928,6 +973,7 @@ class OuterProgram:
         executable = report.compiled(lowered,
                                      relower=functools.partial(self._relowered, args, kwargs, relowered),
                                      first=first)
+        span.built = True
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted, lowered = relowered[-1]
@@ -937,13 +983,7 @@ class OuterProgram:
         if (collected := _COLLECTED.get()) is not None and (
                 digest := stated_digest(lowered, self.options)) is not None:
             collected[digest] = executable
-        if (kept := _KEEPING.get()) is not None:
-            kept(self, lowered, executable)
-        if (spent := _SPENT.get()) is not None:
-            placed = [*jax.tree.leaves(executable.input_shardings),
-                      *jax.tree.leaves(executable.output_shardings)]
-            platform = next(iter(placed[0].device_set)).platform if placed else "none"
-            spent.append(Spent(self.called, platform, lowered_at - began, time.perf_counter() - lowered_at))
+        _heard(self, lowered, executable)
         return executable, digest
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:
@@ -1006,7 +1046,7 @@ def trace_context() -> Hashable:
     facts a trace reads (`generation.traced_fact`) are no part of it: each is answered where a trace asks
     it, under the trace's own target, and one read outside a trace may have no answer (a compile-only GPU
     mesh's devices hold no memory statistics); a caller whose trace reads one names it beside this key (the
-    compiles' refusals, `report.refused_launches`). A value it leaves out costs a trace, never a program
+    compiles' refusals, `report.refusal_entries`). A value it leaves out costs a trace, never a program
     traced under other state."""
     import decimal
     import os
@@ -1033,14 +1073,14 @@ def trace_context() -> Hashable:
 def held_context() -> Hashable:
     """The key a trace kept outside the compile point is held by, beside what it is of: the state a trace
     reads of this thread's context (`trace_context`) and the launches the compiles refused, which a
-    template's legality reads as the call traces (`report.refused_launches`, a process's fact a trace reads
+    template's legality reads as the call traces (`report.refusal_entries`, a process's fact a trace reads
     and a caller names beside the trace's state). A step's candidates (`dew.training._candidates`) and the
     algebra's held kernel decisions (`fusion.choice_context`, the derivation's context beside it) are each
     held by it, so a fact added to it reaches both; a launch's derived config is keyed by what its
     derivation reads (`report.derivation_inputs`, `templates.base`)."""
     from dew.nn.kernels.templates import report
 
-    return trace_context(), report.refused_launches()
+    return trace_context(), report.refusal_entries()
 
 
 def _signature(leaf) -> Hashable:
@@ -1150,7 +1190,8 @@ class Fetched:
         executable = self._executables.get(context)
         if executable is None:
             executable = self._executables[context] = self.program.executable(*args, **kwargs)
-        return executable(*args, **kwargs)
+        with self.program.ran(executable, args, kwargs):
+            return executable(*args, **kwargs)
 
 
 _Structure = tuple[jax.tree_util.PyTreeDef]

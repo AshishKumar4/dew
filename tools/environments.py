@@ -148,7 +148,7 @@ def main() -> int:
     # checkout's `--` is argparse's own, before a TREE that may start with a dash.
     argv = sys.argv[1:]
     cut = argv.index("--") if "--" in argv else len(argv)
-    parser = argparse.ArgumentParser(prog="tools/environments.py", description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(prog="tools/environments.py", description=__doc__)
     parser.add_argument("tree", type=Path, nargs="?")
     parser.add_argument("--lock", default=None, help="cpu, cuda12 or cuda13; by default this machine's")
     parser.add_argument("--reference", default=None,

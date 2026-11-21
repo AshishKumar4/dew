@@ -24,20 +24,34 @@ def pairs(combination: dict[str, str]) -> set[frozenset[tuple[str, str]]]:
 
 
 @pytest.mark.parametrize("family", sorted(kernel_matrix.AXES))
-def test_a_familys_cells_cover_every_pair_of_axis_values_its_route_serves_and_nothing_else(family):
+def test_a_familys_cells_cover_every_pair_of_axis_values_its_route_offers(family):
+    """A family's cells name values of its axes alone and hold every pair of axis values its route's
+    derivation offers (`kernel_matrix.supported`, the census of its derivation's offer, cheap enough for each
+    commit; the pairs a run's certified launches serve are a tier's census). That each cell is a combination
+    the route serves as a run takes it is each cell's own check
+    (`test_a_declared_cell_is_a_combination_its_route_serves`)."""
     cells = kernel_matrix.covered(family)
     axes = kernel_matrix.AXES[family]
     unaxed = [label for label, combination in cells
               if set(combination) != set(axes) or any(combination[axis] not in axes[axis] for axis in axes)]
     assert not unaxed, f"{family}'s cells name values outside its axes: {unaxed}"
-    unserved = [label for label, combination in cells
-                if not kernel_matrix.supported(family, tuple((axis, combination[axis]) for axis in axes))]
-    assert not unserved, f"{family}'s cells cover combinations its route does not serve: {unserved}"
     held = set().union(*(pairs(combination) for _, combination in cells))
     missing = {frozenset(pair) for pair in kernel_matrix.supported_pairs(family)} - held
     assert not missing, (f"{len(missing)} pairs of {family}'s axis values its route serves are in no cell, "
                          f"e.g. {sorted(sorted(pair) for pair in missing)[:10]}: regenerate its cases from "
                          f"kernel_matrix.covering({family!r})")
+
+
+@pytest.mark.parametrize(("family", "label", "combination"),
+                         [(family, label, combination) for family in sorted(kernel_matrix.AXES)
+                          for label, combination in kernel_matrix.covered(family)],
+                         ids=lambda value: value if isinstance(value, str) and ":" in value else None)
+def test_a_declared_cell_is_a_combination_its_route_serves(family, label, combination):
+    """Each declared cell covers a combination its family's route serves as a run takes it
+    (`kernel_matrix.served`: an attention backward's launch form as certification holds it, compiled for the
+    cell's GPU), a cell apiece so the certifications spread across groups."""
+    axes = kernel_matrix.AXES[family]
+    assert kernel_matrix.served(family, tuple((axis, combination[axis]) for axis in axes)), label
 
 
 @pytest.mark.parametrize(("flows", "tier"), [(kernel_matrix.FLOWS, "gpu"), (kernel_matrix.TPU_FLOWS, "tpu")],

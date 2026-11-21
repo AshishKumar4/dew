@@ -100,13 +100,6 @@ def test_a_bf16_gradient_over_one_sequence_is_as_exact_as_its_reference():
     memories kept."""
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=24)
-@interpreted_gradient('a ragged length', 'bf16', 'recomputed')
-def test_a_recomputed_ragged_bf16_gradient_is_as_exact_as_its_reference():
-    """`the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in bf16, its forward's memories
-    recomputed under a remat rung (`recomputing`)."""
-
-
 @pytest.mark.check1_shards(seeds=128, per_task=16)
 @interpreted_gradient('a decay a key dimension', 'bf16', 'kept')
 def test_a_bf16_gradient_under_a_decay_a_key_dimension_is_as_exact_as_its_reference():
@@ -254,15 +247,13 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
                     truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
 
-def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
-    """Kimi delta attention's gradient through the template (interpreted off a GPU) under the remat rung that
-    recomputes the forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse
-    the forward kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories
-    give, whose check 1 against recorded fla holds both
-    (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+@pytest.mark.parametrize('case', ['a ragged length', 'a decay a key dimension'])
+def test_a_recomputed_gradient_trains_as_its_kept_forward(case):
+    """The gradient through the template (interpreted off a GPU) under the remat rung that recomputes the
+    forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse the forward
+    kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories give, whose
+    check 1 against recorded fla holds both (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
     from fla_sites import LEAVES, ruled, sites
-
-    case = 'a decay a key dimension'
     on = on_the_mainloop(case_hooks(case), case, jnp.bfloat16)
     arrays = sites()[recorded_site(case, jnp.bfloat16)].arrays(0)
 
@@ -417,3 +408,126 @@ def test_a_saved_fp32_gradient_under_the_highest_precision_runs_the_numbers_its_
     with generation.assumed("sm90"), jax.default_matmul_precision("highest"):
         lowered = lowered_for(lambda arrays: ruled(saved, arrays), (abstract,), "sm90")
     assert any(call.name.startswith("recurrence_values_back") for call in kernel_calls(lowered, unrun=True))
+
+
+def test_mosaic_held_prices_backward_launches_when_reverse_is_true():
+    """`Mosaic.held(ba, config, reverse=True)` checks every launch `launches(..., backward=True)` compiles
+    against its own consumer register budget, while `reverse=False` checks `_forwards` alone (row 6740)."""
+    hooks = case_hooks("one sequence")
+    (sample,) = draw(jnp.bfloat16, 0, **geometry("one sequence"))
+    ba = template_call(sample, hooks)
+    target = generation.gpu_target("sm100")
+    family = bundles.of("sm100", jnp.bfloat16)
+    with generation.assumed(target):
+        tiles = template.MOSAIC.derived(ba, target)
+        assert tiles is not None
+        assert template.MOSAIC.held(ba, tiles, reverse=False) == template.MOSAIC._launches_hold(
+            template.MOSAIC._forwards(ba, tiles, target), family)
+        assert template.MOSAIC.held(ba, tiles, reverse=True) == template.MOSAIC._launches_hold(
+            template.MOSAIC.launches(ba, tiles, target, backward=True), family)
+@pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
+def test_an_fp32_turned_call_on_the_template_trains_as_the_portable_math_interpreted(packed):
+    """Mamba-3's turned form (`TURNED`) in fp32 (three bf16 parts under the accurate forms, row 7673) trains
+    on the recurrence template's fast backward, output, final memory and every operand's gradient on par
+    with the portable math from float64 (check 1)."""
+    from test_recurrence_chunk import assert_packed_on_par
+    from test_recurrence_mosaic import LENGTH, TURNED, hooked_draw
+
+    def on(route, operands, starts=None):
+        return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
+
+    def drawn(seed):
+        (operands,) = hooked_draw(TURNED, packed=False, seed=seed)
+        return operands, cotangents(operands, seed)
+
+    assert_packed_on_par(formed("accurate", functools.partial(on, "mosaic_gpu")),
+                         functools.partial(on, "xla"), drawn, f"{TURNED} fp32 on the template",
+                         packed=packed, documents=((0, 24, 40), (10, 48)), length=LENGTH, seeds=8)
+
+
+@COMPILES_ON_CPU
+def test_an_fp32_turned_training_step_certifies_on_h100():
+    """Mamba-3's turned form (`TURNED`) in fp32 lowers and certifies its training gradient on a compile-only
+    H100 through the template's fast backward (row 7673), taking `mosaic_gpu` with every kernel unspilled."""
+    from kernel_compile import lowered_for
+    from test_recurrence_mosaic import TURNED, _certified_bodies, hooked_draw
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import report
+
+    (operands,) = hooked_draw(TURNED, packed=False, seed=0)
+    shaped = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), operands)
+    before = {id(certified) for certified in report.certifications()}
+    with report.refusals(), report.certifying(compile_only_gpus("sm90")[0]):
+        lowered_for(jax.grad(lambda given: jnp.sum(chunk_on("mosaic_gpu", TURNED, given)[0])),
+                    (shaped,), "sm90")
+    found = [each for each in report.certifications()
+             if id(each) not in before and each.op == type(template.MOSAIC).__name__]
+    bodies = _certified_bodies(found)
+    assert bodies and all(not entries[-1].refused for entries in bodies.values()), bodies
+
+
+@pytest.mark.parametrize('target', ['sm90', 'sm100'])
+@pytest.mark.parametrize('name', ['nemotron-h-4b-ssd', 'qwen3.5-27b-gdn'])
+def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
+    """A 16-bit forward no gradient follows, under a decay a head on warpgroup MMA and tcgen05, at its own
+    tiles (`Tiles.forward`): the launches the training forward runs (`Mosaic.launches`), its states then
+    its output. Its states and output walked in one launch lost to them at every measured shape: on a GH200
+    Nemotron-H 4B's SSD forward took 669.5 us walked against 271.2 apart, 30B's 192.3 against 182.4 and
+    the 27B gated delta net's 569.8 against 440.6 (M-JS-148b; a B200's 27B walk 613 us against its training
+    forward's states 254, js106c), rows 5668, 7877."""
+    from test_recurrence_mosaic import RATED, _form, _skipped, resource_operands
+
+    dtype = jnp.bfloat16
+    bound = template.MOSAIC.bind(*resource_operands(name, dtype, 1, 4096), None, max_segments=None,
+                                 bound=None if name in RATED else 1.0, **_form(name, dtype), **_skipped(name))
+    facts = generation.gpu_target(target)
+    with generation.assumed(facts):
+        tiles = template.MOSAIC.derived(bound, facts)
+
+        def names(tiles, *, training: bool) -> list[str]:
+            return [launch.name for launch in template.MOSAIC.launches(bound, tiles, facts, backward=False,
+                                                                       training_forward=training)]
+
+        forward, trained = names(tiles.forward or tiles, training=False), names(tiles, training=True)
+    # Named apart, a forward alone's (`mainloop.named`).
+    alone = [name.replace('recurrence', 'recurrence_alone', 1) for name in trained]
+    assert forward == alone, (forward, trained)
+
+
+@pytest.mark.parametrize('kernel', ['recurrence_alone_output', 'recurrence_states'],
+                         ids=['forward alone spent', 'training forward spent'])
+def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
+    """The 27B gated delta net on an H100, one product's kernel refused at its derived tiles' base and every
+    rung of its ladder from there (`Mosaic.rungs`, as a compile spends it): the derivation steps that
+    product's tiles and leaves the other's launches as they were (`Mosaic._refused`'s product), the training
+    call's where a forward alone spent its output launch, the forward alone's where the training forward
+    spent its states. Named alike, a forward alone's spill refused the training call's candidates too (row
+    10559)."""
+    from test_recurrence_mosaic import resource_operands
+
+    from dew.nn.kernels.templates import report
+
+    operands = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
+    bound = template.MOSAIC.bind(*operands, None, bound=1.0)
+    alone = mainloop.ran_alone(kernel)
+    with report.refusals(), generation.assumed('sm90'):
+        target = template.Mosaic.launched()
+        first = template.MOSAIC.derived(bound, target)
+        base, identity = template._base(first), report._identity(template.MOSAIC, bound)
+        # The base refused first, whose ladder its rungs then are (`rungs` walks a refused config's).
+        report.refuse([(identity, base, {kernel})])
+        rungs = list(template.MOSAIC.rungs(bound, base))
+        report.refuse([(identity, rung, {kernel}) for rung in rungs])
+        stepped = template.MOSAIC.derived(bound, target)
+
+        def launches(tiles, training: bool):
+            if training:
+                return template.MOSAIC.launches(bound, tiles, target, backward=True)
+            return template.MOSAIC.launches(bound, tiles.forward or tiles, target, backward=False)
+
+        # Spent: past every rung of its ladder (none where its launch moves no registers), no raise answers.
+        assert template.MOSAIC._exhausted(bound, base, target) and stepped is not None, (rungs, stepped)
+        # The spent product off its ladder, the other's launches as they were.
+        assert launches(stepped, not alone) != launches(first, not alone), (first, stepped)
+        assert launches(stepped, alone) == launches(first, alone), (first, stepped)

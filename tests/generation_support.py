@@ -10,6 +10,8 @@ lowering a generation's Mosaic GPU kernels runs on a CPU or on a GPU that copies
 """
 
 import importlib.util
+import os
+from pathlib import Path
 
 import jax
 import pytest
@@ -18,10 +20,62 @@ from flax.linen.dtypes import canonicalize_dtype
 
 from dew.nn.kernels import gemm, generation
 
-INTERPRETS = pytest.mark.skipif(jax.default_backend() != "cpu",
+
+def interprets() -> bool:
+    """Whether this process's kernels run interpreted as its run runs them: off a GPU, but not in a GPU tier
+    part's prepare, which states them as the node's GPU runs them (`here`), so the run reads its arms from
+    the store. Read at import off a GPU alone, a prepare on the node's CPU stated its arm interpreted and the
+    run's was one it never drew (row 8750's MissingTruth)."""
+    return not tier_wire.preparing() and jax.default_backend() != "gpu"
+
+
+TOPOLOGY = "DEW_NODE_TOPOLOGY"
+"""The node's GPUs' serialized topology (dew-ops' session hands a prepare its node's): the GPU a flow's
+programs are compiled for."""
+
+
+def node_target():
+    """The node's GPU (`TOPOLOGY`): its generation, its kind's (`generation.gpu_target`), and the facts its
+    serialized device states of itself, its multiprocessors and its block's shared memory among them
+    (`generation.runtime_facts`), read with no GPU visible, as a prepare runs, so nothing of the CUDA
+    driver's: what its run's load holds the programs to (`BuildTarget.held`). `here` reads it as this module
+    imports, which gpu_flow imports in turn: it holds nothing of the flows' module, whose import takes
+    gpu_flow's (row 9540)."""
+    from jax.experimental import topologies
+
+    # The CUDA plugin, which a serialized topology deserializes through, initialized with no GPU and no
+    # client (`dew.training.ahead.host_gpus`).
+    generation.compile_only_gpus("sm80", 1)
+    device = topologies.TopologyDescription.deserialize(Path(os.environ[TOPOLOGY]).read_bytes()).devices[0]
+    return generation.runtime_facts(generation.gpu_target(device.device_kind), device,
+                                    read=lambda ordinal, attribute: None)
+
+
+def node_topology(path: Path, gpu: str = "sm80") -> Path:
+    """`path` holding a node's serialized topology (`TOPOLOGY`'s, `node_target`'s), one compile-only GPU of
+    generation `gpu` serialized as a host serializes its own: a prepare's node in a CPU process."""
+    from jax.experimental import topologies
+
+    path.write_bytes(topologies.TopologyDescription(list(generation.compile_only_gpus(gpu, 1))).serialize())
+    return path
+
+
+def here() -> str:
+    """This process's device generation as its kernels run: the node's GPU's in a GPU tier part's prepare
+    (`node_target`), whose default device, a compile-only GPU, states no generation of its own, so a cell
+    pinned to the node's generation prepares there as its run runs it (train 1013's review F4); else its
+    device's. The one prepare-aware reading of it: `runnable`, `lowers_as` and every matrix case's pin (a
+    `skipif` its module evaluates at import, rows 7868 and 7886) read it."""
+    if tier_wire.preparing():
+        return node_target().generation
+    return generation.device_generation()
+
+
+_ON_CPU = here() == "cpu"
+INTERPRETS = pytest.mark.skipif(not _ON_CPU,
                                 reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
 COMPILES_ON_CPU = pytest.mark.skipif(
-    jax.default_backend() != "cpu",
+    not _ON_CPU,
     reason="compiles kernels ahead for compile-only GPUs, a CPU process's work (bible §8: no GPU is held "
            "for host compiles), judging each by every CUDA build's ptxas, whose nvcc wheels the CPU "
            "environment alone installs; a GPU process's Mosaic prints a module's PTX at its first compile "
@@ -31,25 +85,9 @@ COMPILES_ON_CPU = pytest.mark.skipif(
 compile-only GPUs in a CPU process, where its every build's ptxas is installed and each module's PTX is
 printed for it."""
 SUMS_IN_IEEE = pytest.mark.skipif(
-    jax.default_backend() != "cpu",
+    not _ON_CPU,
     reason="compares sums bit for bit as a CPU's IEEE fp32 dots give them, which a GPU's tensor cores, "
            "truncating each add, do not")
-
-
-def here() -> str:
-    """This process's device generation as its kernels run: the node's GPU's in a GPU tier part's prepare
-    (`model_flows.node_target`), whose default device, a compile-only GPU, states no generation of its own,
-    so a cell pinned to the node's generation prepares there as its run runs it (train 1013's review F4);
-    else its device's. The one prepare-aware reading of it: `runnable`, `lowers_as` and every matrix case's
-    pin (a `skipif` its module evaluates at import, rows 7868 and 7886) read it."""
-    if tier_wire.preparing():
-        import model_flows
-
-        return model_flows.node_target().generation
-    return generation.device_generation()
-
-
-
 
 
 def pinned(case_generation: str):

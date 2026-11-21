@@ -9,8 +9,8 @@ estimates (`report`)."""
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Hashable, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
+from typing import TYPE_CHECKING, NamedTuple, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -50,65 +50,77 @@ def producer_floor() -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class Producers:
-    """The registers a config's launches lower their producers to, by launch (a kernel's name, `report.Binary
-    .kernel`), where a compile found one spilling at fewer (its derivation's raise, the recurrence's
-    `Mosaic._raised`): every other launch's at the least (`producer_floor`). A dimension of the config its
-    launches derive, refused and raised as a compile or its certification refuses a spilling config, so the
-    assembler derives a producer's registers, a step at a time (the B200's natural d256 forward over 4,096
-    tokens and sm100's recurrence states, scan and reverse launches each spilled at the least, rows 6010
-    and 5357)."""
+class ByLaunch:
+    """A config's caps on some of its launches, by launch (a kernel's name, `report.Binary.kernel`), where a
+    compile found one spilling: every other launch's its derivation's own. A dimension of the config its
+    launches derive, refused and stepped as a compile or its certification refuses a spilling config."""
 
-    raised_to: tuple[tuple[str, int], ...] = ()
+    caps: tuple[tuple[str, int], ...] = ()
 
     def of(self, launch: str) -> int | None:
-        """The registers `launch`'s producer lowers to, None at the least (`producer_floor`)."""
-        return dict(self.raised_to).get(launch)
+        """`launch`'s cap, None where its derivation alone decides."""
+        return dict(self.caps).get(launch)
 
-    def stepped(self, tops: Mapping[str, int]) -> "Producers | None":
-        """These, with each of `tops`' launches' producers at the next rung of its ladder, which runs from its
-        top down a setmaxnreg step at a time to a step above the least: an unraised producer to its top (its
-        program's entry share, where every role holds the same and no register moves: past it the roles'
-        setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), a raised
-        one a step lower; None where one is a step above the least already, or its top is not above it."""
-        steps, held = facts().raises(), dict(self.raised_to)
-        for launch, top in tops.items():
-            cap = held.get(launch)
-            # A top in setmaxnreg's steps: a program of two warpgroups launches at a thread's 255, no step.
-            lower = min(top, steps.highest) // steps.step * steps.step if cap is None else cap - steps.step
-            if lower <= steps.lowest:
-                return None
-            held[launch] = lower
-        return Producers(tuple(sorted(held.items())))
+    def only(self, launches: Collection[str]) -> Self:
+        """The caps of `launches` alone, what they read of these."""
+        return type(self)(tuple((name, cap) for name, cap in self.caps if name in launches))
+
+    def without(self, launches: Collection[str]) -> Self:
+        """These but `launches`', each its derivation's own again."""
+        return type(self)(tuple((name, cap) for name, cap in self.caps if name not in launches))
+
+    def held(self, stepped: Mapping[str, int]) -> Self:
+        """These with each of `stepped`'s launches at its cap there."""
+        return type(self)(tuple(sorted({**dict(self.caps), **stepped}.items())))
 
 
 @dataclasses.dataclass(frozen=True)
-class Residents:
-    """The programs a multiprocessor holds of a config's launches at most, by launch (a kernel's name, as
-    `Producers`), where a compile found one spilling with its producer's ladder run out (its derivation's
-    step, the recurrence's `Mosaic._fewer`): every other launch's as many as its registers and shared memory
-    hold (`plan`). A dimension of the config as `Producers` is, refused and stepped as a compile or its
-    certification refuses a spilling config: a program fewer gives every role of the launch a larger share,
-    where the assembler may hold what it spilled at more, which no model of a launch's live values states
-    (Mamba-2's query/key walk at 8 heads of 32 and a state of 32, row 6718: its consumers spilled two table
-    reads at three programs' 136 registers at every rung of its producer's ladder, its values 91 registers
-    live at their peak, and held them at two programs' 232)."""
+class Producers(ByLaunch):
+    """The registers a config's launches lower their producers to (`ByLaunch`), where a compile found one
+    spilling at the least (its derivation's raise, the recurrence's `Mosaic._raised`): every other launch's
+    at the least (`producer_floor`), so the assembler derives a producer's registers, a rung at a time (the
+    B200's natural d256 forward over 4,096 tokens and sm100's recurrence states, scan and reverse launches
+    each spilled at the least, rows 6010 and 5357)."""
 
-    held_to: tuple[tuple[str, int], ...] = ()
+    def stepped(self, tops: Mapping[str, int], stated: Mapping[str, int] | None = None) -> "Producers | None":
+        """These, with each of `tops`' launches' producers at the next rung of its ladder: from the least, its
+        `stated` cap where given (where its consumers' statement leaves the producer more than the least,
+        `stated_producer`; a GEMM's gathering producer states none, `gemm.producers`), then its top (its
+        program's entry share, where every role holds the same and no register moves: past it the roles'
+        setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), then down
+        a setmaxnreg step at a time past the stated cap, asked already, to a step above the least; None where
+        one is a step above the least already, or its top is not above it."""
+        steps, rungs = facts().raises(), {}
+        for launch, top in tops.items():
+            cap, start, first = self.of(launch), steps.below(top), (stated or {}).get(launch)
+            if cap is None:
+                lower = start if first is None else first
+            else:
+                lower = start if cap == first != start else cap - steps.step
+                if lower == first != start:
+                    lower -= steps.step
+            if lower <= steps.lowest:
+                return None
+            rungs[launch] = lower
+        return self.held(rungs)
 
-    def of(self, launch: str) -> int | None:
-        """The most programs of `launch` a multiprocessor holds, None where its plan alone decides."""
-        return dict(self.held_to).get(launch)
+
+@dataclasses.dataclass(frozen=True)
+class Residents(ByLaunch):
+    """The programs a multiprocessor holds of a config's launches at most (`ByLaunch`), where a compile found
+    one spilling with its producer's ladder run out (its derivation's step, the recurrence's
+    `Mosaic._fewer`): every other launch's as many as its registers and shared memory hold (`plan`). A program
+    fewer gives every role of the launch a larger share, where the assembler may hold what it spilled at more,
+    which no model of a launch's live values states (Mamba-2's query/key walk at 8 heads of 32 and a state of
+    32, row 6718: its consumers spilled two table reads at three programs' 136 registers at every rung of its
+    producer's ladder, its values 91 registers live at their peak, and held them at two programs' 232)."""
 
     def fewer(self, planned: Mapping[str, int]) -> "Residents | None":
         """These, with each of `planned`'s launches held to a program fewer than the programs it plans now;
         None where one plans one already."""
-        held = dict(self.held_to)
-        for launch, programs in planned.items():
-            if programs <= 1:
-                return None
-            held[launch] = programs - 1
-        return Residents(tuple(sorted(held.items())))
+        if any(programs <= 1 for programs in planned.values()):
+            return None
+        return self.held({launch: programs - 1 for launch, programs in planned.items()})
 
 
 THREADS = 128
@@ -350,46 +362,45 @@ def shared_programs(most: int, shared: int, block: int) -> int:
 
 def held_area(family: "Family", consumers: int) -> int:
     """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
-    (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns); a
+    (`Family.scalar_registers`): a derived tile's rows times columns at most (`held_rows` at any columns); a
     family's own where its values live in a core's scratch memory (`Issuer.held_area`: a TPU's VMEM)."""
     area = family.held_area(consumers)
     if area is not None:
         return area
-    return (family.registers(consumers) - family.held_registers) * THREADS * consumers
+    return (family.registers(consumers) - family.scalar_registers()) * THREADS * consumers
 
 
 def held_rows(family: "Family", consumers: int, columns: int) -> int:
     """The most rows, in whole roles of `consumers` consumers of `family` (`Family.role_rows` each), whose
     fp32 accumulator of `columns` columns their threads hold beside what they hold besides
-    (`Family.held_registers`): the rows a derived tile's registers bound (docs/design/kernel-templates.md
+    (`Family.scalar_registers`): the rows a derived tile's registers bound (docs/design/kernel-templates.md
     §7). A family whose products read registers holds a step's fragments too (`tile_registers`), which
     its derivation checks at each step."""
     share = held_area(family, consumers) // consumers // columns
     return share // family.role_rows * family.role_rows * consumers
 
 
-def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
-         group_row_tiles: int | None = None, *, cluster: int = 1) -> int:
+def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int, *, grouped: bool = False,
+         cluster: int = 1) -> int:
     """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
-    blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
-    that reads each operand fewest times from the device, or a grouped walk's every column tile where
-    the band reaches them. The rows' and the columns' blocks balanced
-    (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
-    where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
-    each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
-    reads once a group. A grouped walk's band that reaches every column tile takes them all, whatever
-    their count: a power of two below it would leave a last band that walks every row tile again (row
-    4053: the H100 grouped forward's three or six column tiles in bands of two or four read its tokens
-    twice, 1.39x CUTLASS's bytes, M-NS-3). A dense walk's stays a power of two: its snake's division by
-    another count took the registers a 128 x 256 kernel gradient had left (ptxas 240 and 44 bytes
-    spilled at a band of three, NS4053-1), which the register model does not see. A cluster of
-    `cluster` multiprocessors is one program, its tile `cluster` row tiles (`group_row_tiles` counts a
-    group's clusters' tiles)."""
+    blocks in the L2 (`grid_block_n`). A grouped walk's every column tile: each row tile's columns walked
+    by one wave reads each block of a group's rows from the device once, as a ragged group's rows are read
+    by no other group's tiles, where a narrower band walks every row tile again a band (Mixtral's down on a
+    GH200, M-EM-68: its device reads 9.70, 8.45, 7.49, 7.40 and 6.73 GB at bands 1, 2, 4, 8 and every
+    column tile, 16; its forward 1.037x CUTLASS's at the band of 8 a wave's balance gave, 0.997x at every
+    column tile; row 4053's H100 forward's three or six column tiles read its tokens twice in bands of
+    two or four, 1.39x CUTLASS's bytes, M-NS-3). A dense walk's the power of two, at most `column_tiles`,
+    nearest below the band that reads each operand fewest times, the rows' and the columns' blocks
+    balanced (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns));
+    a power of two, as its snake's division by another count took the registers a 128 x 256 kernel
+    gradient had left (ptxas 240 and 44 bytes spilled at a band of three, NS4053-1), which the register
+    model does not see. A cluster of `cluster` multiprocessors is one program, its tile `cluster` row
+    tiles."""
+    if grouped:
+        return column_tiles
     programs, rows = multiprocessors // cluster, block_m * cluster
-    balanced = math.sqrt(programs * rows / block_n)
-    spanning = programs / group_row_tiles if group_row_tiles else 0.0
-    wide = max(1, min(int(max(balanced, spanning)), column_tiles))
-    return column_tiles if group_row_tiles and wide == column_tiles else 1 << (wide.bit_length() - 1)
+    wide = max(1, min(int(math.sqrt(programs * rows / block_n)), column_tiles))
+    return 1 << (wide.bit_length() - 1)
 
 
 RAISES_HONORED = True
@@ -405,11 +416,17 @@ SSD query/key launch, 161 us at two, 216 to 226 at one, FS-WHY3-h100), so a rais
 
 def entry_registers(warpgroups: int, programs: int = 1) -> int:
     """The registers a thread of a program of `warpgroups` warpgroups launches with, `programs` of it held by
-    a multiprocessor at once: their threads' share of its registers (`Multiprocessor.registers`, 64K) in the
-    allocator's steps (8), at most the thread's (255): 168 at three warpgroups and one program, 128 at two
+    a multiprocessor at once (`thread_share`): 168 at three warpgroups and one program, 128 at two
     warpgroups and two."""
+    return thread_share(warpgroups * THREADS, programs)
+
+
+def thread_share(threads: int, programs: int = 1) -> int:
+    """The registers a thread of a program of `threads` threads launches with, `programs` of it held by a
+    multiprocessor at once: their threads' share of its registers (`Multiprocessor.registers`, 64K) in the
+    allocator's steps (8), at most the thread's (255)."""
     held = facts()
-    share = held.registers // (programs * warpgroups * THREADS)
+    share = held.registers // (programs * threads)
     return min(held.thread_registers, share // held.register_step * held.register_step)
 
 
@@ -420,19 +437,31 @@ def raise_ceiling() -> int:
     at one program, spilled a 64-bit address at a raise of 256 and none at any of 192 to 248
     (FS-LT-OUTPUT-CAPS1, its PTX otherwise the same)."""
     held = facts()
-    raises = held.raises()
-    return min(raises.highest, held.thread_registers // raises.step * raises.step)
+    return held.raises().below(held.thread_registers)
 
 
-def raised_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
+Joined = tuple[tuple[float, int], ...]
+"""A program's joined raised warpgroup roles beside its consumers (`handoffs.Schedule.joined`), each its
+weight and its count of warpgroups: a correction warpgroup at half a consumer's share, `((0.5, 1),)`."""
+
+
+def raised_registers(consumers: int, programs: int = 1, producer: int | None = None,
+                     joined: Joined = ()) -> int:
     """The registers each of `consumers` consumer warpgroups raises a thread's to beside a producer that
     lowers to `producer` a thread (`producer_floor`, a model's own where it states another,
-    `RegisterModel.cap`): `role_registers` of equal weights (one consumer's 248 at one program and 232 at two;
-    two consumers' 240 at one)."""
-    return role_registers((1,) * consumers + (0,), programs, floor=producer)[0]
+    `RegisterModel.cap`) and the `joined` roles: `role_registers` of the consumers' equal weights beside
+    theirs (one consumer's 248 at one program and 232 at two; two consumers' 240 at one)."""
+    weights = (1,) * consumers + tuple(weight for weight, count in joined for _ in range(count))
+    return role_registers((*weights, 0), programs, floor=producer)[0]
 
 
-def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | None = None) -> tuple[int, ...]:
+def joined_warpgroups(joined: Joined) -> int:
+    """The warpgroups `joined`'s roles run."""
+    return sum(count for _, count in joined)
+
+
+def role_registers(weights: tuple[float, ...], programs: int = 1,
+                   floor: int | None = None) -> tuple[int, ...]:
     """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg: `_role_registers`
     on the multiprocessor the launches derive for (`facts`), the floor a producer lowers to `producer_floor`
     where none is given."""
@@ -440,7 +469,7 @@ def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | Non
 
 
 @functools.lru_cache(maxsize=1024)
-def _role_registers(weights: tuple[int, ...], programs: int, floor: int,
+def _role_registers(weights: tuple[float, ...], programs: int, floor: int,
                     multiprocessor: generation.Multiprocessor) -> tuple[int, ...]:
     """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg
     (`handoffs.Schedule`'s roles), `programs` programs held by a multiprocessor at once: a warpgroup of weight
@@ -461,7 +490,7 @@ def _role_registers(weights: tuple[int, ...], programs: int, floor: int,
         share = pool // (sum(raised.values()) * THREADS)
         capped = [index for index, weight in raised.items() if share * weight >= ceiling]
         if not capped:
-            held |= {index: share * weight // step * step for index, weight in raised.items()}
+            held |= {index: int(share * weight // step * step) for index, weight in raised.items()}
             break
         for index in capped:
             held[index] = ceiling
@@ -470,31 +499,34 @@ def _role_registers(weights: tuple[int, ...], programs: int, floor: int,
     return tuple(held.get(index, floor) for index in range(len(weights)))
 
 
-def consumer_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
+def consumer_registers(consumers: int, programs: int = 1, producer: int | None = None,
+                       joined: Joined = ()) -> int:
     """The registers a thread of each of `consumers` consumer warpgroups holds, `programs` programs a
-    multiprocessor, beside a producer lowered to `producer` (`producer_floor` where None): its raise
-    (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its program's entry's
-    otherwise."""
-    return (raised_registers(consumers, programs, producer) if RAISES_HONORED
-            else entry_registers(consumers + 1, programs))
+    multiprocessor, beside a producer lowered to `producer` (`producer_floor` where None) and the `joined`
+    roles: its raise (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its
+    program's entry's otherwise."""
+    return (raised_registers(consumers, programs, producer, joined) if RAISES_HONORED
+            else entry_registers(consumers + joined_warpgroups(joined) + 1, programs))
 
 
-def producer_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
-    """The registers a thread of a program's producer beside `consumers` consumer warpgroups holds, `programs`
-    programs a multiprocessor: what it lowers to, `producer` (`producer_floor` where None), where the GPU's
-    compile honors the program's raises, its entry's otherwise."""
+def producer_registers(consumers: int, programs: int = 1, producer: int | None = None,
+                       joined: Joined = ()) -> int:
+    """The registers a thread of a program's producer beside `consumers` consumer warpgroups and the `joined`
+    roles holds, `programs` programs a multiprocessor: what it lowers to, `producer` (`producer_floor` where
+    None), where the GPU's compile honors the program's raises, its entry's otherwise."""
     lowered = producer_floor() if producer is None else producer
-    return lowered if RAISES_HONORED else entry_registers(consumers + 1, programs)
+    return (lowered if RAISES_HONORED
+            else entry_registers(consumers + joined_warpgroups(joined) + 1, programs))
 
 
 @dataclasses.dataclass(frozen=True)
 class Scope:
     """A program's shared-memory allocations by lifetime, as its kernel scopes them (`shared_bytes`): those
-    live for the whole `program` (arrays, barriers, a ring's: `plgpu.SMEM`, `plgpu.Barrier`,
-    `plgpu.ClusterBarrier`, nested in sequences and mappings); each walk's own, one after another (`walks`:
-    an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; whether the
-    program `reduces` across warps, reserving its family's scratch (`Family.reduction_scratch`); and its
-    `reducing_warpgroups`, each reserving its share where its arithmetic reduces implicitly
+    live for the whole `program` (arrays, barriers, unions, a ring's: `plgpu.SMEM`, `plgpu.RefUnion`,
+    `plgpu.Barrier`, `plgpu.ClusterBarrier`, nested in sequences and mappings); each walk's own, one after
+    another (`walks`: an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`;
+    whether the program `reduces` across warps, reserving its family's scratch (`Family.reduction_scratch`);
+    and its `reducing_warpgroups`, each reserving its share where its arithmetic reduces implicitly
     (`Family.warpgroup_reduction_scratch`, the kernel's); and its `addresses`, the unaligned words its
     kernel keeps beside them (a tensor memory allocation's address, `TMEM_ADDRESS_BYTES`)."""
     program: tuple = ()
@@ -539,14 +571,19 @@ def stored_bytes(shape: tuple, dtype) -> int:
 def scratch_bytes(family: "Family", scope: Scope) -> int:
     """The shared memory a program of `scope` asks for besides its barriers and semaphores (`_semaphore`),
     as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every array rounded up to
-    `SMEM_ALIGNMENT` (`allocated`), the walks the largest of them, the tiles scoped after the walks the
-    larger of them and the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside
-    the program's otherwise, and the family's reduction scratch where the program reduces
-    (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
-    (`Family.warpgroup_reduction_scratch`)."""
+    `SMEM_ALIGNMENT` (`allocated`), a `plgpu.RefUnion` as large as its largest member (`after_walk`, row
+    8800), the walks the largest of them, the tiles scoped after the walks the larger of them and the walks
+    on a family that scopes its walks apart (`Family.walks_scoped`), and beside the program's otherwise, and
+    the family's reduction scratch where the program reduces (`Family.reduction_scratch`) and its
+    warpgroups' shares where they reduce implicitly (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
-        return [stored_bytes(leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(tree)
-                if not _barrier(leaf) and not _semaphore(leaf)]
+        sizes = []
+        for leaf in jax.tree.leaves(tree, is_leaf=lambda x: isinstance(x, plgpu.RefUnion)):
+            if isinstance(leaf, plgpu.RefUnion):
+                sizes.append(max(allocated(*arrays(member)) for member in leaf.refs))
+            elif not _barrier(leaf) and not _semaphore(leaf):
+                sizes.append(stored_bytes(leaf.shape, leaf.dtype))
+        return sizes
 
     sizes = arrays(scope.program)
     walks = [allocated(*arrays(walk)) for walk in scope.walks]
@@ -562,8 +599,8 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
 
 
 def shared_bytes(family: "Family", scope: Scope) -> int:
-    """The shared memory a program of `scope` asks for: its scratch (`scratch_bytes`), then every
-    barrier (`BARRIER_BYTES`) and every address word (`Scope.addresses`)."""
+    """The shared memory a program of `scope` asks for: its scratch (`scratch_bytes`), then every barrier
+    (`BARRIER_BYTES`) and every address word (`Scope.addresses`)."""
     barriers = sum(_count(leaf.num_barriers) for tree in (scope.program, scope.walks)
                    for leaf in jax.tree.leaves(tree) if _barrier(leaf))
     return scratch_bytes(family, scope) + BARRIER_BYTES * barriers + scope.addresses
@@ -605,10 +642,15 @@ class LaunchPlan:
     shared: int
 
 
-def _register_allocation(registers: int, consumers: int, producer: int, step: int) -> int:
-    consumed = -(-registers // step) * step
-    produced = -(-producer // step) * step
-    return (consumers * consumed + produced) * THREADS
+def _register_allocation(registers: int, consumers: int, producer: int, step: int,
+                         joined: Joined = ()) -> int:
+    """What a program allocates of a multiprocessor's registers: its consumers' `registers` a thread, each
+    `joined` role's its weight's share of them (`role_registers`' rule), and its producer's, in `step`s."""
+    def stepped(held: float) -> int:
+        return math.ceil(held / step) * step
+
+    held = consumers * stepped(registers) + stepped(producer)
+    return (held + sum(count * stepped(weight * registers) for weight, count in joined)) * THREADS
 
 
 def resident_warpgroups() -> int:
@@ -620,22 +662,26 @@ def resident_warpgroups() -> int:
 
 
 def register_programs(family: "Family", consumers: int, registers: int | None = None,
-                      producer: int | None = None) -> int:
+                      producer: int | None = None, joined: tuple = ()) -> int:
     """The most programs of a launch of `consumers` consumer roles a multiprocessor's registers hold at once,
     each consumer thread holding `registers` (None: the family's budget at one program, `Family.registers`):
     the most at whose share (`Family.registers` at that residency, a raise's where the family's roles raise)
     its consumers hold them, beside its producer's where its layout has one. A launch's own need sets its
     residency: two programs of a one-consumer launch at 127 registers ran its walk 1.35 times as fast as one
     (FS-WHY3-h100). A core whose family budgets no registers (a TPU's, `Family.budgets_registers`) runs
-    one. Its producer lowers to `producer` (`producer_floor` where None)."""
+    one. Its producer lowers to `producer` (`producer_floor` where None); its `joined` roles
+    (`Family.role_schedule`'s) take their share beside its consumers."""
     if not family.budgets_registers:
         return 1
-    warpgroups = family.warpgroups(consumers)
-    need = family.registers(consumers, producer=producer) if registers is None else registers
+    warpgroups = family.warpgroups(consumers, joined=joined)
+    shares = family.joined_shares(joined)
+    need = family.registers(consumers, producer=producer, joined=joined) if registers is None else registers
     for programs in range(resident_warpgroups() // warpgroups, 0, -1):
-        lowered = producer_registers(consumers, programs, producer) if warpgroups > consumers else 0
-        if need <= family.registers(consumers, programs, producer) and programs * _register_allocation(
-                need, consumers, lowered, family.register_step) <= facts().registers:
+        lowered = (producer_registers(consumers, programs, producer, shares)
+                   if warpgroups > consumers + joined_warpgroups(shares) else 0)
+        held = programs * _register_allocation(need, consumers, lowered, family.register_step, shares)
+        budget = family.registers(consumers, programs, producer, joined=joined)
+        if need <= budget and held <= facts().registers:
             return programs
     return 0
 
@@ -661,11 +707,14 @@ class RegisterModel:
     family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
     file: int = dataclasses.field(kw_only=True)
     moves: bool = dataclasses.field(default=True, kw_only=True)
+    joined: Joined = dataclasses.field(default=(), kw_only=True)
+    """Its raised roles beside its consumers (`Joined`: a correction warpgroup's weight and count), each
+    holding its weight's share of a consumer's registers."""
 
     def resident(self, registers: int, *, honored: bool = RAISES_HONORED) -> int:
         """Residency at this consumer allocation, bounded by the launch's other resources."""
         producer = self.producer if (honored and self.moves) or not self.producer else registers
-        allocated = _register_allocation(registers, self.consumers, producer, self.step)
+        allocated = _register_allocation(registers, self.consumers, producer, self.step, self.joined)
         return min(self.most, self.file // allocated) if allocated else self.most
 
     def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
@@ -676,15 +725,38 @@ class RegisterModel:
         less the producer's passed a kernel past its launch's raise (144 against 136, one consumer at three
         programs)."""
         if not self.producer:
-            return entry_registers(self.consumers, programs)
+            return entry_registers(self.consumers + joined_warpgroups(self.joined), programs)
         if honored and self.moves:
-            return raised_registers(self.consumers, programs, self.producer)
-        return entry_registers(self.consumers + 1, programs)
+            return raised_registers(self.consumers, programs, self.producer, self.joined)
+        return entry_registers(self.consumers + joined_warpgroups(self.joined) + 1, programs)
 
     def record(self) -> dict:
         """The model's numeric facts; its live family supplies rules, not serialized state."""
         return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
                 if field.name != "family"}
+
+
+def stated_producer(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> int | None:
+    """The registers a producer lowers to where each of its program's `consumers` consumer warpgroups holds
+    its stated `registers` a thread (a program of `warpgroups` warpgroups, `programs` of it a multiprocessor):
+    the most of setmaxnreg's steps below the program's entry share that leaves the consumers that many
+    (`consumer_registers`), the rest of the pool the producer's; None where none above the least does, or the
+    registers are unstated. A launch spilling at the least takes it before its top: the 4B gated delta net's
+    training forward's output walk on an H100, stated at 176 of a two-warpgroup program held two to a
+    multiprocessor, spilled its tile index with its consumers at 232 and 216 and held from 208 down to 176
+    (jsf-out4bcaps), and its reverse walk on a B200, stated at 149, spilled 40 bytes with its producer at the
+    least and none from 80 up (jsf-revcaps). Not before the least: a statement short of what ptxas holds
+    spills at its share where the least holds (a B200's recurrence_solved and recurrence_output, an H100's
+    recurrence_scores_back, jsf-theme-cells)."""
+    if registers is None:
+        return None
+    steps = facts().raises()
+    producer = steps.below(entry_registers(warpgroups, programs))
+    while producer > steps.lowest:
+        if consumer_registers(consumers, programs, producer) >= registers:
+            return producer
+        producer -= steps.step
+    return None
 
 
 def moves_registers(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> bool:
@@ -703,7 +775,7 @@ def moves_registers(registers: int | None, warpgroups: int, consumers: int, prog
 def register_model(family: "Family", consumers: int, registers: int | None, *,
                    shared: int | None = None, target: "GpuTarget | None" = None,
                    tmem: int = 0, producer: int | None = None, programs: int = 1,
-                   moves: bool | None = None) -> RegisterModel:
+                   moves: bool | None = None, joined: tuple = ()) -> RegisterModel:
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), lowered to
     `producer` (`producer_floor` where None), and the most programs a multiprocessor holds of it at those
@@ -712,9 +784,12 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
     else the target its launches derive for (`facts`'). A residency its staging forbids is no launch's (a
     B200's gathered input gradient staging 230,580 bytes runs one program, where its registers held three
     and its gathering producer spilled at three's raise, row 5523); and whether its program moves registers
-    at its plan's residency, `programs` (`moves_registers`), or as its launch states (`moves`, if given)."""
-    warpgroups = family.warpgroups(consumers)
-    most = family.programs(consumers, registers, producer)
+    at its plan's residency, `programs` (`moves_registers`), or as its launch states (`moves`, if given).
+    Its `joined` roles (`Family.role_schedule`'s: a correction warpgroup) take their share beside its
+    consumers."""
+    warpgroups = family.warpgroups(consumers, joined=joined)
+    shares = family.joined_shares(joined)
+    most = family.programs(consumers, registers, producer, joined=joined)
     if shared is not None or tmem:
         target = generation.gpu_target() if target is None else target
         if shared is not None:
@@ -723,12 +798,15 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
             # A program allocates its columns' power of two (`tensor_memory_allocated`): 160 columns hold two
             # programs on a B200's 512, not three.
             most = min(most, (target.tmem_columns or 0) // tensor_memory_allocated(tmem))
-    return RegisterModel(registers, family.registers(consumers, producer=producer), consumers, most,
-                         family.register_step,
-                         producer_registers(consumers, producer=producer) if warpgroups > consumers else 0,
+    raised = consumers + joined_warpgroups(shares)
+    return RegisterModel(registers, family.registers(consumers, producer=producer, joined=joined), consumers,
+                         most, family.register_step,
+                         producer_registers(consumers, producer=producer, joined=shares)
+                         if warpgroups > raised else 0,
                          shared, family, file=facts().registers,
-                         moves=(moves_registers(registers, warpgroups, consumers, programs) if moves is None
-                                else moves))
+                         moves=(moves_registers(registers, warpgroups, raised, programs) if moves is None
+                                else moves),
+                         joined=shares)
 
 
 def placed(launches_of: Callable, layouts: tuple["Family", ...], target, *,
@@ -790,16 +868,18 @@ def plan(launches, family: "Family", target, *, programs: int | None = None) -> 
         most = most if launch.most_programs is None else min(most, launch.most_programs)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
         order = hidden(family, launch.consumers)
+        # Each ring depth's shared memory once a launch, however many residencies read it.
+        staged = functools.cache(lambda stages, launch=launch: shared_bytes(family, launch.scope(stages)))
         found = None
         for held in residencies:
             share = program_shared(block, held)
-            if shared_bytes(family, launch.scope(launch.floor)) > share:
+            if staged(launch.floor) > share:
                 continue
             stages = launch.floor
-            while stages < launch.most and shared_bytes(family, launch.scope(stages + 1)) <= share:
+            while stages < launch.most and staged(stages + 1) <= share:
                 stages += 1
             if found is None or order(held, stages) > order(found.programs, found.stages):
-                found = LaunchPlan(stages, held, shared_bytes(family, launch.scope(stages)))
+                found = LaunchPlan(stages, held, staged(stages))
         if found is None:
             return None
         plans.append(found)

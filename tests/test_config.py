@@ -274,6 +274,15 @@ def test_the_run_length_is_steps_or_epochs():
         TrainerConfig().total_steps(sized)
 
 
+def test_a_setting_of_an_unset_layout_sets_it_from_its_defaults():
+    """A run whose trainer states no layout (`TrainerConfig.layout` unset) takes a setting of one of its
+    fields (`--set trainer.layout.min_shard=8`, `RunConfig.assigned`) over `Layout()`'s defaults, as the
+    `--trainer.layout.*` flags do (row 9635: refused, naming no field of the run record)."""
+    config = RunConfig(data=images_of("tfds://oxford_flowers102", 32))
+    assert config.trainer.layout is None
+    assert config.assigned(["trainer.layout.min_shard=8"]).trainer.layout == Layout(min_shard=8)
+
+
 def test_the_cli_parses_the_mesh_the_layout_and_a_setting_of_the_chain():
     config = RunConfig.cli([
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
@@ -940,3 +949,36 @@ def test_a_saved_runs_encoder_by_its_earlier_path_reads_as_its_path_now_and_a_pa
     with pytest.raises(ValueError):
         registry.imported("dew.inputs.encoders:CLIPText")
 
+
+def test_a_saved_runs_default_layout_reads_as_unset_and_a_stated_one_as_it_is():
+    """A run recorded before its trainer's layout could be unset recorded `Layout()` for its default, which
+    reads back unset, its resume laid out as its checkpoint was (row 9534: read as a stated device layout);
+    a layout of its own reads as it is."""
+    from dew.config.earlier import earlier_trainer_layout
+    from dew.distributed.placement import Layout
+    from dew.registry import to_record
+
+    default = {"class": "lm", "fields": {"trainer": {"layout": to_record(Layout(), Layout)}}}
+    assert earlier_trainer_layout(default)["fields"]["trainer"]["layout"] is None
+    stated = {"class": "lm", "fields": {"trainer": {"layout": to_record(Layout(min_shard=8), Layout)}}}
+    assert earlier_trainer_layout(stated) == stated
+    # Written while the trainer held `layout_unsettable` as a field (train 1109's review, F3): stated.
+    fielded = {"class": "lm", "fields": {"trainer": {"layout": to_record(Layout(), Layout),
+                                                     "layout_unsettable": True}}}
+    assert earlier_trainer_layout(fielded)["fields"]["trainer"] == {"layout": to_record(Layout(), Layout)}
+
+
+def test_a_run_stating_the_default_layout_saves_and_loads_it_stated(tmp_path):
+    """A run whose trainer states `Layout()`, the device layout kept, saves and loads it as stated: a record
+    written today says so beside its fields (`LAYOUT_UNSETTABLE`), so the migration of records written while
+    `Layout()` was the default leaves it (row 9664: it loaded unset, and the chooser could offload)."""
+    from dew.distributed.placement import Layout
+
+    config = RunConfig(data=images_of("tfds://oxford_flowers102", 32))
+    config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, layout=Layout()))
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(config.record()))
+    assert RunConfig.load(str(path)).trainer.layout == Layout()
+    unset = RunConfig(data=images_of("tfds://oxford_flowers102", 32))
+    path.write_text(json.dumps(unset.record()))
+    assert RunConfig.load(str(path)).trainer.layout is None

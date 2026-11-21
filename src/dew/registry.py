@@ -107,7 +107,7 @@ type Annotation = type | types.UnionType | types.GenericAlias | typing.TypeAlias
 # module included), and the records and sequences of any of those. This is
 # the width of what may arrive; `build` narrows each one again against the
 # type its member declared before the member ever sees it.
-type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
+type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic | datetime.timedelta
                    | types.FunctionType | types.BuiltinFunctionType
                    | DataclassInstance | Mapping[str, object]
                    | Mapping[RecordKey, object] | Sequence[Configured])
@@ -163,8 +163,10 @@ def imported(path: str) -> Callable[..., Configured]:
     module, _, name = path.partition(":")
     if not module or not name:
         raise ValueError(f"{path!r} is not an import path, `module:Qualified.name`")
-    if module != "dew" and not module.startswith("dew.") and module not in sys.modules:
-        package = module.split(".")[0]
+    package = module.split(".")[0]
+    if (module != "dew" and not module.startswith("dew.") and module not in sys.modules
+            and not (package in _TRUSTED and module.replace(".", "").isidentifier() and _importable(module))):
+        # A module of a trusted package a record names is imported where the registry reaches it.
         raise ValueError(f"{path!r} names {module}, which is outside Dew and not imported; import it "
                          f"first, or trust its package where the run loads (trust=({package!r},), "
                          f"--trust {package})")
@@ -268,7 +270,9 @@ def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) ->
     # Only JSON a record holds (`json_value` refuses any other), its every string read once.
     for named in strings_of(json_value(record, "record")):
         module, colon, name = named.partition(":")
-        if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
+        # A string shaped as an import path that names no module (a text field's) is data, not a module.
+        if (colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier()
+                and _importable(module)):
             importlib.import_module(module)
 
 
@@ -546,7 +550,11 @@ def to_record(value, annotation) -> JSON:
     from dew._records import recorded_duration
 
     if isinstance(value, datetime.timedelta):
-        return recorded_duration(value)
+        try:
+            return recorded_duration(value)
+        except ValueError as refused:
+            # A duration no record carries is a value no record describes (`Unrecordable`), as any other.
+            raise Unrecordable(str(refused)) from refused
     if isinstance(value, np.dtype) or (isinstance(value, type)
                                        and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes')):
         return dtype_name(value)
@@ -710,6 +718,9 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         # An enum's member is recorded as its value, an IntEnum's its int (`to_record`).
         return annotation(value)
+    if annotation is datetime.timedelta and isinstance(value, str):
+        # A duration is recorded as its text (`_records.recorded_duration`), read back by its reader.
+        return _records.duration(value)
     if (isinstance(annotation, type) and annotation in _SCALARS
             and not isinstance(value, (np.generic, np.ndarray, jax.Array))):
         # A field declaring a scalar holds one of its type (`dew._records`' readers), kept as written: a
@@ -799,6 +810,26 @@ def nominal_class(annotation: Annotation) -> type | None:
     if not isinstance(origin, type) or issubclass(origin, (Mapping, Sequence, tuple)):
         return None
     return origin
+
+
+def owned_built(record: JSON, *, called: bool, what: str) -> Configured:
+    """What a class record (`class_record`) builds where it names a class of Dew's or of a trusted package
+    (`_owned`; with `called`, one whose instances are called), read as `from_record` reads a record (a
+    trusted package's module imported where the registry reaches it, every module it shares built once, a
+    `dtype` field kept as its record states it): a value a record carries beside the fields any class
+    declares (a run's own processor). Any other record (a function's among them, which builds by running
+    it) is refused, as is a class no trust admits, naming `what` and `trust=`."""
+    named = class_record(_records.record(record, what))
+    if named is None:
+        raise ValueError(f"{what} is recorded as a class record, {{'class': ..., 'fields': ...}}; got "
+                         f"{record!r}")
+    member = imported(named[0])
+    if not _owned(member, called=called):
+        called_so = " whose instances are called" if called else ""
+        raise ValueError(f"{what} names {named[0]!r}, which is no class of Dew's or of a package the load "
+                         f"trusts{called_so} (trust=, --trust)")
+    with _reading(_records.record(record, what)):
+        return _built(member, named[1], dtypes=False)
 
 
 def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
@@ -1168,11 +1199,28 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
             # scalar or a dtype's name is read as before (`_rebuilt`).
             return value
         return _rebuilt(declared, configured(value), dtypes=dtypes, name=name)
-    if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")):
+    if not (isinstance(value, (Mapping, list, str)) or (dtypes and name == "dtype")):
         return value
     named = parameters(member)[0]
-    return _rebuilt(parameter_type(named[name][1], name) if name in named else None, value,
-                    dtypes=dtypes, name=name)
+    # A text is kept as given but where its parameter declares a duration, recorded as its text
+    # (`_records.recorded_duration`), optional or not.
+    if isinstance(value, str) and not (dtypes and name == "dtype") and not _declares_duration(named, name):
+        return value
+    return _rebuilt(parameter_type(named[name][1], name) if name in named else None, value, dtypes=dtypes,
+                    name=name)
+
+
+def _declares_duration(named: Mapping[str, tuple], name: str) -> bool:
+    """Whether parameter `name` of `named` (`parameters`) declares a duration, optional or not; False where
+    its annotation names what its module does not import at runtime, whose text is passed as given."""
+    if name not in named:
+        return False
+    try:
+        declared = parameter_type(named[name][1], name)
+    except ValueError:
+        # An annotation no record is read against (`parameter_type`): the text is the argument as written.
+        return False
+    return datetime.timedelta in _union_members(declared)
 
 
 def argument_records(member: type | Callable[..., Configured], fields: Mapping[str, object]
@@ -1400,7 +1448,8 @@ def configured(value: object) -> Configured:
     can carry at all, so a value no member could take is refused where the
     record was read instead of inside the module that would have used it.
     """
-    if value is None or isinstance(value, (bool, int, float, str, bytes, type, Enum, np.dtype)):
+    if value is None or isinstance(value, (bool, int, float, str, bytes, type, Enum, np.dtype,
+                                           datetime.timedelta)):
         return value
     if isinstance(value, (np.ndarray, np.generic, jax.Array)):
         return value
@@ -1724,30 +1773,21 @@ register = models.register
 an `nn.Module`, which a config's `{"class": "my_model"}` then builds. Every other kind registers through its
 own table, `mixers.register("my_mixer")`."""
 
-JsonDict = Annotated[
-    Mapping[str, object],
-    tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda args: json.loads(args[0]),
-        is_instance=lambda value: isinstance(value, dict),
-        str_from_instance=lambda value: [json.dumps(value)],
-    ),
-]
+_JSON_OBJECT = tyro.constructors.PrimitiveConstructorSpec(
+    nargs=1,
+    metavar="JSON",
+    instance_from_str=lambda args: json.loads(args[0]),
+    is_instance=lambda value: isinstance(value, dict),
+    str_from_instance=lambda value: [json.dumps(value)],
+)
+"""A command-line flag holding one JSON object, written as a single JSON string."""
+
+JsonDict = Annotated[Mapping[str, object], _JSON_OBJECT]
 """The fields a model is built from, written as a single JSON string on the
 command line. The registry knows which architecture takes which field and
 narrows each one where it builds it, so the values are read there."""
 
-JsonRecords = Annotated[
-    Mapping[str, JSON],
-    tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda args: json.loads(args[0]),
-        is_instance=lambda value: isinstance(value, dict),
-        str_from_instance=lambda value: [json.dumps(value)],
-    ),
-]
+JsonRecords = Annotated[Mapping[str, JSON], _JSON_OBJECT]
 """Records by name, written as a single JSON string on the command line and
 read back as the records they are (`JSON` entries, `_rebuilt`), never as the
 values they describe: a class's defaults as a run recorded them

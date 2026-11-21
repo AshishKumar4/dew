@@ -49,11 +49,22 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_releases import commit
+
+if TYPE_CHECKING:
+    from vllm.config.device import Device
+
+COHORT = "vllm-dory"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 
 FIXTURE = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'dory-1.0-4b'
-PULL = 'vllm-project/vllm#60149 at shan18/vllm 55076950b6c155f384d6766d63563c3bc20a0e3f'
+PULL = f'vllm-project/vllm#60149 at shan18/vllm {commit("vllm-dory", "vllm")}'
 BASE = '153a17166e5d07bc38184dedeea542d2e8885e55'
 WHEEL = (f'https://wheels.vllm.ai/{BASE}/vllm-0.32.0rc1.dev307%2Bg153a17166-cp38-abi3-'
          'manylinux_2_28_x86_64.whl')
@@ -111,6 +122,8 @@ def engine(loops: int, mode: str, dtype: str, **options):
     as the model card sets them, without prefix caching."""
     from vllm import LLM
 
+    if dtype not in ('bfloat16', 'float32'):
+        raise ValueError(f'the runs are bfloat16 and float32 (RUNS), not {dtype}')
     source = json.loads((FIXTURE / 'source.json').read_text())
     return LLM(model=source['repo'], revision=source['revision'], dtype=dtype, max_model_len=CONTEXT,
                gpu_memory_utilization=MEMORY, max_logprobs=-1, enable_prefix_caching=False, seed=0,
@@ -124,10 +137,13 @@ def scored(llm, prompt: np.ndarray, steps: int, prompt_rows: bool, forced: np.nd
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
 
-    params = SamplingParams(
+    # from_optional, the constructor its signature names (the struct's fields are no signature pyright
+    # reads); its one field it does not name set after.
+    params = SamplingParams.from_optional(
         temperature=0.0, max_tokens=steps, ignore_eos=True, logprobs=-1, detokenize=False,
-        prompt_logprobs=-1 if prompt_rows else None, flat_logprobs=True,
+        prompt_logprobs=-1 if prompt_rows else None,
         extra_args=None if forced is None else {'forced': forced.tolist(), 'prompt': len(prompt)})
+    params.flat_logprobs = True
     (output,) = llm.generate([TokensPrompt(prompt_token_ids=prompt.tolist())], params, use_tqdm=False)
     drawn, vocab = output.outputs[0], llm.llm_engine.model_config.get_vocab_size()
     rows = dense(drawn.logprobs, vocab)
@@ -151,7 +167,7 @@ def record_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
     arrays: dict[str, np.ndarray] = dict(ids)
     for part, steps, prompt_rows in PARTS:
         arrays[f'{part}_generated'], arrays[f'{part}_logprobs'] = scored(llm, ids[part], steps, prompt_rows)
-    np.savez(directory / f'{tag(name(loops, mode, dtype))}.npz', **arrays)
+    np.savez(directory / f'{tag(name(loops, mode, dtype))}.npz', allow_pickle=False, **arrays)
     (directory / 'provenance.json').write_text(json.dumps({
         'reference': f"{PULL}, installed by vLLM's Python-only build over {WHEEL}",
         'vllm': vllm.__version__, 'torch': torch.__version__, 'cuda': torch.version.cuda,
@@ -174,7 +190,7 @@ def probe(directory: Path) -> None:
         key, recorded = name(*run), np.load(directory / f'{tag(name(*run))}.npz')
         found.update({part: recorded[part] for part, _, _ in PARTS})
         found.update({f'{key}/{part}_generated': recorded[f'{part}_generated'] for part, _, _ in PARTS})
-    np.savez(directory / 'probe.npz', **found)
+    np.savez(directory / 'probe.npz', allow_pickle=False, **found)
 
 
 def release() -> tuple[dict, dict]:
@@ -215,6 +231,10 @@ def reference_attention(tf32: bool = False):
             torch.backends.cuda.matmul.allow_tf32 = previous
 
     class ReferenceAttention(torch.nn.Module):
+        keys: torch.Tensor | None
+        values: torch.Tensor | None
+        start_pos: int
+
         def __init__(self, num_heads, head_size, scale, num_kv_heads, **kwargs):
             super().__init__()
             self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
@@ -259,7 +279,7 @@ def single_rank() -> None:
 
 
 def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: bool = False,
-               device: str = 'cuda'):
+               device: Device = 'cuda'):
     """The pull request's DoryForCausalLM over the release in `dtype` (a torch dtype), built as its
     tests/models/test_dory.py builds it, with that test's reference attention in the engine's
     attention's place, under `dtype` as the engine's loader builds a model (its rotary tables take
@@ -272,16 +292,19 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: 
 
     import torch
     from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.compilation import CompilationMode
     from vllm.model_executor.models import dory
     from vllm.transformers_utils.configs.dory import DoryConfig
     from vllm.utils.torch_utils import set_default_torch_dtype
 
     attention = reference_attention(tf32)
-    dory.Attention = attention
+    # The model code's attention layer, which it names at import, replaced by the stand-in.
+    setattr(dory, 'Attention', attention)
     vc = VllmConfig(device_config=DeviceConfig(device=device),
-                    compilation_config=CompilationConfig(mode=0, custom_ops=['none']))
+                    compilation_config=CompilationConfig(mode=CompilationMode.NONE, custom_ops=['none']))
     hf = DoryConfig(**{**config, 'n_recurrent_loops': loops, 'recurrent_kv_cache_mode': mode})
-    vc.model_config = SimpleNamespace(hf_config=hf, head_dtype=None, dtype=dtype)
+    # The model code reads three fields of a model config; a stand-in, no ModelConfig, holds them.
+    setattr(vc, 'model_config', SimpleNamespace(hf_config=hf, head_dtype=None, dtype=dtype))
     # The groups read the config's model, which a model-code run describes by its own fields alone.
     with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device=device))):
         single_rank()
@@ -297,6 +320,11 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: 
 
     model.register_forward_pre_hook(start)
 
+    def logits_of(hidden: torch.Tensor) -> torch.Tensor:
+        logits = model.compute_logits(hidden)
+        assert logits is not None  # The last pipeline rank's, which this one rank is.
+        return logits
+
     def rows(prompt: np.ndarray, tokens: np.ndarray, prompt_rows: bool) -> np.ndarray:
         for cache in model.modules():
             if isinstance(cache, attention):
@@ -304,10 +332,10 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: 
         ids = torch.as_tensor(np.concatenate([prompt, tokens]), device=device)
         with set_current_vllm_config(vc), torch.inference_mode():
             hidden = model(ids[:len(prompt)], torch.arange(len(prompt), device=device))
-            found = [model.compute_logits(hidden if prompt_rows else hidden[-1:])]
+            found = [logits_of(hidden if prompt_rows else hidden[-1:])]
             for at in range(len(prompt), len(ids) - 1):
                 hidden = model(ids[at:at + 1], torch.arange(at, at + 1, device=device))
-                found.append(model.compute_logits(hidden))
+                found.append(logits_of(hidden))
             logits = torch.cat(found)
             # The engine's sampler takes log-probabilities in float32 (Sampler.compute_logprobs).
             wide = torch.promote_types(logits.dtype, torch.float32)
@@ -462,25 +490,27 @@ def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             parameter.copy_(loaded[name], non_blocking=True)
-            layer = re.search(r'\.layers\.(\d+)\.', name)
-            layer = None if layer is None else int(layer.group(1))
+            match = re.search(r'\.layers\.(\d+)\.', name)
             rows = columns = None
-            if name.endswith('qkv_proj.weight'):
-                rows = np.concatenate([found['query'][layer], queries + found['key'][layer],
-                                       queries + keys + found['value'][layer]])
-            elif name.endswith(('g_proj.weight', 's_gate')):
-                rows = found['output'][layer]
-            elif name.endswith('sqk'):
-                rows = found['query'][layer]
-            elif name.endswith('o_proj.weight'):
-                columns = found['output'][layer]
-            elif name.endswith('gate_up_proj.weight'):
-                rows = np.concatenate([found['mlp'][layer],
-                                       config['intermediate_size'] + found['mlp'][layer]])
-            elif name.endswith(('suv_gate', 'suv_up')):
-                rows = found['mlp'][layer]
-            elif name.endswith('down_proj.weight'):
-                columns = found['mlp'][layer]
+            # A layer's own parameter: the maps hold its layer's orders (`maps`).
+            if match is not None:
+                layer = int(match.group(1))
+                if name.endswith('qkv_proj.weight'):
+                    rows = np.concatenate([found['query'][layer], queries + found['key'][layer],
+                                           queries + keys + found['value'][layer]])
+                elif name.endswith(('g_proj.weight', 's_gate')):
+                    rows = found['output'][layer]
+                elif name.endswith('sqk'):
+                    rows = found['query'][layer]
+                elif name.endswith('o_proj.weight'):
+                    columns = found['output'][layer]
+                elif name.endswith('gate_up_proj.weight'):
+                    rows = np.concatenate([found['mlp'][layer],
+                                           config['intermediate_size'] + found['mlp'][layer]])
+                elif name.endswith(('suv_gate', 'suv_up')):
+                    rows = found['mlp'][layer]
+                elif name.endswith('down_proj.weight'):
+                    columns = found['mlp'][layer]
             # A parameter holds the residual width along one axis at most.
             (width,) = [axis for axis, size in enumerate(parameter.shape) if size == hidden] or [None]
             for axis, order in ((0, rows), (1, columns), (width, residual)):

@@ -34,6 +34,7 @@ import dataclasses
 import functools
 import hashlib
 import inspect
+import io
 import json
 import logging
 import os
@@ -79,6 +80,41 @@ DEFERRED = "deferred.json"
 `UNPREPARED`'s), which its run serves from the store beside it and then records unprepared."""
 
 
+@dataclasses.dataclass(frozen=True)
+class HeldName:
+    """A function a site's held record holds that no module holds (a local hook a launch took, `Seen.held`),
+    as its run reads it: by its module and qualified name (`_held_bytes`). Its run reports the launch and
+    calls the program its prepare compiled, never the hook; a call of it is refused."""
+
+    name: str
+
+    def __call__(self, *args, **kwargs):
+        raise MissingTruth(f"{self.name}: a function its prepare held by its name alone, which its run does "
+                           "not call")
+
+
+class _HeldPickler(pickle.Pickler):
+    """A site's held record pickled as pickle pickles it, but a function pickle names by no module
+    (`HeldName`): a local hook of a launch (a GEMM prologue's, a derivative's span) is no function its run
+    calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing ahead)."""
+
+    def reducer_override(self, obj):
+        if not isinstance(obj, types.FunctionType):
+            return NotImplemented
+        try:
+            pickle.dumps(obj)
+        except (pickle.PicklingError, AttributeError):
+            return HeldName, (f"{obj.__module__}.{obj.__qualname__}",)
+        return NotImplemented
+
+
+def _held_bytes(held: dict) -> bytes:
+    """`held` as its site's store keeps it (`_HeldPickler`)."""
+    written = io.BytesIO()
+    _HeldPickler(written).dump(held)
+    return written.getvalue()
+
+
 def named(role: str, inputs) -> str:
     """A program's name in its site's store: its `role` and its inputs' tree, shapes, dtypes and weak types,
     as a trace keys them (`float64_terms.traced`): a weak Python scalar beside a bfloat16 array keeps it
@@ -100,10 +136,43 @@ class CompiledTruths:
     stamp: str
     target: object | None = None
     begun: set[str] = dataclasses.field(default_factory=set)
+    # Each site a check's prepare began to prepare, from before its first trace, and each it finished whole,
+    # its truths and its arms (`preparing`).
+    tried: set[str] = dataclasses.field(default_factory=set)
+    done: set[str] = dataclasses.field(default_factory=set)
     read: dict[str, tuple[dict, dict]] = dataclasses.field(default_factory=dict)
+    # Each arm with no site its prepare compiled (`reference_error.ahead_arm`), by its label: its program's
+    # name (`named`), its outputs' shapes and the launches its kept lowering took, which a second call of
+    # the label at the same program returns, compiling nothing again.
+    arms: dict[str, tuple[str, Any, Any]] = dataclasses.field(default_factory=dict)
 
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
+
+    @contextlib.contextmanager
+    def preparing(self, *labels: str) -> Iterator[None]:
+        """Within the block, a check's prepare of its sites `labels` (a site's truths and its arms, `armed`):
+        recorded tried before its first trace, and finished where it ran to its end, every program it
+        compiles written; a cell's later failure, its every tried site finished, checks what its prepare
+        gives in their place (`gpu_flow.run_cells`)."""
+        self.tried.update(labels)
+        yield
+        self.done.update(labels)
+
+    def arm_again(self, label: str, name: str):
+        """A prepare's call of an arm with no site (`reference_error.ahead_arm`) whose label it compiled
+        (`arms`): its program's zeros (of the shapes its own trace gave, in the store's tracing: a jit of its
+        own compiler options traced again inside another, `eval_shape`'s, was refused) and its kept
+        lowering's launches, noted as its run reports them (`ran`); refused where the call is another program
+        (`name`, its role and its inputs' shapes) than the one its label names."""
+        from dew.nn.kernels import tuning
+
+        compiled, shapes, launches = self.arms[label]
+        if name != compiled:
+            raise ValueError(f"{label}: called in one prepare at two programs (another role or other "
+                             "inputs' shapes than its first call's): one label names one program")
+        tuning.noted(launches)
+        return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
 
     def holds(self, label: str) -> bool:
         """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""
@@ -159,9 +228,11 @@ class CompiledTruths:
         compile point where None, a truth's, whose program is its run's); `arms` whether they are a site's
         arms (`compiled_memory`), whose state its run holds while its truths compute; `host` whether they
         are compiled for the host's CPU, whatever the store's target (an arm placed there, `ahead_arm`'s);
-        `at_run` why none is compiled, their run compiling each on its GPU (`at_run`), the site written with
-        no programs. A site its target's compile refuses (`report.CompiledOnDevice`: a choice its GPU makes at
-        run time) is left unbegun, its refusal raised for its caller to place it otherwise."""
+        `at_run` why none is compiled ahead, their run compiling each on its GPU (`at_run`), the site written
+        with no programs and each one's memory read offline (`compile_programs`' `memory_only`), by which
+        the lane sizes its worker (`compiled_memory`). A site its target's compile refuses
+        (`report.CompiledOnDevice`: a choice its GPU makes at run time) is left unbegun, its refusal raised
+        for its caller to place it otherwise."""
         from dew._cache import uncached
         from dew.nn.kernels.templates import report
 
@@ -174,7 +245,11 @@ class CompiledTruths:
             shutil.rmtree(site)
         site.mkdir(parents=True)
         if at_run is not None:
-            (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": {},
+            with uncached():
+                read = self._compiled(programs, compiled, host, memory_only=True)
+            memory = {name: executable.memory._asdict() for name, executable in read.programs.items()
+                      if executable.memory is not None}
+            (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
                                                  "arms": arms, "host": host, "at_run": at_run}))
             return
         # Compiled here, never loaded from JAX's persistent cache, whose executables serialize without their
@@ -187,21 +262,23 @@ class CompiledTruths:
             shutil.rmtree(site)
             raise
         built.save(site / PROGRAMS)
-        (site / HELD).write_bytes(pickle.dumps(dict(held)))
+        (site / HELD).write_bytes(_held_bytes(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
                   if executable.memory is not None}
         (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
                                              "arms": arms, "host": host}))
 
     def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None,
-                  host: bool = False):
+                  host: bool = False, *, memory_only: bool = False):
         """`programs` compiled for the store's target (`compile_programs`), or for this process's first device
         where it names none, or for the host's first CPU (`host`), each made by `compiled` where it is given
-        (`compile_site`), else by Dew's compile point on a target and `jax.jit` here."""
+        (`compile_site`), else by Dew's compile point on a target and `jax.jit` here; for a target, read for
+        their memory alone where `memory_only` (`compile_programs`')."""
         from dew.training.ahead import AheadPrograms, BuildTarget, Executable, compile_programs
 
         if self.target is not None and not host:
             return compile_programs(programs, self.target.generation, self.target.multiprocessors,
+                                    memory_only=memory_only,
                                     **({} if compiled is None else {"compiled": compiled}))
         devices = jax.devices("cpu" if host else None)[:1]
         placed = jax.sharding.SingleDeviceSharding(devices[0])
@@ -213,8 +290,10 @@ class CompiledTruths:
                              for shape in shapes)
             return Executable.of(compile_one(function, out_shardings=placed).lower(*placed_shapes).compile())
 
+        # Compiled on this process's devices, which made every choice themselves.
         return AheadPrograms(BuildTarget.of(devices), {
-            name: built(function, shapes) for name, (function, shapes) in programs.items()})
+            name: built(function, shapes) for name, (function, shapes) in programs.items()},
+            tuned=True, at_run=())
 
     def called(self, label: str, role: str, inputs):
         """The site's program `role` run on `inputs` (its draw's: a truth's widened, an arm's as drawn) and
@@ -460,7 +539,7 @@ _log = logging.getLogger(__name__)
 
 
 def arm_role(role: str, fn, label: str) -> str | None:
-    """An arm's role in its site's store (`reference_error._compile_arms`) with what it computes as Dew states
+    """An arm's role in its site's store (`arm_store._compile_arms`) with what it computes as Dew states
     an identity (`dew._stated.stated`, one form in every process that holds an equal value): a run that passes
     the site another computation under that role finds none (`MissingTruth`), never the prepare's run in its
     place. None for an arm no statement holds (`Unestablished`), which runs unprepared, named
@@ -491,7 +570,7 @@ def _mutable_known(value, known: dict[int, Any], walking: set[int], at: str) -> 
     wherever it lies, inside another or beside an alias of itself (the review's: a dict read its record
     trace-filled in a prepare, empty in its run)."""
     from dew._sources import function_reads
-    from dew._stated import stated
+    from dew._stated import library_function, stated
 
     if id(value) in walking:
         return
@@ -506,9 +585,11 @@ def _mutable_known(value, known: dict[int, Any], walking: set[int], at: str) -> 
     elif isinstance(value, tuple):
         parts = value
     elif isinstance(value, types.FunctionType):
+        # A library's function, its globals its module's (`dew._stated.library_function`), as its statement
+        # walks it: its closure and defaults, a user's function and what it reads among them.
         cells, read = function_reads(value)
-        parts = (*cells.values(), *read.values(), *(value.__defaults__ or ()),
-                 *(value.__kwdefaults__ or {}).values())
+        parts = (*cells.values(), *(() if library_function(value) else read.values()),
+                 *(value.__defaults__ or ()), *(value.__kwdefaults__ or {}).values())
     elif (wrapped := getattr(value, "__wrapped__", None)) is not None:
         parts = (wrapped,)
     else:

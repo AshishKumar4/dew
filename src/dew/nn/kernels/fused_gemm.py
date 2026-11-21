@@ -44,6 +44,8 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
+from jax._src import config as jax_config
+from jax._src.core import pvary_p, reduced_vary_cast_p
 from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
@@ -51,16 +53,20 @@ from jax.extend import core as jax_core
 from jax.extend.core import primitives
 
 from dew import _cache, algebra
-from dew.algebra import cost as algebra_cost
+from dew.algebra import cost as algebra_cost, program as algebra_program
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, grouped_matmul, launches, tuning
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
-from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates import cost, emission
+from dew.nn.sharding import computed_from
 
 FUSION_ROW = 'ledger 1295'
 """The fusion analysis's limits."""
+
+_MANUAL_CASTS = frozenset({pvary_p, reduced_vary_cast_p})
+"""Casts of a value's type along manual mesh axes, which change no value (`_evaluated`)."""
 
 
 AXES = ('rows', 'columns')
@@ -153,6 +159,9 @@ class Analysis:
     refused: str | None = None
     """Why a kernel the call names (`generation.chosen`) refuses the region, as `fused` would raise
     (`selection.KernelRefused`); None where nothing named refuses."""
+    resident: bool = True
+    """Whether the region's launch keeps, with its hooks, the residency the product's own launch takes
+    (`Region.resident`): a pass fuses a neighbour only where it does (KERNEL-TEMPLATES-13)."""
 
 
 def analysis(region, *inputs) -> Analysis:
@@ -174,7 +183,8 @@ def analysis(region, *inputs) -> Analysis:
     def last(choice):
         return next((route for route in reversed(found) if route.choice == choice), None)
     seconds = priced(priced_calls[-1], generation.gpu_target()) if priced_calls else (None, None)
-    return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'), *seconds)
+    return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'), *seconds,
+                    resident=priced_calls[-1].resident if priced_calls else True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -200,16 +210,25 @@ class Region:
     operand before the launch either way."""
     consumed: bool = True
     """Whether consumers follow the product (its epilogue's); without, its outputs are the product's."""
+    resident: bool = True
+    """Whether its launch with its hooks keeps the residency of the product's launch as its unfused path
+    makes it, no hook and its declared result (`grouped_matmul.resident`)."""
 
 
 @dataclasses.dataclass(frozen=True)
 class Formed:
     """A prologue's priced parts (`priced`): its element stage's work on the whole operand, which the kernel's
-    prologue does tile by tile (`stage`), the work XLA does whole for the row or depth values it reads beside
-    (`sides`, a norm's statistics), and the bytes those values hold (`side_bytes`)."""
+    prologue does tile by tile (`stage`, counted as a kernel's body is, `emission.emitted`); the program XLA
+    runs whole for the row or depth values beside it (`sides`, a norm's statistics, its outputs those values,
+    `side_bytes` their bytes; None where the stage reads its inputs alone); and the producer's whole program
+    (`whole`), XLA's where the operand is formed
+    before the launch. Each program XLA runs is priced by the algebra's one path (`algebra.program.priced`:
+    a reduction of an exponential an exponential an element, of a sum none), never by a kernel body's
+    counter, which prices only what a kernel runs (row 7260)."""
 
     stage: cost.Work
-    sides: cost.Work
+    sides: jax_core.Jaxpr | None
+    whole: jax_core.Jaxpr
     side_bytes: float
 
 
@@ -221,13 +240,13 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     """`region`'s seconds on `target`, fused and unfused, from one model (`templates.cost`): the launch's
     units overlapped at the whole device's rates (its products in their tensor mode, its operands, captured
     arrays and outputs in device memory), plus its fixed launch (`GpuTarget.launch_seconds`), with its
-    producer's element stage and its consumers' work in it, beside XLA's fusion of the producer's row or
-    depth values where it has a prologue (a norm's statistics, reading the operand's base); and unfused, XLA's
-    fusion forming the operand whole (reading its base, writing it), the plain launch writing the product at
-    its result dtype, then XLA's fusion of the consumers reading it (`algebra.cost.fused`). None where the
-    target states no tensor rate."""
+    producer's element stage and its consumers' work in it, beside XLA's program of the producer's row or
+    depth values where it has a prologue (a norm's statistics); and unfused, XLA's program forming the
+    operand whole and writing it, the plain launch writing the product at its result dtype, then XLA's
+    fusion of the consumers reading it (`algebra.cost.fused`), each XLA program as the algebra prices it
+    (`algebra.program.priced`). None where the target states no tensor rate."""
     rates = cost.rates(target, device=True)
-    if rates[0] is None:
+    if rates.tensor is None:
         return None, None
     product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands,
                                         precision=region.precision)
@@ -244,8 +263,11 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     prologue, forming, sides = cost.Work(), 0.0, 0.0
     if formed is not None:
         prologue = formed.stage + cost.Work(device_bytes=formed.side_bytes)
-        forming = xla(formed.sides + formed.stage + cost.Work(device_bytes=2 * base, kernels=1.0))
-        sides = xla(formed.sides + cost.Work(device_bytes=base + formed.side_bytes, kernels=1.0))
+        # XLA's programs as the algebra prices them, beside the arrays they write: the operand formed whole,
+        # or its sides alone.
+        forming = _written(algebra_program.priced(formed.whole, target), base, xla)
+        if formed.sides is not None:
+            sides = _written(algebra_program.priced(formed.sides, target), formed.side_bytes, xla)
     fused_seconds = sides + launched(product + region.chain + prologue + cost.Work(
         device_bytes=operands + region.captured_bytes + region.output_bytes))
     unfused_seconds = forming + launched(product + cost.Work(device_bytes=operands + written))
@@ -255,24 +277,17 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     return fused_seconds, unfused_seconds
 
 
+def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fused) -> float:
+    """An XLA program's seconds as the algebra prices it (`algebra.program.priced`) with the `written` bytes
+    of the arrays it stores beside its reads, its unreadable terms' seconds (`Seconds.extra`) kept."""
+    return xla(program.work + cost.Work(device_bytes=written)) + program.extra
+
+
 def _chain(consumer, values, acc) -> cost.Work:
-    """The consumers' elementwise work on the whole product (`_work` of their program)."""
-    return _work(jax.make_jaxpr(consumer)(values, acc).jaxpr.eqns)
-
-
-def _work(eqns) -> cost.Work:
-    """`eqns`' elementwise work: each equation an operation an element of its result, one the special-function
-    units evaluate on them (the algebra's declaration of it, `dew.algebra.terms.Operation.exponential`), a
-    conversion's apart."""
-    work = cost.Work()
-    for eqn in eqns:
-        elements = float(sum(math.prod(shape) for var in eqn.outvars
-                             if (shape := getattr(var.aval, 'shape', None)) is not None))
-        spoken = algebra.terms.OPERATIONS.get(eqn.primitive)
-        work = work + (cost.Work(exponentials=elements) if spoken is not None and spoken.exponential
-                       else cost.Work(conversions=elements) if eqn.primitive is jax.lax.convert_element_type_p
-                       else cost.Work(operations=elements))
-    return work
+    """The consumers' work on the whole product, their program counted as a kernel's body is
+    (`emission.emitted`): each operation of the CUDA cores, of the special-function units and each
+    conversion an element of its result, each reduction an element of its input."""
+    return emission.emitted(jax.make_jaxpr(consumer)(values, acc).jaxpr, 1, None).fixed
 
 
 def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared: tuple, *fusions):
@@ -286,49 +301,92 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     rhs, *rest = (fusion() for fusion in rest_fusions)
     group_sizes = None if dense else rest[0]
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
-    acc = jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype)
+    # Typed as the launch's result is (`dew.nn.sharding.computed_from`, row 9808): a consumer reading it
+    # beside a value each device holds its own of is traced as the program wrote it.
+    acc = computed_from(jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype), lhs, rhs, group_sizes,
+                        [side for side, _ in prologue.get('prologue_operands', ())])
     operand_bytes = float(sum(operand.size * operand.dtype.itemsize for operand in (lhs, rhs)))
     collected = _PRICED.get()
-    if out_fusion is None:
-        # A product with no producer the prologue takes and no consumer has nothing fused to price.
-        if collected is not None and formed is not None:
-            collected.append(Region(lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype),
-                                    jnp.dtype(out_dtype), precision, operand_bytes, cost.Work(), 0.0,
-                                    float(math.prod(acc.shape) * acc.dtype.itemsize), formed, consumed=False))
+
+    def bare(**hooks):
+        # The product as its unfused path launches it, at its declared result, with `hooks`.
         return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
-                         precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
+                         precision=precision, interpret_on_cpu=interpret_on_cpu, **hooks)
+
+    def weighed(call):
+        # `call()`'s value, and whether its launch keeps the residency of the same launch of the bare product
+        # (`grouped_matmul.resident`), where `analysis` collects the region.
+        with grouped_matmul.weighed() as hooked:
+            value = call()
+        return value, grouped_matmul.resident(hooked, unhooked)
+
+    def unhooked():
+        # The bare product's call as its unfused path makes it, weighed and its routes no program's; one the
+        # call's named kernel refuses unhooked has no launch to weigh (as `gemm._keeps_launch` reads a call a
+        # chosen kernel refuses).
+        try:
+            with generation.routes(alone=True), grouped_matmul.weighed() as found:
+                bare()
+        except KernelRefused:
+            return []
+        return found
+
+    def plain():
+        # The product with no consumer the launch takes: its prologue alone priced, where it takes one.
+        if collected is None or formed is None:
+            return bare(**prologue)
+        value, resident = weighed(functools.partial(bare, **prologue))
+        collected.append(Region(lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype),
+                                jnp.dtype(out_dtype), precision, operand_bytes, cost.Work(), 0.0,
+                                float(math.prod(acc.shape) * acc.dtype.itemsize), formed, consumed=False,
+                                resident=resident))
+        return value
+
+    if out_fusion is None:
+        return plain()
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     # The program's names lifted first (`_named`): the algebra's rewriting reads a name as an identity.
     named_consumer = consumer
     consumer, names = _named(consumer, values, acc)
     written, consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
-    if collected is not None:
-        outs = jax.tree.leaves(jax.eval_shape(consumer, values, acc))
-        collected.append(Region(
-            lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
-            operand_bytes, _chain(consumer, values, acc),
-            float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
-            float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs)), formed))
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
-        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
-                           precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
-        return _rewritten_consumer(named_consumer, values, acc)[0](values, summed)
+        # A consumer the launch takes not runs after the plain product, XLA's, unpriced, the program's
+        # names where it wrote them.
+        return _rewritten_consumer(named_consumer, values, acc)[0](values, plain())
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
-    epilogue = _declared(functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc), written,
-                         treedef, out_treedef, acc)
+    # Its stage and declared derivative, from the consumer's program the algebra pass rewrote
+    # (`_rewritten_consumer`), the launch takes as they are (`tuning.prepared_as`).
+    epilogue = tuning.prepared_as(_declared(
+        functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc), written, treedef,
+        out_treedef, acc))
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
     # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
     # derivative under that name (`gemm`'s `named`), the consumer's outputs then the named values (`_named`).
     outputs = len(out_leaves) - len(names)
-    consumed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
+
+    def hooked():
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
                          epilogue_operands=tuple(zip(leaves, axes, strict=True)),
                          out_dtype=dtypes[0], out_dtypes=dtypes if several else None, precision=precision,
                          interpret_on_cpu=interpret_on_cpu, named=(None,) * outputs + names, **prologue)
+
+    if collected is None:
+        consumed = hooked()
+    else:
+        # A consumer the launch takes as its epilogue is priced (`priced`), its work counted as the launch's
+        # body counts it, and its launch's residency weighed against the bare product's.
+        consumed, resident = weighed(hooked)
+        collected.append(Region(
+            lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
+            operand_bytes, _chain(consumer, values, acc),
+            float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
+            float(sum(math.prod(out.shape) * out.dtype.itemsize for out in out_leaves)), formed,
+            resident=resident))
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))[0]
 
 
@@ -387,8 +445,10 @@ def _prologue(fusion) -> tuple[jax.Array, dict, Formed | None]:
     if stage is None:
         return fusion(), {}, None
     base, function, sides, axes, jvp, formed = stage
-    return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
-                  'prologue_jvp': jvp}, formed
+    # Its stage, from the producer's program the algebra pass rewrote (`_split`), the launch takes as it is
+    # (`tuning.prepared_as`).
+    return base, {'prologue': tuning.prepared_as(function),
+                  'prologue_operands': tuple(zip(sides, axes, strict=True)), 'prologue_jvp': jvp}, formed
 
 
 def _rewritten_consumer(consumer, values, acc) -> tuple[Callable, Callable]:
@@ -511,10 +571,14 @@ def _split(producer, values):
     function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
     places = tuple(given.get(var) for var in (base, *sides))
     jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
-    # Priced (`Formed`): the element stage the prologue runs, the rest XLA runs whole for its sides.
-    staged = {id(eqn) for eqn in stage}
-    formed = Formed(_work(stage), _work(eqn for eqn in jaxpr.eqns if id(eqn) not in staged),
-                    float(sum(array.size * array.dtype.itemsize for array in squeezed)))
+    # Priced (`Formed`): the element stage the prologue runs, counted as a kernel's body is
+    # (`emission.emitted`, which prices every operation the fuser tiles), and XLA's programs beside it.
+    work = emission.emitted(jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), 1, None).fixed
+    # XLA's program of the sides: the producer's, read back from them (its extraction prices what they read
+    # alone); none where every side is an input the stage reads as given.
+    computed = any(not isinstance(var, jax_core.Literal) and var not in jaxpr.invars for var in sides)
+    formed = Formed(work, closed.replace(jaxpr=jaxpr.replace(outvars=list(sides))) if computed else None,
+                    closed, float(sum(array.size * array.dtype.itemsize for array in squeezed)))
     return arrays[0], function, squeezed, named, jvp, formed
 
 
@@ -559,6 +623,10 @@ def _evaluated(program, consts, args):
         invals = [read(var) for var in eqn.invars]
         if body is not None:
             outvals = _evaluated(body, body.consts, invals)
+        elif eqn.primitive in _MANUAL_CASTS and not jax_config._check_vma.value:
+            # A recorded cast of a value's type along manual axes, where nothing checks them (a kernel's
+            # tile, `_tiled`, which carries no mesh's types and binds no manual axis): the value as it is.
+            outvals = invals
         else:
             outvals = eqn.primitive.bind(*invals, **eqn.params)
             outvals = outvals if eqn.primitive.multiple_results else [outvals]
@@ -577,8 +645,9 @@ def _dtype(var):
 
 
 def _staged(closed, *arrays):
-    """The producer's kernel stage evaluated on whole arrays or on tiles (under `pull_block_spec`)."""
-    return jax_core.jaxpr_as_fun(closed)(*arrays)[0]
+    """The producer's kernel stage evaluated on whole arrays or on tiles (under `pull_block_spec`), a
+    recorded cast along manual axes the value as it is on tiles (`_evaluated`)."""
+    return _evaluated(closed.jaxpr, closed.consts, arrays)[0]
 
 
 VIEWS = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.convert_element_type_p)
@@ -660,7 +729,9 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | Refusal:
     blocks = [jax.ShapeDtypeStruct(block.block_shape, array.dtype)
               for block, array in zip(specs, arrays, strict=True)]
     ids = (jnp.int32(0), jnp.int32(0))
-    closed = jax.make_jaxpr(lambda ids, *blocks: tiled(ids, (), *blocks))(ids, *blocks)
+    # Read on tiles, which carry no mesh's types (`_on_tiles`).
+    with _unchecked(on_tiles=True):
+        closed = jax.make_jaxpr(lambda ids, *blocks: tiled(ids, (), *blocks))(ids, *blocks)
     if any(var in programs.read_by(closed.jaxpr, closed.jaxpr.outvars) for var in closed.jaxpr.invars[:2]):
         return Refusal('reads_position', "the producer reads its tile's position")
     return tuple(axes)
@@ -670,14 +741,16 @@ def _prologue_tile(whole, types: tuple, axes: tuple, tile, *side_tiles):
     """The producer's kernel stage on one loaded tile of its base and its side arrays' tiles beside it,
     each side tile given back the dimensions of one the template squeezed (`_split`), by a broadcast:
     Mosaic GPU's layout inference finds a layout for a broadcast's dimension of one, and none for a
-    reshape's (FUSEDNORM-h100)."""
+    reshape's (FUSEDNORM-h100). Its block spec pulled at the tile, read as `_on_tiles` reads it."""
     shaped = [jax.lax.broadcast_in_dim(
         side, tuple(1 if axis is None else tile.shape[PROLOGUE_AXES.index(axis)] for axis in side_axes),
         tuple(index for index, axis in enumerate(side_axes) if axis is not None))
         for side, side_axes in zip(side_tiles, axes, strict=True)]
-    tiled, _, _ = fuser.pull_block_spec(whole, pl.BlockSpec(tile.shape, lambda row, depth: (row, depth)),
-                                        grid_len=2)(*types)
-    return tiled((jnp.int32(0), jnp.int32(0)), (), tile, *shaped)
+    on_tiles = _on_tiles()
+    with _unchecked(on_tiles):
+        tiled, _, _ = fuser.pull_block_spec(whole, pl.BlockSpec(tile.shape, lambda row, depth: (row, depth)),
+                                            grid_len=2)(*(_shaped(each, on_tiles) for each in types))
+        return tiled((jnp.int32(0), jnp.int32(0)), (), tile, *shaped)
 
 
 def _axes(consumer, values, acc) -> tuple | Refusal:
@@ -774,8 +847,10 @@ def _reads_position(tiled, value_specs, values, probe, dtype) -> bool:
     tiles = jax.tree.map(lambda leaf, leaf_spec: jax.ShapeDtypeStruct(leaf_spec.block_shape, leaf.dtype),
                          values, value_specs, is_leaf=_is_spec)
     tile = jax.ShapeDtypeStruct(probe, dtype)
-    closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
-        (jnp.int32(0), jnp.int32(0)), tiles, tile)
+    # Read on tiles, which carry no mesh's types (`_on_tiles`).
+    with _unchecked(on_tiles=True):
+        closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
+            (jnp.int32(0), jnp.int32(0)), tiles, tile)
     needed = programs.read_by(closed.jaxpr, closed.jaxpr.outvars)
     return any(var in needed for var in closed.jaxpr.invars[:2])
 
@@ -784,10 +859,32 @@ def _tiled(consumer, treedef, value_types: tuple, out_treedef, whole: jax.ShapeD
     """The consumer on one fp32 accumulator tile of `acc.shape`, rounded first to the product's declared
     dtype (`whole`'s, the product it was traced at), and the captured arrays' tiles beside it: its block
     spec pulled at that block of `whole`, so the same function serves every kernel tile and XLA's whole
-    array."""
-    values = jax.tree.unflatten(treedef, [jax.ShapeDtypeStruct(t.shape, t.dtype) for t in value_types])
-    tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, whole, acc.shape),
-                                        grid_len=2)(values, whole)
-    outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)),
-                 acc.astype(whole.dtype))
+    array, each read as `_on_tiles` reads it."""
+    on_tiles = _on_tiles()
+    values = jax.tree.unflatten(treedef, [_shaped(t, on_tiles) for t in value_types])
+    product = _shaped(whole, on_tiles)
+    with _unchecked(on_tiles):
+        tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, product, acc.shape),
+                                            grid_len=2)(values, product)
+        outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)),
+                     acc.astype(whole.dtype))
     return tuple(jax.tree.leaves(outs)) if out_treedef.num_leaves > 1 else jax.tree.leaves(outs)[0]
+
+
+def _on_tiles() -> bool:
+    """Whether a stage runs on a kernel's tiles, in a launch's body (`launches.interpreting`), which carry
+    no mesh's types: its program pulled and run there with the check of manual axes off (`_unchecked`), a
+    recorded cast along them the value as it is (`_evaluated`). Elsewhere it runs on XLA's whole arrays,
+    typed as the program made them (a checked manual mesh's, row 9808), each cast bound."""
+    return launches.interpreting() is not None
+
+
+def _shaped(aval, on_tiles: bool):
+    """`aval` (a value's type: an aval, or a struct stating its manual axes' type) as a stage is pulled at
+    it: its shape and dtype alone on a kernel's tiles (`_on_tiles`), as it is on whole arrays."""
+    return jax.ShapeDtypeStruct(aval.shape, aval.dtype) if on_tiles else aval
+
+
+def _unchecked(on_tiles: bool):
+    """No check of manual axes on a kernel's tiles (`_on_tiles`); the context's on whole arrays."""
+    return jax_config._check_vma(new_val=False) if on_tiles else contextlib.nullcontext()

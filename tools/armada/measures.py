@@ -10,13 +10,14 @@ import subprocess
 import sys
 from collections.abc import Callable, Hashable, Iterable
 from pathlib import Path
+from typing import TypeGuard
 
 GPU_HEADROOM = (1.25, 2 ** 30)
 """A file's share of the GPU over its recorded peak, a factor and bytes beside it: the allocator's
 fragmentation, which can leave a share its own size short of a block it needs."""
 
 
-def measured(recorded: dict | None) -> bool:
+def measured(recorded: dict | None) -> TypeGuard[dict]:
     """Whether `recorded`, a run's record, measured what its file held on the GPU: a run that followed every
     process it started and left its report."""
     return recorded is not None and recorded.get("depends") is not None and recorded.get("peak") is not None
@@ -58,12 +59,11 @@ def largest(keys: Iterable[str], read: Callable[[str], dict | None],
 
 NEEDED = """import json, sys
 import jax
-from dew._devices import allocator_limit
-from dew.training.memory import needed
+from dew.training.memory import least_limit
 device = jax.local_devices()[0]
 units = json.load(sys.stdin)
-print(json.dumps({name: allocator_limit(max(needed(device, p["resident"], p["beside"], p["temporaries"])
-                                            for p in programs)) for name, programs in units.items()}))
+print(json.dumps({name: least_limit(device, [(p["resident"], p["beside"], p["temporaries"]) for p in each])
+                  for name, each in units.items()}))
 """
 """Each unit's least pool, in the pool's bytes the lane's budget counts, by Dew's own admission
 (dew.training.memory `needed`, the inverse of `admitted`) of the most demanding of its programs on this

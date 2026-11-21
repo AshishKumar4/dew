@@ -65,8 +65,8 @@ class Operation:
     89j)` is 2.2e38), one no larger than its operand's (`keeps_magnitude`), an integer it rounds to, no
     larger than its operand's or 1 (`integral`: `ceil(2**-126)` is 1), a bitwise result, a boolean's at most
     1 and an integer's any value of its dtype (`bitwise`: int32's `not(-2**31)` is `2**31 - 1`), a value at
-    most 0 where its operand is (`keeps_sign`; a conversion where it keeps the sign, `_keeps_sign`); and
-    whether its work is the special-function units' (`exponential`, `cost.work`)."""
+    most 0 where its operand is (`keeps_sign`; a conversion where it keeps the sign, `_keeps_sign`). Which
+    units an operation's work is the kernels' counter states (`emission.SPECIAL_FUNCTIONS`, `cost.work`)."""
 
     symbol: str
     kind: str
@@ -76,7 +76,6 @@ class Operation:
     integral: bool = False
     bitwise: bool = False
     keeps_sign: bool = False
-    exponential: bool = False
 
 
 OPERATIONS: dict[jcore.Primitive, Operation] = {}
@@ -96,15 +95,15 @@ def _speaks(kind: str, *primitives: jcore.Primitive, **facts) -> None:
 
 _speaks("binary", jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p, jax.lax.min_p,
         jax.lax.atan2_p, jax.lax.rem_p, jax.lax.nextafter_p)
-_speaks("binary", jax.lax.pow_p, exponential=True)
+_speaks("binary", jax.lax.pow_p)
 _speaks("binary", jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p, bitwise=True)
 _speaks("unary", jax.lax.sign_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.erf_inv_p,
         jax.lax.is_finite_p, jax.lax.optimization_barrier_p)
 _speaks("unary", jax.lax.neg_p, jax.lax.abs_p, keeps_magnitude=True)
 _speaks("unary", jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.log2_p, jax.lax.log1p_p,
-        jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p, exponential=True)
+        jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p)
 _speaks("unary", jax.lax.tanh_p, jax.lax.logistic_p, jax.lax.sin_p, jax.lax.cos_p, jax.lax.erf_p,
-        bounded=True, exponential=True)
+        bounded=True)
 _speaks("unary", jax.lax.floor_p, jax.lax.ceil_p, jax.lax.round_p, integral=True)
 _speaks("unary", jax.lax.not_p, bitwise=True)
 _speaks("comparison", jax.lax.lt_p, jax.lax.le_p, jax.lax.eq_p, jax.lax.ne_p, jax.lax.ge_p, jax.lax.gt_p)
@@ -351,8 +350,9 @@ class Region[Node: (Term, Skeleton)]:
     stock: Mapping[str, int]
     dtypes: Mapping[Hashable, np.dtype]
     magnitudes: Mapping[Hashable, Magnitude | None]
-    products: dict[int, tuple[np.dtype | None, ...]] = dataclasses.field(default_factory=dict)
-    """Each product's parameters' index (`Term.dot`'s), its operands' dtypes (a rule's product its own's)."""
+    products: dict[int, Product] = dataclasses.field(default_factory=dict)
+    """Each product's dtypes (`Product`) by its parameters' index (`Term.dot`'s; a rule's product its
+    source's)."""
     literal_keys: frozenset[Hashable] = frozenset()
     """Each literal's term's key (`literals`' terms)."""
     indexed: dict[Hashable, int] = dataclasses.field(default_factory=dict)
@@ -360,6 +360,13 @@ class Region[Node: (Term, Skeleton)]:
     held: dict[jcore.Var, Magnitude | None] = dataclasses.field(default_factory=dict)
     """Each value's magnitude (`magnitudes`') by the jaxpr's variable that names it: what a window cut from
     the jaxpr declares of its inputs (`dew.algebra.program._windowed`)."""
+    apart: dict[jcore.Var, Apart] = dataclasses.field(default_factory=dict)
+    """What the jaxpr proves of each value beside its magnitude (`Apart`: a number, finite, its side and
+    floor) by the variable that names it: with `held`, what a window cut from the jaxpr declares of its
+    inputs (`Proven`)."""
+    floors: dict[Hashable, Apart] = dataclasses.field(default_factory=dict)
+    """`apart` of each term held away from zero, by term text: a number whose floor (`Apart.floor`) is
+    known, the floor and side a guarded reuse reads of a divisor (`rules.log2_floor`, `rules.positive`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -367,11 +374,16 @@ class Region[Node: (Term, Skeleton)]:
         for term, extent in self.shapes:
             self.extents.setdefault(key(term), extent)
 
-    def interned(self, primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
+    def interned(self, primitive: jcore.Primitive, values: Mapping, product: Product | None = None) -> int:
         """The index of `primitive` at `values` in the region's table (`params`), added where it holds none
         (`_interned`): a rule set's own parameters (a transposed product's plain one) by the rule the
         region's equations were interned by."""
-        return _interned(self.params, self.products, self.indexed, primitive, values, operands)
+        return _interned(self.params, self.products, self.indexed, primitive, values, product)
+
+    @functools.cached_property
+    def made_by(self) -> dict[int, Opaque[Node]]:
+        """Each leaf an equation outside the language makes (`opaque`), by its index, that equation."""
+        return {leaf: opaque for opaque in self.opaque for leaf in opaque.outputs}
 
     def shape(self, term: Node) -> tuple[int, ...]:
         """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
@@ -404,18 +416,30 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     return term.__egg_typed_expr__
 
 
-def _interned(params: list, products: dict, indexed: dict[Hashable, int], primitive: jcore.Primitive,
-              values: Mapping, operands: tuple | None = None) -> int:
+class Product(NamedTuple):
+    """A product's dtypes (`Region.products`): its operands' (None where one is no array), which key its
+    mode (`cost.work`), and the one it makes as traced, which its operands' dtypes and parameters fix, kept
+    apart from its parameters, which the region replays as they were traced (a product of two dtypes'
+    unset preferred type stays so, base review 3232beb7c): never another library's promotion of its
+    operands' (NumPy's refuses a bfloat16 beside a float16, base review 0b8b7ed98 F1), nor a trace of a
+    product made for it (base review 7754e5fde F3)."""
+
+    operands: tuple[np.dtype | None, ...]
+    made: np.dtype
+
+
+def _interned(params: list, products: dict[int, Product], indexed: dict[Hashable, int],
+              primitive: jcore.Primitive, values: Mapping, product: Product | None = None) -> int:
     """The index of `primitive` at `values` in a region's table `params`, added where it holds none: two
     entries are one where their primitive and parameters are (`parameters_key`) and, of a product, its
-    `operands`' dtypes too, which key its mode (`cost.work`) and are kept in `products`. The one interning
-    of a region's parameters, while it is built (`_region`) and after (`Region.interned`)."""
-    entry = (*parameters_key(primitive, values), operands)
+    dtypes too (`Product`), kept in `products` (`Region.products`). The one interning of a region's
+    parameters, while it is built (`_region`) and after (`Region.interned`)."""
+    entry = (*parameters_key(primitive, values), product)
     if entry not in indexed:
         indexed[entry] = len(params)
         params.append((primitive, dict(values)))
-        if operands is not None:
-            products[indexed[entry]] = operands
+        if product is not None:
+            products[indexed[entry]] = product
     return indexed[entry]
 
 
@@ -579,8 +603,9 @@ NOTHING = -(2 ** 20)
 """A zero's magnitude: under every other."""
 
 
-type Ranges = Mapping[int, float | tuple[float, float]] | None
-"""Declared ranges by input index (`region`'s): a bound on an input's magnitude, or an interval."""
+type Ranges = Mapping[int, float | tuple[float, float] | Proven] | None
+"""Declared ranges by input index (`region`'s): a bound on an input's magnitude, an interval, or what a
+program around the input proves of it (`Proven`)."""
 
 
 @overload
@@ -618,7 +643,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     shapes: list[tuple[Node, tuple[int, ...]]] = []
     depths: dict[jcore.Var, int] = {}
 
-    products: dict[int, tuple[np.dtype | None, ...]] = {}
+    products: dict[int, Product] = {}
 
     param = functools.partial(_interned, params, products, indexed)
 
@@ -718,7 +743,10 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
                   frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
-                  {var: magnitudes.get(key(node)) for var, node in env.items()})
+                  {var: magnitudes.get(key(node)) for var, node in env.items()},
+                  {var: apart.get(var, NOWHERE) for var in env},
+                  {key(node): held for var, node in env.items()
+                   if (held := apart.get(var, NOWHERE)).number and held.floor is not None})
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
@@ -726,9 +754,7 @@ KEEPING_MAGNITUDE = _symbols(lambda operation: operation.keeps_magnitude)
 INTEGRAL = _symbols(lambda operation: operation.integral)
 BITWISE = _symbols(lambda operation: operation.bitwise)
 KEEPING_SIGN = _symbols(lambda operation: operation.keeps_sign)
-EXPONENTIALS = _symbols(lambda operation: operation.exponential)
-"""The symbols whose operations' values prove each fact of their operand's, and those the special-function
-units evaluate (`Operation`)."""
+"""The symbols whose operations' values prove each fact of their operand's (`Operation`)."""
 UNIT = 0
 
 
@@ -793,6 +819,17 @@ WHOLE = Apart(number=True, finite=True)
 sign."""
 
 
+class Proven(NamedTuple):
+    """An input's declaration as a program around it proves it (`dew.algebra.program._declared`): its
+    magnitude's bound where one holds (a power of two, 0 for nothing; None for none) and what else it holds
+    (`Apart`). A window cut from a program takes each value it reads from the program so, not as every
+    input is taken, a finite real: a value the program proves no number (a NaN's tanh made outside the
+    window) bounds nothing within it (spec alignment, 8993)."""
+
+    bound: float | None
+    apart: Apart
+
+
 def _floor_log2(value: float) -> int:
     """`floor(log2(value))` of a positive float, exactly, by its exponent."""
     return math.frexp(value)[1] - 1
@@ -837,12 +874,14 @@ def _constant_apart(value) -> Apart:
                  finite=bool(np.isfinite(values).all()))
 
 
-def _declared_apart(declared: float | tuple[float, float] | None) -> Apart:
+def _declared_apart(declared: float | tuple[float, float] | Proven | None) -> Apart:
     """An input's `Apart`: a finite number, as every input is taken to be (a real, within its declared range
     where it has one); and, of an interval, its end nearer zero where the interval holds none and the side
     of zero it lies on."""
     if declared is None:
         return WHOLE
+    if isinstance(declared, Proven):
+        return declared.apart
     if not isinstance(declared, tuple):
         return Apart(number=True, finite=math.isfinite(declared))
     low, high = declared
@@ -877,8 +916,9 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
     value that may be zero meets one that may be infinite; a quotient unless both may be zero or both
     infinite; a root or a logarithm of a value at least 0; a maximum, a minimum, a selection, a negation, an
     absolute value, a power of an integer, an exponential, a logistic, a layout, a conversion and a maximum
-    or minimum along an axis of numbers; a sum along axes of numbers on one side of zero. It is finite where
-    it is a number made of finite operands (a quotient's divisor, and a negative power's operand, held away
+    or minimum along an axis of numbers; a sum along axes of numbers on one side of zero. A tanh, an erf and
+    a logistic of a number are finite (an infinity's is its side's limit). It is finite where it is a number
+    made of finite operands (a quotient's divisor, and a negative power's operand, held away
     from zero) and its own bound is under its dtype's largest power; a contraction, and a sum along axes of
     either side's values, is a number only so: its partial sums, in whatever order its mode takes them,
     overflow under no bound within the dtype, and past one two of them may be infinities of opposite sides.
@@ -1019,8 +1059,12 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
     if name == "dot_general":
         return Apart(None, 0, number=False, finite=finite)
     if name in BOUNDED:
-        # Finite of a finite operand, each of them; a sine of an infinity is no number.
-        return Apart(None, 0, first.finite, first.finite)
+        # Finite of a finite operand, each of them; a sine of an infinity is no number, but a tanh's and an
+        # erf's are their side's 1 (XLA clamps the operand before its polynomial), so of a number they are
+        # finite: a product that may overflow, which a window takes as its program proves it, bounds its
+        # tanh still (spec alignment, 8993).
+        held = first.number if name in ("tanh", "erf") else first.finite
+        return Apart(None, 0, held, held)
     if name in INTEGRAL:
         return Apart(None, 0, first.number, first.finite)
     if name in KEEPING_SIGN:
@@ -1245,10 +1289,10 @@ def product_slack(region: Region, index: int) -> int | None:
     """The powers the product of `region`'s parameters `index` adds to its bound for its mode
     (`contraction_slack` at its operands' dtypes, `Region.products`); None where an operand's dtype is
     unknown or the mode's rounding is unstated."""
-    operands = region.products.get(index)
-    if operands is None or len(operands) != 2 or None in operands:
+    product = region.products.get(index)
+    if product is None or len(product.operands) != 2 or None in product.operands:
         return None
-    return contraction_slack(region.params[index][1].get("precision"), *operands)
+    return contraction_slack(region.params[index][1].get("precision"), *product.operands)
 
 
 def contraction_slack(precision, left, right) -> int | None:
@@ -1299,9 +1343,11 @@ def _magnitude(value) -> Magnitude | None:
     return _log2(largest) if math.isfinite(largest) else None
 
 
-def _declared(declared: float | tuple[float, float] | None) -> Magnitude | None:
+def _declared(declared: float | tuple[float, float] | Proven | None) -> Magnitude | None:
     """An input's magnitude from its declared range (an interval's larger end's), None where it declares
     none."""
+    if isinstance(declared, Proven):
+        declared = declared.bound
     if declared is None:
         return None
     largest = max(abs(declared[0]), abs(declared[1])) if isinstance(declared, tuple) else declared
@@ -1318,17 +1364,29 @@ def _typed(dtypes: dict, magnitudes: dict, term: Term | Skeleton, atom, magnitud
     magnitudes.setdefault(named, magnitude)
 
 
+WIDENED = (jnp.bfloat16, jnp.float16)
+"""The floats narrower than float32 a widened sum adds in float32 (`rules.narrowed`), each one's conversion
+back stocked (`stocked`)."""
+
+
 @functools.cache
 def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     """The primitives a stable rule writes where the program held none (`rules.stock`), each at the
-    parameters JAX binds it with by default, read from JAX's own trace of them."""
+    parameters JAX binds it with by default, read from JAX's own trace of them, by its symbol; a conversion
+    by its target's name (`convert_float32`: a widened sum's, and each of `WIDENED`'s, its result's)."""
     # An abstract scalar: the pass reads a jit's trace after it is made, where a process compiling for a
     # device it does not hold (a compile-only GPU) places no array.
     scalar = jax.ShapeDtypeStruct((), jnp.float32)
     traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
-                                       jnp.log1p(a), jnp.expm1(a)))(scalar)
-    return {OPERATIONS[equation.primitive].symbol: (equation.primitive, dict(equation.params))
-            for equation in traced.jaxpr.eqns}
+                                       jnp.log1p(a), jnp.expm1(a),
+                                       *(a.astype(narrow).astype(jnp.float32) for narrow in WIDENED)))(scalar)
+    found = {}
+    for equation in traced.jaxpr.eqns:
+        symbol = OPERATIONS[equation.primitive].symbol
+        if equation.primitive is jax.lax.convert_element_type_p:
+            symbol = f"convert_{np.dtype(equation.params['new_dtype']).name}"
+        found.setdefault(symbol, (equation.primitive, dict(equation.params)))
+    return found
 
 
 def written_as(constructor: str, named: str | None = None) -> str | None:
@@ -1358,6 +1416,13 @@ def spoken_as(equation: jcore.JaxprEqn) -> str | None:
 def form_value(region_: Region, form: Term, values: list) -> jax.Array:
     """One chosen `form`'s value over `region_`'s leaves' `values` (a region of the language alone, whose
     leaves are its inputs), each shared term evaluated once."""
+    (made,) = forms_value(region_, [form], values)
+    return made
+
+
+def forms_value(region_: Region, forms: list[Term], values: list) -> list[jax.Array]:
+    """Chosen `forms`' values over `region_`'s leaves' `values` together, each term any of them shares
+    evaluated once (`dew.algebra.program._splices`: roots priced together are made together)."""
     known: dict[Hashable, jax.Array] = {}
 
     def value(term: Term) -> jax.Array:
@@ -1366,7 +1431,7 @@ def form_value(region_: Region, form: Term, values: list) -> jax.Array:
             known[named] = value_of(term, value, region_, values)
         return known[named]
 
-    return value(form)
+    return [value(form) for form in forms]
 
 
 def _held(value: np.ndarray | complex) -> np.ndarray | complex:
@@ -1480,7 +1545,8 @@ def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., 
             given["preferred_element_type"] = None
         operands = tuple(np.dtype(var.aval.dtype) if isinstance(var.aval, ShapedArray) else None
                          for var in equation.invars)
-        return write(others[0], param(primitive, given, operands))
+        (traced,) = (var.aval for var in equation.outvars if isinstance(var.aval, ShapedArray))
+        return write(others[0], param(primitive, given, Product(operands, np.dtype(traced.dtype))))
     return write(operation.symbol, *others, param(primitive, equation.params))
 
 

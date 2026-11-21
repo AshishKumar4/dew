@@ -86,7 +86,9 @@ def run(dtype, images, labels, weights, teacher, replayed=None):
                                                              labels)
     scope = {"jnp": jnp, "jax": jax, "FLAGS": flags, "train_state": state, "x_t": x_t, "t": t,
              "dt_base": level, "labels": dropped, "v_t": v_t, "dropout_key": jax.random.PRNGKey(4)}
-    exec(ast.get_source_segment(text, update), scope)
+    segment = ast.get_source_segment(text, update)
+    assert segment is not None  # `update` is a node of `text`'s own tree.
+    exec(segment, scope)
     (loss, _), gradient = jax.value_and_grad(scope["loss_fn"], has_aux=True)(weights)
     assert loss.dtype == dtype and gradient.dtype == dtype, (loss.dtype, dtype)
     return {"x_t": x_t, "v_t": v_t, "t": t, "level": level, "labels": dropped, "loss": loss,
@@ -104,8 +106,9 @@ def main() -> None:
     wide, _ = run(jnp.float64, x, labels, weights, teacher, replayed=drawn)
     bootstrap_times, bootstrap_noise, dropout, flow_times, flow_noise = drawn
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE / "targets.npz", pixels=pixels, x=x, classes=np.asarray(labels), weights=weights,
-             teacher=teacher, settings=np.asarray(json.dumps({**MODEL, "batch_size": SHAPE[0]})),
+    np.savez(FIXTURE / "targets.npz", allow_pickle=False, pixels=pixels, x=x, classes=np.asarray(labels),
+             weights=weights, teacher=teacher,
+             settings=np.asarray(json.dumps({**MODEL, "batch_size": SHAPE[0]})),
              bootstrap_times=bootstrap_times, bootstrap_noise=bootstrap_noise, dropout=dropout,
              flow_times=flow_times, flow_noise=flow_noise,
              **{name: np.asarray(value) for name, value in out.items()},

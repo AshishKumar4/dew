@@ -10,8 +10,9 @@ this module follows the paper's equation.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -59,6 +60,11 @@ class GuidanceDistillationObjective(DiffusionObjective):
     the data's latent geometry, and the student's conditioning must have a
     guidance input, as a guidance-embedded Flux's does. Sampling is unguided.
     """
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "teacher_variables": "the teacher's tree, which the held tree the key states by its shapes holds "
+                             "under its own name (`held_variables`'s `TEACHER`), its arrays passed as "
+                             "arguments"}
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
                  teacher: nn.Module | DiffusionObjective | None = None,

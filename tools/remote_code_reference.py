@@ -66,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import reference_worker
@@ -255,7 +256,9 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
         model.prediction_layer.load_state_dict({key: predicted[PREDICTION_STEM + released_name(key)]
                                                 for key in model.prediction_layer.state_dict()})
     if (tokenizer / "model.safetensors").is_file():
-        model.load_audio_tokenizer(str(tokenizer), device="cpu", dtype=next(model.parameters()).dtype)
+        # A method of the release's own class, which its remote code defines.
+        released: Any = model
+        released.load_audio_tokenizer(str(tokenizer), device="cpu", dtype=next(model.parameters()).dtype)
     return model.eval()
 
 
@@ -280,7 +283,9 @@ def prediction_layer(model: torch.nn.Module) -> torch.nn.Module:
     import copy
 
     modeling = sys.modules[type(model).__module__]
-    config = copy.deepcopy(model.config)
+    # The release's own config and rotary, which its remote code defines.
+    released: Any = model
+    config = copy.deepcopy(released.config)
     config.hybrid_layer_pattern = [1] * config.num_hidden_layers
     config.moe_layer_freq = [0] * config.num_hidden_layers
     size, eps = config.hidden_size, config.layernorm_epsilon
@@ -301,7 +306,7 @@ def prediction_layer(model: torch.nn.Module) -> torch.nn.Module:
                 config=config, input_embeds=x, attention_mask=None, cache_position=places,
                 past_key_values=None, position_ids=places[None])
             x = self.block(x, attention_mask=mask, position_ids=places[None], cache_position=places,
-                           position_embeddings=model.model.swa_rotary_emb(x, places[None]))
+                           position_embeddings=released.model.swa_rotary_emb(x, places[None]))
             return self.final_layernorm(x)
     return PredictionLayer()
 
@@ -337,7 +342,9 @@ def media_tokenizer(config: dict, directory: Path) -> None:
     named = {config[field]: token for field, token in MEDIA_TOKENS.items() if config.get(field) is not None}
     ends = {"pad_token": config["pad_token_id"], "bos_token": config["bos_token_id"],
             "eos_token": config["eos_token_id"]}
-    words = {named.get(index, f"w{index}"): index for index in range(vocabulary(config))}
+    # The fixture's config.json, which a site's draws read as their FixtureConfig: untyped.
+    fixture: Any = config
+    words = {named.get(index, f"w{index}"): index for index in range(vocabulary(fixture))}
     tokenizer = Tokenizer(models.WordLevel(words, unk_token=f"w{config['pad_token_id']}"))
     tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
     fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, additional_special_tokens=list(named.values()),

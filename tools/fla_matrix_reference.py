@@ -21,6 +21,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+COHORT = "fla"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 
 def serve(source: str) -> None:
     """The torch side: fla's layer (`FLA_LAYER_SIDE`'s `fla_layer`, its source at `source`) answering each

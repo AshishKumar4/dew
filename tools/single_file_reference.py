@@ -29,6 +29,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "single_file"
@@ -49,47 +50,53 @@ def tiny_pipeline(kind: str, directory: Path, tokenizer_from: Path) -> None:
     """A random pipeline at the topology the reverse script's fixed block and
     layer counts describe, at small widths."""
     import torch
-    from diffusers import (
-        AutoencoderKL,
-        DDIMScheduler,
-        EulerDiscreteScheduler,
-        StableDiffusionPipeline,
-        StableDiffusionXLPipeline,
-        UNet2DConditionModel,
-    )
+    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+    from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
+    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+    from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
     from transformers import CLIPTextConfig, CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
     torch.manual_seed(0)
-    vae = AutoencoderKL(block_out_channels=(8, 8, 16, 16), layers_per_block=2, norm_num_groups=4,
-                        down_block_types=("DownEncoderBlock2D",) * 4, up_block_types=("UpDecoderBlock2D",) * 4,
-                        latent_channels=4, sample_size=16)
+    # Each model's and pipeline's config as its own save writes it: their signatures name one-element
+    # tuples for these fields and a scheduler enum for the scheduler, and no None for a dropped component.
+    vae_config: dict[str, Any] = dict(
+        block_out_channels=(8, 8, 16, 16), layers_per_block=2, norm_num_groups=4,
+        down_block_types=("DownEncoderBlock2D",) * 4, up_block_types=("UpDecoderBlock2D",) * 4,
+        latent_channels=4, sample_size=16)
+    vae = AutoencoderKL(**vae_config)
     text = CLIPTextModel(CLIPTextConfig(hidden_size=16, intermediate_size=32, num_hidden_layers=2,
                                         num_attention_heads=2, vocab_size=514, max_position_embeddings=77))
     tokenizer = CLIPTokenizer.from_pretrained(tokenizer_from)
     if kind == "sd":
-        unet = UNet2DConditionModel(
+        unet_config: dict[str, Any] = dict(
             sample_size=8, block_out_channels=(8, 16, 16, 16), layers_per_block=2, norm_num_groups=4,
             down_block_types=("CrossAttnDownBlock2D",) * 3 + ("DownBlock2D",),
             up_block_types=("UpBlock2D",) + ("CrossAttnUpBlock2D",) * 3,
             cross_attention_dim=16, attention_head_dim=4)
-        pipe = StableDiffusionPipeline(vae=vae, text_encoder=text, tokenizer=tokenizer, unet=unet,
-                                       scheduler=DDIMScheduler(), safety_checker=None, feature_extractor=None,
-                                       requires_safety_checker=False)
+        unet = UNet2DConditionModel(**unet_config)
+        components: dict[str, Any] = dict(
+            vae=vae, text_encoder=text, tokenizer=tokenizer, unet=unet, scheduler=DDIMScheduler(),
+            safety_checker=None, feature_extractor=None, requires_safety_checker=False)
+        pipe = StableDiffusionPipeline(**components)
     else:
         # OpenCLIP-G's projection is as wide as its hidden size, which the
         # OpenCLIP conversion splits the fused qkv by.
         text_2 = CLIPTextModelWithProjection(CLIPTextConfig(
             hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2, vocab_size=514,
             max_position_embeddings=77, projection_dim=32, hidden_act="gelu"))
-        unet = UNet2DConditionModel(
+        unet_config = dict(
             sample_size=8, block_out_channels=(8, 16, 16), layers_per_block=2, norm_num_groups=4,
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"),
             up_block_types=("CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"),
             transformer_layers_per_block=(1, 2, 2), attention_head_dim=(2, 4, 4), use_linear_projection=True,
             cross_attention_dim=16 + 32, addition_embed_type="text_time", addition_time_embed_dim=8,
             projection_class_embeddings_input_dim=6 * 8 + 32)
-        pipe = StableDiffusionXLPipeline(vae=vae, text_encoder=text, text_encoder_2=text_2, tokenizer=tokenizer,
-                                         tokenizer_2=tokenizer, unet=unet, scheduler=EulerDiscreteScheduler())
+        unet = UNet2DConditionModel(**unet_config)
+        components = dict(vae=vae, text_encoder=text, text_encoder_2=text_2, tokenizer=tokenizer,
+                          tokenizer_2=tokenizer, unet=unet, scheduler=EulerDiscreteScheduler())
+        pipe = StableDiffusionXLPipeline(**components)
     pipe.save_pretrained(directory, safe_serialization=True)
 
 
@@ -132,7 +139,8 @@ def _original(kind: str, pipeline: Path, convert) -> dict:
 
 def tiny(kind: str) -> None:
     import torch
-    from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
     from safetensors.torch import save_file
 
     scratch = Path(tempfile.mkdtemp())
@@ -155,7 +163,7 @@ def tiny(kind: str) -> None:
 
 def released() -> None:
     import torch
-    from diffusers import StableDiffusionPipeline
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
     from huggingface_hub import hf_hub_download
 
     repo, name, revision = RELEASED

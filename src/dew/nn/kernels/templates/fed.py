@@ -7,10 +7,10 @@ from collections.abc import Callable, Sequence
 import jax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates import handoffs, mosaic, resources
 from dew.nn.kernels.templates.handoffs import Role, Schedule
-from dew.nn.kernels.templates.mosaic import RingFamily
-from dew.nn.kernels.templates.rings import Ring, drain
+from dew.nn.kernels.templates.ring_family import RingFamily
+from dew.nn.kernels.templates.rings import Ring, drain, loaded_once, stepped_in
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,12 +38,13 @@ class Feed:
 
     @property
     def stages(self) -> int:
-        return min(ring.stages for ring in self.rings.values())
+        # A walk whose every operand is a once stream rotates no ring: one step deep, as `_walked` takes it.
+        return min((ring.stages for ring in self.rings.values()), default=1)
 
     def load(self, index) -> None:
-        for name, ring in self.rings.items():
-            view = ring.viewed(self.views[name], index - self.origin)
-            ring.load(ring.turn(index - self.first), view)
+        # A joined pair's slot freed once and its members copied into it (`rings.stepped_in`).
+        stepped_in(self.rings, lambda name, ring: ring.turn(index - self.first),
+                   lambda name, ring: ring.viewed(self.views[name], index - self.origin))
 
     def primed(self) -> None:
         """The walk's first steps, a slot each, loaded."""
@@ -76,12 +77,20 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     takes_pingpong = False  # its first consumer issues every ring's loads, its partner's tiles' too
     cluster = 1
+    stages_over_rings = True  # its rings the program's, its consumers their only readers
+
+    def taken_once(self, held: dict, views: dict, wg) -> dict:
+        # Its loads its loading consumer's: a walk's once streams too, before the walk's first step.
+        pl.when(wg == self.loader)(lambda: loaded_once(held, views))
+        return super().taken_once(held, views, wg)
     feeds_itself = True
     gathers_rows = True  # the loading consumer, a whole warpgroup, gathers a step's rows (`gathered.Ring`)
     loader = 0
     """The consumer that issues the loads."""
 
-    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
+                  joined: tuple = ()) -> int:
+        handoffs.runs_alone(self.name, joined)
         return resources.entry_registers(consumers, programs)
 
 
@@ -89,24 +98,26 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         # Every warpgroup a consumer, its value the program's, for a scope after the walk's.
         return Schedule((Role("consumer", consumers),))
 
-    def stream(self, streams, views: dict, lo, hi) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, again=None) -> None:
         raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         raise NotImplementedError(f"{self.name}'s consumers each walk every step of their rings (`fed`)")
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0) -> R:
         # Every consumer walks each streamed step over its own feed: no partner reads a step it skips.
         del own, between
         lo, hi = streamed
-        return walk(self.fed(streams, views, lo, hi, wg), lo, hi, lo)
+        return walk(self.fed(streams, views, lo, hi, wg, counted=counted), lo, hi, lo - counted)
 
     def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
-            refills: bool = True) -> "dict[str, Ring] | Feed":
-        """`RingFamily.fed`: a `Feed` of steps `lo` to `hi` from `views`, its ring counters from `lo` (the
-        walk's `first`), its first steps primed by the loading consumer, drained at its walk's end."""
-        feed = Feed(streams, views, lo, hi, wg == self.loader, first=lo, refills=refills, drains=True)
+            refills: bool = True, counted=0) -> "dict[str, Ring] | Feed":
+        """`RingFamily.fed`: a `Feed` of steps `lo` to `hi` from `views`, its ring counters from `lo`
+        `counted` turns on (the walk's `first`: a decided walk's second pass, `after_walk.Decided`), its first
+        steps primed by the loading consumer, drained at its walk's end."""
+        feed = Feed(streams, views, lo, hi, wg == self.loader, first=lo - counted, refills=refills,
+                    drains=True)
         feed.primed()
         return feed
 

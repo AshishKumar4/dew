@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, equations
+from reference_error import assert_as_exact, assert_computes_the_oracle, equations
 from test_algebra import cheaper_spliced, rows, traces_cheaper, two_sums
 
 from dew import algebra
@@ -47,6 +47,52 @@ def nested(kind: str):
 
 
 KINDS = ("jit", "checkpoint", "scan", "cond", "while")
+
+
+def test_an_infinite_scale_stays_inside_a_maximum():
+    """`max(x * inf)` over `x = [0, 1, ..., 1023]`: `0 * inf` is NaN, so the maximum is NaN; the pass took an
+    infinite scale for a positive one and hoisted it out of the maximum, `max(x) * inf`, infinite, its work
+    the less (spec alignment, 8992). A scale out of an extremum is a finite positive real's alone."""
+    def scaled(x):
+        return jnp.max(x * jnp.inf)
+
+    x = jnp.arange(1024, dtype=jnp.float32)
+    assert np.isnan(np.asarray(jax.jit(algebra.rewritten(scaled))(x)))
+
+
+def test_a_window_proves_nothing_of_a_value_its_program_proves_no_number():
+    """`sum(tanh(a / b) * c)`, its quotient outside the window a reduction heads (three equations deep):
+    `a / b` may be `0 / 0`, so the program proves `tanh` of it no number and bounds nothing it makes; each
+    window cut from it holds no bound and no finiteness the program does not (`program._declared`: the
+    quotient declared as the program proves it, `terms.Proven`), where the window took its input for a finite
+    real and bounded the tanh, its product and its sum, which a reordering reads (spec alignment, 8993)."""
+    from jax.extend import core as jcore
+
+    def program_of(a, b, c):
+        return jnp.sum(jnp.tanh(a / b) * c)
+
+    closed = jax.make_jaxpr(program_of)(*(jnp.ones(8, jnp.float32) for _ in range(3)))
+    whole = terms.region(closed)
+    windows = program._windows(closed.jaxpr)
+    assert windows
+    proven = program._held(closed.jaxpr)
+    for window, _ in windows:
+        cut = terms.region(jcore.ClosedJaxpr(window, []), program._declared(window, proven))
+        made = [var for equation in window.eqns for var in equation.outvars]
+        assert [var for var in made if cut.held.get(var) is not None and whole.held.get(var) is None] == []
+        assert [var for var in made if cut.apart[var].finite and not whole.apart[var].finite] == []
+
+
+@pytest.mark.parametrize(("function", "finite"), [(jnp.tanh, True), (jax.lax.erf, True), (jnp.sin, False)],
+                         ids=["tanh", "erf", "sin"])
+def test_a_saturating_function_of_a_product_that_may_overflow_keeps_its_bound(function, finite):
+    """`f(a * b)` of two inputs, finite reals whose product may overflow to an infinity: a tanh's and an erf's
+    is finite, so its bound stands (a bound is stated of a finite value alone; an infinity's tanh is its
+    side's 1), and a window reading the product as its program proves it bounds them still; a sine's of an
+    infinity is no number, and stays unbounded (spec alignment, 8993)."""
+    closed = jax.make_jaxpr(lambda a, b: function(a * b))(*(jnp.ones(8, jnp.float32) for _ in range(2)))
+    made = closed.jaxpr.outvars[0]
+    assert (terms.region(closed).held.get(made) is not None) is finite
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -256,6 +302,39 @@ def test_a_factored_product_is_admitted_only_under_the_reach(name):
     assert held == {1.0: True, largest: False}
 
 
+REUSED = {
+    "a reciprocal": (lambda a, w: (a / jnp.maximum(jnp.abs(w), 1e-3), 1 / jnp.maximum(jnp.abs(w), 1e-3)),
+                     lambda a, w: (a / jnp.abs(w), 1 / jnp.abs(w))),
+    "a reciprocal root": (
+        lambda a, w: (a / jnp.sqrt(jnp.square(w) + 1e-3), jax.lax.rsqrt(jnp.square(w) + 1e-3)),
+        lambda a, w: (a / jnp.sqrt(jnp.square(w)), jax.lax.rsqrt(jnp.square(w)))),
+}
+"""Each reuse's program, its quotient beside the reciprocal it reads: its divisor held away from zero by an
+epsilon (a normalization's `max(|w|, eps)`, a norm's `w^2 + eps`), and the same with no epsilon."""
+
+
+@pytest.mark.parametrize("name", list(REUSED))
+@pytest.mark.parametrize(("floored", "bounded", "admitted"), [(True, True, True), (False, True, False),
+                                                              (True, False, False)],
+                         ids=["held", "no floor", "no bound"])
+def test_a_quotient_reads_the_reciprocal_its_program_holds_only_where_its_divisor_is_held(name, floored,
+                                                                                       bounded, admitted):
+    """A quotient by a value whose reciprocal (or reciprocal root) the program holds is that reciprocal's
+    product (the reuse set) only where the reciprocal is a normal finite float and the product finite
+    (§6.3): its divisor held away from zero by an epsilon and bounded by its operand's declared range, the
+    dividend bounded too. With no epsilon, a subnormal divisor's reciprocal overflows where the quotient is
+    finite; with no bound, a large divisor's flushes to zero; neither is shared."""
+    from egglog import eq, i64
+
+    program_of = REUSED[name][0 if floored else 1]
+    closed = jax.make_jaxpr(program_of)(*rows(1, (64, 32), (64, 32)))
+    region = terms.region(closed, {0: 4.0, 1: 4.0} if bounded else {0: 4.0})
+    graph, _, (quotient, reciprocal) = program.graphed(region)
+    program.saturate(graph, region, (algebra.rules.RULES["reuse"],), algebra.SATURATION)
+    product = terms.Term.leaf(i64(0)).binary("mul", reciprocal, i64(region.stock["mul"]))
+    assert graph.check_bool(eq(quotient).to(product)) == admitted
+
+
 @pytest.mark.parametrize("fn", [
     lambda x, y, s: jnp.max(jnp.tanh(x) * 0.5, axis=1),
     lambda x, y, s: jnp.min(0.5 * jnp.tanh(x), axis=1),
@@ -292,6 +371,23 @@ def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
     return jnp.dot(a, x) + jnp.dot(a, y)
+
+
+def test_two_roots_of_one_shared_product_are_made_once():
+    """Two outputs reading products of a shared operand, `a x + a y` and `a y + a x` (`_shared_products`'s
+    terms, in either order): the pass prices them together as one factored product, and the program it
+    writes makes that product once, the second output the first's value; each traced apart wrote the
+    product twice, so the program computed what extraction priced as shared twice (spec alignment, 8995).
+    Its values are the written program's on par from float64 (check 1)."""
+    def both(a, x, y):
+        a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
+        return jnp.dot(a, x) + jnp.dot(a, y), jnp.dot(a, y) + jnp.dot(a, x)
+
+    shapes = ((256, 64), (64, 64), (64, 64))
+    written = jax.make_jaxpr(algebra.rewritten(both))(*rows(1, *shapes))
+    assert [equation.primitive for equation in equations(written.jaxpr)].count(jax.lax.dot_general_p) == 1
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *shapes),
+                    "two roots of one shared product", seeds=16)
 
 
 def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
@@ -826,6 +922,138 @@ def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
     assert cost.fused(generation.gpu_target("sm86")).unpriced(two)[-1] == 2
 
 
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_xlas_schedule_on_a_tpu_prices_what_its_kernels_keep_in_vmem(target_name):
+    """XLA's schedule on a TPU (`cost.fused`) prices the bytes its kernels move between the vector registers
+    and VMEM (`Work.kept_bytes`) at the TPU's VMEM rate (`GpuTarget.vmem_rate`, row 7283): a leaf read once,
+    a product's result and a reduction's written once and read once (a reduction's at a lane's four bytes),
+    a chunk form's product's too (`cost.product_work`). A GPU's XLA keeps them on chip at no price, and a TPU
+    no one measured leaves them work no rate prices."""
+    tpu = generation.TARGETS[target_name]
+
+    def kept(fn, *shapes):
+        with program.passes(target=target_name):
+            region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.float32) for shape in shapes)))
+            graph, bundle, _ = program.graphed(region)
+            return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(tpu)))[1].work
+
+    product, summed = kept(jnp.dot, (64, 128), (128, 256)), kept(lambda x: jnp.sum(x, axis=-1), (64, 128))
+    assert product.kept_bytes == 4 * (64 * 128 + 128 * 256 + 2 * 64 * 256)
+    assert summed.kept_bytes == 4 * (64 * 128 + 2 * 64)
+    assert kept(lambda x: jnp.sum(x, axis=-1), (4, 0)).kept_bytes == 2 * 4 * 4
+    assert cost.product_work(64, 128, 256, count=3).kept_bytes == 3 * 2 * 64 * 256 * 4
+    # On-chip memory's unit (`templates.cost.units`' fourth): exact, one quotient beside a zero.
+    on_chip = 3
+    assert (kernel_cost.units(product, kernel_cost.rates(tpu, device=True))[0][on_chip]
+            == product.kept_bytes / tpu.vmem_rate)
+    hopper, unmeasured = (kernel_cost.rates(generation.TARGETS[name], device=True) for name in ("sm90", "v4"))
+    assert kernel_cost.units(product, hopper)[0][on_chip] == 0
+    assert product.kept_bytes in kernel_cost.units(product, unmeasured)[1]
+
+
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_a_tpu_tile_walks_staged_bytes_are_priced_at_its_vmem_rate(target_name):
+    """A Pallas TPU template's staged bytes (`Work.shared_bytes`, its tiles copied into VMEM) are priced on
+    on-chip memory's unit at the chip's VMEM rate in a tile walk (`templates.cost.rates`, `device=False`: the
+    chip its one multiprocessor), where they were work no rate priced and a TPU template's forms were
+    compared without them (row 8729); a TPU no one measured leaves them unpriced."""
+    tpu, unmeasured = generation.TARGETS[target_name], generation.TARGETS["v4"]
+    staged = kernel_cost.Work(shared_bytes=4.0 * 512 * 1024)
+    on_chip = 3
+    priced, unpriced = kernel_cost.units(staged, kernel_cost.rates(tpu, device=False))
+    assert priced[on_chip] == staged.shared_bytes / tpu.vmem_rate
+    assert not any(unpriced)
+    assert staged.shared_bytes in kernel_cost.units(staged, kernel_cost.rates(unmeasured, device=False))[1]
+
+
+def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
+    """A scan's chunk form on a v5e (`linear_scan.derive` under XLA's schedule, as `scan` derives it) keeps
+    its products' results and a token step's state on chip (`Work.kept_bytes`), which the TPU's VMEM rate
+    prices (row 7283): derived where the v5e states no rate, those bytes are work no rate prices, and the
+    cheapest form's seconds are fewer by them."""
+    from dew.algebra import linear_scan
+
+    v5e = generation.TARGETS["v5e"]
+
+    def derived(target):
+        # Derived as scan derives on a v5e (`program.passes`' target): its products priced in the v5e's modes.
+        with program.passes(target="v5e"):
+            return linear_scan.derive(linear_scan.Extents(64, 128, 128, 1), corrects=False,
+                                      schedule=cost.fused(target), precision=None,
+                                      saturation=algebra.SATURATION)
+
+    priced, unmeasured = derived(v5e), derived(dataclasses.replace(v5e, vmem_rate=None))
+    assert priced.price.work.kept_bytes > 0
+    assert unmeasured.price.work.kept_bytes in unmeasured.price.schedule.unpriced(unmeasured.price.work)
+    assert priced.price.value > unmeasured.price.value
+
+
+def test_a_derivatives_sum_outside_the_language_is_priced_as_the_sum_it_computes():
+    """A sum JAX's derivatives accumulate with (`add_any`, a leaf of the region, outside the language) is
+    priced as the add it computes, one CUDA-core operation an element, as the template's emission prices it:
+    a product and an `add_any` of it cost what a product and an add do. Its work was dropped, its leaf's
+    bytes alone charged, so a prologue holding one compared cheaper than it computes (the audit of
+    2026-11-19pm, 8964)."""
+    from jax._src.ad_util import add_jaxvals_p
+
+    def priced(fn):
+        x, y = jnp.ones((64, 128), jnp.float32), jnp.ones((64, 128), jnp.float32)
+        region = terms.region(jax.make_jaxpr(fn)(x, y))
+        graph, bundle, _ = program.graphed(region)
+        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, cost.fused(generation.TARGETS["sm90"])))[1].work
+
+    accumulated = priced(lambda x, y: add_jaxvals_p.bind(x * y, x))
+    added = priced(lambda x, y: x * y + x)
+    assert accumulated.operations == added.operations
+
+
+def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
+    """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, priced at the dtype
+    JAX makes it (`terms.Product.made`, its traced result's, which the region records as its stated type),
+    its result kept on chip at two bytes an element beside its leaves' (`Work.kept_bytes`); NumPy's
+    promotion of the pair, which it refuses, raised there (base review 0b8b7ed98 F1). A bare product heads no
+    rewrite window, so `dew.jit` alone never prices it (`test_algebra_fusion`'s witness holds its value)."""
+    def product(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    a, b = jnp.ones((2, 3), jnp.bfloat16), jnp.ones((3, 4), jnp.float16)
+    region = terms.region(jax.make_jaxpr(product)(a, b))
+    graph, bundle, _ = program.graphed(region)
+    work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                         cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
+    made = jax.eval_shape(product, a, b).dtype.itemsize
+    assert work.kept_bytes == 2 * (2 * 3 + 3 * 4) + 2 * made * (2 * 4)
+
+
+def test_a_product_of_two_16_bit_formats_replays_as_traced():
+    """A product of a bfloat16 and a float16 matrix, no preferred type stated, its region's term replayed as
+    the engine binds a term's equation (`terms.value_of`): its product bound with its parameters as traced,
+    its preferred type unset, and its value the traced program's bit for bit, one program. The region wrote
+    the dtype it makes into that preferred type, which the replay then bound (base review 3232beb7c); it
+    keeps it apart (`terms.Product.made`)."""
+    def product(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    a, b = jnp.full((2, 3), 0.75, jnp.bfloat16), jnp.full((3, 4), 2.5, jnp.float16)
+    traced = jax.make_jaxpr(product)(a, b)
+    region = terms.region(traced)
+
+    def replayed(a, b):
+        def value(term):
+            return terms.value_of(term, value, region, (a, b))
+        return value(region.outputs[0])
+
+    def dots(jaxpr) -> list[dict]:
+        # Each product's parameters, within the programs an equation calls too (a jit's).
+        return [dict(equation.params) for equation in programs.equations(jaxpr)
+                if equation.primitive is jax.lax.dot_general_p]
+
+    assert dots(jax.make_jaxpr(replayed)(a, b).jaxpr) == dots(traced.jaxpr)
+    assert np.asarray(jax.jit(replayed)(a, b)).tolist() == np.asarray(jax.jit(product)(a, b)).tolist()
+
+
 def test_device_memory_is_priced_at_the_parts_measured_stream():
     """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
@@ -834,7 +1062,7 @@ def test_device_memory_is_priced_at_the_parts_measured_stream():
 
     def memory_rate(device_kind, clocked):
         target = dataclasses.replace(hopper, device_kind=device_kind, memory_bandwidth=clocked)
-        return kernel_cost.rates(target, device=True)[-1]
+        return kernel_cost.rates(target, device=True).device
 
     (measured,) = {memory_rate("NVIDIA GH200 480GB", clocked) for clocked in (4.0e12, 4.9e12)}
     assert measured is not None and measured < 4.0e12
@@ -1048,6 +1276,78 @@ def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name
     assert kernel_cost.walked(kernel_cost.Work(flops=1.0, span=10_000), target) == 10_000 * step > 0
 
 
+def test_a_template_walks_chain_is_priced_at_its_parts_latencies():
+    """A tile walk's dependent path (`Chain`) waits on its products and its warpgroups' barriers, each at the
+    part's measured latency (a GH200's: a waited 64 x N product 12.9 ns and 1.194 ns a column, a barrier
+    round trip 80.1 ns, FS-4123-LATENCIES1-gh200): a recurrence chunk step waiting on four products of 128
+    columns and two round trips costs their sum, where its span alone priced one reduction (row 4123: a states
+    launch's chunk step measured 13 times one)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    chain = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2)
+    chained = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(chain,)), target)
+    spanned = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
+    expected = target.kernel_step_seconds + 4 * 12.9e-9 + 512 * 1.194e-9 + 2 * 80.1e-9
+    assert_computes_the_oracle(np.float64(chained), np.float64(expected), "the chain's seconds", roundings=8)
+    assert chained > 4 * spanned
+
+
+def test_a_rings_stages_hide_a_tile_copy_its_steps_outlast():
+    """A step's tile copy through a ring of S stages is waited on only past what S - 1 steps ahead hide: a
+    step of C seconds takes max(C, (L + C) / S) for a copy of L seconds, so a 4-stage ring hides a copy of
+    1.5 of a step's 663 ns and a 2-stage ring of the same copy waits on part of it (row 4123)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    copy = dataclasses.replace(target.part, copy=(1000e-9, 0.0))
+    target = dataclasses.replace(target, measured={target.device_kind: copy})
+    step = kernel_cost.Chain(products=4, columns=4 * 128)
+    work = kernel_cost.walked(kernel_cost.Work(chains=(step,)), target)
+    hidden = kernel_cost.Chain(products=4, columns=4 * 128, copies=1, stages=4)
+    waited = dataclasses.replace(hidden, stages=2)
+    assert kernel_cost.walked(kernel_cost.Work(chains=(hidden,)), target) == work
+    waiting = kernel_cost.walked(kernel_cost.Work(chains=(waited,)), target)
+    assert_computes_the_oracle(np.float64(waiting), np.float64((1000e-9 + work) / 2),
+                               "the waited ring's step", roundings=4)
+
+
+def test_work_side_by_side_keeps_every_chain_another_does_not_outlast():
+    """Works summed side by side keep each chain no other outlasts at every part's latencies, so their price
+    is the longest of their chains whatever the part, and adding work never lowers it: a chain of more of
+    every event through no more stages replaces the lesser, two that stress different events are both kept."""
+    products, barriers = kernel_cost.Chain(products=4, columns=512), kernel_cost.Chain(barriers=6)
+    more = kernel_cost.Chain(products=5, columns=640, barriers=6)
+    assert (kernel_cost.Work(chains=(products,)) + kernel_cost.Work(chains=(barriers,))).chains == (
+        products, barriers)
+    both = kernel_cost.Work(chains=(products, barriers))
+    assert (both + kernel_cost.Work(chains=(more,))).chains == (more,)
+    assert (kernel_cost.Work(flops=1.0) + kernel_cost.Work(chains=(more,))).chains == (more,)
+
+
+def test_the_exact_extractor_reads_a_walks_longest_path_as_the_greedy_price_does():
+    """The algebra's walk schedule's peak (`Walk.spanned`, what the exact extractor reads) is the longest
+    dependent path the greedy price takes (`templates.cost.walked`): on a GH200 a form of one reduction and
+    four barrier round trips (463 ns) costs more than one of two reductions (285 ns), where its span alone
+    read 143 ns (base review 1e0a501f0 F1)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    schedule = cost.walk(target)
+    waits = kernel_cost.Work(chains=(kernel_cost.Chain(span=1, barriers=4),))
+    reductions = kernel_cost.Work(span=2)
+    assert schedule.spanned(waits) == kernel_cost.walked(waits, target)
+    assert schedule.spanned(waits) > schedule.spanned(reductions)
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_integer_operations_take_the_integer_units_rate(generation_name):
+    """An integer operation runs on a multiprocessor's ALU at 64 results a clock on sm80 and sm90 (CUDA C++
+    Programming Guide 12.6, §5.4.1 Table 4: 32-bit integer add, shift, logic, compare), beside the fp32 lanes,
+    not on them: a walk of integer work alone costs its count over that rate, and fp32 work beside it no more
+    (row 5386)."""
+    target = generation.gpu_target(generation_name)
+    integers = kernel_cost.Work(integer_operations=64.0 * 10_000)
+    alone = kernel_cost.walked(integers, target)
+    assert_computes_the_oracle(np.float64(alone), np.float64(10_000 / target.loaded_clock_hz),
+                               "integer work's seconds", roundings=4)
+    assert kernel_cost.walked(integers + kernel_cost.Work(operations=128.0), target) == alone
+
+
 def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
     """A protected span (`dew.nn.derivatives.Protected`: an error-free transform's) is a boundary no region
     crosses and whose inside no rule touches (docs/design/algebra.md §1.2): two sums the pass rewrites
@@ -1096,6 +1396,66 @@ def test_an_algebra_span_joins_the_windows_around_it():
     assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))) == []
     assert_as_exact(jax.jit(algebra.rewritten(spanning)), jax.jit(two_sums),
                     lambda seed: rows(seed, *SHAPES_MARKED), "an opened span", seeds=8)
+
+
+def test_an_algebra_span_no_rewrite_crosses_keeps_its_marker():
+    """An Algebra span that no rewrite reaches into (`cumsum(sin(x))`, nothing the rules lower) beside two
+    sums the pass joins elsewhere in the program: the joined sums are spliced, and the span stays one marked
+    call of its kind, as written, where one splice anywhere had opened every span for good (spec alignment,
+    8998, §6.10); the program computes what it computes (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def both(x, y, a):
+        kept = marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x), axis=-1))(x)
+        return kept, two_sums(x, y, a)
+
+    assert cheaper_spliced(lambda x, y, a: both(x, y, a)[1], *rows(14, *SHAPES_MARKED))
+    assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(both))(*rows(14, *SHAPES_MARKED))) == [Algebra()]
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a span no rewrite crosses beside joined sums", seeds=8)
+
+
+def test_an_algebra_span_a_rewrite_lands_inside_stays_rewritten():
+    """An Algebra span whose body joins two sums (`two_sums`) and takes their cumulative sum, an equation no
+    rule rewrites: the join lands inside the span, which stays opened, so the program holds one sum where it
+    held two; closing the span again, its replaced equations being in the program no more, restored its body
+    as written and undid the join the pass had reported (head review). It computes what it computes
+    (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def program_of(x, y, a):
+        return marked(Algebra(), lambda x, y, a: jnp.cumsum(two_sums(x, y, a), axis=-1))(x, y, a)
+
+    def summed(closed) -> int:
+        return [equation.primitive for equation in equations(closed.jaxpr)].count(jax.lax.reduce_sum_p)
+
+    shapes = SHAPES_MARKED
+    assert summed(jax.make_jaxpr(algebra.rewritten(program_of))(*rows(16, *shapes))) < summed(
+        jax.make_jaxpr(program_of)(*rows(16, *shapes)))
+    assert_as_exact(jax.jit(algebra.rewritten(program_of)), jax.jit(program_of),
+                    lambda seed: rows(seed, *shapes), "a span a join lands inside", seeds=8)
+
+
+def test_an_algebra_span_returning_one_value_twice_stays_open_beside_a_splice():
+    """An Algebra span returning one value as two outputs, both read, beside sums the pass joins elsewhere:
+    the program the pass writes is a valid program (JAX's own check), the span left opened, where calling
+    it again bound that one value's name twice (head review); it computes what it computes (check 1)."""
+    from jax._src import core as jax_core
+
+    from dew.nn.derivatives import Algebra, marked
+
+    def both(x, y, a):
+        def twice(x):
+            made = jnp.cumsum(jnp.sin(x), axis=-1)
+            return made, made
+
+        first, second = marked(Algebra(), twice)(x)
+        return first * second, two_sums(x, y, a)
+
+    closed = jax.make_jaxpr(both)(*rows(15, *SHAPES_MARKED))
+    jax_core.check_jaxpr(algebra.rewritten_program(closed).jaxpr)
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a span returning one value twice beside joined sums", seeds=8)
 
 
 def test_an_algebra_span_with_effects_is_rewritten_within_its_call():
@@ -1319,6 +1679,21 @@ def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
     narrow, wide = priced(jnp.bfloat16), priced(jnp.float32)
     assert (wide.device_bytes, wide.shared_bytes) == (2 * 64 * 64 * 4, 2 * 64 * 64 * 4)
     assert (narrow.device_bytes, narrow.shared_bytes) == (2 * 64 * 64 * 2, 2 * 64 * 64 * 2)
+
+
+@pytest.mark.parametrize("function, exponentials", [
+    (jnp.exp, 64 * 64), (jnp.sqrt, 64 * 64), (jax.lax.erf, 0), (jnp.expm1, 0)],
+    ids=lambda f: getattr(f, "__name__", None))
+def test_a_functions_work_is_the_units_the_kernels_counter_names(function, exponentials):
+    """A region's elementwise function is priced on the units the kernels' counter states it issues on
+    (`emission.SPECIAL_FUNCTIONS`, `cost.work`): an exp and a square root on the special-function units, an
+    erf and an expm1 on the CUDA cores (XLA's polynomial; CUDA's expm1f, FMAs alone), where the algebra's
+    own table charged all four as exponentials (base review 05bd9f77b F2)."""
+    region = terms.region(jax.make_jaxpr(function)(jnp.ones((64, 64), jnp.float32)))
+    graph, bundle, _ = program.graphed(region)
+    _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+    assert price.work.exponentials == exponentials, price.work
 
 
 def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():

@@ -15,6 +15,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.nn.derivatives import contracted, surrogate
+from dew.nn.float_bits import exact_power2, raw_fields
 from dew.nn.precision import at_least_fp32, correctly_rounded_divide, divided
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
@@ -46,13 +47,14 @@ E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
 
 def _power_of_two_ceil(value):
     """2 ** ceil(log2(value)) off the fp32 bits, as the kernels' fast_round_scale
-    computes it (kernel.py:22-37). Unclamped, unlike the host codecs'
-    `ceil_to_ue8m0` rule (exponents 1 to 254): only past the normal range do
-    they part, a zero giving 0.0 here and 2 ** -126 there, a value above
-    2 ** 127 inf here and 2 ** 127 there."""
-    bits = jax.lax.bitcast_convert_type(value.astype(jnp.float32), jnp.int32)
-    exponent = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).astype(jnp.int32)
-    return jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
+    computes it (kernel.py:22-37), the power set by `float_bits.exact_power2`. Unclamped, unlike the
+    host codecs' `ceil_to_ue8m0` rule (exponents 1 to 254): only past the normal range do they part, a
+    zero giving 0.0 here (exact_power2's sentinel at 2 ** -127) and 2 ** -126 there, a value above 2 **
+    127 inf here (its biased exponent 255) and 2 ** 127 there; an infinity inf and a NaN the bits
+    0x80000000, -0.0 (`exact_power2` past the normal range)."""
+    _, _, biased, fraction = raw_fields(value.astype(jnp.float32))
+    exponent = biased.astype(jnp.int32) - 127 + (fraction != 0).astype(jnp.int32)
+    return exact_power2(exponent, jnp.float32)
 
 
 def _round(values, mantissa: int, lowest: int):
@@ -61,9 +63,8 @@ def _round(values, mantissa: int, lowest: int):
     the power of two of the value's binade less the mantissa bits, floored
     at the subnormal spacing; dividing by it is exact, and `round` ties to
     the even multiple, the one whose last mantissa bit is 0."""
-    bits = jax.lax.bitcast_convert_type(values.astype(jnp.float32), jnp.int32)
-    exponent = jnp.maximum(((bits >> 23) & 0xFF) - 127, lowest) - mantissa
-    quantum = jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
+    biased = raw_fields(values.astype(jnp.float32))[2].astype(jnp.int32)
+    quantum = exact_power2(jnp.maximum(biased - 127, lowest) - mantissa, jnp.float32)
     return jnp.round(values / quantum) * quantum
 
 

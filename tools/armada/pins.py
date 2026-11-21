@@ -32,7 +32,7 @@ def pytest_collection_finish(session):
         own = {str(generation) for mark in item.iter_markers(MARK) for generation in mark.args}
         if not own:
             pinned[name] = None
-        elif pinned.setdefault(name, set()) is not None:
-            pinned[name] |= own
+        elif (held := pinned.setdefault(name, set())) is not None:
+            held |= own
     with open(out, "w") as file:
         json.dump({name: sorted(found or ()) for name, found in sorted(pinned.items())}, file)

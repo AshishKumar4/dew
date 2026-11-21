@@ -44,6 +44,15 @@ pythons	"$PYTHON" tools/armada/ci.py pythons --check
 # container (12 GiB), where checking src/dew ran out of heap. With 8 GiB it passed, the task peaking at 4.3 GiB;
 # 8 GiB also fits GitHub's runner (16 GiB), so both check alike.
 pyright	NODE_OPTIONS=--max-old-space-size=8192 uvx pyright@1.1.406 --pythonpath "$(command -v "$PYTHON")" $pyright_inputs
+# Every script under tools/ type-checked in the environment it runs in: Dew's, its COHORTS' reference releases,
+# or its PEP 723 header's (tools/check_tool_types.py, row 7933), each verdict kept by its key; six shards, as
+# Dew's own tools alone took 1713 s in one, past a gate's deadline.
+tool-types-1	"$PYTHON" tools/check_tool_types.py --shard 1/6
+tool-types-2	"$PYTHON" tools/check_tool_types.py --shard 2/6
+tool-types-3	"$PYTHON" tools/check_tool_types.py --shard 3/6
+tool-types-4	"$PYTHON" tools/check_tool_types.py --shard 4/6
+tool-types-5	"$PYTHON" tools/check_tool_types.py --shard 5/6
+tool-types-6	"$PYTHON" tools/check_tool_types.py --shard 6/6
 # Main still holds structural copies (ledger 896-1287, 1309), so a checkout is held to adding none to origin/main's,
 # whose history a shallow checkout fetches first; main holds no text copy, so any fails.
 duplicate-text	"$PYTHON" tools/duplicates.py --reading=text $duplicate_roots

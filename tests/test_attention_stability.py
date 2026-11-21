@@ -33,16 +33,26 @@ import ml_dtypes
 import numpy as np
 import pytest
 from arm_arithmetic import Truth
-from attention_oracle import exact_attention
-from reference_error import as_given, assert_as_exact, widened, with_gradients
+from attention_oracle import anchored_softmax, exact_attention
+from generation_support import here, interprets
+from reference_error import (
+    FEWEST_SEEDS,
+    as_given,
+    assert_as_exact,
+    assert_merges_no_ties,
+    widened,
+    with_gradients,
+)
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_algebra as algebra,
     attention_decode,
     attention_mosaic,
     attention_portable,
+    attention_route,
     attention_triton,
     mosaic_sm90,
 )
@@ -52,7 +62,7 @@ PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
 """The Triton mainloop's tiles: a family is a block or less, so one tile walks it, but the equal-weight ones
 over 64 and 256 keys, which walk two and eight."""
 
-INTERPRETED = jax.default_backend() == "cpu"
+INTERPRETED = interprets()
 """Whether the Pallas-Triton mainloop runs interpreted, in a CPU process, or compiled, on a GPU: the A100's
 default for every template call and the H100's for fp16 and the hooks Mosaic refuses, so the GPU tier
 proves on the compiled kernel what the interpreter covers."""
@@ -904,7 +914,7 @@ def _cast(family: Family, draw: Callable[[int], tuple]) -> Callable[[int], tuple
     return cast
 
 
-def _reference(family: Family, *, anchored: bool) -> Callable:
+def _reference(family: Family, *, anchored: bool, round_logits=None) -> Callable:
     """The reference's output `(query, key, value, extra) -> out`, in the call's dtype as every attention
     call returns it, its gradients autodiff's (`reference_error.with_gradients`); the float64 truth's
     derivative `anchored`. The reference arm
@@ -924,7 +934,8 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
 
     def attend(query, key, value, extra):
         if isinstance(extra, tuple):
-            out = _resumed_attention(query, key, value, extra, family.keep)
+            out = _resumed_attention(query, key, value, extra, family.keep, anchored=anchored,
+                                     round_logits=round_logits)
         elif extra is None and jax_holds and family.query_first:
             scale = query.shape[-1] ** -0.5
             assert float(np.log2(scale)).is_integer(), "a query scaled first is exact at a power of two alone"
@@ -934,31 +945,34 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
             out = jax.nn.dot_product_attention(query, key, value, mask=jnp.asarray(family.keep),
                                                implementation="xla")
         else:
-            out = exact_attention(query, key, value, extra, keep=family.keep, anchored=anchored)
+            out = exact_attention(query, key, value, extra, keep=family.keep, anchored=anchored,
+                                  round_logits=round_logits)
         return out.astype(query.dtype)
 
     return attend
 
 
-def _resumed_attention(query, key, value, state, keep):
+def _resumed_attention(query, key, value, state, keep, *, anchored: bool, round_logits=None):
     """Attention resumed from a softmax state `(m, total, acc)` (one query head a key head), written apart
-    from Dew with normalized weights, so a state whose sums are near fp32's largest stays finite: the
-    state's weight `total e^(m - M)` and each kept key's `e^(s - M)` over their sum, the state reading its
-    values' mean `acc / total`; in fp32 or the inputs' wider dtype, as the state is, the probabilities
-    rounded to the values' dtype for their product (row 1362)."""
+    from Dew: the state one more column of the softmax, its logit `m + log total` and its value its values'
+    mean `acc / total`, so a state whose sums are near fp32's largest stays finite; in fp32 or the inputs'
+    wider dtype, as the state is, the probabilities rounded to the values' dtype for their product (row
+    1362). Its derivative the float64 truth's where `anchored` (`anchored_softmax`): the state's logit's
+    is `p_state sum_k p_k c (mean - v_k)`, no term cancelling, where a state of total 2^126 beside two keys
+    had its `2 mean / total` share rounded off `total + 2` (row 6302: 6.34e-35 against 1.268e-34)."""
     wide = jnp.promote_types(query.dtype, jnp.float32)
     m, total, acc = (jnp.asarray(x, wide) for x in state)
     query, key = query.astype(wide), key.astype(wide)
     logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(jnp.asarray(query.shape[-1], wide))
+    if round_logits is not None:
+        logits = logits + jax.lax.stop_gradient(logits.astype(round_logits).astype(logits.dtype) - logits)
     logits = jnp.where(keep, logits, -jnp.inf)
-    top = jnp.maximum(m, jnp.max(logits, axis=-1))
-    own = total * jnp.exp(m - top)
-    weights = jnp.exp(logits - top[..., None])
-    denominator = own + weights.sum(axis=-1)
+    joined = jnp.concatenate([(m + jnp.log(total))[..., None], logits], axis=-1)
+    weights = (anchored_softmax if anchored else functools.partial(jax.nn.softmax, axis=-1))(joined)
     mean = acc / total[..., None]
-    shares = weights / denominator[..., None]
-    weighted = jnp.einsum("bhqk,bkhd->bhqd", shares.astype(value.dtype), value, preferred_element_type=wide)
-    out = mean * (own / denominator)[..., None] + weighted
+    weighted = jnp.einsum("bhqk,bkhd->bhqd", weights[..., 1:].astype(value.dtype), value,
+                          preferred_element_type=wide)
+    out = mean * weights[..., :1] + weighted
     return jnp.swapaxes(out, 1, 2)
 
 
@@ -980,32 +994,47 @@ def _differentiated(forward: Callable, backward: Callable) -> Callable:
     return attend
 
 
-def _differentiable(family: Family, forward: Callable, backward: Callable) -> Callable:
+def _differentiable(family: Family, forward: Callable, backward: Callable, *, dropping: bool = False
+                    ) -> Callable:
     """A mainloop's `forward` and `backward` as `(query, key, value, extra) -> out` over `family`'s spans,
     its derivative the mainloop's own backward, the sinks' or resumed state's gradient through the softmax's
-    initial state."""
+    initial state; under `_dropping`'s draw where `dropping`."""
     def run(query, key, value, extra):
         spans, hooks = _spans(family, query, key), _hooks(query, extra)
+        drop = _dropping(query).drop if dropping else None
 
         def ahead(query, key, value, initial):
-            return forward(query, key, value, spans, template.Hooks(initial=initial))
+            return forward(query, key, value, spans, template.Hooks(initial=initial, drop=drop))
 
         def back(query, key, value, initial, dout):
-            return backward(query, key, value, spans, template.Hooks(initial=initial), dout)
+            return backward(query, key, value, spans, template.Hooks(initial=initial, drop=drop), dout)
 
         initial = None if hooks is None else hooks.initial
         return _differentiated(ahead, back)(query, key, value, initial)
     return run
 
 
-def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
+DROP_RATE = 0.25
+"""The dropout rate a dropping family's call takes (`_dropping`): a kept key's multiplier 4/3, inexact in
+every format, so a walk that weighs it per key rounds where the reference's does not (row 8652)."""
+
+
+def _dropping(query) -> template.Hooks:
+    """A dropout draw at `DROP_RATE` over `query`'s rows and heads, its key fixed."""
+    batch, _, heads, _ = query.shape
+    return template.Hooks(drop=template.Dropout(jax.random.bits(jax.random.PRNGKey(7), (2,), jnp.uint32),
+                                                jnp.arange(batch, dtype=jnp.int32),
+                                                jnp.arange(heads, dtype=jnp.int32), DROP_RATE))
+
+
+def _mainloops(family: Family, options: dict, *, dropping: bool = False) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
     or none for the default), its derivative the mainloop's own backward (`_differentiable`); on an H100 the
     Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
     deterministic mode's two launches (`TWO_LAUNCHES`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = attention_portable.Tiles(32, 32, attention_triton.BLOCK)
-    mainloop = functools.partial(_differentiable, family)
+    mainloop = functools.partial(_differentiable, family, dropping=dropping)
 
     def triton_forward(*operands):
         with tuning.pinned(PINS):
@@ -1027,7 +1056,9 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
 
     portable = mainloop(functools.partial(attention_portable.xla_mainloop, tiles, **forward_options),
                         functools.partial(attention_portable.backward, tiles, **options))
-    mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
+    # The Pallas-Triton mainloop takes no probability dropout (ledger row 1521).
+    mainloops = {"portable": portable} if dropping else {"triton": mainloop(triton_forward, triton_backward),
+                                                         "portable": portable}
     def two_launch_backward(*operands):
         with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
             return mosaic_backward(*operands)
@@ -1044,7 +1075,7 @@ TWO_LAUNCHES = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=False, family=
 refined D: a hookless fast-form call's in deterministic mode, where its derived one is one launch."""
 
 
-ON_HOPPER = generation.device_generation() == "sm90"
+ON_HOPPER = here() == "sm90"
 """Whether the Mosaic mainloop runs here, compiled on an H100: interpreted, a family takes it 6 to 33 minutes
 on a CPU, past a CI task's time, and the interpreter is coverage, not proof (`test_attention_mosaic`)."""
 
@@ -1058,30 +1089,33 @@ def _mosaic_takes(family: Family, drawn: tuple) -> bool:
                                     backward=True, family=mosaic_sm90.WGMMA) is None
 
 
-def _held_empty(family: Family, found, label: str) -> None:
-    """A row that sees no key reads nothing and passes nothing back: its output and query gradient are
-    zero exactly."""
-    if family.empty is None:
-        return
-    rows = np.asarray(family.empty)
+def _held_empty(empty, found, label: str) -> None:
+    """A row that sees no key reads nothing and passes nothing back: its output and query gradient
+    (`found`'s first two leaves) are zero exactly at a family's `empty` rows, on each draw checked (row
+    9041)."""
+    rows = np.asarray(empty)
     for leaf, array in zip(("output", "dq"), found[:2], strict=True):
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
+def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int, empty=None) -> None:
     """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever the
     float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is. A reference computing
     in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4` gives a
     key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1). The truth runs
     on the host's CPU device, as the lane runs float64 references (tests/lane_environment.py): a family's
     draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2 (MAINGPU-0243234e8's
-    part 2 on an H100: 25 truths, 182 s)."""
+    part 2 on an H100: 25 truths, 182 s). A family's `empty` rows, each draw's outputs held empty there
+    (`_held_empty`)."""
     truth_of = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
     for seed in range(seeds):
         inputs = draw(seed)
         with jax.enable_x64(new_val=True):
             truth = jax.tree.leaves(truth_of(*widened(jax.device_get(inputs))))
-        found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
+        outputs = dew_fn(*inputs)
+        if empty is not None:
+            _held_empty(empty, outputs, f"{label} seed {seed}")
+        found = jax.tree_util.tree_leaves_with_path(outputs)
         for (path, mine), wide in zip(found, truth, strict=True):
             mine = np.asarray(mine)
             rounded = np.asarray(wide, np.float64).astype(mine.dtype)
@@ -1119,15 +1153,20 @@ its own, so none holds a CPU task past the suite's target (row 1849); those past
 @pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
 def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, name):
     """A template mainloop's output and query, key and value gradients in the accurate form (`ACCURATE`),
-    check 1 over the family's draws; a row that sees nothing, zero."""
+    check 1 over the family's draws, merging no ties the reference keeps apart (`assert_merges_no_ties`,
+    row 6302); a row that sees nothing, zero."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
     reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
     truth = with_gradients(_reference(family, anchored=True))
+    rounded = with_gradients(_reference(family, anchored=True, round_logits=jnp.float32))
     label = f"{name} accurate {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, ACCURATE)[name]))
-    assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
-    _held_empty(family, differentiated(*draw(0)), label)
+    # Each result check 1 draws (its second stage's too) held empty at the family's empty rows (row 9041).
+    held = (None if family.empty is None
+            else lambda outputs, inputs: _held_empty(family.empty, outputs, label))
+    assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth, held=held)
+    assert_merges_no_ties(differentiated, reference, truth, draw, label, seeds=seeds, rounded_fn=rounded)
 
 
 def default_is_finite(family_name: str, mainloop_name: str) -> None:
@@ -1140,8 +1179,25 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
     truth = with_gradients(_reference(family, anchored=True))
     label = f"{mainloop_name} default {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
-    assert_finite(differentiated, truth, draw, label, seeds=seeds)
-    _held_empty(family, differentiated(*draw(0)), label)
+    assert_finite(differentiated, truth, draw, label, seeds=seeds, empty=family.empty)
+
+
+@pytest.mark.parametrize("family", [name for name in TEMPLATE_FAMILIES if _drawn_first(name)[3] is None])
+def test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges(family):
+    """The plain-JAX mainloop, and on an H100 the Mosaic one in both schedules, under dropout (`_dropping`)
+    over every family that starts from no state: output and gradients finite wherever the float64 truth's
+    (the reference's own dropping call, its draw the same) rounded to their dtype are. A kept key's
+    multiplier taken per weight and on the walk's sums before the division passed fp32's largest where the
+    output is finite, and on D's sums before their product with dO overflowed dQ (row 8652)."""
+    seeds, family_spec = min(SEEDS[family], 16), FAMILIES[family]
+    draw = _cast(family_spec, family_spec.draw)
+
+    def truth(query, key, value, extra):
+        return template.reference(query, key, value, _spans(family_spec, query, key), _dropping(query))
+
+    for name, mainloop in _mainloops(family_spec, {}, dropping=True).items():
+        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw,
+                      f"{name} dropping {family_spec.dtype}", seeds=seeds, empty=family_spec.empty)
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
@@ -1152,24 +1208,183 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     default_is_finite(family, "portable")
 
 
-@pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")
+@pytest.mark.skipif(not (INTERPRETED or ON_HOPPER),
+                    reason="runs interpreted as Hopper on CPU or compiled on Hopper (row 6881)")
 @pytest.mark.parametrize("family", ["values at fp32's largest over 2 equal keys",
                                     "values at fp32's largest over 256 equal keys"])
 def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_reference_interpreted(family):
-    """The Mosaic forward in fp32, interpreted on a CPU as an H100 runs it, over values at fp32's limit: check
-    1 over the family's draws, where it summed its operands' bf16 parts and its products' pairs largest first
-    and passed fp32's largest before the smaller terms took it back (inf over 2 keys already, row 6842). A
-    GPU runs it in `_mainloops`' Mosaic arms."""
+    """The Mosaic forward in fp32, routed through `attention_route.attend` (interpreted on a CPU as an H100
+    runs it, or compiled natively on Hopper; rows 6842, 6869, 6881), over values at fp32's limit: check 1
+    over the family's draws, where it summed its operands' bf16 parts and its products' pairs largest first
+    and passed fp32's largest before the smaller terms took it back (inf over 2 keys already)."""
     seeds, family = SEEDS[family], FAMILIES[family]
 
     def forward(query, key, value, extra):
-        with generation.assumed("sm90"):
-            spans = _spans(family, query, key)
-            return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+        spans = _spans(family, query, key)
+        if INTERPRETED:
+            with generation.assumed("sm90"):
+                return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+        with generation.chosen(attention_mainloop="mosaic"):
+            return attention_route.attend(query, key, value, spans, None)
 
-    assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
-                    lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
-                    seeds=seeds, truth_fn=_reference(family, anchored=True))
+    with generation.routes() as routes:
+        assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
+                        lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
+                        seeds=seeds, truth_fn=_reference(family, anchored=True))
+    if not INTERPRETED:
+        assert any(found.choice == "attention_mainloop" and found.kernel == "mosaic"
+                   for found in routes), routes
+
+
+MAINLOOPS = ("portable", "triton", "decode_kernel", *(("mosaic", "decode") if INTERPRETED else ()))
+"""The forwards a mean's test walks: the plain-JAX mainloop's, the Pallas-Triton one's and the Triton decode
+kernel's, and in a CPU process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a
+GPU runs them in `_mainloops`' Mosaic arms and the decode cells)."""
+
+
+@pytest.mark.parametrize("sink", [None, -20.0], ids=["no sink", "a sink"])
+@pytest.mark.parametrize(("mainloop", "training"),
+                         [(mainloop, training) for mainloop in MAINLOOPS for training in (False, True)
+                          if mainloop not in ("decode", "decode_kernel") or not training],
+                         ids=lambda value: {False: "inference", True: "training"}.get(value, value))
+def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, sink):
+    """One fp16 query over a key at logit 0 and 1000 at a logit whose weight, 0.50035, narrows up to 0.5005
+    for its product, every value fp16's largest, beside a `sink` or none: the output, their mean (and the
+    sink's zero), is 65504, on par with the reference (check 1) on both walks, where the narrowed weights
+    over their unrounded sum put it at 65522, inf in fp16 (row 9519; beside a sink of -20, the base review of
+    545370f65, F2; through Triton and the decode step, of c55dff91f, F1: each dropped a sink's hold). The
+    decode step's call is 17 such rows over 8 key heads, 136 programs past an H100's 132, so its work list
+    takes one slice a row and its walk finishes each row from the packed state itself (of 12e76ca7e, F3).
+    Each key's logit is two fp16 entries of it, their sum in fp32 log(0.50035) at the call's scale, 1/8."""
+    keys, width = 1001, 64
+    rows, heads = (17, 8) if mainloop == "decode" else (1, 1)
+    logit = np.float32(8 * np.log(0.50035))
+    high = np.float16(logit)
+    query = jnp.zeros((rows, 1, heads, width), jnp.float16).at[..., :2].set(1)
+    key = (jnp.zeros((rows, keys, heads, width), jnp.float16).at[:, 1:, :, 0].set(high)
+           .at[:, 1:, :, 1].set(np.float16(logit - np.float32(high))))
+    value = jnp.full((rows, keys, heads, width), jnp.finfo(jnp.float16).max, jnp.float16)
+    spans = template.spans(1, keys, rows)
+    hooks = template.Hooks(initial=None if sink is None
+                           else template.sinks(jnp.full((heads,), sink, jnp.float32), rows, 1, width))
+
+    def ours(query, key, value):
+        kept = template.Kept.SPLIT if training else template.Kept.NONE
+        if mainloop == "portable":
+            out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                                  hooks, residuals=training)
+        elif mainloop == "triton":
+            with tuning.pinned(PINS):
+                out = attention_triton.forward(query, key, value, spans, hooks, residuals=kept,
+                                               interpret=INTERPRETED)
+        elif mainloop == "mosaic":
+            with generation.assumed("sm90"):
+                out = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
+                                               residuals=kept)
+        elif mainloop == "decode_kernel":
+            sunk = None if sink is None else jnp.full((heads,), sink, jnp.float32)
+            out = _decode_attend(query, key, value, [keys], 1, sinks=sunk)
+        else:
+            with generation.assumed("sm90"):
+                out = attention_decode.attend(query, key, value, spans, hooks, interpret=True)
+        return out[0] if training else out
+
+    assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans, hooks),
+                    lambda seed: (query, key, value), "an fp16 mean at fp16's largest", seeds=FEWEST_SEEDS)
+
+
+def test_a_mean_of_an_infinite_value_stays_infinite_through_the_hold():
+    """One fp16 query over one key at logit 0 whose value is inf, and over two keys whose values are inf and
+    -inf: the reference's mean held at fp16's largest from finite sums (`attention.held_mean`) leaves the
+    infinite mean inf and the opposite infinities' NaN, as their mean is, where the held value less the
+    unheld one took inf to NaN (the head review of 12e76ca7e, F2)."""
+    query = jnp.zeros((1, 1, 1, 8), jnp.float16)
+    one, two = template.spans(1, 1, 1), template.spans(1, 2, 1)
+    inf = jnp.full((1, 1, 1, 8), jnp.inf, jnp.float16)
+    alone = template.reference(query, jnp.zeros((1, 1, 1, 8), jnp.float16), inf, one)
+    opposite = template.reference(query, jnp.zeros((1, 2, 1, 8), jnp.float16),
+                                  jnp.concatenate([inf, -inf], axis=1), two)
+    assert bool(jnp.all(alone == jnp.inf)) and bool(jnp.all(jnp.isnan(opposite)))
+
+
+NARROWING_TIES = {
+    "float16": [65520.0, 1.5 * 2.0 ** -14 + 2.0 ** -25, 3 * 2.0 ** -25, 2.0 ** -25, 1000.25, -65520.0],
+    "bfloat16": [(2 - 2.0 ** -8) * 2.0 ** 127, 1 + 2.0 ** -8, -(1 + 3 * 2.0 ** -8) * 2.0 ** 100,
+                 (1 + 2.0 ** -8) * 2.0 ** -126],
+}
+"""Points exactly between two neighbouring values of each 16-bit dtype, which a narrowing ties to even: fp16's
+overflow midpoint, ties among its subnormals and the least (half its least subnormal), a normal one and a
+negative one; bf16's overflow midpoint, normal ties of either sign and one at its least normal."""
+
+
+@pytest.mark.parametrize("dtype", NARROWING_TIES, ids=NARROWING_TIES.keys())
+def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
+    """Sums over a divisor whose fp32 quotient rounds onto a 16-bit tie (`NARROWING_TIES`), and the sums an
+    fp32 ulp either side of the tie's product with the divisor and on it where exact: the settled quotient
+    (`algebra.narrowing_settled`) narrows to `dtype` as the exact quotient rounds once, to the tie's nearer
+    neighbour where it is not the tie and to the even one where it is, where the fp32 quotient's second
+    rounding took a quotient below fp16's overflow midpoint to inf (row 9544), and so at the overflow
+    midpoint does a register epilogue's settle of it alone (`algebra.midpoint_settled`); a held quotient,
+    past the one it stands for, as it is. Each divisor a drawn fp32 value from 2^-6 to 2^6, the expectation
+    the float64 quotient's side of the tie (two fp32 values' quotient lies on a tie in float64 only where it
+    is one)."""
+    narrow = jnp.dtype(dtype)
+    rng = np.random.default_rng([9544, len(dtype)])
+    ties = np.asarray(NARROWING_TIES[dtype], np.float64)
+    # Drawn divisors and one just below 1, whose tie's product rounds so the quotient lies off it.
+    divisors = np.append(np.float32(np.ldexp(1 + rng.random(64), rng.integers(-6, 7, 64))),
+                         np.float32(1 - 2.0 ** -24))
+    tie, divisor = (np.ravel(x) for x in np.meshgrid(ties, divisors, indexing="ij"))
+    divisor = divisor.astype(np.float32)
+    centre = np.float32(tie * divisor)
+    acc = np.concatenate([np.nextafter(centre, -np.inf), centre, np.nextafter(centre, np.inf)])
+    divisor, tie, centre = (np.tile(x, 3) for x in (divisor, tie, centre))
+    # A tie's product with a divisor past fp32's largest is no sum a quotient of the tie has, and one below
+    # fp32's least normal a sum XLA's CPU flushes (row 4023).
+    finite = np.isfinite(centre) & np.isfinite(acc) & (np.abs(acc) >= np.finfo(np.float32).tiny)
+    acc, divisor, tie = acc[finite], divisor[finite], tie[finite]
+    rounded = np.asarray(jnp.asarray(acc) / jnp.asarray(divisor))
+    settled = algebra.narrowing_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    found = np.asarray(settled.astype(narrow).astype(jnp.float32), np.float64)
+    exact = acc.astype(np.float64) / divisor.astype(np.float64)
+
+    def narrowed(x):
+        return np.asarray(jnp.asarray(np.float32(x)).astype(narrow).astype(jnp.float32), np.float64)
+
+    # The tie's neighbours, an fp32 value either side of it narrowed once; the even one, the tie narrowed.
+    nearer, further = (narrowed(np.nextafter(np.float32(tie), np.float32(np.sign(tie) * side)))
+                       for side in (0.0, np.inf))
+    expected = np.where(exact == tie, narrowed(tie), np.where(np.abs(exact) < np.abs(tie), nearer, further))
+    np.testing.assert_array_equal(found, expected)
+    largest = jnp.finfo(narrow).max
+    midpoint = np.abs(tie) > largest
+    alone = algebra.midpoint_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    found = np.asarray(alone.astype(narrow).astype(jnp.float32), np.float64)
+    np.testing.assert_array_equal(found[midpoint], expected[midpoint])
+    held = algebra.narrowing_settled(jnp.float32(jnp.finfo(narrow).max), jnp.float32(65522.0),
+                                     jnp.float32(1.0), narrow)
+    assert held == jnp.finfo(narrow).max
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+def test_a_quantized_calls_codes_past_fp16s_largest_are_no_mean(training):
+    """One fp16 key at logit 0 and value 1024 under a quantized model's weights (`Hooks.rounds` 127.5, the
+    key's code 127) and an output hook taking the output by 1/128: the output is 127 x 1024 / 128, 1016, on
+    par with the reference (check 1), the codes' product no mean of the values, so none held at fp16's
+    largest (the base review of 545370f65, F1: held, 511.75)."""
+    query = jnp.zeros((1, 1, 1, 64), jnp.float16)
+    key = jnp.zeros((1, 1, 1, 64), jnp.float16)
+    value = jnp.full((1, 1, 1, 64), 1024, jnp.float16)
+    spans = template.spans(1, 1, 1)
+    hooks = template.Hooks(output_mod=lambda out: out / 128, rounds=127.5)
+
+    def ours(query, key, value):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks, residuals=training)
+        return out[0] if training else out
+
+    assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans, hooks),
+                    lambda seed: (query, key, value), "a quantized call's codes", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
@@ -1271,13 +1486,15 @@ def hookless_families() -> tuple[str, ...]:
 
 
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
+                       "a small weight on a large value, float32",
                        "a small column beside an overflowing one",
                        "a cotangent on a small column beside an overflowing one",
                        "a column near fp32's least normal beside an overflowing one",
-                       "a resumed state beside an overflowing column")
+                       "a resumed state beside an overflowing column",
+                       "a resumed state of a large denominator")
 """The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
 (tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (123 to 257
-s, rows 1849, 2193, 4344; `GPU_ONLY`)."""
+s, rows 1849, 2193, 4344, 5533; `GPU_ONLY`)."""
 
 
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
@@ -1326,7 +1543,7 @@ def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     query, key, value, dout = (first(fill, 1, 1, 1, 16) for fill in (4.0, m0, size, 2.0 ** -8))
     state = (jnp.full((1, 1, 1), m0, jnp.float32), jnp.ones((1, 1, 1), jnp.float32), first(size, 1, 1, 1, 16))
     family = Family(lambda seed: (query, key, value, state, dout), np.ones((1, 1, 1, 1), bool))
-    reference = with_gradients(lambda *args: _resumed_attention(*args, family.keep))
+    reference = with_gradients(lambda *args: _resumed_attention(*args, family.keep, anchored=False))
     ours = jax.jit(with_gradients(_mainloops(family, {})["portable"]))
     for name, found in (("reference", reference(query, key, value, state, dout)),
                         ("default", ours(query, key, value, state, dout))):
@@ -1437,6 +1654,17 @@ def _cache(array: jax.Array) -> jax.Array:
     return jnp.pad(array, ((0, 0), (0, slots), (0, 0), (0, 0)))
 
 
+def _decode_attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths, splits: int,
+                   sinks: jax.Array | None = None, **form) -> jax.Array:
+    """`decode_attention.attend` over `key` and `value` padded to whole decode blocks (`_cache`), with
+    `splits` slices pinned (as an A100's launch on a CPU, where `INTERPRETED` holds)."""
+    pin = {decode_attention.DecodeAttention: decode_attention.Split(splits)}
+    target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+    with target, tuning.pinned(pin):
+        return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(lengths, jnp.int32),
+                                       sinks=sinks, interpret=INTERPRETED, **form)
+
+
 def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
     """The decode kernel over `family`'s step, interpreted on a CPU (as an A100's launch) and compiled on a
     GPU, each row's keys the first `K` of its cache, in the form `natural` names (None, the default), the
@@ -1447,13 +1675,7 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
 
     def decoded(query, key, value, sinks):
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
-        # The family's slice count, which a launch on a CPU, of no multiprocessors, does not offer: there
-        # as an A100's launch.
-        pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
-        target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
-        with target, tuning.pinned(pin):
-            return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                           sinks=sinks, interpret=INTERPRETED, **form)
+        return _decode_attend(query, key, value, count, family.splits, sinks=sinks, **form)
 
     def forward(seed):
         return _cast(family, family.draw)(seed)[:4]
@@ -1485,7 +1707,7 @@ parts, `MosaicForward.parts`); a decode step's alone (`Family.decode_only`) wher
 mainloop."""
 
 
-@pytest.mark.skipif(not INTERPRETED and generation.device_generation() != "sm90",
+@pytest.mark.skipif(not INTERPRETED and here() != "sm90",
                     reason="the template's decode runs on warpgroup MMA's Mosaic mainloop")
 @pytest.mark.parametrize("family", TEMPLATE_DECODED)
 def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family):

@@ -6,7 +6,7 @@ caller asked for, and keeps the declaration through every mainloop and its VJP's
 import dataclasses
 import functools
 import itertools
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import NamedTuple
 
 import jax
@@ -193,6 +193,29 @@ def bf16_parts(x: jax.Array, count: int, *, saturating: int) -> Iterator[jax.Arr
 def formed(x: jax.Array, count: int) -> tuple[jax.Array, ...]:
     """`bf16_parts` of `x`, every part saturating, all formed at once."""
     return tuple(bf16_parts(x, count, saturating=count))
+
+
+def whole(parts: Sequence[jax.Array]) -> jax.Array:
+    """The value `parts` (a value's parts, largest first, `formed`'s) sum to, fp32, summed from the smallest
+    up: each part the last's remainder, the sum is exact. Summed largest first, a finite value past bf16's
+    largest by `2^120 - 2^111` or more took its leading two parts past fp32's, to infinity, before the third's
+    negative remainder brought it back (rows 6842, 6866)."""
+    found = parts[-1].astype(jnp.float32)
+    for part in reversed(parts[:-1]):
+        found = part.astype(jnp.float32) + found
+    return found
+
+
+def stacked(x: jax.Array, count: int) -> jax.Array:
+    """fp32 `x` `[rows, ...]` as its `count` bf16 parts (`formed`) stacked along its first axis `[count *
+    rows, ...]`, the largest first: an operand as a launch reads its parts."""
+    return jnp.concatenate(formed(x.astype(jnp.float32), count), 0)
+
+
+def joined(x: jax.Array, count: int) -> jax.Array:
+    """`stacked`'s inverse: the value `[rows, ...]` its `count` stacked parts sum to (`whole`)."""
+    parts = x.astype(jnp.float32).reshape(count, x.shape[0] // count, *x.shape[1:])
+    return whole(list(parts))
 
 
 def terms(left: int, right: int) -> list[tuple[int, int]]:

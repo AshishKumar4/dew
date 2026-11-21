@@ -50,6 +50,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 from common import WorkloadWork
 from torch_runs import Ranks, Split, finish, record, split, torch_arguments, train
 
@@ -87,7 +88,7 @@ def moe_aux(router_logits, active: int, distributed: bool) -> torch.Tensor:
     each rank's copy of its gradient into the global loss's gradient."""
     from torch.distributed.nn.functional import all_reduce
 
-    total = 0.0
+    total = torch.zeros(())
     for logits in router_logits:
         probs = torch.softmax(logits.float(), dim=-1)
         experts = probs.shape[-1]
@@ -199,6 +200,13 @@ def trunk(model) -> torch.nn.Module:
     return stack
 
 
+def decoder_layers(model) -> torch.nn.ModuleList:
+    """The trunk's layers (`trunk`), each a block of the stack."""
+    layers = trunk(model).layers
+    assert isinstance(layers, torch.nn.ModuleList)
+    return layers
+
+
 def final_norm(stack) -> torch.nn.Module:
     """The norm a decoder's `model.norm` or a Mamba's `backbone.norm_f` is."""
     return stack.norm if hasattr(stack, "norm") else stack.norm_f
@@ -206,18 +214,22 @@ def final_norm(stack) -> torch.nn.Module:
 
 def build(args: argparse.Namespace, place: Ranks) -> Run:
     from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers.modeling_utils import PreTrainedModel
 
     config = AutoConfig.from_pretrained(args.model)
     extra = {} if config.model_type == "mamba2" else {"attn_implementation": args.attention}
     if args.experts is not None:
         extra["experts_implementation"] = args.experts
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, **extra).to(place.device)
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, **extra)
+    # Moved in place by its own `to` (PreTrainedModel's), whose functools.wraps hides its signature.
+    placed: Any = model
+    placed.to(place.device)
     model.config.use_cache = False
     model.train()
     if args.precision == "autocast-bf16-residual":
         bf16_residual(model)
     if args.compile:
-        for layer in trunk(model).layers:
+        for layer in decoder_layers(model):
             layer.compile()
         final_norm(trunk(model)).compile()
         model.lm_head.compile()
@@ -235,7 +247,7 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
         from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
         policy = (MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
                   if args.precision == "fsdp-bf16" else MixedPrecisionPolicy())
-        for layer in trunk(model).layers:
+        for layer in decoder_layers(model):
             fully_shard(layer, mp_policy=policy)
         fully_shard(model, mp_policy=policy)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(args.b1, args.b2),
@@ -276,7 +288,7 @@ def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int
             (objective / accumulation).backward()
         step_loss += loss.detach() / accumulation
     norm = torch.nn.utils.clip_grad_norm_(run.model.parameters(), args.clip)
-    if hasattr(norm, "full_tensor"):
+    if isinstance(norm, DTensor):
         norm = norm.full_tensor()
     run.optimizer.step()
     run.optimizer.zero_grad(set_to_none=True)

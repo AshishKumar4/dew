@@ -12,6 +12,7 @@ transcribed into JAX, in float64.
 Run with torch and NumPy installed: python tools/kda_reference.py [output.npz].
 """
 
+import ast
 import sys
 from functools import partial
 from pathlib import Path
@@ -43,7 +44,7 @@ def rule_inputs(seed: int) -> dict[str, np.ndarray]:
         lengths = rng.uniform(0.5, 2.0, norms.shape)
         arrays[name] = (arrays[name] / norms * lengths).astype(np.float32)
     arrays["g"] = -np.abs(arrays["g"]) * np.float32(.7)
-    arrays["beta"] = 1 / (1 + np.exp(-arrays["beta"]))
+    arrays["beta"] = (1 / (1 + np.exp(-arrays["beta"]))).astype(np.float32)
     arrays["state"] *= np.float32(.3)
     arrays["output_cotangent"] = rng.normal(size=(ROWS, 7, 2, 4)).astype(np.float32)
     arrays["state_cotangent"] = rng.normal(size=(ROWS, 2, 3, 4)).astype(np.float32)
@@ -142,7 +143,8 @@ def reference_functions() -> dict:
     functions = selected(fetched(SOURCE), {"l2norm", "chunk_kimi_delta_attention",
                                            "recurrent_kimi_delta_attention"}, filename=SOURCE)
     for node in functions:
-        node.decorator_list = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            node.decorator_list = []
     return ran(functions, {"torch": torch, "F": F}, SOURCE)
 
 

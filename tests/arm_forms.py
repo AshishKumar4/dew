@@ -4,6 +4,8 @@ YNNPACK's fusions (`without_ynn`, `_arms`) or as Dew's users compile them, a ref
 (`windows`, `over_windows`) and declared to vary from run to run (`run_to_run`), each an adapter
 `reference_error`'s check 1 reads through (`_layers`)."""
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import os
@@ -12,7 +14,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import Unrewritten, unrewritten
+from arm_arithmetic import Unrewritten, Written, as_written, unrewritten
 from check1_judge import SWITCHED
 from check1_wire import CENSUS
 
@@ -192,6 +194,77 @@ def as_recorded[Arm: Callable](fn: Arm, pilots: range | None = None) -> Arm:
     return fn
 
 
+
+HELD: contextvars.ContextVar[Callable | None] = contextvars.ContextVar("held", default=None)
+"""The site's `held` (`reference_error.assert_as_exact`), called on every result of Dew's arm a draw of it
+makes (`_drawn`), wherever check 1 draws it: a stage, a sizing, a map task, a prepared run."""
+
+
+@contextlib.contextmanager
+def holding(held: Callable | None):
+    """`held` (`HELD`) for the site judged within, where given."""
+    token = HELD.set(held)
+    try:
+        yield
+    finally:
+        HELD.reset(token)
+
+
+class _RoundedTruth:
+    """`ROUNDED`, a reference that is check 1's own float64 truth of each draw (its live or prepared run,
+    `reference_error._draw_truth`) rounded once to float32 (`rounded_like`), formed from that truth by the
+    gate (`reference_error._arm_ran`) and never run: an arm run as given, so Dew's arm compiles as its users
+    run it, with the fusions (`_arms`), and holds no program a store compiles. The reference of draws whose
+    truth float32 holds exactly or rounds once, judged by check 1's parity as any reference is: where the
+    truth is a float32 the reference's error is zero and Dew must equal it; where it rounds, Dew is held
+    within PARITY of that one rounding's error (not bit for bit: a tie rounded away from even has the
+    reference's error). A second float64 run of the truth, computed under the arms' arithmetic preset (a
+    CPU's float32 sums), was a second owner of check 1's truth and computed it otherwise (rows 9481, 9515,
+    9532)."""
+
+    as_given, recorded, rounded, programs = True, False, True, None
+
+    def __repr__(self) -> str:
+        return "ROUNDED"
+
+    def __call__(self, *inputs, **options):
+        raise TypeError("ROUNDED is check 1's own truth of a draw rounded once, which the gate forms from "
+                        "that truth (`reference_error._arm_ran`); it is never run")
+
+
+ROUNDED = _RoundedTruth()
+
+
+def rounded_like(truth, made):
+    """`truth`'s float64 leaves each rounded once to float32 (NumPy's cast: to nearest, ties to even), the
+    dtype of `made`'s leaf there (Dew's arm's result), whose tree it is: refused for a leaf of another dtype,
+    which no one rounding of a float64 reaches as a float32's does."""
+    def once(true, leaf):
+        if np.dtype(leaf.dtype) != np.float32:
+            raise TypeError(f"ROUNDED rounds a float64 truth to float32 once; Dew's leaf is {leaf.dtype}")
+        return np.asarray(true, np.float64).astype(np.float32)
+
+    return jax.tree.map(once, truth, made)
+
+
+def refuse_rounded(label: str, *references, truth_fn, followed=None, conditioning=None,
+                   beside_dew: bool = True) -> None:
+    """Refuse `ROUNDED` among `label`'s `references` (its reference and further ones) without the `truth_fn`
+    it rounds (it has none of its own), beside `followed` roundings (each arm's own truth) or a weighed check
+    (`conditioning`, its reference's own rounding), or with no arm of Dew's beside it (`beside_dew`: a sizing
+    or null run of the reference against itself), where it would be the arm run; and refuse it adapted (any
+    layer of a reference, `_layers`), which the gate cannot see through to form it."""
+    rounded = [fn for fn in references if any(layer is ROUNDED for layer in _layers(fn))]
+    if any(fn is not ROUNDED for fn in rounded):
+        raise ValueError(f"{label}: ROUNDED is given bare, never adapted (a window loop, a run-to-run "
+                         f"declaration): the gate forms it from the truth, and an adapter would call it")
+    if rounded and (
+            truth_fn is None or followed is not None or conditioning not in (None, False) or not beside_dew):
+        raise ValueError(f"{label}: ROUNDED is the site's float64 truth rounded once, beside an arm of "
+                         f"Dew's: it takes `truth_fn`, and no followed roundings, weighed check or run of "
+                         f"itself")
+
+
 def as_given(fn, programs: Callable | None = None):
     """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
     arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
@@ -287,22 +360,43 @@ def _refuse_numpy_arms(draw, *arms) -> None:
                             f"values unconverted")
 
 
-def _compiled(fn, compile, pairing=None, *, reference: bool = False):
+def _compiled(fn, compile, pairing=None, *, reference: bool = False, written: bool = False):
     """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program already
     (another jit around it would nest its compiler options), or compiled by `compile`, a window loop's arm
     within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
     unrewritten (`arm_arithmetic.unrewritten`), but one of Dew's own paths (`dew_path`), which runs under the
-    rewrite as Dew's arm does."""
+    rewrite as Dew's arm does. `written`, compiled as written (`arm_arithmetic.as_written`: none of XLA's
+    rewrites, its products held from its fusions, the twin an accuracy claim bounds Dew's arm by,
+    `_written_twin`), a `without_ynn`
+    program from its own function; else with them, as Dew's arm is."""
     run = unrewritten if reference and not _declared(fn) else _as_is
     if isinstance(fn, _RunToRun):
-        return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference), fn.why)
+        return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference, written=written), fn.why)
+    fn = _own_function(fn) if written else fn
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run(fn)
+    # As written for the platform each call runs on (`arm_arithmetic.Written`), read where it runs: an arm
+    # running Dew's own programs, whose products Dew's compile point compiles beyond the gate's hold, without
+    # fusions too (`as_written`'s `held`).
+    options = functools.partial(as_written, held=False) if written else dict
     if getattr(fn, "dew_programs", False):
-        return run(fn) if compile is jax.jit else _Paired(pairing, run(_with_ynn_off(fn)), run(fn))
+        plain = _with_options(fn, options) if written else fn
+        return run(plain) if compile is jax.jit else _Paired(
+            pairing, run(_with_options(fn, lambda: {**_switched_off_here(), **options()})), run(plain))
     if isinstance(fn, _Windowed):
-        return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference))
+        return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference, written=written))
+    if written:
+        return run(Written(fn)) if compile is jax.jit else _Paired(pairing, run(Written(fn, compile)),
+                                                                   run(Written(fn)))
     return run(compile(fn)) if compile is jax.jit else _Paired(pairing, run(compile(fn)), run(jax.jit(fn)))
+
+
+def _own_function(fn):
+    """`fn`'s own function where it is a jit (a plain one, one of compiler options of its own: a
+    `without_ynn` program, a library arm's cuBLAS), which the gate compiles as written (`_compiled`'s
+    `written`), so no jit of options nests in another, which JAX refuses (options on a program's outermost
+    jit alone); else `fn`. An arm takes arrays alone, so a jit's static arguments are none of its call."""
+    return fn.__wrapped__ if hasattr(fn, "lower") and hasattr(fn, "__wrapped__") else fn
 
 
 def _as_is(fn):
@@ -436,15 +530,23 @@ def _mode_of(arms) -> str | None:
     return next((arm.pairing.refused for arm in _paired_arms(arms) if arm.pairing.refused), None)
 
 
-def _with_ynn_off(fn):
-    """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane, where the context places
-    the call (`dew_programs`, `generation.placed_platform`)."""
+def _switched_off_here() -> dict:
+    """WITHOUT_YNN on the CPU lane, where the context places a call (`switched_off`,
+    `generation.placed_platform`), else none."""
     from dew.nn.kernels.generation import placed_platform
+
+    return switched_off() if placed_platform() == "cpu" else {}
+
+
+def _with_options(fn, compiler_options: Callable[[], dict]):
+    """`fn`, an arm that runs Dew's own programs (`dew_programs`), run with Dew's compile seam adding the
+    compiler options `compiler_options()` gives at each call (where the call is placed) to every program it
+    compiles (`compiled_with`)."""
     from dew.nn.kernels.options import compiled_with
 
     @functools.wraps(fn)
     def run(*inputs, **options):
-        with compiled_with(switched_off() if placed_platform() == "cpu" else {}):
+        with compiled_with(compiler_options()):
             return fn(*inputs, **options)
     return run
 
@@ -460,9 +562,34 @@ def _arms(dew_fn, reference_fn):
     reference runs unrewritten (`_compiled`), so one function as both arms compiles twice, but one of Dew's
     own paths (`dew_path`), which runs under the rewrite as Dew's arm does. A program XLA:CPU
     cannot compile without the fusions turns both arms over to them, decided once a site (`_ynn_decided`)."""
-    compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
+    compile, pairing = _compile_for(dew_fn, reference_fn), _Pairing()
     _refuse_owned_policies(compile, dew_fn, reference_fn)
     return _compiled(dew_fn, compile, pairing), _compiled(reference_fn, compile, pairing, reference=True)
+
+
+def _compile_for(dew_fn, reference_fn):
+    """How the gate compiles a check's arms (`_arms`): each without YNNPACK's fusions (`without_ynn`) where
+    it compiles both, as Dew's users run them (`jax.jit`) beside an arm run as given."""
+    return jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
+
+
+def _bounded(fn) -> bool:
+    """Whether an accuracy claim also holds Dew's arm against reference `fn` compiled as written
+    (`_written_twin`): a reference the gate compiles, written apart from Dew; not one of Dew's own paths (an
+    invariance claim's, `dew_path`, or one running Dew's own programs, `dew_programs`), nor one run as given
+    or recorded."""
+    return not (_given(fn) or _declared(fn)
+                or any(getattr(layer, "dew_programs", False) for layer in _layers(fn)))
+
+
+def _written_twin(dew_fn, reference_fn):
+    """`reference_fn` compiled as written (`_compiled`'s `written`), unrewritten, beside `dew_fn` as `_arms`
+    pairs the two: the reference an accuracy claim holds Dew's arm within PARITY to the power WRITTEN of
+    (`dew.parity.WRITTEN`), so a defect a rewrite of XLA's would share between the two arms compiled alike
+    fails (docs/design/testing.md, check 1); and, where a site names no truth, its truth on the draw widened
+    (`reference_error._site_judged`), every truth compiled as written."""
+    return _compiled(reference_fn, _compile_for(dew_fn, reference_fn), _Pairing(), reference=True,
+                     written=True)
 
 
 def _arms_with(dew_fn, reference_fn, further: list, label: str):

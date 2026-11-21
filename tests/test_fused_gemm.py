@@ -11,10 +11,12 @@ import pytest
 from generation_support import INTERPRETS
 from reference_error import assert_as_exact
 from test_algebra import traces_cheaper
+from test_algebra_program import _scaled_twice
 
+import dew
 from dew import algebra
 from dew.nn import programs
-from dew.nn.kernels import fused_gemm, generation, selection
+from dew.nn.kernels import fused_gemm, gemm, generation, selection
 
 
 @INTERPRETS
@@ -50,6 +52,46 @@ def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generat
 
 
 @INTERPRETS
+@pytest.mark.parametrize("target", ["sm90", "cpu"])
+def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_its_own_of(target):
+    """A region fused through `fused_gemm.fused` in a shard_map over two CPU devices that checks the axes its
+    values vary over (`check_vma`): each device's rows and its own bias (both varying over the map's axis), a
+    feature scale and the matrix the same on every device, the rows scaled before the product (its producer,
+    the template's prologue) and the bias added after (its epilogue). On an assumed, interpreted H100 the
+    template's launch, named, takes both, its product typed as its operands vary (row 9808); on the CPU, XLA's
+    products run them whole, checked. Each device's region computes the scaled rows' dot rounded to bf16 plus
+    its bias, bitwise, over integers whose sums pass bf16's 256."""
+    keys = jax.random.split(jax.random.key(9808), 4)
+    x = jax.random.randint(keys[0], (2, 64, 128), -7, 8).astype(jnp.bfloat16)
+    scale = jax.random.randint(keys[1], (128,), -3, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[2], (128, 256), -7, 8).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[3], (2, 256), -3, 4).astype(jnp.bfloat16)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def region(x, scale, w, bias):
+        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16,
+                                  interpret_on_cpu=target != "cpu") + bias
+
+    def each_device(x, scale, w, bias):
+        return fused_gemm.fused(region, x[0], scale, w, bias[0])[None]
+
+    mapped = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, data),
+                                   out_specs=data, check_vma=True))
+    if target == "cpu":
+        got = mapped(x, scale, w, bias)
+    else:
+        with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"), \
+                generation.routes() as routes:
+            got = mapped(x, scale, w, bias)
+        assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
+    expected = jnp.einsum("dri,io->dro", x * scale, w,
+                          preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(got, np.float32),
+                                  np.asarray(expected + bias[:, None, :], np.float32))
+
+
+@INTERPRETS
 def test_a_fused_regions_consumer_is_rewritten_by_the_algebra_pass_before_its_epilogue_tiles_it():
     """A region fused through `fused_gemm.fused` whose consumer two capped column scales of the product
     summed, which the epilogue takes tile by tile: the region traces the consumer's cheaper form, the one
@@ -82,6 +124,30 @@ def test_a_fused_regions_consumer_is_rewritten_by_the_algebra_pass_before_its_ep
                         seeds=8)
 
 
+@INTERPRETS
+def test_an_explicit_epilogue_is_rewritten_by_the_algebra_pass_as_an_inferred_one_is():
+    """A launch given its epilogue directly (`gemm.gemm`'s `epilogue`) runs it as the algebra pass rewrites
+    it, as a fused region's inferred consumer is (the test above's two capped column scales): one
+    preparation for every hook a launch takes, explicit or inferred (`tuning.KernelOp.prepared`; spec
+    alignment 2026-11-19 PM, ALGEBRA-6); with the pass off, as written."""
+    sizes = jnp.asarray([96, 40], jnp.int32)
+
+    def explicit(x, w, a, b):
+        # The consumer the pass rewrites (test_algebra_program's score hook), on the product's tile.
+        return gemm.gemm(x, w, sizes, epilogue=lambda acc, a, b: _scaled_twice(acc, None, None, a, b),
+                         epilogue_operands=((a, ("columns",)), (b, ("columns",))), out_dtype=jnp.float32,
+                         interpret_on_cpu=True)
+
+    rng = np.random.default_rng(0)
+    operands = (jnp.asarray(rng.standard_normal((136, 128)) / 8, jnp.float32),
+                jnp.asarray(rng.standard_normal((2, 128, 256)) / 8, jnp.float32),
+                *(jnp.asarray(rng.uniform(0.5, 2.0, 256), jnp.float32) for _ in range(2)))
+    with generation.assumed("sm90"):
+        assert traces_cheaper(explicit, *operands)
+        with algebra.passes(on=False):
+            assert not traces_cheaper(explicit, *operands)
+
+
 def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     """`fused_gemm.analysis` prices a region both ways from one model (`fused_gemm.priced`, the shared
     `templates.cost`): a bf16 product of 8192 x 4096 x 4096 with a bias and a SiLU after it costs less fused
@@ -106,28 +172,69 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     assert plain.fused_seconds is None and plain.unfused_seconds is None
 
 
+@pytest.mark.parametrize("operation", [jax.lax.erf, jnp.expm1, jnp.isfinite], ids=lambda f: f.__name__)
+def test_a_projection_followed_by_an_elementwise_function_traces_through_dew_jit(operation):
+    """A bf16 projection followed by an erf, an expm1 or a finiteness test, traced through `dew.jit` for an
+    H100 (whose analysis prices each region, `fused_gemm.analysis`): it traces, each counted as the CUDA
+    cores' work (`emission`'s rule), where a counter that priced none of the three refused the program (base
+    review 92f34bc8d F1)."""
+    x = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((512, 256), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        traced = dew.jit(lambda x, w: operation(x @ w)).trace(x, w)
+    assert traced.out_info.shape == (256, 256)
+
+
+def test_a_regions_analysis_reads_a_divisibility_hint_as_its_value():
+    """A projection's product rounded to int32 under a divisibility hint (`pl.multiple_of`), analysed for an
+    H100: the hint is its operand's value and no work, so the region analyses (`fused_gemm.analysis`), where
+    the counter priced no rule for it and refused the region (base review 05bd9f77b F1)."""
+    from jax.experimental import pallas as pl
+
+    x = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((512, 256), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        fused_gemm.analysis(lambda x, w: pl.multiple_of(fused_gemm.product(x, w).astype(jnp.int32), 1), x, w)
+
+
+_NORMED = (jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16), jax.ShapeDtypeStruct((4096,), jnp.float32),
+           jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16))
+"""An RMS norm's rows, its scale and a projection's weights, 8192 x 4096 x 4096, as shapes."""
+
+
+def _normed_product(x, scale, w):
+    """`x`'s rows RMS-normed and scaled, then projected by `w` (`fused_gemm.product`), in bf16."""
+    wide = x.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(wide * wide, axis=-1, keepdims=True) + 1e-6)
+    return fused_gemm.product((wide * inverse * scale).astype(jnp.bfloat16), w, out_dtype=jnp.bfloat16)
+
 def test_a_normed_projections_analysis_prices_its_prologue_against_forming_the_rows_whole():
     """`fused_gemm.analysis` of an RMS norm feeding a bf16 product of 8192 x 4096 x 4096 (a compile-only
     H100): its prologue fused (the rows' inverse RMS computed whole beside, the normalization tile by tile
     in the kernel), it costs less than XLA forming the normalized rows whole and the launch reading them
     back, by at least the rows' bytes once at the device memory rate: the normalized rows are never written
     or read, where the statistics' pass reads the rows once more. Shapes only."""
-    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
-    scale = jax.ShapeDtypeStruct((4096,), jnp.float32)
-    w = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
-
-    def region(x, scale, w):
-        wide = x.astype(jnp.float32)
-        inverse = jax.lax.rsqrt(jnp.mean(wide * wide, axis=-1, keepdims=True) + 1e-6)
-        return fused_gemm.product((wide * inverse * scale).astype(jnp.bfloat16), w, out_dtype=jnp.bfloat16)
-
     with generation.assumed("sm90"):
-        found = fused_gemm.analysis(region, x, scale, w)
+        found = fused_gemm.analysis(_normed_product, *_NORMED)
         rate = generation.gpu_target().memory_rate
     assert found.prologue is not None and found.prologue.kernel == "fused", found
     assert found.fused_seconds is not None and found.unfused_seconds is not None, found
     assert found.unfused_seconds - found.fused_seconds >= 8192 * 4096 * 2 / rate, found
 
+
+def test_a_normed_projection_read_transposed_is_priced_as_its_product_alone():
+    """An RMS norm feeding a bf16 product of 8192 x 4096 x 4096 (a compile-only H100), its product read
+    transposed: the launch takes the prologue and not the consumer (the product read at other than its
+    tile), so `fused_gemm.analysis` prices the region as the normed product alone, the transpose XLA's
+    after it either way. Shapes only."""
+    with generation.assumed("sm90"):
+        alone = fused_gemm.analysis(_normed_product, *_NORMED)
+        transposed = fused_gemm.analysis(lambda *args: _normed_product(*args).T, *_NORMED)
+    assert transposed.epilogue is not None and transposed.epilogue.kernel != "fused", transposed
+    assert transposed.prologue is not None and transposed.prologue.kernel == "fused", transposed
+    assert (transposed.fused_seconds, transposed.unfused_seconds) == (
+        alone.fused_seconds, alone.unfused_seconds)
+    assert alone.fused_seconds is not None, alone
 
 def test_a_regions_price_reads_its_declared_precision_and_every_bank_of_its_matrix():
     """`fused_gemm.priced` reads what the region's product declares (a compile-only H100): a float32 product
@@ -222,6 +329,103 @@ def test_a_fused_prologue_never_reads_the_depths_padding(generation_name):
     np.testing.assert_array_equal(np.asarray(got), np.asarray(program(x, w, s)))
 
 
+@pytest.mark.parametrize("row_value", [lambda x: jnp.prod(x, axis=1, keepdims=True),
+                                       lambda x: jnp.argmax(x, axis=1, keepdims=True).astype(x.dtype)],
+                         ids=["product", "argmax"])
+def test_a_producer_whose_row_value_is_any_reduction_fuses_through_the_public_entry(row_value):
+    """A producer scaling each row by a value XLA computes whole beside the prologue (its elements' product,
+    the index of its largest) is priced and fused through `fused_gemm.fused` (a CPU's interpretation): XLA's
+    pass for the row value priced by its bytes, the stage the kernel runs by the kernels' counter, where a
+    product's and an index's reductions were refused unpriced (base reviews of 045f07e31 and df983f703,
+    F1); the region's values the program's as written (check 1)."""
+    def region(x, w):
+        return fused_gemm.product(x * row_value(x), w, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def program(x, w):
+        return jnp.dot(x * row_value(x), w)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(1.0 + rng.standard_normal((64, 128)) / 64, jnp.float32),
+                jnp.asarray(rng.standard_normal((128, 64)) / 8, jnp.float32))
+
+    fused = functools.partial(fused_gemm.fused, region)
+    with generation.assumed("sm90"):
+        found = fused_gemm.analysis(region, *draw(0))
+        assert found.prologue is not None, found
+        assert_as_exact(jax.jit(fused), jax.jit(program), draw, "a product reduction's producer, fused",
+                        seeds=8)
+
+
+def test_a_prologues_sides_are_priced_by_their_arithmetic_as_xla_runs_them():
+    """Two producers scaling each row of an 8192 x 4096 bf16 operand by a row value XLA computes beside the
+    prologue, a sum of the row and a sum of its exponentials, feeding one 4096-wide product on an H100: the
+    exponential's side prices above the sum's by its 33.5M exponentials, as the algebra prices XLA's
+    program (`algebra.program.priced`), where bytes alone priced them alike (row 7260); the fused price of
+    each its unfused one's less its forming, the stage priced once."""
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
+
+    def region(side):
+        def fn(x, w):
+            return fused_gemm.product(x * side(x), w, out_dtype=jnp.bfloat16)
+        return fn
+
+    with generation.assumed("sm90"):
+        summed = fused_gemm.analysis(region(lambda x: jnp.sum(x, axis=1, keepdims=True)), x, w)
+        exponential = fused_gemm.analysis(region(lambda x: jnp.sum(jnp.exp(x), axis=1, keepdims=True)), x, w)
+    for found in (summed, exponential):
+        assert found.prologue is not None and found.prologue.kernel == "fused", found.prologue
+    assert exponential.fused_seconds > summed.fused_seconds, (exponential, summed)
+
+
+def test_an_elementwise_producer_formed_whole_prices_xlas_launch_of_it():
+    """`fused_gemm.analysis` on an H100 of a small product (128 x 128 x 128, a bias its consumer) whose
+    operand an elementwise producer forms (`x * scale`), against the same region given its operand: its
+    unfused price is XLA's launch forming the operand whole beside it, at least the part's fixed latency
+    more (row 7284: an elementwise program priced no launch), its bytes a few hundred nanoseconds at most."""
+    x, w = (jax.ShapeDtypeStruct((128, 128), jnp.bfloat16) for _ in range(2))
+    scale, bias = (jax.ShapeDtypeStruct((128,), jnp.bfloat16) for _ in range(2))
+
+    def scaled(x, scale, w, bias):
+        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16) + bias
+
+    def given(x, w, bias):
+        return fused_gemm.product(x, w, out_dtype=jnp.bfloat16) + bias
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        formed = fused_gemm.analysis(scaled, x, scale, w, bias)
+        bare = fused_gemm.analysis(given, x, w, bias)
+    assert formed.unfused_seconds - bare.unfused_seconds >= target.fixed_seconds, (formed, bare)
+
+
+def test_a_prologues_side_program_prices_what_its_sides_read():
+    """`fused_gemm.analysis` on an H100 of an 8192 x 4096 x 4096 bf16 product whose producer scales each row
+    by its sum, its stage `x` or an exponential read through a bitcast (an equation the algebra reads as
+    opaque, whose inputs a program's roots price): the sides XLA computes beside the launch are the row sums
+    alike, so the fused prices agree (the stage's work hidden under the launch's products), where the side
+    program priced the stage's dead equations (row 7285)."""
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
+
+    def region(stage):
+        def fn(x, w):
+            scaled = stage(x) * jnp.sum(x, axis=1, keepdims=True)
+            return fused_gemm.product(scaled, w, out_dtype=jnp.bfloat16)
+        return fn
+
+    def bitcast(x):  # an exponential through a bitcast, which the algebra reads as an opaque equation
+        return jax.lax.bitcast_convert_type(jax.lax.bitcast_convert_type(jnp.exp(x), jnp.int16), jnp.bfloat16)
+
+    with generation.assumed("sm90"):
+        plain = fused_gemm.analysis(region(lambda x: x), x, w)
+        exponential = fused_gemm.analysis(region(bitcast), x, w)
+    for found in (plain, exponential):
+        assert found.prologue is not None and found.prologue.kernel == "fused", found.prologue
+    assert exponential.fused_seconds == plain.fused_seconds, (exponential, plain)
+
+
 def _products(jaxpr) -> int:
     """How many products `jaxpr` and the programs within it compute (`programs.equations`): dots and kernel
     launches."""
@@ -274,7 +478,7 @@ def test_a_named_gate_projection_is_its_launchs_residual_and_its_backward_recomp
 def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden, width, rows, taken, gpu):
     """An RMS norm feeding a bf16 projection of 4 x 3072 rows of 1024 on an A100 or an H100 (its program
     through the algebra's pass, which recognizes the norm as the product's prologue): at the widths M-EM-65
-    timed (Qwen3.5-0.8B's joined q/k/v and gate/up, `grouped_matmul.NORMED_08B`) the product's launch is the
+    timed (Qwen3.5-0.8B's joined q/k/v and gate/up, `grouped_cells.NORMED_08B`) the product's launch is the
     template's and the norm its prologue, as the receipt measured faster than the norm kernel then XLA's
     dot, and on an H100 at the 4B's and the 8B's normed widths M-EM-67 timed (`NORMED_4B_8B`: an A100's lost
     there); a formed projection at a matrix another receipt timed (the 4B's up, M-EM-36 on wgmma) its

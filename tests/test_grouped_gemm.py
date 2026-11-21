@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from certified import lane
-from generation_support import INTERPRETS, interpreted_projection, lowers, runs
+from generation_support import INTERPRETS, here, interpreted_projection, lowers, runs
 from jax.sharding import Mesh
 from native_certificates import (
     forward_products,
@@ -25,8 +25,16 @@ from native_certificates import (
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from reference_error import assert_as_exact, equations, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, selection, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels import (
+    gemm,
+    generation,
+    grouped_cells,
+    grouped_launch,
+    grouped_matmul,
+    grouped_triton,
+    tuning,
+)
+from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles, tiling
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -76,21 +84,21 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     group_sizes = jnp.asarray(sizes, jnp.int32)
     # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
     # multiprocessors the interpreter does not model, the GPU's tile gate runs).
-    tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'),
-             mosaic_gpu.Tiles(128, 64, 64, 2, 1, family='wgmma'),
-             mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family='wgmma'),
-             mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')]
+    tiled = [tiling.Tiles(64, 64, 64, 2, 1, family='wgmma'),
+             tiling.Tiles(128, 64, 64, 2, 1, family='wgmma'),
+             tiling.Tiles(128, 64, 64, 2, 1, warpgroups=2, family='wgmma'),
+             tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')]
     for tiles, transpose in itertools.product(tiled, (False, True)):
         matrix = jnp.swapaxes(arrays[1], 1, 2) if transpose else arrays[1]
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
-                             out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+                             out_dtype=dtype, multiprocessors=1, interpret=grouped_launch.INTERPRETED)
         routed(got, group, forward, fmt, f"forward {tiles} transpose={transpose}")
-    for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'),
-                  mosaic_gpu.Tiles(64, 64, 128, 2, 1, family='wgmma'),
-                  mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
-                  mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')):
+    for tiles in (tiling.Tiles(64, 64, 64, 2, 1, family='wgmma'),
+                  tiling.Tiles(64, 64, 128, 2, 1, family='wgmma'),
+                  tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
+                  tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')):
         got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
-                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+                              multiprocessors=1, interpret=grouped_launch.INTERPRETED)
         for index, products in enumerate(kernel_gradient):
             held(got[index], products, FLOAT32, f"kernel gradient {tiles} of group {index}")
 
@@ -113,8 +121,8 @@ def routed(got, group, products, out, label):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("tiles", [mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'),
-                                   mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')],
+@pytest.mark.parametrize("tiles", [tiling.Tiles(64, 64, 64, 2, 1, family='wgmma'),
+                                   tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')],
                          ids=["one warpgroup", "cooperative"])
 def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
     """For each group, every other row (its neighbours' and the unrouted tail) holds inf in the rows and
@@ -131,7 +139,7 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
         dirty_x[group != kept], dirty_dy[group != kept] = np.inf, np.nan
         got = mosaic_gpu.tgmm(jnp.asarray(dirty_x, jnp.bfloat16), jnp.asarray(dirty_dy, jnp.bfloat16),
                               jnp.asarray(sizes, jnp.int32), tiles=tiles, out_dtype=jnp.float32,
-                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED)[kept]
+                              multiprocessors=1, interpret=grouped_launch.INTERPRETED)[kept]
         held(got, kernel_gradient[kept], FLOAT32, f"kernel gradient of group {kept}")
 
 
@@ -162,7 +170,7 @@ def test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         ba, target = launch.bind(*args, **options), generation.gpu_target()
         derived = launch.derived(ba, target)
-        narrow = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+        narrow = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
         assert derived is not None and launch.legal(ba, narrow, target)
         # The forward on a pair of multiprocessors as well (its matrix's blocks multicast), whatever the
         # derivation picks (row 4491).
@@ -278,8 +286,8 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
-    gradients through CUTLASS's launches, chosen by name, are as exact as XLA's ragged dot from float64,
-    unrouted rows and empty groups included."""
+    gradients through CUTLASS's launches, chosen by name and the forward's kernel pinned, are as exact as
+    XLA's ragged dot from float64, unrouted rows and empty groups included."""
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
@@ -294,8 +302,13 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     def projection(implementation, dtype=jnp.bfloat16):
         return lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None)
 
+    # Its build's kernel pinned, as a tuned pick names it: the pin taken as legal for the wheel's one kernel
+    # (`_Cutlass.legal`), where a template's shared-memory model, which CUTLASS has none of, raised.
+    pinned = {grouped_matmul.CutlassGmm: grouped_matmul.cutlass_tile(grouped_matmul.cutlass_built_for(here),
+                                                                     jnp.bfloat16)}
+
     def through_cutlass(x, w, dy):
-        with generation.chosen(grouped_matmul="cutlass"):
+        with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
             return with_gradients(projection("pallas"))(x, w, dy)
 
     assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
@@ -395,7 +408,7 @@ def test_tritons_tile_counts_every_stage_where_its_mma_reads_shared_memory_async
     (Hopper's wgmma, Blackwell's tcgen05), so the dense fp32 product of the exact-sums cell (64 rows, depth
     4096, 128 columns, at the highest precision) derives a tile whose `stages` steps fit the device's shared
     memory: a B200 refused 262,160 bytes for the tile counted at `stages - 1` (row 4449)."""
-    launch = grouped_matmul.Gmm()
+    launch = grouped_triton.Gmm()
     f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
     with generation.assumed(generation_name):
         target = generation.gpu_target()
@@ -460,7 +473,7 @@ def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_le
         tile = launch.derived(bound, target)
         assert tile is not None and launch.legal(bound, tile, target)
         assert launch.candidate(bound, tile, target)
-        cooperative = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=2, family="wgmma")
+        cooperative = tiling.Tiles(128, 192, 64, 2, 1, warpgroups=2, family="wgmma")
         assert 2880 % cooperative.block_m and launch.legal(bound, cooperative, target) and launch.candidate(
             bound, cooperative, target)
         lowered = functools.partial(mosaic_gpu.tgmm, tiles=cooperative, out_dtype=jnp.float32,
@@ -476,17 +489,17 @@ def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_le
         groups = jnp.asarray([100, 0, 150, 30], jnp.int32)
 
         def gradient(block_m, warpgroups):
-            tiles = mosaic_gpu.Tiles(block_m, 128, 64, 2, 1, warpgroups=warpgroups, family="wgmma")
+            tiles = tiling.Tiles(block_m, 128, 64, 2, 1, warpgroups=warpgroups, family="wgmma")
             return np.asarray(mosaic_gpu.tgmm(tokens, cotangent, groups, tiles=tiles, out_dtype=jnp.float32,
-                                              multiprocessors=4, interpret=grouped_matmul.INTERPRETED))
+                                              multiprocessors=4, interpret=grouped_launch.INTERPRETED))
 
         np.testing.assert_array_equal(gradient(128, 2), gradient(64, 1))
     with generation.assumed("sm80"):
         tokens = jnp.asarray(rng.integers(-3, 4, size=(300, 264)), jnp.bfloat16)
         cotangent = jnp.asarray(rng.integers(-3, 4, size=(300, 64)), jnp.bfloat16)
-        narrow = mosaic_gpu.Tiles(192, 64, 32, 2, 1, family="mma.sync")
+        narrow = tiling.Tiles(192, 64, 32, 2, 1, family="mma.sync")
         got = mosaic_gpu.tgmm(tokens, cotangent, groups, tiles=narrow, out_dtype=jnp.float32,
-                              multiprocessors=4, interpret=grouped_matmul.INTERPRETED)
+                              multiprocessors=4, interpret=grouped_launch.INTERPRETED)
     # Every product and sum exact (small integers): each group's rows' tokens times their cotangent.
     ends = np.cumsum(np.asarray(groups))
     exact = np.stack([np.asarray(tokens, np.float64)[end - size:end].T @ np.asarray(cotangent, np.float64)[
@@ -835,7 +848,7 @@ def test_a_cooperative_tile_refuses_what_its_consumers_cannot_compute(block_m, b
     """A cooperative tile's two consumers each take half its rows in warpgroup MMAs (a multiple of 64
     rows by at most 256 columns): a tile whose halves are not that refuses."""
     with pytest.raises(ValueError):
-        mosaic_gpu.Tiles(block_m, block_n, 64, 2, 1, warpgroups=2, family='wgmma')
+        tiling.Tiles(block_m, block_n, 64, 2, 1, warpgroups=2, family='wgmma')
 
 
 @INTERPRETS
@@ -847,15 +860,15 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
     wide = np.tile(w, (1, 1, 2))[..., :192]
     forward = forward_products(x[:sum(sizes)], wide, sizes)
     for warpgroups in (1, 2):
-        tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=warpgroups, family='wgmma')
+        tiles = tiling.Tiles(128, 192, 64, 2, 1, warpgroups=warpgroups, family='wgmma')
         got = mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
                              jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
-                             out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+                             out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_launch.INTERPRETED)
         routed(got, group, forward, BFLOAT16, f"forward {tiles}")
 
 
-AMPERE_CLASS = jax.default_backend() == "cpu" or (
-    jax.default_backend() == "gpu" and not generation.gpu_target().wgmma)
+HERE = here()
+AMPERE_CLASS = HERE == "cpu" or (HERE.startswith("sm") and not generation.gpu_target(HERE).wgmma)
 """Whether this process runs mma.sync's kernels: a CPU interprets them as an A100's; a GPU without warpgroup
 MMA (an A100, an A10, an L4) runs them on its own facts, where one with warpgroup MMA lowers them for its
 own device, whose pipelines its Mosaic sizes past its block (SM80-h100)."""
@@ -864,14 +877,14 @@ own device, whose pipelines its Mosaic sizes past its block (SM80-h100)."""
 def ampere(generation_name: str = "sm80"):
     """The assumed device an mma.sync test runs on: the process's own Ampere-class GPU, else
     `generation_name`'s, which a CPU interprets."""
-    return generation.assumed(None if jax.default_backend() == "gpu" else generation_name)
+    return generation.assumed(generation_name if HERE == "cpu" else None)
 
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla(sizes, out_dtype):
-    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) and Triton's
+    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`derivation.derived`) and Triton's
     launch, each named: every routed element a value its exact products admit, rounded once to its output
     dtype, unrouted rows zero."""
     x, w, _, group = operands(SIZES[sizes], jnp.bfloat16)
@@ -895,13 +908,14 @@ def test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla(size
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 def test_an_mma_sync_forward_of_no_depth_is_zero():
-    """A product of no depth through mma.sync's tile, named on an Ampere GPU, is zero: it sums nothing,
-    and no launch runs."""
+    """A product of no depth on an Ampere GPU is zero: it sums nothing, no launch taking a call with no
+    extent on an axis (`SUPPORTS`' extents), XLA's program its sum of nothing."""
     lhs, rhs = jnp.zeros((128, 0), jnp.bfloat16), jnp.zeros((1, 0, 256), jnp.bfloat16)
-    with ampere(), generation.chosen(grouped_matmul="mosaic"):
+    with ampere(), generation.routes() as routes:
         got = jax.jit(lambda x, w: gemm.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
                                                  precision="default", interpret_on_cpu=True))(lhs, rhs)
-    assert not np.any(np.asarray(got))
+    assert got.shape == (128, 256) and not np.any(np.asarray(got))
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
 
 
 @pytest.mark.parametrize("sizes", [(3, 2), (2, 2)])
@@ -914,7 +928,7 @@ def test_a_grouped_epilogue_of_no_depth_reads_each_rows_group(sizes):
     def added(acc, by_group, by_column):
         return acc + by_group + by_column
 
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, family="wgmma")
+    tiles = tiling.Tiles(128, 128, 64, 2, 1, family="wgmma")
     got = mosaic_gpu.gmm(jnp.zeros((5, 0), jnp.bfloat16), jnp.zeros((2, 0, 128), jnp.bfloat16),
                          jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
                          out_dtype=jnp.float32, multiprocessors=1, epilogue=added,
@@ -944,7 +958,7 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
     and its epilogue in float64 (eagerly: the interpreter's ordered callbacks)."""
     bias = jnp.asarray(np.linspace(-1, 1, WIDTH), jnp.float32)
     sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
-    tiles = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')
+    tiles = tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')
 
     def draw(seed):
         x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
@@ -952,7 +966,7 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
 
     def run(x, w):
         return mosaic_gpu.gmm(x, w, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
-                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED,
+                              multiprocessors=1, interpret=grouped_launch.INTERPRETED,
                               epilogue=doubled_halves, epilogue_operands=(bias,),
                               epilogue_axes=(("columns",),), out_dtypes=(jnp.bfloat16, jnp.bfloat16))
 
@@ -971,16 +985,16 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
 @pytest.mark.parametrize("sizes, row_tile", [([120, 8], 64), ([3, 200, 1, 0, 57], 128), ([0, 0, 13], 256),
                                              ([64, 64], 64), ([7] * 9, 128)])
 def test_no_row_tile_reads_past_its_operands_allocation(sizes, row_tile):
-    """Every row tile `gmm`'s schedule takes (`mosaic_gpu.tile_groups`, a group's tiles from its first row)
-    reads within the rows its operands are allocated to (`mosaic_gpu.row_extent`): its first row plus the
+    """Every row tile `gmm`'s schedule takes (`row_tiles.tile_groups`, a group's tiles from its first row)
+    reads within the rows its operands are allocated to (`row_tiles.row_extent`): its first row plus the
     tile's rows, unpredicated on an A100, stay inside the extent (row 1866 K3: groups [120, 8] at 64-row
     tiles read rows 120 to 183 of a 128-row lhs)."""
-    rows = -(-sum(sizes) // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS
+    rows = -(-sum(sizes) // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS
     lengths = jnp.asarray([*sizes, rows - sum(sizes)], jnp.int32)
-    table = mosaic_gpu.tile_groups(lengths, row_tile, -(-rows // row_tile) + len(sizes))
+    table = row_tiles.tile_groups(lengths, row_tile, -(-rows // row_tile) + len(sizes))
     used = np.asarray(table.group_end > table.group_start)
     reads = int((np.asarray(table.block_start)[used] + row_tile).max())
-    assert reads <= mosaic_gpu.row_extent(rows, row_tile)
+    assert reads <= row_tiles.row_extent(rows, row_tile)
     if sizes == [120, 8]:
         assert reads > -(-rows // row_tile) * row_tile  # past the row-tile padding that held before
 
@@ -1077,9 +1091,11 @@ def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scatt
     integer values, so every sum is exact whatever tile each launch derives, and each side's one rounding
     the same."""
     rng = np.random.default_rng(5)
-    tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 128)), jnp.bfloat16)
+    # 64 deep and wide, one step and one column tile a launch: every path the cell names at a quarter of
+    # the interpreter's work at 128 (row 8942: 130 s past its group's 120).
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 64)), jnp.bfloat16)
     stacked = (3,) if layered else ()
-    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, *stacked, 3, 128, 128)), jnp.bfloat16)
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, *stacked, 3, 64, 64)), jnp.bfloat16)
     layer = jnp.asarray(2, jnp.int32) if layered else None
     # Interpreted on the host's CPU, whatever GPU it has: a B200's kernels compiled for a GH200 abort its
     # process (row 7130).
@@ -1184,34 +1200,9 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
                         seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
 
 
-TIMED = [
-    ("sm90", "forward", (2560, 9216), "mosaic"), ("sm90", "forward", (9216, 2560), "xla"),
-    ("sm90", "forward", (2560, 1024), "mosaic"), ("sm90", "forward", (2560, 64), "xla"),
-    ("sm90", "input_gradient", (2560, 9216), "mosaic"), ("sm90", "input_gradient", (9216, 2560), "mosaic"),
-    ("sm90", "input_gradient", (2560, 1024), "mosaic"), ("sm90", "input_gradient", (2560, 64), "mosaic"),
-    ("sm90", "kernel_gradient", (2560, 9216), "xla"), ("sm90", "kernel_gradient", (9216, 2560), "mosaic"),
-    ("sm90", "kernel_gradient", (2560, 1024), "mosaic"), ("sm90", "kernel_gradient", (2560, 64), "mosaic"),
-    ("sm90", "forward", (2560, 3072), "xla"), ("sm90", "kernel_gradient", (3072, 2560), "xla"),
-    ("sm100", "forward", (2560, 64), "xla"), ("sm100", "forward", (2560, 9216), "mosaic"),
-    ("sm100", "input_gradient", (2560, 9216), "xla"), ("sm100", "input_gradient", (2560, 64), "mosaic"),
-    ("sm100", "kernel_gradient", (2560, 9216), "xla"), ("sm100", "kernel_gradient", (9216, 2560), "mosaic"),
-    ("sm100", "kernel_gradient", (2560, 1024), "xla"), ("sm100", "kernel_gradient", (2560, 64), "mosaic"),
-    ("sm100", "kernel_gradient", (3072, 2560), "mosaic"),
-]
-"""Each dense product the receipts timed (M-EM-36-gh200 on Hopper, em35d and lab-b200-20261113-grid on a
-B200: Qwen3.5-4B's up, down, key and gates matrices `[in, out]` at 24,576 tokens) beside the route its receipt
-timed fastest, and an untimed matrix (`[2560, 3072]`, `[3072, 2560]`), which keeps its kind's default
-(Hopper's XLA cells, the B200's template)."""
-
-
-def _named(value) -> str:
-    """A parameter's id: a matrix's extents joined by x, any other value as it prints."""
-    return "x".join(map(str, value)) if isinstance(value, tuple) else str(value)
-
-
-def _dense_route(generation_name: str, made: str, matrix: tuple[int, int], rows: int) -> str:
-    """The route `GROUPED` selects on `generation_name` for a 16-bit dense product making `made` of `matrix`
-    `[in, out]` over `rows` tokens."""
+def _dense_cell(generation_name: str, made: str, matrix: tuple[int, int], rows: int) -> grouped_cells.Kind:
+    """The cell (`GroupedCase.cell`'s kind) of a 16-bit dense product on `generation_name` making `made` of
+    `matrix` `[in, out]` over `rows` tokens."""
     from dew.nn.kernels.templates.product import declared
 
     width_in, width_out = matrix
@@ -1228,24 +1219,43 @@ def _dense_route(generation_name: str, made: str, matrix: tuple[int, int], rows:
             call = grouped_matmul.gmm_call(tokens, bf16((1, width_in, width_out)), sizes,
                                            out_dtype=jnp.bfloat16, trans_rhs=transposed, interpret=False,
                                            dense=True)
-        case = grouped_matmul.grouped_case(*call, product=product, whole=True)
-        return selection.selected(grouped_matmul.GROUPED, case).name
-
-
-@pytest.mark.parametrize(("generation_name", "made", "matrix", "kernel"), TIMED, ids=_named)
-def test_a_timed_dense_product_takes_the_route_its_receipt_timed_fastest(generation_name, made, matrix,
-                                                                          kernel):
-    """A dense product of a matrix its family's receipts timed is a cell of its own (`grouped_matmul.Kind`'s
-    `matrix`, `MEASURED`), which the route its receipt timed fastest holds (`DECLARED`): the template where it
-    won, XLA's dot where it lost; a matrix no receipt timed takes its kind's cell, as before (owner, ops
-    361caffc)."""
-    assert _dense_route(generation_name, made, matrix, 24576) == kernel
+        return grouped_matmul.grouped_case(*call, product=product, whole=True).cell[1]
 
 
 @pytest.mark.parametrize("made", ("forward", "input_gradient", "kernel_gradient"))
-def test_a_timed_matrix_over_rows_no_receipt_timed_takes_its_kinds_cell(made):
-    """A receipt is evidence for the rows it timed alone (`grouped_matmul.Timed`, row 6794): the 4B key's
-    matrix, whose cells the template holds on Hopper at 24,576 tokens, takes its kind's cell, XLA's dot, over
-    a fine-tune row's 2,048, where the template's launches made the step's products 1.75 ms slower."""
-    assert _dense_route("sm90", made, (2560, 1024), 24576) == "mosaic"
-    assert _dense_route("sm90", made, (2560, 1024), 2048) == "xla"
+def test_a_receipts_matrix_is_a_cell_of_its_own_over_the_rows_it_timed_alone(made):
+    """A receipt is evidence for the products it timed alone (`grouped_cells.Timed`, row 6794): each matrix
+    Hopper's receipts timed is a cell of its own (`Kind.matrix`) over the receipt's fewest to most rows and
+    no further (a fine-tune's 2,048 took the 4B key's cell and its launches made the step's products 1.75
+    ms slower), and a matrix no receipt timed never is."""
+    (timed,) = grouped_cells.MEASURED[("wgmma", grouped_cells.Made(made), False)]
+    for matrix in timed.matrices:
+        for rows, held in ((timed.fewest, True), (timed.most, True), (timed.fewest - 1, False),
+                           (timed.most + 1, False)):
+            assert (_dense_cell("sm90", made, matrix, rows).matrix == matrix) is held, (matrix, rows)
+    untimed = (timed.fewest + 1, timed.fewest + 3)
+    assert _dense_cell("sm90", made, untimed, timed.fewest).matrix is None
+
+
+@pytest.mark.parametrize("gpu", [pytest.param(name, marks=runs(name)) for name in ("sm80", "sm90")])
+def test_a_ragged_grouped_forward_at_its_derived_tile_is_its_groups_products(gpu):
+    """A grouped forward of ragged groups (an empty one, one of a single row, the rest uneven), its tile
+    derived where its rows weigh its groups' padding (`derivation._padded_side`), interpreted as an A100 and
+    an H100 run it: each row its group's matrix's product, exactly (small integers), the derived tile one
+    the launch holds legal."""
+    rng = np.random.default_rng(23)
+    sizes = np.asarray([0, 1, 37, 130, 64, 3, 90, 75], np.int32)
+    rows = jnp.asarray(rng.integers(-3, 4, size=(int(sizes.sum()), 128)), jnp.bfloat16)
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(8, 128, 256)), jnp.bfloat16)
+    launch = grouped_matmul.MosaicGmm()
+    arguments = launch.bind(rows, matrices, jnp.asarray(sizes), out_dtype="float32", trans_rhs=False,
+                            interpret=True)
+    with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"):
+        target = generation.gpu_target()
+        tile = launch.derived(arguments, target)
+        got = gemm.gemm(rows, matrices, jnp.asarray(sizes), out_dtype=jnp.float32, interpret_on_cpu=True)
+    assert launch.legal(arguments, tile, target), tile
+    group_of = np.repeat(np.arange(8), sizes)
+    exact = np.einsum("rk,rkn->rn", np.asarray(rows, np.float64), np.asarray(matrices, np.float64)[group_of])
+    np.testing.assert_array_equal(np.asarray(got, np.float64), exact)
+

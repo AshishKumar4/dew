@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
-from dew.algebra import SATURATION, program, scan
+from dew.algebra import SATURATION, linear_scan, program, scan
 from dew.nn.kernels import generation
 from dew.nn.precision import float32_matmul
 
@@ -338,15 +338,15 @@ def gated_draw(seed):
             jnp.asarray(rng.uniform(0.05, 0.95, TOKENS), jnp.float32))
 
 
-def gated_tokenwise(update_fn, reads: str = "after"):
+def gated_tokenwise(update_fn, reads: str = "after", readout_fn=gated_readout):
     """A gated rule `update_fn` token by token, its outputs and final state, each token reading the state
-    after its update or, `reads` "apart", after its decay before its own write (`Scan.reads` at a group of
-    one: `exp(g) h`, each key's row by its own decay where `g` is a key's)."""
+    (`readout_fn`) after its update or, `reads` "apart", after its decay before its own write (`Scan.reads`
+    at a group of one: `exp(g) h`, each key's row by its own decay where `g` is a key's)."""
     def run(q, k, v, g, beta):
         def one(h, token):
             decayed = jnp.reshape(jnp.exp(token[3]), (-1, 1)) * h
             h = update_fn(h, *token)
-            return h, gated_readout(h if reads == "after" else decayed, *token)
+            return h, readout_fn(h if reads == "after" else decayed, *token)
 
         final, outputs = jax.lax.scan(one, jnp.zeros((KEY, VALUE), q.dtype), (q, k, v, g, beta))
         return outputs, final
@@ -368,6 +368,13 @@ def kimi_delta_written_as_error(h, q, k, v, g, beta):
     return decayed + beta * jnp.outer(k, v - k @ decayed)
 
 
+def delta_before(h, q, k, v, g, beta):
+    """The delta rule correcting the state a token enters, before its decay (RWKV7's erase read):
+    `h = D h + beta k (v - k^T h)^T`, `D = exp(g)` a scalar's or each key's."""
+    del q
+    return jnp.reshape(jnp.exp(g), (-1, 1)) * h + beta * jnp.outer(k, v - k @ h)
+
+
 KIMI = {**GATED, "g": ("time", "key")}
 
 
@@ -376,6 +383,98 @@ def kimi_draw(seed):
     q, k, v, _, beta = gated_draw(seed)
     rng = np.random.default_rng(seed + 1)
     return q, k, v, jnp.asarray(-(10.0 ** rng.uniform(-3, 0, (TOKENS, KEY))), jnp.float32), beta
+
+
+def rwkv_erase(h, q, k, v, g, beta, a, c):
+    """RWKV7's token: the state decayed, erased along its own vector `a` by its read `c^T h` of the state the
+    token enters, and written: `h = D h + a (c^T h)^T + beta k v^T`, `D = exp(g)` a scalar's or each key's."""
+    del q
+    return jnp.reshape(jnp.exp(g), (-1, 1)) * h + jnp.outer(a, c @ h) + beta * jnp.outer(k, v)
+
+
+def rwkv_readout(h, q, k, v, g, beta, a, c):
+    del k, v, g, beta, a, c
+    return (q @ h) * KEY ** -0.5
+
+
+RWKV = {**GATED, "a": ("time", "key"), "c": ("time", "key")}
+"""RWKV7's operands: `GATED`'s and its erase's vector `a` and read `c`."""
+
+RWKV_KEYED = {**RWKV, "g": ("time", "key")}
+
+
+def rwkv_draw(seed, per_key: bool = False):
+    """`gated_draw`'s (`kimi_draw`'s where `per_key`) and an erase of unit vectors' own: `c = -kk`, `a = kk
+    alpha`, `alpha` up to 1/2, each token's erase a contraction."""
+    q, k, v, g, beta = (kimi_draw if per_key else gated_draw)(seed)
+    rng = np.random.default_rng([seed, 9670])
+    kk = rng.standard_normal((TOKENS, KEY))
+    kk /= np.linalg.norm(kk, axis=-1, keepdims=True)
+    alpha = rng.uniform(0.0, 0.5, (TOKENS, 1))
+    return q, k, v, g, beta, jnp.asarray(kk * alpha, jnp.float32), jnp.asarray(-kk, jnp.float32)
+
+
+VANISHED = -200.0
+"""A log decay that vanishes alone (`exp(-200)`, zero in float32), no document's start."""
+
+SATURATED = scan.RESET_DECAY
+"""A gate saturated at a document's start's own exponent (`scan.RESET_DECAY`), no document's start: RWKV7's
+`-exp(x)` past it at `x` of about 9.2."""
+
+
+def rwkv_forms(operands: dict, **declared):
+    """RWKV7's token's derived forms over `operands` (`RWKV`'s or `RWKV_KEYED`'s), `declared` the rest of its
+    declaration (`scan.Scan`'s)."""
+    return scan.derive_scan(scan.Scan(rwkv_erase, rwkv_readout, operands, walked="time",
+                                      state=((KEY, VALUE), jnp.float32), **declared), saturation=SATURATION)
+
+
+def rwkv_tokenwise(q, k, v, g, beta, a, c):
+    """RWKV7's token scan from a zero state: its outputs and final state."""
+    return scanned(rwkv_erase, rwkv_readout)(q, k, v, g, beta, a, c, jnp.zeros((KEY, VALUE), q.dtype))
+
+
+def scanned(update_fn, readout_fn):
+    """`update_fn`'s token scan, each token reading the state after it (`readout_fn`), from the state given
+    after its operands: its outputs and final state."""
+    def run(*xs):
+        *tokens, h0 = xs
+
+        def one(h, token):
+            h = update_fn(h, *token)
+            return h, readout_fn(h, *token)
+
+        final, outputs = jax.lax.scan(one, h0, tuple(tokens))
+        return outputs, final
+
+    return run
+
+
+def walked_of(forms, operands: dict, entering: bool = False):
+    """`forms`' chunks walked over `operands` from a zero state, or from the state given after them where
+    `entering`: outputs and final state."""
+    def walked(*xs):
+        values = dict(zip(operands, xs[:len(operands)], strict=True))
+        state = forms.init({})
+        state = (state[0], xs[-1]) if entering else state
+        outputs, state = walk(forms, values, range(TOKENS // CHUNK), state, operands)
+        return jnp.concatenate(outputs), forms.finish(state, values)
+
+    return walked
+
+
+def replayed_of(forms, operands: dict):
+    """`forms`' token walk (`Derived.replay`) chunk by chunk over `operands` from the state given after them,
+    as the chunked op's walk takes its tangent: outputs and final state."""
+    def replayed(*xs):
+        values, h = dict(zip(operands, xs[:-1], strict=True)), xs[-1]
+        outputs = []
+        for index in range(TOKENS // CHUNK):
+            out, h = forms.replay(chunk_of(values, index, operands), h)
+            outputs.append(out)
+        return jnp.concatenate(outputs), h
+
+    return replayed
 
 
 def gated_walk(forms, axes: dict):
@@ -503,15 +602,20 @@ def test_a_token_loop_carries_its_state_in_its_operands_wider_type():
 
 
 @pytest.mark.parametrize("target", ["sm86", "sm90"])
-def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
-    """The gated delta rule's chunks derived under an A10 (its step's latency unstated, so the token loop is
-    priced at its work alone and extracted) and an H100 (WY's): on par with the token scan, outputs and
-    final state, against the float64 truth (check 1)."""
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (delta_before, GATED, gated_draw), (delta_before, KIMI, kimi_draw)],
+    ids=["gated_delta", "before its decay, a head's", "before its decay, a key's"])
+def test_a_chunk_form_any_target_extracts_computes_the_token_scan(update_fn, operands, draw_fn, target):
+    """The gated delta rule's chunks, and the delta rule's correcting the state a token enters
+    (`delta_before`, a decay a head's or each key's: the WY system's decays a token back), derived under an
+    A10 (its step's latency unstated, so the token loop is priced at its work alone and extracted) and an
+    H100 (WY's): on par with the token scan, outputs and final state, against the float64 truth (check
+    1)."""
     with generation.assumed(target):
-        forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+        forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                            state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
-        assert_as_exact(jax.jit(gated_walk(forms, GATED)), jax.jit(gated_tokenwise(gated_delta)), gated_draw,
-                        f"gated delta on {target}", seeds=8)
+        assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(gated_tokenwise(update_fn)), draw_fn,
+                        f"{update_fn.__name__} on {target}", seeds=8)
 
 
 def test_a_scans_carry_derived_for_one_target_serves_no_other():
@@ -855,12 +959,16 @@ def test_a_walk_carries_its_state_in_one_dtype(dtype):
 
 
 def adjoint(forms, chunk_of_values, count: int):
-    """A loss's gradient through the derived forms: the chunks walked forward from a zero state (each
-    entering state kept), then back through each chunk's `backward`, the cotangents of the outputs and the
-    final state the loss's (`COTANGENT`, a fixed draw)."""
+    """A loss's gradient through the derived forms: the chunks walked forward from a zero state, or from
+    `values`' "h0" where given, whose cotangent it returns too (each entering state kept), then back through
+    each chunk's `backward`, the cotangents of the outputs and the final state the loss's (`COTANGENT`, a
+    fixed draw)."""
     def run(values, cotangents):
+        values = dict(values)
+        entering = values.pop("h0", None)
         d_outputs, d_final = cotangents
-        states = [forms.init({})]
+        init = forms.init({})
+        states = [init if entering is None else (init[0], entering)]
         for index in range(count):
             states.append(forms.step(states[-1], forms.prepare(chunk_of_values(values, index))))
         d_state, grads = d_final, []
@@ -870,8 +978,9 @@ def adjoint(forms, chunk_of_values, count: int):
                                               d_outputs[index * CHUNK:(index + 1) * CHUNK])
             grads.append(d_chunk)
         # A token operand's gradient each chunk's; a constant's (a rate, a skip) summed over them.
-        return {name: jnp.concatenate([grad[name] for grad in reversed(grads)]) if grads[0][name].ndim
-                else sum(grad[name] for grad in grads) for name in grads[0]}
+        found = {name: jnp.concatenate([grad[name] for grad in reversed(grads)]) if grads[0][name].ndim
+                 else sum(grad[name] for grad in grads) for name in grads[0]}
+        return found if entering is None else {**found, "h0": d_state}
 
     return run
 
@@ -951,11 +1060,9 @@ def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16,
                          reads: str = "after") -> None:
     """`forms`' chunk adjoint of the delta rule `update_fn`, on par with its token scan's, each token reading
     as `reads` (`gated_tokenwise`, `assert_adjoint`)."""
-    def chunked(values, index):
-        return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
-
-    assert_adjoint(forms, gated_tokenwise(update_fn, reads), ("q", "k", "v", "g", "beta"), chunked, draw_fn,
-                   ((TOKENS, VALUE), (KEY, VALUE)), label, seeds)
+    assert_adjoint(forms, gated_tokenwise(update_fn, reads), ("q", "k", "v", "g", "beta"),
+                   functools.partial(chunk_of, axes=GATED), draw_fn, ((TOKENS, VALUE), (KEY, VALUE)), label,
+                   seeds)
 
 
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
@@ -966,6 +1073,303 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
     forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                        state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
     assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint")
+
+
+def update_parts(update_fn, operands, readout_fn=gated_readout) -> linear_scan.Parts:
+    """`update_fn`'s token as the rules read it (`linear_scan.parts`, its readout `readout_fn`'s) over a chunk
+    of `operands`' shapes."""
+    declaration = scan.Scan(update_fn, readout_fn, operands, walked="time", state=((KEY, VALUE), jnp.float32))
+    widths = {"key": KEY, "value": VALUE}
+    shapes = {name: jax.ShapeDtypeStruct((CHUNK, *(widths[axis] for axis in axes[1:])), jnp.float32)
+              for name, axes in operands.items()}
+    names = tuple(declaration.operands)
+    return linear_scan.parts(scan._traced(declaration, update_fn, names, shapes),
+                             scan._traced(declaration, readout_fn, names, shapes), SATURATION)
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "before"), [
+    (delta_before, GATED, True), (delta_before, KIMI, True), (gated_delta_written_as_error, GATED, False),
+    (kimi_delta_written_as_error, KIMI, False)],
+    ids=["before, a head's decay", "before, a key's", "after, a head's", "after, a key's"])
+def test_a_corrections_read_before_or_after_its_decay_reaches_its_own_form(update_fn, operands, before):
+    """A delta rule's correction reading the state a token enters (`delta_before`) reaches the pre-decay
+    form (`linear_scan.Affine.corrected_before`), and one reading its decayed state the after-decay form
+    (`Affine.corrected`), neither the other's: a decay a head's commuting into the read, the after-decay
+    form priced first."""
+    assert update_parts(update_fn, operands).before == before
+
+
+PRE_DECAY = {
+    "rwkv7": (rwkv_erase, rwkv_readout, RWKV, RWKV_KEYED, rwkv_draw),
+    "delta_before": (delta_before, gated_readout, GATED, KIMI,
+                     lambda seed, per_key: (kimi_draw if per_key else gated_draw)(seed)),
+}
+"""The forms correcting the state a token enters: RWKV7's erase along its own vector (`rwkv_erase`, rank two,
+`linear_scan.Affine.erased_before`) and the delta rule's along its write's (`delta_before`, rank one,
+`Affine.corrected_before`), each its update, readout, operands (a head's decay, a key's) and draw."""
+
+
+def pre_decay(rule: str, per_key: bool):
+    """`rule`'s (`PRE_DECAY`) derived forms, operands, token scan from a state entering (`scanned`) and its
+    draw from one (`entering_of`)."""
+    update_fn, readout_fn, scalar, keyed, draw_fn = PRE_DECAY[rule]
+    operands = keyed if per_key else scalar
+    forms = scan.derive_scan(scan.Scan(update_fn, readout_fn, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    return forms, operands, scanned(update_fn, readout_fn), entering_of(draw_fn, per_key)
+
+
+def entering_of(draw_fn, per_key: bool):
+    """`draw_fn`'s operands (its log decays the fourth) and a state entering of unit normals, a decay
+    vanishing alone (`VANISHED`, one key's where `per_key`) at the second chunk's first token and at its
+    sub-chunk's start, and a gate saturated at a reset's exponent (`SATURATED`, no reset) inside it."""
+    def drawn(seed):
+        q, k, v, g, *rest = draw_fn(seed, per_key)
+        g = np.array(g)
+        for token, key, exponent in ((CHUNK, 0, VANISHED), (CHUNK + 5, 3, SATURATED),
+                                     (CHUNK + CHUNK // 2, KEY - 1, VANISHED)):
+            g[(token, key) if per_key else token] = exponent
+        h0 = np.random.default_rng([seed, 6755]).standard_normal((KEY, VALUE))
+        return q, k, v, jnp.asarray(g, jnp.float32), *rest, jnp.asarray(h0, jnp.float32)
+
+    return drawn
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "readout_fn", "erased"), [
+    (rwkv_erase, RWKV, rwkv_readout, True), (rwkv_erase, RWKV_KEYED, rwkv_readout, True),
+    (delta_before, GATED, gated_readout, False)],
+    ids=["an erase's own vector, a head's decay", "a key's", "the write's vector"])
+def test_an_erase_along_its_own_vector_reaches_the_rank_two_form(update_fn, operands, readout_fn, erased):
+    """RWKV7's token (`rwkv_erase`: an erase along its own vector beside the write) reaches the rank-two
+    pre-decay form (`linear_scan.Affine.erased_before`, `Parts.erase`), and a correction along the write's
+    own vector (`delta_before`) the shared form, neither the other's."""
+    parts = update_parts(update_fn, operands, readout_fn)
+    assert (parts.erase is not None, parts.before) == (erased, True)
+
+
+@pytest.mark.parametrize("target", ["sm86", "sm90"])
+@pytest.mark.parametrize("per_key", [False, True], ids=["a head's decay", "a key's"])
+def test_an_erase_along_its_own_vectors_chunks_compute_their_token_scan(per_key, target):
+    """RWKV7's token (`rwkv_erase`) walked in chunks through its rank-two form (one triangular system for its
+    erased values, its writes known), the dual form an H100's extraction takes and the token loop an A10's:
+    outputs and final state on par with the token scan's from float64 (check 1)."""
+    operands = RWKV_KEYED if per_key else RWKV
+    with generation.assumed(target):
+        forms = rwkv_forms(operands)
+        assert_as_exact(jax.jit(walked_of(forms, operands)), jax.jit(rwkv_tokenwise),
+                        functools.partial(rwkv_draw, per_key=per_key), f"rwkv7 on {target}", seeds=16)
+
+
+@pytest.mark.parametrize("per_key", [False, True], ids=["a head's decay", "a key's"])
+def test_an_erase_along_its_own_vectors_chunk_adjoint_is_the_token_scans_gradient(per_key):
+    """RWKV7's chunk adjoint (`backward`, its token update replayed: its erase and its write each its own
+    outer product), walked back: each token operand's gradient on par with the token scan's from float64
+    (check 1)."""
+    operands = RWKV_KEYED if per_key else RWKV
+    assert_adjoint(rwkv_forms(operands), rwkv_tokenwise, tuple(operands),
+                   functools.partial(chunk_of, axes=operands), functools.partial(rwkv_draw, per_key=per_key),
+                   ((TOKENS, VALUE), (KEY, VALUE)), "rwkv7 adjoint", 16)
+
+
+def pulled(run):
+    """`run`'s value and its gradient along every primal under the cotangents drawn after them (the drawn
+    operands, then the outputs' and the final state's cotangents)."""
+    def ran(*drawn):
+        value, pull = jax.vjp(run, *drawn[:-2])
+        return value, pull(drawn[-2:])
+
+    return ran
+
+
+def pushed(run):
+    """`run`'s value and its tangent along every primal (`jax.jvp`), the tangents drawn after them."""
+    def ran(*drawn):
+        half = len(drawn) // 2
+        return jax.jvp(run, drawn[:half], drawn[half:])
+
+    return ran
+
+
+@pytest.mark.parametrize("target", ["sm86", "sm90"])
+@pytest.mark.parametrize("per_key", [False, True], ids=["a head's decay", "a key's"])
+@pytest.mark.parametrize("rule", PRE_DECAY)
+def test_a_pre_decay_walk_from_a_state_entering_holds_its_token_scans_gradient(rule, per_key, target):
+    """Each form correcting the state a token enters (`PRE_DECAY`: RWKV7's rank-two erase, the delta rule's
+    rank-one correction), its chunks (the token loop an A10's extraction takes, the dual or WY form an
+    H100's) walked from a state entering, its decays vanishing alone and saturated at a reset's exponent
+    with no reset declared (`entering_of`), differentiated through the forms' own derivatives (the decays'
+    `_decays_backward`, the decays a token back transposed as their shift): outputs, final state and every
+    gradient, the entering state's among them, on par with the token scan's from float64 (check 1). A key
+    whose decay vanishes at the correcting token is read from the state it enters, as the recurrence reads
+    it: a declared document's start alone reads it zero."""
+    with generation.assumed(target):
+        forms, operands, tokenwise, drawn = pre_decay(rule, per_key)
+
+        def draws(seed):
+            return *drawn(seed), *cotangents_of(seed, (TOKENS, VALUE), (KEY, VALUE))
+
+        assert_as_exact(jax.jit(pulled(walked_of(forms, operands, entering=True))),
+                        jax.jit(pulled(tokenwise)), draws, f"{rule} entering on {target}", seeds=16)
+
+
+@pytest.mark.parametrize("per_key", [False, True], ids=["a head's decay", "a key's"])
+@pytest.mark.parametrize("rule", PRE_DECAY)
+def test_a_pre_decay_adjoint_from_a_state_entering_is_the_token_scans_gradient(rule, per_key):
+    """Each pre-decay form's chunk adjoint (`backward`, its token update replayed) walked back to a state
+    entering, its decays vanishing alone and saturated with no reset (`entering_of`): each token operand's
+    gradient and the entering state's on par with the token scan's from float64 (check 1)."""
+    forms, operands, tokenwise, drawn = pre_decay(rule, per_key)
+    assert_adjoint(forms, tokenwise, (*operands, "h0"), functools.partial(chunk_of, axes=operands), drawn,
+                   ((TOKENS, VALUE), (KEY, VALUE)), f"{rule} adjoint entering", 16)
+
+
+@pytest.mark.parametrize("per_key", [False, True], ids=["a head's decay", "a key's"])
+@pytest.mark.parametrize("rule", PRE_DECAY)
+def test_a_pre_decay_replay_takes_its_token_scans_tangent(rule, per_key):
+    """Each pre-decay form's token walk (`Derived.replay`) chunk by chunk from a state entering, as the
+    chunked op's walk takes its tangent at every order (`recurrence_chunk._walk`), its decays vanishing alone
+    and saturated with no reset (`entering_of`): outputs, final state and their tangent along every operand
+    on par with the token scan's from float64 (check 1)."""
+    forms, operands, tokenwise, drawn = pre_decay(rule, per_key)
+
+    def draws(seed):
+        primals = drawn(seed)
+        rng = np.random.default_rng([seed, 1])
+        return *primals, *(jnp.asarray(rng.standard_normal(x.shape), jnp.float32) for x in primals)
+
+    assert_as_exact(jax.jit(pushed(replayed_of(forms, operands))), jax.jit(pushed(tokenwise)), draws,
+                    f"{rule} replay tangent", seeds=16)
+
+
+def rwkv_values_readout(h, q, k, v, g, beta, a, c):
+    del k, v, g, beta, a, c
+    return h @ q
+
+
+@pytest.mark.parametrize("prepared", [True, False], ids=["prepared", "replayed"])
+@pytest.mark.parametrize("declared", [{"readout": rwkv_values_readout}, {"reads": "apart"}],
+                         ids=["a readout along the values", "a readout apart from its writes"])
+def test_an_erase_along_its_own_vector_beside_a_readout_no_form_takes_is_refused(declared, prepared):
+    """RWKV7's token beside a readout along the state's values (its query a value's) or apart from its
+    group's writes, which no chunk form takes: refused, named, whether a chunk is prepared or replayed
+    (`scan._apart`, which both ask), never computed by forms that do not hold it."""
+    operands = {**RWKV, "q": ("time", "value")} if "readout" in declared else RWKV
+    forms = scan.derive_scan(scan.Scan(rwkv_erase, declared.get("readout", rwkv_readout), operands,
+                                       walked="time", state=((KEY, VALUE), jnp.float32),
+                                       reads=declared.get("reads", "after")), saturation=SATURATION)
+    widths = {"key": KEY, "value": VALUE}
+    chunk = {name: jnp.zeros((CHUNK, *(widths[axis] for axis in axes[1:])), jnp.float32)
+             for name, axes in operands.items()}
+    with pytest.raises(scan.Refused):
+        if prepared:
+            forms.prepare(chunk)
+        else:
+            forms.replay(chunk, jnp.zeros((KEY, VALUE), jnp.float32))
+
+
+def rwkv_widened(h, q, k, v, g, beta, a, c):
+    """`rwkv_erase` erasing along `a` times a float64 vector it closes over (x64's): its erase part wider than
+    every operand."""
+    return rwkv_erase(h, q, k, v, g, beta, a * np.ones(KEY, np.float64), c)
+
+
+@pytest.mark.parametrize(("update_fn", "wide", "carried"), [
+    (rwkv_erase, "a", jnp.float64), (rwkv_widened, None, jnp.float64), (rwkv_erase, "q", jnp.float32)],
+    ids=["an erase vector given wide", "an erase part widened in the update", "a query given wide"])
+def test_a_pre_decay_walks_carry_follows_its_updates_parts(update_fn, wide, carried):
+    """RWKV7's token over float32 operands, its erase vector given in float64, or widened in its update by a
+    float64 vector it closes over, or its query given in float64 (x64's), walked by a token loop (an A10's,
+    its step unpriced, the extraction guarded) and replayed (`Derived.replay`): each carries its state in the
+    type its update's parts widen it to (`scan._carry_type`), float64 where its erase part is, float32 where
+    a readout's operand alone is, where the replay's carry typed by its state alone changed type mid-scan,
+    which `lax.scan` refuses."""
+    extents = linear_scan.Extents(CHUNK, KEY, VALUE, 1, before=True, erased=True)
+    with jax.enable_x64(new_val=True), generation.assumed("sm86"):
+        form = scan._form(extents, corrected=True, saturation=SATURATION)
+        assert linear_scan.looped((form.outputs, form.state))
+        forms = scan.derive_scan(scan.Scan(update_fn, rwkv_readout, RWKV, walked="time",
+                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+        drawn = dict(zip(RWKV, rwkv_draw(0), strict=True))
+        if wide is not None:
+            drawn[wide] = drawn[wide].astype(jnp.float64)
+        chunk = chunk_of(drawn, 0, RWKV)
+        looped = forms.step(forms.init({}), forms.prepare(chunk))[1]
+        _, replayed = forms.replay(chunk, jnp.zeros((KEY, VALUE), jnp.float32))
+    assert (looped.dtype, replayed.dtype) == (jnp.dtype(carried),) * 2
+
+
+def test_an_erases_document_after_a_nonfinite_one_is_its_own():
+    """RWKV7's tokens from a state entering of inf, a document starting at the fifth token (`Scan.reset`),
+    walked by a token loop (an A10's extraction) and replayed: the outputs from the start on and the final
+    state on par with the token scan's, which zeroes the state at the start, from float64 (check 1), where
+    the loop decayed the earlier document's state by its start's zero before selecting it out, `0 * inf`,
+    NaN in every later token."""
+    operands = {**RWKV, "first": ("time",)}
+    start = 5
+
+    def draw_inf(seed):
+        first = np.zeros(TOKENS, bool)
+        first[start] = True
+        return (*rwkv_draw(seed), jnp.asarray(first), jnp.full((KEY, VALUE), jnp.inf, jnp.float32))
+
+    def tokens(q, k, v, g, beta, a, c, first, h0):
+        def one(h, token):
+            *xs, first_t = token
+            h = rwkv_erase(jnp.where(first_t, jnp.zeros((), h.dtype), h), *xs)
+            return h, rwkv_readout(h, *xs)
+
+        final, outputs = jax.lax.scan(one, h0, (q, k, v, g, beta, a, c, first))
+        return outputs[start:], final
+
+    def later(run):
+        def ran(*xs):
+            outputs, final = run(*xs)
+            return outputs[start:], final
+
+        return ran
+
+    with generation.assumed("sm86"):
+        forms = rwkv_forms(operands, reset="first")
+        for arm, label in ((walked_of(forms, operands, entering=True), "loop"),
+                           (replayed_of(forms, operands), "replay")):
+            assert_as_exact(jax.jit(later(arm)), jax.jit(tokens), draw_inf, f"rwkv7 after inf, {label}",
+                            seeds=16)
+
+
+def values_readout(h, q, k, v, g, beta):
+    """A read of the state along its values, `h q`, its query a value's."""
+    del k, v, g, beta
+    return h @ q
+
+
+def valued(draw_fn):
+    """`draw_fn`'s operands, its queries along the state's values."""
+    def drawn(seed):
+        q = np.random.default_rng([seed, 2]).standard_normal((TOKENS, VALUE))
+        return jnp.asarray(q, jnp.float32), *draw_fn(seed)[1:]
+
+    return drawn
+
+
+@pytest.mark.parametrize(("operands", "draw_fn", "along"), [
+    (GATED, gated_draw, "keys"), (KIMI, kimi_draw, "keys"), (GATED, gated_draw, "values")],
+    ids=["a head's decay", "a key's", "a head's decay, read along the values"])
+def test_a_pre_decay_corrections_chunk_adjoint_is_the_token_scans_gradient(operands, draw_fn, along):
+    """The pre-decay delta rule (`delta_before`), its state read along its keys or its values
+    (`values_readout`, the replay's read of its whole state): its chunks' outputs and final state and its
+    chunk adjoint's (`backward`, its token update replayed, its correction read before the decay) each token
+    operand's gradient on par with the token scan's from float64 (check 1), its decays' through the shifted
+    parts' rows."""
+    readout_fn, draw_fn = (gated_readout, draw_fn) if along == "keys" else (values_readout, valued(draw_fn))
+    operands = operands if along == "keys" else {**operands, "q": ("time", "value")}
+    forms = scan.derive_scan(scan.Scan(delta_before, readout_fn, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    tokenwise = gated_tokenwise(delta_before, readout_fn=readout_fn)
+    assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(tokenwise), draw_fn,
+                    f"delta_before along its {along}", seeds=16)
+    assert_adjoint(forms, tokenwise, ("q", "k", "v", "g", "beta"), functools.partial(chunk_of, axes=operands),
+                   draw_fn, ((TOKENS, VALUE if along == "keys" else KEY), (KEY, VALUE)),
+                   f"delta_before adjoint along its {along}", 16)
 
 
 def kimi_draw_float16(seed):
@@ -983,10 +1387,16 @@ RESETTING = {
     "kimi_delta": (kimi_delta, gated_readout, KIMI, (KEY, VALUE), kimi_draw, tuple(GATED), {}),
     "kimi_delta_float16": (kimi_delta, gated_readout, KIMI, (KEY, VALUE), kimi_draw_float16, tuple(GATED),
                            {}),
+    "delta_before": (delta_before, gated_readout, GATED, (KEY, VALUE), gated_draw, tuple(GATED), {}),
+    "delta_before_per_key": (delta_before, gated_readout, KIMI, (KEY, VALUE), kimi_draw, tuple(GATED), {}),
+    "rwkv7": (rwkv_erase, rwkv_readout, RWKV, (KEY, VALUE), rwkv_draw, tuple(RWKV), {}),
+    "rwkv7_per_key": (rwkv_erase, rwkv_readout, RWKV_KEYED, (KEY, VALUE),
+                      functools.partial(rwkv_draw, per_key=True), tuple(RWKV), {}),
 }
 """Each rule a reset walk is derived for: its update and readout, operands, state, draw, token operands and
 constants. A decay in base 2, and exponents in float16, whose partials' sum of several resets passes its
-largest."""
+largest; corrections reading the state a token enters (`delta_before`), a reset's zero, through the decays
+a token back."""
 
 
 READING = {"after": "", "before": ", reading the state entering each token",
@@ -1168,8 +1578,10 @@ def test_a_derived_chunk_computes_what_its_token_update_states(update, dtype):
         np.testing.assert_array_equal(np.asarray(outputs), np.asarray(declared_outputs))
 
 
-@pytest.mark.parametrize("reverse", [False, True], ids=["prefixes", "suffixes"])
-def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_segments_exact_sum(reverse):
+@pytest.mark.parametrize(("reverse", "chunk"), [(False, None), (True, None), (False, 24)],
+                         ids=["prefixes", "suffixes", "prefixes walked in chunks"])
+def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_segments_exact_sum(reverse,
+                                                                                                  chunk):
     """`scan.compensated` over double floats (`low` each value's low part) along a later axis, restarting
     at each segment's first: each prefix's pair, and each suffix's where `reverse`, is its segment's exact
     sum, the high half that sum rounded once (a suffix's within its segment to its last element, where a
@@ -1177,7 +1589,9 @@ def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_
     not [3, 2, 7, 4]: the base review of row 7432's head). Whole numbers with low parts in multiples of
     2^-30 keep every pair's arithmetic exact, so the pairs equal float64's sums, where a plain fp32 sum drops
     every low part. Each value a double float as an
-    exact product leaves it, its low part within half its high part's ulp (none beside a zero)."""
+    exact product leaves it, its low part within half its high part's ulp (none beside a zero). Walked in
+    chunks of 24 (`chunk`, Mamba-3's frames' walk), the axis of 64 padded to three, a segment crossing a
+    chunk's edge sums the same."""
     rng = np.random.default_rng(7432)
     shape = (2, 64, 3)
     high = rng.integers(-8, 9, shape).astype(np.float32)
@@ -1185,8 +1599,8 @@ def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_
     restarts = rng.random(shape[:2]) < 0.1
     restarts[:, 0] = True
     restarts = np.broadcast_to(restarts[:, :, None], shape)
-    summed_high, summed_low = jax.jit(functools.partial(scan.compensated, axis=1, reverse=reverse))(
-        high, low=low, restarts=restarts)
+    summed_high, summed_low = jax.jit(functools.partial(scan.compensated, axis=1, reverse=reverse,
+                                                        chunk=chunk))(high, low=low, restarts=restarts)
     exact, steps = np.zeros(shape), shape[1]
     for t in reversed(range(steps)) if reverse else range(steps):
         # The sum beside `t` so far, its segment's where `t` opens none: a prefix's where `t` starts no
@@ -1200,7 +1614,7 @@ def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_
     np.testing.assert_array_equal(np.asarray(summed_high), exact.astype(np.float32))
     # An empty axis scans to empty sums either way (the review: a reverse scan's restarts shifted along it).
     empty = np.zeros((2, 0, 3), np.float32)
-    assert [x.shape for x in scan.compensated(empty, axis=1, reverse=reverse,
+    assert [x.shape for x in scan.compensated(empty, axis=1, reverse=reverse, chunk=chunk,
                                               restarts=np.zeros(empty.shape, bool))] == [empty.shape] * 2
 
 
@@ -1232,3 +1646,351 @@ def test_a_delta_rule_reading_apart_from_its_own_write_reads_its_decayed_enterin
     grouped = scan.derive_scan(dataclasses.replace(declared, group=2), saturation=SATURATION)
     with pytest.raises(scan.Refused):
         gated_walk(grouped, operands)(*draw_fn(0))
+
+
+def two_sided(h, q, k, v, g, e, beta, exponential=jnp.exp):
+    """Two-sided GLA's token: the state decayed along its keys and its values, `exp(g)` each key's and
+    `exp(e)` each value's, then written, `h = diag(exp(g)) h diag(exp(e)) + beta k v^T`; its decays
+    `exponential`'s (`jnp.exp2`: in base 2, exact at integer exponents)."""
+    del q
+    return exponential(g)[:, None] * h * exponential(e)[None, :] + beta * k[:, None] * v[None, :]
+
+
+def two_sided_readout(h, q, k, v, g, e, beta):
+    del k, v, g, e, beta
+    return (q @ h) * KEY ** -0.5
+
+
+TWO_SIDED = {**{name: KIMI[name] for name in ("q", "k", "v", "g")}, "e": ("time", "value"), "beta": ("time",)}
+"""Its operands in its update's order, as its draw gives them."""
+
+
+def two_sided_draw(seed, steep: bool = False):
+    """`kimi_draw`'s, each value's decay its own beside each key's, down to 1e-3 a token, or `steep`, its
+    values' decays of `exp(-30)` to `exp(-60)` a token at every eighth token (a chunk's span past fp32's
+    exponents), and a state entering of entries about 0.3."""
+    q, k, v, g, beta = kimi_draw(seed)
+    rng = np.random.default_rng(seed + 2)
+    e = -(10.0 ** rng.uniform(-3, 0, (TOKENS, VALUE)))
+    if steep:
+        e[::8] = -rng.uniform(30, 60, (TOKENS // 8, VALUE))
+    h0 = 0.3 * rng.standard_normal((KEY, VALUE))
+    return q, k, v, g, jnp.asarray(e, jnp.float32), beta, jnp.asarray(h0, jnp.float32)
+
+
+def two_sided_tokenwise(q, k, v, g, e, beta, h0):
+    def one(h, token):
+        h = two_sided(h, *token)
+        return h, two_sided_readout(h, *token)
+
+    final, outputs = jax.lax.scan(one, h0, (q, k, v, g, e, beta))
+    return outputs, final
+
+
+TWO_SIDED_FORMS = scan.Scan(two_sided, two_sided_readout, TWO_SIDED, walked="time",
+                            state=((KEY, VALUE), jnp.float32))
+
+ALGORITHMS = {"sm90": False, "sm86": True}
+"""The targets each two-sided form is derived under and whether its extraction takes the token loop: an
+H100's step latency prices its loop past the dual form, an A10's states none, its loop priced at its work."""
+
+
+def two_sided_forms(target: str):
+    """Two-sided GLA's forms derived under `target`, its extraction the algorithm `ALGORITHMS` names (a
+    guard: a test of both forms that ran one twice would hold neither)."""
+    extents = linear_scan.Extents(CHUNK, KEY, VALUE, KEY, across=True)
+    form = scan._form(extents, corrected=False, saturation=SATURATION)
+    assert linear_scan.looped((form.outputs, form.state)) == ALGORITHMS[target]
+    return scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
+
+
+def two_sided_walked(forms, q, k, v, g, e, beta, h0):
+    """`forms`' chunks walked from `h0`: the outputs and the final state."""
+    values = {"q": q, "k": k, "v": v, "g": g, "e": e, "beta": beta}
+    init = forms.init({})
+    outputs, state = walk(forms, values, range(TOKENS // CHUNK), (init[0], h0), TWO_SIDED)
+    return jnp.concatenate(outputs), forms.finish(state, values)
+
+
+@pytest.mark.parametrize("target", list(ALGORITHMS))
+@pytest.mark.parametrize("steep", [False, True], ids=["mild", "steep values"])
+def test_a_two_sided_decays_chunks_compute_their_token_scan(target, steep):
+    """Two-sided GLA (`two_sided`: a decay along the state's keys and its values) walked in chunks from a
+    state entering through its derived forms, the dual form and the token loop (`ALGORITHMS`): outputs and
+    final state on par with the token scan's from float64 (check 1), its values' decays mild or steep past
+    fp32's exponents across a chunk."""
+    with generation.assumed(target):
+        forms = two_sided_forms(target)
+        assert_as_exact(jax.jit(functools.partial(two_sided_walked, forms)), jax.jit(two_sided_tokenwise),
+                        functools.partial(two_sided_draw, steep=steep), f"two-sided on {target}", seeds=16)
+
+
+@pytest.mark.parametrize("target", list(ALGORITHMS))
+@pytest.mark.parametrize("steep", [False, True], ids=["mild", "steep values"])
+def test_a_two_sided_decays_chunk_adjoint_is_the_token_scans_gradient(target, steep):
+    """Two-sided GLA's chunk adjoint (`backward`, its token update replayed) walked back from the states
+    each form's walk entered (`ALGORITHMS`): each token operand's gradient, its values' decays' among them,
+    and the entering state's, on par with the token scan's from float64 (check 1)."""
+    with generation.assumed(target):
+        forms = two_sided_forms(target)
+        sliced = functools.partial(chunk_of, axes=TWO_SIDED)
+        assert_adjoint(forms, two_sided_tokenwise, (*TWO_SIDED, "h0"), sliced,
+                       functools.partial(two_sided_draw, steep=steep), ((TOKENS, VALUE), (KEY, VALUE)),
+                       f"two-sided adjoint on {target}")
+
+
+def gla(h, q, k, v, g, beta):
+    """GLA's token: the state decayed along its keys alone, then written."""
+    del q
+    return jnp.exp(g)[:, None] * h + beta * k[:, None] * v[None, :]
+
+
+def test_two_sided_and_one_sided_walks_merged_in_either_grouping_give_the_final_state():
+    """Three walks merged in either grouping, `(a b) c` and `a (b c)`: two-sided GLA's first chunk from the
+    state entering (`a`), its next two from a one-sided walk's start (`b`: a walk that decays no values
+    stepped through chunks that do), and GLA's last chunk (`c`, one-sided, its walk's decay along the values
+    none): the final state on par with the token scan's whose last chunk's value gates are the identity's
+    from float64 (check 1), each walk's decay along the values summed, a walk of none the zero sum's."""
+    two_sided = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
+    one_sided = scan.derive_scan(scan.Scan(gla, gated_readout, KIMI, walked="time",
+                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    last = TOKENS // CHUNK - 1
+
+    def merged(q, k, v, g, e, beta, h0):
+        values = {"q": q, "k": k, "v": v, "g": g, "e": e, "beta": beta}
+        plain = {name: value for name, value in values.items() if name != "e"}
+        start = one_sided.init(chunk_of(plain, 0, KIMI))
+        a = walk(two_sided, values, range(1), two_sided.init(chunk_of(values, 0, TWO_SIDED))._replace(h=h0),
+                 TWO_SIDED)[1]
+        b = walk(two_sided, values, range(1, last), start, TWO_SIDED)[1]
+        c = walk(one_sided, plain, range(last, last + 1), start, KIMI)[1]
+        return (two_sided.finish(two_sided.merge(two_sided.merge(a, b, values), c, values), values),
+                two_sided.finish(two_sided.merge(a, two_sided.merge(b, c, values), values), values))
+
+    def twice(q, k, v, g, e, beta, h0):
+        final = two_sided_tokenwise(q, k, v, g, e.at[last * CHUNK:].set(0.0), beta, h0)[1]
+        return final, final
+
+    assert_as_exact(jax.jit(merged), jax.jit(twice), two_sided_draw, "two-sided and one-sided merged",
+                    seeds=16)
+
+
+def plain_readout(h, q, k, v, g, e, beta):
+    del k, v, g, e, beta
+    return q @ h
+
+
+def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are_summed():
+    """Two-sided GLA's dual form (an H100's), two writes of a key of 2^63 and a unit value before a
+    sub-chunk's reference (`recurrence_algebra.SUB`) read by a query of 2^64 after it, the value's gate 1/4
+    at the reference's next token: the reader's output 2^126 exactly, the token scan's (its every term
+    normal), each pair's read of 2^127 decayed before the pairs are summed, where summed first they passed
+    float32's largest (row 9029's head review)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    def at(shape, *entries):
+        x = np.zeros(shape, np.float32)
+        for index, value in entries:
+            x[index] = value
+        return jnp.asarray(x)
+
+    reader = SUB + 1
+    values = {"q": at((CHUNK, KEY), ((reader, 0), 2.0 ** 64)),
+              "k": at((CHUNK, KEY), ((0, 0), 2.0 ** 63), ((1, 0), 2.0 ** 63)),
+              "v": at((CHUNK, VALUE), ((0, 0), 1.0), ((1, 0), 1.0)), "g": jnp.zeros((CHUNK, KEY)),
+              "e": at((CHUNK, VALUE), ((SUB, 0), -2.0)), "beta": jnp.ones((CHUNK,))}
+    with generation.assumed("sm90"):
+        update = functools.partial(two_sided, exponential=jnp.exp2)
+        base2 = dataclasses.replace(TWO_SIDED_FORMS, update=update, readout=plain_readout)
+        forms = scan.derive_scan(base2, saturation=SATURATION)
+        outputs = forms.mapped(forms.prepare(values), forms.init({}))
+    assert float(outputs[reader, 0]) == 2.0 ** 126
+
+
+def isolated_draw(seed: int, side: str, merged: bool = False):
+    """Two-sided GLA's operands of one write of about 2^100 (its key's where `side` is "keys", its value's
+    where "values") and three gates of -39 to -41 on that side after it, every other write none and every
+    other decay at most 1e-2 a token: the write decayed to about `e^-51`, normal, as the token scan keeps it,
+    where each gate's span past the write alone is past fp32's least normal (row 9660). The gated side's
+    exponents multiples of 2^-10, so every span's sum is exact in fp32 and the decays' own rounding (an
+    exponent of -120 rounded, `|x|` ulps of its decay) is no part of the witness. The write in chunk 1 and its
+    readers in the chunks after it, or where `merged`, the write the first half's last token and its gates
+    the second half's first tokens."""
+    rng = np.random.default_rng([9660, seed])
+    write = TOKENS // 2 - 1 if merged else CHUNK + int(rng.integers(0, CHUNK - 4))
+    large, unit = 2.0 ** 100 * rng.uniform(1, 2), rng.uniform(1, 2)
+    k, v = np.zeros((TOKENS, KEY)), np.zeros((TOKENS, VALUE))
+    k[write, 0], v[write, 0] = (large, unit) if side == "keys" else (unit, large)
+    g, e = -rng.uniform(0, 1e-2, (TOKENS, KEY)), -rng.uniform(0, 1e-2, (TOKENS, VALUE))
+    gated = g if side == "keys" else e
+    gated[:] = np.round(gated * 1024) / 1024
+    gated[write + 1:write + 4] = -rng.integers(39, 42, (3, gated.shape[1]))
+    q = rng.standard_normal((TOKENS, KEY))
+    q[:(write // CHUNK + 1) * CHUNK] = 0.0
+    drawn = (q, k, v, g, e, np.ones(TOKENS), np.zeros((KEY, VALUE)))
+    return tuple(jnp.asarray(x, jnp.float32) for x in drawn)
+
+
+@pytest.mark.parametrize("target", list(ALGORITHMS))
+@pytest.mark.parametrize("side", ["keys", "values"])
+def test_a_large_write_through_gates_past_the_least_normal_is_kept(target, side):
+    """Two-sided GLA's forms (`ALGORITHMS`) over one write of 2^100 decayed by three gates of -40 on its key's
+    or its value's side (`isolated_draw`): outputs of its readers in later chunks and the final state on par
+    with the token scan's from float64 (check 1), each decay a value takes alone applied as two normal
+    factors in turn (`scan._Split`), where its span's decay alone (`e^-120`) underflowed to zero (row
+    9660)."""
+    with generation.assumed(target):
+        forms = two_sided_forms(target)
+        assert_as_exact(jax.jit(functools.partial(two_sided_walked, forms)), jax.jit(two_sided_tokenwise),
+                        functools.partial(isolated_draw, side=side), f"a large write's {side} on {target}",
+                        seeds=16)
+
+
+@pytest.mark.parametrize("side", ["keys", "values"])
+def test_a_large_write_through_a_later_walks_gates_is_kept_by_the_merge(side):
+    """Two-sided GLA's tokens walked in two halves, a write of 2^100 the first's last token and three gates
+    of -40 on its key's or its value's side the second's first (`isolated_draw`), merged: the final state on
+    par with the token scan's from float64 (check 1), the later walk's decay of `e^-120` applied as two
+    normal factors in turn, where a floor at the vanished exponent (-105) zeroed it (row 9660)."""
+    forms = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
+    half = TOKENS // CHUNK // 2
+
+    def merged(q, k, v, g, e, beta, h0):
+        values = {"q": q, "k": k, "v": v, "g": g, "e": e, "beta": beta}
+        init = forms.init(chunk_of(values, 0, TWO_SIDED))
+        a, b = (walk(forms, values, chunks, init._replace(h=h0) if not chunks.start else init, TWO_SIDED)[1]
+                for chunks in (range(half), range(half, 2 * half)))
+        return forms.finish(forms.merge(a, b, values), values)
+
+    assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: two_sided_tokenwise(*xs)[1]),
+                    functools.partial(isolated_draw, side=side, merged=True),
+                    f"a large write's {side} merged", seeds=16)
+
+
+def scalar_gla(h, q, k, v, g, beta):
+    """GLA's token under a decay a head's: the state decayed by `exp(g)`, then written."""
+    del q
+    return jnp.exp(g) * h + beta * k[:, None] * v[None, :]
+
+
+def steep_last_draw(seed: int):
+    """`scalar_gla`'s operands and a state entering of about 2^90 (within 2^96 of its values of about one,
+    row 2344's range): the last chunk no write and three gates of -39 to -41 at its second to fourth tokens,
+    so its readers after them read the state through a span past fp32's least normal (`e^-120`), about
+    2^-83, normal, and the chunk leaves it so. Its exponents multiples of 2^-10, every span's sum exact in
+    fp32 (row 9667's rounding none of the witness)."""
+    rng = np.random.default_rng([9660, seed, 2])
+    last = TOKENS - CHUNK
+    k = rng.standard_normal((TOKENS, KEY))
+    g = -np.round(rng.uniform(0, 1e-2, TOKENS) * 1024) / 1024
+    g[last + 1:last + 4] = -rng.integers(39, 42, 3)
+    beta = rng.uniform(0.05, 0.95, TOKENS)
+    beta[last:] = 0.0
+    drawn = (rng.standard_normal((TOKENS, KEY)), k / np.linalg.norm(k, axis=-1, keepdims=True),
+             rng.standard_normal((TOKENS, VALUE)), g, beta, 2.0 ** 90 * rng.standard_normal((KEY, VALUE)))
+    return tuple(jnp.asarray(x, jnp.float32) for x in drawn)
+
+
+def late_reads(run):
+    """`run`'s outputs of the last chunk's readers after its gates and its final state, their tangent along
+    every operand (`jax.jvp`) and their gradient by the log decays (`jax.vjp`): the split decays' own
+    (`scan._split_term`). A reader's gradient by its query, its cotangent times the decay before the state it
+    reads, is a product's range, fla's (row 2344)."""
+    def late(*primals):
+        outputs, final = run(*primals)
+        return outputs[TOKENS - CHUNK + 4:], final
+
+    def ran(*primals):
+        value, pull = jax.vjp(late, *primals)
+        tangents = tuple(jnp.full_like(x, 1e-2) for x in primals)
+        decays = pull(tuple(map(jnp.ones_like, value)))[3]
+        return {"late": value[0], "final": value[1], "decays' gradient": decays,
+                "tangent": jax.jvp(late, primals, tangents)[1]}
+
+    return ran
+
+
+def test_a_steep_chunks_split_decays_keep_the_state_it_enters_and_leaves():
+    """GLA under a decay a head's (`scalar_gla`), its dual form (an H100's), the state entering its last chunk
+    about 2^90 and that chunk's three gates of -40 (`steep_last_draw`): its readers after the gates (through
+    `entering`) and the state it leaves (through `whole`), their tangent and their gradient by the decays
+    through the forms' own derivatives (`late_reads`), on par with the token scan's from float64 (check 1),
+    each standalone decay (`e^-120`) taken as two normal factors (`scan._Split`), where whole it underflowed
+    to zero and read the state as none (row 9660)."""
+    declared = scan.Scan(scalar_gla, gated_readout, GATED, walked="time", state=((KEY, VALUE), jnp.float32))
+
+    def tokenwise(q, k, v, g, beta, h0):
+        def one(h, token):
+            h = scalar_gla(h, *token)
+            return h, gated_readout(h, *token)
+
+        final, outputs = jax.lax.scan(one, h0, (q, k, v, g, beta))
+        return outputs, final
+
+    with generation.assumed("sm90"):
+        forms = scan.derive_scan(declared, saturation=SATURATION)
+
+        def walked(q, k, v, g, beta, h0):
+            values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+            outputs, state = walk(forms, values, range(TOKENS // CHUNK), (forms.init({})[0], h0), GATED)
+            return jnp.concatenate(outputs), forms.finish(state, values)
+
+        assert_as_exact(jax.jit(late_reads(walked)), jax.jit(late_reads(tokenwise)), steep_last_draw,
+                        "a steep last chunk's split decays", seeds=16)
+
+
+@pytest.mark.parametrize(("update_fn", "operands"), [(scalar_gla, GATED), (gla, KIMI)],
+                         ids=["a decay a head's", "a decay a key's"])
+def test_a_nan_key_reads_nan_through_a_decay_that_underflows(update_fn, operands):
+    """GLA's dual form (an H100's) over one chunk whose every log decay is -80, so the span from token 0 to
+    token 2 underflows to a live zero, and whose first key is NaN: token 2 reads NaN, as the recurrence does
+    (its state NaN from token 0 on), the pair kept where only a crossed decay (`scan._crossed`'s negative
+    zero) drops one, never one that underflows (row 8808: a pair dropped on any zero read finite)."""
+    declared = scan.Scan(update_fn, gated_readout, operands, walked="time", state=((KEY, VALUE), jnp.float32))
+    rng = np.random.default_rng(8808)
+    keys = rng.standard_normal((CHUNK, KEY))
+    keys[0] = np.nan
+    values = {"q": jnp.asarray(rng.standard_normal((CHUNK, KEY)), jnp.float32),
+              "k": jnp.asarray(keys, jnp.float32),
+              "v": jnp.asarray(rng.standard_normal((CHUNK, VALUE)), jnp.float32),
+              "g": jnp.full((CHUNK,) + (() if operands is GATED else (KEY,)), -80.0, jnp.float32),
+              "beta": jnp.full((CHUNK,), 0.5, jnp.float32)}
+    with generation.assumed("sm90"):
+        forms = scan.derive_scan(declared, saturation=SATURATION)
+        outputs = forms.mapped(forms.prepare(values), forms.init({}))
+    assert np.isnan(np.asarray(outputs[2])).all()
+
+
+def corrected_two_sided(h, q, k, v, g, e, beta):
+    """A two-sided decay beside the delta rule's correction, which no chunk form takes."""
+    del q
+    decayed = jnp.exp(g)[:, None] * h * jnp.exp(e)[None, :]
+    return decayed + beta * k[:, None] * (v - k @ decayed)[None, :]
+
+
+def two_sided_values_read(h, q, k, v, g, e, beta):
+    del k, v, g, e, beta
+    return h @ q
+
+
+APART = dataclasses.replace(TWO_SIDED_FORMS, reads="apart")
+"""Two-sided GLA read apart from its own write, which no form takes."""
+
+
+@pytest.mark.parametrize(("declared", "path"), [
+    (APART, "prepare"), (APART, "replay"),
+    (dataclasses.replace(TWO_SIDED_FORMS, update=corrected_two_sided), "prepare"),
+    (dataclasses.replace(TWO_SIDED_FORMS, readout=two_sided_values_read,
+                         operands={**TWO_SIDED, "q": ("time", "value")}), "prepare")],
+    ids=["apart, prepared", "apart, replayed", "corrected", "read along the values"])
+def test_a_two_sided_decay_outside_its_forms_is_refused(declared, path):
+    """A decay along the state's values beside a readout apart from its group's writes, prepared or replayed,
+    beside the delta rule's correction, or beside a readout along the values: refused (`scan.Refused`)."""
+    q, k, v, g, e, beta, h0 = two_sided_draw(0)
+    values = {"q": q, "k": k, "v": v, "g": g, "e": e, "beta": beta}
+    if "q" in declared.operands and declared.operands["q"][1:] == ("value",):
+        values["q"] = v
+    chunk = chunk_of(values, 0, TWO_SIDED)
+    forms = scan.derive_scan(declared, saturation=SATURATION)
+    with pytest.raises(scan.Refused):
+        forms.prepare(chunk) if path == "prepare" else forms.replay(chunk, h0)

@@ -78,13 +78,13 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes each
     sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
     dtype = jnp.dtype(dtype)
-    if dtype == jnp.float32 and not rounded:
+    if per_key and dtype == jnp.float32 and not rounded:
         return False
     if delta:
         return True
     if per_key or dtype == jnp.float16:
         return False
-    return rounded or not wide
+    return rounded or dtype == jnp.float32 or not wide
 
 
 class Kept(NamedTuple):
@@ -104,7 +104,8 @@ class Kept(NamedTuple):
     dh0: jax.Array
     """`_reverse`'s gradient of the initial memory."""
     ds: jax.Array
-    """`_scores_back`'s scores' gradient."""
+    """The scores' gradient in `_score_grads`' form: `_scores_back`'s, a key head's group summed after it
+    (`_grouped_scores`)."""
     decay_pairs: jax.Array
     """`_scores_back`'s decay pair terms."""
     dq: jax.Array
@@ -135,7 +136,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   max_segments: int | None = None, scale: float | None = None,
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True,
-                  rounded: bool = False, apart: int = 0, ranged: bool = False,
+                  rounded: bool = False, apart: int = 0, values_gated: bool = False,
+                  unit_keys: bool = False, ranged: bool = False,
                   skip=None,
                   forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
@@ -159,12 +161,13 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     (`_tabled_gradients`, `_entered_gradient`), None for another."""
     dtype = jnp.result_type(q, k, v)
     if not fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=jnp.dtype(do.dtype) != dtype):
-        raise NotImplementedError("the fast backward takes the delta rule, or a bf16 call without it and a "
-                                  "decay a head (its output's gradient bf16 where it is not rounded), an "
-                                  "fp32 call's under the run's fast forms alone")
+        raise NotImplementedError("the fast backward takes the delta rule (under a decay a key dimension "
+                                  "not in fp32 three-part form), or a bf16 or fp32 call without it and a "
+                                  "decay a head (a bf16 call's output gradient bf16 where not rounded)")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, rounded=rounded, apart=apart, ranged=ranged, forked=forked,
+                   firsts=firsts, rounded=rounded, apart=apart, values_gated=values_gated,
+                   unit_keys=unit_keys, ranged=ranged, forked=forked,
                    skipped=skip is not None)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
@@ -186,8 +189,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                                     scale=run.scale, skip=skip if gates else None, table=run.table)
     taken = gated.pop() if run.table is not None else None
     ds, decay_pairs = _scores_back(run.q, run.k, run.corrected, laid_do, run.hi, run.lo, run.taken, run.beta,
-                                   call,
-                                   scale=run.scale)
+                                   call, scale=run.scale)
+    ds = _grouped_scores(ds, call)
     dq, dk, dw, after, leaving, memory = _query_key(run.q, run.k, run.corrected, laid_do, dv2, run.h, dh, ds,
                                                     run.hi, run.lo, run.taken, run.beta, call,
                                                     scale=run.scale)
@@ -238,12 +241,11 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
 
 def _taken_up(run, taken):
     """The gradient of the memory each chunk takes up (`taken`, the reverse walk's, `[chunks * HV * Dk, Dv]`),
-    `[B, NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
+    `[NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
     call, table = run.call, run.table
-    taking = (table.loads >= 0).reshape(run.batch, -1)
     taken = taken[table.pad:taken.shape[0] - table.pad]
-    taken = taken.reshape(*taking.shape, call.heads, call.width, call.value_width)
-    return jnp.where(taking[..., None, None, None], taken, 0.0)
+    taken = taken.reshape(-1, call.heads, call.width, call.value_width)
+    return jnp.where((table.loads >= 0)[:, None, None, None], taken, 0.0)
 
 
 def _turned_back(run, taken):
@@ -252,8 +254,8 @@ def _turned_back(run, taken):
     table = run.table
     if table.turning is None:
         return taken
-    rows, after, before = (part.reshape(*taken.shape[:3], -1)[..., None] for part in table.turning)
-    shifted = jnp.pad(taken, ((0, 0),) * 3 + ((1, 1), (0, 0)))
+    rows, after, before = (part.reshape(*taken.shape[:2], -1)[..., None] for part in table.turning)
+    shifted = jnp.pad(taken, ((0, 0),) * 2 + ((1, 1), (0, 0)))
     return rows * taken - after * shifted[..., 2:, :] - before * shifted[..., :-2, :]
 
 
@@ -264,15 +266,20 @@ def _tabled_gradients(run, grads: tuple, taken) -> tuple:
     if taken is None:
         return grads
     table = run.table
-    loads = table.loads.reshape(run.batch, -1)
-    slots = jnp.arange(1, table.count + 1)
-    given = jnp.einsum("bcs,bchkv->bshkv", (loads[..., None] == slots).astype(jnp.float32),
-                       _turned_back(run, _taken_up(run, taken)))
+    # Each chunk taking a given slot up adds to its row's slot (a stored slot's, its storing chunk's walk),
+    # its gradient turned back into the slot's frame where the call turns it (`_turned_back`); a slot a chunk
+    # adds (`Table.adds`) takes the same gradient as the one it loads.
+    returned = _turned_back(run, _taken_up(run, taken))
+    given = jnp.zeros((run.batch, table.count, *returned.shape[1:]), jnp.float32)
+    for slots in (table.loads, *(() if table.adds is None else (table.adds,))):
+        given_slot = (slots > 0) & (slots <= table.count)
+        given = given.at[table.rows, jnp.clip(slots - 1, 0, table.count - 1)].add(
+            jnp.where(given_slot[:, None, None, None], returned, 0.0), mode="drop")
     return (*grads[:5], given[..., :run.key_width, :run.value_width])
 
 
 def _entered_gradient(run, taken):
-    """A forked call's entry write's gradient `[B, NC, HV, Dk, Dv]` (`chunk_forward.ForkedTable.entries`): the
+    """A forked call's entry write's gradient `[NC, HV, Dk, Dv]` (`chunk_forward.ForkedTable.entries`): the
     memory's each chunk takes up, which its entry write adds to; None where the call gives none."""
     if taken is None or run.table.entries is None:
         return None
@@ -761,7 +768,7 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
     the group's `i`-th value head's values, output gradient and corrected values' gradient (`served`) at
     its columns, its entered memory and leaving memory's gradient (`memory`) a head's rows apart, and its
     scores' gradient (`scores`: the ref and the key head; without the delta rule each step the key head's,
-    summed over its value heads, `_scores_back`); of each value head's columns the `split`-th `vq` (all of
+    summed over its value heads, `_grouped_scores`); of each value head's columns the `split`-th `vq` (all of
     them where None, `_query_key_split`)."""
     width, value_width, group = call.width, call.value_width, call.group
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
@@ -924,7 +931,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     weights), after, leaving [blocks, HV, R], memory
     [blocks, HV, chunks * block] fp32)`: each chunk's and key block's queries', keys' and weights' gradients
     (fla's dqkwg's memory products, `algebra.memory_gradients`, given the scores' gradient `ds` in
-    `_score_grads`' form, `_scores_back`'s: `[R, HV * C]` with the delta rule, each step's value head's
+    `_score_grads`' form, `_grouped_scores`': `[R, HV * C]` with the delta rule, each step's value head's
     product; without it `[R, H * C]`, the key head's, its products the first step's alone), a program a key
     head's and a step each value head it serves,
     the queries' and keys' summed over them in fp32 where they leave (each program's own tiles: a register
@@ -952,9 +959,9 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         row, span, last = n * chunk, pl.ds(n * chunk, chunk), n * chunk + chunk - 1
         key_columns = keyed * width + c * call.block
         first = keyed * group
-        views = _query_key_views(call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row,
-                                 key_columns=key_columns, first=first, chunk=n, block=c, split=split, vq=vq,
-                                 scores=(ds_ref, keyed))
+        views, once = _walked_once(call, _query_key_views(
+            call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row, key_columns=key_columns,
+            first=first, chunk=n, block=c, split=split, vq=vq, scores=(ds_ref, keyed)))
 
         def step(index, slots, carry, accumulators, *, scores: bool = True):
             h = first + index
@@ -1016,9 +1023,10 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
 
         # Without the delta rule the scores' products the first step's alone.
         return mosaic.Walk(views, step, steps=group, segments=() if call.delta else (
-            (step, 0, 1), (functools.partial(step, scores=False), 1, group)))
+            (step, 0, 1), (functools.partial(step, scores=False), 1, group)), once=once)
 
     tiles, out_type = _query_key_launched(call, vq)
+    tiles, once = _walked_once(call, tiles)
     # Persistent under the delta rule, whose tile walks one step function (without it, the first step's
     # scores products are a segment of their own, which a persistent tile walks none of): a program a tile
     # paid each tile's setup, its chunk's table entries' dependent loads and its ring's and done barriers,
@@ -1026,7 +1034,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     dq, dk, *weights, after, leaving, memory = launch_kernel(
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
-        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
+        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None, stages=1,
+        live=chunk_liveness(10),
         steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq),
         landing=_query_key_landing(call, splits),
         persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
@@ -1037,6 +1046,18 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     after, leaving, memory = (x.reshape(splits, -1, *x.shape[1:]).sum(0) for x in (after, leaving, memory))
     dw = None if not weights else weights[0] if splits == 1 else held.split(weights[0])
     return dq, dk, dw, after, leaving, memory
+
+
+def _walked_once(call: Call, streams: dict) -> tuple[dict, dict]:
+    """`_query_key`'s `streams` (its views or its blocks, by part name) as those its steps stream and those
+    its walk loads once (`mosaic.Walk.once`): without the delta rule the key head's queries, keys and scores'
+    gradient, which every value head's step reads alike (a plain walk's, on a family whose walks load them,
+    `Family.walks_once`; under the delta rule its tiles persist, whose once streams the recurrence's bundles
+    do not load, each step its value head's scores' gradient): streamed, a step each of a group's value heads
+    loaded them again, the 4B SSD's twelve where one serves."""
+    once = () if call.delta or not call.family.walks_once else ("queries", "keys", "ds")
+    held = {name: value for name, value in streams.items() if name.rstrip("0123456789") in once}
+    return {name: value for name, value in streams.items() if name not in held}, held
 
 
 def _query_key_model(call: Call) -> float:
@@ -1092,18 +1113,41 @@ def _score_grads(call: Call) -> Operand:
     return held if call.delta else dataclasses.replace(call.given, rows=call.rows)
 
 
-def _scores_back_held(call: Call, grads: Operand, group: int) -> Held:
+def _head_grads(call: Call) -> Operand:
+    """The form `_scores_back` stores each value head's scores' gradient in: `_score_grads`' where a value
+    head is its key head's alone (the delta rule's, or a group of one), else fp32, the group's sum's terms
+    (`_grouped_scores`)."""
+    grouped = not call.delta and call.group > 1
+    return Operand(call.rows, 1, jnp.dtype(jnp.float32)) if grouped else _score_grads(call)
+
+
+def _grouped_scores(ds: jax.Array, call: Call) -> jax.Array:
+    """`_scores_back`'s value heads' scores' gradients `[R, HV * C]` fp32 summed over each key head's group
+    in `_score_grads`' form, compensated and rounded once (`precision.compensated_sum`): near-zero decays
+    leave a token's own ds dominant, its 64 heads cancelling to 4e-4 from terms of order 100 (seed 117), so
+    a plain sum lost a quarter of dq/dk (row 2066). Summed in the launch, a program a chunk and key head
+    stepping its value heads, Kimi's log-linear levels' 64 heads ran 64 programs a level, 330 us of a GH200
+    (M-JS-146ll), and its running pair held sm120's consumer-fed thread past 255 registers (row 10522)."""
+    if call.delta or call.group == 1:
+        return ds
+    summed = compensated_sum(ds.reshape(ds.shape[0], call.heads // call.group, call.group, call.chunk), (2,))
+    return _score_grads(call).split(summed.reshape(ds.shape[0], -1))
+
+
+def _scores_back_held(call: Call, grads: Operand) -> Held:
     """What `_scores_back`'s consumer thread holds: the scores' gradient fp32 and narrow, the pairs'
     decays, the scores and the pair terms, the masks, and the pairs' sum's product: three fp32 tiles at
     once, the decays taken before the scores' product and each block sum into one accumulator
     (`algebra.scores_gradient`; an accumulator a block, four, and an H100's need was 232 in a bf16 call, 192
     in one, back-need-one-32 at 9482e4d26). Where the scores' gradient leaves in parts (an fp32 call's), the
     remainder each part after the first is formed from (`product.formed`): without it the model stated 232
-    registers where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22). Where a key head's
-    value heads are summed (`group`), a phase after their pair reduction."""
+    registers where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22). Stored fp32 (a key
+    head's group's terms, `_head_grads`), the fp32 tile is stored as it is, no narrow copy (sm120's 208
+    registers to ptxas at Kimi's log-linear level, jsf-llc120d)."""
     chunk, given, held = call.chunk, call.given, dataclasses.replace(call.held, rows=call.rows)
+    narrow = [] if grads.stored == jnp.float32 else held_tile(grads, chunk, chunk)
     phases = ([f32(chunk, chunk)] * (3 + (grads.parts > 1))
-              + held_tile(grads, chunk, chunk)
+              + narrow
               + masks(chunk, chunk)
               # In turn: the queries against the keys read transposed ('local_t'); the output's gradient
               # against the corrected values read transposed ('values_ds'); the pairs' sum's three fp32
@@ -1115,111 +1159,76 @@ def _scores_back_held(call: Call, grads: Operand, group: int) -> Held:
                                     rhs_transposed=True),
                   product_fragments(call, (Operand(call.rows, 3, jnp.dtype(jnp.float32)), chunk, chunk),
                                     (Operand(call.rows, 1, jnp.dtype(jnp.bfloat16)), chunk, chunk))),)
-    if group > 1:
-        # After the pair reduction, no scores, masks or operand fragments remain: the incoming ds,
-        # the running pair and TwoSum's temporaries peak at six fp32 tiles.
-        phases += ([f32(chunk, chunk)] * 6,)
     return Held(phases=phases)
 
 
 @lowered_once
 def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale: float):
-    """`(ds in `_score_grads`' form, decay [HV, R] fp32)`: each chunk and value head's scores' gradient and
+    """`(ds in `_head_grads`' form, decay [HV, R] fp32)`: each chunk and value head's scores' gradient and
     the decay's gradient from its pair terms (`algebra.scores_gradient`, `algebra.summed_pairs`), fla's
-    dqkwg's part the memory's products do not take, a program a chunk and value head with the delta rule;
-    without it a program a chunk and key head, a step each of its value heads, their scores' gradients summed
-    in fp32 in shared memory and the key head's stored at the last (`_score_grads`). Persistent: apart from
-    `_query_key`, each launch's tiles a thread's registers hold (one launch spilled 1.5 KB a thread on an
-    H100's, SE bwd-probe at a49c8da50)."""
+    dqkwg's part the memory's products do not take, a program a chunk and value head; without the delta rule
+    a key head's value heads' each fp32, which `_grouped_scores` sums. Persistent: apart from `_query_key`,
+    each launch's tiles a thread's registers hold (one launch spilled 1.5 KB a thread on an H100's, SE
+    bwd-probe at a49c8da50)."""
     chunk = call.chunk
     width, value_width, family = call.width, call.value_width, call.family
-    grads = _score_grads(call)
+    grads = _head_grads(call)
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
     blocks = value_width // call.value_block
-    group = 1 if call.delta else call.group
 
     def program(at, q_ref, k_ref, v_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref,
                 beta_ref, ds_ref, decay_ref, *, streams, staging, landing):
-        n, head = at["chunks"], at["heads"]
-        first = head * group
+        n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        keyed = first // call.group * width
+        keyed = h // call.group * width
         views = stream_views(lambda i: (0, 0), queries=given.views(q_ref, row, chunk, keyed, width),
                              keys=given.views(k_ref, row, chunk, keyed, width))
-        # Step `i` the `i`-th value head's.
-        columns = first * value_width, group * value_width
-        views |= stream_views(lambda i: (0, i), values=held.views(v_ref, row, chunk, *columns),
-                              out=given.views(do_ref, row, chunk, *columns))
+        views |= stream_views(lambda i: (0, 0), values=held.views(v_ref, row, chunk, h * value_width,
+                                                                  value_width),
+                              out=given.views(do_ref, row, chunk, h * value_width, value_width))
         vectors = {"gate": hi_ref, "low": lo_ref, "column_gate": column_hi_ref, "column_low": column_lo_ref}
-        # A program a value head streams its vectors where the family copies them; a key head's steps read
-        # theirs.
-        streamed = family.copies_vectors and group == 1
+        # The head's vectors streamed where the family copies them, else read in its prologue.
+        streamed = family.copies_vectors
         if streamed:
-            views |= vector_views(n, first, **vectors)
-        summing, accumulated = (staging, None) if group == 1 else (staging[:-2], staging[-2:])
+            views |= vector_views(n, h, **vectors)
+
+        read = prefix_reader(family, streamed, vectors, h, span)
 
         def step(index, slots, carry, accumulators, loaded=None):
-            h = first + index
-            found = prefix_reader(family, streamed, vectors, h, span)(slots) if loaded is None else loaded
+            del index
+            found = read(slots) if streamed else loaded
+            assert found is not None, "a family that streams no vectors loads them in the prologue"
             (gate, low), laid = found
 
             column = functools.partial(column_tile, call, slots)
             value_column = functools.partial(column, width=call.value_block)
 
-            summed, column_sums = summed_issuer(tuple(summing), call)
+            summed, column_sums = summed_issuer(tuple(staging), call)
             ds, pairs = algebra.scores_gradient(
                 functools.partial(column, "queries", given), functools.partial(column, "keys", given),
                 width // call.block, functools.partial(value_column, "values", held),
-                functools.partial(value_column, "out", given), blocks, gate, low, scale,
-                grads.dtype if accumulated is None else jnp.float32, Issuer(call).summed, laid=laid,
+                functools.partial(value_column, "out", given), blocks, gate, low, scale, grads.dtype,
+                Issuer(call).summed, laid=laid,
                 column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None,
                 apart=call.apart)
             # The pairs' sum before the scores' gradient's store, so an fp32 call's parts form after the
             # pairs are gone.
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)
-            if accumulated is None:
-                grads.store(ds_ref, ds, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
-            else:
-                # Keep the group's head-sum roundings, as mamba_ssd's dCB does (row 2066).
-                # Near-zero decays leave a token's own ds dominant; its 64 heads can cancel to
-                # 4e-4 from terms of order 100 (seed 117), so a plain sum loses a quarter of dq/dk.
-                total, correction = accumulated
-
-                @pl.when(index == 0)
-                def _():
-                    total[...] = jnp.zeros(total.shape, jnp.float32)
-                    correction[...] = jnp.zeros(correction.shape, jnp.float32)
-
-                ds, tail = algebra.compensated_add(
-                    (family.tile_of(total), family.tile_of(correction)), (ds, jnp.zeros_like(ds)))
-                total[...] = ds
-                correction[...] = tail
-
-                @pl.when(index == group - 1)
-                def _():
-                    grads.store(ds_ref, ds.astype(grads.dtype), row, chunk, head * chunk, chunk,
-                                family=family, smem=landing["square"])
-
+            grads.store(ds_ref, ds, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
             return carry, accumulators
 
-        read = prefix_reader(family, streamed, vectors, first, span)
-        prologue = None if streamed or group > 1 else lambda: read(None)
-        return mosaic.Walk(views, step, steps=group, prologue=prologue)
+        return mosaic.Walk(views, step, steps=1, prologue=None if streamed else lambda: read(None))
 
     tiles = stream_blocks(queries=((chunk, width), given), keys=((chunk, width), given),
                           values=((chunk, value_width), held), out=((chunk, value_width), given))
-    if group == 1:
-        tiles |= vector_blocks(call, "gate", "low", "column_gate", "column_low")
-    out_type = (grads.shape((call.heads // group) * chunk),
-                jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
+    tiles |= vector_blocks(call, "gate", "low", "column_gate", "column_low")
+    out_type = (grads.shape(call.heads * chunk), jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     # The scores' gradient, the scores and the pairs' sums, each value head's: the model's.
-    model = 2 * chunk * chunk * (value_width + width + chunk) * group
-    held_tiles = _scores_back_held(call, grads, group)
-    summing = summing_staging(call) + ((plgpu.SMEM((chunk, chunk), jnp.float32),) * 2 if group > 1 else ())
-    return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads // group),
+    model = 2 * chunk * chunk * (value_width + width + chunk)
+    return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(8),
-                         steps=group, model=model,
-                         held=held_tiles, staging=summing, landing={"square": grads.landing(chunk, chunk)},
+                         steps=1, model=model, held=_scores_back_held(call, grads),
+                         staging=summing_staging(call), landing={"square": grads.landing(chunk, chunk)},
                          persistent=True)(q, k, corrected, do, hi, lo, hi, lo, taken, beta)
 
 

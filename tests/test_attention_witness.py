@@ -32,3 +32,36 @@ def test_the_certify_launch_writes_every_record_it_declares():
         checked = launched(q, k, v, causal, interpret=True)
     for name in ("out", "m", "l", "acc"):
         assert np.asarray(checked[name]).tobytes() == np.asarray(unchecked[name]).tobytes(), name
+
+
+def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monkeypatch):
+    """Row 9546: under a compile-only sm90 GPU-tier prepare (`truths_ahead.prepared`), the real native
+    attention certificate cells (`test_native_certificates`) compile both causal and full certify programs
+    through `ahead_arm` into completed `site.json` records with zero `DEFERRED`/`UNPREPARED`."""
+    import json
+
+    import generation_support
+    import model_flows
+    import test_native_certificates as certs
+    import tier_wire
+    from gpu_flow import run_cells
+    from truths_ahead import DEFERRED, UNPREPARED, prepared
+
+    topology = generation_support.node_topology(tmp_path / "topology.bin", gpu="sm90")
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    store_dir = tmp_path / "store"
+    certify_step = certs.the_attention_templates_states_certify_natively_a_step_at_a_time
+    with prepared(store_dir, stamp="a", target=generation_support.node_target()):
+        skipped = run_cells([
+            certs.cell(certify_step, "sm90", "causal"),
+            certs.cell(certify_step, "sm90", "full"),
+            certs.cell(certs.the_attention_witness_refuses_its_faults_natively, "sm90"),
+        ])
+    assert skipped == []
+    assert not (store_dir / DEFERRED).exists(), (store_dir / DEFERRED).read_text()
+    assert not (store_dir / UNPREPARED).exists(), (store_dir / UNPREPARED).read_text()
+    labels = {json.loads(path.read_text())["label"] for path in store_dir.rglob("site.json")}
+    for expected in ("attention witness, witness, causal,", "attention witness, witness, full,",
+                     "attention witness, faults, causal,", "attention witness, faults, full,"):
+        assert any(expected in label for label in labels), (expected, labels)

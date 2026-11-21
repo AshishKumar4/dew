@@ -75,6 +75,25 @@ def test_an_nvfp4_grouped_product_is_its_decoded_values_product(kernel):
     assert ("nvfp4_block", kernel) in {(route.choice, route.kernel) for route in routes}
 
 
+def test_an_nvfp4_product_shallower_than_a_b200s_step_takes_the_decoded_route():
+    """An NVFP4 block product of one group's 128 rows, 64 deep (four scales a row, whole blocks of its scale
+    tiles) and 128 wide on a B200, whose tcgen05 4-bit step is 256 deep: no tile of the template takes it
+    (its derivation derives none) and the call runs the decoded operands' product in XLA, on par with the
+    decoded values' product from float64."""
+    blocks = jnp.asarray([1], jnp.int32)
+    draw = functools.partial(_operands, shapes=((128, 64), (1, 128, 64)))
+
+    def dew(x, w):
+        operands = (formats.NvFp4Block.quantized(x), formats.NvFp4Block.quantized(w))
+        return gemm.nvfp4_block_product(*operands, blocks, out_dtype=jnp.float32)
+
+    with generation.assumed("sm100"), generation.routes() as routes:
+        assert_as_exact(jax.jit(dew), jax.jit(mx_matrix.values_product(mx_matrix.nvfp4_values, 128 * blocks)),
+                        draw, "a 64-deep nvfp4 product", seeds=SEEDS,
+                        truth_fn=mx_matrix.values_product(mx_matrix.nvfp4_values, 128 * blocks, jnp.float64))
+    assert ("nvfp4_block", "xla") in {(route.choice, route.kernel) for route in routes}
+
+
 def test_an_nvfp4_quantized_projection_is_its_quantized_rows_product():
     """An inference projection of a stored NVFP4 matrix with its rows quantized as it runs
     (`gemm.nvfp4_quantized_product`), rows no whole 128s: bitwise the NVFP4 block product of its rows,

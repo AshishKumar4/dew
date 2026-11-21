@@ -45,12 +45,16 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from diffusers_reference_helpers import on_bfloat16_grid
 from reference_releases import require
 from reference_vjp import recorded_vjp
+
+if TYPE_CHECKING:
+    from diffusers.models.autoencoders.autoencoder_dc import AutoencoderDC
 
 COHORTS = {"conv": "diffusers-0.34", "shuffle": "diffusers-0.34", "plain": "diffusers"}
 """The reference release each variant is recorded by (`reference_releases.RELEASES`): a run records the
@@ -85,8 +89,24 @@ SMALL = (8, 16)
 SEED = 31
 
 
+def encoded(model: AutoencoderDC, image: torch.Tensor) -> torch.Tensor:
+    from diffusers.models.autoencoders.vae import EncoderOutput
+
+    output = model.encode(image)
+    assert isinstance(output, EncoderOutput)  # return_dict's default.
+    return output.latent
+
+
+def decoded(model: AutoencoderDC, code: torch.Tensor) -> torch.Tensor:
+    from diffusers.models.autoencoders.vae import DecoderOutput
+
+    output = model.decode(code)
+    assert isinstance(output, DecoderOutput)  # return_dict's default.
+    return output.sample
+
+
 def build(config: dict, root: Path) -> dict[str, np.ndarray]:
-    from diffusers import AutoencoderDC
+    from diffusers.models.autoencoders.autoencoder_dc import AutoencoderDC
 
     torch.manual_seed(SEED)
     generator = torch.Generator().manual_seed(SEED)
@@ -94,10 +114,12 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
     with torch.no_grad():
         for module in model.modules():
             if isinstance(module, torch.nn.BatchNorm2d):
-                module.running_mean.copy_(0.1 * torch.randn(module.running_mean.shape, generator=generator))
-                module.running_var.copy_(torch.rand(module.running_var.shape, generator=generator) + 0.5)
-                module.running_mean.copy_(module.running_mean.to(torch.bfloat16).float())
-                module.running_var.copy_(module.running_var.to(torch.bfloat16).float())
+                mean, var = module.running_mean, module.running_var
+                assert mean is not None and var is not None  # track_running_stats, BatchNorm2d's default.
+                mean.copy_(0.1 * torch.randn(mean.shape, generator=generator))
+                var.copy_(torch.rand(var.shape, generator=generator) + 0.5)
+                mean.copy_(mean.to(torch.bfloat16).float())
+                var.copy_(var.to(torch.bfloat16).float())
         for name, parameter in model.named_parameters():
             if "norm" in name:
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
@@ -107,24 +129,24 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
 
     image = (torch.rand((BATCH, config["in_channels"], HEIGHT, WIDTH), generator=generator) * 2 - 1
              ).requires_grad_()
-    latent = model.encode(image).latent
-    encoded = recorded_vjp("encode", {"probe_latent": latent}, {"image": image}, named, generator)
+    latent = encoded(model, image)
+    encode = recorded_vjp("encode", {"probe_latent": latent}, {"image": image}, named, generator)
 
     code = torch.randn(latent.shape, generator=generator).requires_grad_()
-    pixels = model.decode(code).sample
-    decoded = recorded_vjp("decode", {"probe": pixels}, {"code": code}, named, generator)
+    pixels = decoded(model, code)
+    decode = recorded_vjp("decode", {"probe": pixels}, {"code": code}, named, generator)
 
     small = torch.rand((BATCH, config["in_channels"], *SMALL), generator=generator) * 2 - 1
     with torch.no_grad():
-        small_latent = model.encode(small).latent
+        small_latent = encoded(model, small)
         small_code = torch.randn(small_latent.shape, generator=generator)
-        small_pixels = model.decode(small_code).sample
+        small_pixels = decoded(model, small_code)
 
     arrays = {
         "image": image.detach().numpy(), "latent": latent.detach().numpy(),
         "code": code.detach().numpy(), "pixels": pixels.detach().numpy(),
         "small": small.numpy(), "small_latent": small_latent.numpy(),
-        "small_code": small_code.numpy(), "small_pixels": small_pixels.numpy(), **encoded, **decoded,
+        "small_code": small_code.numpy(), "small_pixels": small_pixels.numpy(), **encode, **decode,
     }
     print(f"{root.name}: parameters {len(named)} ({sum(value.numel() for _, value in named)} values); "
           f"latent {tuple(latent.shape)}; |latent| <= {np.abs(arrays['latent']).max():.3g}; "
@@ -163,7 +185,7 @@ def main(destination: str, variants: list[str]) -> None:
     releases = json.loads(held.read_text()).get("releases", {}) if held.exists() else {}
     for name in variants:
         arrays = build(CONFIGS[name], root / name)
-        np.savez_compressed(root / name / "reference.npz", **arrays)
+        np.savez_compressed(root / name / "reference.npz", allow_pickle=False, **arrays)
         releases[name] = release
     record = {"releases": releases, "configs": CONFIGS, "batch": BATCH, "height": HEIGHT, "width": WIDTH,
               "small": SMALL, "seed": SEED}

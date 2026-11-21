@@ -406,16 +406,14 @@ def test_the_decode_matrix_holds_on_this_tpu():
 
 
 @on_tpu
-@pytest.mark.parametrize(("width", "precision"), [(128, None), (64, None), (128, "highest")],
-                         ids=["default-128", "default-64", "highest-128"])
-def test_a_paged_decode_step_on_this_tpu_is_on_par_on_jaxs_kernel_where_it_takes_the_step(width, precision):
+@pytest.mark.parametrize(("width", "precision"), [(64, None), (128, "highest")],
+                         ids=["default-64", "highest-128"])
+def test_a_paged_decode_step_on_this_tpu_falls_back_where_jaxs_kernel_refuses(width, precision):
     """A bf16 paged pool's decode step on this TPU (`kv_cache.KVStore.decode`, 16 query heads over 8, the
-    selector's own kernel), at the default matmul precision or `precision`: on par with the reference path
-    (check 1), through jax's Pallas paged attention where it takes the step (`kv_cache.TPU_PAGED_SUPPORTS`:
-    a width filling its 128-lane tiles, a precision whose fp32 products the MXU takes) and through another
-    path where it refuses it (width 64; 'highest' on a v5e, whose MXU takes no fp32 product of fp32 weights
-    with bf16 values). The decode matrix's arms ask fp32 sums, which a v5e's kernel refuses, so its cells
-    leave the kernel untested there (row 7385)."""
+    selector's own kernel) at a width (64) or precision (`'highest'` on v5e) where
+    `kv_cache.TPU_PAGED_SUPPORTS` refuses jax's Pallas paged attention (rows 7385, 10142): on par with the
+    reference path (check 1) through the fallback route where refused, and through `tpu` where a newer
+    TPU's MXU takes fp32-by-bf16."""
     from dew.nn.kernels import generation
 
     case = {"generation": "tpu", "layout": "paged", "heads": "gqa-16-8", "hook": "plain", "dtype": "bfloat16",

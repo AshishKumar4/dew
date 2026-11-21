@@ -9,13 +9,25 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import CANCELLING_LEVELS, MOST
+from low_precision_support import edge_values
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
+from dew.nn.aligned import aligned_sum
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
+from dew.nn.float_bits import (
+    TWO_FACTOR_REACH,
+    binade_of,
+    float_bits,
+    lowered_rounded,
+    raised_exactly,
+    raw_fields,
+    widened_exactly,
+)
 from dew.nn.kernels import generation
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
@@ -36,7 +48,7 @@ from dew.nn.precision import (
 from dew.telemetry.instrumentation import hlo_instructions
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
-SEEDS = {"auto": 8, "local auto": 8}
+SEEDS = {"auto": 8, "local auto": 8, "default": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (paired, on armada): the most any
 of a site's cases took."""
 
@@ -195,15 +207,22 @@ def test_local_attention_under_auto_computes_the_precision_it_is_asked_for(span)
                     truth_fn=call("reference"))
 
 
-@pytest.mark.parametrize("precision", [None, jax.lax.Precision.DEFAULT, "default"])
-def test_fused_attention_default_precision_matches_the_attention_equation(precision):
-    query, key, value = jax.random.normal(
-        jax.random.key(0), (3, *BF16_QKV), dtype=jnp.float32)
-    scores = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(query.shape[-1])
-    expected = jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(scores, axis=-1), value)
-    actual = scaled_dot_product_attention(
-        query, key, value, precision=precision, implementation="xla")
-    assert jnp.max(jnp.abs(actual - expected)) < 1e-5
+def test_fused_attention_default_precision_matches_the_attention_equation():
+    """XLA's attention at the default precision on par with the attention equation, the reference path run
+    in float64 its truth (check 1); `Precision.DEFAULT` and "default" spell that default alike, each the same
+    program as no precision given, bit for bit on one draw."""
+    draw = qkv_draws(jnp.float32)
+
+    def attended(precision):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, precision=precision,
+                                                                    implementation="xla"))
+
+    assert_as_exact(attended(None), jax.jit(reference_attention), draw, "xla at the default precision",
+                    seeds=SEEDS["default"], truth_fn=reference_attention)
+    operands = draw(0)
+    for alias in (jax.lax.Precision.DEFAULT, "default"):
+        np.testing.assert_array_equal(np.asarray(attended(alias)(*operands)),
+                                      np.asarray(attended(None)(*operands)))
 
 
 @pytest.mark.parametrize("helper", ["rounded_operand", "rounded_to"])
@@ -1135,6 +1154,897 @@ def test_a_float64_value_asked_for_without_x64_fails_rather_than_computing_in_fl
         assert jnp.ones(3, jnp.float64).dtype == jnp.float64
 
 
+ALIGNED_CASES = {
+    "cancelling": ([(2.0 ** 100, 2.0 ** -20, 2.0 ** 60), (2.0 ** 100, 2.0 ** -20, -(2.0 ** 60))], 0.0),
+    "in range though its terms are not": ([(1 + 2.0 ** -20, 2.0 ** 70, 2.0 ** 70),
+                                           (-1.0, 2.0 ** 70, 2.0 ** 70)], 2.0 ** 120),
+    "past the largest": ([(1.0, 2.0 ** 70, 2.0 ** 70), (1.0, 2.0 ** 70, 2.0 ** 70)], float("inf")),
+    "a unit below cancelling terms": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
+                                       (1.0, 1.0, 1.0)], 1.0),
+    "a term past the normals below cancelling terms": ([(2.0 ** 100, 2.0 ** 60, 2.0 ** 60),
+                                                        (-(2.0 ** 100), 2.0 ** 60, 2.0 ** 60),
+                                                        (2.0 ** -50, 2.0 ** -50, 2.0 ** -20)], 2.0 ** -120),
+    "a tie below cancelling terms": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
+                                      (2.0 ** 25, 1.0, 1.0), (-(2.0 ** 24), 1.0, 1.0),
+                                      (-(2.0 ** 24), 1.0, 1.0), (-2.0, 1.0, 1.0)], -2.0),
+    "a band below two that cancel": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
+                                      (2.0 ** 25, 1.0, 1.0), (-(2.0 ** 24), 1.0, 1.0),
+                                      (-(2.0 ** 24), 1.0, 1.0), (2.0 ** -50, 2.0 ** -50, 1.0)], 2.0 ** -100),
+    "three levels cancelling beside the largest": ([(key, value, 1.0) for key, value in CANCELLING_LEVELS],
+                                                   MOST),
+    "cancelling past twice the precision": ([(2.0 ** 80, 1.0, 1.0), (2.0 ** 50, 1.0, 1.0), (1.0, 1.0, 1.0),
+                                             (-(2.0 ** 50), 1.0, 1.0), (-1.0, 1.0, 1.0),
+                                             (-(2.0 ** 80), 1.0, 1.0)], 0.0),
+}
+"""`aligned_sum`'s cases: three-factor terms whose products leave fp32's range, and their sum, exact in any
+order of summing (their sum a float32): a term more than float32's exponent range below the largest kept,
+where the largest cancel (base review 224fcf53a F1), and a lower band's rounding, -2^25 - 2 a tie, kept
+where its rounded sum cancels a higher band's (base review 644ef5535 F1), a third band's 2^-100 kept
+where the two above it cancel (base review f5e6e678d F1), and three levels of cancelling terms beside the
+largest (`contract_support.CANCELLING_LEVELS`) the largest, not inf, and
+`2^80 + 2^50 + 1 - 2^50 - 1 - 2^80` zero, which floats summed in some order lose (row 8757)."""
+
+
+@pytest.mark.parametrize("case", list(ALIGNED_CASES))
+def test_an_aligned_sum_is_exact_where_its_terms_leave_fp32s_range(case):
+    """`aligned_sum` of fp32 terms each past fp32's range where their sum is in it or past it: exactly the
+    sum, as a float32 holds it (a subnormal sum is no case: XLA:CPU flushes subnormals to zero). Summed as
+    formed, two terms of +-2^140 were inf - inf, NaN (base review ead11c83a F1)."""
+    terms, total = ALIGNED_CASES[case]
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
+    assert float(found) == total
+
+
+ROUNDED_CASES = {
+    "a tie to even": ([1.0, 2.0 ** -24], 1.0),
+    "past a tie by a sticky bit": ([1.0, 2.0 ** -24, 2.0 ** -60], 1 + 2.0 ** -23),
+    "below a tie by a sticky bit": ([1.0, 2.0 ** -24, -(2.0 ** -60)], 1.0),
+    "the largest past by half its unit": ([float(np.finfo(np.float32).max), 2.0 ** 103], float("inf")),
+    "a cancelled zero": ([1.0, -1.0], 0.0),
+    "negative zeros": ([-0.0, -0.0], -0.0),
+    "infinities of both signs": ([float("inf"), float("-inf")], float("nan")),
+    "an infinity beside a finite term": ([float("inf"), 1.0], float("inf")),
+    "a NaN": ([float("nan"), 1.0], float("nan")),
+}
+"""`aligned_sum`'s rounding cases: terms of one factor and the float their sum rounds to, nearest and ties
+to even, every bit below the rounding place sticky, its zeros' and non-finite terms' as IEEE's."""
+
+
+@pytest.mark.parametrize("case", list(ROUNDED_CASES))
+def test_an_aligned_sum_rounds_its_exact_sum_once_to_nearest_ties_to_even(case):
+    """`aligned_sum` of one-factor fp32 terms (`ROUNDED_CASES`): the float their exact sum rounds to, to
+    nearest, ties to even, a bit far below the tie deciding it, past the largest infinite, a cancelled sum
+    positive zero and negative zeros' negative, infinities' and NaNs' as IEEE sums them (row 8757)."""
+    terms, total = ROUNDED_CASES[case]
+    found = np.asarray(aligned_sum([(jnp.float32(term),) for term in terms]))
+    np.testing.assert_array_equal(found, np.float32(total))
+    # A zero's sign is IEEE's; a NaN's is none it states (base review 6c68b90ad F5).
+    assert total != 0 or np.signbit(found) == np.signbit(np.float32(total))
+
+
+def test_an_aligned_sum_of_fp32_terms_under_x64_keeps_fp32():
+    """`aligned_sum` of three fp32 ones with x64 on: fp32 3, where its integer digits' sums widened to int64
+    and their bits read as fp32 pairs (base review 6c68b90ad F1)."""
+    with jax.enable_x64(new_val=True):
+        found = aligned_sum([(jnp.ones((3,), jnp.float32),)], axis=0)
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), [3.0])
+
+
+def test_an_aligned_sum_of_mixed_factors_reads_a_subnormal_from_its_bits():
+    """`aligned_sum` of an fp32 subnormal times an fp64 factor, with x64 on: `2^-149 2^149` is fp64's 1 and
+    `-(0x007fffff) 2^-149 2^149` its `-(2^23 - 1)`, each factor widened from its bits, where cast to fp64
+    first XLA:CPU flushed the subnormal and the sum was 0 (row 8966)."""
+    with jax.enable_x64(new_val=True):
+        subnormal = jnp.asarray(np.asarray([1, 0x807FFFFF], np.uint32).view(np.float32))
+        found = aligned_sum([(subnormal, jnp.full((2,), 2.0 ** 149, jnp.float64))])
+    assert found.dtype == jnp.float64
+    np.testing.assert_array_equal(np.asarray(found), [1.0, -(2.0 ** 23 - 1)])
+
+
+def test_an_aligned_sum_of_mixed_factors_differentiates_each_factor():
+    """`aligned_sum([(a, b)])` of an fp32 `a` and an fp64 `b`, with x64 on: its tangent and gradient in `a`
+    at `a = 0` and at the subnormal `2^-149` are `b`, 2, each factor's own type's, where its exact widening
+    read `a`'s bits outside the declared rule and its tangent was 0 (base review ed11c8e4e F1)."""
+    with jax.enable_x64(new_val=True):
+        a = jnp.asarray([0.0, 2.0 ** -149], jnp.float32)
+        b = jnp.full((2,), 2.0, jnp.float64)
+        _, tangent = jax.jvp(lambda a: aligned_sum([(a, b)]), (a,), (jnp.ones_like(a),))
+        gradient = jax.grad(lambda a: jnp.sum(aligned_sum([(a, b)])))(a)
+    assert tangent.dtype == jnp.float64 and gradient.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(tangent), [2.0, 2.0])
+    np.testing.assert_array_equal(np.asarray(gradient), [2.0, 2.0])
+
+
+def test_an_aligned_sums_tangent_keeps_its_float64_sum_where_no_direction_moves_its_float64_term():
+    """The tangent of `aligned_sum([(a, 2^70), (1,)])` of fp32 `a` and `2^70` and a float64 `1`, with x64
+    on, at `a = 0` in the direction `2^70`: float64's `2^140`, the sum's type, where the float64 term no
+    direction moves was dropped from the tangent's terms and they were summed in fp32, infinite (base review
+    a8a1fdea7 F1)."""
+    with jax.enable_x64(new_val=True):
+        big = jnp.float32(2.0 ** 70)
+        value, tangent = jax.jvp(lambda a: aligned_sum([(a, big), (jnp.float64(1.0),)]),
+                                 (jnp.float32(0.0),), (big,))
+    assert value.dtype == tangent.dtype == jnp.float64
+    assert float(tangent) == 2.0 ** 140 and float(value) == 1.0
+
+
+def test_an_aligned_sum_of_a_weak_float64_factor_keeps_float32():
+    """`aligned_sum` of one weakly typed float64 factor (`jnp.asarray(1.0)` with x64 on) is float32's 1, the
+    factor narrowed as promotion narrows it, where its exact widening read float64's bits as float32's and
+    shifted by a negative count (base review ed11c8e4e F2)."""
+    with jax.enable_x64(new_val=True):
+        found = aligned_sum([(jnp.asarray(1.0),)])
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), 1.0)
+
+
+@pytest.mark.parametrize(("source", "target"), [
+    (np.float32, np.float64), (jnp.bfloat16, np.float32), (np.float16, np.float32), (np.float16, np.float64),
+    (jnp.float8_e4m3fn, np.float32), (jnp.float8_e4m3fnuz, np.float32), (np.float32, np.float32)],
+    ids=["fp32-float64", "bf16-fp32", "fp16-fp32", "fp16-float64", "e4m3-fp32", "e4m3fnuz-fp32", "fp32-fp32"])
+def test_a_float_widens_exactly_from_its_bits(source, target):
+    """`widened_exactly` of a format's edge values of both signs (its subnormals of every leading bit's place
+    among them) into a format at least as wide, compiled: NumPy's exact conversion bit for bit, a negative
+    zero's sign kept, where XLA:CPU's cast flushes a subnormal (row 8966); an 8-bit float's as its
+    conversion gives it, E4M3FNUZ's 0x80 a NaN, not -0 (base review ed11c8e4e F4)."""
+    with jax.enable_x64(new_val=target == np.float64):
+        values = edge_values(source)
+        found = np.asarray(jax.jit(lambda x: widened_exactly(x, target))(jnp.asarray(values)))
+    assert found.dtype == target
+    expected = values.astype(target)
+    word = f"uint{np.finfo(target).bits}"
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(expected))
+    held = ~np.isnan(expected)
+    np.testing.assert_array_equal(found[held].view(word), expected[held].view(word))
+
+
+@pytest.mark.parametrize("source", [jnp.float4_e2m1fn, jnp.float8_e4m3fnuz, jnp.float8_e5m2fnuz])
+def test_a_narrow_float_widens_as_it_converts(source):
+    """`widened_exactly` of every code of a narrow float into float32, compiled: its conversion, exact, where
+    its bits were read as an IEEE format's: a sub-byte float's (FP4) asked for an unsigned integer of its
+    width (base review ed11c8e4e F3), and E4M3FNUZ's and E5M2FNUZ's 0x80 widened to -0, not their NaN (F4).
+    FP6's conversion XLA:CPU compiles none of (an invalid i6 bitcast), so its codes are no cell here."""
+    values = np.arange(1 << jnp.finfo(source).bits, dtype=np.uint8).view(source)
+    found = np.asarray(jax.jit(lambda x: widened_exactly(x, np.float32))(jnp.asarray(values)))
+    expected = values.astype(np.float32)
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(expected))
+    np.testing.assert_array_equal(found[~np.isnan(expected)], expected[~np.isnan(expected)])
+
+
+@pytest.mark.parametrize(("lanes", "gradient"), [((2.0 ** 140, -(2.0 ** 140)), 0.0),
+                                                ((2.0 ** 140, -(2.0 ** 140) + 2.0 ** 100), 2.0 ** 100)],
+                         ids=["cancelling", "past float32 alone"])
+def test_an_aligned_sums_shared_float32_factor_takes_its_gradient_summed_wide(lanes, gradient):
+    """The gradient in a float32 `a` shared by a batch of aligned sums `aligned_sum([(a, b)])` (`jax.vmap`
+    over float64 `b` of `2^140` and `-2^140`, or `-2^140 + 2^100`), with x64 on, summed over the batch: 0 and
+    `2^100`, each cotangent in float64 through the batch's sum and cast once, where each was cast to float32
+    first, infinite, and their sum NaN (base reviews 279405f7f F1, 7eccb9f88 F4)."""
+    with jax.enable_x64(new_val=True):
+        b = jnp.asarray(lanes, jnp.float64)
+        found = jax.grad(lambda a: jnp.sum(jax.vmap(lambda b: aligned_sum([(a, b)]))(b)))(jnp.float32(1.0))
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), np.float32(gradient))
+
+
+def test_an_explicit_float64_widens_as_jax_resolves_it():
+    """`widened_exactly` of a float64 `2^140` to float64 with x64 off and JAX's explicit 64-bit dtypes allowed
+    (`jax_explicit_x64_dtypes`): the float64 itself, the destination as JAX resolves the request, where
+    read as x64's default policy it narrowed to float32's infinity (base review 7eccb9f88 F1)."""
+    held = jax.config.jax_explicit_x64_dtypes
+    jax.config.update("jax_explicit_x64_dtypes", "allow")
+    try:
+        x = jnp.asarray(2.0 ** 140, dtype=np.float64)
+        found = widened_exactly(x, np.float64)
+    finally:
+        jax.config.update("jax_explicit_x64_dtypes", held)
+    assert found.dtype == np.float64 and float(found) == 2.0 ** 140
+
+
+def test_a_wide_cpu_reduction_widens_its_subnormal_operands_exactly(monkeypatch):
+    """`widened_reduction`'s sum, under Dew's wide CPU arithmetic, of float32's two largest subnormals (built
+    from their bits): their sum `2^-125 - 2^-148`, a normal float32, each widened from its bits where
+    XLA:CPU's cast flushed them and the sum was 0 (base review 7eccb9f88 F2)."""
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC, widened_reduction
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    largest = jnp.asarray(np.full((2,), 0x7FFFFF, np.uint32).view(np.float32))
+    with jax.default_device(jax.devices("cpu")[0]):
+        (found,) = jax.jit(lambda x: widened_reduction(lambda x: (jnp.sum(x),), x))(largest)
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), np.float32(2.0 ** -125 - 2.0 ** -148))
+
+
+def test_an_exact_widenings_transpose_keeps_its_sources_type_outside_x64():
+    """The transpose of a batch's exact widening (`jax.vmap` of `widened_exactly` of a weak float32 to
+    float64, traced with x64 on), its cotangents `2^140` and `-2^140 + 2^100` pulled back with x64 off:
+    the weak float32 `2^100`, the batch summed in float64 and cast once, where summed as x64's default
+    narrowed them first, `inf - inf`, NaN, and the cast's strong result dropped the source's weakness (base
+    review of 961433795 F3, F6)."""
+    # A weak float32: a Python float's array with x64 off.
+    weak = jnp.asarray(1.0)
+    assert weak.dtype == jnp.float32 and jax.typeof(weak).weak_type
+    with jax.enable_x64(new_val=True):
+        transposed = jax.linear_transpose(
+            lambda x: jax.vmap(lambda _: widened_exactly(x, jnp.float64))(jnp.zeros(2)), weak)
+        cotangent = jnp.asarray([2.0 ** 140, -(2.0 ** 140) + 2.0 ** 100], jnp.float64)
+    (pulled,) = transposed(cotangent)
+    assert pulled.dtype == jnp.float32 and float(pulled) == 2.0 ** 100
+    assert jax.typeof(pulled).weak_type
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_exact_widenings_transpose_keeps_its_sources_placement():
+    """The gradient through `widened_exactly` of a float32 split over its rows by an Explicit axis of two
+    devices, widened to float64 under x64: the float32 ones, placed as the source is, where the transpose's
+    source rebuilt from its shape and dtype alone lost the placement (review of cbb640145 F1)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("rows",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split = NamedSharding(mesh, PartitionSpec("rows", None))
+    with jax.set_mesh(mesh), jax.enable_x64(new_val=True):
+        x = jax.device_put(np.ones((4, 3), np.float32), split)
+        gradient = jax.jit(jax.grad(lambda x: jnp.sum(widened_exactly(x, jnp.float64))))(x)
+    assert gradient.dtype == jnp.float32 and jax.typeof(gradient).sharding.spec == PartitionSpec("rows", None)
+    np.testing.assert_array_equal(np.asarray(gradient), np.ones((4, 3), np.float32))
+
+
+def test_an_exact_power_of_two_past_float32s_range_is_its_field():
+    """`exact_power2` in float32 at `minexp - 1`, `maxexp` and `maxexp + 1`: +0, infinity and the sign bit
+    alone, the field as the word holds it, which a quantizer's ceiling of a zero, an infinity and a NaN
+    reads (`fake_quant._power_of_two_ceil`: 0.0, inf, -0.0; review of e71e8066f F7)."""
+    from dew.nn import fake_quant
+    from dew.nn.float_bits import exact_power2
+
+    found = np.asarray(exact_power2(jnp.asarray([-127, 128, 129], jnp.int32), jnp.float32))
+    np.testing.assert_array_equal(found.view(np.uint32), np.uint32([0, 0x7F800000, 0x80000000]))
+    ceiling = np.asarray(fake_quant._power_of_two_ceil(jnp.asarray([0.0, np.inf, np.nan], jnp.float32)))
+    np.testing.assert_array_equal(ceiling.view(np.uint32), np.uint32([0, 0x7F800000, 0x80000000]))
+
+
+def test_a_host_scalar_widens_at_its_destination():
+    """`widened_exactly` of a Python integer past int32 (`2^40`) to float32 with x64 off is float32's
+    `2^40`, converted at its destination, where staging it as int32 first raised (base review 279405f7f
+    F2)."""
+    found = widened_exactly(2 ** 40, jnp.float32)
+    assert found.dtype == jnp.float32 and float(found) == 2.0 ** 40
+
+
+def test_an_exact_widening_transposes_as_a_cast():
+    """`jax.linear_transpose` of `widened_exactly` from bfloat16 to float32 at a float32 cotangent of 1:
+    bfloat16's 1, the cotangent cast back, where the widening's select on its operand's bits took no
+    transpose (base review 20ad463a7 F1)."""
+    transposed = jax.linear_transpose(lambda x: widened_exactly(x, jnp.float32), jnp.bfloat16(1))
+    (pulled,) = transposed(jnp.float32(1))
+    assert pulled.dtype == jnp.bfloat16 and float(pulled) == 1.0
+
+
+def test_an_exact_widening_is_strongly_typed():
+    """`widened_exactly` of a weakly typed float32 `2^-25` to float64, added to a strong float32 1 inside
+    jit, with x64 on: float64's `1 + 2^-25`, the widening's type strong as an explicit conversion's, where a
+    weak float64 yielded to the strong float32 and the sum rounded to 1 (base review 7fa8fe6c2 F2)."""
+    weak = jnp.asarray(2.0 ** -25)
+    assert weak.weak_type and weak.dtype == jnp.float32
+    with jax.enable_x64(new_val=True):
+        found = jax.jit(lambda w: widened_exactly(w, jnp.float64) + jnp.float32(1.0))(weak)
+    assert found.dtype == jnp.float64 and float(found) == 1.0 + 2.0 ** -25
+
+
+def test_a_wide_products_cotangent_widens_exactly(monkeypatch):
+    """The gradient of a wide CPU product (`accumulated`, Dew's wide arithmetic) of float32 `[[1]]` and
+    `[[2^127]]` at the subnormal cotangent `2^-149` (built from its bits): `2^-22`, the cotangent widened
+    from its bits into the float64 sum, where XLA:CPU's cast flushed it and the gradient was 0 (base review
+    7fa8fe6c2 F3)."""
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC, accumulated
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    rhs = jnp.asarray([[2.0 ** 127]], jnp.float32)
+    _, pullback = jax.vjp(lambda lhs: accumulated(jnp.matmul, lhs, rhs), jnp.ones((1, 1), jnp.float32))
+    (gradient,) = pullback(jnp.asarray(np.asarray([[1]], np.uint32).view(np.float32)))
+    np.testing.assert_array_equal(np.asarray(gradient), np.float32([[2.0 ** -22]]))
+
+
+def test_an_aligned_sums_subnormal_direction_widens_exactly():
+    """The tangent of `aligned_sum([(a, 2^149)])` of a float32 `a` and a float64 `2^149`, with x64 on, at
+    `a = 0` in the direction `2^-149` (built from its bits): float64's 1, the direction widened from its
+    bits, where XLA:CPU's cast flushed it to zero (base review 20ad463a7 F2)."""
+    direction = jnp.asarray(np.asarray(1, np.uint32).view(np.float32))
+    with jax.enable_x64(new_val=True):
+        _, tangent = jax.jvp(lambda a: aligned_sum([(a, jnp.float64(2.0 ** 149))]), (jnp.float32(0.0),),
+                             (direction,))
+    assert tangent.dtype == jnp.float64 and float(tangent) == 1.0
+
+
+@pytest.mark.parametrize("axis", [None, 0], ids=["elementwise", "along the rows"])
+def test_aligned_cotangents_are_the_aligned_sums_vjp(axis):
+    """`aligned.aligned_cotangents` of an entry write's three-factor term (a weight near 2^60, keys and
+    values) and a two-factor term of factors of their own, elementwise and summed along an axis: each
+    distinct factor's cotangent bit for bit what `jax.vjp` of `aligned_sum` gives it, compiled, so a
+    backward that takes no autodiff (a Pallas TPU kernel's) forms an aligned sum's transpose as its reverse
+    mode does (row 8666)."""
+    from dew.nn.aligned import aligned_cotangents
+
+    rng = np.random.default_rng(8666)
+    weight, key, value, left, right = (jnp.asarray(rng.standard_normal(shape) * scale, jnp.float32)
+                                       for shape, scale in (((2, 1, 1), 2.0 ** 60), ((2, 6, 1), 1.0),
+                                                            ((2, 1, 5), 1.0), ((2, 6, 5), 2.0 ** 40),
+                                                            ((2, 6, 5), 2.0 ** 30)))
+    shape = aligned_sum([(weight, key, value), (left, right)], axis).shape
+    cotangent = jnp.asarray(rng.standard_normal(shape), jnp.float32)
+
+    def summed(*factors):
+        return aligned_sum([factors[:3], factors[3:]], axis)
+
+    _, pullback = jax.vjp(summed, weight, key, value, left, right)
+    want = jax.jit(pullback)(cotangent)
+    found = jax.jit(lambda *factors: aligned_cotangents([factors[:3], factors[3:]], cotangent, axis))(
+        weight, key, value, left, right)
+    for got, wanted in zip(found, want, strict=True):
+        assert got.dtype == wanted.dtype and got.shape == wanted.shape
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+
+
+def test_aligned_cotangents_sum_a_shared_factors_terms_before_they_round():
+    """`aligned_cotangents` of terms `(w, 2^70, 2^70)`, `(w, -2^70, 2^70)` and `(w, 1, 1)` sharing one
+    float32 `w` (an entry write's weight) at a cotangent of one: `w`'s one cotangent, 1, as `jax.vjp` gives
+    it, its terms' products summed together before they round, where each term's rounded alone was
+    `+inf`, `-inf` and 1, summed NaN (review of bba02dcf8 F2); and a float64 factor's beside a float32 one
+    under x64 at a weak cotangent of `2^100`: `2^200`, the cotangent in the sum's float64, where taken
+    against the float32 factor it overflowed (F4)."""
+    from dew.nn.aligned import aligned_cotangents
+
+    w, big, one = jnp.float32(3.0), jnp.float32(2.0 ** 70), jnp.float32(1.0)
+    terms = [(w, big, big), (w, -big, big), (w, one, one)]
+    (shared, *_) = jax.jit(lambda w: aligned_cotangents([(w, *term[1:]) for term in terms], one))(w)
+    _, pullback = jax.vjp(lambda w: aligned_sum([(w, *term[1:]) for term in terms]), w)
+    assert float(shared) == float(pullback(one)[0]) == 1.0
+    with jax.enable_x64(new_val=True):
+        a, b = jnp.float32(2.0 ** 100), jnp.float64(1.0)
+        _, of_b = aligned_cotangents([(a, b)], 2.0 ** 100)
+    assert of_b.dtype == jnp.float64 and float(of_b) == 2.0 ** 200
+
+
+def test_an_aligned_sum_of_three_factors_over_a_long_axis_is_its_exact_sum():
+    """`aligned_sum([(x, x, x)], axis=0)` of 2^20 fp32 ones: 2^20, its digits as narrow as its count of limbs
+    needs, where four million pieces were refused (base review 6c68b90ad F2)."""
+    x = jnp.ones((2 ** 20,), jnp.float32)
+    np.testing.assert_array_equal(np.asarray(aligned_sum([(x, x, x)], axis=0)), [2.0 ** 20])
+
+
+@pytest.mark.parametrize(("term", "total"), [((2.0 ** -75, 2.0 ** -75, float("inf")), float("inf")),
+                                             ((0.0, float("inf"), 1.0), float("nan"))],
+                         ids=["an infinity beside a product that underflows", "an infinity times zero"])
+def test_an_aligned_sums_non_finite_product_is_ieees(term, total):
+    """`aligned_sum` of one three-factor fp32 term with an infinite factor: `2^-75 2^-75 inf` infinite, where
+    the finite factors' rounded product, zero, met the infinity, NaN; and `0 inf` NaN (base review 6c68b90ad
+    F3)."""
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term)])
+    np.testing.assert_array_equal(np.asarray(found), np.float32(total))
+
+
+@pytest.mark.parametrize("x64", [False, True], ids=["x32", "x64"])
+def test_an_aligned_sum_in_a_tpu_kernel_lowers_for_a_tpu(x64):
+    """A Pallas launch summing a `[16, 16]` tile's rows aligned (as the forked SSD's entry-write gradient
+    does), traced for an assumed v5p, with x64 off and on: it lowers on any host to a Mosaic kernel, where
+    under x64 its digit loop's index was 64-bit and Mosaic's 32 (base review d710d7ee9 F2, row 8757)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import AbstractDevice, AbstractMesh, AxisType
+
+    from dew.nn.kernels import launches
+    from dew.nn.kernels.generation import TARGETS, assumed
+    from dew.nn.kernels.lowered import custom_calls
+
+    def body(x_ref, y_ref, out_ref):
+        out_ref[...] = aligned_sum([(x_ref[...], y_ref[...])], axis=0)
+
+    spec = pl.BlockSpec((16, 16), lambda: (0, 0), memory_space=pltpu.VMEM)
+    call = launches.pallas_call(body, grid=(), in_specs=[spec, spec],
+                                out_specs=pl.BlockSpec((1, 16), lambda: (0, 0), memory_space=pltpu.VMEM),
+                                out_shape=jax.ShapeDtypeStruct((1, 16), jnp.float32), interpret=False,
+                                name="aligned_sum_lowered")
+    tile = jax.ShapeDtypeStruct((16, 16), jnp.float32)
+    device = AbstractDevice(device_kind=TARGETS["v5p"].device_kind, num_cores=None, platform="tpu")
+    mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with jax.enable_x64(new_val=x64), assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(call).trace(tile, tile).lower(lowering_platforms=("tpu",))
+    assert any(found.target == "tpu_custom_call" for found in custom_calls(lowered))
+
+
+def test_an_aligned_sums_tangent_over_four_factors_and_2_28_terms_traces():
+    """The tangent of `aligned_sum([(x, x, x, x)], axis=0)` along `x` for fp32 `x` of 2^28 terms, lowered:
+    its four terms' 2^30 products take digits the integers hold beside their carries, each term carried as
+    it is added, where one sum of all 2^30 was refused (base review 5a5cb5c98 F2, row 8757)."""
+    x = jax.ShapeDtypeStruct((2 ** 28,), jnp.float32)
+
+    def tangent(x):
+        return jax.jvp(lambda x: aligned_sum([(x, x, x, x)], axis=0), (x,), (x,))[1]
+
+    lowered = jax.jit(tangent).trace(x).lower()
+    assert lowered.out_info.shape == (1,)
+
+
+def test_an_aligned_sums_tangent_moves_only_the_factors_it_reaches():
+    """The tangent along `x` of `aligned_sum([(x,), (inf, 1)])` on fp32 scalars, and the gradient of `x`:
+    one each, the constant term's infinity moving nothing, where its zero direction met the other constant's
+    infinity, NaN (base review ee7d1e761 F1, row 8757)."""
+    infinite, one = jnp.float32(jnp.inf), jnp.float32(1.0)
+
+    def summed(x):
+        return aligned_sum([(x,), (infinite, one)])
+
+    assert float(jax.jvp(summed, (one,), (one,))[1]) == 1.0
+    assert float(jax.grad(summed)(one)) == 1.0
+
+
+def test_an_aligned_sums_tangent_takes_the_values_layout():
+    """The tangent along a scalar `x` of `aligned_sum([(x,), (v,)])` beside a constant `v` of `[10, 20]`:
+    `[1, 1]`, the value's layout, where the moving term alone made a scalar (base review 0c6ef9c11 F1)."""
+    v = jnp.asarray([10.0, 20.0], jnp.float32)
+    tangent = jax.jvp(lambda x: aligned_sum([(x,), (v,)]), (jnp.float32(1.0),), (jnp.float32(1.0),))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), [1.0, 1.0])
+
+
+def test_an_aligned_sums_mixed_derivative_holds_a_constant_infinity_still():
+    """The tangent along `y` of the tangent along `x` of `aligned_sum([(x, y), (x, inf, 1)])` at `x = y =
+    1`: one, the constant infinity held still, where its residual's zero tangent met it, NaN (base review
+    0c6ef9c11 F2)."""
+    infinite, one = jnp.float32(jnp.inf), jnp.float32(1.0)
+
+    def along_x(y):
+        return jax.jvp(lambda x: aligned_sum([(x, y), (x, infinite, one)]), (one,), (one,))[1]
+
+    assert float(jax.jvp(along_x, (one,), (one,))[1]) == 1.0
+
+
+def test_an_aligned_sums_tangent_keeps_the_values_placement():
+    """The tangent along a scalar `x` of `aligned_sum([(x,), (v,)])` beside a constant `v` of `[10, 20]`
+    split over an Explicit two-device data axis: `[1, 1]` placed as `v`'s value is, where the moving term
+    alone broadcast whole and JAX refused its placement (base review c439a41f3 F1, row 8757)."""
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+        v = jax.device_put(jnp.asarray([10.0, 20.0], jnp.float32), split)
+        tangent = jax.jvp(lambda x: aligned_sum([(x,), (v,)]), (jnp.float32(1.0),), (jnp.float32(1.0),))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), [1.0, 1.0])
+    assert tangent.sharding.is_equivalent_to(split, tangent.ndim)
+
+
+def test_an_aligned_sum_over_two_terms_of_2_30_lowers():
+    """`aligned_sum([(x,), (y,)], axis=0)` of fp32 `x` of 2^30 terms and `y` of `2^30 - 1`, lowered: one-bit
+    digits whose partial sums and carry, in `[-n, n - 1]`, int32 holds, where a looser carry bound refused
+    them (base review c439a41f3 F2, row 8757)."""
+    x, y = (jax.ShapeDtypeStruct((length,), jnp.float32) for length in (2 ** 30, 2 ** 30 - 1))
+    lowered = jax.jit(lambda x, y: aligned_sum([(x,), (y,)], axis=0)).trace(x, y).lower()
+    assert lowered.out_info.shape == (1,)
+
+
+def test_an_aligned_sums_second_order_holds_a_constant_direction_still():
+    """The tangent along `db` of the tangent of `aligned_sum([(a, b)])` at `a` one and `b` infinite, `a`'s
+    direction a constant one: `a`, one, where the constant direction's zero second-order tangent met the
+    infinity, NaN (row 8757)."""
+    one, infinite = jnp.float32(1.0), jnp.float32(jnp.inf)
+
+    def tangent(db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (one, infinite), (one, db))[1]
+
+    assert float(jax.jvp(tangent, (one,), (one,))[1]) == 1.0
+
+
+def test_an_aligned_sums_second_order_is_one_exact_sum():
+    """The tangent along `(b, db)` of the tangent of `aligned_sum([(a, b)])` along `(a, db)` at `a` 2^70, `da`
+    `a` itself, outer direction `(-2^70, 2^70)`: `a vb + a vdb`, its parts `-2^140` and `2^140` summed to
+    zero, where each, rounded apart, overflowed and added to inf - inf, NaN (row 8757)."""
+    a = jnp.float32(2.0 ** 70)
+
+    def tangent(b, db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (a, b), (a, db))[1]
+
+    direction = (jnp.float32(-(2.0 ** 70)), jnp.float32(2.0 ** 70))
+    assert float(jax.jvp(tangent, (jnp.float32(1.0), jnp.float32(0.0)), direction)[1]) == 0.0
+
+
+def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
+    """The tangent along `db` alone of the tangent of `aligned_sum([(a, b)])` at `a` one, `db`'s direction a
+    negative zero: a negative zero, where its one part's plain sum added it to a positive zero (row 8757)."""
+    one = jnp.float32(1.0)
+
+    def tangent(db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (one, one), (one, db))[1]
+
+    found = np.asarray(jax.jvp(tangent, (one,), (jnp.float32(-0.0),))[1])
+    assert found == 0.0 and np.signbit(found)
+
+
+def test_an_aligned_sums_tangents_value_and_gradient_keeps_its_joint_tangent():
+    """The tangent along `(0, -2^70, 2^70 (1 + k 2^-23), 0)` at `(2^70, 2^70, 2^70, 0)`, `k` each of 0 to 8
+    in check 1's first stage (the seed's modulo `offsets`, its seeds; rows 9087, 9091), of the value of
+    `aligned_sum([(a, b)])`'s tangent's value-and-gradient, `da vb + vda b`: `k 2^117`, its two products each
+    2^140 past float32's largest, cancelling exactly at `k` zero, held by check 1 against the formula in
+    float64 rounded once (exact, so Dew must be) where an untraced map's parts, rounded apart, added to inf -
+    inf, NaN (rows 8757, 8975)."""
+    from arm_forms import as_given
+
+    big, offsets = 2.0 ** 70, 9
+
+    def draw(seed):
+        k = seed % offsets
+        point, direction = (big, big, big, 0.0), (0.0, -big, big * (1 + k * 2.0 ** -23), 0.0)
+        return tuple(np.float32(x) for x in (*point, *direction))
+
+    def tangent(a, b, da, db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (a, b), (da, db))[1]
+
+    def ours(*inputs):
+        def value(*point):
+            return jax.value_and_grad(tangent)(*point)[0]
+
+        return jax.jvp(value, inputs[:4], inputs[4:])[1]
+
+    def formula(a, b, da, db, va, vb, vda, vdb):
+        return vda * b + da * vb + va * db + a * vdb
+
+    rounded = as_given(lambda *inputs: np.float32(formula(*(np.float64(x) for x in inputs))))
+    assert_as_exact(jax.jit(ours), rounded, draw, "an aligned sum's tangent's value and gradient",
+                    seeds=offsets, truth_fn=jax.jit(formula))
+
+
+def test_an_aligned_sums_tangent_pulls_back_inside_its_sum():
+    """The gradient in `b` of `aligned_sum([(a, b), (v,)])`'s tangent along `a`'s direction a quarter, `v`
+    a constant `[0, 0]`, under a cotangent of `[fp32's largest] * 2`: half the largest, where the tangent
+    broadcast to the value's layout outside the sum, its transpose summing the cotangents first, inf (base
+    review 89fc6bccd F1, row 8757)."""
+    largest, v = float(np.finfo(np.float32).max), jnp.zeros((2,), jnp.float32)
+
+    def tangent(b):
+        return jax.jvp(lambda a: aligned_sum([(a, b), (v,)]), (jnp.float32(1.0),), (jnp.float32(0.25),))[1]
+
+    _, pulled = jax.vjp(tangent, jnp.float32(1.0))
+    assert float(pulled(jnp.full((2,), largest, jnp.float32))[0]) == np.float32(largest / 2)
+
+
+def test_an_aligned_sum_in_an_interpreted_kernel_keeps_its_derivative():
+    """The tangent of a Pallas launch, interpreted, writing `aligned_sum([(x,)], axis=0)` of a `[16, 16]`
+    tile: the direction's own sum, where an interpreted body took the bare bits, which carry none, zero
+    (base review 89fc6bccd F2, row 8757)."""
+    from jax.experimental import pallas as pl
+
+    from dew.nn.kernels import launches
+
+    def body(x_ref, out_ref):
+        out_ref[...] = aligned_sum([(x_ref[...],)], axis=0)
+
+    call = launches.pallas_call(body, grid=(), in_specs=[pl.BlockSpec((16, 16), lambda: (0, 0))],
+                                out_specs=pl.BlockSpec((1, 16), lambda: (0, 0)),
+                                out_shape=jax.ShapeDtypeStruct((1, 16), jnp.float32), interpret=True,
+                                name="aligned_sum_interpreted")
+    x, direction = jnp.ones((16, 16), jnp.float32), jnp.arange(256, dtype=jnp.float32).reshape(16, 16)
+    tangent = jax.jvp(call, (x,), (direction,))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), np.asarray(direction).sum(0, keepdims=True))
+
+
+@pytest.mark.parametrize("length", [2 ** 30, 2 ** 31 - 2, 2 ** 31 - 1], ids=["2^30", "2^31 - 2", "2^31 - 1"])
+def test_an_aligned_sum_over_one_long_axis_lowers(length):
+    """`aligned_sum([(x,)], axis=0)` over `length` fp32 terms, up to its cap of `2^31 - 1` products a value,
+    lowered: one-bit digits whose one term's sum int32 holds, its quotient carried before its remainder
+    adds and the carry in `[-n, n - 1]`, where they were refused (base reviews ee7d1e761 F2, 0c6ef9c11 F3,
+    43f8e75e7 F3, row 8757)."""
+    lowered = jax.jit(lambda x: aligned_sum([(x,)], axis=0)).trace(
+        jax.ShapeDtypeStruct((length,), jnp.float32)).lower()
+    assert lowered.out_info.shape == (1,)
+
+
+def test_an_aligned_sums_tangent_leaks_no_tracer():
+    """The tangent and the gradient of `aligned_sum([(a, b)])` under `jax.checking_leaks`: no tracer kept,
+    where its tangent's map, a primitive's static parameter, closed over its traced value (row 8757)."""
+    one = jnp.float32(1.0)
+    with jax.checking_leaks():
+        jax.jvp(lambda a: aligned_sum([(a, one)]), (one,), (one,))
+        jax.grad(lambda a: aligned_sum([(a, one)]))(one)
+
+
+@pytest.mark.parametrize("axis", [2, -3, (0, 0), (1, -1), 2 ** 31, (0, 2 ** 31)],
+                         ids=["past the rank", "before it", "repeated", "repeated by its sign",
+                              "past a C int", "one of them past a C int"])
+def test_an_aligned_sum_refuses_an_axis_its_term_has_not(axis):
+    """`aligned_sum([(x,)], axis)` of a `[2, 3]` term over an axis past its rank or repeated: a ValueError, as
+    `jnp.sum`'s, where the axis wrapped by the rank reduced another (row 8837), and one past a C int's range,
+    where numpy's conversion of it raised an OverflowError (row 9086)."""
+    with pytest.raises(ValueError):
+        aligned_sum([(jnp.ones((2, 3), jnp.float32),)], axis=axis)
+
+
+def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():
+    """`aligned_sum` over an empty fp32 axis: positive zero, IEEE's sum of no terms, where a sum of none
+    counted as of negative zeros alone, negative zero (base review 6c68b90ad F4)."""
+    found = np.asarray(aligned_sum([(jnp.zeros((0,), jnp.float32),)], axis=0))
+    np.testing.assert_array_equal(found, [0.0])
+    assert not np.signbit(found).any()
+
+
+@pytest.mark.parametrize(("terms", "total"), [
+    ([(2.0 ** -75, 2.0 ** -75)] * 2, 2.0 ** -149),
+    ([(2.0 ** -75, 2.0 ** -75)], 0.0),
+    ([(2.0 ** -75, 2.0 ** -75)] * 3, 2.0 ** -148),
+    ([(1 + 2.0 ** -12, 1 + 2.0 ** -12), (-(1 + 2.0 ** -11), 1.0)], 2.0 ** -24),
+], ids=["two products a subnormal", "a product half the least subnormal", "three such halves",
+        "a product's bit below its rounding"])
+def test_an_aligned_sum_sums_its_products_every_bit(terms, total):
+    """`aligned_sum` of two-factor fp32 terms whose products round in fp32 or are subnormal: their exact sum
+    rounded once, `2^-150` twice the least subnormal, once a tie to zero, three times `2^-148`, and `(1 +
+    2^-12)^2 - (1 + 2^-11)` its `2^-24`, where its products were rounded first and subnormals flushed (row
+    8757)."""
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
+    np.testing.assert_array_equal(np.asarray(found), np.float32(total))
+
+
+def test_an_aligned_sum_over_a_long_axis_is_its_exact_sum():
+    """`aligned_sum([(x,)], axis=0)` of 65,536 ones but `2^100` and `-2^100` first: 65,534, its digits'
+    sums within their integers however many terms an axis holds (row 8757)."""
+    x = jnp.ones((65536, 2), jnp.float32).at[0].set(2.0 ** 100).at[1].set(-(2.0 ** 100))
+    np.testing.assert_array_equal(np.asarray(aligned_sum([(x,)], axis=0)), [[65534.0, 65534.0]])
+
+
+@pytest.mark.parametrize("terms", [[(0.0, 0.5, 0.5)], [(0.0, 0.0, 0.0), (0.0, 2.0 ** 100, 2.0 ** 100)]],
+                         ids=["one zero term", "zero terms past fp32's range"])
+def test_an_aligned_sum_of_zero_terms_is_zero(terms):
+    """`aligned_sum` of terms whose products are all zero, one beside factors past fp32's range: zero, where
+    its largest binade's sentinel aligned a zero term by 2^896 and wrapped it to -inf, its sum NaN (base
+    review 820eaf429 F1)."""
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
+    assert float(found) == 0.0
+
+
+def test_an_aligned_sum_of_float64_terms_keeps_float64():
+    """`aligned_sum` of float64 terms sums in float64: an entry weight of `1 + 2^-30` written at unit key and
+    value is itself, where cast to fp32 it was 1 (base review 820eaf429 F2)."""
+    with jax.enable_x64(new_val=True):
+        found = aligned_sum([(jnp.float64(1 + 2.0 ** -30), jnp.float64(1.0), jnp.float64(1.0))])
+        assert found.dtype == jnp.float64 and float(found) == 1 + 2.0 ** -30
+
+
+def test_an_aligned_sums_derivative_reduces_each_term_before_it_adds():
+    """`aligned_sum` along an axis of terms of different shapes (`x` `[2, 1]` and `y` `[1, 1]`, unit
+    values and directions): its tangent is 3, and `y`'s gradient 1, each term reduced over the axis before
+    the terms add, as its value is; summed broadcast first, `y`'s direction counted on both rows gave 4, its
+    gradient 2 (base review 675f2c056 F1)."""
+    x, y = jnp.ones((2, 1), jnp.float32), jnp.ones((1, 1), jnp.float32)
+
+    def summed(x, y):
+        return aligned_sum([(x,), (y,)], axis=0)
+
+    _, tangent = jax.jvp(summed, (x, y), (x, y))
+    assert float(tangent[0, 0]) == 3.0
+    assert float(jax.grad(lambda y: summed(x, y)[0, 0])(y)[0, 0]) == 1.0
+
+
+def test_an_aligned_sums_derivatives_hold_a_cancelling_shared_factors_range():
+    """`aligned_sum` of an entry write's two terms sharing their weight and key, a key of `(2^80, 0, 0)` and
+    values of 2^80 and -2^80 (each term 2^160, their sum zero): its tangent along the shared factors and
+    every factor's gradient float64's exactly, where its tangent summed each term's 2^160 plainly, inf - inf,
+    and a shared factor's gradient took each term's apart, the same (row 8501)."""
+    weight, key = np.ones((1, 1)), np.asarray([[2.0 ** 80], [0.0], [0.0]])
+    up = np.full((1, 4), 2.0 ** 80)
+    factors = (weight, key, up, -up)
+    directions = (np.ones((1, 1)), np.ones((3, 1)), np.zeros((1, 4)), np.zeros((1, 4)))
+    cotangent = np.arange(12.0).reshape(3, 4) - 5.0
+
+    def summed(weight, key, up, down):
+        return aligned_sum([(weight, key, up), (weight, key, down)])
+
+    narrow = [tuple(jnp.asarray(x, jnp.float32) for x in group) for group in (factors, directions)]
+    _, tangent = jax.jvp(summed, *narrow)
+    gradients = jax.grad(lambda *given: jnp.sum(summed(*given) * jnp.asarray(cotangent, jnp.float32)),
+                         argnums=(0, 1, 2, 3))(*narrow[0])
+    # float64's: the tangent each factor's direction in its place, the gradients the cotangent times the
+    # other factors summed over each one's broadcast, each exact here.
+    weight_d, key_d, up_d, down_d = directions
+    exact_tangent = (weight_d * key * (up - up) + weight * key_d * (up - up)
+                     + weight * key * (up_d + down_d))
+    exact = (np.sum(cotangent * key * (up - up), keepdims=True).reshape(1, 1),
+             np.sum(cotangent * weight * (up - up), axis=1, keepdims=True),
+             np.sum(cotangent * weight * key, axis=0, keepdims=True),
+             np.sum(cotangent * weight * key, axis=0, keepdims=True))
+    np.testing.assert_array_equal(np.asarray(tangent, np.float64), exact_tangent)
+    for found, expected in zip(gradients, exact, strict=True):
+        np.testing.assert_array_equal(np.asarray(found, np.float64), expected)
+
+
+@pytest.mark.parametrize("smaller", [[1.0], [2.0 ** -100], [2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), -2.0],
+                                     [2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), 2.0 ** -100]],
+                         ids=["a unit", "2^-100", "a tie", "a band below two that cancel"])
+def test_an_aligned_sums_derivatives_keep_smaller_terms_below_cancelling_ones(smaller):
+    """`aligned_sum([(w, a), (w, -a), *((w, s) for s in smaller)])` of `a` 2^127 at `w` zero along one: its
+    tangent and `w`'s gradient the sum of `smaller`, and at `w` one its value, float64's, where aligned to the
+    largest term, a unit or 2^-100 more than float32's exponent range below it was dropped before the largest
+    cancelled, zero (base review 224fcf53a F1), where each band rounded its sum alone, -2^25 - 2 tied to
+    -2^25 beside 2^25, zero (base review 644ef5535 F1), and where the bands' totals were aligned at once,
+    2^-100 dropped before 2^25 and -2^25 cancelled (base review f5e6e678d F1)."""
+    terms = [jnp.float32(2.0 ** 127), jnp.float32(-(2.0 ** 127)), *map(jnp.float32, smaller)]
+    small = sum(smaller)
+
+    def summed(w):
+        return aligned_sum([(w, term) for term in terms])
+
+    _, tangent = jax.jvp(summed, (jnp.float32(0.0),), (jnp.float32(1.0),))
+    assert float(tangent) == small
+    assert float(jax.grad(summed)(jnp.float32(0.0))) == small
+    assert float(summed(jnp.float32(1.0))) == small
+
+
+def test_an_aligned_sum_reduces_a_term_before_its_value_broadcasts_it():
+    """`aligned_sum([(x,), (y,)], axis=0)` of `x` `[1, 2]` and `y` `[[10, 20]]`: `x` summed to one value
+    broadcast across the value's two, `[[13, 23]]`, its tangent along `x`'s direction `[1, 2]` 3 at each, and
+    under a cotangent of `[[1, 2]]` `x`'s gradient 3 at each element and `y`'s the cotangent, where the
+    transpose laid `x` against the value's axis and gave it `[1, 2]` (base review f5e6e678d F2), and the
+    value and tangent reduced it against a top broadcast to the value's shape, `[[11, 22]]` and `[[1, 2]]`
+    (base review db30f3e80 F2)."""
+    x, y = jnp.asarray([1.0, 2.0], jnp.float32), jnp.asarray([[10.0, 20.0]], jnp.float32)
+
+    def summed(x, y):
+        return aligned_sum([(x,), (y,)], axis=0)
+
+    value, pulled = jax.vjp(summed, x, y)
+    np.testing.assert_array_equal(np.asarray(value), [[13.0, 23.0]])
+    tangent = jax.jvp(summed, (x, y), (jnp.asarray([1.0, 2.0], jnp.float32), jnp.zeros_like(y)))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), [[3.0, 3.0]])
+    dx, dy = pulled(jnp.asarray([[1.0, 2.0]], jnp.float32))
+    np.testing.assert_array_equal(np.asarray(dx), [3.0, 3.0])
+    np.testing.assert_array_equal(np.asarray(dy), [[1.0, 2.0]])
+
+
+def test_an_aligned_sums_shared_factors_gradient_holds_its_groups_scaled_until_they_sum():
+    """`aligned_sum([(f, x), (f, y)], axis=1)` of `f` ones `[2, 3]` beside `x` `[2, 3]` of 2^125 and `y`
+    `[4, 2, 3]` of -1.25 2^125, each reduced over its own second axis (`f`'s second in the first, its first
+    in the second), under a unit cotangent: every element of `f`'s gradient 2^126, where its two terms'
+    gradients, laid apart, were scaled back apart, 3 2^127 and -2.5 2^127 opposite infinities, and summed to
+    zero (base review db30f3e80 F1)."""
+    f = jnp.ones((2, 3), jnp.float32)
+    x = jnp.full((2, 3), 2.0 ** 125, jnp.float32)
+    y = jnp.full((4, 2, 3), -1.25 * 2.0 ** 125, jnp.float32)
+    value, pulled = jax.vjp(lambda f: aligned_sum([(f, x), (f, y)], axis=1), f)
+    np.testing.assert_array_equal(np.asarray(pulled(jnp.ones_like(value))[0]), np.full((2, 3), 2.0 ** 126))
+
+
+def _plain_sum(terms, axis=None):
+    """`aligned_sum`'s value in plain float32 arithmetic: each term's product, reduced over `axis` where one
+    is given, the terms added."""
+    products = [functools.reduce(jnp.multiply, term) for term in terms]
+    return functools.reduce(jnp.add, [p if axis is None else jnp.sum(p, axis=axis) for p in products])
+
+
+@pytest.mark.parametrize("order", ["forward over reverse", "reverse over reverse"])
+def test_an_aligned_sums_second_order_keeps_its_losss_curvature(order):
+    """The Hessian along `d` of `sum(aligned_sum([(a, a, c)])^2)`, its loss nonlinear in the sum (`12 a^2 c^2
+    d`), and of a mixed-rank sum's `sum(aligned_sum([(x, y), (y,)], axis=0)^2)` its cross curvature along
+    `d` in `x`, the `y`-gradient's (`4 y (x + 1) d`), each by `jax.jvp` of a gradient and by the gradient of
+    a gradient's product with the direction, on par with the same losses' in plain float32 arithmetic
+    against float64 (check 1), over normal draws, where the sum's tangent rule formed its value from bits,
+    which carry no tangent, and both orders lost the loss's curvature (at `a` `[1, 2]`, `c` `[3, 4]`, `d`
+    `[1, 0]`: `[36, 0]` and `[0, 0]` for `[108, 0]`; base review d2d45bd6f F2, row 8701)."""
+    def draw(seed):
+        rng = np.random.default_rng([2026_1120, seed])
+        return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
+                     for shape in ((4096,), (4096,), (4096,), (1, 4096)))
+
+    def curvatures(summed):
+        def run(a, c, direction, y):
+            def loss(a):
+                return jnp.sum(summed([(a, a, c)]) ** 2)
+
+            def mixed(x, y):
+                return jnp.sum(summed([(x, y), (y,)], axis=0) ** 2)
+
+            if order == "forward over reverse":
+                curvature = jax.jvp(jax.grad(loss), (a,), (direction,))[1]
+                crossed = jax.jvp(lambda x: jax.grad(mixed, argnums=1)(x, y), (a,), (direction,))[1]
+            else:
+                curvature = jax.grad(lambda a: jnp.vdot(jax.grad(loss)(a), direction))(a)
+                crossed = jax.grad(lambda y: jnp.vdot(jax.grad(mixed)(a, y), direction))(y)
+            return {"curvature": curvature, "mixed": crossed}
+
+        return run
+
+    assert_as_exact(jax.jit(curvatures(aligned_sum)), jax.jit(curvatures(_plain_sum)), draw,
+                    f"an aligned sum's second order, {order}", seeds=8)
+
+
+def test_an_aligned_sum_over_an_axis_a_mesh_splits_sums_it_shard_by_shard():
+    """`aligned_sum([(x,)], axis=0)` of ones `[6, 2]` split over an Explicit two-device data axis: `[[6, 6]]`,
+    and its gradient ones placed as `x` is, where its axis summed in halves sliced the split axis at three,
+    which two shards do not divide (base review 9e56c760b F1); and of a whole `x` of ones beside a split `y`
+    of twos, `x`'s gradient twos placed whole as `x` is, where it kept `y`'s split and JAX's accumulator
+    refused it (base review 8d59803fd F1)."""
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+        whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        x = jax.device_put(jnp.ones((6, 2), jnp.float32), rows)
+        value = jax.jit(lambda x: aligned_sum([(x,)], axis=0))(x)
+        gradient = jax.jit(jax.grad(lambda x: jnp.sum(aligned_sum([(x,)], axis=0))))(x)
+        x = jax.device_put(jnp.ones((6, 2), jnp.float32), whole)
+        y = jax.device_put(jnp.full((6, 2), 2.0, jnp.float32), rows)
+        beside = jax.jit(jax.grad(lambda x, y: jnp.sum(aligned_sum([(x, y)], axis=0))))(x, y)
+    np.testing.assert_array_equal(np.asarray(value), [[6.0, 6.0]])
+    np.testing.assert_array_equal(np.asarray(gradient), np.ones((6, 2)))
+    assert gradient.sharding.is_equivalent_to(rows, gradient.ndim)
+    np.testing.assert_array_equal(np.asarray(beside), np.full((6, 2), 2.0))
+    assert beside.sharding.is_equivalent_to(whole, beside.ndim)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis_type, ambient", [(jax.sharding.AxisType.Explicit, True),
+                                                (jax.sharding.AxisType.Auto, True),
+                                                (jax.sharding.AxisType.Auto, False)],
+                         ids=["explicit", "auto", "auto-placed-alone"])
+def test_an_elementwise_aligned_sum_split_over_a_mesh_is_computed_shard_by_shard(axis_type, ambient):
+    """`aligned_sum([(x, y), (z,)])` elementwise of `[8, 4]` operands split over a two-device data axis,
+    Explicit or Auto (the Auto mesh set around the trace, or only placing the operands), is each element's
+    exact sum (`3 + 2^-30` rounded, 3, everywhere) and its compiled program holds no collective
+    (`dew.telemetry.trace.collective`): each shard's sums are its own, where the digits' walk bounded itself
+    by the extrema of every limb across the shards, an all-reduce of independent sums (row 8841)."""
+    from dew.telemetry.trace import collective
+
+    mesh = jax.make_mesh((2,), ("data",), (axis_type,), devices=jax.devices()[:2])
+    rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+    with jax.set_mesh(mesh) if ambient else contextlib.nullcontext():
+        x, y, z = (jax.device_put(jnp.full((8, 4), value, jnp.float32), rows)
+                   for value in (2.0 ** -15, 2.0 ** -15, 3.0))
+        summed = jax.jit(lambda x, y, z: aligned_sum([(x, y), (z,)]), out_shardings=rows)
+        compiled = summed.lower(x, y, z).compile()
+        value = compiled(x, y, z)
+    instructions = hlo_instructions(compiled).values()
+    assert instructions
+    assert not [each.op for each in instructions if collective(each.op) is not None]
+    np.testing.assert_array_equal(np.asarray(value), np.full((8, 4), 3.0, np.float32))
+    assert value.sharding.is_equivalent_to(rows, value.ndim)
+
+
+def test_an_aligned_sum_over_an_empty_axis_is_zero():
+    """`aligned_sum([(x, y)])` of a scalar `x` beside an empty `y`: an empty value whose pullback gives `x` a
+    zero cotangent, and a sum over an empty axis zero, where the largest binade over no element raised
+    (base review 9e56c760b F2)."""
+    x, y = jnp.float32(2.0), jnp.zeros((0,), jnp.float32)
+    value, pulled = jax.vjp(lambda x, y: aligned_sum([(x, y)]), x, y)
+    assert value.shape == (0,) and float(pulled(jnp.zeros_like(value))[0]) == 0.0
+    np.testing.assert_array_equal(np.asarray(aligned_sum([(jnp.zeros((0, 3), jnp.float32),)], axis=0)),
+                                  np.zeros((1, 3)))
+
+
+def test_an_aligned_sums_gradient_scales_a_cotangent_before_its_broadcast_sum():
+    """`aligned_sum([(x, y), (z,)])` of one-element `x` 2^-20 and `y` 2^-100 beside `z` of two, under a
+    cotangent of 1.5 2^127 on each: `x`'s gradient 3 2^27 and `y`'s 3 2^107, float64's, where the cotangent's
+    sum across the broadcast came before its products, 3 2^127 past float32's largest (base review d6c1b2c1a
+    F1)."""
+    x, y, z = (jnp.asarray(v, jnp.float32) for v in ([2.0 ** -20], [2.0 ** -100], [0.0, 0.0]))
+    cotangent = jnp.full((2,), 1.5 * 2.0 ** 127, jnp.float32)
+    def loss(x, y, z):
+        return jnp.sum(aligned_sum([(x, y), (z,)]) * cotangent)
+
+    gradients = jax.grad(loss, argnums=(0, 1))(x, y, z)
+    np.testing.assert_array_equal(np.asarray(gradients[0], np.float64), [3.0 * 2.0 ** 27])
+    np.testing.assert_array_equal(np.asarray(gradients[1], np.float64), [3.0 * 2.0 ** 107])
+
+
+def test_an_aligned_sum_of_a_subnormal_factor_raises_it_by_its_bits():
+    """`aligned_sum` of a term whose factor is fp32-subnormal (`2^-140`) and whose product is in range
+    (`2^-140 2^100`): `2^-40` exactly, the factor normalized by its bits, where lifted by a multiply XLA:CPU
+    flushes it to zero (base review 675f2c056 F2)."""
+    found = aligned_sum([(jnp.float32(2.0 ** -140), jnp.float32(2.0 ** 100), jnp.float32(1.0))])
+    assert float(found) == 2.0 ** -40
+
+
+def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
+    """`aligned_sum` over an axis: each row's two columns `(1 + 2^-20) 2^(140 + i)` and `-2^(140 + i)`, each
+    past fp32's range, summed along the row to `2^(120 + i)` exactly."""
+    rows = np.arange(6)
+    first = np.stack([np.full(6, 1 + 2.0 ** -20), np.full(6, -1.0)], axis=1).astype(np.float32)
+    second = np.broadcast_to(np.float32(2.0 ** 70), (6, 2))
+    third = np.broadcast_to((2.0 ** (70 + rows)).astype(np.float32)[:, None], (6, 2))
+    found = aligned_sum([(jnp.asarray(first), jnp.asarray(second), jnp.asarray(third))], axis=1)
+    np.testing.assert_array_equal(np.asarray(found)[:, 0], 2.0 ** (120 + rows))
+
+
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 def test_a_gated_norms_gate_gradient_is_a_number_where_its_exp_overflows(activation):
     """A gated norm's gate on JAX's derivative (the portable path, `norms.gated_rms_normalized`) at gates of
@@ -1207,6 +2117,201 @@ def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right
         product, residual = two_product(a, b, bit_split=True)
         exact = Fraction(float(a)) * Fraction(float(b))
         assert Fraction(float(product)) + Fraction(float(residual)) == exact
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
+                                   jnp.float8_e5m2, jnp.float6_e2m3fn, jnp.float6_e3m2fn, jnp.float4_e2m1fn])
+def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
+    """`dew.nn.float_bits.exact_power2` is `2^n` in its format, bit for bit, at every normal exponent from the
+    least to the largest, and +0 one below them (a zero a caller encodes so), compiled, a sub-byte format's
+    too (FP6, FP4: base review d47c0d69c F1); an exponent of a narrow integer type is its value, where an
+    unsigned 2-bit 1 read as the E3M2 sentinel -3's wrap and gave +0 (base review 1e030145c F1)."""
+    from dew.nn.float_bits import exact_power2
+
+    # Each exponent type's values: int32's every one here, int4's and an unsigned 2-bit's narrow.
+    held = {jnp.int32: (-(2 ** 31), 2 ** 31 - 1), jnp.int4: (-8, 7), jnp.uint2: (0, 3)}
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        limits = jnp.finfo(dtype)
+        exponents = np.arange(limits.minexp - 1, limits.maxexp)
+        taken = {exponent: (low <= exponents) & (exponents <= high) for exponent, (low, high) in held.items()}
+        found = {exponent: np.asarray(jax.jit(lambda n: exact_power2(n, dtype))(
+            jnp.asarray(exponents[within], exponent))) for exponent, within in taken.items()}
+    expected = np.asarray([0.0, *(2.0 ** int(n) for n in exponents[1:])], np.float64).astype(dtype)
+    # A sub-byte format's value is held in a byte (ml_dtypes'): its storage's bits.
+    stored = f"uint{8 * np.dtype(dtype).itemsize}"
+    for exponent, within in taken.items():
+        assert found[exponent].dtype == dtype, exponent
+        np.testing.assert_array_equal(found[exponent].view(stored), expected[within].view(stored),
+                                      err_msg=str(exponent))
+
+
+def test_an_exact_power_of_two_in_e8m0_is_every_biased_exponent():
+    """`exact_power2` in E8M0 (an MX block's scale) is `2^n` at every exponent from its least, `2^-127`, its
+    biased exponent 0 a power and no zero, to its largest, `2^127`, compiled, bit for bit the byte MXFP8's
+    encode wrote as `n + 127` (row 8832)."""
+    from dew.nn.float_bits import exact_power2
+
+    exponents = np.arange(-127, 128)
+    found = np.asarray(jax.jit(lambda n: exact_power2(n, jnp.float8_e8m0fnu))(
+        jnp.asarray(exponents, jnp.int32)))
+    assert found.dtype == jnp.float8_e8m0fnu
+    np.testing.assert_array_equal(found.view(np.uint8), (exponents + 127).astype(np.uint8))
+    np.testing.assert_array_equal(found.astype(np.float64), np.exp2(exponents.astype(np.float64)))
+
+
+def power2_rounds_a_subnormal_result_once():
+    """`dew.nn.precision.power2` by `2^o 2^(k-2o) 2^o` rounds a result below the least normal once, at its
+    last factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where
+    XLA:CPU's flushes them): `(0.5 + 2^-24) 2^-149` is `2^-149`, where a whole factor first rounded the
+    partial product to `2^-127` and the remainder's then rounded its tie to zero (base review 54bb1f61a F2).
+    Its pullback applies the factors in reverse and rounds once too, a broadcast operand's cotangent summed
+    after each term is scaled: the cotangent `0.5 + 2^-24` to `1` by `2^-149` is `2^-149`, and to a scalar by
+    two such terms `2^-148`, where the remainder applied last rounded it to zero (base review 44e282c4f F1).
+    A GPU numerics cell (tests/test_gpu_numerics.py), one program prepared as an arm is in a GPU tier part
+    (`ahead_arm`, base review 85b5535a6 F4)."""
+    from reference_error import ahead_arm
+
+    from dew.nn.precision import power2
+
+    # Each exponent given (traced) and fixed (a constant the compiler folds its factors of): a scalar and
+    # two broadcast against the operand (base review 3e560b112, row 9469).
+    fixed = (np.int32(-149), np.full((2,), -149, np.int32))
+
+    def scaled(x, one, cotangent, exponents):
+        exponents = (exponents[0], exponents, *fixed)
+        pulled = [jax.vjp(lambda y, k=k: power2(y, k), one)[1](jnp.broadcast_to(cotangent, np.shape(k)))[0]
+                  for k in exponents]
+        return power2(x, exponents[0]), power2(x, fixed[0]), *pulled
+
+    tiny = np.float32(0.5 + 2.0 ** -24)
+    found = ahead_arm(jax.jit(scaled), "a power of two's scaling and its pullback")(
+        tiny, np.float32(1.0), tiny, np.full((2,), -149, np.int32))
+    # Each one correctly rounded answer: the least subnormal's bits, twice it summed.
+    for value, bits in zip(found, (1, 1, 1, 2, 1, 2), strict=True):
+        value = np.asarray(value)
+        assert value.dtype == np.float32 and value.view(np.uint32) == bits, value.view(np.uint32)
+
+
+def test_a_python_integer_exponent_past_float32_saturates():
+    """`dew.nn.precision.power2` holds a Python integer exponent within its reach before converting it:
+    `2^(±10^400)` of `1` is infinite and zero, where `10^400` raised in its host conversion to float32 (base
+    review 44e282c4f F2)."""
+    from dew.nn.precision import power2
+
+    found = [np.asarray(power2(np.float32(1.0), sign * 10 ** 400)) for sign in (1, -1)]
+    assert [value.dtype for value in found] == [np.float32] * 2
+    assert np.isposinf(found[0]) and found[1] == 0, found
+
+
+def test_an_exact_power_of_two_in_a_python_float_is_jaxs_float():
+    """`exact_power2` of a Python `float` destination is JAX's float (float32 where x64 is off), its layout
+    that dtype's: `2^0` is float32's 1.0, the sentinel below the normals (`2^-127`) its zero (base review
+    43f53b12f F1)."""
+    from dew.nn.float_bits import exact_power2
+
+    found = np.asarray(jax.jit(lambda n: exact_power2(n, float))(jnp.asarray([0, 3, -126, -127], jnp.int32)))
+    assert found.dtype == np.float32
+    np.testing.assert_array_equal(found, np.asarray([1.0, 8.0, 2.0 ** -126, 0.0], np.float32))
+
+
+def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
+    """`dew.nn.precision.power2` at a reach past `TWO_FACTOR_REACH` (254, float32's twice its largest
+    exponent) takes `2^127` and `1.5 2^127` by `2^-253` to the normal `2^-126` and `1.5 2^-126` exactly,
+    compiled: two halves there hold a -127, no normal power, whose encoding is +0, and gave zero."""
+    from dew.nn.precision import power2
+
+    found = np.asarray(jax.jit(lambda x, k: power2(x, k, reach=2 * 127))(
+        jnp.asarray([2.0 ** 127, 1.5 * 2.0 ** 127, 2.0 ** 127], jnp.float32), jnp.asarray([-253, -253, 254])))
+    np.testing.assert_array_equal(found, np.asarray([2.0 ** -126, 1.5 * 2.0 ** -126, np.inf], np.float32))
+
+
+@pytest.mark.parametrize(("dtype", "reach", "exponent"), [
+    (jnp.float32, None, jnp.int32), (jnp.float32, TWO_FACTOR_REACH, jnp.int32),
+    (jnp.float32, None, jnp.int8), (jnp.float32, TWO_FACTOR_REACH, jnp.int8), (jnp.float32, None, jnp.uint8),
+    (jnp.float32, None, jnp.float32), (jnp.float64, None, jnp.int32), (jnp.bfloat16, None, jnp.int32),
+    (jnp.float8_e4m3fn, None, jnp.int32), (jnp.float8_e5m2, TWO_FACTOR_REACH, jnp.int32)])
+def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach, exponent):
+    """`dew.nn.precision.power2` (the one owner of scaling by a power of two: a kernel template's, a scaled
+    value's, an aligned sum's) scales by powers of two exactly wherever the operand and the result are
+    normal values of its format (`x`'s, at least float32), compiled (where XLA computes `exp2` as an inexact
+    `exp` and fuses a product of them into one `exp`, past the format), at every integral exponent its type
+    holds past the format's range both ways against exact rational scaling, equal parts by default and a
+    stated reach's two halves within it, operands at both ends of the normal range among them, an 8-bit
+    float's in float32 (`at_least_fp32`, which no implicit promotion reaches; base review a7c5428ef F1); zero
+    stays zero, and a result past the format is infinite."""
+    from dew.nn.precision import at_least_fp32, power2
+
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        wide = at_least_fp32(dtype)
+        limits = np.finfo(wide)
+        span = int(limits.maxexp - limits.minexp + limits.nmant) + 8 if reach is None else reach
+        held = np.iinfo(exponent) if jnp.issubdtype(exponent, jnp.integer) else np.finfo(exponent)
+        exponents = np.arange(max(-span, int(held.min)), min(span, int(held.max)) + 1)
+        operands = [0.0, 0.5, 0.75, 1.0, -0.6, 1.0 + 2.0 ** -7, float(jnp.finfo(dtype).tiny),
+                    -1.5 * 2.0 ** (jnp.finfo(dtype).maxexp - 2)]
+        found = np.asarray(jax.jit(lambda x, k: power2(x[:, None], k[None, :], reach))(
+            jnp.asarray(operands, dtype), jnp.asarray(exponents, exponent)))
+    assert found.dtype == wide
+    taken = np.asarray(np.asarray(operands, np.float64).astype(dtype), np.float64)
+    exact = [[Fraction(float(x)) * Fraction(2) ** int(k) for k in exponents] for x in taken]
+    normal = np.asarray([[value == 0 or limits.tiny <= abs(value) <= limits.max for value in row]
+                         for row in exact])
+    expected = np.asarray([[float(value) if normal[i, j] else 0.0 for j, value in enumerate(row)]
+                           for i, row in enumerate(exact)], wide)
+    np.testing.assert_array_equal(found[normal], expected[normal])
+    np.testing.assert_array_equal(found[0], 0.0)
+    past = np.asarray([[abs(value) > limits.max for value in row] for row in exact])
+    assert np.all(np.isinf(found[past]))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
+                                   jnp.float8_e5m2])
+def test_a_floats_raw_fields_are_its_bits(dtype):
+    """`raw_fields` of a format's edge values of both signs, compiled: its bits as the unsigned integer of its
+    width, its sign bit in place, its biased exponent and its fraction, each NumPy's reading of the same
+    bits, and the three fields recompose the bits."""
+    with jax.enable_x64(new_val=dtype == np.float64):
+        values = edge_values(dtype)
+        bits, sign, biased, fraction = (np.asarray(field)
+                                        for field in jax.jit(raw_fields)(jnp.asarray(values)))
+    limits = jnp.finfo(dtype)
+    word = np.dtype(f"uint{limits.bits}")
+    expected = values.view(word)
+    assert {field.dtype for field in (bits, sign, biased, fraction)} == {word}
+    np.testing.assert_array_equal(bits, expected)
+    np.testing.assert_array_equal(sign, expected & word.type(1 << (limits.bits - 1)))
+    # The exponent field's own width (`nexp`): E4M3's top binade holds finite values.
+    np.testing.assert_array_equal(biased, (expected >> limits.nmant) & word.type((1 << limits.nexp) - 1))
+    np.testing.assert_array_equal(sign | (biased << limits.nmant) | fraction, expected)
+
+
+def test_e8m0s_raw_fields_hold_no_sign():
+    """`raw_fields` of E8M0 (an MX block's scale, unsigned, no fraction): no sign bit, every bit its biased
+    exponent, where the sign's mask read its top exponent bit (base review ed11c8e4e F3)."""
+    codes = np.arange(255, dtype=np.uint8)
+    bits, sign, biased, fraction = (np.asarray(field) for field in jax.jit(raw_fields)(
+        jnp.asarray(codes.view(jnp.float8_e8m0fnu))))
+    np.testing.assert_array_equal(bits, codes)
+    np.testing.assert_array_equal(sign, 0)
+    np.testing.assert_array_equal(biased, codes)
+    np.testing.assert_array_equal(fraction, 0)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["fp32", "float64"])
+def test_a_floats_bits_read_as_its_exponent_and_significand(dtype):
+    """`float_bits` of normal, subnormal and zero values of both signs: each nonzero value's exponent
+    `floor(log2 |x|)` (numpy's `frexp`, less one) and its normalized fraction with the implicit bit the
+    value's significand, the value exactly their product, a subnormal's read from its bits."""
+    with jax.enable_x64(new_val=dtype == np.float64):
+        values = edge_values(dtype)
+        _, _, _, normalized, exponent = (np.asarray(part) for part in float_bits(jnp.asarray(values)))
+    nonzero = values != 0
+    expected = np.frexp(values.astype(np.float64))[1] - 1
+    np.testing.assert_array_equal(exponent[nonzero], expected[nonzero])
+    nmant = np.finfo(dtype).nmant
+    significand = (normalized.astype(np.float64) + 2.0 ** nmant) / 2.0 ** nmant
+    rebuilt = np.copysign(np.ldexp(significand, exponent.astype(np.int64)), values.astype(np.float64))
+    np.testing.assert_array_equal(rebuilt[nonzero], values.astype(np.float64)[nonzero])
 
 
 TWO_PI_SPLIT = (np.float32(6.2831855), np.float32(-1.7484555e-07))
@@ -1282,11 +2387,27 @@ def test_a_compensated_primitive_under_jit_on_a_tpu_is_its_eager_arithmetic(shap
     compensated_primitives_hold_under_jit(shape)
 
 
-def test_a_sum_of_products_rounded_once_cancels_a_product_made_in_its_program():
+PATHS = ("marked", "barriered")
+"""The error-free transforms' two paths (row 8378): their arithmetic marked to round alone where the jaxlib
+marks (`dew.nn.precision.rounding_alone`), or their operands behind a barrier (`dew._cache.BARRIERED`, which
+the suite enters to run that path on a lane whose jaxlib marks)."""
+
+
+def on_path(path: str):
+    """The block run on `path` (`PATHS`): the barrier path entered, the marked one as the process runs."""
+    from dew import _cache
+
+    return _cache.BARRIERED(new_value=True) if path == "barriered" else contextlib.nullcontext()
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_a_sum_of_products_rounded_once_cancels_a_product_made_in_its_program(path):
     """`summed_once` of `-q` and `1 * q`, `q` a square made in the same jitted program (`t = 1 + 2^-12`, whose
     square's rounding drops `2^-24`), is 0 exactly: its products' splits read each operand as one value,
     where a compiler that contracted the square into a split's subtraction read the exact square there and
-    the rounded one in the product, a spurious low part of `2^-24` the sum carried (row 7953)."""
+    the rounded one in the product, a spurious low part of `2^-24` the sum carried (row 7953). On each path
+    (`PATHS`): the caller's square, unmarked, is read by the transform's marked arithmetic, which rounds alone
+    (row 8378)."""
     from dew.nn.precision import summed_once
 
     @jax.jit
@@ -1295,10 +2416,77 @@ def test_a_sum_of_products_rounded_once_cancels_a_product_made_in_its_program():
         return summed_once((-square,), ((jnp.ones_like(square), square),))
 
     t = jnp.full((4096,), 1 + 2.0 ** -12, jnp.float32)
-    np.testing.assert_array_equal(np.asarray(cancelled(t)), np.zeros(4096, np.float32))
+    with on_path(path):
+        np.testing.assert_array_equal(np.asarray(cancelled(t)), np.zeros(4096, np.float32))
 
 
+def test_a_sum_of_products_rounded_once_reaching_an_infinity_is_the_plain_sums():
+    """`summed_once` whose sum overflows float32, by its values or by a product, is the plain sum's
+    infinity, as `jnp.sum`'s is, and a finite sum beside it is its own: a residual past an infinity is
+    inf - inf, which added back would make it NaN (row 8453)."""
+    from dew.nn.precision import summed_once
+
+    largest = jnp.finfo(jnp.float32).max
+    values = jnp.asarray([largest, -largest, 1.0], jnp.float32)
+    summed = jax.jit(lambda values: summed_once((values, values)))(values)
+    np.testing.assert_array_equal(np.asarray(summed), np.asarray([np.inf, -np.inf, 2.0], np.float32))
+    scaled = jax.jit(lambda values: summed_once((values,), ((values, jnp.full_like(values, 2.0)),)))(values)
+    np.testing.assert_array_equal(np.asarray(scaled), np.asarray([np.inf, -np.inf, 3.0], np.float32))
+
+
+def test_a_sum_of_products_rounded_once_keeps_its_residuals_apart_from_its_running_value():
+    """`summed_once` carries each rounding's residual apart and adds them back at the end (Dot2): of
+    `M, 2^102, 2^102, -M` (`M` float32's largest) it is `2^103`, where residuals renormalized into the
+    running value as they come rounded it past `M` to an infinity, and of `-2^-24 + 1 * 2^-49 + t * t - fl(t
+    t)` (`t = 1 + 2^-12`) it is `2^-49`, where the residual a later one cancels was rounded away first (row
+    8453's review)."""
+    from dew.nn.precision import summed_once
+
+    largest, big = np.finfo(np.float32).max, np.float32(2.0 ** 102)
+    overflowing = jax.jit(lambda values: summed_once(tuple(values)))(
+        jnp.asarray([largest, big, big, -largest], jnp.float32))
+    assert float(overflowing) == 2.0 ** 103
+    t = np.float32(1 + 2.0 ** -12)
+
+    @jax.jit
+    def cancelled(t):
+        return summed_once((jnp.float32(-(2.0 ** -24)), -(t * t)), ((jnp.float32(1), jnp.float32(2.0 ** -49)),
+                                                                     (t, t)))
+
+    assert float(cancelled(jnp.asarray(t))) == 2.0 ** -49
+
+
+@pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize("shape", COMPENSATED_SHAPES)
-def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape):
-    """`compensated_primitives_hold_under_jit` on the CPU (a GPU's in tests/test_gpu_numerics.py)."""
-    compensated_primitives_hold_under_jit(shape)
+def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape, path):
+    """`compensated_primitives_hold_under_jit` on the CPU (a GPU's in tests/test_gpu_numerics.py), on each
+    path (`PATHS`)."""
+    with on_path(path):
+        compensated_primitives_hold_under_jit(shape)
+
+
+def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flushing_cpu():
+    """On XLA's CPU, whose fp32 multiply flushes a subnormal operand and result (row 4023):
+    `dew.nn.float_bits.raised_exactly` is `x * 2^k` and `lowered_rounded` `x * 2^-k` rounded once to nearest
+    even, bitwise numpy's IEEE `ldexp`, across every binade, subnormals both ways, at shifts 0 to 300, zero
+    kept zero; and `binade_of` is `floor(log2|x|)`, -1024 at zero, int32 (row 6302's finish,
+    `algebra.quotient`, and an initial state's gradient)."""
+    values = edge_values(np.float32)
+    shifts = np.asarray([0, 1, 2, 23, 24, 25, 63, 64, 126, 127, 149, 150, 151, 252, 300], np.int32)
+    on_cpu = jax.devices("cpu")[0]
+    x, k = (jax.device_put(each, on_cpu) for each in (values[:, None], shifts[None, :]))
+    lowered = np.asarray(jax.jit(lowered_rounded)(x, k))
+    rounded = np.ldexp(values[:, None], -shifts[None, :]).astype(np.float32)
+    np.testing.assert_array_equal(lowered.view(np.uint32), rounded.view(np.uint32))
+    raised = np.asarray(jax.jit(raised_exactly)(x, k))
+    assert raised.dtype == np.float32
+    exact = np.ldexp(values[:, None].astype(np.float64), shifts[None, :])
+    held = np.abs(exact) <= np.finfo(np.float32).max
+    expected = exact[held].astype(np.float32)
+    np.testing.assert_array_equal(raised[held].view(np.uint32), expected.view(np.uint32))
+    binades = np.asarray(jax.jit(binade_of)(jax.device_put(values, on_cpu)))
+    assert binades.dtype == np.int32
+    nonzero = values != 0
+    np.testing.assert_array_equal(binades[nonzero],
+                                  np.floor(np.log2(np.abs(values[nonzero].astype(np.float64)))).astype(np.int32))
+    np.testing.assert_array_equal(binades[~nonzero], -1024)

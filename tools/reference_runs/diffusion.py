@@ -61,6 +61,10 @@ from common import (
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_source import dew_revision
 
+COHORT = "flaxdiff-trainer"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 # The DiT both packages define, at 64x64 pixels: 256 patches of 4x4.
 MODEL = {"output_channels": 3, "patch_size": 4, "emb_features": 384, "num_layers": 8,
          "num_heads": 6, "mlp_ratio": 4, "norm_epsilon": 1e-5, "force_fp32_for_softmax": True}
@@ -133,7 +137,7 @@ def load_tree(path: str | Path) -> dict:
 
 def save_tree(path: str | Path, tree) -> None:
     arrays: dict[str, Any] = {name: np.asarray(leaf) for name, leaf in flatten_dict(tree, sep="/").items()}
-    np.savez(path, **arrays)
+    np.savez(path, allow_pickle=False, **arrays)
 
 
 class NormState(NamedTuple):
@@ -177,14 +181,14 @@ def flaxdiff_side(args, images, total, attention):
     class FixedDraws(DiffusionObjective):
         """flaxdiff's `DiffusionObjective.loss`, the two draws read from the batch."""
 
-        def loss(self, variables, ema_params, batch, rng, step):
+        def loss(self, params, ema_params, batch, rng, step):
             data = (jnp.asarray(batch["image"], dtype=jnp.float32) - 127.5) / 127.5
             noise_level, noise = batch["t"], batch["noise"]
             rates = self.noise_schedule.get_rates(noise_level, get_coeff_shapes_tuple(data))
             noisy_data, c_in, expected_output = self.model_output_transform.forward_diffusion(
                 data, noise, rates)
             inputs = self.noise_schedule.transform_inputs(noisy_data * c_in, noise_level)
-            preds = self.model.apply(variables, *inputs, train=True, rngs={"dropout": rng})
+            preds = self.model.apply(params, *inputs, train=True, rngs={"dropout": rng})
             preds = self.model_output_transform.pred_transform(noisy_data, preds, rates)
             sample_losses = self.loss_fn(preds, expected_output)
             weights = self.noise_schedule.get_weights(noise_level, get_coeff_shapes_tuple(sample_losses))
@@ -208,11 +212,11 @@ def flaxdiff_side(args, images, total, attention):
     state = trainer.state
     init = Path(args.init)
     if not init.exists():
-        save_tree(init, jax.device_get(state.variables))
+        save_tree(init, jax.device_get(state.params))
     initial = load_tree(init)
     params = jax.device_put(initial, trainer.state_sharding.params)
     state = state.replace(
-        variables=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
+        params=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
         opt_state=jax.jit(optimizer.init, out_shardings=trainer.state_sharding.opt_state)(params))
     step_fn = trainer._define_train_step(args.batch)
     rng_state = trainer.rngstate
@@ -299,6 +303,8 @@ def dew_side(args, images, total, attention):
         if not compiled:
             compiled["step"] = trainer.compile(state, batch)
         state, loss, _, _, _, committed = compiled["step"](state, batch)
+        if committed is None:
+            raise RuntimeError("the trainer's step reported no update it committed")
         # The norm of the update it committed, none (NaN) where it committed none.
         return state, loss, committed.norm / committed.count
 
@@ -330,7 +336,7 @@ def main() -> None:
     losses, norms = [], []
     trace_dir = Path(args.out).with_suffix("").resolve()
     window = TracedWindow(total, args.timing_warmup, args.profile_steps, trace_dir)
-    loss = None
+    loss = first_step_seconds = None
     compile_start = time.perf_counter()
     for step in range(total):
         window.before(step, loss)
@@ -365,7 +371,7 @@ def main() -> None:
         "host": host(),
         "loss": np.asarray(jax.device_get(losses), np.float64).tolist(),
         "grad_norm": np.asarray(jax.device_get(norms), np.float64).tolist(),
-        "lr": [float(schedule(step)) for step in range(total)],
+        "lr": [float(np.asarray(schedule(step))) for step in range(total)],
         "throughput": timed,
         "first_step_seconds": first_step_seconds,
         "flops_per_image": flops_image,

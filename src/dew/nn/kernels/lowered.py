@@ -275,6 +275,18 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
     return _read(lowered, call, unrun=unrun)
 
 
+def read_operations[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each operation of a lowered program's StableHLO module, every region's (a
+    reduction's body among them, a function no run reaches too), each once, in the order JAX lowered them
+    (`_read`): the operations it makes something of."""
+    return [made for made, _ in _read(lowered, read, unrun=True)]
+
+
+def frontend_attributes(operation: ir.Operation) -> dict[str, str]:
+    """An operation's frontend attributes (`mhlo.frontend_attributes`), each its string."""
+    return _frontend(operation.attributes)
+
+
 def operations(lowered: jax.stages.Lowered) -> list[str]:
     """The name of every operation a lowered program's StableHLO module holds, as lowered (`_read`), each once
     (a collective a `shard_map` body issues among them, `stablehlo.all_gather`)."""
@@ -374,7 +386,7 @@ def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
         return None
     stack = named.split("/")
     # Less the launch the kernel's name carries (`report.named`), so a kernel reads as itself in every call.
-    return report.kernel_of(stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1])
+    return report.kernel_of(stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1])[:2]
 
 
 def _named(location: ir.Location) -> str | None:

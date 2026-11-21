@@ -296,6 +296,10 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             if due is not None:
                 moved, moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),
                                                     (moved, moved_moments), (held, held_moments))
+            # One barrier over the layer's new rows keeps XLA from fusing their producers (an Adam's new
+            # moments feed both its new weight and the moments' writes) across the stacks' separate writes,
+            # which held slices of the stacks past a row's write on the measured CUDA builds (row 8389).
+            moved, moved_moments = jax.lax.optimization_barrier((moved, moved_moments))
             moving = _written(moving, moved, index)
             moments = {name: _written(tree, moved_moments[name], index) for name, tree in moments.items()}
             sumsq = sumsq.at[index].set(squares)

@@ -10,10 +10,11 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact, dew_path, widened
 from token_support import token_rows
 
 from dew.distributed.batches import shard_batch
+from dew.nn.backbones.layer_names import group_layers
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.nn.kernels.options import program
 from dew.objectives.lm import LMObjective
@@ -21,6 +22,7 @@ from dew.optim import OptimConfig, ParamGroup
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import compile_ahead
+from dew.training.narrow import forward_variables
 
 VOCAB, SEQ, BATCH = 128, 8, 8
 """The decoder's vocabulary, each row's length and the step's rows."""
@@ -55,13 +57,24 @@ RUN_SEEDS = 64
 """Check 1's declared seeds for a run updating in its backward against the whole step's update, sized by
 `seeds_for` paired on armada: the two updates share the layers' weights and moments, and the reference
 compared with itself does not resolve within 512 seeds."""
+RUN_CONDITIONING = 8
+"""The weighed check's declared seeds for the same site (`seeds_for(..., conditioning=True)` on armada):
+adamw's first step moves a weight by its rate times g / (|g| + eps), so at a gradient a few eps across the
+update turns on the gradient's last bits; where the unweighted check stays undecided, or one element rules
+a worst row, each element is weighed by the whole step's own rounding there (row 8752: a norm scale's
+element at seed 170, whose two float32 gradients were 1.98e-8 and 1.30e-8 from float64, ruled its row's
+worst on CUDA, the reference's own arithmetic against itself deciding the same rule red in 3 of 8 runs,
+row 10145)."""
 
 
-def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
+@pytest.mark.parametrize("barriered", [False, True], ids=["marked", "barriered"])
+def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would(barriered):
     """A scanned run of three layers that updates in its backward (`dew.nn.in_backward.scanned_run`) under
     adamw, each layer's update the optimizer's on the layer alone, moves each layer's weights as adamw's
     update of the whole tree a layer at a time moves them, on par with it (check 1): two programs, the scanned
-    one never holding the run's gradient whole, a layer below reading the layer above as its forward did."""
+    one never holding the run's gradient whole, a layer below reading the layer above as its forward did. On
+    both paths of precision's error-free transforms: their arithmetic marked to round alone, and behind a
+    barrier (`dew._cache.BARRIERED`, row 8378)."""
     from dew.nn import in_backward
 
     scanned = decoder(scan=True)
@@ -101,9 +114,12 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
     def draw(seed):
         return (jax.random.randint(jax.random.key(seed), (2, SEQ), 0, VOCAB),)
 
-    assert_as_exact(jax.jit(in_backward_step), jax.jit(whole_step(plain, layered)), draw,
-                    "a run updating in its backward", seeds=RUN_SEEDS,
-                    truth_fn=jax.jit(whole_step(wide, widened(layered))))
+    from dew import _cache
+
+    with _cache.BARRIERED(new_value=barriered):
+        assert_as_exact(jax.jit(in_backward_step), dew_path(jax.jit(whole_step(plain, layered))), draw,
+                        "a run updating in its backward", seeds=RUN_SEEDS,
+                        truth_fn=jax.jit(whole_step(wide, widened(layered))), conditioning=RUN_CONDITIONING)
 
 
 SHARED_SEEDS = 64
@@ -178,43 +194,52 @@ def test_a_scanned_steps_runs_train_under_each_update(optimizer, wider):
     assert int(jax.device_get(moved.updates)) == 3
 
 
-@pytest.mark.parametrize("generation, dtype", [("sm90", "float32"), ("sm80", "bfloat16")])
-def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
-    """The scanned step that updates in its backward (row 4098) holds none of the run's gradient, compiled
-    for a GPU (`compile_ahead`), under bf16 copies of float32 weights too, where the masters' update is the
-    backward's. Its reference is the same scanned step under global-norm clipping, which holds the whole
-    gradient: clipping by the norm of every leaf can update no leaf before every leaf's norm is known, so
-    the stacked gradient is whole at once there, whatever its program. The updating step's temporaries are
-    then at most the clipped step's, less that gradient's bytes (each of the run's stacked weights, the
-    leaves a layer of `LAYERS` holds a row of, at the dtype its layers differentiate them in, the step's),
-    plus one layer's rows of the state the walk moves (the stacked weights as the state holds them, fp32
-    masters of bf16 copies, and the optimizer's moments of them, over the run's layers): the rows a layer's
-    update reads, which XLA keeps beside the stacks or fuses into their writes as it fuses (row 7953: one
-    barrier in the loss flipped which). Every term is read off the clipped run's abstract state. A step
-    that held the gradient again, or more than a layer's state at once, fails it; a fusion that keeps a
-    layer's rows does not."""
+@pytest.mark.parametrize("generation, dtype, width", [("sm90", "float32", None), ("sm80", "bfloat16", None),
+                                                     ("sm80", "bfloat16", 512), ("sm90", "bfloat16", 512)])
+def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, width):
+    """The scanned step that updates in its backward (row 4098), compiled for a GPU (`compile_ahead`), under
+    bf16 copies of float32 weights too, where the masters' update is the backward's, holds no more
+    temporaries than its reference: the same scanned step under global-norm clipping, whose compile holds
+    the layers' gradient whole, less that gradient (each of the layers' weights at the dtype the step
+    differentiates it in, its compute copy's where the step reads one), plus one layer's rows of the state
+    the walk moves (the layers' weights as the state holds them and the optimizer's moments of them, over
+    the run's layers): the rows a layer's update reads, which XLA keeps beside the stacks or fuses into
+    their writes as it fuses (row 7953: one barrier in the loss flipped which). A regression bound, read
+    off the clipped step's own input state: at width 512 on an A100 it catches a walk that kept slices of
+    the stacks past a layer's writes (row 8389)."""
+    wider = {} if width is None else {"emb_features": width, "mlp_features": 4 * width,
+                                      "num_heads": max(2, width // 64)}
+
     def built(optimizer: OptimConfig):
         gpu = compile_only_gpus(generation, 1, 80 * 2**30)
-        run = Trainer(LMObjective(decoder(scan=True, dtype=dtype, num_layers=LAYERS), SEQ), optimizer,
+        model = decoder(scan=True, dtype=dtype, num_layers=LAYERS, **wider)
+        run = Trainer(LMObjective(model, SEQ), optimizer,
                       key=jax.random.key(0), mesh=MeshSpec().build(gpu),
                       layout=Layout(min_shard=TINY_SHARD), split=1, accumulation=1, checkpoints=None,
                       tracker=None)
         run.validate(steps=8)
         return run
 
-    def stacked(tree) -> list:
-        return [leaf for leaf in jax.tree.leaves(tree) if leaf.shape[:1] == (LAYERS,)]
+    def layer_leaves(tree) -> list:
+        # The layers' leaves: under a layer's own tree (`layers_<i>`) or a run's stacked one
+        # (`layers_<a>_<b>`, a staged start's `stages/<run>`), `group_layers`'s names.
+        leaves = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+                  if any(isinstance(key, jax.tree_util.DictKey) and isinstance(key.key, str)
+                         and group_layers(key.key) is not None for key in path)]
+        assert leaves, jax.tree_util.tree_structure(tree)
+        return leaves
 
-    def held(leaves, dtype=None) -> int:
-        return sum(int(np.prod(leaf.shape)) * np.dtype(dtype or leaf.dtype).itemsize for leaf in leaves)
+    def held(leaves) -> int:
+        return sum(int(np.prod(leaf.shape)) * np.dtype(leaf.dtype).itemsize for leaf in leaves)
 
     updating = compile_ahead(built(ADAMW), token_rows(VOCAB, 1, SEQ + 1)).temp_bytes
     run = built(dataclasses.replace(ADAMW, clip_grads=1.0))
     clipped = compile_ahead(run, token_rows(VOCAB, 1, SEQ + 1)).temp_bytes
-    state = jax.eval_shape(run.initial_state)
-    weights = stacked(state.variables["params"])
-    gradient = held(weights, dtype)
-    rows = (held(weights) + held(stacked(state.opt_state))) // LAYERS
+    executable = run.executable
+    assert executable is not None
+    (state, *_), _ = executable.args_info
+    gradient = held(layer_leaves(forward_variables(state.variables, state.compute)["params"]))
+    rows = (held(layer_leaves(state.variables["params"])) + held(layer_leaves(state.opt_state))) // LAYERS
     assert updating <= clipped - gradient + rows, (updating, clipped, gradient, rows)
 
 

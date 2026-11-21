@@ -48,6 +48,8 @@ from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
     Artifact,
+    Batched,
+    BatchedGroups,
     Combined,
     Concatenated,
     FlatMap,
@@ -139,21 +141,23 @@ def _materialize(
     counts: dict[str, CorpusCounts],
     *,
     training: bool = True,
+    sealing: bool = False,
 ) -> Pipeline:
     if isinstance(pipeline.source, Phases):
         raise ValueError("materialize each phase before constructing its global order")
     if isinstance(pipeline.source, Concatenated):
         # Each member held as its own read holds it; the join reads them where it stands.
         return with_children(
-            pipeline, lambda child: _materialize(child, counts, training=training))
+            pipeline, lambda child: _materialize(child, counts, training=training, sealing=sealing))
     if isinstance(pipeline.source, Combined):
-        return _memory_mixture(pipeline, pipeline.source, counts, training=training)
+        return _memory_mixture(pipeline, pipeline.source, counts, training=training, sealing=sealing)
     source = pipeline.source
     stored = source.records("memory")
     counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline), _label(pipeline)))
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
-    lowering = _analyzed(pipeline, "memory", validation=not training)
+    # A sealing pass's draws stand as its records do (`compile._prepared`'s `sealing`).
+    lowering = _analyzed(pipeline, "memory", validation=not training, sealing=sealing)
     # A cache among the eager stages fills over the whole source here; one after a view of the
     # inputs is the lowering's, which reads it by input (`_Build.indexed`).
     eager = lowering.cache if lowering.cache is not None and lowering.eager > lowering.cache else None
@@ -280,6 +284,14 @@ def _memory_stages(
                                       stage.fields[0], rule)
         elif isinstance(stage, Pack):
             rows, targets, documents = _memory_pack(stage, rows, source, counter, derived, consumed - placed)
+        elif isinstance(stage, Batched):
+            # A same-rows batched step (`analysis` runs no other here) over the source's own consecutive
+            # records, each row keeping its identity, so a global shuffle after it reads them (row 9784).
+            groups = BatchedGroups(stage)
+            rows = [(identifier, value) for start in range(0, len(rows), stage.size)
+                    for (identifier, _), value in zip(
+                        rows[start:start + stage.size],
+                        groups.flat_map([value for _, value in rows[start:start + stage.size]]), strict=True)]
         else:
             if isinstance(stage, FlatMap) and stage.examples and examples is None:
                 # The corpus counts its source examples, so its counts are taken here, before an
@@ -484,28 +496,23 @@ def _memory_mixture(
     counts: dict[str, CorpusCounts],
     *,
     training: bool,
+    sealing: bool = False,
 ) -> Pipeline:
-    children = tuple(_measured_targets(_materialize(child, counts, training=training),
+    children = tuple(_measured_targets(_materialize(child, counts, training=training, sealing=sealing),
                                        mixture)
                      for child in mixture.pipelines)
-    kept = tuple(
-        (child, weight)
-        for child, weight in zip(children, mixture.weights, strict=True)
-        if isinstance(child.source, Combined) or len(child.source.records("memory"))
-    )
-    omitted = [_name(child) for child in children if all(child is not accepted for accepted, _ in kept)]
-    if omitted:
-        _log.warning("left out of the mixture: %s (zero accepted rows)", ", ".join(omitted))
-    if not kept:
-        if not training:
-            return dataclasses.replace(children[0], stages=(*children[0].stages, *pipeline.stages))
-        raise ValueError(
-            f"no accepted row of {', '.join(_name(child) for child in children)}; raise the row budgets"
-        )
-    children, weights = zip(*kept, strict=True)
-    return dataclasses.replace(
-        pipeline, source=dataclasses.replace(mixture, pipelines=tuple(children), weights=tuple(weights))
-    )
+    # A mix ends at its first exhausted member, as an online read of it does (docs/design/data.md, combine):
+    # a member that accepted no row ends it before its first row, every member kept with its weight
+    # (row 9008: the member and its weight were dropped, and the read went on past that end).
+    empty = [child for child in children
+             if not isinstance(child.source, Combined) and not len(child.source.records("memory"))]
+    if empty and training:
+        raise ValueError(f"no accepted row of {', '.join(_name(child) for child in empty)}: a mix ends at "
+                         "its first exhausted member, so it reads none; raise the row budgets, or mix "
+                         "without the member")
+    if empty:
+        return dataclasses.replace(empty[0], stages=(*empty[0].stages, *pipeline.stages))
+    return dataclasses.replace(pipeline, source=dataclasses.replace(mixture, pipelines=children))
 
 
 def _memory_order(

@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import functools
 import itertools
+import math
 from collections.abc import Callable
 
 import jax
@@ -16,7 +17,17 @@ import numpy as np
 import pytest
 import tiny_models
 from arm_arithmetic import on_float64_device
-from contract_support import normal_float32
+from arm_forms import ROUNDED
+from contract_support import (
+    ADDS,
+    CANCELLING_LEVELS,
+    FORKED,
+    GIVEN,
+    HELD,
+    cancelling_entries,
+    cancelling_orbit,
+    normal_float32,
+)
 from delta_rule_support import stacked_documents
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
@@ -33,7 +44,13 @@ from reference_error import (
     with_gradients,
 )
 
-from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
+from dew.nn.kernels import (
+    chunked_launch,
+    generation,
+    recurrence,
+    recurrence_algebra as algebra,
+    recurrence_chunk,
+)
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates import bundles
 from dew.nn.precision import l2norm
@@ -162,6 +179,11 @@ independently by `seeds_for` on armada (2026-10-21; the readouts apart 2026-11-1
 memory entering and a document starting on a chunk's first token."""
 
 
+PACKED_DOCUMENTS = ((0, 23, 40), (9, 48))
+"""`draw`'s packed documents, the turned and transition sites' too: each row's documents' first tokens, a
+row's first continuing its given memory."""
+
+
 def marked(documents, length: int) -> np.ndarray:
     """Each row's `documents` (its documents' first tokens) as the `[rows, length]` marks of those tokens."""
     starts = np.zeros((len(documents), length), bool)
@@ -260,7 +282,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     if hooks.output is not None:
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
-    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), length)) if packed else None
+    starts = jnp.asarray(marked(PACKED_DOCUMENTS, length)) if packed else None
     own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
@@ -271,7 +293,8 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     """The sequence a token at a time through the decode step's reference, a packed document's first
-    token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype. Host
+    token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype. A
+    token's updates (`Hooks.substeps`) its keys', values' and write gates' in turn, the step's own axis. Host
     operands are taken as JAX arrays: a float64 truth's first call runs on the gate's widened host arrays,
     which the scan's traced token can't index."""
     operands = jax.tree.map(jnp.asarray, operands)
@@ -279,8 +302,16 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     query, key = (jnp.repeat(x, group, axis=2) for x in (operands.query, operands.key))
     work = jnp.promote_types(operands.value.dtype, jnp.float32)
     state = operands.state.astype(work)
-    rows, length = operands.value.shape[:2]
+    rows, length = operands.query.shape[:2]
     starts = jnp.zeros((rows, length), bool) if operands.starts is None else jnp.asarray(operands.starts)
+
+    def by_token(x):
+        # A token's updates (`Hooks.substeps`) on an axis of their own, the step's.
+        if x is None or hooks.substeps == 1:
+            return x
+        return x.reshape(rows, length, hooks.substeps, *x.shape[2:])
+
+    key, value, beta = by_token(key), by_token(operands.value), by_token(operands.beta)
 
     def one_token(state, t):
         state = jnp.where(starts[:, t, None, None, None], 0.0, state)
@@ -288,10 +319,12 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
             return None if x is None else x[:, t]
 
         token = recurrence.Step(
-            state, query=query[:, t], key=key[:, t], value=operands.value[:, t],
+            state, query=query[:, t], key=key[:, t], value=value[:, t],
             log_decay=at(operands.log_decay), gate=at(operands.gate), log_a=operands.log_a,
-            bias=operands.bias, beta=at(operands.beta), skip=operands.skip, z=at(operands.z),
-            weight=operands.weight, rate=operands.rate, own=operands.own, turn=at(operands.turn))
+            bias=operands.bias, beta=at(beta), skip=operands.skip, z=at(operands.z),
+            weight=operands.weight, rate=operands.rate, own=operands.own, turn=at(operands.turn),
+            erase_key=at(operands.erase_key), erase_read=at(operands.erase_read),
+            value_decay=at(operands.value_decay))
         out, _, state = recurrence.step_reference(hooks, token)
         return state, out
 
@@ -301,18 +334,24 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
 
 def release(hooks: recurrence.Hooks) -> str | None:
     """The upstream library a form's family has a release of, whose own code is its oracle (testing.md): fla's
-    for the delta rule, mamba_ssm's for the rated scan; None for a write gate without the delta rule, whose
-    oracle is the recurrence a token at a time (`token_by_token`)."""
-    return "fla" if hooks.delta else "mamba_ssm" if hooks.rated else None
+    for the delta rule and for its simple GLA (lightning attention's, `recurrence_chunk.simple_gla`),
+    mamba_ssm's for the rated scan; None for a write gate without the delta rule, whose oracle is the
+    recurrence a token at a time (`token_by_token`)."""
+    if hooks.delta or recurrence_chunk.simple_gla(hooks):
+        return "fla"
+    return "mamba_ssm" if hooks.rated else None
 
 
 def oracle(hooks: recurrence.Hooks, dtype) -> str | None:
     """A cell's independent oracle at `dtype` (testing.md): its form's release (`release`) where the run's
     declaration admits that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's
-    TF32 at no more than the default), else None, the recurrence a token at a time: no run of the release
-    computes the call's numbers there."""
+    TF32 at no more than the default) and its route takes the release's numbers (a simple GLA's under the
+    fast forms alone, `recurrence_chunk.chunk_rounding`), else None, the recurrence a token at a time: no run
+    of the release computes the call's numbers there."""
     found = release(hooks)
-    return found if found is not None and recurrence_chunk.upstream_precision(dtype) else None
+    taken = hooks.delta or hooks.rated or recurrence_chunk.chunk_rounding(delta=False, dtype=dtype,
+                                                                          released=True)
+    return found if found is not None and taken and recurrence_chunk.upstream_precision(dtype) else None
 
 
 def against_the_portable_math(label: str, dew_fn, portable_fn, draw, truth_fn, seeds: int) -> str | None:
@@ -355,6 +394,149 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
                     seeds=SEEDS[hooks, packed])
 
 
+DELTA_PRODUCTS = [recurrence.Hooks(decay='scalar', l2norm=True, substeps=2),
+                  recurrence.Hooks(decay='vector', l2norm=True, substeps=3)]
+"""DeltaProduct's forms (`Hooks.substeps`): Gated DeltaProduct's, a decay a head over two updates a token
+(fla's `chunk_gated_delta_product`), and a decay a key dimension over three."""
+
+
+def substepped_draw(hooks: recurrence.Hooks, seed: int):
+    """`draw`'s operands of `LENGTH` tokens of `hooks.substeps` updates each, and cotangents: its keys,
+    values and write gates fresh at every update, its queries and decays a token's."""
+    (laid,) = draw(hooks, packed=False, seed=seed, length=LENGTH * hooks.substeps)
+    every = hooks.substeps
+    operands = dataclasses.replace(laid, query=laid.query[:, ::every], log_decay=laid.log_decay[:, ::every])
+    out, final = cotangents(laid, seed)
+    return operands, (out[:, ::every], final)
+
+
+@pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
+@pytest.mark.parametrize('hooks', DELTA_PRODUCTS, ids=['two updates a head', 'three updates a key dimension'])
+def test_a_delta_products_chunks_are_as_exact_as_its_tokens(hooks, packed):
+    """DeltaProduct (`Hooks.substeps`) on the chunked op's portable math, its updates the op's tokens in
+    turn, against the decode step's reference a token at a time, its updates on their own axis
+    (`token_by_token`): the output, the final memory and every operand's gradient from float64 (check 1, row
+    9030)."""
+    # Packed documents at `draw`'s tokens, marked outside the differentiated operands.
+    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), LENGTH)) if packed else None
+
+    def differentiated(fn):
+        return jax.jit(with_gradients(lambda operands: fn(dataclasses.replace(operands, starts=starts))))
+
+    assert_as_exact(differentiated(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)),
+                    differentiated(functools.partial(token_by_token, hooks)),
+                    functools.partial(substepped_draw, hooks), f'{hooks} packed={packed}', seeds=8)
+
+
+def substepped_entered_draw(hooks: recurrence.Hooks, seed: int):
+    """`entered_draw`'s forked operands, entry writes among them, of `LENGTH` tokens of `hooks.substeps`
+    updates each, and cotangents: its keys, values and write gates fresh at every update, its queries and
+    decays a token's."""
+    operands, (out, final) = entered_draw(hooks, seed, entries=True, length=LENGTH * hooks.substeps)
+    every = hooks.substeps
+    return (dataclasses.replace(operands, query=operands.query[:, ::every],
+                                log_decay=operands.log_decay[:, ::every]), (out[:, ::every], final))
+
+
+@pytest.mark.parametrize('by_firsts', [False, True], ids=['starts', 'firsts'])
+def test_a_forked_delta_products_documents_are_as_exact_as_each_alone(by_firsts):
+    """Gated DeltaProduct (`DELTA_PRODUCTS[0]`) over a forked call on the chunked op's portable math, each
+    document entering its table slot's memory with its entry write, the documents given by their starts or
+    their first slots alone (`Chunk.firsts`, a token's, which its updates scale): output, last memory and
+    every gradient against each document alone a token at a time (`document_by_document`) from float64
+    (check 1, row 9030)."""
+    hooks = DELTA_PRODUCTS[0]
+
+    def ours(operands):
+        return chunk_on('xla', hooks, entering_documents(operands, by_firsts=by_firsts), chunk_size=CHUNK)
+
+    assert_as_exact(jax.jit(with_gradients(ours)),
+                    jax.jit(with_gradients(functools.partial(document_by_document, hooks))),
+                    functools.partial(substepped_entered_draw, hooks),
+                    f'{hooks} forked by_firsts={by_firsts}', seeds=8)
+
+
+def stepped(hooks: recurrence.Hooks, state, query, key, value, log_decay, beta):
+    """A decode token of `hooks` through `recurrence.step`: `(output, state')`."""
+    token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+    out, _, updated = recurrence.step(hooks, token)
+    return out, updated
+
+
+def delta_product_token(state, query, key, value, log_decay, beta):
+    """A DeltaProduct decode token as its paper writes it, a value head per key head: the memory `[R, H, K,
+    V]` decayed once, `exp(g) S`, then each of its updates `S + beta_j k_j (v_j - S^T k_j)^T` in turn, read
+    after the last, `S^T q`: `(output [R, H, V], memory)` (Siems et al. 2025, eq. 3; fla's
+    `naive_gated_delta_product`)."""
+    state = jnp.exp(log_decay)[..., None, None] * state
+    for update in range(key.shape[1]):
+        k, v, b = key[:, update], value[:, update], beta[:, update]
+        corrected = v - jnp.einsum('rhkv,rhk->rhv', state, k)
+        state = state + b[..., None, None] * k[..., :, None] * corrected[..., None, :]
+    return jnp.einsum('rhkv,rhk->rhv', state, query), state
+
+
+def test_a_delta_product_decode_token_is_as_exact_as_its_recurrence():
+    """A decode token of three updates (`Hooks.substeps`) through the public step (`recurrence.step`):
+    output, memory and every gradient against the token as DeltaProduct's paper writes it
+    (`delta_product_token`: decayed once, read after its last update) from float64 (check 1, row 9030)."""
+    hooks = recurrence.Hooks(decay='scalar', substeps=3)
+
+    def draw(seed):
+        normal = np.random.default_rng([9030, seed]).standard_normal
+        rows, heads, keys, values = 2, 2, KEY_WIDTH, VALUE_WIDTH
+        operands = (hosted(0.3 * normal((rows, heads, keys, values))), hosted(normal((rows, heads, keys))),
+                    hosted(unit(normal((rows, 3, heads, keys)))), hosted(normal((rows, 3, heads, values))),
+                    hosted(-softplus(normal((rows, heads)))), hosted(sigmoid(normal((rows, 3, heads)))))
+        return *operands, (hosted(normal((rows, heads, values))), hosted(normal((rows, heads, keys, values))))
+
+    assert_as_exact(jax.jit(with_gradients(functools.partial(stepped, hooks))),
+                    jax.jit(with_gradients(delta_product_token)), draw, 'a DeltaProduct decode token',
+                    seeds=8)
+
+
+def test_a_delta_products_decode_memory_is_wide_between_its_updates():
+    """A decode token of two updates (`Hooks.substeps`) on a bf16 memory from zero, one key and value, no
+    decay and a unit query: the first writes the fp32 midpoint `m` of two adjacent bf16 values (a gate of
+    one), the second its negative under a gate of one half, `m + (-m - m) / 2`: output and memory exactly
+    zero, the memory held in fp32 between the updates (`recurrence._substeps`), where rounded to bf16 after
+    the first its residual is half that rounding's."""
+    midpoint = (1.0 + 2.0 ** -8) * 2.0 ** -3
+    token = recurrence.Step(jnp.zeros((1, 1, 1, 1), jnp.bfloat16), query=jnp.ones((1, 1, 1), jnp.float32),
+                            key=jnp.ones((1, 2, 1, 1), jnp.float32),
+                            value=jnp.asarray([midpoint, -midpoint], jnp.float32).reshape(1, 2, 1, 1),
+                            log_decay=jnp.zeros((1, 1), jnp.float32),
+                            beta=jnp.asarray([1.0, 0.5], jnp.float32).reshape(1, 2, 1))
+    out, _, updated = recurrence.step(recurrence.Hooks(decay='scalar', substeps=2, scale=1.0), token)
+    assert (out.astype(jnp.float32).ravel().tolist(), updated.astype(jnp.float32).ravel().tolist()) == (
+        [0.0], [0.0])
+
+
+@pytest.mark.parametrize(('substeps', 'form'), [(2, {'delta': False}), (2, {'reads': 'before'}),
+                                               (2, {'erase': 'untied'}), (2, {'rated': True}), (0, {})],
+                         ids=['no delta rule', 'read before', 'an erase of its own', 'rated', 'none'])
+def test_a_delta_product_outside_its_form_is_refused(substeps, form):
+    """Substeps (`Hooks.substeps`) outside DeltaProduct's form, a token's delta-rule updates read after its
+    last: a ValueError, beside an erase of its own whose laid tokens are a layout of their own (row 9030)."""
+    with pytest.raises(ValueError):
+        recurrence.Hooks(decay='scalar', substeps=substeps, **form)
+
+
+@pytest.mark.parametrize('stream', ['key', 'value', 'beta'])
+def test_a_delta_product_token_of_another_count_of_updates_is_refused(stream):
+    """A decode token of three updates (`Hooks.substeps`) given two of one stream, its keys', values' or
+    write gates': a ValueError, where the step took the updates it was given and left the third out (row
+    9030)."""
+    hooks = recurrence.Hooks(decay='scalar', substeps=3)
+    shapes = {'key': (1, 3, 1, 4), 'value': (1, 3, 1, 2), 'beta': (1, 3, 1)}
+    given = {name: jnp.ones((shape[0], 2 if name == stream else 3, *shape[2:]))
+             for name, shape in shapes.items()}
+    token = recurrence.Step(jnp.zeros((1, 1, 4, 2)), query=jnp.ones((1, 1, 4)),
+                            log_decay=jnp.zeros((1, 1)), **given)
+    with pytest.raises(ValueError):
+        recurrence.step(hooks, token)
+
+
 TURNED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True, turns=KEY_WIDTH // 2 - 2)
 """Mamba-3's form: a decay a head's, a write gate, the skip, and the state's first key pairs turned each token
 (`Hooks.turns`), two pairs unturned. Its sites' oracle is the recurrence a token at a time, the spec's own
@@ -365,18 +547,14 @@ and angles to bf16 (mamba_ssm/ops/triton/mamba3/mamba3_siso_combined.py:384-392)
 layer sites are held to it recorded (row 7923)."""
 
 
-TURNED_DOCUMENTS = ((0, 23, 40), (9, 48))
-"""The turned sites' packed documents' first tokens: a row's first continuing its given memory."""
-
-
 def steep_draw(seed: int):
-    """`draw`'s operands for `TURNED` and cotangents, each row's even documents (`TURNED_DOCUMENTS`) decaying
+    """`draw`'s operands for `TURNED` and cotangents, each row's even documents (`PACKED_DOCUMENTS`) decaying
     steeply, each token's log decay in (-120, -60), its others mildly, in (-1, 0): a chunk's earlier
     document's prefix past its later one's by more than fp32's exponents span."""
     (operands,) = draw(TURNED, packed=False, seed=seed)
     tokens = np.arange(LENGTH)
     steep = np.stack([np.sum(tokens[:, None] >= np.asarray(begins)[None, :], axis=1) % 2 == 1
-                      for begins in TURNED_DOCUMENTS])
+                      for begins in PACKED_DOCUMENTS])
     rng = np.random.default_rng([seed, 8288])
     mild = rng.uniform(-1.0, 0.0, operands.log_decay.shape)
     log_decay = np.where(steep[..., None], rng.uniform(-120.0, -60.0, operands.log_decay.shape), mild)
@@ -386,7 +564,7 @@ def steep_draw(seed: int):
 
 VANISHED = (5, 9, 30, 33)
 """The tokens whose decays vanish in `vanishing`'s draws: two in one chunk of each row's first two
-documents (`TURNED_DOCUMENTS`, `CHUNK`)."""
+documents (`PACKED_DOCUMENTS`, `CHUNK`)."""
 
 
 def vanishing(operands):
@@ -411,8 +589,9 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
     """A state that turns its key pairs (`Hooks.turns`, Mamba-3's rotating basis) through `chunk`'s portable
     math in `CHUNK`-token chunks against the same recurrence a token at a time: output, final memory and
     every operand's gradient, the turns' among them, from float64 (check 1). A turn's gradient is the
-    replay's, of the state entering its token and the cotangent leaving it (row 7419: a turn read as an
-    angle summed over a document cancelled across its tokens to 120 times the recurrence's error). Under
+    crossing form's (`templates.recurrence.turned.turn_gradient`), its pairs' scores' cotangents across each
+    token (row 7419: a turn read as an angle summed over a document cancelled across its tokens to 120 times
+    the recurrence's error; rows 7971, 7978). Under
     steep decays (`steep_draw`) a chunk's earlier document's writers lie past fp32's exponents from its last
     one's end, which the turns' gradient weighed by `exp` of their difference before it took them out, NaN
     (base review fbb1c2f71 F2); under vanishing decays (`vanishing_draw`, two of -2^127 in a chunk) its
@@ -428,8 +607,377 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
         return operands, cotangents(operands, seed)
 
     drawing = {None: drawn, 'steep': steep_draw, 'vanishing': vanishing_draw}[regime]
-    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=TURNED_DOCUMENTS,
+    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=PACKED_DOCUMENTS,
                          length=LENGTH, seeds=32)
+
+
+OJA = recurrence.Hooks(decay='vector', erase='values', scale=KEY_WIDTH ** -0.5)
+"""Oja's rule with a gate a value dimension (`Hooks.erase` 'values', fla's gated_oja_rule), row 9028."""
+
+
+def oja_token(state, query, key, value, log_decay, beta):
+    """A decode token of Oja's rule as its paper writes it, a value head per key head: the memory `S` `[R, H,
+    K, V]` decayed along its values and its values erased from it, then written, `S D (I - beta v v^T) + beta
+    k v^T`, `D = exp(log_decay)` `[R, H, V]`, read after, `q^T S'`."""
+    decayed = state * jnp.exp(log_decay)[..., None, :]
+    erased = jnp.einsum('rhkv,rhv->rhk', decayed, value)
+    beta_ = beta[..., None, None]
+    written = beta_ * key[..., :, None] * value[..., None, :]
+    updated = decayed - beta_ * erased[..., None] * value[..., None, :] + written
+    return jnp.einsum('rhk,rhkv->rhv', query, updated), updated
+
+
+def test_an_oja_decode_token_is_as_exact_as_its_formula():
+    """A decode token of Oja's rule (`OJA`, scale one) through the public step (`recurrence.step`): output,
+    memory and every gradient against the token as its paper writes it (`oja_token`) from float64 (check 1,
+    row 9028)."""
+    hooks = dataclasses.replace(OJA, scale=1.0)
+    rows, heads, keys, values = 8, 4, KEY_WIDTH, VALUE_WIDTH
+
+    def draw(seed):
+        rng = np.random.default_rng([9028, seed])
+        normal = rng.standard_normal
+        operands = (0.3 * normal((rows, heads, keys, values)), normal((rows, heads, keys)),
+                    unit(normal((rows, heads, keys))), unit(normal((rows, heads, values))),
+                    -rng.uniform(0, 1, (rows, heads, values)), rng.uniform(0, 1, (rows, heads)))
+        seeded = (normal((rows, heads, values)), normal((rows, heads, keys, values)))
+        return *(hosted(x) for x in operands), tuple(hosted(x) for x in seeded)
+
+    assert_as_exact(jax.jit(with_gradients(functools.partial(stepped, hooks))),
+                    jax.jit(with_gradients(oja_token)), draw, "an oja decode token", seeds=8)
+
+
+def oja_edge(state, key, value, beta):
+    """A decode token of Oja's rule over one key, a query of one, no decay and scale one, in fp32 (`OJA`'s
+    through `recurrence.step`): `(output, memory)` of a memory `state` `[Dv]`, a key `key` `[1]`, values
+    `value` `[Dv]` and a write gate `beta`."""
+    def held(x, *shape):
+        return jnp.reshape(jnp.asarray(x, jnp.float32), (1, 1, *shape))
+
+    token = recurrence.Step(held(state, 1, len(state)), query=held([1.0], 1), key=held(key, 1),
+                            value=held(value, len(value)), log_decay=jnp.zeros((1, 1), jnp.float32),
+                            beta=held(beta))
+    out, _, updated = recurrence.step(dataclasses.replace(OJA, decay='scalar', scale=1.0), token)
+    return out.ravel(), updated.ravel()
+
+
+@pytest.mark.parametrize(('state', 'key', 'value', 'beta', 'expected'), [
+    ([-2.0 ** 127], [2.0 ** 127], [1.0], 0.25, [-2.0 ** 126]),
+    ([2.0 ** 120, 0.0], [0.0], [2.0 ** -60, 1.0], 2.0 ** -100, [2.0 ** 120, -2.0 ** -40]),
+    ([2.0 ** 127] * 4, [0.0], [0.5] * 4, 0.25, [2.0 ** 127 - 2.0 ** 125] * 4)],
+    ids=['a correction past the largest', 'a gated value past the least', 'an ungated read past the largest'])
+def test_an_oja_decode_tokens_gate_scales_its_formed_correction(state, key, value, beta, expected):
+    """A decode token of Oja's rule (`oja_edge`), its memory and output exact in fp32: the gated correction
+    `beta k - beta v^T S^T` one exact sum, which neither its ungated parts past fp32's largest (2^128) nor
+    `beta v` past its least (2^-160) loses."""
+    out, updated = oja_edge(state, key, value, beta)
+    assert (out.tolist(), updated.tolist()) == (expected, expected)
+
+
+def test_an_oja_decode_tokens_gate_gradient_sums_its_terms_exactly():
+    """The gate's derivative of a decode token of Oja's rule (`oja_edge`) at a memory `[2^31, 2, 0, 0]`,
+    values of 1/2 and a key of 2^30: its write's `k` 2^30 and its erase's read `v^T S^T` 2^30 + 1, summed
+    exactly, give twice its second output's -1, where each rounded apart cancelled to zero."""
+    def second(beta):
+        return 2.0 * oja_edge([2.0 ** 31, 2.0, 0.0, 0.0], [2.0 ** 30], [0.5] * 4, beta)[0][1]
+
+    assert float(jax.grad(second)(jnp.float32(0.25))) == -1.0
+
+
+RWKV7_FLOOR = -math.exp(-0.5)
+"""RWKV7's least log decay, `w = exp(-e^{-1/2} sigmoid(x))`'s."""
+
+ADDITIVE = recurrence.Hooks(decay='vector', erase='additive', scale=KEY_WIDTH ** -0.5)
+"""RWKV7's additive diagonal plus low rank, a token erasing along its own vector the state it enters beside
+its write (`recurrence_chunk._erases_laid`, `linear_scan.Affine.erased_before`)."""
+
+UNTIED = recurrence.Hooks(decay='vector', erase='untied', scale=KEY_WIDTH ** -0.5)
+"""GDN-2's and Comba's erase vectors of their own under a decay a key dimension's, which laid tokens take."""
+
+TRANSITIONS = [
+    pytest.param(recurrence.Hooks(decay='scalar', erase='untied', scale=KEY_WIDTH ** -0.5), id='untied'),
+    pytest.param(UNTIED, id='untied per key'),
+    pytest.param(ADDITIVE, id='additive'),
+    pytest.param(recurrence.Hooks(decay='scalar', delta=False, write_gate=True, value_decay=True),
+                 id='two-sided')]
+"""The delta rule's transitions beside its tied erase and a decay along the keys (`Hooks.erase`,
+`Hooks.value_decay`, row 9029): GDN-2's and Comba's erase vectors of their own, a head's and a key
+dimension's decay; RWKV7's additive diagonal plus low rank, its tokens erasing the state they enter (row
+9670); two-sided GLA's decay along the values (Oja's rule's erase along the values, row 9028:
+test_gated_oja)."""
+
+
+def transition_draw(hooks: recurrence.Hooks, seed: int):
+    """`draw`'s operands for `hooks` and cotangents, with its transition's own (`transitioned`)."""
+    (operands,) = draw(hooks, packed=False, seed=seed)
+    operands = transitioned(hooks, operands, seed)
+    return operands, cotangents(operands, seed)
+
+
+def transitioned(hooks: recurrence.Hooks, operands, seed: int):
+    """`operands` with `hooks`' transition's own: erase vectors of unit norm (`erase_key`, `erase_read`;
+    RWKV7's, additive, `a` scaled so `a b^T` stays inside the decay, a key's `exp(g) / 2` at most), or a log
+    decay along the values in (-1, 0) (`value_decay`). An additive erase's log decays RWKV7's, in
+    `[-exp(-1/2), 0]`, every seventh at its least."""
+    rng = np.random.default_rng([9029, seed])
+    if hooks.erase == 'additive':
+        steps = rng.uniform(RWKV7_FLOOR, 0.0, operands.log_decay.shape)
+        steps[:, ::7] = RWKV7_FLOOR
+        operands = dataclasses.replace(operands, log_decay=hosted(steps))
+    keys = operands.key.shape
+    if hooks.erase in ('untied', 'additive'):
+        a, b = (unit(rng.standard_normal(keys)) for _ in range(2))
+        if hooks.erase == 'additive':
+            a = 0.5 * np.exp(np.asarray(operands.log_decay, np.float64))[:, :, :keys[2]] * a
+        operands = dataclasses.replace(operands, erase_key=hosted(a), erase_read=hosted(b))
+    if hooks.value_decay:
+        across = rng.uniform(-1.0, 0.0, operands.value.shape)
+        operands = dataclasses.replace(operands, value_decay=hosted(across))
+    return operands
+
+
+@pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
+@pytest.mark.parametrize('hooks', TRANSITIONS)
+def test_a_transitions_chunks_are_as_exact_as_its_tokens(hooks, packed):
+    """Each transition (`TRANSITIONS`) through the chunked op, which the portable math takes (its forms the
+    token update's derived, `scan.derive_scan`), against the decode step's reference a token at a time
+    (`token_by_token`): output, final memory and every operand's gradient from float64 (check 1, row
+    9029)."""
+    def ours(operands, starts=None):
+        return chunk(hooks, dataclasses.replace(operands, starts=starts), chunk_size=CHUNK)
+
+    def tokens(operands, starts=None):
+        return token_by_token(hooks, dataclasses.replace(operands, starts=starts))
+
+    assert_packed_on_par(ours, tokens, functools.partial(transition_draw, hooks), f'{hooks}', packed=packed,
+                         documents=PACKED_DOCUMENTS, length=LENGTH, seeds=8)
+
+
+def transition_token(kind: str, state, query, key, value, log_decay, beta, a, b, e):
+    """A decode token of each transition as its papers write it, a value head per key head, its memory `S`
+    `[R, H, K, V]` read after its update, `q^T S'`: 'untied' (GDN-2's, Comba's) `(I - beta a b^T) D S + beta
+    k v^T`; 'additive' (RWKV7's) `(D - a b^T) S + beta k v^T`; 'two-sided' (GLA's value gates) `D S E + beta
+    k v^T`. `D` and `E` the exponents' `exp`, a key's and a value's each (`log_decay` `[R, H, K]`, `e` `[R,
+    H, V]`); Oja's rule's is `oja_token`."""
+    beta_ = beta[..., None, None]
+    written = beta_ * key[..., :, None] * value[..., None, :]
+    decayed = jnp.exp(log_decay)[..., None] * state
+    if kind == 'untied':
+        erased = jnp.einsum('rhk,rhkv->rhv', b, decayed)
+        updated = decayed - beta_ * a[..., :, None] * erased[..., None, :]
+    elif kind == 'additive':
+        updated = decayed - a[..., :, None] * jnp.einsum('rhk,rhkv->rhv', b, state)[..., None, :]
+    else:
+        updated = decayed * jnp.exp(e)[..., None, :]
+    updated = updated + written
+    return jnp.einsum('rhk,rhkv->rhv', query, updated), updated
+
+
+TRANSITION_TOKENS = {'untied': recurrence.Hooks(decay='vector', erase='untied', scale=1.0),
+                     'additive': recurrence.Hooks(decay='vector', erase='additive', scale=1.0),
+                     'two-sided': recurrence.Hooks(decay='vector', delta=False, write_gate=True,
+                                                   value_decay=True, scale=1.0)}
+"""Each transition's decode form (`transition_token`'s kinds), its decay a key dimension's."""
+
+
+@pytest.mark.parametrize('kind', list(TRANSITION_TOKENS))
+def test_a_transitions_decode_token_is_as_exact_as_its_formula(kind):
+    """A decode token of each transition (`TRANSITION_TOKENS`) through the public step (`recurrence.step`):
+    output, memory and every gradient against the token as its paper writes it (`transition_token`) from
+    float64 (check 1, row 9029)."""
+    hooks = TRANSITION_TOKENS[kind]
+    rows, heads, keys, values = 2, 2, KEY_WIDTH, VALUE_WIDTH
+
+    def draw(seed):
+        rng = np.random.default_rng([9029, seed])
+        normal = rng.standard_normal
+        operands = (0.3 * normal((rows, heads, keys, values)), normal((rows, heads, keys)),
+                    unit(normal((rows, heads, keys))), normal((rows, heads, values)),
+                    -rng.uniform(0, 1, (rows, heads, keys)),
+                    rng.uniform(0, 1, (rows, heads)), unit(normal((rows, heads, keys))),
+                    unit(normal((rows, heads, keys))), -rng.uniform(0, 1, (rows, heads, values)))
+        if kind == 'additive':
+            # RWKV7's `a b^T` inside its decay: `a` a key's `exp(g) / 2` at most.
+            operands = (*operands[:6], 0.5 * np.exp(operands[4]) * operands[6], *operands[7:])
+        seeded = (normal((rows, heads, values)), normal((rows, heads, keys, values)))
+        return *(hosted(x) for x in operands), tuple(hosted(x) for x in seeded)
+
+    def stepped(state, query, key, value, log_decay, beta, a, b, e):
+        token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta,
+                                erase_key=a if kind in ('untied', 'additive') else None,
+                                erase_read=b if kind in ('untied', 'additive') else None,
+                                value_decay=e if kind == 'two-sided' else None)
+        out, _, updated = recurrence.step(hooks, token)
+        return out, updated
+
+    assert_as_exact(jax.jit(with_gradients(stepped)),
+                    jax.jit(with_gradients(functools.partial(transition_token, kind))), draw,
+                    f'a {kind} decode token', seeds=8)
+
+
+def test_an_additive_erases_decay_gradient_is_its_decays_alone():
+    """RWKV7's additive erase (`Hooks.erase` 'additive', `S' = D S - a (b^T S)`) through the chunked op, one
+    token of no decay (`g = 0`) and no write over a memory `(1, 2^-27)`, erase vectors `b = (1, 0)` and `a =
+    (0, 1/2)`: its final memory's second key's gradient by the decay exactly 2^-27, the decay's alone, the
+    erase reading the memory before its decay independent of it (`linear_scan.Affine.erased_before`, row
+    9670). Laid as the delta rule's correction of the decayed memory (`b exp(-g)` read through `D S`), its
+    decay entered twice, the second key's `2^-27 - 1/2` rounded to `-1/2` before its decay, and the two
+    cancelled to zero (row 9029's head review)."""
+    hooks = recurrence.Hooks(decay='scalar', erase='additive', scale=1.0)
+
+    def held(x, *shape):
+        return jnp.reshape(jnp.asarray(x, jnp.float32), shape)
+
+    def second(log_decay):
+        operands = Chunk(held([1.0, 0.0], 1, 1, 1, 2), held([0.0, 0.0], 1, 1, 1, 2), held([1.0], 1, 1, 1, 1),
+                         log_decay=log_decay, beta=held([1.0], 1, 1, 1),
+                         state=held([1.0, 2.0 ** -27], 1, 1, 2, 1), erase_key=held([0.0, 0.5], 1, 1, 1, 2),
+                         erase_read=held([1.0, 0.0], 1, 1, 1, 2))
+        return chunk(hooks, operands)[1][0, 0, 1, 0]
+
+    assert float(jax.grad(second)(jnp.zeros((1, 1, 1), jnp.float32))[0, 0, 0]) == 2.0 ** -27
+
+
+def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
+    """RWKV7's additive erase (its rank-two token, `recurrence_chunk._erases_laid`) from no memory entering,
+    its rows split over an Explicit mesh axis: it traces and runs, its output and final memory finite and
+    placed as its rows are, the zero memory it starts from placed so (row 9029's head review: seeded whole,
+    a token loop's carry changed its sharding at its first token, which `lax.scan` refuses)."""
+    (operands,) = draw(ADDITIVE, packed=False, seed=0)
+    operands = dataclasses.replace(transitioned(ADDITIVE, operands, 0), state=None)
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, P('data'))
+        split = jax.tree.map(lambda x: jax.device_put(x, rows), operands)
+        found = jax.jit(functools.partial(chunk, ADDITIVE, chunk_size=CHUNK))(split)
+    for got in found:
+        assert np.isfinite(np.asarray(got)).all()
+        assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
+
+
+@pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[4], ADDITIVE],
+                         ids=['no decay', 'the delta rule', 'an additive erase'])
+def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
+    """A forked call (`Chunk.loads`: documents taking their memories up from its table, entry writes) on the
+    portable math, its operands' rows split over an Explicit mesh axis before it is differentiated: its
+    output, last memory, every operand's gradient and their tangent along its values on par from float64
+    with the same call whole (check 1), each placed as its rows are (row 9690: its walk's carries, seeded
+    within the rows' map whole, met the rows' token maps split in a gather JAX refuses; a no-decay call's
+    gates, formed whole, its map's)."""
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    rows = jax.sharding.NamedSharding(mesh, P('data'))
+    run = functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)
+
+    def drawn(seed):
+        operands, seeded = entered_draw(hooks, seed, entries=True)
+        tangent = jax.random.normal(jax.random.key(seed + 31), operands.value.shape, operands.value.dtype)
+        return transitioned(hooks, operands, seed), seeded, tangent
+
+    def arm(place):
+        # The draw's operands, cotangents and tangent placed as `place` places them before the call is
+        # differentiated, its documents laid within it (as `assert_forked_on_par`'s) and placed alike.
+        def ran(operands):
+            return run(place(entering_documents(operands)))
+
+        def both(operands, cotangents, tangent):
+            operands, cotangents, tangent = place((operands, cotangents, tangent))
+
+            def along(value):
+                return ran(dataclasses.replace(operands, value=value))
+
+            pulled = with_gradients(ran)(operands, cotangents)
+            return pulled, jax.jvp(along, (operands.value,), (tangent,))[1]
+
+        return both
+
+    split = arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree))
+    with jax.set_mesh(mesh):
+        assert_as_exact(jax.jit(split), jax.jit(arm(lambda tree: tree)), drawn,
+                        f'forked {hooks} on an explicit row axis', seeds=FEWEST_SEEDS)
+        ((out, last), grads), tangents = jax.jit(split)(*drawn(0))
+    for placed in (out, last, grads.value, *tangents):
+        assert jax.typeof(placed).sharding.spec[0] == 'data'
+
+
+@pytest.mark.parametrize('documents', [3, 0], ids=['three slots a row', 'none'])
+def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis(documents):
+    """A forked call's token maps (`chunked_launch.Forked.tokens`: each token's load, store and document)
+    over ten tokens, its rows split over an Explicit mesh axis: a row of three documents and one of two, its
+    third slot unused (its start the call's length, its load and store nonzero, dropped), or a table of no
+    documents, each map a row's own exactly (a document's first token its load and number, its last its
+    store, every other token -1 or zero), int32 and placed as its rows are (row 9690: scattered into whole
+    buffers by a row index, JAX refused indices and updates split on an Explicit axis)."""
+    firsts = np.asarray([[0, 3, 7], [0, 5, 10]], np.int32)[:, :documents]
+    loads = np.asarray([[1, 0, 2], [0, 3, 4]], np.int32)[:, :documents]
+    stores = np.asarray([[1, 2, 3], [3, 1, 5]], np.int32)[:, :documents]
+    expected = (np.full((2, 10), -1, np.int32), np.zeros((2, 10), np.int32), np.zeros((2, 10), np.int32))
+    if documents:
+        for row, (begins, ends) in enumerate((([0, 3, 7], [2, 6, 9]), ([0, 5], [4, 9]))):
+            live = len(begins)
+            expected[0][row, begins], expected[1][row, ends] = loads[row, :live], stores[row, :live]
+            expected[2][row, begins] = range(live)
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, P('data'))
+        placed = (jax.device_put(x, rows) for x in (firsts, loads, stores))
+        forked = chunked_launch.Forked(*placed, entry=None, held=3)
+        found = jax.jit(lambda forked: forked.tokens(10))(forked)
+    for got, want in zip(found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want, strict=True)
+        assert jax.typeof(got).sharding.spec[0] == 'data'
+
+
+@pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['after its decay', 'before its decay'])
+def test_a_forked_erase_runs_in_a_shard_map_that_checks_varying_axes(hooks):
+    """A forked call of an erase of its own (`Chunk.loads`, entry writes and given memories), its rows, tables
+    and documents split over a checked `shard_map`'s axis, its tokens correcting the state after its decay
+    (an untied erase's laid tokens) or before it (an additive one's): its outputs, final memory and their
+    tangent along its erase vectors finite, every carry typed as the operands that reach it vary (row 9029's
+    head review)."""
+    operands, _ = entered_draw(hooks, 0, entries=True)
+    operands = entering_documents(transitioned(hooks, operands, 0))
+    rows = P('data')
+    mapped = jax.shard_map(functools.partial(chunk, hooks, chunk_size=CHUNK),
+                           mesh=Mesh(np.asarray(jax.devices()[:2]), ('data',)), in_specs=rows, out_specs=rows,
+                           check_vma=True)
+
+    def run(erase_key):
+        return mapped(dataclasses.replace(operands, erase_key=erase_key))
+
+    found = jax.jit(lambda x: jax.jvp(run, (x,), (jnp.ones_like(x),)))(jnp.asarray(operands.erase_key))
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(found))
+
+
+@pytest.mark.parametrize('by_firsts', [False, True], ids=['by starts', 'by first slots'])
+@pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['after its decay', 'before its decay'])
+def test_a_forked_erases_documents_are_as_exact_as_each_alone(hooks, by_firsts):
+    """A forked call of an erase of its own (`Chunk.loads`), each document entering its table slot's memory
+    with an entry write of its own, its documents given by their starts or their first slots alone, through
+    tokens correcting the state after its decay (an untied erase's laid tokens) or before it (an additive
+    one's): its output, last memory and every gradient against each document a sequence of its own a token at
+    a time from float64 (check 1), the stored finals each a document's last token's."""
+    def drawn(seed):
+        operands, seeded = entered_draw(hooks, seed, entries=True)
+        return transitioned(hooks, operands, seed), seeded
+
+    assert_forked_on_par('xla', hooks, drawn, f'forked {hooks}', seeds=16, by_firsts=by_firsts)
+
+
+@pytest.mark.parametrize('form', [{'erase': 'untied', 'delta': False}, {'erase': 'values', 'delta': False},
+                                  {'value_decay': True}, {'erase': 'untied', 'value_decay': True},
+                                  {'erase': 'values', 'value_decay': True},
+                                  {'erase': 'untied', 'reads': 'before'},
+                                  {'erase': 'values', 'reads': 'before'}, {'erase': 'erasing'}],
+                         ids=['erase without the delta rule', 'values erased without it',
+                              'values decayed under it', 'values decayed beside an erase',
+                              'values decayed beside their erase', 'read before', 'values erased read before',
+                              'unknown'])
+def test_a_transition_outside_its_form_is_refused(form):
+    """A transition outside its form (`Hooks.erase`, `Hooks.value_decay`): an erase of its own or along
+    the values without the delta rule, a decay along the values under it or beside an erase, a readout before
+    its token, or an unknown erase, a ValueError (rows 9029, 9028)."""
+    with pytest.raises(ValueError):
+        recurrence.Hooks(decay='scalar', **form)
 
 
 def test_a_turned_readout_before_its_tokens_turn_is_refused():
@@ -445,6 +993,52 @@ def vanishing_entered_draw(seed: int):
     """`entered_draw`'s turned operands, entry writes included, the decays at `VANISHED` vanishing."""
     operands, seeded = entered_draw(TURNED, seed, entries=True)
     return vanishing(operands), seeded
+
+
+def turned_entered_draw(seed: int):
+    """`entered_draw`'s turned operands with entry writes, its cotangents, and a direction of its turns,
+    standard normal."""
+    operands, seeded = entered_draw(TURNED, seed, entries=True)
+    key = jax.random.fold_in(jax.random.key(seed), 8573)
+    return operands, jax.random.normal(key, operands.turn.shape, operands.turn.dtype), seeded
+
+
+def turn_curvature(fn):
+    """`fn(operands)`'s outputs against their cotangents, its turns' gradient's derivative along a direction
+    of the turns (`jax.jvp` of `jax.grad`): the turns' block of its Hessian, which a forked call's load
+    rotations (`Forked.turning`) reach."""
+    def run(operands, direction, seeded):
+        def gradient(turn):
+            def loss(turn):
+                out, final = fn(dataclasses.replace(operands, turn=turn))
+                return jnp.sum(out * seeded[0]) + jnp.sum(final * seeded[1])
+
+            return jax.grad(loss)(turn)
+
+        return jax.jvp(gradient, (operands.turn,), (direction,))[1]
+
+    return run
+
+
+def test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone():
+    """A turned forked call's turns' block of its Hessian along a drawn direction (`turn_curvature`), its
+    documents entering their table slots with entry writes (`turned_entered_draw`): on par from float64 with
+    each document alone through the same op (check 1, the recurrence a token at a time in float64 the
+    truth): a forked call's second order, which its custom VJP refused (row 8573), and which through the
+    portable pullback lost each document's load rotation's part (its head review)."""
+    def ours(operands):
+        return chunk_on('xla', TURNED, entering_documents(operands), chunk_size=CHUNK)
+
+    def own(hooks, piece):
+        return chunk_on('xla', hooks, piece, chunk_size=CHUNK)
+
+    def alone(operands):
+        return document_by_document(TURNED, operands, own)
+
+    # The gate widens the truth's inputs (`reference_error._truth_and_terms`).
+    exact = jax.jit(turn_curvature(lambda operands: document_by_document(TURNED, operands)))
+    assert_as_exact(jax.jit(turn_curvature(ours)), jax.jit(turn_curvature(alone)), turned_entered_draw,
+                    f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=exact)
 
 
 def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence():
@@ -478,15 +1072,15 @@ def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recu
                     "a turned call's mixed derivative at zero queries", seeds=32, truth_fn=exact)
 
 
-def assert_finite_where_float64_is(operands, seeded) -> None:
-    """`TURNED`'s chunked op over `operands` on the portable math, its output and every gradient under the
+def assert_finite_where_float64_is(operands, seeded, hooks=TURNED) -> None:
+    """`hooks`' chunked op over `operands` on the portable math, its output and every gradient under the
     cotangents `seeded`: finite wherever the recurrence a token at a time's in float64 is a normal float32,
     the leaf named where one is not (a mark's gradient, float0, skipped)."""
-    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', TURNED, given, chunk_size=CHUNK)))(operands,
-                                                                                                    seeded)
+    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', hooks, given, chunk_size=CHUNK)))(operands,
+                                                                                                   seeded)
     with jax.enable_x64(new_val=True), on_float64_device():
-        exact = jax.jit(with_gradients(lambda given: token_by_token(TURNED, given)))(*widened((operands,
-                                                                                               seeded)))
+        exact = jax.jit(with_gradients(lambda given: token_by_token(hooks, given)))(*widened((operands,
+                                                                                              seeded)))
     leaves = jax.tree_util.tree_leaves_with_path(ours)
     for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
         if not jnp.issubdtype(made.dtype, jnp.floating):
@@ -515,6 +1109,66 @@ def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
     assert_finite_where_float64_is(operands, seeded)
 
 
+@pytest.mark.parametrize("values_first", [False, True], ids=["keys first", "values first"])
+def test_an_entry_write_of_no_terms_is_zero(values_first):
+    """A document's entry write (`chunked_launch.entry_write`) of rank zero, keys `[2, 0, 3]` and values `[2,
+    0, 4]` (or `[2, 4, 0]` laid values first) under a weight `[2, 1, 1]`: zeros `[2, 3, 4]` (`[2, 4, 3]`),
+    the memory it enters unchanged, and its weight's gradient zero, where its aligned sum of no terms raised
+    (row 8967)."""
+    from dew.nn.kernels.chunked_launch import entry_write
+
+    key = jnp.zeros((2, 0, 3), jnp.float32)
+    value = jnp.zeros((2, 4, 0) if values_first else (2, 0, 4), jnp.float32)
+    weight = jnp.ones((2, 1, 1), jnp.float32)
+
+    def written(weight):
+        return entry_write(key, value, weight, values_first=values_first)
+
+    shape = (2, 4, 3) if values_first else (2, 3, 4)
+    np.testing.assert_array_equal(np.asarray(written(weight)), np.zeros(shape))
+    gradient = jax.grad(lambda weight: jnp.sum(written(weight)))(weight)
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros((2, 1, 1)))
+
+
+@pytest.mark.parametrize('hooks', [*HOOKS, TURNED], ids=str)
+def test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it(hooks):
+    """A one-token call whose token begins a document, its memory entering 2^127 in every entry (discarded),
+    unit queries over every key, zero keys, values, turns and log decays, a unit output cotangent: its output
+    and every gradient finite wherever float64's is a normal float32, on the portable math, where the
+    memory was read, its sum over the keys past float32's largest, before the start took it out, zero times
+    inf (row 8560)."""
+    (operands,) = draw(hooks, packed=False, seed=0, length=1)
+    names = [name for name in ('key', 'value', 'log_decay', 'turn') if getattr(operands, name) is not None]
+    operands = dataclasses.replace(operands, query=jnp.ones_like(operands.query),
+                                   state=jnp.full_like(operands.state, 2.0 ** 127),
+                                   starts=jnp.ones(operands.value.shape[:2], bool),
+                                   **{name: jnp.zeros_like(getattr(operands, name)) for name in names})
+    seeded = (jnp.ones_like(operands.value), jnp.zeros_like(operands.state))
+    assert_finite_where_float64_is(operands, seeded, hooks)
+
+
+@pytest.mark.parametrize('where', ['entering', 'written'])
+def test_a_live_spans_decay_that_underflows_reads_as_the_recurrence(where):
+    """A three-token call of one document under log decays of -80 (each live, a span of two `exp(-160)`,
+    zero in float32) of a scalar write gate's recurrence, unit queries, a NaN in the memory entering or in
+    the first token's key: its output NaN where the recurrence a token at a time reads NaN, on the portable
+    math, where the readout and the pairs (`scan._paired`, `scan.spread`) took a decay rounded to zero for a
+    document's start and read zero (row 8560's head review, train 1079's review F1)."""
+    hooks = recurrence.Hooks(decay='scalar', delta=False, write_gate=True)
+    (operands,) = draw(hooks, packed=False, seed=0, length=3)
+    key, state = jnp.zeros_like(operands.key), jnp.zeros_like(operands.state)
+    if where == 'entering':
+        state = jnp.full_like(state, jnp.nan)
+    else:
+        key = key.at[:, 0].set(jnp.nan)
+    operands = dataclasses.replace(
+        operands, query=jnp.ones_like(operands.query), log_decay=jnp.full_like(operands.log_decay, -80.0),
+        state=state, key=key, starts=jnp.zeros(operands.value.shape[:2], bool))
+    out, _ = chunk_on('xla', hooks, operands, chunk_size=CHUNK)
+    reference, _ = token_by_token(hooks, operands)
+    np.testing.assert_array_equal(np.isnan(np.asarray(out)), np.isnan(np.asarray(reference)))
+
+
 def test_a_turned_calls_cotangent_near_the_largest_across_documents_keeps_every_gradient_finite():
     """Two one-token turned documents, zero queries, keys, turns and log decays, unit write gates, values of
     two and output cotangents of 2^127: its output and every gradient finite wherever float64's is a normal
@@ -527,6 +1181,164 @@ def test_a_turned_calls_cotangent_near_the_largest_across_documents_keeps_every_
                                    starts=jnp.ones(operands.value.shape[:2], bool), **zero)
     seeded = (jnp.full_like(operands.value, 2.0 ** 127), jnp.zeros_like(operands.state))
     assert_finite_where_float64_is(operands, seeded)
+
+
+def cancelling_entries_draw(seed: int):
+    """`entered_draw`'s turned forked call, each document's entry write of three terms: two of one key
+    `(2^80, 0, ...)` under values of `2^47 u` and `-2^47 u` (`u` drawn in [1, 1.9]), their products 2^127
+    times `u` and cancelling, and a drawn third, more than float32's exponent range below them."""
+    operands, seeded = entered_draw(TURNED, seed, entries=True)
+    rng = np.random.default_rng([8501, seed])
+    key, value = operands.entry_key, operands.entry_value
+    big = jnp.zeros_like(key[:, :, :1]).at[..., 0].set(2.0 ** 80)
+    u = jnp.asarray(2.0 ** 47 * rng.uniform(1.0, 1.9, value[:, :, :1].shape), value.dtype)
+    return dataclasses.replace(operands, entry_key=jnp.concatenate([big, big, key[:, :, :1]], axis=2),
+                               entry_value=jnp.concatenate([u, -u, value[:, :, :1]], axis=2)), seeded
+
+
+ENTRY_CASES = ["a tie", "a band below", "three levels beside the largest", "the levels' own ties"]
+"""Entry writes whose terms cancel across exponent bands beside a surviving last one: a tie, a band below,
+three levels beside the largest of drawn factors, and those levels as `contract_support.CANCELLING_LEVELS`
+gives them, each key and value scaled by a drawn power of two, so its products keep their exact ties (row
+8840)."""
+
+
+@pytest.mark.parametrize("case", ENTRY_CASES)
+@pytest.mark.parametrize("values_first", [False, True], ids=["keys first", "values first"])
+def test_an_entry_write_of_cancelling_terms_is_its_exact_sum(values_first, case):
+    """A document's entry write (`chunked_launch.entry_write`) of cancelling terms across exponent bands
+    beside a surviving last term: its write, its tangent along the weight and the weight's gradient on par
+    from float64 with the surviving last term alone (check 1, row 8715), in both layouts, where each band
+    rounded its own sum (base review 644ef5535 F1), its bands' totals aligned at once dropped 2^-100 (base
+    review f5e6e678d F1), and three levels cancelling beside the largest summed to inf (row 8757)."""
+    from dew.nn.kernels.chunked_launch import entry_write
+
+    def draw(seed):
+        case_id = ENTRY_CASES.index(case)
+        rng = np.random.default_rng([8715, seed, int(values_first), case_id])
+        rows = 16
+        if case == "the levels' own ties":
+            keys, values = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
+            key = (keys[:, None] * 2.0 ** -rng.integers(0, 4, (rows, 1, 4))).astype(np.float32)
+            terms = (values[:, None] * 2.0 ** -rng.integers(1, 4, (rows, 1, 4))).astype(np.float32)
+        elif case == "three levels beside the largest":
+            k0 = (2.0 ** 26 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            k1 = (2.0 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            k2 = rng.uniform(0.5, 0.9, (rows, 1, 4)).astype(np.float32)
+            k3 = rng.uniform(0.5, 0.9, (rows, 1, 4)).astype(np.float32)
+            key = np.concatenate([k0, k1, k2, k1, k2, k0, k3], axis=1)
+            v0 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            v1 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            v2 = (2.0 ** 103 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            last = (0.5 * np.finfo(np.float32).max * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            terms = np.concatenate([v0, v1, -v2, -v1, v2, -v0, last], axis=1)
+        else:
+            scale = 2.0 if case == "a tie" else 2.0 ** -100
+            k0 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            k1 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            k2 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            key = np.concatenate([k0, k0, k1, k1, k1, k2], axis=1)
+            u0 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            u1 = (2.0 ** 25 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            last = (scale * rng.uniform(0.5, 1.5, (rows, 1, 4))
+                    * rng.choice([-1.0, 1.0], (rows, 1, 4))).astype(np.float32)
+            terms = np.concatenate([u0, -u0, u1, -0.5 * u1, -0.5 * u1, last], axis=1)
+        value = np.swapaxes(terms, -1, -2) if values_first else terms
+        weight = rng.uniform(0.5, 1.0, (rows, 1, 1)).astype(np.float32)
+        dweight = rng.uniform(0.5, 1.0, (rows, 1, 1)).astype(np.float32)
+        cotangent = (rng.uniform(-0.05, 0.05, (rows, 4, 4)) if case in ENTRY_CASES[2:]
+                     else rng.standard_normal((rows, 4, 4))).astype(np.float32)
+        return (jnp.asarray(key), jnp.asarray(value), jnp.asarray(weight), jnp.asarray(dweight),
+                jnp.asarray(cotangent))
+
+    def evaluated(written):
+        def run(key, value, weight, dweight, cotangent):
+            out, tangent = jax.jvp(lambda w: written(key, value, w), (weight,), (dweight,))
+            _, pull = jax.vjp(lambda w: written(key, value, w), weight)
+            return out, tangent, pull(cotangent)[0]
+
+        return jax.jit(run)
+
+    def formula(key, value, weight):
+        if values_first:
+            return weight * jnp.einsum("...vr,...rk->...vk", value, key)
+        return weight * jnp.einsum("...rk,...rv->...kv", key, value)
+
+    def surviving(key, value, weight):
+        return formula(key[:, -1:], value[:, :, -1:] if values_first else value[:, -1:], weight)
+
+    ours = evaluated(lambda k, v, w: entry_write(k, v, w, values_first=values_first))
+    exact_surviving = evaluated(surviving)
+    assert_as_exact(ours, exact_surviving, draw,
+                    f"entry_write cancelling bands, values_first={values_first}, case={case}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact_surviving)
+
+
+def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_document_alone():
+    """A turned forked call whose documents' entry writes take two terms of 2^127 that cancel beside a third
+    more than float32's exponent range below them (`cancelling_entries_draw`): its output, the row's last
+    memory and every gradient on par with each document alone (`assert_forked_on_par`, check 1), where the
+    turns' gradient formed the write's terms one at a time and summed them, inf - inf (base review 2354cbaf7
+    F1), the weight's gradient summed `aligned_sum`'s terms plainly (row 8501), and the write aligned to its
+    largest term dropped the third before the two cancelled (base review 224fcf53a F1)."""
+    assert_forked_on_par('xla', TURNED, cancelling_entries_draw,
+                         f"xla {TURNED} a forked call's cancelling entry writes", seeds=160)
+
+
+def levels_entered_draw(hooks, seed: int):
+    """`entered_draw`'s forked call under `hooks` whose documents' entry writes are `CANCELLING_LEVELS`'
+    (`contract_support.cancelling_entries`, its cotangents too), nothing else written, decayed or skipped,
+    and each token's memory's first row read by a unit query: its output, last memory and entry writes'
+    gradients each a sum float32 holds exactly or rounds once, as float64's is."""
+    operands, _ = entered_draw(hooks, seed, entries=True)
+    entries = cancelling_entries(seed, KEY_HEADS, KEY_WIDTH, VALUE_HEADS, VALUE_WIDTH)
+    query = np.zeros(operands.query.shape)
+    query[..., 0] = 1.0
+    # Every other operand zero: no key, value, log decay, write gate or step (a rated decay's `exp(A 0)`),
+    # skip or memory given.
+    zeroed = {name: jnp.zeros_like(getattr(operands, name))
+              for name in ('key', 'value', 'log_decay', 'beta', 'skip', 'state')
+              if getattr(operands, name) is not None}
+    drawn = dataclasses.replace(operands, query=hosted(query), entry_key=hosted(entries.key),
+                                entry_value=hosted(entries.value), entry_weight=hosted(entries.weight),
+                                **zeroed)
+    final = (ROWS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH)
+    return drawn, (hosted(entries.signed(operands.value.shape)), hosted(entries.signed(final)))
+
+
+@pytest.mark.parametrize('hooks', [pytest.param(HOOKS[4], id='delta-rule'),
+                                   pytest.param(FORMED[4], id='ssd')])
+def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(hooks):
+    """A forked call on the portable math's walk, of the gated delta rule and of Mamba2's SSD (the rated
+    scan's XLA handoff, its TPU scan's in test_ssd_kernel), whose documents' entry writes are three levels
+    cancelling beside float32's largest (`levels_entered_draw`): its output, the row's last memory and its
+    entry keys', values' and weights' gradients held by check 1 against each document a sequence of its own
+    the recurrence a token at a time in float64, rounded once (exact, so the walk must be: a write summed in
+    some order dropped a level at its tie as its negative survived, an ulp here and inf at float32's largest,
+    row 8757; rows 8840, 9480, 9513)."""
+
+    def leaves(walk):
+        def run(operands, seeded):
+            def entered(key, value, weight):
+                return walk(dataclasses.replace(operands, entry_key=key, entry_value=value,
+                                                entry_weight=weight))
+
+            out, pull = jax.vjp(entered, operands.entry_key, operands.entry_value, operands.entry_weight)
+            return dict(zip(('output', 'final', 'entry keys', 'entry values', 'entry weights'),
+                            (*out, *pull(seeded)), strict=True))
+
+        return run
+
+    def ours(operands):
+        out, final = chunk_on('xla', hooks, entering_documents(operands), chunk_size=CHUNK)
+        return out.astype(jnp.float32), final.astype(jnp.float32)
+
+    # The gate widens a truth's inputs; the reference is that truth rounded once.
+    truth = jax.jit(leaves(functools.partial(document_by_document, hooks)))
+    assert_as_exact(jax.jit(leaves(ours)), ROUNDED,
+                    functools.partial(levels_entered_draw, hooks),
+                    f"xla {hooks} a forked call's entry writes of cancelling levels",
+                    seeds=cancelling_orbit(KEY_HEADS, VALUE_HEADS, VALUE_WIDTH), truth_fn=truth)
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
@@ -639,20 +1451,6 @@ def test_a_turned_forked_documents_arithmetic_reads_only_its_ancestors(case):
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))
 """Each row's packed documents' first tokens under `draw`'s `packed`."""
 
-GIVEN = 1
-"""The memories a row's table holds before its documents store theirs (`Chunk.loads`: a row's start, a
-cache)."""
-
-FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
-"""Each row's documents' table slots and stored slots (`Chunk.loads`, `Chunk.stores`): the first row's start
-continued by its first document, whose final both later documents enter (a slot's gradient summing two
-documents'); the second row a chain from its start, each document entering its predecessor's final. Every
-memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each draw."""
-
-HELD = 2
-"""The stored slots a row's table holds (`Chunk.held`)."""
-
-
 def entered_draw(hooks, seed: int, entries: bool = False, length: int = LENGTH):
     """`draw`'s packed operands of `length` tokens over a table of `GIVEN` memories a row, with `entries` an
     entry write a document (`Chunk.entry_key`: two terms a document, a weight a value head), and cotangents
@@ -683,18 +1481,19 @@ def entry_write(operands, row: int, document: int):
     return operands.entry_weight[row, document][:, None, None] * written
 
 
-def entering_documents(operands, documents=DOCUMENTS, by_firsts: bool = False):
+def entering_documents(operands, documents=DOCUMENTS, by_firsts: bool = False, added: bool = False):
     """`operands` with `documents` (each row's first tokens, `DOCUMENTS` where not given) a forked call's,
     each entering its `FORKED` table slot, given by their starts or, `by_firsts`, by their first slots alone
-    (`Chunk.firsts`)."""
+    (`Chunk.firsts`), and where `added`, adding its `ADDS` slot to it (`Chunk.adds`)."""
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
+    adds = jnp.asarray(ADDS, jnp.int32) if added else None
     if by_firsts:
         return dataclasses.replace(operands, starts=None, firsts=jnp.asarray(documents, jnp.int32),
-                                   loads=loads, stores=stores, held=HELD)
-    starts = jnp.zeros(operands.value.shape[:2], bool)
+                                   loads=loads, stores=stores, adds=adds, held=HELD)
+    starts = jnp.zeros(operands.query.shape[:2], bool)
     for row, begins in enumerate(documents):
         starts = starts.at[row, jnp.asarray(begins)].set(True)
-    return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, held=HELD)
+    return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, adds=adds, held=HELD)
 
 
 def _neutral(hooks: recurrence.Hooks, name: str) -> float:
@@ -704,11 +1503,11 @@ def _neutral(hooks: recurrence.Hooks, name: str) -> float:
     return -1e30 if formed else 0.0
 
 
-def document_by_document(hooks, operands, run=None, documents=DOCUMENTS):
+def document_by_document(hooks, operands, run=None, documents=DOCUMENTS, added: bool = False):
     """Each document of `operands` a sequence of its own through `run(hooks, piece)` (`token_by_token`
     where None), `documents` its rows' first tokens (`DOCUMENTS` where not given), in the row's order from
-    its `FORKED` table slot's memory (a given one, or the final an
-    earlier document stored, with its entry write added where `operands` give one), its outputs back in
+    its `FORKED` table slot's memory (a given one, or the final an earlier document stored, with its `ADDS`
+    slot's added where `added`, its entry write where `operands` give one), its outputs back in
     place, and each row's last memory. The rows' k-th documents run as one call, a row each over the longest
     document's tokens, each padded after its own with tokens that leave its memory as it is
     (`stacked_documents`, `_neutral`):
@@ -716,10 +1515,12 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS):
     the six documents' 18 sets of the GPU tier's three forms, and with the float64 truth's six traces took
     240 s of an H100 job's harness (MAINGPU-be0a83791-PART2of10, tests/arm_arithmetic.py:147)."""
     run = token_by_token if run is None else run
-    named = [name for name in ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z', 'turn')
-             if getattr(operands, name) is not None]
-    bounds = [tuple(zip(begins, (*begins[1:], operands.value.shape[1]), strict=True)) for begins in documents]
+    named = [name for name in ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z', 'turn', 'erase_key',
+                               'erase_read', 'value_decay') if getattr(operands, name) is not None]
+    bounds = [tuple(zip(begins, (*begins[1:], operands.query.shape[1]), strict=True)) for begins in documents]
     longest = max(end - begin for row in bounds for begin, end in row)
+    # A token's updates (`Hooks.substeps`) its keys', values' and write gates' in turn.
+    every = {name: hooks.substeps if name in ('key', 'value', 'beta') else 1 for name in named}
     tables = [list(operands.state[row]) + [None] * HELD for row in range(len(documents))]
     pieces = [[] for _ in documents]
     finals = []
@@ -729,13 +1530,18 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS):
         for row, (loads, _) in enumerate(FORKED):
             load = loads[document]
             state = tables[row][load - 1] if load else jnp.zeros_like(operands.state[row, 0])
+            if added and ADDS[row][document]:
+                state = state + tables[row][ADDS[row][document] - 1]
             if operands.entry_key is not None:
                 state = state + entry_write(operands, row, document)
             states.append(state)
         spans = [(row, *bounds[row][document]) for row in range(len(documents))]
         piece = dataclasses.replace(
-            operands, **{name: stacked_documents(getattr(operands, name), spans, longest,
-                                                 _neutral(hooks, name)) for name in named},
+            operands, **{name: stacked_documents(getattr(operands, name),
+                                                 [(row, begin * every[name], end * every[name])
+                                                  for row, begin, end in spans],
+                                                 longest * every[name], _neutral(hooks, name))
+                         for name in named},
             state=jnp.stack(states), starts=None, loads=None, stores=None, held=0, entry_key=None,
             entry_value=None, entry_weight=None)
         out, finals = run(hooks, piece)
@@ -748,7 +1554,7 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS):
 
 
 @pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0], FORMED[9]], ids=str)
 def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
     """80 draws, 8 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
     inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b); the gate holds a draw's
@@ -757,9 +1563,22 @@ def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hoo
     The portable math's walk over a forked call, each document laid from a chunk's edge and its table slot's
     memory taken up there, the stored finals kept in the walk's table (`xla_mainloop`, `_walk`), against
     each document a sequence of its own the recurrence a token at a time (`assert_forked_on_par`): a slot
-    entered twice sums both documents' gradients."""
+    entered twice sums both documents' gradients. RWKV6's readout of the memory entering its token
+    (`Hooks.reads`) among them: a window refused it, its document's memory entering mid-chunk (base review
+    80b5b68ad F1)."""
     assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
                          f'xla {hooks} a forked call\'s documents', seeds=80)
+
+
+@pytest.mark.check1_shards(seeds=80, per_task=8)
+@pytest.mark.parametrize('hooks', [HOOKS[4], FORMED[0]], ids=str)
+def test_documents_adding_a_second_slot_are_as_exact_as_each_alone(hooks):
+    """The portable math's walk over a forked call whose documents each add a second table slot to the memory
+    they enter (`Chunk.adds`, `ADDS`: a given memory, and a final stored two documents before), against each
+    document a sequence of its own from the two memories summed (`assert_forked_on_par`): an added slot's
+    gradient its document's too. The template's and the TPU scan's tables take none yet (`ADDS_HANDOFF`)."""
+    assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
+                         f'xla {hooks} a forked call\'s documents adding a slot', seeds=80, added=True)
 
 
 @pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[6], HOOKS[8]], ids=str)
@@ -818,16 +1637,17 @@ def test_fla_refuses_a_forked_call_named_or_handed_to_it():
 
 
 def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alone: bool = False,
-                         documents=DOCUMENTS, by_firsts: bool = False) -> None:
+                         documents=DOCUMENTS, by_firsts: bool = False, added: bool = False) -> None:
     """A forked call on `kernel` (`entering_documents` of `draw`'s operands; `Chunk.loads`: a request's
     questions entering its shared part's final memory, a chain's each its predecessor's): its output, the
     row's last memory and every operand's gradient, the given memories' included, against each document a
     sequence of its own from its table slot's memory in the row's order (`document_by_document`), through
     `kernel`'s call where `alone`, else the recurrence a token at a time, which in float64 is their truth
     (check 1); `documents` its rows' first tokens (`DOCUMENTS` where not given), given by their first slots
-    alone where `by_firsts` (`entering_documents`)."""
+    alone where `by_firsts` (`entering_documents`); where `added`, each document adding its `ADDS` slot
+    (`Chunk.adds`)."""
     def ours(operands):
-        out, final = chunk_on(kernel, hooks, entering_documents(operands, documents, by_firsts),
+        out, final = chunk_on(kernel, hooks, entering_documents(operands, documents, by_firsts, added),
                               chunk_size=CHUNK)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
@@ -835,35 +1655,107 @@ def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alo
         return chunk_on(kernel, hooks, piece, chunk_size=CHUNK)
 
     def theirs(operands):
-        out, final = document_by_document(hooks, operands, own if alone else None, documents)
+        out, final = document_by_document(hooks, operands, own if alone else None, documents, added)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
-    wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands,
-                                                                        documents=documents)))
+    wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands, documents=documents,
+                                                                        added=added)))
 
-    def widened(leaf):
-        floating = jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
-        return jnp.asarray(leaf, jnp.float64) if floating else leaf
-
-    def truth(operands, seeded):
-        with jax.enable_x64(new_val=True):
-            return wide(jax.tree.map(widened, operands), jax.tree.map(widened, seeded))
-
+    # The gate widens the truth's inputs (`reference_error._truth_and_terms`).
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)), draw, site, seeds=seeds,
-                    truth_fn=truth)
+                    truth_fn=wide)
 
 
-@pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=str)
-def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
-    """The port of mamba_ssm's kernels over a forked call, each document laid from a chunk's edge and the
-    state passing taking up its table slot's memory there with its entry write added (`Chunk.entry_key`),
-    keeping the finals its documents store (`_ported_documents`), as the port's call over each document
-    alone from its slot's memory and entry write (`assert_forked_on_par`). The port's own numbers
-    (mamba_ssm's) are tests/test_mamba_ssd.py's."""
-    assert_forked_on_par('pallas', hooks, functools.partial(entered_draw, hooks, entries=True),
-                         f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80,
-                         alone=True)
+def _measured_routes(choice, generation_name: str, run, *shapes, mesh=None) -> list:
+    """The routes `choice`'s selector reports for `run` over operands of `shapes` traced
+    (`jax.eval_shape`) on an assumed `generation_name`, under the abstract `mesh` where given: whether a
+    receipt-backed cell (`Op.declared`) overrode its kernels' order, its route's refusal 'measured'."""
+    with (generation.assumed(generation_name), generation.routes() as found,
+          contextlib.nullcontext() if mesh is None else jax.sharding.use_abstract_mesh(mesh)):
+        jax.eval_shape(run, *shapes)
+    return [(route.kernel, route.refusal is not None and route.refusal.kind == 'measured')
+            for route in found if route.choice == choice]
+
+
+@pytest.mark.parametrize(('rows', 'tokens', 'product', 'packed', 'mesh', 'ported'), [
+    (1, 4096, 'forward', False, None, True), (1, 4096, 'training', False, None, True),
+    (2, 4096, 'forward', False, None, False), (1, 8192, 'forward', False, None, False),
+    (1, 4096, 'forward', True, None, False), (2, 4096, 'forward', False, ('data', 2), True),
+    (1, 4096, 'forward', False, ('tensor', 2), False)],
+    ids=['timed forward', 'timed training', 'two rows', 'longer', 'packed', 'two rows split', 'heads split'])
+def test_a_b200s_port_cell_overrides_only_the_extent_its_receipt_timed(rows, tokens, product, packed, mesh,
+                                                                     ported):
+    """A bf16 gated delta net of Qwen3.5-27B's heads (16 key heads, 48 value heads, 128 wide) on a B200,
+    whose forward and training a receipt timed on fla's port at one unpacked row of 4096 tokens
+    (`recurrence_chunk.PORT_CELLS`, `TIMED`): the delta rule's selector runs the port by that receipt where
+    each launch's shard computes that (two rows split over two devices among them), and for more rows,
+    other tokens, packed documents or heads split apart no receipt overrides its kernels' order, where
+    every length, batch and split at those heads took the port (row 8991)."""
+    # A training step's mesh, its axes automatic: the rules place each operand (`sharding.grouped_heads`).
+    mesh = None if mesh is None else jax.sharding.AbstractMesh((mesh[1],), (mesh[0],),
+                                                               axis_types=(jax.sharding.AxisType.Auto,))
+    gates = (jax.ShapeDtypeStruct((rows, tokens, 48), jnp.float32),
+             jax.ShapeDtypeStruct((rows, tokens, 48), jnp.bfloat16))
+    shapes = [jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16) for heads in (16, 16, 48)]
+    starts = [jax.ShapeDtypeStruct((rows, tokens), jnp.bool_)] if packed else []
+
+    def forward(query, key, value, g, beta, *starts):
+        given = starts[0] if starts else None
+        return recurrence_chunk.chunk_gated_delta_rule(query, key, value, g, beta, starts=given)[0]
+
+    run = forward if product == 'forward' else jax.grad(lambda *o: forward(*o).astype(jnp.float32).sum(),
+                                                        argnums=(0, 1, 2))
+    found = _measured_routes(recurrence_chunk.GATED_DELTA.choice, 'sm100', run, *shapes, *gates, *starts,
+                             mesh=mesh)
+    assert all(measured == ported for _, measured in found) and found, found
+    assert not ported or {kernel for kernel, _ in found} == {'fla'}, found
+
+
+@pytest.mark.parametrize(('rows', 'tokens', 'packed', 'heads', 'width', 'chunk_size', 'keys', 'declared'), [
+    (1, 4096, False, 96, 80, 256, jnp.bfloat16, True), (1, 4096, False, 64, 64, 128, jnp.bfloat16, True),
+    (1, 4096, False, 96, 80, 256, jnp.float32, False), (2, 4096, False, 96, 80, 256, jnp.bfloat16, False),
+    (1, 2048, False, 96, 80, 256, jnp.bfloat16, False), (1, 4096, True, 96, 80, 256, jnp.bfloat16, False),
+    (1, 4096, False, 96, 96, 256, jnp.bfloat16, False), (1, 4096, False, 32, 64, 128, jnp.bfloat16, False),
+    (1, 4096, False, 64, 64, 256, jnp.bfloat16, False)],
+    ids=['4B', '30B', '4B of float32 keys', '4B of two rows', '4B shorter', '4B packed',
+         'heads padded to 4B\'s', 'another head count', 'another chunk'])
+def test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_timed(rows, tokens, packed, heads,
+                                                                                width, chunk_size, keys,
+                                                                                declared):
+    """An SSD's bf16 training on an A100, whose receipt timed mamba_ssm's port faster than the template on
+    Nemotron-H 4B's (96 heads of 80 and chunks of 256) and 30B's (64 heads of 64 and chunks of 128), each
+    eight groups of 128-wide states, at one unpacked row of 4096 tokens (`recurrence_chunk.SCAN_CELLS`): the
+    rated scan's selector runs the port by that receipt on those calls alone, and on another row count,
+    length, chunk or head count, packed documents, heads only padded to the port's width as 4B's are (96
+    wide), or float32 keys, whose call the scan launches in float32, no receipt overrides its kernels' order,
+    where every mma.sync training geometry took the port (row 8991)."""
+    def loss(x, B, C, dt, A, D, *starts):
+        operands = Chunk(C, B, x, beta=dt, rate=A, skip=D, starts=starts[0] if starts else None)
+        out, _ = chunk(FORMED[4], operands, chunk_size=chunk_size, dtype=jnp.float32)
+        return out.sum()
+
+    shapes = (jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16),
+              *[jax.ShapeDtypeStruct((rows, tokens, 8, 128), keys)] * 2,
+              jax.ShapeDtypeStruct((rows, tokens, heads), jnp.float32),
+              *[jax.ShapeDtypeStruct((heads,), jnp.float32)] * 2,
+              *([jax.ShapeDtypeStruct((rows, tokens), jnp.bool_)] if packed else []))
+    found = _measured_routes(recurrence_chunk.SCAN.choice, 'sm80', jax.grad(loss, argnums=(0, 1, 2, 3)),
+                             *shapes)
+    assert any(measured for _, measured in found) == declared, found
+    assert not declared or ('pallas', True) in found, found
+
+
+def test_the_ssd_port_refuses_a_forked_call_named_to_it():
+    """mamba_ssm's state passing takes a memory at a sequence's first chunk alone, so no forked call
+    (`Chunk.loads`), whose documents take their memories up mid-chunk, is one its port takes (inherently): a
+    forked call naming it is refused, the selector's typed refusal and its reason, never a shape's error."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    hooks = FORMED[4]
+    operands = entering_documents(entered_draw(hooks, 0, entries=True)[0])
+    with pytest.raises(KernelRefused) as named:
+        chunk_on('pallas', hooks, operands, chunk_size=CHUNK)
+    assert recurrence_chunk.SSD_PORT_FORKED in named.value.refusals
 
 
 def narrowed_draw(hooks, seed: int):
@@ -880,13 +1772,14 @@ FORKED_TEMPLATE = [HOOKS[4], HOOKS[8], FORMED[4], TURNED]
 turned state (Mamba-3's, each document's frame on from its source's, `templates.recurrence.turned`)."""
 
 
-def the_templates_forked_documents_are_as_exact_as_each_alone(hooks):
+def the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added: bool = False):
     """The recurrence template over a forked call in 16 bits: its walks take each document's memory up from
     the call's table and keep the finals its documents store (`table.Taking`, `table.Returning`; ledger
-    5376), as its call over each document alone (`assert_forked_on_par`), the same launches' arithmetic."""
+    5376), where `added` each document adding its `ADDS` slot (`Chunk.adds`), as its call over each document
+    alone (`assert_forked_on_par`), the same launches' arithmetic."""
     assert_forked_on_par('mosaic_gpu', hooks, functools.partial(narrowed_draw, hooks),
-                         f'mosaic_gpu {hooks} a forked call\'s documents, against each alone',
-                         seeds=8, alone=True)
+                         f'mosaic_gpu {hooks} a forked call\'s documents{" adding a slot" if added else ""}, '
+                         'against each alone', seeds=8, alone=True, added=added)
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=1)
@@ -895,6 +1788,47 @@ def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(h
     """`the_templates_forked_documents_are_as_exact_as_each_alone` interpreted off a GPU. A draw a task: four
     took 287 to 381 s a task (jsf-table-phase at 693aa1c1c)."""
     the_templates_forked_documents_are_as_exact_as_each_alone(hooks)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=1)
+@pytest.mark.parametrize('hooks', [hooks for hooks in FORKED_TEMPLATE if not hooks.turns], ids=str)
+def test_the_templates_documents_adding_a_slot_are_as_exact_as_each_alone_interpreted(hooks):
+    """The template's walks over a forked call whose documents each add a second table slot (`Chunk.adds`,
+    `ADDS`): the forward's taking sums both slots (`table.Taking`), the reverse walk returns the memory's
+    gradient to both (`table.Returning`, the given slots' sum; Kimi delta attention's taken memories),
+    interpreted off a GPU (`the_templates_forked_documents_are_as_exact_as_each_alone`); a turned call's
+    documents add none (refused, row 8284)."""
+    the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added=True)
+
+
+@pytest.mark.parametrize('hooks', FORKED_TEMPLATE, ids=str)
+def test_a_forked_call_of_entry_writes_of_no_terms_lowers_on_the_template(hooks):
+    """A forked call whose documents' entry writes take no terms (`Chunk.entry_key` `[B, D, 0, H, K]`),
+    through the public chunked op on the template, its gradient lowered for an H100: each chunk's write
+    zero (`chunked_launch.entry_write`, row 8967), where its documents' terms flattened by an inferred
+    extent of no elements refused the call (`ForkedChunks.entries`, head review of 512810acf F3)."""
+    operands = entering_documents(narrowed_draw(hooks, 0)[0])
+    rows, documents, value_heads = operands.value.shape[0], len(DOCUMENTS[0]), operands.value.shape[2]
+    operands = dataclasses.replace(
+        operands, entry_key=jnp.zeros((rows, documents, 0, *operands.key.shape[2:])),
+        entry_value=jnp.zeros((rows, documents, 0, *operands.value.shape[2:])),
+        entry_weight=jnp.ones((rows, documents, value_heads)))
+
+    def loss(given):
+        out, final = chunk_on('mosaic_gpu', hooks, given)
+        return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+    with generation.assumed('sm90'):
+        jax.jit(jax.grad(loss, allow_int=True)).trace(operands).lower(lowering_platforms=('cuda',))
+
+
+def test_a_turned_forked_call_adding_a_slot_is_refused():
+    """A turned call's documents adding a second table slot (`Chunk.adds` under `Hooks.turns`) are refused:
+    its turns' gradient composes each document's frames from the one slot it loads (`turned._forked_frames`),
+    so an added slot's turns would take no gradient (row 8284)."""
+    operands, _ = entered_draw(TURNED, 0, entries=True)
+    with pytest.raises(ValueError):
+        chunk_on('xla', TURNED, entering_documents(operands, added=True), chunk_size=CHUNK)
 
 
 UNDELTA_HEADS = 8
@@ -1466,3 +2400,86 @@ def test_rwkv6_through_the_chunked_op_is_as_exact_as_fla(site):
 
     the_template_is_as_exact_as_fla(lambda operands: chunk(RWKV6, operands), site, OWN_LEAVES,
                                     label=f"RWKV6 through the chunked op against fla, {site}")
+
+
+def _unit_turn_grad(q, k, v, do, state, *, turn=None):
+    """Run `turned.turn_gradient` with unit decay/gate and zero final cotangent for P0 witnesses."""
+    from dew.nn.kernels.templates.recurrence import turned
+
+    length = q.shape[1]
+    g = jnp.zeros((1, length, 1), jnp.float32)
+    b = jnp.ones((1, length, 1), jnp.float32)
+    t = jnp.zeros((1, length, 1, 1), jnp.float32) if turn is None else turn
+    return turned.turn_gradient(q, k, v, do, g, b, state, jnp.zeros_like(state), t, None,
+                                scale=1.0, group=1, pairs=1)
+
+
+def test_a_turned_gradients_overflowed_term_reaches_no_later_tokens_sum():
+    """Two tokens, no turn, decay or write, a memory entering of `(0, 2^126)` read by the first token's query
+    `(1, 0)` under its output's cotangent 4 alone: the first token's turn gradient overflows (`2^128`), and
+    the second's, which no term of the first reaches, is exactly zero, as the scan of its suffix keeps it
+    (`recurrence_algebra.suffix_sums(scanned=True)`), where a triangle's dot multiplied the first token's
+    infinity by zero, NaN (rows 7969 and 7975's head review)."""
+    q = jnp.zeros((1, 2, 1, 2), jnp.float32).at[0, 0, 0, 0].set(1.0)
+    k = jnp.zeros((1, 2, 1, 2), jnp.float32)
+    v = jnp.zeros((1, 2, 1, 1), jnp.float32)
+    do = jnp.zeros((1, 2, 1, 1), jnp.float32).at[0, 0, 0, 0].set(4.0)
+    state = jnp.zeros((1, 1, 2, 1), jnp.float32).at[0, 0, 1, 0].set(np.float32(2.0 ** 126))
+    gradient = np.asarray(_unit_turn_grad(q, k, v, do, state))
+    assert np.isinf(gradient[0, 0, 0, 0]) and gradient[0, 1, 0, 0] == 0.0
+
+
+def test_turned_gradient_p0_regressions_f1_f2_f3():
+    """Regressions for turned-frame base-review P0s (d80c85a37 F1/F2/F3, 1cf389a60 F1, e488dc198 F1):
+    carry zero-reset tangent (-1), deferred scale restoration across both own-chunk and cross-chunk cross
+    products, and float64 turn angle precision under x64."""
+    from dew.nn.kernels.templates.recurrence import turned
+
+    # d80c85a37 F1: carry reset at zero peak preserves tangent -1.0 (not -0.5)
+    big = np.float32(2.0 ** 126)
+    z129 = jnp.zeros((1, 129, 1, 2), jnp.float32)
+    k129 = z129.at[0, 0, 0, 0].set(-big)
+    v129 = jnp.zeros((1, 129, 1, 1), jnp.float32).at[0, 0, 0, 0].set(1.0)
+    do129 = jnp.zeros((1, 129, 1, 1), jnp.float32)
+    g129 = jnp.zeros((1, 129, 1), jnp.float32)
+    b129 = jnp.ones((1, 129, 1), jnp.float32)
+    t129 = jnp.zeros((1, 129, 1, 1), jnp.float32)
+    s129 = jnp.array([[[[big], [np.float32(0.0)]]]], jnp.float32)
+    ds129 = jnp.array([[[[np.float32(1.0)], [np.float32(0.0)]]]], jnp.float32)
+    df129 = jnp.array([[[[np.float32(0.0)], [np.float32(1.0)]]]], jnp.float32)
+    _, jvp129 = jax.jvp(
+        lambda st: turned.turn_gradient(z129, k129, v129, do129, g129, b129, st, df129, t129, None,
+                                        scale=1.0, group=1, pairs=1),
+        (s129,), (ds129,))
+    np.testing.assert_array_equal(np.asarray(jvp129[0, 128, 0, 0]), np.float32(-1.0))
+
+    # d80c85a37 F2 & e488dc198 F1: own-chunk _halves defers inv_q restore until after _crossed
+    z2 = jnp.zeros((1, 1, 2, 1), jnp.float32)
+    v2 = jnp.array([[[[1.0]], [[0.0]]]], jnp.float32)
+    for k_vals, do_val, want in (
+        ([0.0, np.float32(2.0 ** -126)], np.float32(2.0 ** 127), np.float32(2.0 ** 127)),
+        ([np.float32(2.0), np.float32(2.0 ** -126)], np.float32(2.0 ** 126), np.float32(2.0 ** 126)),
+    ):
+        q = jnp.array([[[[0.0, 0.0]], [[np.float32(2.0 ** 126), 0.0]]]], jnp.float32)
+        k = jnp.array([[[k_vals], [[0.0, 0.0]]]], jnp.float32)
+        do = jnp.array([[[[0.0]], [[do_val]]]], jnp.float32)
+        grad = _unit_turn_grad(q, k, v2, do, z2)
+        assert np.isfinite(np.asarray(grad)).all()
+        np.testing.assert_array_equal(np.asarray(grad[0, 1, 0, 0]), want)
+
+    # 1cf389a60 F1: cross-chunk _scaled_einsum defers post-scale until after _crossed
+    q4 = jnp.array([[[[np.float32(2.0 ** 126), np.float32(2.0 ** -100)]]]], jnp.float32)
+    st4 = jnp.array([[[[np.float32(2.0)], [np.float32(2.0 ** -126)]]]], jnp.float32)
+    grad4 = _unit_turn_grad(q4, jnp.zeros((1, 1, 1, 2), jnp.float32), jnp.zeros((1, 1, 1, 1), jnp.float32),
+                            jnp.array([[[[np.float32(2.0 ** 126)]]]], jnp.float32), st4)
+    assert np.isfinite(np.asarray(grad4)).all()
+    np.testing.assert_array_equal(np.asarray(grad4[0, 0, 0, 0]), np.float32(2.0 ** 126))
+
+    # d80c85a37 F3: float64 turn pi/2 - 1e-9 preserves positive gradient sign under x64
+    with jax.enable_x64(new_val=True):
+        q3 = jnp.array([[[[0.0, 0.0]], [[1.0, 0.0]]]], jnp.float32)
+        k3 = jnp.array([[[[0.0, 1.0]], [[0.0, 0.0]]]], jnp.float32)
+        do3 = jnp.array([[[[0.0]], [[1.0]]]], jnp.float32)
+        t3 = jnp.array([[[[0.0]], [[np.pi / 2.0 - 1e-9]]]], jnp.float64)
+        grad3 = _unit_turn_grad(q3, k3, v2, do3, z2, turn=t3)
+        assert float(grad3[0, 1, 0, 0]) > 0.0

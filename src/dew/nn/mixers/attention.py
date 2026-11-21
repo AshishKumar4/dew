@@ -57,6 +57,7 @@ from dew.nn.inputs import (
     intersected_runs,
 )
 from dew.nn.inspection import QK
+from dew.nn.joined import side_by_side
 from dew.nn.kernels.selection import select
 from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
@@ -945,9 +946,18 @@ class CausalSelfAttention(nn.Module):
             return metadata is not None
         # QK-Clip's logit maxima are taken under the mask (`_attended`), so a
         # layer that sows them keeps it.
-        implied = (metadata is not None and metadata.right_padded and causal
-                   and not (not self.is_initializing() and self.is_mutable_collection(QK)))
-        return metadata is not None and metadata.valid is not None and not implied
+        return (metadata is not None and metadata.valid is not None
+                and not self._causal_implies_right_padding(metadata, causal))
+
+    @property
+    def _sows(self) -> bool:
+        """Whether this call sows QK-Clip's per-head logit maxima (`QK`)."""
+        return not self.is_initializing() and self.is_mutable_collection(QK)
+
+    def _causal_implies_right_padding(self, metadata: AttentionMetadata | None, causal: bool) -> bool:
+        """Whether causality alone keeps each real query off trailing padding (so right-padded validity
+        or single-document metadata need not materialize a mask), unless QK-Clip is sowing under it."""
+        return metadata is not None and metadata.right_padded and causal and not self._sows
 
     def _one_document_a_row(self, metadata: AttentionMetadata | None, causal: bool, prefix,
                             append: Append | None, decode: bool) -> bool:
@@ -960,9 +970,8 @@ class CausalSelfAttention(nn.Module):
         for its documents (`_reads_whole_blocks`), and a layer that sows QK-Clip's logit maxima takes them
         under the mask, so both keep them."""
         laid = None if metadata is None else metadata.coordinates
-        sowing = not self.is_initializing() and self.is_mutable_collection(QK)
-        return (causal and not decode and laid is not None and laid.max_segments == 1 and laid.right_padded
-                and laid.forks is None and not sowing
+        return (not decode and laid is not None and laid.max_segments == 1 and laid.forks is None
+                and self._causal_implies_right_padding(metadata, causal)
                 and not self._reads_whole_blocks(metadata, prefix, append, decode))
 
     @nn.compact
@@ -1058,17 +1067,23 @@ class CausalSelfAttention(nn.Module):
         which the reference marks "unlike olmo, only on the head dim" (modeling_qwen3_moe.py:147)."""
         return self.ctx.qk_norm and self.ctx.qk_norm_scope == 'projection'
 
-    def _query(self, x):
+    def _query(self, x, keys: bool = True):
         """The query heads of `x` `[B, S, E]`, `[B, S, heads, head_dim]`, normed as the layer norms
         them and column-parallel under a tensor axis (each shard a run of whole heads); the output gate
-        where it gates, else None; and the keys and values `qkv_proj` packs beside the query, else
-        None. The projections carry the names a remat policy saves or offloads
+        where it gates, else None; and the keys and values projected with the query, else None: those
+        `qkv_proj` packs beside it, or, where `keys` asks for them, its own three projections' side by
+        side (`joined.side_by_side`: one launch, their input gradient chained, where its selector takes
+        them). The projections carry the names a remat policy saves or offloads
         (residuals.RESIDUALS)."""
         B, S, _ = x.shape
         projected_kv = None
         group = self._group()
         if group is not None and self._packed():
             projected, key, value = group.split(self.qkv_proj(x))
+            projected_kv = (key, value)
+        elif keys and group is not None and (
+                plan := side_by_side((self.q_proj, self.k_proj, self.v_proj), x)) is not None:
+            projected, key, value = plan()
             projected_kv = (key, value)
         else:
             projected = self.q_proj(x)
@@ -1108,7 +1123,7 @@ class CausalSelfAttention(nn.Module):
         projected and normed as its own call does them, scaled to the logit scale its checkpoint asks
         for, and placed nowhere: a context has no positions to rotate by, nor a temperature a place
         tunes. With the output gate, None where it gates none."""
-        query, gate, _ = self._query(x)
+        query, gate, _ = self._query(x, keys=False)
         if self.qk_norm_after_rotary:
             # Normed where a rotation would have turned it, before its scale, as the layer's own call.
             query = self.q_norm(query, axes=HEADS)
@@ -1529,7 +1544,7 @@ class CausalSelfAttention(nn.Module):
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
-        sowing = not self.is_initializing() and self.is_mutable_collection(QK)
+        sowing = self._sows
         if sowing:
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
             seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,

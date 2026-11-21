@@ -119,6 +119,26 @@ def test_a_decision_its_rounding_did_not_make_is_refused(fault):
                         seeds=SEEDS, followed=followed)
 
 
+def bare(arm):
+    """`arm`'s judged leaves alone, its decisions dropped: an arm of a followed site returning none."""
+    def run(*inputs):
+        return arm(*inputs).judged
+    return run
+
+
+@pytest.mark.parametrize("where", ["reference", "further reference"])
+def test_a_live_arm_returning_no_decisions_is_refused(where):
+    """At a site of followed roundings every live arm returns its decisions (`Rounded`): a reference, or a
+    further reference, returning its judged leaves alone is refused, where it was held to Dew's truth with no
+    decision of its own and passed with its leaves Dew's own (spec alignment, 8999)."""
+    reference, also = ((bare(layer(product)), {}) if where == "reference"
+                       else (layer(product), {"bare": bare(layer(product))}))
+    with pytest.raises(AssertionError) as refused:
+        assert_as_exact(layer(product), reference, draw, f"a bare {where}", seeds=SEEDS, followed=followed,
+                        also=also)
+    assert not isinstance(refused.value, GateFailure)
+
+
 def test_values_rounded_that_are_not_the_arms_are_charged():
     """The values a decision is held to are the arm's judged leaf, which check 1 holds to the truth: an arm
     stating it rounded zeros, and so deciding zeros, is legal to the site's rounding and charged on the

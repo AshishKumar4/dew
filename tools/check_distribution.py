@@ -30,7 +30,10 @@ def metadata(path: Path) -> str:
     with tarfile.open(path) as sdist:
         member = next(member for member in sdist.getmembers()
                       if member.name.count("/") == 1 and member.name.endswith("/PKG-INFO"))
-        return sdist.extractfile(member).read().decode()
+        read = sdist.extractfile(member)
+        if read is None:
+            raise ValueError(f"{path}: its {member.name} is not a regular file")
+        return read.read().decode()
 
 
 def requirements(path: Path) -> list[str]:
@@ -39,7 +42,7 @@ def requirements(path: Path) -> list[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("distributions", nargs="+", type=Path)
     args = parser.parse_args()
     refused = []

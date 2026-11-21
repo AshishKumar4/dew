@@ -82,6 +82,37 @@ def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
                          length=LENGTH, seeds=SEEDS[packed])
 
 
+@pytest.mark.parametrize("read", ["overflowing", "overflowing at a level of zero weight", "a NaN"])
+def test_a_live_span_that_underflows_reads_as_the_recurrence(read):
+    """Three tokens of one document within a block under log decays `[0, -80, -80]`, each live, its first
+    and last tokens' span `exp(-160)` zero in float32 (`scan.spread`'s pairs): a key's and the last query's
+    2^70, whose score overflows before that decay weighs it: every token's read exactly zero and every
+    gradient finite, the contract of a score that overflows formed before its decay (rows 5426 and 9547;
+    the recurrence a token at a time, which decays before it reads, reads 2^-20 there), where infinity times
+    the zero decay was NaN (head review of 512810acf F7), the last token's levels weighed zero too, where
+    the weight met the infinity first (head review of bd4031d41 F1); and a NaN in the first key read NaN at
+    every token, as the recurrence a token at a time reads it, where a decay rounded to zero took the pair
+    for a document's start (train 1079's review F1)."""
+    weights = jnp.ones((1, 3, 1, levels(3)), jnp.float32)
+    if read == "overflowing at a level of zero weight":
+        weights = weights.at[0, 2].set(0.0)
+    g = jnp.asarray([[[0.0], [-80.0], [-80.0]]], jnp.float32)
+    value = jnp.ones((1, 3, 1, 1), jnp.float32)
+    if read == "a NaN":
+        query, key = jnp.ones((1, 3, 1, 1), jnp.float32), jnp.asarray([np.nan, 0.0, 0.0]).reshape(1, 3, 1, 1)
+        assert np.isnan(np.asarray(log_linear_attention(query, key, value, g, weights, scale=1.0))).all()
+        return
+    query, key = (jnp.asarray(x, jnp.float32).reshape(1, 3, 1, 1) for x in ([0.0, 0.0, 2.0 ** 70],
+                                                                           [2.0 ** 70, 0.0, 0.0]))
+
+    def read(query, key, g):
+        return log_linear_attention(query, key, value, g, weights, scale=1.0)
+
+    out, pull = jax.vjp(read, query, key, g)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros(out.shape, np.float32))
+    assert all(np.isfinite(np.asarray(x)).all() for x in pull(jnp.ones_like(out)))
+
+
 def test_a_blocks_pairs_keep_a_decay_past_a_vanished_one_and_no_future_overflow():
     """Within a block (`log_linear.WITHIN`), a pair's decay after a vanishing one is its own, as after any
     (a running sum of -2**70 rounds a later -1 away, its pair decayed by one), and an overflowing score of a
@@ -105,3 +136,28 @@ def test_a_blocks_pairs_keep_a_decay_past_a_vanished_one_and_no_future_overflow(
         value, grads = jax.value_and_grad(summed, argnums=(0, 1, 2))(query, key, g)
         assert value == 0.0
         assert all(np.isfinite(np.asarray(grad)).all() for grad in grads)
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90", "sm100", "sm120"])
+def test_log_linear_levels_train_on_the_template_on_each_gpu_family(target):
+    """A log-linear call of Kimi's geometry (64 value heads on one key head of 128, bf16), traced as each
+    GPU family's device: each level's recurrence takes the recurrence template for its forward and its
+    gradient (`generation.routes`), where a key head's value heads summed in one program held sm120's
+    consumer-fed scores' gradient launch past 255 registers and every level trained on the portable math,
+    1091 ms of a step against its forward's 4.6 (row 10522)."""
+    from dew.nn.kernels import generation
+
+    length, heads = 512, 64
+    shapes = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((1, length, 1, 128), jnp.bfloat16), ((1, length, 1, 128), jnp.bfloat16),
+        ((1, length, heads, 64), jnp.bfloat16), ((1, length, heads), jnp.float32),
+        ((1, length, heads, levels(length)), jnp.bfloat16))]
+
+    def call(*operands):
+        return log_linear_attention(*operands, scale=1.0)
+
+    with generation.assumed(target), generation.routes() as found:
+        jax.eval_shape(lambda *x: jax.vjp(call, *x)[1](call(*x)), *shapes)
+    taken = {(route.kernel, None if route.refusal is None else route.refusal.code)
+             for route in found if route.choice == generation.Choice.GATED_DELTA_RULE}
+    assert taken == {("mosaic_gpu", None)}, taken

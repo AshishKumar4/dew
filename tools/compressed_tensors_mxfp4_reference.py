@@ -49,7 +49,7 @@ def crafted_groups() -> np.ndarray:
     groups = np.zeros((16, 32), np.float32)
     groups[0, 3] = groups[0, 17] = -0.0
     # Largest magnitude 6: scale 2 ** 0, so each value is its own quotient.
-    groups[1, :16] = [6.0, *TIES, -6.0, *(-np.float32(TIES))]
+    groups[1, :16] = [6.0, *TIES, -6.0, *(-np.asarray(TIES, np.float32))]
     groups[1, 16:24] = [-0.1, -0.2, -0.24, 0.1, 0.26, -0.26, -0.0, 0.0]
     # 1.75 = 1.11b: the mantissa fraction 0.75 rounds up to 2 (scale byte 126).
     groups[2, :4] = [1.75, -1.0, 0.3, -0.7]

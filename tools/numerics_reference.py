@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -131,7 +132,7 @@ def write_workflow() -> None:
     bf16 = workflow_outputs(workflow(torch.bfloat16), reference, torch.bfloat16)
     arrays = {f"{key}_f64": value for key, value in f64.items()}
     arrays.update({f"{key}_bf16": value.astype(np.float32) for key, value in bf16.items()})
-    np.savez(directory / "numerics.npz", **arrays)
+    np.savez(directory / "numerics.npz", allow_pickle=False, **arrays)
     for key in f64:
         report(f"workflow {key}", reference[key], arrays[f"{key}_bf16"], f64[key])
 
@@ -166,9 +167,13 @@ def teacher_forced(model, sequences: np.ndarray, mask: np.ndarray, width: int) -
 
 def filtered(scores: torch.Tensor) -> torch.Tensor:
     """generate's sampling chain in its own order: temperature, top-k, top-p."""
+    # A warper reads no input ids; transformers types its tensors by torch's legacy nominal classes, which no
+    # tensor is at run time.
+    ids: Any = torch.zeros((scores.shape[0], 0), dtype=torch.long)
     for warper in (TemperatureLogitsWarper(TEMPERATURE), TopKLogitsWarper(TOP_K),
                    TopPLogitsWarper(TOP_P)):
-        scores = warper(None, scores)
+        held: Any = scores
+        scores = warper(ids, held)
     return scores
 
 
@@ -183,9 +188,12 @@ def write_generation(name: str) -> None:
               "eos_token_id": None, "use_cache": True, "return_dict_in_generate": True,
               "output_logits": True}
     with torch.no_grad():
-        greedy = model.generate(**common, do_sample=False, num_beams=1)
+        # transformers declares `device` apart on PreTrainedModel and GenerationMixin, which hides
+        # `generate` from the checker.
+        generating: Any = model
+        greedy = generating.generate(**common, do_sample=False, num_beams=1)
         torch.manual_seed(SAMPLE_SEED)
-        sampled = model.generate(**common, do_sample=True, temperature=TEMPERATURE, top_k=TOP_K,
+        sampled = generating.generate(**common, do_sample=True, temperature=TEMPERATURE, top_k=TOP_K,
                                  top_p=TOP_P)
     arrays: dict[str, np.ndarray] = {"prompt": ids, "mask": mask}
     with float64():
@@ -208,7 +216,7 @@ def write_generation(name: str) -> None:
     arrays["sampled_behavior_f64"] = exact_behavior.numpy()
     if not np.all(np.isfinite(arrays["sampled_behavior_f64"])):
         raise SystemExit(f"{name}: a sampled token lies outside the float64 filtered support")
-    np.savez(directory / "generate.npz", **arrays)
+    np.savez(directory / "generate.npz", allow_pickle=False, **arrays)
 
 
 def report_generation(name: str, path: str, fp32: np.ndarray, f64: np.ndarray,
@@ -227,7 +235,6 @@ def bits(values: torch.Tensor) -> np.ndarray:
 
 
 def write_attention() -> None:
-    from types import SimpleNamespace
 
     from transformers.models.llama.modeling_llama import eager_attention_forward
 
@@ -236,7 +243,10 @@ def write_attention() -> None:
     # [batch, heads, length, width]; q.k / sqrt(width) has standard deviation 0.5
     q, k, v = (torch.from_numpy(rng.randn(1, 1, 512, width)).to(torch.bfloat16) for _ in range(3))
     k = (k.to(torch.float64) * 0.5).to(torch.bfloat16)
-    module = SimpleNamespace(num_key_value_groups=1, training=False)
+    class Attending(torch.nn.Module):
+        num_key_value_groups = 1
+
+    module = Attending().eval()
 
     def attend(dtype):
         out, _ = eager_attention_forward(module, q.to(dtype), k.to(dtype), v.to(dtype), None,

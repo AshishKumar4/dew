@@ -12,8 +12,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import normal_float32
-from reference_error import assert_as_exact
+from arm_arithmetic import as_written, products_held
+from low_precision_support import edge_values
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
     BACKWARD_FORMS,
@@ -329,10 +330,11 @@ def test_a_resumed_state_carried_far_is_as_exact_as_the_references(natural):
         return template.Hooks(initial=template.Initial(jnp.zeros((4, 1, 1)), jnp.ones((4, 1, 1)), acc))
 
     def triton(distance, value, acc):
+        from generation_support import interprets
+
         with tuning.pinned({attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}):
             return attention_triton.forward(distance, jnp.ones_like(distance), value, spans, state(acc),
-                                            scale=1.0, natural=natural,
-                                            interpret=jax.default_backend() != "gpu")
+                                            scale=1.0, natural=natural, interpret=interprets())
 
     def portable(distance, value, acc):
         return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
@@ -927,66 +929,13 @@ def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at
     _accurate_dq(query, key, value, spans, hooks, dout, 2.0 ** -40, "a tiny weight over a large state")
 
 
-def test_power2_is_exact_under_jit_at_every_exponent():
-    """`algebra.power2` scales by powers of two exactly wherever the result is a normal fp32, compiled
-    (where XLA computes `exp2` as an inexact `exp` and fuses a product of them into one `exp`, past fp32's
-    range), at every integral exponent from -400 to 400 against exact float64 scaling (its split takes thirds
-    by a product with fp32's 1/3, the clip at POWER2_REACH among them), and zero stays zero."""
-    exponents = jnp.arange(-400.0, 401.0, dtype=jnp.float32)
-    mantissas = jnp.asarray([0.0, 0.5, 0.75, 1.0, -0.6], jnp.float32)
-    found = np.asarray(jax.jit(lambda x, k: algebra.power2(x[:, None], k[None, :]))(mantissas, exponents))
-    exact = np.ldexp(np.asarray(mantissas, np.float64)[:, None], np.asarray(exponents, np.int64)[None, :])
-    normal = normal_float32(exact)
-    np.testing.assert_array_equal(found[normal], exact[normal].astype(np.float32))
-    np.testing.assert_array_equal(found[0], 0.0)
-    assert np.all(np.isinf(found[1:][np.abs(exact[1:]) > np.finfo(np.float32).max]))
-
-
-
-def _edge_floats() -> np.ndarray:
-    """fp32 values across every binade, subnormals among them: zeros, the least subnormal and normal, the
-    largest, and significands of ties to even at every shift."""
-    bits = np.concatenate([np.arange(0, 0x800000, 4099, dtype=np.uint32),
-                           np.arange(0x800000, 0x7F800000, 1048573, dtype=np.uint32),
-                           np.asarray([0, 1, 2, 3, 0x7FFFFF, 0x800000, 0x7F7FFFFF, 0x00C00000, 0x00A00000,
-                                       0x3FC00000, 0x40400001], np.uint32)])
-    values = bits.view(np.float32)
-    return np.concatenate([values, -values])
-
-
-def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flushing_cpu():
-    """On XLA's CPU, whose fp32 multiply flushes a subnormal operand and result (row 4023):
-    `dew.nn.precision.raised_exactly` is `x * 2^k` and `lowered_rounded` `x * 2^-k` rounded once to nearest
-    even, bitwise numpy's IEEE `ldexp`, across every binade, subnormals both ways, at shifts 0 to 300, and
-    `binade_of` is `floor(log2|x|)` (row 6302's finish, `algebra.quotient`, and an initial state's
-    gradient)."""
-    from dew.nn import precision
-
-    values = _edge_floats()
-    shifts = np.asarray([0, 1, 2, 23, 24, 25, 63, 64, 126, 127, 149, 150, 151, 252, 300], np.int32)
-    on_cpu = jax.devices("cpu")[0]
-    x, k = (jax.device_put(each, on_cpu) for each in (values[:, None], shifts[None, :]))
-    lowered = np.asarray(jax.jit(precision.lowered_rounded)(x, k))
-    rounded = np.ldexp(values[:, None], -shifts[None, :]).astype(np.float32)
-    np.testing.assert_array_equal(lowered.view(np.uint32), rounded.view(np.uint32))
-    raised = np.asarray(jax.jit(precision.raised_exactly)(x, k))
-    exact = np.ldexp(values[:, None].astype(np.float64), shifts[None, :])
-    held = np.abs(exact) <= np.finfo(np.float32).max
-    expected = exact[held].astype(np.float32)
-    np.testing.assert_array_equal(raised[held].view(np.uint32), expected.view(np.uint32))
-    nonzero = values != 0
-    binades = np.asarray(jax.jit(precision.binade_of)(jax.device_put(values, on_cpu)))
-    np.testing.assert_array_equal(binades[nonzero],
-                                  np.floor(np.log2(np.abs(values[nonzero].astype(np.float64)))).astype(np.int32))
-
-
 def test_a_quotient_below_the_least_normal_is_correctly_rounded_on_a_flushing_cpu():
     """`algebra.quotient` on XLA's CPU, which flushes a subnormal result (row 6302's finish): weighted values
     across fp32's subnormals and least normals over totals from 1 to 3 * 2^121, each quotient it raises (its
     weighted value over 124 binades under its total) bitwise the correctly rounded fp32 of its exact ratio,
     the constructed tie `0x00c00002 / 3` among them (a second rounding's one-ulp miss), and every other one
     bitwise XLA's own division."""
-    values = _edge_floats()
+    values = edge_values(np.float32)
     totals = np.asarray([1.0, 3.0, 7.0, 2.0 ** 20 + 1, 2.0 ** 60, 3.0 * 2.0 ** 121], np.float32)
     acc = np.concatenate([values, np.asarray([0x00C00002], np.uint32).view(np.float32)])
     rows = np.broadcast_to(acc, (len(totals), len(acc)))
@@ -1028,6 +977,44 @@ def test_finished_slices_merged_at_a_large_maximum_keep_each_ones_mass(totals, o
     assert out.item() == np.float32(share), out.item()
 
 
+def test_a_merged_state_landed_past_fp32s_largest_moves_its_maximum_and_keeps_its_mass():
+    """Two slices of output 0 and denominator 2^127 at the natural maximum 2^30, merged
+    (`algebra.finished_merged`): their mass, 2^128, passes fp32's largest, so their state lands at the next
+    maximum fp32 holds past 2^30, 2^30 + 128 (fp32's spacing there), its mass taken by e^-128; merged again
+    with a slice of output 1 and denominator 2^127 at 2^30, the output is 1/3. The landed mass and the
+    output on par with the plain fp32 combination of each slice's mass at the moved maximum, exp(log(T) -
+    128), against float64 (check 1), where a maximum moved by log 2 rounded back to 2^30 and the state lost
+    half its mass: the output was 1/2 (the base review of 7d8b5e062, F2; of e97ed082d, F4: masses of 2^126
+    landed at 2^30 unmoved)."""
+    spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
+
+    def state(out, total):
+        return algebra.slice_state(spec, jnp.full((1, 1), out, jnp.float32), jnp.full((1,), 2.0 ** 30),
+                                   jnp.reshape(total, (1,)).astype(jnp.float32))
+
+    def merged(*states):
+        stacked = algebra.Partial(*(jnp.stack(parts) for parts in zip(*(each[:3] for each in states),
+                                                                        strict=True)))
+        return algebra.finished_merged(spec, stacked, axis=0)
+
+    totals = jnp.full((3,), 2.0 ** 127, jnp.float32)
+    pair = merged(state(0.0, totals[0]), state(0.0, totals[1]))
+    assert pair.m.item() == np.float32(2.0 ** 30 + 128), pair.m.item()
+
+    def ours(totals):
+        pair = merged(state(0.0, totals[0]), state(0.0, totals[1]))
+        out = algebra.finish(spec, merged(pair, state(1.0, totals[2])), initial=True, normalized=True)[0]
+        return jnp.reshape(pair.total, (1, 1)), jnp.reshape(out, (1, 1))
+
+    def plain(totals):
+        masses = jnp.exp(jnp.log(totals) - 128)
+        return (jnp.reshape(masses[0] + masses[1], (1, 1)),
+                jnp.reshape(masses[2] / jnp.sum(masses), (1, 1)))
+
+    _on_par_jitted_and_op_by_op(ours, plain, lambda seed: (totals,),
+                                "a merged state landed past fp32's largest", seeds=FEWEST_SEEDS)
+
+
 LARGEST = float(np.finfo(np.float32).max)
 
 
@@ -1067,7 +1054,7 @@ def test_finished_slices_merge_within_their_outputs_at_fp32s_largest(outputs, ma
     assert np.isfinite(np.asarray(gradient)), gradient
 
 
-CANCELLING_SEEDS = 8
+CANCELLING_SEEDS = 16
 """The cancelling merge's declared draws (check 1)."""
 
 
@@ -1076,8 +1063,10 @@ def test_slices_that_cancel_near_fp32s_largest_merge_on_par_beside_a_least_norma
     that cancel and one whose share of its output is near fp32's least normal, so the merged output is that
     third slice's share: on par with the plain fp32 convex combination against float64 (check 1). Summing
     the whole combination at half its size, as the largest outputs' terms are summed, would drop the third's
-    last bits below the normal range (0 where the truth is 2^-126)."""
+    last bits below the normal range (0 where the truth is 2^-126); summing the large terms' products
+    unrounded, as a compiled sum did, left one product's rounding (3.6e30, row 6909)."""
 
+    @_reaches_subnormals
     def draw(seed):
         streams = jax.random.split(jax.random.key(seed), 2)
         large = 2.0 ** 127 * (1 + jax.random.uniform(streams[0], (), jnp.float32))
@@ -1090,9 +1079,111 @@ def test_slices_that_cancel_near_fp32s_largest_merge_on_par_beside_a_least_norma
     def plain(outputs, totals):
         return jnp.sum(totals / jnp.sum(totals) * outputs)[None, None]
 
-    assert_as_exact(jax.jit(merged), jax.jit(plain), draw, "slices cancelling beside a least normal one",
-                    seeds=CANCELLING_SEEDS)
+    _on_par_jitted_and_op_by_op(merged, plain, draw, "slices cancelling beside a least normal one",
+                                seeds=CANCELLING_SEEDS)
 
+
+VALUE_SEEDS = 512
+"""The merge of masses past fp32's largest's declared draws (check 1)."""
+
+
+def _masses_past_fp32s_largest(seed):
+    """Sixteen slices of masses near 2^124, whose total passes fp32's largest, under outputs near 1 and 2 by
+    turns: a mean near 1.5, which shares formed over the total mass made 0 (their denominator inf). Each
+    mass's reciprocal is normal, as XLA:CPU divides by a broadcast through its reciprocal (`_shares`)."""
+    streams = jax.random.split(jax.random.key(seed), 2)
+    totals = 2.0 ** 124 * (1 + 0.5 * jax.random.uniform(streams[0], (16,), jnp.float32))
+    outputs = jnp.asarray([1.0, 2.0] * 8, jnp.float32) * (1 + 0.25 * jax.random.uniform(streams[1], (16,)))
+    return outputs.astype(jnp.float32), totals
+
+
+def _reaches_subnormals(draw):
+    """`draw`, marked as one whose arithmetic reaches fp32's subnormals (`_on_par_jitted_and_op_by_op`)."""
+    draw.reaches_subnormals = True
+    return draw
+
+
+@_reaches_subnormals
+def _masses_near_fp32s_largest(seed):
+    """Two slices of masses from 2^126 to 2^127 under outputs near 1: shares over the largest, which XLA:CPU
+    divides by through its reciprocal, there below fp32's least normal (row 6904; the base review of
+    7746edbd6, F1: masses of 2^127 merged to 0 where the mean is 1)."""
+    streams = jax.random.split(jax.random.key(seed), 2)
+    totals = 2.0 ** 126 * (1 + jax.random.uniform(streams[0], (2,), jnp.float32))
+    outputs = 1 + 0.25 * jax.random.uniform(streams[1], (2,), jnp.float32)
+    return outputs.astype(jnp.float32), totals.astype(jnp.float32)
+
+
+def _scaled_masses(totals, *others):
+    """`totals` and `others` scaled exactly (`jnp.ldexp`) by the power of two that takes the largest of
+    `totals` into [1/2, 1): a reference's shares that divide by no mass, as XLA:CPU divides by a broadcast
+    through its reciprocal (openxla/xla#51148), past 2^126 below fp32's least normal, even op by op (a
+    jnp division is a program of its own)."""
+    exponent = jnp.frexp(jnp.max(totals))[1]
+    return tuple(jnp.ldexp(x, -exponent) for x in (totals, *others))
+
+
+def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int,
+                                run: str | None = None) -> None:
+    """`ours` on par with `reference` against float64 (check 1), jitted and as written: its compiler
+    rewrites a quotient divided again into one over the divisors' product, a division by a broadcast into a
+    product with its reciprocal and a sum of products into one of unrounded products, so each order is held
+    as written and as compiled. As written is op by op (`as_given`, which the gate runs uncompiled) where the
+    draw reaches fp32's subnormals (`_reaches_subnormals`), which XLA's CPU keeps one primitive at a time and
+    flushes in a compiled program (row 4023); compiled with no rewrite, its products held from any fused
+    multiply-add (`arm_arithmetic.as_written`, `products_held`, its own program run as given) for every other
+    draw, where op by op compiled each primitive of the merge's windows apart (the cotangent cell 6.81 GiB op
+    by op, 1.28 jitted). The reference runs op by op, so none of those rewrites reaches the bar it sets (row
+    6909: a compiled reference summing products shared Dew's error)."""
+    reaches = getattr(draw, "reaches_subnormals", False)
+    written = as_given(ours if reaches else jax.jit(products_held(ours), compiler_options=as_written()))
+    for program, mode in ((jax.jit(ours), "jitted"), (written, "as written")):
+        if run is None or run == mode:
+            assert_as_exact(program, as_given(reference), draw, f"{label} {mode}", seeds=seeds)
+
+
+@pytest.mark.parametrize("draw", [_masses_past_fp32s_largest, _masses_near_fp32s_largest],
+                         ids=["sixteen-near-2^124", "two-near-2^127"])
+def test_a_merge_of_masses_near_fp32s_largest_is_on_par(draw):
+    """Finished slices merged (`algebra.finished_merged`, at one maximum) of masses near fp32's largest: the
+    merged output on par with the fp32 convex combination of their outputs weighed by their masses over the
+    largest first, against float64 (check 1), where shares over the total were 0 past fp32's largest and
+    shares over a largest past 2^126 flushed (row 6904)."""
+
+    def merged(outputs, totals):
+        return _finished_merged_output(outputs, jnp.zeros_like(totals), totals)
+
+    def plain(outputs, totals):
+        shares, = _scaled_masses(totals)
+        return (jnp.sum(shares * outputs) / jnp.sum(shares))[None, None]
+
+    _on_par_jitted_and_op_by_op(merged, plain, draw,
+                                f"a merge of masses near fp32's largest, {draw.__name__}", seeds=VALUE_SEEDS)
+
+
+
+def test_an_eager_merge_compiles_its_law_once():
+    """Finished slices merged op by op (`algebra.finished_merged`, no jit) at a second draw of the same
+    shapes compile nothing: the law's primitives hold the walk's units as a parameter, a value equal at an
+    equal spec, where a factor made afresh each call keyed each eager merge anew, compiled it again and JAX's
+    eager cache held every executable (8 MiB a call, a test's process past 12 GiB)."""
+    from jax._src import dispatch
+
+    first, second = (_masses_near_fp32s_largest(seed) for seed in (0, 1))
+    jax.block_until_ready(_finished_merged_output(first[0], jnp.zeros_like(first[1]), first[1]))
+    compiled = []
+
+    def heard(event: str, duration: float, **values) -> None:
+        del duration, values
+        if event == dispatch.BACKEND_COMPILE_EVENT:
+            compiled.append(event)
+
+    jax.monitoring.register_event_duration_secs_listener(heard)
+    try:
+        jax.block_until_ready(_finished_merged_output(second[0], jnp.zeros_like(second[1]), second[1]))
+    finally:
+        jax.monitoring.unregister_event_duration_listener(heard)
+    assert not compiled, len(compiled)
 
 DERIVATIVE_SEEDS = 256
 """The merge derivative's sites' declared draws (check 1), each sized by `seeds_for` paired on armada."""
@@ -1106,6 +1197,7 @@ def _opposite_near_largest(seed):
     return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals
 
 
+@_reaches_subnormals
 def _cancelling_beside_least_normal(seed):
     """Two slices of outputs near +-2^127 that cancel beside one whose output is near fp32's least normal."""
     streams = jax.random.split(jax.random.key(seed), 3)
@@ -1125,17 +1217,44 @@ def _subunit_masses_of_alternate_signs(seed):
     return (sizes * jnp.asarray([1.0, -1.0] * 4, jnp.float32)).astype(jnp.float32), totals
 
 
+@_reaches_subnormals
+def _subunit_masses_near_least_normal(seed):
+    """Two slices of outputs of opposite signs near fp32's least normal, denominators near 1/8: a mean near
+    zero over a total mass near 1/4, its derivatives near 6 x 2^-126, where a gap over the summed count
+    first fell into the subnormals a CPU flushes (row 6894)."""
+    streams = jax.random.split(jax.random.key(seed), 2)
+    sizes = 1.5 * 2.0 ** -126 * (1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32))
+    totals = 0.125 * (1 + 0.25 * jax.random.uniform(streams[1], (2,), jnp.float32))
+    return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals
+
+
+ALONG_SEEDS = 512
+"""The merge derivative's forward sites' declared draws (check 1), each sized by `seeds_for` paired on
+armada."""
+
+
+def _subunit_masses_under_large_outputs(seed):
+    """Two slices of masses near 2^-20 under outputs of opposite signs near 2^120: coefficients (o - out) / W
+    near 2^139, past fp32's largest, where the derivative along masses near theirs is near 2^116."""
+    streams = jax.random.split(jax.random.key(seed), 2)
+    sizes = 2.0 ** 120 * (1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32))
+    totals = 2.0 ** -20 * (1 + 0.25 * jax.random.uniform(streams[1], (2,), jnp.float32))
+    return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals
+
+
 @pytest.mark.parametrize("draw", [_opposite_near_largest, _cancelling_beside_least_normal,
-                                  _subunit_masses_of_alternate_signs],
+                                  _subunit_masses_of_alternate_signs, _subunit_masses_near_least_normal],
                          ids=["opposite-near-largest", "cancelling-beside-least-normal",
-                              "subunit-masses-of-alternate-signs"])
+                              "subunit-masses-of-alternate-signs", "subunit-masses-near-least-normal"])
 def test_the_merges_derivative_as_to_its_denominators_is_on_par(draw):
     """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) as to each
     slice's denominator, (o_j - out) / T, on par with the mean's own derivative formed in fp32 as
     o_j / T - out / T against float64 (check 1): slices of opposite signs near fp32's largest, whose sum's
     reverse pass overflowed (L/8 returned as inf, row 6827), slices cancelling near 2^127 beside a
     least-normal one, whose gaps halved would lose its bits, and eight of subunit masses under outputs of
-    alternate signs near 2^127, whose gaps over the largest mass passed fp32 before their sum (row 6886)."""
+    alternate signs near 2^127, whose gaps over the largest mass passed fp32 before their sum (row 6886),
+    and two of subunit masses under outputs near fp32's least normal, whose gaps over the summed count first
+    flushed to zero (row 6894)."""
 
     def ours(outputs, totals):
         return jax.grad(lambda each: _finished_merged_output(outputs, jnp.zeros_like(totals), each).sum())(
@@ -1145,8 +1264,460 @@ def test_the_merges_derivative_as_to_its_denominators_is_on_par(draw):
         total = jnp.sum(totals)
         return outputs / total - jnp.sum(totals / total * outputs) / total
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"the merge's derivative, {draw.__name__}",
-                    seeds=DERIVATIVE_SEEDS)
+    _on_par_jitted_and_op_by_op(ours, reference, draw, f"the merge's derivative, {draw.__name__}",
+                                seeds=DERIVATIVE_SEEDS)
+
+
+@pytest.mark.parametrize("run", ["jitted", "as written"])
+@pytest.mark.parametrize("draw", [_opposite_near_largest, _subunit_masses_of_alternate_signs,
+                                  _subunit_masses_under_large_outputs, _masses_past_fp32s_largest,
+                                  _masses_near_fp32s_largest],
+                         ids=["opposite-near-largest", "subunit-masses-of-alternate-signs",
+                              "subunit-masses-under-large-outputs", "masses-past-fp32s-largest",
+                              "masses-near-fp32s-largest"])
+def test_the_merges_derivative_along_its_denominators_is_on_par(draw, run):
+    """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along its
+    denominators, every other one's direction an eighth of it, on par with the mean's own formed in fp32 as
+    (sum(d o / L) - out sum(d / L)) over the masses' sum over L, a power of two near their largest
+    (`_scaled_masses`), against float64 (check 1): the reverse pass's sites whose outputs reach `HALVED`
+    (row 6827, 6886), outputs near 2^120 over masses near 2^-20, whose coefficients passed fp32 where the
+    derivative did not (NaN where it is near 2^116, row 6905), and masses near and past fp32's largest
+    (row 6904)."""
+
+    def along(totals):
+        return totals * (0.125 * (jnp.arange(totals.shape[0]) % 2 == 0))
+
+    def ours(outputs, totals):
+        return jax.jvp(lambda each: _finished_merged_output(outputs, jnp.zeros_like(totals), each), (totals,),
+                       (along(totals),))[1]
+
+    def reference(outputs, totals):
+        shares, directions = _scaled_masses(totals, along(totals))
+        out = jnp.sum(shares * outputs) / jnp.sum(shares)
+        return ((jnp.sum(directions * outputs) - out * jnp.sum(directions)) / jnp.sum(shares))[None, None]
+
+    _on_par_jitted_and_op_by_op(ours, reference, draw, f"the merge's derivative along, {draw.__name__}",
+                                seeds=ALONG_SEEDS, run=run)
+
+
+def _opposite_near_largest_over_unequal_masses(seed):
+    """Two slices of outputs of opposite signs within a quarter of fp32's largest, masses near 1 and 1/4:
+    the second's mass coefficient (o - out) / W near -1.28 times fp32's largest, past it."""
+    streams = jax.random.split(jax.random.key(seed), 2)
+    sizes = LARGEST * (1 - 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32))
+    totals = jnp.asarray([1.0, 0.25], jnp.float32) * (1 + 0.25 * jax.random.uniform(streams[1], (2,)))
+    return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals.astype(jnp.float32)
+
+
+def _along_one_to_two(draw):
+    """`draw`'s slices with directions from 1 to 2 along their outputs."""
+    def drawn(seed):
+        outputs, totals = draw(seed)
+        return outputs, totals, jnp.linspace(1.0, 2.0, outputs.shape[0], dtype=jnp.float32)
+
+    drawn.__name__ = draw.__name__
+    return drawn
+
+
+@_reaches_subnormals
+def _tiny_and_huge_masses_along_the_tiny(seed):
+    """Two slices of masses near 2^-100 and 2^100 under outputs near 0, a direction near 2^100 along the
+    first's output: its share near 2^-200, past fp32's least subnormal, where its term is near 2^-100 (the
+    base review of 6f09a9627, F1: 0 where it is 2^-100)."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    totals = jnp.asarray([2.0 ** -100, 2.0 ** 100], jnp.float32) * (1 + jax.random.uniform(streams[0], (2,)))
+    outputs = jax.random.uniform(streams[1], (2,), jnp.float32, -1.0, 1.0)
+    first = 2.0 ** 100 * (1 + jax.random.uniform(streams[2], ()))
+    return outputs, totals.astype(jnp.float32), jnp.zeros(2, jnp.float32).at[0].set(first)
+
+
+@pytest.mark.parametrize("run", ["jitted", "as written"])
+@pytest.mark.parametrize("draw", [_along_one_to_two(_opposite_near_largest_over_unequal_masses),
+                                  _along_one_to_two(_subunit_masses_of_alternate_signs),
+                                  _tiny_and_huge_masses_along_the_tiny],
+                         ids=["opposite-near-largest-over-unequal-masses",
+                              "subunit-masses-of-alternate-signs", "tiny-and-huge-masses-along-the-tiny"])
+def test_the_merges_derivative_along_its_outputs_is_on_par(draw, run):
+    """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along drawn
+    directions of its outputs alone, on par with sum(w d) / sum(w) formed in fp32, against float64 (check
+    1): its masses' tangents inactive form no term, where a zero times a mass coefficient past fp32's
+    largest was NaN (the base review of 7746edbd6, F2: NaN where the derivative is 1), and a share below
+    fp32's least subnormal is never formed where its term is normal (the base review of 6f09a9627, F1)."""
+
+    def ours(outputs, totals, direction):
+        return jax.jvp(lambda each: _finished_merged_output(each, jnp.zeros_like(totals), totals), (outputs,),
+                       (direction,))[1]
+
+    def reference(outputs, totals, direction):
+        return (jnp.sum(totals * direction) / jnp.sum(totals))[None, None]
+
+    _on_par_jitted_and_op_by_op(ours, reference, draw,
+                                f"the merge's derivative along its outputs, {draw.__name__}",
+                                seeds=ALONG_SEEDS, run=run)
+
+
+MERGE_EDGE_SEEDS = 512
+"""The merge derivative's and the decode merge's sites at fp32's edges' declared draws (check 1), each sized
+by `seeds_for` paired on armada."""
+
+
+SECOND_ORDER_SEEDS = 256
+"""The merge's mixed second derivative's declared draws (check 1), sized by `seeds_for` paired on armada:
+each order's two jvps over its draws pass the 120 s group target at the first-order sites' 512."""
+
+
+def _equal_outputs_along_large_directions(seed):
+    """Two slices of masses near 1 under equal outputs near 0 (a zero gap), masses along [2^60, 0] and outputs
+    along [2^67, 0]: their mixed second derivative near 2^125, which a written chain's autodiff through
+    `jnp.frexp` at the zero gap passed fp32's largest before its 2^-3 (the base review of 67b7edd06, F1:
+    inf where it is 2^125)."""
+    streams = jax.random.split(jax.random.key(seed), 4)
+    totals = 1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32)
+    outputs = jnp.full(2, jax.random.uniform(streams[1], (), jnp.float32, -1.0, 1.0))
+    masses = jnp.zeros(2, jnp.float32).at[0].set(2.0 ** 60 * (1 + jax.random.uniform(streams[2], ())))
+    along = jnp.zeros(2, jnp.float32).at[0].set(2.0 ** 67 * (1 + jax.random.uniform(streams[3], ())))
+    return outputs, totals.astype(jnp.float32), masses, along
+
+
+@_reaches_subnormals
+def _a_subnormal_gap_along_units(seed):
+    """Two slices of masses near 1 under outputs 0 and a subnormal near 2^-130, masses along [1, 0] and
+    outputs along [0, 1]: a gap below fp32's least normal, where autodiff of `jnp.frexp` multiplied by
+    2^-e = inf (train 934's review: NaN where the mixed second derivative is near -1/4)."""
+    streams = jax.random.split(jax.random.key(seed), 4)
+    totals = 1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32)
+    outputs = jnp.zeros(2, jnp.float32).at[1].set(2.0 ** -130 * (1 + jax.random.uniform(streams[1], ())))
+    masses = jnp.zeros(2, jnp.float32).at[0].set(1 + jax.random.uniform(streams[2], ()))
+    along = jnp.zeros(2, jnp.float32).at[1].set(1 + jax.random.uniform(streams[3], ()))
+    return outputs, totals.astype(jnp.float32), masses, along
+
+
+@pytest.mark.parametrize("run", ["jitted", "as written"])
+@pytest.mark.parametrize("draw", [_equal_outputs_along_large_directions, _a_subnormal_gap_along_units],
+                         ids=["equal-outputs-along-large-directions", "a-subnormal-gap-along-units"])
+def test_the_merges_mixed_second_derivative_is_on_par(draw, run):
+    """The mixed second derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along
+    drawn directions of its masses and its outputs, in both orders, on par with sum(dw (do - d out)) / W
+    formed in fp32 over the masses' power of two (`_scaled_masses`), d out = sum(w do) / W, against float64
+    (check 1): every order of the mean's derivative holds as its first does (the base review of 67b7edd06,
+    F1: inf where it is 2^125; train 934's review: NaN at a subnormal gap where it is near -1/4)."""
+
+    def ours(outputs, totals, masses, along):
+        def merged(outputs, totals):
+            return _finished_merged_output(outputs, jnp.zeros_like(totals), totals)
+
+        masses_then_outputs = jax.jvp(lambda o: jax.jvp(lambda w: merged(o, w), (totals,), (masses,))[1],
+                                      (outputs,), (along,))[1]
+        outputs_then_masses = jax.jvp(lambda w: jax.jvp(lambda o: merged(o, w), (outputs,), (along,))[1],
+                                      (totals,), (masses,))[1]
+        return jnp.stack([masses_then_outputs, outputs_then_masses]).reshape(1, 2)
+
+    def reference(outputs, totals, masses, along):
+        shares, moved = _scaled_masses(totals, masses)
+        moving = jnp.sum(shares * along) / jnp.sum(shares)
+        second = jnp.sum(moved * (along - moving)) / jnp.sum(shares)
+        return jnp.stack([second, second]).reshape(1, 2)
+
+    _on_par_jitted_and_op_by_op(ours, reference, draw,
+                                f"the merge's mixed second derivative, {draw.__name__}",
+                                seeds=SECOND_ORDER_SEEDS, run=run)
+
+
+def _unit_masses_along_two(seed):
+    """Eight slices of masses near 1 under outputs of alternate signs near 1.8 x 2^127, the first mass's
+    tangent near 2: a term near 7.7e37, which a chain doubling the tangent before its quotient passed."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    totals = 1 + 0.25 * jax.random.uniform(streams[0], (8,), jnp.float32)
+    sizes = 1.8 * 2.0 ** 127 * (1 - 0.1 * jax.random.uniform(streams[1], (8,), jnp.float32))
+    direction = jnp.zeros(8, jnp.float32).at[0].set(2 * (1 + 0.25 * jax.random.uniform(streams[2], ())))
+    return (sizes * jnp.asarray([1.0, -1.0] * 4, jnp.float32)).astype(jnp.float32), totals, direction
+
+
+def _masses_past_2_127_along_their_own(seed):
+    """Two slices of masses near 1.5 x 2^127 under outputs of opposite signs near 0.9 x 2^127, their tangents
+    near their own masses: a doubled tangent passed fp32's largest (NaN where the derivative is near 0)."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    totals = 1.5 * 2.0 ** 127 * (1 - 0.1 * jax.random.uniform(streams[0], (2,), jnp.float32))
+    sizes = 0.9 * 2.0 ** 127 * (1 - 0.1 * jax.random.uniform(streams[1], (2,), jnp.float32))
+    direction = totals * (1 - 0.5 * jax.random.uniform(streams[2], (2,), jnp.float32))
+    return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals, direction
+
+
+@_reaches_subnormals
+def _masses_near_2_126_along_least_normal(seed):
+    """Two slices of masses near 1.5 x 2^126 under outputs of opposite signs near 1.8 x 2^127, the first
+    mass's tangent near 2^-125: a term near 2.8e-38, which a quotient on the way flushed."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    totals = 1.5 * 2.0 ** 126 * (1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32))
+    sizes = 1.8 * 2.0 ** 127 * (1 - 0.1 * jax.random.uniform(streams[1], (2,), jnp.float32))
+    direction = jnp.zeros(2, jnp.float32).at[0].set(2.0 ** -125 * (1 + jax.random.uniform(streams[2], ())))
+    return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals, direction
+
+
+def _unit_masses_under_small_outputs_along_2_127(seed):
+    """Two slices of masses near 1 under outputs near 2 and -2, the first mass's tangent near 2^127: a term
+    near it, which a chain doubling the tangent before halving it passed fp32's largest with (the base
+    review of 405c2e725)."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    totals = 1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32)
+    sizes = 2 * (1 + 0.1 * jax.random.uniform(streams[1], (2,), jnp.float32))
+    first = 2.0 ** 127 * (1 + 0.4 * jax.random.uniform(streams[2], ()))
+    direction = jnp.zeros(2, jnp.float32).at[0].set(first)
+    return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals, direction
+
+
+def _halves_over_masses(outputs, totals):
+    """`(o - out) / 2` over the masses' power of two (`_scaled_masses`), the scaled masses' sum, and the
+    power's exponent: a reference's gaps, neither past fp32 nor flushed at these sites."""
+    exponent = jnp.frexp(jnp.max(totals))[1]
+    shares = jnp.ldexp(totals, -exponent)
+    summed = jnp.sum(shares)
+    out = jnp.sum(shares * outputs) / summed
+    return jnp.ldexp(outputs * 0.5 - out * 0.5, -exponent), summed
+
+
+@pytest.mark.parametrize("run", ["jitted", "as written"])
+@pytest.mark.parametrize("draw", [_unit_masses_along_two, _masses_past_2_127_along_their_own,
+                                  _masses_near_2_126_along_least_normal,
+                                  _unit_masses_under_small_outputs_along_2_127],
+                         ids=["unit-masses-along-two", "masses-past-2^127-along-their-own",
+                              "masses-near-2^126-along-least-normal",
+                              "unit-masses-under-small-outputs-along-2^127"])
+def test_the_merges_derivative_along_drawn_directions_is_on_par(draw, run):
+    """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along drawn
+    tangents of its denominators, on par with sum(d (o - out)) / W formed in fp32 over the masses' power
+    of two and the tangents' own, exactly (`_halves_over_masses`), against float64 (check 1): a forward
+    pass whose terms are finite where a chain's intermediate overflowed or flushed (train 931's review:
+    inf where it is 7.7e37, NaN where it is near 0, 0 where it is 2.8e-38; the base review of 405c2e725:
+    inf where it is 2^127)."""
+
+    def ours(outputs, totals, direction):
+        return jax.jvp(lambda each: _finished_merged_output(outputs, jnp.zeros_like(totals), each), (totals,),
+                       (direction,))[1]
+
+    def reference(outputs, totals, direction):
+        halves, summed = _halves_over_masses(outputs, totals)
+        exponent = jnp.frexp(jnp.max(jnp.abs(direction)))[1]
+        return jnp.ldexp(jnp.sum(jnp.ldexp(direction, -exponent) * halves) / summed * 2, exponent)[None, None]
+
+    _on_par_jitted_and_op_by_op(ours, reference, draw,
+                                f"the merge's derivative along drawn directions, {draw.__name__}",
+                                seeds=MERGE_EDGE_SEEDS, run=run)
+
+
+def _masses_of_2_20_under_a_cotangent_of_16(seed):
+    """Two slices of masses near 2^20 (a slice of 2^20 keys) under outputs of opposite signs near 0.9 x
+    2^127, a cotangent near 16: gradients near 1.2e33, which a reverse pass multiplying the cotangent by a
+    gap before its quotient passed."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    totals = 2.0 ** 20 * (1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32))
+    sizes = 0.9 * 2.0 ** 127 * (1 - 0.1 * jax.random.uniform(streams[1], (2,), jnp.float32))
+    cotangent = 16 * (1 + 0.25 * jax.random.uniform(streams[2], (), jnp.float32))
+    return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals, cotangent
+
+
+def test_the_merges_derivative_under_a_large_cotangent_is_on_par():
+    """The reverse pass of finished slices' merge (`algebra.finished_merged`, at one maximum) as to its
+    denominators under a drawn cotangent, on par with c (o - out) / W formed in fp32 over the masses' power
+    of two (`_halves_over_masses`), against float64 (check 1): gradients finite where a transposed chain's
+    intermediate overflowed (train 931's review: inf where they are 1.2e33)."""
+
+    def ours(outputs, totals, cotangent):
+        out, pull = jax.vjp(lambda each: _finished_merged_output(outputs, jnp.zeros_like(totals), each),
+                            totals)
+        return pull(jnp.full_like(out, cotangent))[0]
+
+    def reference(outputs, totals, cotangent):
+        halves, summed = _halves_over_masses(outputs, totals)
+        return cotangent * halves / summed * 2
+
+    _on_par_jitted_and_op_by_op(ours, reference, _masses_of_2_20_under_a_cotangent_of_16,
+                                "the merge's derivative under a cotangent of 16", seeds=MERGE_EDGE_SEEDS)
+
+
+def _equal_outputs_over_small_masses_under_a_large_cotangent(seed):
+    """Two slices of masses near 2^-40 under equal outputs (a zero gap) and a cotangent near 2^100: the
+    masses' gradients 0, the outputs' near 2^99, where a zero gap's growing exponent met the cotangent
+    before its zero in the transposed chain (the base review of 826882bbf: NaN where the gradient is 0)."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    totals = 2.0 ** -40 * (1 + jax.random.uniform(streams[0], (2,), jnp.float32))
+    outputs = jnp.full(2, jax.random.uniform(streams[1], (), jnp.float32, -1.0, 1.0))
+    cotangent = 2.0 ** 100 * (1 + jax.random.uniform(streams[2], (), jnp.float32))
+    return outputs, totals.astype(jnp.float32), cotangent
+
+
+def test_the_merges_gradients_over_equal_outputs_are_on_par():
+    """The reverse pass of finished slices' merge (`algebra.finished_merged`, at one maximum) as to its
+    denominators and its outputs under a drawn cotangent, on par with c (o - out) / W and c w / W formed in
+    fp32 over the masses' power of two, against float64 (check 1): a zero gap's term 0 however large the
+    cotangent (the base review of 826882bbf)."""
+
+    def ours(outputs, totals, cotangent):
+        out, pull = jax.vjp(lambda o, w: _finished_merged_output(o, jnp.zeros_like(w), w), outputs, totals)
+        d_outputs, d_masses = pull(jnp.full_like(out, cotangent))
+        return jnp.concatenate([d_masses, d_outputs.reshape(-1)]).reshape(1, -1)
+
+    def reference(outputs, totals, cotangent):
+        exponent = jnp.frexp(jnp.max(totals))[1]
+        shares = jnp.ldexp(totals, -exponent)
+        summed = jnp.sum(shares)
+        out = jnp.sum(shares * outputs) / summed
+        d_masses = jnp.ldexp(cotangent * (outputs - out) / summed, -exponent)
+        return jnp.concatenate([d_masses, cotangent * shares / summed]).reshape(1, -1)
+
+    _on_par_jitted_and_op_by_op(ours, reference, _equal_outputs_over_small_masses_under_a_large_cotangent,
+                                "the merge's gradients over equal outputs", seeds=MERGE_EDGE_SEEDS)
+
+
+def _opposite_outputs_along_a_common_scaling(seed):
+    """Two slices of equal masses under outputs a drawn 2^100 apart either side of a drawn 2^90 (each sum
+    exact), the masses along a common scaling of them near 2^100, and the outputs along ones: a derivative
+    0 along the scaling, whose terms are near 2^199 apart (the base review of 85c6cee2f: NaN where it is 0),
+    and 1 along the outputs."""
+    streams = jax.random.split(jax.random.key(seed), 4)
+    mass = 1 + jax.random.randint(streams[0], (), 0, 8).astype(jnp.float32) / 8
+    spread = 2.0 ** 100 * (1 + jax.random.randint(streams[1], (), 0, 8).astype(jnp.float32) / 8)
+    centre = 2.0 ** 90 * (1 + jax.random.randint(streams[2], (), 0, 8).astype(jnp.float32) / 8)
+    scaling = 2.0 ** 100 * (1 + jax.random.uniform(streams[3], (), jnp.float32))
+    return (jnp.stack([centre + spread, centre - spread]), jnp.full(2, mass, jnp.float32),
+            jnp.full(2, scaling, jnp.float32))
+
+
+def test_the_merges_derivative_along_a_common_scaling_of_its_masses_is_on_par():
+    """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along a common
+    scaling of its masses and along ones of its outputs, on par with c sum(w (o - out)) / W and 1 formed in
+    fp32 over the masses' power of two, against float64 (check 1): the mean does not move under a common
+    scaling of its masses, however large its terms (the base review of 85c6cee2f)."""
+
+    def ours(outputs, totals, scaling):
+        def merged(o, w):
+            return _finished_merged_output(o, jnp.zeros_like(w), w)
+
+        along_masses = jax.jvp(lambda w: merged(outputs, w), (totals,), (scaling * totals,))[1]
+        along_outputs = jax.jvp(lambda o: merged(o, totals), (outputs,), (jnp.ones_like(outputs),))[1]
+        return jnp.stack([along_masses, along_outputs]).reshape(1, 2)
+
+    def reference(outputs, totals, scaling):
+        exponent = jnp.frexp(jnp.max(totals))[1]
+        shares = jnp.ldexp(totals, -exponent)
+        summed = jnp.sum(shares)
+        out = jnp.sum(shares * outputs) / summed
+        gaps, gap_exponent = jnp.frexp(outputs - out)
+        top = jnp.max(gap_exponent)
+        moved = jnp.sum(shares * jnp.ldexp(gaps, gap_exponent - top)) / summed
+        return jnp.stack([jnp.ldexp(moved * scaling[0], top), jnp.sum(shares) / summed]).reshape(1, 2)
+
+    _on_par_jitted_and_op_by_op(ours, reference, _opposite_outputs_along_a_common_scaling,
+                                "the merge's derivative along a common scaling", seeds=MERGE_EDGE_SEEDS)
+
+
+def _zero_gap(seed):
+    """Two slices of drawn masses under equal outputs (a zero gap), drawn directions and a cotangent: train
+    943's review's first input, where a jvp of the gradient was 2 where it is 1/4."""
+    streams = jax.random.split(jax.random.key(seed), 5)
+    totals = 1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32)
+    outputs = jnp.full(2, jax.random.uniform(streams[1], (), jnp.float32, -1.0, 1.0))
+    return (outputs, totals, jax.random.normal(streams[2], (2,)), jax.random.normal(streams[3], (2,)),
+            jax.random.normal(streams[4], ()))
+
+
+def _zero_mass(seed):
+    """A slice of a drawn mass beside one of none (its weight 0), drawn outputs, directions and a cotangent:
+    the review's second input, -1, 4 where it is -1, 1 (row 7124: a slice of zero total moves the mean along
+    its own total by its gap)."""
+    streams = jax.random.split(jax.random.key(seed), 5)
+    totals = jnp.zeros(2, jnp.float32).at[0].set(1 + 0.25 * jax.random.uniform(streams[0], ()))
+    outputs = jax.random.uniform(streams[1], (2,), jnp.float32, -1.0, 1.0)
+    return (outputs, totals, jax.random.normal(streams[2], (2,)), jax.random.normal(streams[3], (2,)),
+            jax.random.normal(streams[4], ()))
+
+
+@_reaches_subnormals
+def _subnormal_gap(seed):
+    """Two slices of drawn masses under outputs 0 and a subnormal near 2^-130, drawn directions and a
+    cotangent: the review's third input, inf where it is finite."""
+    streams = jax.random.split(jax.random.key(seed), 5)
+    totals = 1 + 0.25 * jax.random.uniform(streams[0], (2,), jnp.float32)
+    outputs = jnp.zeros(2, jnp.float32).at[1].set(2.0 ** -130 * (1 + jax.random.uniform(streams[1], ())))
+    return (outputs, totals, jax.random.normal(streams[2], (2,)), jax.random.normal(streams[3], (2,)),
+            jax.random.normal(streams[4], ()))
+
+
+@pytest.mark.parametrize("run", ["jitted", "as written"])
+@pytest.mark.parametrize("order", ["mixed", "forward over reverse", "reverse over reverse"])
+@pytest.mark.parametrize("draw", [_zero_gap, _zero_mass, _subnormal_gap],
+                         ids=["zero-gap", "zero-mass", "subnormal-gap"])
+def test_the_merges_derivatives_of_its_gradient_are_on_par(draw, order, run):
+    """The derivatives of the gradient as to the masses of finished slices' merge (`algebra.finished_merged`,
+    at one maximum) under a drawn cotangent c, each `order` its own program (one program of the three held
+    an op-by-op run past 10 GiB): its jvp along drawn output directions d, c (d - sum(w d) / W) / W
+    (`mixed`), and its jvp and gradient along drawn mass directions b, the Hessian's product -c (sum(b (o -
+    out)) + (o - out) sum(b)) / W^2, forward over reverse and reverse over reverse, on par with those formed
+    in fp32 over the masses' power of two, against float64 (check 1): a reverse pass's derivatives never
+    read the frexp its terms are formed by (train 943's review: 2 where it is 1/4 at a zero gap, inf at a
+    subnormal gap)."""
+
+    def ours(outputs, totals, along_outputs, along_masses, cotangent):
+        def gradient(o, w):
+            return jax.grad(lambda each: cotangent * _finished_merged_output(o, jnp.zeros_like(each),
+                                                                            each)[0, 0])(w)
+
+        if order == "mixed":
+            return jax.jvp(lambda o: gradient(o, totals), (outputs,), (along_outputs,))[1].reshape(1, -1)
+        if order == "forward over reverse":
+            return jax.jvp(lambda w: gradient(outputs, w), (totals,), (along_masses,))[1].reshape(1, -1)
+        return jax.grad(lambda w: jnp.vdot(gradient(outputs, w), along_masses))(totals).reshape(1, -1)
+
+    def reference(outputs, totals, along_outputs, along_masses, cotangent):
+        shares, moved = _scaled_masses(totals, along_masses)
+        exponent = jnp.frexp(jnp.max(totals))[1]
+        summed = jnp.sum(shares)
+        out = jnp.sum(shares * outputs) / summed
+        if order == "mixed":
+            mixed = cotangent * (along_outputs - jnp.sum(shares * along_outputs) / summed) / summed
+            return jnp.ldexp(mixed, -exponent).reshape(1, -1)
+        gaps = outputs - out
+        hessian = -cotangent * (jnp.sum(moved * gaps) + gaps * jnp.sum(moved)) / (summed * summed)
+        return jnp.ldexp(hessian, -exponent).reshape(1, -1)
+
+    _on_par_jitted_and_op_by_op(ours, reference, draw,
+                                f"the derivatives of the merge's gradient, {draw.__name__}, {order}",
+                                seeds=SECOND_ORDER_SEEDS, run=run)
+
+
+@_reaches_subnormals
+def _slice_and_initial_near_fp32s_largest(seed):
+    """A slice and an initial state of masses from 2^126 to 2^127, their outputs near 1: the initial state's
+    sums over its total, which XLA:CPU divided by through its reciprocal, there below fp32's least normal
+    (train 931's review: its output 0, the merge near half where it is near 1)."""
+    streams = jax.random.split(jax.random.key(seed), 2)
+    totals = 2.0 ** 126 * (1 + jax.random.uniform(streams[0], (2,), jnp.float32))
+    outputs = 1 + 0.25 * jax.random.uniform(streams[1], (2,), jnp.float32)
+    return outputs.astype(jnp.float32), totals.astype(jnp.float32), (outputs * totals)[1]
+
+
+def test_a_decode_merge_from_an_initial_state_near_fp32s_largest_is_on_par():
+    """A split decode step's slice merged with the call's initial state (`algebra.merged_state` + `finish`,
+    as attention_decode merges them), both of masses from 2^126 to 2^127: on par with their outputs' convex
+    combination over the masses' power of two, the initial state's output its sums over its total, against
+    float64 (check 1)."""
+
+    def merged(outputs, totals, sums):
+        spec = algebra.Forward("spans", 1, ids=False, scale=1.0, natural=True, initial=True)
+        initial = template.Initial(jnp.zeros((1, 1, 1)), totals[1].reshape(1, 1, 1),
+                                   sums.reshape(1, 1, 1, 1))
+        state = algebra.merged_state(spec, outputs[0].reshape(1, 1, 1, 1, 1), jnp.zeros((1, 1, 1, 1)),
+                                     totals[0].reshape(1, 1, 1, 1), initial)
+        return algebra.finish(spec, state, initial=True, normalized=True)[0]
+
+    def plain(outputs, totals, sums):
+        shares, = _scaled_masses(totals)
+        each = jnp.stack([outputs[0], sums / totals[1]])
+        return (jnp.sum(shares * each) / jnp.sum(shares)).reshape(1, 1, 1, 1)
+
+    _on_par_jitted_and_op_by_op(merged, plain, _slice_and_initial_near_fp32s_largest,
+                                "a decode merge from an initial state near fp32's largest",
+                                seeds=MERGE_EDGE_SEEDS)
 
 
 @pytest.mark.parametrize("form", ["causal", "full"])
@@ -1168,3 +1739,41 @@ def test_a_padded_query_walks_nothing_again_where_a_real_row_past_fp32_does(form
     later = jnp.asarray([0.0, 3.0, 1.0, 0.5, 2.0, 1e6, -jnp.inf, -jnp.inf], jnp.float32)
     sliced, _ = algebra.rewalks(spec, jnp.stack([maxima, later]))
     np.testing.assert_array_equal(np.asarray(sliced), [expected, [False] * 5 + [True, False, False]])
+
+
+def test_rescaled_uses_exact_power_of_two_constants_for_dropout_reach():
+    """`algebra.rescaled` scales a dropping call's bound by exact host power-of-two constants (row 10161),
+    never `jnp.exp2`, so the scaled bound is bitwise exact on XLA:CPU for both normal and wide reaches."""
+    for binades in (10, 50):
+        zero = jnp.int32(0)
+        drop = template.Draw((jnp.uint32(0), jnp.uint32(0)), zero, zero, 1.0 - 2.0 ** -binades)
+        assert np.log2(drop.reach) == binades
+        prior = jnp.array([1.5], jnp.float32)
+        state = algebra.Partial(jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32),
+                                jnp.ones((1,), jnp.float32),
+                                algebra.Scale(jnp.zeros((1,), jnp.float32), prior))
+        scale = jax.jit(lambda s, d=drop: algebra.rescaled(s, jnp.ones((1,), jnp.float32),
+                                                           lambda: jnp.zeros((1,), jnp.float32), d))(state)
+        assert scale is not None
+        np.testing.assert_array_equal(np.asarray(scale.bound), np.array([np.float32(1.5)], np.float32))
+    # Static exponents past fp32's normal range [-126, 127] split into exact normal host multiplies.
+    big = jnp.array([np.float32(1.5 * 2.0 ** 120)], jnp.float32)
+    down = jax.jit(lambda x: algebra.taken_back(x, -140))(big)
+    up = jax.jit(lambda x: algebra.taken_back(x, 140))(down)
+    np.testing.assert_array_equal(np.asarray(down), np.array([np.float32(1.5 * 2.0 ** -20)], np.float32))
+    np.testing.assert_array_equal(np.asarray(up), np.asarray(big))
+
+
+def test_taken_back_avoids_double_rounding_and_quotient_preserves_large_total_tangent():
+    """`taken_back` uses balanced normal factors so wide negative exponents do not double-round at the
+    subnormal boundary (row 10161), and `output_of` preserves finite tangents when total >= 2^126."""
+    x = jnp.array([np.nextafter(np.float32(2.0 ** 15), np.float32(np.inf))], jnp.float32)
+    got = jax.jit(lambda v: algebra.taken_back(v, -140))(x)
+    expected = np.nextafter(np.float32(2.0 ** -125), np.float32(np.inf))
+    np.testing.assert_array_equal(np.asarray(got), np.array([expected], np.float32))
+
+    big = jnp.array([np.float32(2.0 ** 126)], jnp.float32)
+    val, tan = jax.jit(lambda a, d: jax.jvp(
+        lambda u: algebra.output_of(u, d, guarded=False), (a,), (a,)))(big[:, None], big)
+    np.testing.assert_array_equal(np.asarray(val), np.ones((1, 1), np.float32))
+    np.testing.assert_array_equal(np.asarray(tan), np.ones((1, 1), np.float32))

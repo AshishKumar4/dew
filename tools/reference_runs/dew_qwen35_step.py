@@ -52,6 +52,7 @@ class BackboneLoss(Objective):
         self.model = model
         self.variables = variables
         self.projection = projection
+        self.sequence = sequence
         self.inputs = InputSpec(sample=Field("tokens", (sequence,)))
 
     counts_tokens = True
@@ -63,7 +64,7 @@ class BackboneLoss(Objective):
 
     def fresh_variables(self, key, held):
         """The backbone drawn over a row of its tokens: the boxes a run's table reads its axes from."""
-        return self.model.init(key, jnp.zeros((1, self.inputs.sample.shape[0]), jnp.int32))
+        return self.model.init(key, jnp.zeros((1, self.sequence), jnp.int32))
 
     def loss(self, variables, batch, step):
         hidden = self.model.apply(variables, batch["tokens"], train=step.training,
@@ -179,7 +180,8 @@ def train(args, trainer, state, compiled, batch):
         finite.append(valid)
     if not np.isfinite(np.asarray(losses)).all() or not np.asarray(finite).all():
         raise RuntimeError("non-finite loss or update")
-    if args.smoke and np.array_equal(first_before, np.asarray(jax.tree.leaves(state.variables)[0])):
+    if first_before is not None and np.array_equal(
+            first_before, np.asarray(jax.tree.leaves(state.variables)[0])):
         raise RuntimeError("tiny proof failed to update the backbone")
     parameters = jax.tree.leaves(state.variables["params"])
     if any(leaf.dtype != jnp.float32 for leaf in parameters):

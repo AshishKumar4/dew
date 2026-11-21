@@ -76,6 +76,17 @@ def test_a_targeted_group_runs_what_cis_task_runs_and_a_site_runs_in_its_own_tas
     assert seen == expected[split]
 
 
+def test_a_targeted_run_of_a_named_site_runs_it(ci, tmp_path, monkeypatch):
+    """A node id named with no split (tmp/run_tests.py's `file::test`) runs the test it names, a site among
+    them, which a file's group sets aside (row 8963: it selected nothing)."""
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setenv("SEEN", str(tmp_path / "seen.jsonl"))
+    written(tmp_path, {"test_sites.py": SITED})
+    assert ci.targeted("3.12", ["tests/test_sites.py::test_check1"], tmp_path / "report.xml") == 0
+    seen = [json.loads(line)[0] for line in (tmp_path / "seen.jsonl").read_text().splitlines()]
+    assert seen == ["check1"]
+
+
 def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(ci, tmp_path, monkeypatch):
     """On 3.12 files are packed near the target by armada's medians, else
     the recorded durations; a file nothing has timed runs alone; a file
@@ -391,19 +402,38 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
 
 
+def assert_green_task(ci, tmp_path, name: str, source: str) -> None:
+    """A task of one test file, `name` under tests/ holding `source`, is green."""
+    (tmp_path / "tests" / name).write_text(source)
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    ci.task("3.12", [f"tests/{name}"], "", out, 600.0)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] == 0, row["output"]
+
+
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
     """A task's pytest arms no timed dump of every thread's stack, which killed a multithreaded test mid-dump
     (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer, its stacks written
     only once its task is past its deadline (test_armada_deadlines). A test running past the old ten minutes
     through a task is green with no dump (armada receipt in the head's review)."""
-    (tmp_path / "tests/test_timer.py").write_text(
-        "def test_no_dump_timer(request):\n"
-        "    assert request.config.getini('faulthandler_timeout') == 0\n")
-    interpreter(tmp_path, "3.12")
-    out = tmp_path / "verdict.json"
-    ci.task("3.12", ["tests/test_timer.py"], "", out, 600.0)
-    [row] = json.loads(out.read_text())["rows"]
-    assert row["exitCode"] == 0, row["output"]
+    assert_green_task(ci, tmp_path, "test_timer.py", "def test_no_dump_timer(request):\n"
+                   "    assert request.config.getini('faulthandler_timeout') == 0\n")
+
+
+def test_a_tasks_pytest_keeps_its_temp_dirs_under_a_root_of_its_own(ci, tmp_path, monkeypatch):
+    """A task's pytest takes its temp directories under a root no other process on the node shares, gone once
+    it exits: pytest's default root is one per user, and one process's exit, pruning it, raced another's
+    `pytest-current` link (row 8298: a green GPU file red in pytest's atexit cleanup)."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(shared))  # The root every process would inherit.
+    assert_green_task(ci, tmp_path, "test_temp.py", "from pathlib import Path\n"
+                   "def test_temp(tmp_path):\n    Path('temp.txt').write_text(str(tmp_path))\n")
+    # Under its root: pytest's per-user directory, then its numbered one.
+    root = Path((tmp_path / "temp.txt").read_text()).parents[2]
+    assert root != shared
+    assert not root.exists()
 
 
 def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_every_test_deselected(
@@ -973,6 +1003,8 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
     ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "cold"), ({"locks/cpu.txt": "jax==9\n"}, "cold"),
+    ({"locks/cuda12.txt": "jax-cuda12-plugin==9\n"}, "on"), ({"locks/site.txt": "jax==9\n"}, "on"),
+    ({".gitignore": "*.pyc\n"}, "off"),
     ({"tools/armada/session.py": "# the session\n"}, "cold"),
     ({"tools/armada/executed.py": "# the recorder\n"}, "cold"),
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),
@@ -981,12 +1013,15 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"kernels/flash_attn/dew_flash_attn/__init__.py": "VALUE = 2\n"}, "on"),
     ({"stubs/pkg/__init__.pyi": "VALUE: int\n"}, "on"), ({"licenses/NOTICE": "notice\n"}, "on"),
     ({".thresh/seams.toml": "[seam]\n"}, "on"), ({"MANIFEST.in": "include LICENSE\n"}, "on"),
-    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
-    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "cold"),
+    ({".armada.json": '{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}, "env": {"MODE": "1"}, '
+                      '"pool": 400}\n'}, "on"),
+    ({".armada.json": '{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}, "env": {"MODE": "2"}, '
+                      '"pool": 160}\n'}, "cold"),
     ({"tools/armada/followed.py": '"""Followed, as each run reads."""\n\n\n# A note.\ndef read(path):\n'
                                   '    return path\n'}, "on"),
     ({"tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n    return [path]\n'}, "cold"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
+        "a CUDA lock", "the site lock", "the ignore list",
         "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
         "a native kernel package's wrapper", "a type stub", "a license", "thresh's annotations",
         "the manifest",
@@ -1002,8 +1037,11 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     10 trains ran with the cache off, and 0.75% of rows were reused). The recorder (executed.py, followed.py,
     watched.py) stays every file's input: an old record may lack a dependency a new recorder finds, by its
     code alone, so an edit of what it says of itself keeps the cache on (Main, 2026-11-07: 12 of 20 trains ran
-    cold on harness edits)."""
-    armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
+    cold on harness edits). A lock the environment is not built from (a CUDA lock, the site lock) is a GPU
+    lane's input alone, and leaves the CPU cache on (Main, 2026-11-20: a CUDA wheel bump ran train 1089's
+    suite cold)."""
+    armada = ('{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}, "env": {"MODE": "1"}, '
+              '"pool": 160}\n')
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada,
                        "tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n'
@@ -1237,6 +1275,61 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
             ci.plan(300.0, {})
 
 
+def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_as_the_plan_cuts_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tests marked shared_setup with `by` share the setup the first match of `by` in their parameter ids
+    keys, across test functions, a model's ids though they hold dashes and another parameter's id beside
+    them: the plan cuts the split file's record and each task its collected tests alike, each model's tests
+    in one group, so its programs are compiled once (Main, 2026-11-20: 7 model files cut in node-id order
+    paid each model's compile in every group its tests fell in); a test whose id has no match shares
+    nothing. A `by` that is no literal regular expression, or a keyword other than `by`, refuses the file."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    (tmp_path / "tests/test_models.py").write_text(
+        "from pathlib import Path\nimport pytest\nMODELS = ['m-a-tiny', 'm-b-tiny', 'm-c-tiny', 'plain']\n"
+        "@pytest.mark.shared_setup('models', by=r'm-[a-z]-tiny')\n@pytest.mark.parametrize('name', MODELS)\n"
+        "def test_forward(name):\n    with Path('runs').open('a') as runs: runs.write(f'f {name}\\n')\n"
+        "@pytest.mark.shared_setup('models', by=r'm-[a-z]-tiny')\n@pytest.mark.parametrize('name', MODELS)\n"
+        "@pytest.mark.parametrize('dtype', ['f32'])\n"
+        "def test_gradient(dtype, name):\n"
+        "    with Path('runs').open('a') as runs: runs.write(f'g {name}\\n')\n")
+    node = "tests/test_models.py::{}"
+    models = ("m-a-tiny", "m-b-tiny", "m-c-tiny", "plain")
+    nodes = [node.format(f"test_forward[{model}]") for model in models] + [
+        node.format(f"test_gradient[f32-{model}]") for model in models]
+    # Node-id order parts each model's two tests; 100 s each, a 300 s target cuts the file in three. The two
+    # plain tests, matching no model, 200 s each: sharing nothing, they run apart.
+    plain = {node.format("test_forward[plain]"), node.format("test_gradient[f32-plain]")}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {each: 200.0 if each in plain else 100.0 for each in nodes}))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert all(row["exitCode"] == 0 for row in rows)
+    ran = {row["name"]: set(row["tests"]) for row in rows if "test_models" in row["name"]}
+    assert len(ran) > 1 and sorted(node for tests in ran.values() for node in tests) == sorted(nodes)
+    for model in models[:3]:
+        both = {node.format(f"test_forward[{model}]"), node.format(f"test_gradient[f32-{model}]")}
+        assert sum(both <= tests for tests in ran.values()) == 1, ran
+    assert not any(plain <= tests for tests in ran.values()), ran
+    # An id beyond ASCII keys nothing, whatever the pattern's flags: no Python reads it otherwise.
+    key = ci.session.setup_key
+    for beyond in ("\U000105c0", "\u00e9"):
+        assert key(node.format(f"test_forward[{beyond}]"), ("models", r"^.")) is None
+    assert key(node.format("test_forward[m-a-tiny]"), ("models", r"m-[a-z]-tiny")) == ("models", "m-a-tiny")
+    count = len(ran)
+    assert [set(ci.members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
+        ran[f"3.12:tests/test_models.py#{group}/{count}"] for group in range(1, count + 1)]
+    assert sorted((tmp_path / "runs").read_text().splitlines()) == sorted(
+        f"{kind} {model}" for kind in "fg" for model in models)
+    for refused in ("by=NAME", "by=r'['", "by='x', other='y'", "other='y'", "by=r'\\N{BULLET}'",
+                    "by=r'(?u)x'", "by=r'(?u:^\\w)'", "by=r'(?i)m'"):
+        (tmp_path / "tests/test_refused.py").write_text(
+            f"import pytest\nNAME = 'x'\n@pytest.mark.shared_setup('s', {refused})\n"
+            "def test_one():\n    pass\n")
+        with pytest.raises(SystemExit):
+            ci.plan(300.0, {})
+        (tmp_path / "tests/test_refused.py").unlink()
+
 def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does(ci, tmp_path):
     """Every row's shared key holds the SHARED harness modules by their code (`code_of`): an edit to what one
     says of itself, a comment or a docstring, reuses every row, as it changes no run (row 2730: a docstring
@@ -1250,6 +1343,23 @@ def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does
     assert ci.shared("3.12") == before
     module.write_text('"""Followed."""\n\n\ndef read(path):\n    """The file."""\n    return [path]\n')
     assert ci.shared("3.12") != before
+
+
+def test_a_cuda_lock_rekeys_a_gpu_lanes_files_and_no_cpu_tasks(ci, tmp_path):
+    """A CPU task's shared key holds the lock its environment is built from (.armada.json's key) and no other,
+    so a CUDA or site lock's change reuses every CPU row; a GPU lane's (`lane_inputs`) holds every lock, so
+    the same change reruns its files on the new wheels (Main, 2026-11-20: a CUDA wheel bump ran a train's CPU
+    suite cold)."""
+    for name, text in {".armada.json": '{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}}\n',
+                       "locks/cpu.txt": "jax==1\n", "locks/cuda12.txt": "jax-cuda12-plugin==1\n"}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    cpu, gpu = ci.shared("3.12"), ci.lane_inputs("3.12")
+    (tmp_path / "locks/cuda12.txt").write_text("jax-cuda12-plugin==2\n")
+    assert ci.shared("3.12") == cpu and ci.lane_inputs("3.12") != gpu
+    gpu = ci.lane_inputs("3.12")
+    (tmp_path / "locks/cpu.txt").write_text("jax==2\n")
+    assert ci.shared("3.12") != cpu and ci.lane_inputs("3.12") != gpu
 
 
 def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_code_does(

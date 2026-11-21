@@ -22,6 +22,33 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
                         plain_fn=jnp.abs)
 
 
+def test_the_contract_holds_the_orders_a_case_takes_alone():
+    """A case naming the orders it holds (`taking`, row 9077) holds those alone, off training's mesh and on
+    it: a custom VJP, whose forward-mode orders do not run, holds its primal and its reverse derivative; a
+    name of no order, taken or left out, is refused."""
+    @jax.custom_vjp
+    def doubled(x):
+        return 2 * x
+
+    doubled.defvjp(lambda x: (2 * x, None), lambda _, g: (2 * g,))
+    x = (jnp.asarray([1.0, -3.0], jnp.float32),)
+    direction = (jnp.ones((2,), jnp.float32),)
+    cotangent = jnp.ones((2,), jnp.float32)
+    assert_contract(doubled, x, direction, cotangent, "a custom VJP's reverse derivative",
+                    taking=("primal", "vjp"))
+    for named in ({"taking": ("jvp of grads",)}, {"without": ("vjp twice",)}):
+        with pytest.raises(ValueError):
+            assert_contract(doubled, x, direction, cotangent, "a misnamed order", **named)
+
+
+def split_dot(seed, scale):
+    """A split sum's draw (`_summed_over_the_mesh`): two vectors of 1024 at `scale`, their directions, and a
+    cotangent, each stream salted apart (row 8464: seeds seed, seed + 1 and seed + 2 made one seed's
+    direction the next seed's primals, and a shared scalar factor left its jvp of grad unresolved)."""
+    primals = normal_draw((0, seed), (1024,), (1024,), scale=scale)
+    return primals, normal_draw((1, seed), (1024,), (1024,), scale=scale), normal_draw((2, seed), (1,))[0]
+
+
 def _split_over_the_mesh(specs: int):
     """A product of two operands split over the context mesh's data axis by a shard map given `specs` of their
     specs, as a template's launch reads the mesh it runs under (row 7973's: one whose specs left two of its
@@ -37,8 +64,9 @@ def _split_over_the_mesh(specs: int):
 
 
 def _summed_over_the_mesh(psums: int):
-    """A product's sum split over the context mesh's data axis by a shard map, each device's part summed
-    across the devices `psums` times (a launch counting its sum twice at two); off a mesh, the sum itself."""
+    """A dot product split over the context mesh's data axis by a shard map, both operands' halves on each
+    device, each device's part summed across the devices `psums` times (a launch counting its sum twice at
+    two); off a mesh, the dot itself."""
     from jax.sharding import PartitionSpec as P
 
     def total(x, w):
@@ -51,7 +79,7 @@ def _summed_over_the_mesh(psums: int):
                 summed = jax.lax.psum(jax.lax.pvary(summed, ("data",)), "data")
             return summed
 
-        return jax.shard_map(local, in_specs=(P("data"), P()), out_specs=P())(x, w)
+        return jax.shard_map(local, in_specs=(P("data"), P("data")), out_specs=P())(x, w)
 
     return total
 
@@ -69,14 +97,10 @@ def test_the_contract_runs_every_order_on_trainings_mesh():
     with pytest.raises(AssertionError):
         assert_contract(_split_over_the_mesh(1), x, x, cotangent, "a product a spec short")
 
-    # A sum of 1024 products, its rounding errors check 1's to resolve (four of them resolve no ratio).
-    def inputs(seed, scale):
-        summed = normal_draw(seed, (1024,), (1,), scale=scale)
-        return summed, normal_draw(seed + 1, (1024,), (1,), scale=scale), normal_draw(seed + 2, (1,))[0]
-
-    assert_drawn_contract(_summed_over_the_mesh(1), inputs, EDGES["normal"], "a split sum")
+    # A dot of 1024, its rounding errors check 1's to resolve (four of them resolve no ratio).
+    assert_drawn_contract(_summed_over_the_mesh(1), split_dot, EDGES["normal"], "a split sum")
     with pytest.raises(AssertionError):
-        assert_drawn_contract(_summed_over_the_mesh(2), inputs, EDGES["normal"],
+        assert_drawn_contract(_summed_over_the_mesh(2), split_dot, EDGES["normal"],
                               "a split sum counted twice")
 
 
@@ -95,8 +119,7 @@ def test_a_contracts_mesh_sites_draw_their_declared_seeds_and_size_none(monkeypa
 
     def inputs(seed, scale):
         drawn.add(int(seed))
-        summed = normal_draw(seed, (1024,), (1,), scale=scale)
-        return summed, normal_draw(seed + 1, (1024,), (1,), scale=scale), normal_draw(seed + 2, (1,))[0]
+        return split_dot(seed, scale)
 
     assert_drawn_contract(_summed_over_the_mesh(1), inputs, EDGES["normal"], "a split sum of declared seeds",
                           seeds=16)

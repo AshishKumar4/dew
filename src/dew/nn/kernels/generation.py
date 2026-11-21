@@ -17,6 +17,7 @@ import dataclasses
 import enum
 import functools
 import inspect
+import itertools
 import logging
 import os
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
@@ -197,9 +198,11 @@ class Choice(enum.StrEnum):
     NVFP4 = 'nvfp4'
     NVFP4_BLOCK = 'nvfp4_block'
     PAGED_DECODE = 'paged_decode'
+    QKV = 'qkv'
     RMS_NORM = 'rms_norm'
     SELECTIVE_SCAN = 'selective_scan'
     SHORT_CONV = 'short_conv'
+    SPARSE_ATTENTION = 'sparse_attention'
     SSD = 'ssd'
     SWIGLU = 'swiglu'
 
@@ -273,6 +276,11 @@ class RegisterRaises:
     highest: int
     step: int
 
+    def below(self, registers: int) -> int:
+        """The most a `setmaxnreg` moves a thread to at or below `registers`: a program's entry share, a
+        thread's 255 at two warpgroups, is no step (row 6783)."""
+        return min(registers, self.highest) // self.step * self.step
+
 
 SETMAXNREG = RegisterRaises(24, 256, 8)
 """`setmaxnreg`'s range on every architecture that takes it (PTX ISA, "setmaxnreg")."""
@@ -281,23 +289,18 @@ SETMAXNREG = RegisterRaises(24, 256, 8)
 @dataclasses.dataclass(frozen=True)
 class Multiprocessor:
     """A CUDA multiprocessor's resources, which the templates' register and resource models read
-    (`templates.resources`, `templates.cost`) and a compile ahead's target describes
-    (`target_config`): the most threads and blocks resident at once
-    (`resident_threads`, `resident_blocks`), its 32-bit `registers`, the most a thread holds
-    (`thread_registers`), a block's limits (`block_registers`, `block_threads`, `block_shared`, the static
-    shared memory a block declares without opting in), the threads of a warp (`warp_threads`), the
-    allocator's `register_step` a thread (256 a warp), the shared memory the driver reserves for each
-    resident block (`reserved_shared`), the bytes its shared memory serves a clock
-    (`shared_bytes_per_clock`), the base-2 exponentials its special-function units return a clock
-    (`exponentials_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`templates.resources`, `templates.cost`) and a compile ahead's target describes (`target_config`): the
+    most threads and blocks resident at once (`resident_threads`, `resident_blocks`), its 32-bit `registers`,
+    the most a thread holds (`thread_registers`), a block's limits (`block_registers`, `block_threads`,
+    `block_shared`, the static shared memory a block declares without opting in), the threads of a warp
+    (`warp_threads`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
+    reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
+    (`shared_bytes_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
-    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; the exponentials the CUDA C++ Best
-    Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s row, where CUDA 13 moved the throughput table,
-    15.97 measured on an H200, the kernel challenge's MUFU.EX2; 128 bytes a clock measured 126 to 128 on an
-    A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking",
-    Table 3) and setmaxnreg's range,
-    which a target of no architecture (the CPU interpreting a launch) reads too, under which every family's
-    launch interprets."""
+    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; 128 bytes a clock measured 126 to 128
+    on an A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through
+    Microbenchmarking", Table 3) and setmaxnreg's range, which a target of no architecture (the CPU
+    interpreting a launch) reads too, under which every family's launch interprets."""
 
     resident_threads: int = 1536
     resident_blocks: int = 16
@@ -310,7 +313,6 @@ class Multiprocessor:
     register_step: int = 8
     reserved_shared: int = 1024
     shared_bytes_per_clock: int = 128
-    exponentials_per_clock: int = 16
     register_raises: RegisterRaises | None = SETMAXNREG
 
     def raises(self) -> RegisterRaises:
@@ -331,8 +333,13 @@ class Architecture:
     `wgmma`, one of them), the multiprocessors a cluster's TMA multicast reaches (`cluster`), whether its
     tensor instructions read block-scaled operands (`block_scales`), its dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32'; '8bit': FP8
-    operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively; 'fp32': IEEE fp32
-    on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Blackwell's tensor memory columns (PTX ISA,
+    operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively), the elementwise
+    fp32 operations its vector units do a clock (`vector_per_clock`: a CUDA multiprocessor's fp32 lanes'
+    FLOPs, two a lane for its fused multiply-add, which a dot at Precision.HIGHEST takes there too; a TPU's
+    VPU's) and the exponentials its special-function units return a clock (`exponentials_per_clock`: a CUDA
+    multiprocessor's, a TPU's transcendental unit's), the 32-bit integer operations its ALU returns a clock
+    (`integer_per_clock`: add, shift, logic and comparison, CUDA C++ Programming Guide 12.6 §5.4.1 Table 4,
+    64 on sm80 to sm90; None where unread), Blackwell's tensor memory columns (PTX ISA,
     tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and the VMEM a kernel may raise its
     limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block into shared memory by TMA, which
     it picks from compute capability 9.0 on (its `emit_pipeline` and `copy_gmem_to_smem`), where below it they
@@ -343,6 +350,9 @@ class Architecture:
     issuers: tuple[str, ...]
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     multiprocessor: Multiprocessor | None = Multiprocessor()
+    vector_per_clock: float | None = None
+    exponentials_per_clock: float | None = None
+    integer_per_clock: float | None = None
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
@@ -356,11 +366,6 @@ class Architecture:
     bf16 at the same shapes compiles (rows 6993, 7227). Measured False on a v5e (those rows) and True on a
     v6e (control runs of the same cells, colab7062); the default True is the path every device took before
     the v5e refused it, unmeasured on v2, v3, v4, v5p and the GPUs."""
-    packed_slices: bool = True
-    """Whether its Mosaic slices one row of a 16-bit tile's packed sublane pair, as a one-head block of a
-    16-bit `[..., heads, width]` array is: a v5e's does not ("Offsets along tiled dimensions must be aligned
-    to tiles", the unit subtile 2 on the heads; bf16 and fp16 alike, rows 6993, 7227). Measured False on a
-    v5e and True on a v6e as `float16` is; the default True unmeasured elsewhere."""
     fp32_by_bf16_precise: bool = True
     """Whether its matrix unit takes an fp32 by bf16 product at fp32 precision, which a default matmul
     precision of 'highest' asks of a kernel's fp32 weights and bf16 values: a v5e's MXU does not (row 6994,
@@ -400,31 +405,43 @@ class Architecture:
 # Resident blocks and threads a multiprocessor holds are the CUDA C++ Programming Guide's (§5.1, Table 33):
 # 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
 # 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
-_AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None))
-_AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, 'fp32': 256},
-                                Multiprocessor(register_raises=None))
-_ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                    Multiprocessor(resident_blocks=24, register_raises=None))
+CUDA_EXPONENTIALS = 16
+"""The base-2 exponentials a CUDA multiprocessor's special-function units return a clock, every compute
+capability from 7.5 to 12.x alike (the CUDA C++ Best Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s
+row, where CUDA 13 moved the throughput table; 15.97 measured on an H200, the kernel challenge's MUFU.EX2)."""
+_AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
+                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS, integer_per_clock=64)
+_AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512},
+                                Multiprocessor(register_raises=None),
+                                vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
+                                integer_per_clock=64)
+_ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048},
+                    Multiprocessor(resident_blocks=24, register_raises=None),
+                    vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, integer_per_clock=64)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture((), {'16bit': 1024, 'fp32': 128},
-                       Multiprocessor(resident_threads=1024, register_raises=None))
+_TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024, register_raises=None),
+                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
 # Hopper issues wgmma (sm_90a) and mma.sync, its TMA multicast to a pair of multiprocessors a cluster (the
 # pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
-_HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32), tma=True,
+_HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32),
+                       vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
+                       integer_per_clock=64, tma=True,
                        dependent_launch=True, cluster=2)
 # Blackwell's tcgen05 family: tcgen05 (sm_100a) and mma.sync, no wgmma; tensor memory, a pair's 2-CTA
 # products and multicast, block-scaled operands (PTX ISA, tcgen05.mma's kind::mxf8f6f4 and mxf4nvf4).
-_BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
-                          Multiprocessor(resident_threads=2048, resident_blocks=32), tmem_columns=512,
+_BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096, '8bit': 16384},
+                          Multiprocessor(resident_threads=2048, resident_blocks=32),
+                          vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, tmem_columns=512,
                           tma=True, dependent_launch=True, cluster=2, block_scales=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
 # Its components are those PTX's forward compatibility gives every NVIDIA GPU after it too: mma.sync and
 # cp.async from sm_80, TMA and grid dependency control from sm_90, no arch-specific instruction (wgmma's
 # sm_90a, tcgen05's sm_100a), which no capability implies.
-_BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                                   Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
+_BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048},
+                                   Multiprocessor(resident_blocks=24), vector_per_clock=256,
+                                   exponentials_per_clock=CUDA_EXPONENTIALS, tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default, read from a Mosaic kernel's refusal of a scratch it uses whole (a flag such as
 # --xla_tpu_scoped_vmem_limit_kib moves it): v5e 16 MiB ("limit 16.00M"); v6e 32 MiB ("Scoped allocation with
@@ -433,11 +450,26 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
+# Its VPU's fp32 operations and its transcendental unit's exponentials a clock, measured (Google's pages state
+# neither): a Pallas kernel's chain over one VMEM-resident 512 x 1024 fp32 block, the slope of its wall time
+# over 256 to 4096 iterations, each iteration one step or four, over the clock its MXU's peak gives (the
+# tpu_rates script on Colab TPUs, colab7062's rates2 and rates3, two rounds each, at most 1% from the line).
+# An iteration costs the block's VMEM read and write (v5e 0.65 us, v6e 0.28) beside its steps, so a unit's own
+# rate is the four-step iteration's excess over the one-step's, a third of it a step: the VPU's a
+# multiply-add's, two operations an element (v5e 0.627 us a step, 1.67e12 operations a second; v6e 0.370,
+# 2.83e12, where an add alone takes 0.138), and the exponentials an exp2's (v5e 0.341 us, 1.54e12 a second;
+# v6e 0.293, 1.79e12). That read and write is 4 MiB an iteration, 6.5e12 bytes a second on a v5e and 1.5e13
+# on a v6e, which a TPU states no rate of (no shared memory, `templates.cost.rates`): the unit rates hold none
+# of it, and nothing prices a form's VMEM traffic there. A step (`step_seconds`) holds its body's own, once: a
+# substitution row reads its chunk's 64 x 128 fp32 values and writes a row, 33 KiB, 5 ns at that rate of a
+# v5e's 0.89 us step, the rest the chain's latency.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20, float16=False, packed_slices=False,
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=1.67e12 / (197e12 / 131072),
+                             exponentials_per_clock=1.54e12 / (197e12 / 131072), float16=False,
                              fp32_by_bf16_precise=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20)}
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
+                             exponentials_per_clock=1.79e12 / (918e12 / 524288))}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -489,6 +521,13 @@ class Measured:
     launch: float | None = None
     handoff: float | None = None
     loaded_clock: float | None = None
+    product: tuple[float, float] | None = None
+    """A tile walk's step's latencies (`templates.cost.Chain`, `chained`): a warpgroup product waited on, its
+    fixed seconds and its seconds a column (a 64 x N product of 16-bit operands 64 deep); `barrier`, two
+    warpgroups' round trip through a block's barriers; `copy`, a tile copy into shared memory waited on, read
+    from device memory, its fixed seconds and its seconds a byte. None where not measured."""
+    barrier: float | None = None
+    copy: tuple[float, float] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -550,14 +589,26 @@ class GpuTarget:
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
     step_seconds: float | None = None
-    """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
-    predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
-    GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
+    """The least one step of a form's dependent chain costs on XLA's path (the work-span model's step,
+    `templates.cost.Work.span`), each step reading the last: the slope over its iterations of a loop XLA
+    lowers, measured per device (FS-STEP-SECONDS1's script). A span counts dependent steps, a chunk's
+    forward-substitution row (64 rows of 128 values) two of them on every device, its contraction and its set
+    (`dew.algebra.linear_scan`'s `Chunk.substituted`). What bounds a step is the device's: on a GPU each
+    iteration's launch, a one-element loop's launch and predicate; on a TPU, whose iterations launch nothing
+    (a one-element loop's slope zero within 1e-9 s), its body, half the substitution row's slope, a step of
+    two vector operations: a form whose iteration body is longer is priced approximately there until measured
+    as its own. None where none was measured, so a form's span there is priced by no time."""
     kernel_step_seconds: float | None = None
     """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
     step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
-    measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
-    none was."""
+    measured per device as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None
+    where none was."""
+    vmem_rate: float | None = None
+    """A TPU's VMEM bytes a second, read and written by its vector unit: what XLA's path moves between its
+    vector registers and VMEM costs (`templates.cost.Work.kept_bytes`, `templates.cost.rates`), measured as a
+    Pallas chain's fixed cost an iteration of reading and writing one 2 MiB fp32 block (4 MiB an iteration)
+    beside its steps, on Colab's TPUs, two rounds each (rows 7201 and 7283, colab7062's rates2 and rates3);
+    None where none was, so those bytes are priced by no time there."""
     host_links: Mapping[str, float] = dataclasses.field(kw_only=True, hash=False)
     """Each part's link to its host's memory (by the device-kind prefixes `dense_peaks` keys), in bytes a
     second one way, its datasheet's peak: PCIe's x16 lanes or NVLink-C2C, whose sheets state both ways
@@ -596,12 +647,6 @@ class GpuTarget:
     def float16(self) -> bool:
         """Whether the device computes in float16 (`Architecture.float16`)."""
         return self.architecture.float16
-
-    @property
-    def packed_slices(self) -> bool:
-        """Whether its Mosaic slices one row of a 16-bit tile's sublane pair
-        (`Architecture.packed_slices`)."""
-        return self.architecture.packed_slices
 
     @property
     def fp32_by_bf16_precise(self) -> bool:
@@ -664,6 +709,24 @@ class GpuTarget:
         return stated if measured is None else measured
 
     @property
+    def product_latency(self) -> tuple[float, float] | None:
+        """A waited warpgroup product's fixed seconds and seconds a column on the part (`Measured.product`);
+        None where unmeasured."""
+        return None if self.part is None else self.part.product
+
+    @property
+    def barrier_seconds(self) -> float | None:
+        """Two warpgroups' round trip through a block's barriers on the part (`Measured.barrier`); None where
+        unmeasured."""
+        return None if self.part is None else self.part.barrier
+
+    @property
+    def copy_latency(self) -> tuple[float, float] | None:
+        """A waited tile copy's fixed seconds and seconds a byte from device memory on the part
+        (`Measured.copy`); None where unmeasured."""
+        return None if self.part is None else self.part.copy
+
+    @property
     def fixed_seconds(self) -> float | None:
         """The seconds a kernel's stream spends before its bytes arrive, its launch and first byte, measured
         on the part (`Measured.fixed`); None where no one measured it."""
@@ -696,12 +759,11 @@ class GpuTarget:
         """Dense tensor-core FLOPs per clock per multiprocessor in arithmetic `mode`, or None where
         the generation states none: the generation's, lowered where the SKU's catalogued dense bf16 peak
         is below what its multiprocessors and clock give at that rate, as a GeForce part's half-rate
-        fp32 accumulation reads; IEEE fp32 on the CUDA cores keeps its rate. A part reporting fewer
-        multiprocessors than its catalogue counts (a MIG slice) keeps the generation's rate: the
-        catalogue never raises it."""
+        fp32 accumulation reads. A part reporting fewer multiprocessors than its catalogue counts (a MIG
+        slice) keeps the generation's rate: the catalogue never raises it."""
         rate = self.tensor_rates.get(mode)
         peak = self.bf16_peak
-        if rate is None or mode == 'fp32' or not (peak and self.multiprocessors and self.clock_hz):
+        if rate is None or not (peak and self.multiprocessors and self.clock_hz):
             return rate
         return rate * min(1.0, peak / (self.tensor_rates['16bit'] * self.multiprocessors * self.clock_hz))
 
@@ -826,8 +888,12 @@ TARGETS = {target.generation: target for target in (
                         # time-weighted mean of sm__cycles_elapsed.avg.per_second over 18 GEMM launches under
                         # ncu (1.476 to 1.522; the template's, cuBLASLt's and a pair's alike; M-EM-36-gh200),
                         # against its 1.98 GHz clock locked.
+                        # A step's latencies, the slope of a chain of 256 to 4,096 waited steps
+                        # (FS-4123-LATENCIES1-gh200, two rounds: products 12.9 ns and 1.194 ns a column, their
+                        # fit within 1%; a barrier round trip 80.2 and 80.0 ns).
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
-                                                       loaded_clock=1.496e9),
+                                                       loaded_clock=1.496e9, product=(12.9e-9, 1.194e-9),
+                                                       barrier=80.1e-9),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)},
               # PCIe Gen5 x16 (the H100 and H200 datasheets' 128 GB/s both ways, SXM, PCIe and NVL alike);
               # the GH200's NVLink-C2C to its Grace (the GH200 datasheet's 900 GB/s both ways).
@@ -894,7 +960,16 @@ TARGETS = {target.generation: target for target in (
     # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
     # derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
-              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30, host_links={}),
+              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30, host_links={},
+              # A step of a form's chain on XLA's path, 0.89 us: half the substitution row's slope over 64 to
+              # 1024 iterations, a row two steps (FS-STEP-SECONDS1's script on a Colab v5e, colab7062's
+              # steps-v5e1, its two rounds 1.772 and 1.770 us a row, 1.8% from the line); its one-element
+              # loop's slopes +-1e-9 s, zero.
+              step_seconds=1.77e-6 / 2,
+              # In-kernel: a dependent lane reduction's 133.8 ns (its two rounds 133.78 and 133.70).
+              kernel_step_seconds=133.8e-9,
+              # 0.65 us an iteration of 4 MiB (`vmem_rate`).
+              vmem_rate=6.5e12),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}},
               host_links={}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
@@ -902,7 +977,15 @@ TARGETS = {target.generation: target for target in (
     # link is "PCIe Gen5 x8 per chip" (the same page's system architecture): half a Gen5 x16's 64 GB/s each
     # way.
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
-              clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={'TPU v6 lite': 32e9}),
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={'TPU v6 lite': 32e9},
+              # A step of a form's chain on XLA's path, 1.23 us: half the substitution row's slope, a row two
+              # steps (colab7062's steps-v6e1, its two rounds 2.452 and 2.445 us a row); its one-element
+              # loop's slopes 6e-9 and 2e-10 s.
+              step_seconds=2.45e-6 / 2,
+              # In-kernel: a dependent lane reduction's 141.1 ns (its two rounds 141.12 and 141.07).
+              kernel_step_seconds=141.1e-9,
+              # 0.28 us an iteration of 4 MiB (`vmem_rate`).
+              vmem_rate=1.5e13),
 )}
 
 
@@ -944,10 +1027,16 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
         return found.target
     if identifier is None:
         import jax
-        device = jax.local_devices()[0]
-        real = device.platform == 'gpu' and assumption() is None
+
+        # Within `assumed`, the assumed generation's target, this process's own device picking its SKU's
+        # peaks where it is of that generation: no device of the call's placement is read, which a
+        # compile-only one (an abstract mesh of GPUs a CPU process lowers for) has none of. Else the device
+        # the call is placed on (`placed_device`).
+        device = jax.local_devices()[0] if assumption() is not None else placed_device()
+        # A device of this process's or a compile-only one; an abstract mesh's states its kind alone.
+        real = isinstance(device, jax.Device) and device.platform == 'gpu' and assumption() is None
         if real and gpu_placed():
-            _one_kind(jax.devices())
+            _one_kind(_run_devices())
         return _resolved(device, device_generation(), real)
     if identifier in TARGETS:
         return TARGETS[identifier]
@@ -1012,22 +1101,29 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the GPU `target` a build states (`built_target`: its
     CUDA generation's, its multiprocessors its own where stated): its compute capability, the shared memory
     a block may opt into, its multiprocessors, clock and bandwidth, its multiprocessor's and a block's
-    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.tensor_rates`); CUDA's grid limits for the
+    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.vector_per_clock`); CUDA's grid limits for the
     rest. The fields past the capability and shared memory only steer XLA's own fusions, never a Triton
     kernel's code. From Hopper on, its capability states the architecture-specific features (sm_90a,
     sm_100a, sm_120a), which Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain
-    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
+    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120'). Its
+    device memory `memory` where a build states it, else the least of the target's parts (`GpuTarget.memory`),
+    never none: XLA's memory-driven passes compiled a recurrence's gradient for a GPU of 0 bytes to values
+    O(1) wrong (a GH200 running a step compiled ahead for compile-only sm90 GPUs of no stated memory, row
+    8768). Its L2 where the target states it (`l2_bytes`): XLA fuses by it, and a compile-only A100 stating
+    none fused a recurrence gradient's sums apart from its host's compile of it (row 9609)."""
     generation = target.generation
     version = capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
+    memory = target.memory if memory is None else memory
     # Its fp32 lanes, two FLOPs a clock each (a fused multiply-add), as its architecture states them.
-    fp32 = target.tensor_rates.get("fp32")
+    fp32 = target.architecture.vector_per_clock
     if (version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None
-            or fp32 is None):
+            or fp32 is None or memory is None):
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
     multiprocessor = target.multiprocessor
+    l2 = "" if target.l2_bytes is None else f"\n  l2_cache_size: {target.l2_bytes}"
     return f"""gpu_device_info {{
   threads_per_block_limit: {multiprocessor.block_threads}
   threads_per_warp: {multiprocessor.warp_threads}
@@ -1035,12 +1131,12 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
   shared_memory_per_core: {shared + multiprocessor.reserved_shared}
   threads_per_core_limit: {multiprocessor.resident_threads}
   core_count: {multiprocessors}
-  fpus_per_core: {fp32 // 2}
+  fpus_per_core: {int(fp32) // 2}
   block_dim_limit_x: 2147483647
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
-  memory_bandwidth: {int(bandwidth)}
-  device_memory_size: {0 if memory is None else memory}
+  memory_bandwidth: {int(bandwidth)}{l2}
+  device_memory_size: {memory}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
   cuda_compute_capability {{
@@ -1067,8 +1163,9 @@ def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None
     `dew._devices.STATED_GPUS`), as the GPU's own allocator states it, at `share`, the pool's share in the
     run that loads their programs: Dew's own (`DEW_SHARE`, a constant) where none is given, never this
     process's (`pool_share`). Devices of two shares are two (each its record), however alike otherwise.
-    Absent `memory`, the devices state no memory: a step is compiled ahead for them only where it is
-    stated (`compile_ahead`)."""
+    Absent `memory`, the devices state no memory to an admission (a step is compiled ahead for them only where
+    it is stated, `compile_ahead`), and XLA compiles for the least of the generation's parts
+    (`target_config`)."""
     from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu
 
     if memory is not None:
@@ -1140,8 +1237,9 @@ def _driver_facts(ordinal: int, read: Callable[[int, int], int | None]) -> tuple
 
 def _one_kind(devices) -> None:
     """Refuse a run whose processes read their facts from GPUs of different kinds: every process traces
-    the same program, so the kernel choices each makes from its first GPU's facts (`gpu_target`) must be
-    the same, which first GPUs of one kind give. A process's other GPUs take no part."""
+    the same program, so the kernel choices each makes from the first GPU it places a call on
+    (`gpu_target`, `placed_device`) must be the same, which first GPUs of one kind give. A process's other
+    GPUs take no part."""
     first = {}
     for device in sorted(devices, key=lambda device: device.id):
         first.setdefault(device.process_index, device.device_kind)
@@ -1212,7 +1310,7 @@ def device_generation() -> str:
         return found.generation
     if (platform := placed_platform()) != jax.default_backend():
         return platform
-    return _generation(jax.local_devices()[0])
+    return _generation(placed_device())
 
 
 def _generation(device) -> str:
@@ -1264,18 +1362,16 @@ class GpuFacts:
 
 def gpu_facts(part: str | None = None) -> GpuFacts:
     """The facts Dew's kernels read of a GPU (`GpuFacts`), read from the target they resolve, never a copy
-    of it: this process's GPU's where `part` is None, what its driver reports of itself (multiprocessors,
-    shared memory, clocks and L2, `runtime_facts`), or, within `assumed`, the assumed part's; else a named
-    part's, by generation ('sm90'), device kind ('NVIDIA H100 80GB HBM3') or alias ('a100'). Raises
-    `ValueError` for a process whose device is not a GPU and for a part Dew knows nothing of."""
+    of it: the GPU a call is placed on where `part` is None (`placed_device`), what its driver reports of
+    itself (multiprocessors, shared memory, clocks and L2, `runtime_facts`), or, within `assumed`, the
+    assumed part's; else a named part's, by generation ('sm90'), device kind ('NVIDIA H100 80GB HBM3') or
+    alias ('a100'). Raises `ValueError` for a call placed on no GPU and for a part Dew knows nothing of."""
     from types import MappingProxyType
-
-    import jax
 
     from dew.nn.kernels.templates import bundles
 
-    if part is None and assumption() is None and jax.local_devices()[0].platform != 'gpu':
-        raise ValueError(f"this process's device is a {jax.local_devices()[0].platform}, not a GPU; "
+    if part is None and assumption() is None and (placed := placed_device()).platform != 'gpu':
+        raise ValueError(f"the device a call is placed on is a {placed.platform}, not a GPU; "
                          f"name a part to read its facts")
     target = gpu_target(part)
     if capability(target.generation) is None:
@@ -1366,13 +1462,11 @@ def routes(*, alone: bool = False) -> Iterator[list[Route]]:
 
 
 def reported(found: Sequence[Route]) -> None:
-    """Report `found`, routes a trace's dispatches reported, to every open `routes` block, as each of its
-    dispatches did (`route`): a trace held and reused (`dew.algebra.fusion`'s regions) reports the routes it
-    took where its program is written."""
-    from dew import _cache
-
-    for collected in _cache.KERNEL_ROUTES.value:
-        collected.found.extend(found)
+    """Report `found`, routes a trace's dispatches reported, again, each as its dispatch did (`published`): a
+    trace held and reused (`dew.algebra.fusion`'s regions, a decision cached by its key) reports the routes it
+    took where its program is written (train 1095's review F1: a second appender beside `published`)."""
+    for each in found:
+        published(each)
 
 
 def _site() -> str:
@@ -1390,15 +1484,29 @@ _logged: set[tuple[str, str, str]] = set()
 def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
           forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
-    decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
-    `kernel`. Every `routes` block open records it.
-    A call off its preferred kernel is logged once a process for each kernel and refusal at INFO, naming
-    both and the refusal's reason; one that runs the preferred kernel logs nothing."""
+    decided (`dew.nn.kernels.selection.select`): `routed`'s route, `published`."""
+    return published(routed(choice, kernel=kernel, preferred=preferred, refusal=refusal, forced=forced))
+
+
+def routed(choice: Choice, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
+           forced: str | None = None) -> Route:
+    """The route of a dispatch of `choice` to `kernel`, reported nowhere: what a caller asking which kernel
+    would run holds until the dispatch it decides runs (`published`; `selection.decided`). `preferred`
+    defaults to the kernel `chosen` names, else `kernel`."""
     from dew import _cache
 
-    generation = device_generation()
     preferred = preferred or dict(_cache.KERNEL_CHOICES.value).get(choice) or kernel
-    found = Route(choice, kernel, preferred, refusal, generation, _site(), forced)
+    return Route(choice, kernel, preferred, refusal, device_generation(), _site(), forced)
+
+
+def published(found: Route) -> Route:
+    """`found`, a dispatch that runs, reported: every `routes` block open records it, and a call off its
+    preferred kernel is logged once a process for each kernel and refusal at INFO, naming both and the
+    refusal's reason; one that runs the preferred kernel logs nothing."""
+    from dew import _cache
+
+    choice, kernel, preferred, refusal, generation = (found.choice, found.kernel, found.preferred,
+                                                      found.refusal, found.target)
     for collected in _cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
@@ -1408,28 +1516,79 @@ def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal:
     return found
 
 
+def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Callable:
+    """`linear_tangent`'s forward without `nested`: run on its operands held still (`stop_gradient`), its
+    output alone taking `portable`'s tangent where an outer order differentiates it, what it saves none:
+    held still whole, a second order lost its loss's curvature, `J^T H J` (row 8648)."""
+    import jax
+
+    from dew.nn.derivatives import contracted, declared_tangent
+
+    def tangent(primals, tangents):
+        # The output's own tangent is zero: it is computed from operands held still. Its value the attached
+        # output again, so a third order takes its tangent too (8573's head review: 32 where 48).
+        output, *operands = primals
+        return attached(output, *operands), jax.jvp(portable, tuple(operands), tuple(tangents[1:]))[1]
+
+    def holding(output, *operands):
+        del operands
+        return output
+
+    attached = contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, holding, tangent))
+
+    def run(*operands):
+        output, saved = forward(*jax.lax.stop_gradient(operands))
+        return attached(output, *operands), saved
+
+    return run
+
+
+def _symbolic_tangent(portable: Callable, operands, tangents, output):
+    """`portable`'s tangent at `operands` along `tangents`, a tree like them whose symbolic zeros
+    (`SymbolicZero`) hold their operands still (`_perturbed_tangent`)."""
+    import jax
+    from jax.custom_derivatives import SymbolicZero
+
+    directions = jax.tree.leaves(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+    live = [not isinstance(direction, SymbolicZero) for direction in directions]
+    return _perturbed_tangent(portable, operands, live, itertools.compress(directions, live), output)
+
+
+def _perturbed_tangent(portable: Callable, operands, live: Sequence[bool], moving, output=None):
+    """`portable`'s tangent at `operands` along `moving`, the directions of the leaves `live` masks alone,
+    the others held as constants: a zero direction would meet an infinite factor (inf * 0, NaN, where a
+    bias's own tangent was 1: rows 8757, 6740). With none live, `output`'s zeros, in its dtypes."""
+    import jax
+    from jax.custom_derivatives import zero_from_primal
+
+    from dew.nn import programs
+
+    if not any(live):
+        return zero_from_primal(output)
+    perturbed, fill = programs.holes(operands, live)
+    return jax.jvp(lambda *values: portable(*fill(values)), tuple(perturbed), tuple(moving))[1]
+
+
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: TangentKind,
                    live_cotangents: bool = False, zero_cotangents: bool = False,
                    primal: Callable | None = None, nested: bool = True,
-                   unread: tuple[int, ...] = ()) -> Callable:
+                   unread: tuple[int, ...] = (), traced: bool = False) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
     arrays); `backward(saved, operands, cotangent)` gives the operands' cotangents, a tuple; and
-    `portable(*operands)` gives the output.
-
-    The output's derivative is one custom JVP whose tangent is `portable`'s, evaluated as a
-    linear map that transposes to `backward` (`linear_map`): forward mode (`jax.jvp`,
-    `jax.linearize`) takes the portable tangent however a jit or a scan staged the call, and reverse
-    mode runs the backward kernel, through a vjp or through a jvp that a shard_map or a scan then
+    `portable(*operands)` gives the output. The output's derivative is one custom JVP whose tangent is
+    `portable`'s, evaluated as a linear map that transposes to `backward` (`linear_map`): forward mode
+    (`jax.jvp`, `jax.linearize`) takes the portable tangent however a jit or a scan staged the call, and
+    reverse mode runs the backward kernel, through a vjp or through a jvp that a shard_map or a scan then
     transposes. The forward and the backward are custom JVPs of their own whose tangents are
     `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
     `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
     `saved` holds is a function of the operands, whose tangents carry it. This composes with
-    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse. Each of the three is
-    declared as the caller's `kind` (`dew.nn.derivatives.declared_tangent`): a kernel's glue (`KernelGlue`),
-    a rule its numerics need as written (`Protected`), or one written to restructure algebra (`Algebra`),
-    which is what the algebra pass reads of it.
+    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse. Each is declared as
+    the caller's `kind` (`dew.nn.derivatives.declared_tangent`), which the algebra pass reads: a kernel's
+    glue (`KernelGlue`), a rule its numerics need as written (`Protected`) or algebra's own (`Algebra`).
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
@@ -1439,13 +1598,13 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     operands at `unread` positions, which no derivative reads (`portable` and `backward` alike: a value only
     the forward multiplies, `gemm`'s `applied`), are no residual of the derivative: it holds each as an empty
     array of its dtype, so a remat policy that saves the other operands recomputes nothing to form it.
-    `primal(*operands)` gives the output where no derivative is taken (a kernel
-    that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
-    it is on its operands held still (`stop_gradient`), not as a custom JVP of its own: a value it names
-    (`checkpoint_name`) is a residual a remat policy can keep, and no order differentiates the kernels'
-    forward, whose custom VJP takes none (what it saves reaches `pulled` alone, whose tangent reads the
-    operands': run as it was, a jvp of a gradient through a named kernel reached Mosaic GPU's call, which
-    no JAX rule differentiates, row 2655)."""
+    `primal(*operands)` gives the output where no derivative is taken (a kernel that saves nothing),
+    `forward`'s where None. Without `nested`, a derivative's level runs `forward` on its operands held
+    still (`_held_still`), not as a custom JVP of its own: a value it names (`checkpoint_name`) is a
+    residual a remat policy can keep, and no order differentiates the kernels' forward, whose custom VJP
+    takes none (what it saves reaches `pulled` alone, whose tangent reads the operands': a jvp of a
+    gradient through a named kernel reached Mosaic GPU's call, row 2655). With `traced`, orders past the
+    first differentiate `forward` and `backward` as written (row 8656: the turned rule's crossing form)."""
     import jax
     import jax.numpy as jnp
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
@@ -1454,21 +1613,22 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
+        moved = _symbolic_tangent(portable, primals, tangents, output)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
-        return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
+        return (output, saved), (moved, zero_from_primal(saved))
 
     def producing(*operands):
         return forward(*operands)
 
     produced = contracted("test_an_embedding_lookup_holds_every_order")(
-        declared_tangent(kind, producing, produced_jvp))
+        declared_tangent(kind, producing, produced_jvp, symbolic_zeros=True))
 
     def pulled_by(saved, operands, cotangent, live):
         arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
         return backward(*arguments)
 
     def pulled_jvp(live, primals, tangents):
-        _, operands, cotangent = primals
+        saved, operands, cotangent = primals
         _, doperands, dcotangent = tangents
 
         def pullback(operands, cotangent):
@@ -1477,15 +1637,17 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             # `live` indexes the operands' leaves, as the reverse pass's `backward` takes them.
             return whole if live is None else tuple(jax.tree.leaves(whole)[index] for index in live)
 
-        return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
+        value = pulled(saved, operands, cotangent, live)
+        return value, _symbolic_tangent(pullback, (operands, cotangent), (doperands, dcotangent), value)
 
-    pulled = contracted("test_an_embedding_lookup_holds_every_order")(
-        declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,)))
+    pulled = pulled_by if traced else contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,), symbolic_zeros=True))
+    level = forward if traced else produced if nested else _held_still(forward, portable, kind)
 
     def bounded_jvp(primals, tangents):
-        output, saved = produced(*primals) if nested else forward(*jax.lax.stop_gradient(primals))
+        output, saved = level(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
-        directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+        directions = jax.tree.leaves(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)
                 if not isinstance(direction, SymbolicZero)]
         if not live:
@@ -1493,10 +1655,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            whole = [zero_from_primal(operand) for operand in jax.tree.leaves(operands)]
-            for index, value in zip(live, moving, strict=True):
-                whole[index] = value
-            return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
+            return _perturbed_tangent(portable, operands, [index in live for index in range(len(directions))],
+                                      moving)
 
         def transposed(residuals, cotangent):
             operands, saved = residuals
@@ -1542,7 +1702,7 @@ def unbroadcast(cotangent, shape: tuple[int, ...]):
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,
-               zero_cotangents: bool = False):
+               zero_cotangents: bool = False, traced_tangent: bool = False, summed_first: bool = False):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
@@ -1550,7 +1710,16 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
     derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
     avals like it), which `apply` is then traced for only where forward mode runs it. With `zero_cotangents`,
-    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros."""
+    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros. With
+    `traced_tangent`, for an `apply` whose derivatives at every order are declared (an aligned sum's), its
+    tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches, the others held as
+    constants, and reverse mode past the map's own transpose (`pullback`'s) that tangent's, `apply`'s
+    declared ones: split into the map and its residuals' part, an aligned sum's two parts added overflowed to
+    inf - inf, and a zero direction met an infinite factor, NaN (row 8757). With `summed_first`, for a
+    pullback that narrows (an exact widening's cast back), a batch that reaches the map through its cotangent
+    alone pulls back the batch's cotangent summed in its own type, once: pulled back by element and summed
+    after, each element rounded first, and two that cancel overflowed to NaN (base reviews 279405f7f F1 and
+    7fa8fe6c2 F1: a general pullback keeps map-then-reduce, its partial sums its own)."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
@@ -1560,7 +1729,26 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
         traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
         out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
-    return _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents)(residuals, moving)
+    primitive = _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents, traced_tangent,
+                                    summed_first)
+    return primitive(residuals, moving)
+
+
+def _unmapped(*axes) -> bool:
+    """Whether a batch rule's operands' batch axes (trees of axes, None where unbatched) map none of them."""
+    import jax
+
+    return all(axis is None for axis in jax.tree.leaves(axes, is_leaf=lambda axis: axis is None))
+
+
+def _summed_batch(cotangent):
+    """A batch's cotangent (a tree, the batch its leaves' first axis) summed over the batch in each leaf's own
+    type (`lax.reduce_sum`), whatever x64 scope a pullback runs in; a `float0` leaf's zeros without it."""
+    import jax
+    import numpy as np
+
+    return jax.tree.map(lambda leaf: np.zeros(leaf.shape[1:], jax.dtypes.float0)
+                        if leaf.dtype == jax.dtypes.float0 else jax.lax.reduce_sum(leaf, (0,)), cotangent)
 
 
 @functools.cache
@@ -1570,6 +1758,8 @@ def _linear_primitive() -> type:
     import jax.numpy as jnp
     import numpy as np
     from jax.experimental import hijax
+
+    from dew.nn import programs
 
     def zero(leaf) -> bool:
         return isinstance(leaf, hijax.Zero)
@@ -1581,6 +1771,23 @@ def _linear_primitive() -> type:
         """`tangents` with each symbolic zero an array of its tangent type: float0's for an integer leaf."""
         return jax.tree.map(hijax.instantiate_zeros, tangents, is_leaf=zero)
 
+    def nothing(out_aval):
+        """A tangent of `out_aval`'s type no direction reaches: its symbolic zeros."""
+        return jax.tree.map(lambda aval: hijax.Zero(aval.to_tangent_aval()), out_aval)
+
+    def held_jvp(apply, structure, primals, tangents, out_aval):
+        """`apply(*primals)`'s tangent in the leaves `tangents` reaches (neither None nor a symbolic zero,
+        paired by `structure`, the primals' own the primitive holds, which raises where theirs differs),
+        the others held as constants: a zero tangent's leaf beside an infinite one was a 0 inf, NaN (row
+        8757). The primals are flattened once, by `programs.holes`, which selects and rebuilds them."""
+        directions = structure.flatten_up_to(tangents)
+        live = [direction is not None and not zero(direction) for direction in directions]
+        moving, fill = programs.holes(primals, live)
+        if not moving:
+            return nothing(out_aval)
+        return jax.jvp(lambda *moved: apply(*fill(moved)), tuple(moving),
+                       tuple(itertools.compress(directions, live)))[1]
+
     def unbatched(cotangent):
         """An unbatched operand's cotangent: its batch's sum."""
         if cotangent.dtype == jax.dtypes.float0:
@@ -1591,12 +1798,16 @@ def _linear_primitive() -> type:
         apply: Callable
         pullback: Callable
         zero_cotangents: bool
-        """`linear_map`'s two functions and whether its pullback takes None for a zero cotangent, `params`
-        that `HiPrim` makes attributes."""
+        traced_tangent: bool
+        summed_first: bool
+        """`linear_map`'s two functions and its flags (`zero_cotangents`, `traced_tangent`, `summed_first`),
+        `params` that `HiPrim` makes attributes."""
 
-        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False):
+        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False, traced_tangent=False,
+                     summed_first=False):
             self.in_avals, self.out_aval = in_avals, out_aval
-            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents}
+            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents,
+                           "traced_tangent": traced_tangent, "summed_first": summed_first}
             super().__init__()
 
         def expand(self, *args):
@@ -1618,16 +1829,21 @@ def _linear_primitive() -> type:
         def jvp(self, primals, tangents):
             residuals, moving = primals
             d_residuals, d_moving = tangents
+            if self.traced_tangent:
+                return self(residuals, moving), held_jvp(self.apply, self.in_tree, primals, tangents,
+                                                         self.out_aval)
             terms = []
             if not all_zero(d_moving):
                 terms.append(self(residuals, instantiated(d_moving)))
             if not all_zero(d_residuals):
-                terms.append(jax.jvp(lambda held: self.apply(held, moving), (residuals,),
-                                     (instantiated(d_residuals),))[1])
+                # The residuals' own, the moving leaves held still (base review 0c6ef9c11 F2).
+                held = (d_residuals, jax.tree.map(lambda _: None, moving))
+                terms.append(held_jvp(self.apply, self.in_tree, primals, held, self.out_aval))
             if not terms:
-                return self(residuals, moving), jax.tree.map(
-                    lambda aval: hijax.Zero(aval.to_tangent_aval()), self.out_aval)
-            return self(residuals, moving), jax.tree.map(lambda *parts: sum(parts), *terms)
+                return self(residuals, moving), nothing(self.out_aval)
+            # Added only where two parts are: a lone part's sign kept (`0 + -0.0` is positive zero).
+            return self(residuals, moving), jax.tree.map(lambda *parts: functools.reduce(jnp.add, parts),
+                                                         *terms)
 
         lin, linearized = hijax.linearize_from_jvp
         vjp_fwd, vjp_bwd_retval = hijax.vjp_from_jvp
@@ -1642,6 +1858,8 @@ def _linear_primitive() -> type:
                 return jax.vmap(self.apply, in_axes=(residual_axes, moving_axes), **mapped)(residuals, moving)
 
             def pulled(residuals, cotangent):
+                if self.summed_first and _unmapped(residual_axes, moving_axes):
+                    return self.pullback(residuals, _summed_batch(cotangent))
                 back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
                 leaves, tree = jax.tree.flatten(back)
                 axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
@@ -1649,7 +1867,8 @@ def _linear_primitive() -> type:
                     unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
-            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents),
+            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,
+                               traced_tangent=self.traced_tangent, summed_first=self.summed_first),
                     jax.tree.map(lambda _: 0, self.out_aval))
 
     return Linear
@@ -1797,16 +2016,52 @@ def device_memory() -> int | None:
 
 
 def placed_devices() -> list:
-    """This process's devices the context places a call on, as `placed_platform` reads the context: the
-    default device where no mesh is set and one is (`jax.default_device`), else the local devices of the
-    placed platform."""
-    import jax
+    """This process's devices the context places a call on, as `placed_platform` reads the context: a set
+    mesh's own (`jax.set_mesh`), in its order; else the default device where one is (`jax.default_device`);
+    else the local devices of the placed platform."""
+    return list(_placed())
 
+
+def placed_device():
+    """The device a call's target and generation are read from (`gpu_target`, `device_generation`): the
+    first its context places it on (`placed_devices`), so a call on a second local GPU reads that GPU's
+    instruction family and resources; where the context places it on an abstract mesh alone (devices none
+    of this process's, a compile-only lowering's, `jax.sharding.use_abstract_mesh`), that mesh's abstract
+    device, whose kind names its SKU."""
+    import jax
+    from jax._src import mesh as mesh_lib
+
+    concrete = mesh_lib.get_concrete_mesh()
+    abstract = jax.sharding.get_abstract_mesh().abstract_device
+    if abstract is not None and (concrete is None or concrete.empty):
+        return abstract
+    return _placed()[0]
+
+
+def _placed() -> Sequence:
+    """`placed_devices`, as the context holds them: a set mesh's own devices of this process are its cached
+    list, which a trace's tens of thousands of target reads take without a copy."""
+    import jax
+    from jax._src import mesh as mesh_lib
+
+    mesh = mesh_lib.get_concrete_mesh()
+    if mesh is not None and not mesh.empty and mesh.local_devices:
+        return mesh.local_devices
     device = jax.config.jax_default_device
     if (jax.sharding.get_abstract_mesh().abstract_device is None and device is not None
             and not isinstance(device, str)):
         return [device]
     return jax.local_devices(backend=placed_platform())
+
+
+def _run_devices():
+    """The devices of every process a call runs on, whose first in each process the kind guard reads
+    (`_one_kind`): a set mesh's, else the run's."""
+    import jax
+    from jax._src import mesh as mesh_lib
+
+    mesh = mesh_lib.get_concrete_mesh()
+    return mesh.devices.flat if mesh is not None and not mesh.empty else jax.devices()
 
 
 def backend() -> str:

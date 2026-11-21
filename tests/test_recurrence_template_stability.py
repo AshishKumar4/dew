@@ -8,9 +8,11 @@ long and fading memories, steep then mild decays), held as test_recurrence_stabi
 
 - finite wherever the recurrence a token at a time in float64 is;
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm in the call's 16-bit dtype, its
-  family's independent oracle (docs/design/testing.md): the fla port where it runs the form (the delta rule
-  with a decay), the recurrence a token at a time where the form's family has no release (a write gate
-  without the delta rule), its distance from the portable math reported beside the verdict. Mamba2's rated
+  family's independent oracle (docs/design/testing.md): recorded fla-core where it runs the form (the delta
+  rule with a decay; a write gate without it under a decay a head, fla's `chunk_simple_gla` on its keys
+  gated, whose chunked state gradient takes the chunk's `q^T do` in one product as the template's does, 1.57
+  times the token loop's distance, row 6755), the recurrence a token at a time where no fla release runs it,
+  its distance from the portable math reported beside the verdict. Mamba2's rated
   decay runs under both forms (`forms_of`): the accurate ones held to the portable math, the fast ones, its
   16-bit numbers mamba_ssm's (`chunk_forward.prepared`), to the port of mamba_ssm's kernels, as recorded
   mamba_ssm holds them at the same inputs (test_mamba_ssd).
@@ -29,7 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from fla_sites import LEAVES, the_template_is_as_exact_as_fla
+from fla_sites import FAINT_CROSS, FLOOR_GATES, LEAVES, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU
 from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
@@ -121,9 +123,11 @@ def reference_arm(hooks, forms: str | None, **bound):
 
 
 def fla_recorded(hooks) -> bool:
-    """Whether a form's reference is recorded fla-core (`fla_sites`): the delta rule with a decay on its
-    operands as given, no gates formed in the rule."""
-    return hooks.delta and hooks.decay != 'none' and hooks.gates is None
+    """Whether a form's reference is recorded fla-core (`fla_sites`): the delta rule with a decay, or a write
+    gate without it under a decay a head (`chunk_simple_gla` on its keys gated), on its operands as given, no
+    gates formed in the rule."""
+    held = (hooks.delta and hooks.decay != 'none') or (hooks.write_gate and hooks.decay == 'scalar')
+    return held and hooks.gates is None and not hooks.rated
 
 
 @contextlib.contextmanager
@@ -156,6 +160,31 @@ def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
     return True
 
 
+RESTARTED = 'resets on chunk edges'
+"""The one regime whose arms are its own (`_arms`): its documents restart on chunk edges (`restarting`), its
+chunked arms bounded by them (`bounded`)."""
+
+
+@functools.cache
+def _arms(name: str, regime: str, product: str, forms: str) -> tuple:
+    """A case's arms (`the_template_stays_finite_and_on_par_where_chunked_forms_break`'s): the template's,
+    its reference arm, the recurrence a token at a time and the portable math's, their gradients' where
+    `product` is; one function each for every regime but `RESTARTED`, which run them alike, so a form's
+    regimes of one shape trace its arms once, where each case built and traced its own (the GPU tier's 120
+    traces of the template's at assert_finite)."""
+    if regime != RESTARTED:
+        regime = next(other for other in REGIMES if other != RESTARTED)
+    hooks = SITES[name]
+    mosaic, portable = (functools.partial(chunk_on, kernel, hooks, **bounded(regime))
+                        for kernel in ('mosaic_gpu', 'xla'))
+    exact = functools.partial(token_by_token, hooks)
+    with under(forms):
+        reference = reference_arm(hooks, forms, **bounded(regime))
+    if product == 'gradient':
+        return tuple(with_gradients(restarting(fn, regime)) for fn in (mosaic, reference, exact, portable))
+    return mosaic, reference, exact, portable
+
+
 def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product, forms):
     """Each form's 16-bit forward through the template, or its forward and gradient, under `forms`
     (`forms_of`), finite wherever the float64 recurrence's are on the regime's first draws, and on par with
@@ -175,15 +204,9 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
-    mosaic, portable = (functools.partial(chunk_on, kernel, hooks, **bounded(regime))
-                        for kernel in ('mosaic_gpu', 'xla'))
-    exact = functools.partial(token_by_token, hooks)
+    mosaic = _arms(name, regime, 'forward', forms)[0]
+    dew, reference, truth, portable = _arms(name, regime, product, forms)
     with under(forms):
-        reference = reference_arm(hooks, forms, **bounded(regime))
-        dew, truth = mosaic, exact
-        if product == 'gradient':
-            dew, reference, truth, portable = (with_gradients(restarting(fn, regime))
-                                               for fn in (mosaic, reference, exact, portable))
         if not runs(dew, hooks, operands, draws(0), product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
         label = f'the template, {name} under {regime}, its {product}'
@@ -238,10 +261,27 @@ def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms)
                       'the decay bound')
 
 
-@pytest.mark.parametrize(('name', 'regime', 'forms'),
-                         [(name, regime, forms) for name, regime, product, forms in CASES
-                          if product == 'forward' and regime in INTERPRETED])
-@pytest.mark.check1_shards(seeds=256, per_task=8)
+@pytest.mark.parametrize(('name', 'regime', 'forms'), [
+    pytest.param('scalar delta', 'aligned keys', None, id='scalar_delta-aligned_keys'),
+    pytest.param('vector delta', 'aligned keys', None, id='vector_delta-aligned_keys'),
+    pytest.param('scalar write', 'aligned keys', None, id='scalar_write-aligned_keys'),
+    pytest.param('rated', 'aligned keys', 'fast', id='rated-aligned_keys-fast'),
+    pytest.param('rated', 'aligned keys', 'accurate', id='rated-aligned_keys-accurate'),
+    pytest.param('gated', 'aligned keys', 'accurate', id='gated-aligned_keys-accurate',
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param('scalar delta', 'decays near zero', None, id='scalar_delta-decays_near_zero',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param('vector delta', 'decays near zero', None, id='vector_delta-decays_near_zero',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=16)),
+    pytest.param('scalar write', 'decays near zero', None, id='scalar_write-decays_near_zero',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param('gated', 'decays near zero', 'accurate', id='gated-decays_near_zero-accurate',
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param('rated', 'decays near zero', 'fast', id='rated-decays_near_zero-fast',
+                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
+    pytest.param('rated', 'decays near zero', 'accurate', id='rated-decays_near_zero-accurate',
+                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
+])
 def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
     """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
     tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64
@@ -313,6 +353,44 @@ def compiled_gradient(hooks, name: str) -> list[dict]:
         return jax.grad(loss), (jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), operands),)
 
     return compile_mosaic_kernels([KernelCase(name, call)], 'sm90')
+
+
+def kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla():
+    """Kimi delta attention's 16-bit gradient through the template under decays at its floor and write gates
+    down to 2^-60 (fla_sites' `FLOOR_GATES`): its output, final memory and every operand's gradient on par
+    with recorded fla-core's from float64 (check 1, 512 seeds), run natively in `test_gpu_recurrence`
+    (interpreted off a GPU at 3 draws a task took 171 CI tasks / ~14.6 CPU-h, row 8835)."""
+    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
+    the_template_is_as_exact_as_fla(mosaic, FLOOR_GATES, LEAVES,
+                                    'the template, Kimi delta attention under tiny gates at the floor')
+
+
+@COMPILES_ON_CPU
+def test_kimis_unit_keys_under_tiny_gates_at_the_floor_stays_finite_interpreted():
+    """Kimi delta attention's 16-bit gradient under `FLOOR_GATES`, interpreted off a GPU on `FINITE_SEEDS`
+    draws: every leaf finite wherever float64 is (its 512-seed check 1 runs natively in
+    `test_gpu_recurrence.template_stability_cells`)."""
+    from fla_sites import chunk_of, sites
+
+    site = sites()[FLOOR_GATES]
+    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
+    truth = functools.partial(token_by_token, site.hooks)
+    for seed in range(FINITE_SEEDS):
+        operands = chunk_of(site.arrays(seed))
+        assert_finite(with_gradients(mosaic), with_gradients(truth), operands, FLOOR_GATES)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_kimis_faint_cross_terms_are_as_exact_as_fla_interpreted():
+    """Kimi delta attention's 16-bit gradient through the template, interpreted, over one key under faint
+    write gates beside large ones and no decay (fla_sites' `FAINT_CROSS`): its output, final memory and
+    every operand's gradient on par with recorded fla-core's from float64 (check 1). A token's own scores
+    pair taken out of the log decay's terms after they were summed in fp32 lost the faint cross term
+    beside it (base review 29b07fb60 F1, row 7906), which a cell held bitwise outside the gate (row 8569)."""
+    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
+    the_template_is_as_exact_as_fla(mosaic, FAINT_CROSS, LEAVES,
+                                    'the template, Kimi delta attention under faint cross terms')
 
 
 @COMPILES_ON_CPU

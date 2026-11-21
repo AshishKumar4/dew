@@ -13,12 +13,15 @@ drawn NCHW images its processor packs (`image_draw`), and its projector over dra
 (`trunk_draw`), each in float32 and float64 over seeds for check 1 (`recorded_references.record_case`).
 """
 
-from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import torch
 from mimo_reference import FIXTURES, packed_rows, padded, scatter, write
-from transformers.models.muse_glimmer.configuration_muse_glimmer import MuseGlimmerVisionConfig
+from transformers.models.muse_glimmer.configuration_muse_glimmer import (
+    MuseGlimmerConfig,
+    MuseGlimmerVisionConfig,
+)
 from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
 from transformers.models.muse_glimmer.modeling_muse_glimmer import (
     MuseGlimmerRMSNorm,
@@ -29,13 +32,13 @@ from transformers.models.muse_glimmer.modeling_muse_glimmer import (
 
 from _dew_torch.precision import float64
 
-MUSE_VISION = dict(
+MUSE_VISION: dict[str, Any] = dict(
     num_hidden_layers=4, hidden_size=32, intermediate_size=48, num_attention_heads=4, hidden_act="gelu",
     patch_size=2, patch_temporal=2, merge_size=2, pos_emb_height=4, pos_emb_width=4, layer_norm_eps=1e-5,
     layer_types=["window_attention", "window_attention", "full_attention", "window_attention"],
     rope_parameters={"rope_type": "default", "rope_theta": 10000.0})
-MUSE_WRAPPER = dict(out_hidden_size=128, projector_hidden_size=24, projector_hidden_act="gelu")
-MUSE_TEXT = dict(hidden_size=16, rms_norm_eps=1e-6)
+MUSE_WRAPPER: dict[str, Any] = dict(out_hidden_size=128, projector_hidden_size=24, projector_hidden_act="gelu")
+MUSE_TEXT: dict[str, Any] = dict(hidden_size=16, rms_norm_eps=1e-6)
 MUSE_GRIDS = ((1, 6, 10), (1, 8, 4))
 """4-patch windows over a 6x10 grid, some partial, and an 8x4 one; the first row is an NCHW image
 packed by the processor's own patchify."""
@@ -47,7 +50,7 @@ def write_muse_glimmer_vision_tiny() -> None:
     processor's patchify, which the test feeds Dew as the image."""
     vconf = MuseGlimmerVisionConfig(**MUSE_VISION)
     vconf._attn_implementation = "eager"
-    wrapper = SimpleNamespace(**MUSE_WRAPPER)
+    wrapper = MuseGlimmerConfig(vision_config=vconf, text_config=MUSE_TEXT, **MUSE_WRAPPER)
 
     def build():
         return (MuseGlimmerVisionModel(vconf).eval(), MuseGlimmerVisionAdapter(wrapper).eval(),
@@ -63,8 +66,8 @@ def write_muse_glimmer_vision_tiny() -> None:
     _, height, wide = MUSE_GRIDS[0]
     patch = MUSE_VISION["patch_size"]
     image = np.random.RandomState(17).rand(1, 3, height * patch, wide * patch).astype(np.float32)
-    packed, _, _ = MuseGlimmerImageProcessor.patchify(None, torch.from_numpy(image), patch,
-                                                       MUSE_VISION["patch_temporal"])
+    packed, _, _ = MuseGlimmerImageProcessor().patchify(torch.from_numpy(image), patch,
+                                                         MUSE_VISION["patch_temporal"])
     rows[0] = packed[0].numpy()
     batch[0, :len(rows[0])] = rows[0]
 
@@ -146,7 +149,7 @@ def record_muse_glimmer_vision() -> None:
     directory = FIXTURES / "muse-glimmer-vision-tiny"
     vconf = MuseGlimmerVisionConfig(**MUSE_VISION)
     vconf._attn_implementation = "eager"
-    wrapper = SimpleNamespace(**MUSE_WRAPPER)
+    wrapper = MuseGlimmerConfig(vision_config=vconf, text_config=MUSE_TEXT, **MUSE_WRAPPER)
     tower_state = load_file(str(directory / "model.safetensors"))
     projector_state = load_file(str(directory / "projector.safetensors"))
 
@@ -202,8 +205,8 @@ def record_muse_glimmer_vision() -> None:
         return {"tower": trunks(modules, rows, MUSE_GRIDS, dtype)}
 
     def image_case(modules, inputs, dtype):
-        packed, _, _ = MuseGlimmerImageProcessor.patchify(
-            None, torch.from_numpy(inputs["image"]), MUSE_VISION["patch_size"], MUSE_VISION["patch_temporal"])
+        packed, _, _ = MuseGlimmerImageProcessor().patchify(
+            torch.from_numpy(inputs["image"]), MUSE_VISION["patch_size"], MUSE_VISION["patch_temporal"])
         return {"tower": trunks(modules, [packed[0].numpy()], MUSE_GRIDS[:1], dtype)}
 
     def trunk_case(modules, inputs, dtype):

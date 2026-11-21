@@ -827,6 +827,45 @@ def test_an_offloaded_banks_regrouped_page_copies_lower_with_the_bank_in_host_me
     compile_programs({"regrouped": (regrouped, shapes)}, "sm80")
 
 
+def test_an_offloaded_pools_page_writes_lower_with_the_pool_in_host_memory():
+    """`pages_written` over a pool in host memory (`KVCache.offloaded`'s) compiles for an A100
+    (`compile_programs`), a place past the pool writing nothing, its result in host memory: each page copied
+    to the host before the choice to write it (`host_memory.stored_at`'s `kept`), the form XLA:GPU's host
+    offloading compiles (row 8507)."""
+    from dew.training.ahead import compile_programs
+
+    def written(pool, places, values):
+        held = pages_written(jax.device_put(pool, jax.memory.Space.Host), places, values, 1)
+        assert jax.typeof(held).memory_space is jax.memory.Space.Host
+        return held
+
+    shapes = [jax.ShapeDtypeStruct((1, 6, 2, 1), jnp.float32), jax.ShapeDtypeStruct((3,), jnp.int32),
+              jax.ShapeDtypeStruct((3, 1, 2, 1), jnp.float32)]
+    compile_programs({"written": (written, shapes)}, "sm80")
+
+
+def test_a_pools_page_reads_and_writes_take_an_axis_counted_from_either_end():
+    """`pages_read` and `pages_written` over a pool in host memory read and write the same pages along its
+    last axis named `-1` as named by its index, a place past the pool writing nothing, and a host entry
+    refuses an axis past the pool's rank either way (`host_memory`'s entries, each axis counted from the
+    array's own rank)."""
+    from dew.nn.host_memory import fetched_at
+
+    pool = jax.device_put(jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4), jax.memory.Space.Host)
+    places = jnp.asarray([2, 0, 7], jnp.int32)
+    values = jnp.full((3, 2, 3), -1.0, jnp.float32)
+    for axis in (2, -1):
+        read = np.asarray(pages_read(pool, places, axis))
+        np.testing.assert_array_equal(read, np.moveaxis(np.asarray(pool)[:, :, [2, 0, 3]], 2, 0))
+        written = np.asarray(pages_written(pool, places, values, axis))
+        expected = np.asarray(pool).copy()
+        expected[:, :, [2, 0]] = -1.0
+        np.testing.assert_array_equal(written, expected)
+    for axis in (3, -4):
+        with pytest.raises(np.exceptions.AxisError):
+            fetched_at(pool, 0, axis)
+
+
 @pytest.mark.parametrize(("layout", "rebuilds", "row"), [(KVCache(page_size=2, groups=2), False, 8493),
                                                           (KVCache(page_size=2), True, 8494)],
                          ids=["groups", "rebuilds"])
@@ -838,3 +877,24 @@ def test_a_search_regrouping_rows_unpaged_says_so(layout, rebuilds, row, caplog)
         chosen = regrouped_layout(layout, 2, 3, 5, 6, 24, rebuilds=rebuilds)
     assert (chosen.page_size, chosen.pages, chosen.quantized) == (None, None, layout.quantized)
     assert [getattr(record, "row", None) for record in caplog.records] == [row]
+
+
+@pytest.mark.parametrize("codes", [jnp.int8, jnp.float8_e4m3fn], ids=["int8", "fp8"])
+def test_a_quantized_stores_codes_compute_in_its_scales_dtype(codes):
+    """A module stating no dtype whose parameters are a quantized store, one-byte codes beside bf16 scales,
+    computes in bf16 (`protocols.computes_in`): an fp8 code is no dtype a product computes in, as an int8 one
+    is not, for a cache's dtype, a streamed step's price and a release's alike (row 7946)."""
+    from dew.nn.protocols import computes_in
+
+    store = {"kernel": jax.ShapeDtypeStruct((8, 8), codes), "scale": jax.ShapeDtypeStruct((8,), jnp.bfloat16)}
+    assert computes_in(None, {"proj": store}) == jnp.bfloat16
+    assert computes_in(jnp.float32, {"proj": store}) == jnp.float32
+    assert computes_in(None, {}) == jnp.float32
+
+
+def test_a_module_bound_to_no_scope_states_its_caches_dtype():
+    """An unbound module whose dtype is stated keeps its cache in it (`kv_cache.compute_dtype`), reading no
+    parameters it has no scope to hold: a cache's spec is read before a model is bound."""
+    from dew.nn.kv_cache import compute_dtype
+
+    assert compute_dtype(nn.Dense(4), jnp.bfloat16) == jnp.bfloat16

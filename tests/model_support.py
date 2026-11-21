@@ -447,3 +447,37 @@ def kept_by_slot(cache) -> dict[tuple[str, ...], np.ndarray]:
             leaf = np.swapaxes(leaf, 1, 2)
         kept[path] = leaf
     return kept
+
+
+def device_buffers(device) -> dict[int, int]:
+    """Each buffer the live arrays hold in `device`'s own memory, by its storage's address, with its bytes:
+    an array's views and copies of one buffer counted once, host-pinned shards none."""
+    import jax
+
+    return {shard.data.unsafe_buffer_pointer(): shard.data.nbytes
+            for array in jax.live_arrays() for shard in array.addressable_shards
+            if shard.device == device and shard.data.sharding.memory_kind in (None, "device")}
+
+
+def allocating(monkeypatch, limit: int, pool: int, in_use: int = 0) -> None:
+    """Every device an attached GPU's allocator (`Device.memory_stats`) of `limit` bytes holding `in_use`
+    and every buffer placed on it from here on (a run's copies and window as it builds them, each counted
+    by its storage, gone once deleted), its pool of `pool` bytes free in one block, the rest growth: the
+    allocator a step's buffers take their block from, as a BFC pool's reading states it."""
+    import gc
+
+    import jax
+
+    gc.collect()
+    # The arrays holding the buffers already placed, kept alive while the allocator reads (held by its
+    # reading), so no buffer placed after reuses one's address and is taken for it.
+    baseline = jax.live_arrays()
+    before = {device: set(device_buffers(device)) for device in jax.devices()}
+
+    def read(device, baseline=baseline) -> dict[str, int]:
+        held = in_use + sum(size for address, size in device_buffers(device).items()
+                            if address not in before[device])
+        grown = max(pool, held)
+        return {"bytes_limit": limit, "bytes_in_use": held, "pool_bytes": grown,
+                "largest_free_block_bytes": grown - held}
+    monkeypatch.setattr(jax.Device, "memory_stats", read)

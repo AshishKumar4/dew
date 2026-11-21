@@ -25,8 +25,8 @@ from jax.sharding import PartitionSpec
 from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import bundles, report, resources
-from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+from dew.nn.kernels.templates import bundles, report, resources, swizzling
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 
 
@@ -147,15 +147,17 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
     assert not failures(found), "\n".join(failures(found))
 
 
+@pytest.mark.parametrize("case_index", [0, 1], ids=["kda", "kda-keys-256"])
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, case_index):
     """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
     compiled by XLA's CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py), within
-    the compile bound and the block's shared memory."""
-    found = compile_kernels(kda_training_cases(), target)
-    assert len(found) == 2
+    the compile bound and the block's shared memory (row 10557: each case its own pytest node)."""
+    cases = list(kda_training_cases())
+    assert len(cases) == 2
+    found = compile_kernels([cases[case_index]], target)
+    assert len(found) == 1
     assert not failures(found), "\n".join(failures(found))
-
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("target", gate_generations(scoped=True))
@@ -179,7 +181,7 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     shared memory, no register spilled. The resource gate every Mosaic GPU mainloop takes."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    from dew.nn.kernels.templates.gemm import mosaic_gpu
+    from dew.nn.kernels.templates.gemm import tiling
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     args = (bf16((1024, 512)), bf16((4, 512, 1024)), jax.ShapeDtypeStruct((4,), jnp.int32))
@@ -192,8 +194,8 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
             model = _model(launch, ba, tiles)
         return support.KernelCase(f"gmm {tiles}", lambda: launch.lowering(ba, tiles), {"dew_gmm": model})
 
-    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1, family='wgmma')),
-                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2,
+    found = compile_mosaic_kernels([case(tiling.Tiles(128, 128, 64, 3, 1, family='wgmma')),
+                                    case(tiling.Tiles(128, 256, 64, 3, 1, warpgroups=2,
                                                           family='wgmma'))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
     failed = mosaic_failures(found)
@@ -213,10 +215,9 @@ def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_pri
     planned shared memory (`mosaic_failures`)."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    from dew.nn.kernels.templates.gemm import mosaic_gpu
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    tile = mosaic_gpu.Tiles(block_m, block_n, 64, 3, 1, warpgroups=2, cluster=cluster, family='wgmma',
+    tile = tiling.Tiles(block_m, block_n, 64, 3, 1, warpgroups=2, cluster=cluster, family='wgmma',
                             pingpong=True)
     launch = grouped_matmul.MosaicGmm()
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
@@ -253,7 +254,7 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
 
     def call():
         def gmm(lhs, rhs, sizes):
-            return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2,
+            return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2,
                                                                           cluster=2, family='wgmma'),
                                   transpose_rhs=False, out_dtype=jnp.bfloat16, dense=True,
                                   multiprocessors=generation.gpu_target("sm90").multiprocessors)
@@ -626,12 +627,12 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             if every_consumer_count:
                 family = pricing.family_of(config, jnp.bfloat16)
                 configs = {}
-                for consumers in sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)}):
+                for consumers in sorted({1, min(family.consumers, tiling.CONSUMERS)}):
                     # Each consumer keeps its share of the derived tile's rows, else the tile's rows split
                     # among them where its registers hold no more (mma.sync's one-consumer tile, two of
                     # whose shares no consumer holds), at as many of its stages as the block holds (a
                     # one-consumer tile's deeper ring past two consumers' rows); one consumer runs alone, a
-                    # cluster being two consumers' (`mosaic_gpu.Tiles`).
+                    # cluster being two consumers' (`tiling.Tiles`).
                     shares = dict.fromkeys((config.block_m // config.warpgroups * consumers, config.block_m))
                     # As many programs a multiprocessor as the derived tile's, else one, whose registers its
                     # consumers then share alone.
@@ -644,7 +645,7 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                               for rows_ in shares for depth in depths for programs in residencies
                               for stages in range(config.stages, 1, -1))
                     tile = next((tile for tile in staged
-                                 if isinstance(tile, mosaic_gpu.Tiles) and launch.legal(ba, tile, target)),
+                                 if isinstance(tile, tiling.Tiles) and launch.legal(ba, tile, target)),
                                 None)
                     if tile is not None:
                         configs[(f"{name} x{consumers} {tile}", consumers)] = tile
@@ -659,7 +660,7 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
 
 
 def _replaced(config, **changes):
-    """`config` with `changes`, or its tile type's refusal of them (`mosaic_gpu.Tiles`' own checks, a
+    """`config` with `changes`, or its tile type's refusal of them (`tiling.Tiles`' own checks, a
     `ValueError`), which a search passes over."""
     try:
         return dataclasses.replace(config, **changes)
@@ -926,10 +927,17 @@ def _contract_cases(generation_name: str, form: str | None = None) -> list:
     is that bundle's, compiled at the gate's picks."""
     found: dict = {}
     contract = _family_forms(generation_name)
+    target_forms = ({form} & contract) if form is not None else contract
     for shape in GEMM_SHAPES:
         for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True, form=form):
             if case.form in contract:
                 found.setdefault((case.form, case.consumers), case)
+        if target_forms.issubset({key[0] for key in found}):
+            by_form = {name: pricing.family_of(case.tile, jnp.bfloat16) for (name, _), case in found.items()}
+            if all(all((name, count) in found
+                       for count in {1, min(by_form[name].consumers, tiling.CONSUMERS)})
+                   for name in target_forms):
+                break
     return list(found.values())
 
 
@@ -952,7 +960,9 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
     side vectors and tiles, several outputs, the running sum) at one consumer and at the family's most
     (`_contract_cases`), each form among those the compile gate compiles for the generation, where its
-    contract compiles beside its picks."""
+    contract compiles beside its picks. A form's most consumers are those of the family its launch derives
+    on (a B200's GEMM forms tcgen05's, one consumer, where its contract bundle, mma.sync's fed rings, takes
+    two)."""
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
     # Every contract form is compiled beside the gate's picks (`test_each_gemm_mainloop_compiles_...`).
@@ -960,19 +970,12 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
                                for name in param.values}
     assert _family_forms(generation_name) <= _gate_forms(generation_name)
     cases = _contract_cases(generation_name)
-    counts = sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)})
-    expected = {(form, count) for form in _emitted_forms(family) for count in counts}
+    launched = {case.form: pricing.family_of(case.tile, jnp.bfloat16) for case in cases}
+    assert set(launched) == _emitted_forms(family), sorted(_emitted_forms(family) ^ set(launched))
+    expected = {(form, count) for form, emitting in launched.items()
+                for count in {1, min(emitting.consumers, tiling.CONSUMERS)}}
     got = {(case.form, case.consumers) for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
-
-
-@pytest.fixture
-def libtpu_shared(monkeypatch):
-    """libtpu loaded in this process beside another's: its lock file holds one process's libtpu at a time,
-    so two test workers compiling for a TPU at once failed the second's load (ABORTED, /tmp/libtpu_lockfile).
-    A compile-only TPU needs no device a lock guards, so each loads with libtpu's own allowance and takes no
-    lock file."""
-    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
 
 
 @COMPILES_FOR_TPU
@@ -1202,7 +1205,7 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
     route evidence), which ptxas compiles, its E2M1 codes decoded by their form's PTX inline
     (`inline_forms.registers`, row 3733), its E4M3 block scales by integer arithmetic
-    (`packed.e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
+    (`bits.scales_decoded`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
     refused the kernel (W8-a100, M-NS-8; row 3621)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
@@ -1361,7 +1364,7 @@ def test_an_mx_products_tile_holds_its_block_scale_rings_in_tensor_memory_too():
     taken = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
              if isinstance(op, grouped_matmul.MosaicMxGmm)]
     assert taken
-    wide = mosaic_gpu.Tiles(128, 256, 128, 2, 1, warpgroups=1, family="tcgen05")
+    wide = tiling.Tiles(128, 256, 128, 2, 1, warpgroups=1, family="tcgen05")
     with generation.assumed("sm100"):
         target = generation.gpu_target()
         assert all(op.legal(ba, config, target) and not op.legal(ba, wide, target)
@@ -1488,7 +1491,8 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     spilling fails."""
     from kernel_compile import inherited, mosaic_failures, reports
 
-    within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
+    within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0,
+              "cap": 168}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
@@ -1508,14 +1512,16 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
     a, b, c = (inherited(dataclasses.asdict(found), compiled, "sm90") for found in reports(
         {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
-        [report.Binary("a", None, 168, 0, shared=1024), report.Binary("b", None, 255, 40, shared=1024)]))
+        [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024),
+         report.Binary("b", None, 255, 40, "mosaic_gpu", shared=1024)]))
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
     assert set(c["unread"]) == {"shared bytes", "tensor memory columns", "binary", "registers", "spills"}
-    assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
+    # Each at the cap its compile states (`compile_mosaic_kernels`'), which these records skip.
+    assert len(mosaic_failures([{**record, "kernels": [{**each, "cap": 255} for each in (a, b, c)]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):
-        reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=512)])
+        reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=512)])
     # A complete estimate and its PTX's compile without a binary: no compiled kernel, read as missing.
     (unbound,) = (inherited(dataclasses.asdict(found), compiled, "sm90")
                   for found in reports({"a": complete}, []))
@@ -1534,7 +1540,7 @@ def test_a_kernel_no_ptx_covers_takes_its_binarys_figures_only_under_every_build
     from kernel_compile import inherited, reports
 
     complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
-    (found,) = reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=1024)])
+    (found,) = reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024)])
     judged = {}
     for builds, gpu in ((["cuda13"], "sm100"), (["cuda12"], "sm90"), (["cuda12"], "sm100")):
         monkeypatch.setattr(kernel_compile, "cuda_builds", lambda builds=builds: builds)
@@ -1556,7 +1562,7 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     assert report.kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
     with pytest.raises(report.KernelsOfOneName):
         report.kernel_modules(calls)
-    binaries = [report.Binary("k", "0123456789", registers, 0) for registers in (168, 200)]
+    binaries = [report.Binary("k", "0123456789", registers, 0, "mosaic_gpu") for registers in (168, 200)]
     assert len(reports({}, binaries[:1])) == 1
     with pytest.raises(ValueError):
         reports({}, binaries)
@@ -1679,11 +1685,11 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     import subprocess
     import sys
 
-    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family='wgmma')"
+    tile = "tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, family='wgmma')"
     preamble = ("import json, sys\n"
                 "from dew.nn.kernels import tuning\n"
                 "from dew.nn.kernels.templates import report\n"
-                "from dew.nn.kernels.templates.gemm import mosaic_gpu\n")
+                "from dew.nn.kernels.templates.gemm import tiling\n")
     snapshot = ("print(json.dumps([[identity, tuning.encoded(config), sorted(kernels)] "
                 "for identity, config, kernels in report.refused_launches()]))")
     environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(tmp_path / "cache")}
@@ -1744,3 +1750,172 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
         for got in outputs:
             for value, want in zip(got, expected, strict=True):
                 np.testing.assert_array_equal(value, want)
+
+
+@pytest.mark.parametrize("dense", [True, False], ids=["dense", "grouped"])
+def test_a_grouped_calls_walk_takes_every_column_tile_and_a_dense_ones_a_power_of_two(dense):
+    """An H100's Mosaic GEMM forward of 4096 rows by 1024 to 768 columns (`MosaicGmm.derived`): a grouped
+    call's (four groups) planar snake walks every column tile a band, each row block read once (row 5666,
+    M-EM-68); a dense call's (`gemm`'s `group_sizes=None`, one group) a power of two of them, as a dense
+    walk's band is (`resources.band`; row 7348: a dense call had taken the grouped band)."""
+    launch = grouped_matmul.MosaicGmm()
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    groups = 1 if dense else 4
+    arguments = launch.bind(shaped((4096, 1024)), shaped((groups, 1024, 768)),
+                            jax.ShapeDtypeStruct((groups,), jnp.int32), out_dtype="bfloat16", trans_rhs=False,
+                            interpret=False, dense=dense)
+    with report.refusals(), generation.assumed("sm90"):
+        tile = launch.derived(arguments, generation.gpu_target())
+    columns = 768 // tile.block_n  # three or six: no power of two, so the two bands differ
+    assert (tile.grid_block_n & (tile.grid_block_n - 1) == 0) if dense else tile.grid_block_n == columns, tile
+
+
+@lowers("sm80")
+def test_a_balanced_tail_of_two_by_two_warps_lowers_its_partials_for_an_a100():
+    """The 4B up projection's dense kernel gradient on an A100 at 128 x 128, one program a multiprocessor
+    (mma.sync's warps two by two, `MmaIssuer.specialized`; its tiles past the multiprocessors' walked by a
+    balanced tail, programs leaving fp32 partials in a workspace), compiled by Mosaic for a compile-only A100:
+    it lowers, each partial read in the accumulator's layout (`Family.fixed_up`), and spills no register (no
+    layout of the loaded partial satisfied the two-by-two accumulator's combine before)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    [(name, launch, args, options)] = [call for call in _gemm_forms(*GEMM_SHAPES["qwen3.5-4b up"])
+                                       if call[0] == "dense kernel gradient"]
+    with generation.assumed("sm80"):
+        ba = launch.bind(*args, **options)
+        tile = dataclasses.replace(launch.derived(ba, generation.gpu_target()), block_m=128, block_n=128,
+                                   stages=3, programs=1)
+        assert pricing.family_of(tile, jnp.bfloat16).specialized(128, 128).m_warps == 2
+        (record,) = compile_mosaic_kernels([KernelCase(name, lambda: launch.lowering(ba, tile))], "sm80")
+    assert not record.get("error"), record.get("error")
+    assert [kernel.get("spilled") for kernel in record["kernels"]] == [0]
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (64, 64), (32, 64)], ids=lambda shape: f"{shape[0]}x{shape[1]}")
+def test_an_mma_sync_stage_takes_its_copies_and_ldmatrix_reads_in_one_pass_a_phase(shape):
+    """A 16-bit step stage an A100's cp.async copies in and mma.sync's ldmatrix reads, at the swizzle it
+    stages at (`swizzling.copied_swizzle`): each copy phase (8 lanes, 16 bytes each, a row's consecutive
+    chunks) and each ldmatrix phase (8 lanes, a 16-byte chunk of 8 consecutive rows at one column, its
+    transposed read's too) passes shared memory's banks once, by the staging's address arithmetic
+    (`swizzling.staged_address`)."""
+    swizzle = swizzling.copied_swizzle(shape, jnp.bfloat16)
+    row_bytes = shape[1] * 2
+    for row in range(0, shape[0], 8):
+        for chunk in range(0, row_bytes, 16 * 8 if row_bytes >= 128 else row_bytes):
+            copies = [swizzling.staged_address(row + (chunk + 16 * lane) // row_bytes,
+                                               (chunk + 16 * lane) % row_bytes, row_bytes, swizzle)
+                      for lane in range(8)]
+            assert swizzling.wavefronts(copies, 16) == 1, (row, chunk, swizzle)
+        for column in range(0, row_bytes, 16):
+            reads = [swizzling.staged_address(row + lane, column, row_bytes, swizzle) for lane in range(8)]
+            assert swizzling.wavefronts(reads, 16) == 1, (row, column, swizzle)
+
+
+@pytest.mark.parametrize(("shape", "dtype"), [((128, 64), jnp.bfloat16), ((128, 192), jnp.bfloat16),
+                                              ((64, 64), jnp.float32), ((16, 8), jnp.bfloat16)])
+def test_an_mma_sync_output_tile_stages_where_its_accumulators_stores_pass_the_banks_once(shape, dtype):
+    """An mma.sync output tile's staging (`Mma.stored_swizzle`): each warp store of its accumulator
+    fragment (an 8-row slab by 8 columns, two elements a lane) passes shared memory's banks the fewest times
+    at the staging chosen, once a phase where a swizzle's row fits its columns, by the staging's own address
+    arithmetic (`swizzling.staged_address`); plain, a 64-column slab's rows share their banks (row 5271's
+    dense kernel gradient's bank conflicts)."""
+    from dew.nn.kernels.templates import mosaic_sm80
+
+    family = mosaic_sm80.Mma(jnp.dtype(dtype))
+    itemsize = jnp.dtype(dtype).itemsize
+    row_bytes = shape[1] * itemsize
+
+    def passes(swizzle: int) -> int:
+        addresses = [swizzling.staged_address(lane // 4, (2 * (lane % 4)) * itemsize, row_bytes, swizzle)
+                     for lane in range(32)]
+        return swizzling.wavefronts(addresses, 2 * itemsize)
+
+    chosen = family.stored_swizzle(shape, dtype)
+    phases = 32 * 2 * itemsize // (swizzling.BANKS * 4)
+    if row_bytes % swizzling.NARROWEST_SWIZZLE_BYTES == 0:
+        assert chosen != swizzling.UNSWIZZLED and passes(chosen) == phases
+    else:
+        assert chosen == swizzling.UNSWIZZLED
+    if row_bytes == 128:
+        assert passes(swizzling.UNSWIZZLED) > phases
+
+
+def test_a_walk_ranks_the_qkv_input_gradients_as_a_gh200_ran_them():
+    """Each arm of a decoder's q/k/v step on a GH200 (M-EM-70d: each projection apart on the template, their
+    kernels joined, or side by side, `beside`, its input gradient three products chained through their fp32
+    output), priced as the walk prices each launch (`pricing.split_walk`, its output's store at its outputs'
+    and read operands' bytes an element) at the template's 128 x 256 tile, the joined arm's copies at the
+    memory's rate: side by side cheaper than joined where it ran faster (1 x 2048 rows of the 4B's and 8B's
+    widths), dearer where it ran slower (4 x 3072 of the 8B's), as measured (0.613 against 0.744 ms, 0.545
+    against 0.608, 2.877 against 2.694). Priced at its walks alone, the 8B's side by side priced under
+    joined: its chain's fp32 hand-offs, written and read back, were no part of it."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    step = pricing.step_seconds(tile, target, (2, 2))
+
+    def launch(contraction: int, depth: int, width: int, stored: float) -> float:
+        walk = pricing.split_walk(tile, groups=1, rows=contraction, depth=depth, width=width,
+                                  itemsizes=(2, 2), stored=stored, multiprocessors=target.multiprocessors,
+                                  step_seconds=step,
+                                  bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
+        return walk.seconds(1) + target.launch_seconds
+
+    def arms(rows: int, hidden: int, widths: tuple[int, ...]) -> dict[str, float]:
+        total = sum(widths)
+        forward = launch(hidden, rows, total, 2)
+        grads = sum(launch(rows, hidden, width, 2) for width in widths)
+        # Side by side: the input gradient's products chained last first, each adding the last's fp32 sum.
+        chain = [launch(width, rows, hidden, 4 + 4 * bool(at) if at < len(widths) - 1 else 2 + 4)
+                 for at, width in enumerate(widths[::-1])]
+        copies = 2 * 2 * 2 * (hidden * total + rows * total) / target.memory_rate
+        return {"beside": forward + sum(chain) + grads,
+                "joined": forward + launch(total, rows, hidden, 2) + launch(rows, hidden, total, 2) + copies}
+
+    ran_faster = {(2048, 2560, (8192, 1024, 1024)): True, (2048, 4096, (4096, 1024, 1024)): True,
+                  (12288, 4096, (4096, 1024, 1024)): False}
+    for (rows, hidden, widths), beside_faster in ran_faster.items():
+        priced = arms(rows, hidden, widths)
+        assert (priced["beside"] < priced["joined"]) == beside_faster, (rows, hidden, priced)
+
+
+def test_a_walk_stores_each_output_and_reads_each_epilogue_operand_at_its_dtype():
+    """A decode step's 4096 x 4096 product on an H100 at the derived tile, as the launch prices its walk
+    (`MosaicGmm._contraction`, `pricing.walk_seconds`): its output stored at its dtype's bytes, a second
+    fp32 output's and an fp32 residual its epilogue reads adding theirs, each the walk's store of `rows` x
+    `width` elements at the memory's rate; and a kernel gradient split into fp32 partials stores its output
+    at the call's own bf16, half its fp32 partials' pass (`MosaicTgmm._walk`)."""
+    s = jax.ShapeDtypeStruct
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        launch = grouped_matmul.MosaicGmm()
+        rows, width = 16, 4096
+        tokens, kernel = s((rows, 4096), jnp.bfloat16), s((1, 4096, width), jnp.bfloat16)
+        sizes = s((1,), jnp.int32)
+        plain = launch.bind(tokens, kernel, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                            dense=True)
+        tile = launch.derived(plain, target)
+        residual = s((rows, width), jnp.float32)
+        added = launch.bind(tokens, kernel, sizes, (), (residual,), out_dtype="bfloat16", trans_rhs=False,
+                            interpret=False, dense=True,
+                            hooks=Hooks(epilogue=lambda acc, r: acc + r,
+                                        epilogue_axes=(("rows", "columns"),)))
+        two = launch.bind(tokens, kernel, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                          dense=True, hooks=Hooks(epilogue=lambda acc: (acc, acc),
+                                                  out_dtypes=("bfloat16", "float32")))
+        priced = {name: launch._contraction(ba, tile, target) for name, ba in
+                  (("plain", plain), ("added", added), ("two", two))}
+        assert [priced[name]["stored"] for name in ("plain", "added", "two")] == [2, 6, 6]
+        seconds = {name: pricing.walk_seconds(tile, contraction) for name, contraction in priced.items()}
+        assert seconds["plain"] < seconds["added"] == seconds["two"]
+
+        gradient = grouped_matmul.MosaicTgmm()
+        ba = gradient.bind(s((24576, 2560), jnp.bfloat16), s((24576, 1024), jnp.bfloat16), sizes,
+                           out_dtype="bfloat16", interpret=False, dense=True)
+        unsplit = gradient.derived(ba, target)
+        # The split's output stored as the unsplit call's (bf16), its fp32 partials' passes apart.
+        walks = {count: gradient._walk(ba, dataclasses.replace(unsplit, splits=count), target)
+                 for count in (1, 4)}
+        assert walks[4].stored == walks[1].stored
+        assert walks[4].stored * 2 == walks[4].passes
+

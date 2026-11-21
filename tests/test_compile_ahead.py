@@ -95,13 +95,15 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, 
                    tracker=tracker)
 
 
+@functools.cache
 def need_ahead(generation: str, *, split: int, remat: str, tiled: bool = False) -> int:
     """The bytes the fine-tuned step (`fine_tune`) compiled ahead for a compile-only GPU of `generation`
     needs at `split` microbatches and `remat`, its head tiled where asked: the headroom its compile left of
     a room past all (`gpus`' 64 GiB, which states exactly that allocator limit, `memory_limited_to`), taken
     from that room. A cell states its room from such needs, so the plan it claims of a room holds whatever
     the step's GEMM route or workspace makes them; XLA schedules a tighter room's compile for less, so a cell
-    states the least room its claim allows and reads its premise from the build's own probes too."""
+    states the least room its claim allows and reads its premise from the build's own probes too. Measured
+    once a process: the cells that read one need share it (`shared_setup("sm90_full_tiled_needs")`)."""
     from dew.training.ahead import compile_ahead
 
     room = 2**36
@@ -133,7 +135,7 @@ def need_run(root, generation: str, split: int) -> int:
     with pytest.raises(CompiledAhead):
         run.run()
     ahead = AheadOfTime.load(path)
-    return ahead.built.memory - record(ahead.plan, "plan")["probes"][0]["headroom"]
+    return ahead.capacity - record(ahead.plan, "plan")["probes"][0]["headroom"]
 
 
 def capacity_gib(room: int) -> str:
@@ -682,8 +684,9 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     (probe,) = listed(plan["probes"], "probes", read=record, what="probes")
     assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
     assert probe["argument"] == ahead.argument_bytes
-    # The plan was made against the allocator's limit the GPU's stated memory gives (`allocator_limit`).
-    assert ahead.capacity == ahead.built.memory == 2**30
+    # The plan was made against the allocator's limit the GPU's stated memory gives (`allocator_limit`); the
+    # build states what its programs need of it (`programs_need`).
+    assert ahead.capacity == 2**30 and 0 < ahead.built.memory <= ahead.capacity
     stated = device_memory(trainer.device_mesh.devices.flat[0], ahead.argument_bytes)
     assert stated["pool_bytes"] == ahead.capacity
     assert stated["largest_free_block_bytes"] == ahead.capacity - ahead.argument_bytes
@@ -691,9 +694,11 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert isinstance(seconds, float) and ahead.planned_seconds is not None
     assert ahead.planned_seconds >= seconds > 0
     # Its seconds by part, as the perf gate reports them (row 5339): the step was traced, passed through the
-    # algebra, lowered and compiled, and its compile is at least its probe's.
+    # algebra, lowered and compiled, and its compile is at least its probe's; the fresh state's start,
+    # compiled beside it, is a part of its own, none of the step's (row 6740).
     parts = ahead.planned_parts
-    assert all(parts[part] > 0 for part in ("traced", "algebra", "lowered")) and parts["compiled"] >= seconds
+    assert all(parts[part] > 0 for part in ("traced", "algebra", "lowered", "start"))
+    assert parts["compiled"] >= seconds
     destination = tmp_path / "planned.dew-aot"
     ahead.save(destination)
     saved = AheadOfTime.load(destination)
@@ -931,6 +936,7 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     assert trainer.plan == ahead.plan and recompute_record(trainer.objective) == plan["remat"]
 
 
+@pytest.mark.shared_setup("sm90_full_tiled_needs")
 @pytest.mark.parametrize("several", [False, True], ids=["one microbatch", "several"])
 def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_fit(tmp_path, monkeypatch,
                                                                                     several):
@@ -977,6 +983,7 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
                                                                              plan["head_fused"])
 
 
+@pytest.mark.shared_setup("sm90_full_tiled_needs")
 def test_a_fused_tiled_heads_plan_compiled_ahead_with_its_frontier_restores_the_admitted_plan(tmp_path,
                                                                                               monkeypatch):
     """A fused tiled head's plan compiled ahead with its frontier (`FitSearch.above`, which moves the
@@ -1102,6 +1109,28 @@ def test_a_configured_run_compiling_ahead_for_gpus_of_no_stated_memory_is_refuse
     assert stated_limit(gpus("sm80", limit=2**34)) == 2**34
 
 
+def test_a_step_built_for_a_whole_gpu_loads_where_its_programs_fit_and_is_refused_naming_their_need(
+        tmp_path, monkeypatch):
+    """A step compiled ahead for a GPU of 64 GiB states what its programs need of a device
+    (`programs_need`): a GPU whose allocator holds that much takes it, however much less than the room its
+    plan was made in (the GPU tier's part, its pool sized by its tests' peaks, refused a tiny step built for
+    80 GiB, rows 8094 and 8371), and one holding a byte less is refused, naming the need."""
+    import dataclasses
+
+    from dew.training.ahead import BuildTarget, compile_ahead
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    ahead = compile_ahead(fine_tune(MeshSpec().build(gpus("sm90", limit=2**36))), token_rows(VOCAB, BATCH,
+                                                                                         SEQ_LEN + 1))
+    need = ahead.built.memory
+    assert need is not None and need < 2**30
+    assert not ahead.built.differences(BuildTarget.of(gpus("sm90", limit=2**30)))
+    held = BuildTarget.of(gpus("sm90"))
+    assert not ahead.built.differences(dataclasses.replace(held, memory=need))
+    refused = ahead.built.differences(dataclasses.replace(held, memory=need - 1))
+    assert refused == [f"memory {need} bytes, not {need - 1}"], refused
+
+
 def test_a_build_of_compile_only_gpus_holds_their_stated_memory_and_refuses_a_device_holding_less():
     """A build of compile-only GPUs (`BuildTarget.of`) holds the allocator's limit their stated memory gives
     (`device_memory`), as a build of attached GPUs holds theirs: a device of a lower limit is refused naming
@@ -1146,8 +1175,11 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     its window's gradient sum, needs room for that sum once: the stated pool holds the step's arguments,
     the sum among them, and beside them the outputs that alias none, the temporaries and the batches
     prefetched next to the step (the 2113 review: the sum was counted among the arguments and again
-    beside them, so an offline plan could refuse a step that fits)."""
+    beside them, so an offline plan could refuse a step that fits). The pool charges what the first call
+    builds by allocation, each shard rounded up (`allocated_bytes`), past what its arguments count; the
+    same step run here builds the same buffers."""
     from dew.distributed.batches import batch_shardings, prefetched_bytes
+    from dew.distributed.placement import allocated_bytes, placed_bytes
     from dew.training.ahead import compile_ahead, step_batch
     from dew.training.memory import temporaries_factor
 
@@ -1160,9 +1192,11 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     batch = step_batch(trainer, rows)
     prefetched = prefetched_bytes(batch, batch_shardings(trainer.device_mesh, batch))
     temporaries = ahead.temp_bytes * temporaries_factor(trainer.device_mesh)
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), split=2).fit(rows, steps=1)
+    built = [part for part in (run.compute, run.window) if part is not None]
     assert probe["fits"] is True
     assert probe["headroom"] == (capacity - ahead.argument_bytes - (ahead.output_bytes - ahead.alias_bytes)
-                                 - prefetched - temporaries)
+                                 - prefetched - temporaries - (allocated_bytes(built) - placed_bytes(built)))
 
 
 @pytest.mark.mesh(devices=8)
@@ -1446,7 +1480,26 @@ def test_programs_saved_before_executables_were_one_type_are_refused_to_compile_
 
     target = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64")
     path = tmp_path / "old.dew-aot"
-    path.write_bytes(pickle.dumps(AheadPrograms(target, {"step": ("program", b"executable", ())})))
+    path.write_bytes(pickle.dumps(AheadPrograms(target, {"step": ("program", b"executable", ())}, tuned=True,
+                                                at_run=())))
+    with pytest.raises(ValueError):
+        AheadPrograms.load(path)
+
+
+def test_programs_saved_before_their_files_said_how_they_were_tuned_are_refused(tmp_path):
+    """A file of programs saved before it said whether XLA tuned them and which leave a choice to run time
+    (`AheadPrograms.tuned`, `at_run`) is refused as it loads, asking for them compiled again, where the class
+    default took it as tuned (row 8459)."""
+    import pickle
+
+    from dew.training.ahead import AheadPrograms, BuildTarget
+
+    old = object.__new__(AheadPrograms)
+    for field, value in (("target", BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64")), ("programs", {}),
+                         ("kept", None)):
+        object.__setattr__(old, field, value)
+    path = tmp_path / "old.dew-aot"
+    path.write_bytes(pickle.dumps(old))
     with pytest.raises(ValueError):
         AheadPrograms.load(path)
 
@@ -1597,8 +1650,12 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     again = compiled("--trainer.compile-ahead.multiprocessors", "114")
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
-    assert pcie.built.memory == pcie.target.memory == allocator_limit(int(float(capacity_gib(room)) * 2**30))
-    assert pcie.sampled is not None and again.built == pcie.built
+    assert pcie.target.memory == allocator_limit(int(float(capacity_gib(room)) * 2**30))
+    assert 0 < pcie.built.memory <= pcie.target.memory
+    # One target, its need the programs each carries: the inspected build's sampled step beside its step.
+    assert pcie.sampled is not None
+    assert again.built == dataclasses.replace(pcie.built, memory=again.built.memory)
+    assert again.built.memory <= pcie.built.memory
     assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
     held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
     assert pcie.derived_for(held) == pcie.target
@@ -1968,7 +2025,8 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     setting the autotuner's level 0, as a repeatable lane's do), its products then the run's own, unless
     it leaves a convolution's algorithm to run time (`at_run`). A step of this host's own target stands for
     the GPU host's here: a CPU is no target a step compiles ahead for."""
-    from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead
+    from dew._cache import uncached
+    from dew.training.ahead import AheadOfTime, BuildTarget, Executable, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     compile_ahead(fine_tune(MeshSpec().build(gpus("sm90"))), batch).save(tmp_path / "step.dew-aot")
@@ -1984,15 +2042,28 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     assert len([entry for entry in caplog.records if entry.name == "dew.training.ahead"]) == 1
     tuned = dataclasses.replace(own, plan={**record(own.plan, "plan"), "autotuned": True})
     assert tuned.tuned and tuned.runnable(here) is tuned
+    # Loaded direct, as a tool or a caller of `taken` loads it, the untuned step is refused alike and the
+    # tuned one loads (row 8986): a step this host loads as it is, over its every device.
+    every = jax.devices()
+    replicated = jax.sharding.NamedSharding(jax.sharding.Mesh(np.asarray(every), ("devices",)),
+                                            jax.sharding.PartitionSpec())
+    with uncached():
+        doubled = jax.jit(lambda x: x * 2.0, out_shardings=replicated).lower(
+            jax.ShapeDtypeStruct((4,), jnp.float32, sharding=replicated)).compile()
+    loads = dataclasses.replace(own, built=BuildTarget.of(every), executable=Executable.of(doubled))
+    with pytest.raises(ValueError):
+        loads.loaded()
+    assert dataclasses.replace(loads, plan=tuned.plan).loaded() is not None
     # Built under the flags it runs under: XLA's flags are part of a step's target (`BuildTarget.flags`).
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
     level_zero = dataclasses.replace(handed, built=BuildTarget.of(here))
     assert level_zero.runnable(here) is level_zero
     # One leaving a convolution's algorithm to run time is never taken: the run's own compile picks it.
-    at_run = dataclasses.replace(level_zero, plan={**record(level_zero.plan, "plan"), "at_run_time": True})
+    at_run = dataclasses.replace(level_zero, at_run=True)
     assert at_run.runnable(here) is None
     with pytest.raises(ValueError):
         own.runnable(here)
+
 
 
 def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
@@ -2220,47 +2291,15 @@ def test_programs_compiled_ahead_for_a_generation_are_untuned_and_refused_where_
     assert not built.tuned
     here = jax.devices()[:1]
     with pytest.raises(ValueError):
-        AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded()
-    assert AheadPrograms(BuildTarget.of(here), {}, tuned=True).loaded() == {}
+        AheadPrograms(BuildTarget.of(here), {}, tuned=False, at_run=()).loaded()
+    assert AheadPrograms(BuildTarget.of(here), {}, tuned=True, at_run=()).loaded() == {}
     serialized = tmp_path / "topology.bin"
     serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm90", 1))).serialize())
     with pytest.raises(ValueError):
         compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm90", topology=serialized)
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
-    assert AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded() == {}
+    assert AheadPrograms(BuildTarget.of(here), {}, tuned=False, at_run=()).loaded() == {}
 
-
-def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path, monkeypatch):
-    """A compile without a device cannot pick a cuDNN convolution's algorithm, which is then picked at run
-    time, on an A100 not the same each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941): over a node's
-    topology, autotuner off as a repeatable lane runs, and over the generation's canonical GPUs alike, a
-    program holding a convolution is refused before any compiles (`report.CompiledOnDevice`), named, where a
-    product alone compiles."""
-    from jax.experimental import topologies
-
-    from dew.nn.kernels.generation import compile_only_gpus
-    from dew.nn.kernels.templates import report
-    from dew.training.ahead import compile_programs
-
-    serialized = tmp_path / "topology.bin"
-    serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
-    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
-    image = jax.ShapeDtypeStruct((1, 8, 8, 4), jnp.float32)
-    kernel = jax.ShapeDtypeStruct((3, 3, 4, 4), jnp.float32)
-    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
-
-    def convolved(x, w):
-        return jax.lax.conv_general_dilated(x, w, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"))
-
-    with pytest.raises(report.CompiledOnDevice) as refused:
-        compile_programs({"conv": (convolved, [image, kernel])}, "sm80", topology=serialized)
-    assert refused.value.programs == ("conv",)
-    assert list(compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm80",
-                                 topology=serialized).programs) == ["dot"]
-    with pytest.raises(report.CompiledOnDevice) as refused:
-        compile_programs({"conv": (convolved, [image, kernel]),
-                          "dot": (lambda x, y: x @ y, [square, square])}, "sm80")
-    assert refused.value.programs == ("conv",)
 
 def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
     """A device's own target, what a program compiled ahead is checked against, is the one `gpu_target`
@@ -2425,7 +2464,8 @@ def test_programs_built_for_the_host_cpu_load_onto_it_whatever_the_process_lists
     with uncached():
         doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
             jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
-    programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)})
+    programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)}, tuned=True,
+                             at_run=())
     listed = jax.devices
     # A process listing another device first, the host's first CPU among its CPUs.
     monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])

@@ -138,7 +138,7 @@ def smoke(wheel: Path, lowest: bool) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wheel", type=Path)
     wheel = parser.parse_args().wheel.resolve()
     for lowest in (False, True):

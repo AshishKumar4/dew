@@ -214,7 +214,10 @@ class Interval:
     their FLOPs. `model_counted` and `tokens_counted` say whether a step
     since the last log reported its analytical work and real tokens.
     `rollout_seconds` is the time spent sampling, logged under
-    train/rollout_seconds when a rollout is set. `waited` is the time the
+    train/rollout_seconds when a rollout is set, and `rollout_copied` the bytes its
+    rollouts copied of the run's host-held weights onto a device (`rollout.on_devices`), logged
+    under train/rollout_copied_gib where they copied any (a run whose devices hold its weights copies
+    none). `waited` is the time the
     loop spent waiting on its next batch and `compiling` the time it spent
     compiling the step for a shape it had not met, both in seconds, since
     the last log. `compiles` counts StepCompiled records over the whole fit,
@@ -239,6 +242,7 @@ class Interval:
     model_counted: bool = False
     tokens_counted: bool = False
     rollout_seconds: float = 0.0
+    rollout_copied: int = 0
     kept_paths: tuple[str, ...] = ()
     """The leaves of the run's kept state (`dew.training.transaction.checked`) by their paths, in their
     order, by which a stop names one not finite (`checked_finite`)."""
@@ -424,6 +428,7 @@ class Interval:
                 self.logged_tokens, book.tokens)
         self.since_log, self.samples, self.computed = 0, 0, 0
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
+        self.rollout_copied = 0
         self.model_counted = self.tokens_counted = False
         self.inspected = None
         if book is not None and self.fresh is not None:
@@ -655,6 +660,8 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
         scalars["train/loss_scale"] = float(read.scale)
     if rollout:
         scalars["train/rollout_seconds"] = counts.rollout_seconds
+        if counts.rollout_copied:
+            scalars["train/rollout_copied_gib"] = counts.rollout_copied / 2 ** 30
         scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
     if read.inspected is not None and int(read.inspected[0]):
         scalars.update(logged(read.inspected[1]))
@@ -671,12 +678,14 @@ class LogWriter:
     point every process reaches alike (`raise_failure`), where it agrees on it, never on these threads."""
 
     def __init__(self) -> None:
-        self._reads: queue.SimpleQueue[tuple[Callable[[], Any], Callable[[Any], None], Future] | None]
+        self._reads: queue.SimpleQueue[tuple[Callable[[], Any], Callable[[Any], None], Future, Future] | None]
         self._reads = queue.SimpleQueue()
         self._reports: queue.SimpleQueue[tuple[Any, Callable[[Any], None], Future] | None]
         self._reports = queue.SimpleQueue()
         self._threads: tuple[threading.Thread, ...] = ()
         self._writes: collections.deque[tuple[Future, Callable[[], bool]]] = collections.deque()
+        # Each read's verdict on its steps' finiteness, delivered apart from its report (row 9022).
+        self._verdicts: collections.deque[tuple[Future, Callable[[], bool]]] = collections.deque()
         self.unchecked = 0
         """Writes handed over since the loop last waited on every one: alike on every process."""
         self.since: float | None = None
@@ -690,18 +699,24 @@ class LogWriter:
                              threading.Thread(target=self._report, name="dew-log-reporter", daemon=True))
             for thread in self._threads:
                 thread.start()
-        written: Future = Future()
-        self._reads.put((read, report, written))
+        written, verdict = Future(), Future()
+        self._reads.put((read, report, written, verdict))
         self._writes.append((written, ready))
+        self._verdicts.append((verdict, ready))
         self.unchecked += 1
 
     def _read(self) -> None:
         while (handed := self._reads.get()) is not None:
-            read, report, written = handed
+            read, report, written, verdict = handed
             try:
-                self._reports.put((read(), report, written))
+                value = read()
             except BaseException as error:
-                written.set_exception(error)
+                # Raised once, through its verdict, which every path settles first (`raise_failure`).
+                verdict.set_exception(error)
+                written.set_result(None)
+                continue
+            verdict.set_result(None)
+            self._reports.put((value, report, written))
         self._reports.put(None)
 
     def _report(self) -> None:
@@ -715,12 +730,24 @@ class LogWriter:
     def raise_failure(self, *, wait: bool, ready_only: bool = False) -> None:
         """Raise the first failed write's error among those done, or, where `wait`, among every write,
         waiting for each; `ready_only` waits only for writes that wait on no device (a failed run's
-        cleanup, whose devices or peers may never finish a step)."""
-        while self._writes and (self._writes[0][0].done() or (wait and (
-                not ready_only or self._writes[0][1]()))):
-            self._writes.popleft()[0].result()
+        cleanup, whose devices or peers may never finish a step). The reads' verdicts on their steps'
+        finiteness first, apart from their reports, which a slow tracker holds (row 9022: a verdict known
+        sat behind an older report while the loop stepped on): each read's but the newest waited on at
+        every tick, so no step passes more than one interval unchecked."""
+        self._settled(self._verdicts, wait=wait, ready_only=ready_only, keep=1)
+        self._settled(self._writes, wait=wait, ready_only=ready_only)
         if wait:
             self.unchecked = 0
+
+    @staticmethod
+    def _settled(pending: collections.deque[tuple[Future, Callable[[], bool]]], *, wait: bool,
+                 ready_only: bool, keep: int | None = None) -> None:
+        """Raise the first failure among `pending`'s done futures, in order, and drop them: waiting for every
+        one where `wait`, else for each but the newest `keep` where it states that many, only for one that
+        waits on no device where `ready_only`."""
+        while pending and (pending[0][0].done() or ((wait or (keep is not None and len(pending) > keep))
+                                                    and (not ready_only or pending[0][1]()))):
+            pending.popleft()[0].result()
 
     def close(self) -> None:
         """Stop the threads once they have written what they hold, and wait for them: a thread still in

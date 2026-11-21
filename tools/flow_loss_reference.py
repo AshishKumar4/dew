@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_loss_weighting_for_sd3
 from reference_source import fetched, selected, simple_statements
 
@@ -78,7 +78,9 @@ def published_loss(statements: tuple[str, str], weights, pixels, noise, sigmas, 
                                        scope["sigmas"].flatten() * 1000)
         exec(loss_lines, scope)
         scope["loss"].backward()
-    return {"loss": scope["loss"].detach().numpy(), "gradient": parameters.grad.numpy()}
+    if (gradient := parameters.grad) is None:
+        raise RuntimeError("the backward pass left the parameters without their gradient")
+    return {"loss": scope["loss"].detach().numpy(), "gradient": gradient.numpy()}
 
 
 def main() -> None:
@@ -92,7 +94,7 @@ def main() -> None:
              loss_lines=np.asarray(loss_lines),
              # The scheduler's grid before its static shift, and after it.
              grid=np.linspace(1, 1000, 1000, dtype=np.float32)[::-1] / 1000,
-             grid_shifted_3=scheduler.sigmas.numpy())
+             grid_shifted_3=np.asarray(scheduler.sigmas))
     print(FIXTURE)
 
 if __name__ == "__main__":

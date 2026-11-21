@@ -6,6 +6,7 @@ their logits over check 1's seeds. A family's own checks stay in its own file.""
 
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -42,7 +43,24 @@ def load(name: str) -> Pretrained:
     return Pretrained.load(ROOT / name, dtype='float32', attention_impl='reference', **FIXTURES[name])
 
 
-@pytest.mark.parametrize('name', sorted(FIXTURES))
+CHECK1_SHARDS = {
+    "test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_reference[qwen4-exp-tiny]":
+        {"seeds": 8, "per_task": 8},
+}
+"""The cells whose check-1 seeds run as map tasks (`check1_shards`), by node id, a literal the CI plan reads
+as it reads a mark's (tools/armada/ci.py): Qwen4-Exp's logits leave its first eight seeds undecided on every
+host and draw its second stage's 32, 69 s alone cold, 31 s of it compiling (armada at c27860888, 4 of 4
+runs), where CI ran the cell 130 s (row 7820): each stage's seeds a task of 8."""
+
+
+def fixtures() -> list:
+    """Each fixture a cell, marked where `CHECK1_SHARDS` names its node."""
+    test = "test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_reference"
+    return [pytest.param(name, id=name, marks=[pytest.mark.check1_shards(**held)] if (
+        held := CHECK1_SHARDS.get(f"{test}[{name}]")) else []) for name in sorted(FIXTURES)]
+
+
+@pytest.mark.parametrize('name', fixtures())
 def test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_reference(name):
     """Left-padded rows under their mask and the unpadded rows, each on par with the reference from
     float64 over drawn ids (check 1), with the reference's argmax, and four ids continued six tokens
@@ -85,10 +103,13 @@ def test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_refere
             return {'padded_logits': padded[valid], 'logits': model(ids, use_cache=False).logits}
 
         reference, truth = transformers_arms(transformers_model(directory), read)
-        assert_as_exact(ours, reference, draw, f'{name} logits', seeds=SEEDS, truth_fn=truth)
+        # The ids as JAX arrays, so the gate traces Dew's arm alone: a draw holding NumPy arrays runs each arm
+        # once eagerly (`arm_forms._refuse_numpy_arms`), 953 programs and 19 s of a cold run (row 7820).
+        assert_as_exact(ours, reference, lambda seed: tuple(map(jnp.asarray, draw(seed))), f'{name} logits',
+                        seeds=SEEDS, truth_fn=truth)
         (ids,) = draw(0)
         expected = reference(ids)
-    for rows, actual in ours(jnp.asarray(ids)).items():
+    for rows, actual in jax.jit(ours)(jnp.asarray(ids)).items():
         np.testing.assert_array_equal(np.asarray(actual).argmax(-1), expected[rows].argmax(-1))
 
     ids = np.load(directory / 'input_ids.npy')

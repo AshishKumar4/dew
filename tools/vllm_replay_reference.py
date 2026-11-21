@@ -18,6 +18,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "vllm"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / "tests/fixtures/hf/qwen3-moe-vllm"
 NEW_TOKENS = 10
@@ -64,9 +68,11 @@ def generated(prompts: np.ndarray, seed: int) -> dict[str, np.ndarray]:
     sampled, behavior, support, routed = [], [], [], []
     for request in requests:
         output = request.outputs[0]
+        # Both asked of every request (logprobs and the sampling mask), so both held.
+        assert output.logprobs is not None and output.sampling_mask is not None
         ids = list(output.token_ids)
         sampled.append(ids)
-        behavior.append([entry[token].logprob for entry, token in zip(output.logprobs, ids, strict=True)])
+        behavior.append([logprob_of(entry, token) for entry, token in zip(output.logprobs, ids, strict=True)])
         kept = [list(map(int, row)) for row in output.sampling_mask.token_ids]
         support.append([row + [-1] * (top_k - len(row)) for row in kept])
         routed.append(np.asarray(output.routed_experts))
@@ -104,6 +110,12 @@ def scored(model, prompts: np.ndarray, replay: dict[str, np.ndarray]) -> np.ndar
             scores.append(line[kept.index(int(token))] - torch.logsumexp(line, 0))
         rows.append(torch.stack(scores))
     return torch.stack(rows).numpy()
+
+
+def logprob_of(entry, token: int) -> float:
+    """The log-probability `entry`, a position's logprobs, gives `token`, which every position asked holds."""
+    assert entry is not None
+    return entry[token].logprob
 
 
 def _forced(gate, indices):

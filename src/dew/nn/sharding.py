@@ -49,6 +49,8 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 from flax.typing import Initializer
+from jax._src import config as jax_config, core as jax_core
+from jax.core import ShapedArray
 
 from dew import _cache
 from dew.batch import FROZEN
@@ -543,18 +545,28 @@ def shard_shapes(operands: Sequence[jax.Array], specs) -> tuple[jax.ShapeDtypeSt
 
 def on_shards(local: Callable, spec: jax.sharding.PartitionSpec, operands: Sequence[jax.Array | None],
               whole: Collection[int] = (), out_specs=None, gathered: Mapping[int, jax.sharding.PartitionSpec]
-              = types.MappingProxyType({})):
+              = types.MappingProxyType({}), heads: Mapping[int, int] = types.MappingProxyType({}),
+              split: MeshAxes = None):
     """`local(*operands)` on each shard (`manual_map`), each operand placed by its role: as `spec` along its
     leading dimensions (a token mask `[B, S]` beside activations `[B, S, D]`), whole on every shard where
     its index is in `whole` (a weight or a conv's taps, whose gradient the transpose sums over the
     shards), where its parameter is placed (`gathered`, by index: a projection's weight where its layout
     puts it, `dew.distributed.placement.Layout.leaf_spec`) and gathered whole in the map, so its gradient
     leaves it summed over the shards and scattered back to that placement (the gather's transpose, a
-    reduce-scatter), or absent (None); the outputs placed as `out_specs`, `spec` unless given (row 1923: one
-    builder of a kernel's per-shard specs from its operands' roles)."""
-    specs = tuple(None if operand is None else gathered[index] if index in gathered
-                  else jax.sharding.PartitionSpec() if index in whole
-                  else jax.sharding.PartitionSpec(*spec[:operand.ndim])
+    reduce-scatter), or absent (None); and split over `split` along the dimension `heads` names by index
+    besides (a mixer's heads, a token's at 2 and a channel weight's at 0, `sequence_heads`); the outputs
+    placed as `out_specs`, `spec` unless given (row 1923: one builder of a kernel's per-shard specs from its
+    operands' roles)."""
+    def placed(index: int, operand: jax.Array) -> jax.sharding.PartitionSpec:
+        if index in gathered:
+            return gathered[index]
+        entries = [] if index in whole else list(spec[:operand.ndim])
+        if index in heads:
+            entries += [None] * (heads[index] + 1 - len(entries))
+            entries[heads[index]] = split
+        return jax.sharding.PartitionSpec(*entries)
+
+    specs = tuple(None if operand is None else placed(index, operand)
                   for index, operand in enumerate(operands))
 
     def held(*operands):
@@ -574,15 +586,36 @@ def _gathered_whole(operand: jax.Array, spec: jax.sharding.PartitionSpec) -> jax
 
 def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:
     """The mesh axes the rule table splits a `[B, T, H, ...]` activation's rows and heads over
-    (`HEADS`), its heads whole where their split does not divide the `groups` they read (a delta
-    rule's key heads, Mamba-2's B and C), so no group's gradient is summed across shards: a
+    (`HEADS`), its heads whole where their split does not divide the `groups` they read (`_dividing`): a
     per-shard kernel's placement (`manual_map`)."""
     spec = logical_spec(HEADS, shape)
     rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
+    return rows, _dividing(heads, groups)
+
+
+def sequence_heads(batch: int, length: int, heads: int, groups: int) -> tuple[MeshAxes, MeshAxes, MeshAxes]:
+    """The mesh axes a split over the sequence (`dew.nn.linear.over_sequence`) places a `[B, S, H, ...]`
+    activation's rows, sequence and heads over: the rows and the sequence as the rule table places a
+    `[batch, length, ...]` activation, the heads by their rule read with the axes those and a pipeline
+    stage's vmap hold set aside (a rule naming them takes what it has left, or its next where none), whole
+    where their split does not divide the `groups` they read (`_dividing`). The one statement of it for
+    every recurrent mixer's split: where a tensor axis held every head whole, each of its devices ran the
+    whole mixer's conv and scan (row 1437, train 1108's F1)."""
+    rows, sequence = logical_spec(("activation_batch", "activation_length"), (batch, length))
+    taken = {*mesh_axes(rows), *mesh_axes(sequence), *((STAGE_AXIS,) if in_pipeline_stage() else ())}
+    left = tuple((name, None if assignment is None else tuple(axis for axis in mesh_axes(assignment)
+                                                              if axis not in taken))
+                 for name, assignment in axis_rules())
+    split = mesh_axes((*logical_spec(("activation_heads",), (heads,), rules=left), None)[0])
+    return rows, sequence, _dividing(split or None, groups)
+
+
+def _dividing(heads: MeshAxes, groups: int) -> MeshAxes:
+    """`heads`, the mesh axes splitting a call's heads, where their split divides the `groups` its heads read
+    (a delta rule's key heads, Mamba-2's B and C), else None (the heads whole), so no group's gradient is
+    summed across shards."""
     mesh = jax.sharding.get_abstract_mesh()
-    if groups % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
-        heads = None
-    return rows, heads
+    return None if groups % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)) else heads
 
 
 def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
@@ -634,14 +667,25 @@ def auto_part(spec: jax.sharding.PartitionSpec,
                                         else axes[0] if len(axes) == 1 else axes or None for axes in kept))
 
 
+def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:
+    """Where the type `aval` (`jax.typeof`'s) places its value where its mesh has an Explicit axis, None
+    otherwise. A value no Explicit axis splits on such a mesh (a replicated one) still has its placement:
+    the one lookup of an Explicit placement, which `explicit_spec` narrows to a split, a reshard restores
+    (`dew.nn.aligned`), a product infers from its operands (`dew.nn.kernels.xla_products`) and a trainer
+    types its batch by (row 8838)."""
+    sharding = aval.sharding
+    explicit = isinstance(sharding, jax.sharding.NamedSharding) and sharding.mesh.explicit_axes
+    return sharding if explicit else None
+
+
 def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding | None:
     """Where `x`'s type places it, over its dimensions and `trailing` more
     left whole, when an Explicit axis splits it (`MeshSpec.explicit`); None
     otherwise. An operation JAX cannot place from its operands' types (a
     gather, a scatter, a reshape that splits a split dimension, a repeat)
     takes it as its `out_sharding`; None leaves the operation as it was."""
-    sharding = jax.typeof(x).sharding
-    if not isinstance(sharding, jax.sharding.NamedSharding):
+    sharding = explicit_placement(jax.typeof(x))
+    if sharding is None:
         return None
     explicit = set(sharding.mesh.explicit_axes)
     spec = tuple(sharding.spec)
@@ -688,14 +732,34 @@ def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
     return x if placed is None else jax.sharding.reshard(x, placed)
 
 
+def varying(*operands) -> frozenset[str]:
+    """The manual axes (a checked `shard_map`'s) any array among `operands` (trees; None for none) varies
+    over: what a value computed from them varies over, as JAX types an operation's result."""
+    return frozenset().union(*(jax.typeof(leaf).mat.varying for leaf in jax.tree.leaves(operands)))
+
+
 def varying_like(x: jax.Array, *operands) -> jax.Array:
-    """`x` varying over every manual axis (a checked `shard_map`'s) any of `operands` varies over (None for
-    none): a scan's carry seeded so keeps its type through steps that read them, as a step's output varies
-    wherever an input does."""
-    axes = frozenset().union(*(jax.typeof(operand).mat.varying for operand in operands
-                               if operand is not None))
-    missing = tuple(sorted(axes - jax.typeof(x).mat.varying))
+    """`x` varying over every manual axis any of `operands` varies over (`varying`): a scan's carry seeded
+    so keeps its type through steps that read them, as a step's output varies wherever an input does."""
+    missing = tuple(sorted(varying(*operands) - jax.typeof(x).mat.varying))
     return jax.lax.pcast(x, missing, to="varying") if missing else x
+
+
+def checked() -> bool:
+    """Whether a value traced here is typed by the manual axes it varies over: inside a `shard_map` that
+    checks them (`check_vma`)."""
+    return jax_config._check_vma.value and bool(jax.sharding.get_abstract_mesh().manual_axes)
+
+
+def computed_from(struct: jax.ShapeDtypeStruct, *operands) -> jax.ShapeDtypeStruct:
+    """`struct` typed as a value each device computes from its own `operands` is where values are typed
+    by their manual axes (`checked`): varying over every one any of them varies over (`varying`), unless it
+    states its own (`manual_axis_type`); `struct` itself elsewhere. A launch's results (row 9808: a
+    kernel's result typed the same on every device, beside a bias each device reads its own of)."""
+    if not checked() or struct.manual_axis_type is not None:
+        return struct
+    return jax.ShapeDtypeStruct(struct.shape, struct.dtype, sharding=jax_core.get_cur_mesh_sharding(),
+                                manual_axis_type=jax.sharding.ManualAxisType(varying=varying(*operands)))
 
 
 def automatic_axes() -> tuple[str, ...]:
@@ -706,14 +770,6 @@ def automatic_axes() -> tuple[str, ...]:
     return tuple(name for name in mesh.axis_names if mesh.shape[name] > 1 and name not in mesh.manual_axes)
 
 
-def seen_whole(value: jax.Array) -> bool:
-    """Whether a Pallas kernel, which sees local arrays and carries no
-    manual-axis type, can take `value` where it is traced: no mesh axis
-    outside a `shard_map` splits it (`automatic_axes`), and no `shard_map`
-    that checks varying axes holds it."""
-    return not automatic_axes() and not jax.typeof(value).mat.varying
-
-
 def per_shard(kernel: str) -> None:
     """Raise unless the kernel named `kernel` launches per shard: every
     axis of the context's mesh larger than one device manual (`manual_map`,
@@ -722,7 +778,8 @@ def per_shard(kernel: str) -> None:
     reads them whole, and every device runs the whole batch (row 1923; the
     gated delta net's template, 1897). The kernels' launch points call it as
     they trace (`templates.mosaic.Family.kernel`, the TPU and Triton GEMM
-    launches); a selector refuses such a call first (`seen_whole`)."""
+    launches); a selector refuses such a call first (its `whole`, no
+    `automatic_axes`)."""
     if axes := automatic_axes():
         raise ValueError(f"{kernel} launches with the mesh's {', '.join(axes)} automatic: a kernel reads its "
                          f"operands whole, so it launches only where every axis larger than one device is "

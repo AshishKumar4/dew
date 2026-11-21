@@ -23,7 +23,7 @@ import json
 import math
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -249,6 +249,8 @@ class _StableTopK(TorchFunctionMode):
 _INDEXERS = {
     'glm5_next_text': ('transformers.models.glm5_next.modeling_glm5_next', 'Glm5NextTextIndexer'),
     'deepseek_v4': ('transformers.models.deepseek_v4.modeling_deepseek_v4', 'DeepseekV4Indexer'),
+    'glm_moe_dsa': ('transformers.models.glm_moe_dsa.modeling_glm_moe_dsa', 'GlmMoeDsaIndexer'),
+    'deepseek_v32': ('transformers.models.deepseek_v32.modeling_deepseek_v32', 'DeepseekV32Indexer'),
 }
 
 
@@ -269,11 +271,13 @@ def lower_index_ties(model, block: torch.nn.Module | None = None,
             yield
             return
         from importlib import import_module
-        classes = getattr(import_module(named[0]), named[1])
+        kinds = getattr(import_module(named[0]), named[1])
+    else:
+        kinds = classes
     target = model if block is None else block
-    held = [(m, m.forward) for m in target.modules() if isinstance(m, classes)]
+    held = [(m, m.forward) for m in target.modules() if isinstance(m, kinds)]
     if not held:
-        raise ValueError(f'the reference has no {classes}')
+        raise ValueError(f'the reference has no {kinds}')
 
     def stable(original):
         def forward(*args, **kwargs):
@@ -428,7 +432,11 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
         else:
             prepared[name] = value
     for target, converter in pending.items():
-        prepared.update(converter.convert(target, config=model.config))
+        # Each target's one tensor, which transformers' conversion base types as a list of them.
+        for key, value in converter.convert(target, config=model.config).items():
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{target}'s conversion gave {type(value).__name__} for {key}, not a tensor")
+            prepared[key] = value
     depth.load_state_dict(prepared, strict=True)
     tokens = torch.from_numpy(np.asarray(ids, np.int64))
     with torch.no_grad(), lower_index_ties(model), lower_index_ties(model, depth):
@@ -513,9 +521,9 @@ def _bare(name: str) -> str:
         parts.pop(0)
     return '.'.join(parts)
 
-def _indexed(named):
+def _indexed[V](named: Iterable[tuple[str, V]]) -> dict[str, tuple[str, V]]:
     """`named` by bare name, refusing two that share one."""
-    held: dict[str, tuple[str, object]] = {}
+    held: dict[str, tuple[str, V]] = {}
     for name, value in named:
         key = _bare(name)
         if key in held:

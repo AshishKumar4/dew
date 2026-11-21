@@ -745,6 +745,12 @@ def _random(stage: Stage) -> bool:
     return isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random)
 
 
+def draws(pipeline: Pipeline) -> bool:
+    """Whether a pass of `pipeline` draws from its records' rngs: a random step anywhere in its tree, a
+    mixed chain's or a configured one's (`_random`)."""
+    return any(_random(stage) for stage in _steps(pipeline))
+
+
 def _external(stage: Stage) -> bool:
     """Whether `stage` reads storage its record names by path (a step that says it is `External`), which
     the record's content does not key, so no automatic cache stands for it."""
@@ -763,8 +769,36 @@ def _volatile(stage: Stage) -> bool:
 
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
-    the rows before it, one for one."""
-    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native, Batched)) or rejects(stage)
+    the rows before it, one for one: a batched step that keeps its rows' count (`Batched.same_rows`) is
+    none, its groups formed in the order's own consecutive records (rows 9007, 9784), so its rows are the
+    same at any share count, however a shuffle after it reads them."""
+    if isinstance(stage, Batched):
+        return not stage.same_rows
+    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native)) or rejects(stage)
+
+
+def groups_held(after: Sequence[Stage], size: int, threads: int) -> int:
+    """The groups of `size` a same-rows batched step's read holds at once (`dew.data.lowering._GroupedRows`):
+    a window shuffle's after it and the read's threads'. A global shuffle after it the analysis refused
+    (`_regrouped`)."""
+    threaded = 2 * max(1, threads)
+    windows = [stage.window for stage in after if isinstance(stage, Shuffle) and stage.window is not None]
+    return threaded if not windows else -(-windows[0] // size) + 1 + threaded
+
+
+def _regrouped(pipeline: Pipeline, read: Read, eager: int) -> None:
+    """Refuse a global shuffle after a same-rows batched step a reader runs over its order's rows, not one a
+    memory read's eager pass ran (before `eager`): it would draw each row's group anew, a group a draw
+    (`dew.data.lowering._GroupedRows`), naming the remedies its read has (row 9784). Refused as `compile`
+    analyzes the chain, where a reader lowering its stages refused it."""
+    grouped = False
+    for index, stage in enumerate(pipeline.stages):
+        grouped = grouped or (index >= eager and isinstance(stage, Batched) and stage.same_rows)
+        if grouped and isinstance(stage, Shuffle) and stage.window is None:
+            remedies = (*(("read it in memory (read='memory')",) if read != "memory" else ()),
+                        "shuffle within a window (window=)", "shuffle before the map")
+            raise ValueError(f"the global shuffle in {_name(pipeline)} after a batched map would read each "
+                             f"row's group anew: {', or '.join(remedies)}")
 
 
 def rejects(stage: Stage) -> bool:
@@ -896,7 +930,8 @@ def reach(stages: Sequence[Stage], unending: bool) -> tuple[bool, bool]:
 
 
 def _analyzed(
-    pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False, bound: bool = False
+    pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False, bound: bool = False,
+    sealing: bool = False,
 ) -> _Lowering:
     """The analysis of `pipeline` at `read`, a scored branch with
     `validation`. A token split in a training order cut per share is refused
@@ -919,7 +954,8 @@ def _analyzed(
             kind, verb = ("concatenation", "concat") if joined else ("mixture", "mix")
             raise ValueError(f"{kind} member {_name(batched)} is batched; a {kind} batches once, after "
                              f"{verb}: move the member's batch and the stages after it onto the {kind}")
-    lowered = tuple(_analyzed(child, read, validation=validation, promotion=promotion) for child in nested)
+    lowered = tuple(_analyzed(child, read, validation=validation, promotion=promotion, sealing=sealing)
+                    for child in nested)
     # A concatenation's members each end where they are read, so the join is finite where its own stages
     # leave it so: a member's repeat repeats that member alone.
     ancestry = tuple(stage for child in nested for stage in _steps(child)
@@ -942,11 +978,17 @@ def _analyzed(
         # Analyzed `bound`, a configured step counts as the step it binds to, eager unless it draws.
         stage = stages[eager]
         once_bound = bound and isinstance(stage, Configured) and not stage.random
-        held = 1 if isinstance(stage, _EAGER) or once_bound else _held_bound(stages, eager)
+        # A batched step that keeps its rows runs here too, its groups the source's own records, which a
+        # global shuffle after it then reads in memory (row 9784).
+        grouped = isinstance(stage, Batched) and stage.same_rows
+        held = 1 if isinstance(stage, _EAGER) or once_bound or grouped else _held_bound(stages, eager)
         if not held:
             break
         eager += held
-    per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
+    per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion,
+                         sealing=sealing)
+    if read != "streamed":
+        _regrouped(pipeline, read, eager)
     if isinstance(source, Mixture) and source.tokens is not None:
         per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in lowered)
@@ -985,7 +1027,7 @@ def _analyzed(
         None if absorbed is None else absorbed[0],
         epochs,
         tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
-        _order(source, lowered, stages),
+        _order(source, lowered, stages, streamed=per_share and read != "memory"),
         parts_unending,
         unending,
         records_unending,
@@ -1000,8 +1042,15 @@ def _analyzed(
     return lowering
 
 
-def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequence[Stage]
-           ) -> Mapping[str, object]:
+STATED_SHARES = "tokens, by stated counts"
+"""How a streamed token mixture whose every member states its rows and valid targets (`_states_its_targets`)
+shares its windows (`_Lowering.order`'s `shares`): by weights those counts make (`token_weights`), as an
+indexed read's do, where one whose counts are not stated keeps a deficit of each member's targets
+(`dew.data.mixing.TokenDeficit`; row 9010: a streamed read kept the deficit whatever its members stated)."""
+
+
+def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequence[Stage], *,
+           streamed: bool = False) -> Mapping[str, object]:
     """The canonical order a resume must find unchanged (`_Lowering.order`): what `source` reads, a store by
     its description, phases, a mixture or a concatenation by its members' orders (`lowered`) and the names
     they go by (`_members`), then the stages that order its rows, a memory read's own among them
@@ -1019,7 +1068,8 @@ def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequ
             "corpora": [child.order for child in lowered],
             "members": _members(source.pipelines),
             "weights": list(source.weights),
-            "shares": "tokens" if source.tokens is not None else "accepted rows",
+            "shares": ("accepted rows" if source.tokens is None else STATED_SHARES if streamed and all(
+                _states_its_targets(child) for child in source.pipelines) else "tokens"),
             # The seed of the mix's corpus order where it has one, which another plan's is not.
             **({} if source.seed is None else {"selection_seed": source.seed}),
         }
@@ -1102,9 +1152,12 @@ def _checked(
     *,
     validation: bool,
     promotion: bool,
+    sealing: bool = False,
 ) -> bool:
     """Walk the stages once, refusing what no lowering takes where it stands,
-    and say whether the order must be cut per share."""
+    and say whether the order must be cut per share. A `sealing` pass (a snapshot's) is a scored one whose
+    draws stand as its records do in the one order it seals: no draw of its is held to the canonical index
+    (row 10567)."""
     from dew.data.handoff import pooled
     random = next((_identity(stage).name for stage in ancestry if isinstance(stage, RandomMap)), None)
     indexed, batched, workers, host = read != "streamed", False, False, False
@@ -1145,9 +1198,10 @@ def _checked(
         finite = finite and not isinstance(stage, Repeat)
         if _random(stage):
             random = _identity(stage).name
-            if validation and not canonical:
+            if validation and not canonical and not sealing:
                 raise ValueError(f"validation random step {random} must use the canonical record index")
-        reorders = isinstance(stage, (Shuffle, Repeat, Slice, Limit)) or _drops(stage)
+        drops = _drops(stage)
+        reorders = isinstance(stage, (Shuffle, Repeat, Slice, Limit)) or drops
         canonical = canonical and not reorders
         if isinstance(stage, Artifact):
             if random is not None:
@@ -1183,13 +1237,13 @@ def _checked(
         # share.
         on_pool = pooled(stage) and index >= eager
         streams = isinstance(stage, (Interleave, Workers, BatchStage, TokenBudget)) or (
-            _drops(stage) and index >= eager
+            drops and index >= eager
         ) or on_pool
         # A cache reads as the stages it holds would: by index and in one order where they keep one
         # record for each input, as a stream and per share where they drop or expand them.
         streamed_cache = isinstance(stage, Artifact) and not _indexed_cache(prefix, read)
         indexed = indexed and not (streams or (streamed_cache and read != "memory"))
-        shared = _drops(stage) or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache or on_pool
+        shared = drops or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache or on_pool
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
         batched = _check_batch(stage, batched=batched, name=name)
         if isinstance(stage, Workers):

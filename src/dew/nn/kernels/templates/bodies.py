@@ -1,5 +1,5 @@
 """A launch's body as every Mosaic GPU family's kernel builds it (`mosaic.kernel`, `Family.kernel`): run in
-Pallas's interpreter or natively (`interpreted`, and `interpreting` while its body traces, which every
+Pallas's interpreter or natively (`interpreted`; `launches.interpreting` while its body traces, which every
 family's products read), a dependent launch waiting for the one before it where the GPU has grid dependency
 control (`waits`, `dependent`), with its L2 prefetches issued before that wait (`prefetched`)."""
 
@@ -13,11 +13,12 @@ import jax.numpy as jnp
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, launches
+from dew.nn.kernels.templates import rings
 
 
 def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
     """A launch's interpreter: `interpret`'s own parameters where it gives them (a read past an operand
-    poisoned, `grouped_matmul.INTERPRETED`), the default where it is True, none where False."""
+    poisoned, `grouped_launch.INTERPRETED`), the default where it is True, none where False."""
     if isinstance(interpret, plgpu.InterpretGPUParams):
         return interpret
     return plgpu.InterpretGPUParams() if interpret else None
@@ -44,27 +45,19 @@ def dependent(entry: Callable, interpret, *, prefetched: Callable | None = None)
     `entry` as it is.
 
     With `prefetched`, `prefetched(*refs)`'s views of any operands each prefetched into L2 before the wait
-    (`plgpu.async_prefetch`): a prefetch reads nothing into the program, and L2 is where every write
+    (`rings.prefetch`): a prefetch reads nothing into the program, and L2 is where every write
     lands, so a view the launch before it still writes is correct to prefetch, at worst early."""
     if not waits(interpret):
         return entry
 
     def body(*refs):
         for view in () if prefetched is None else prefetched(*refs):
-            plgpu.async_prefetch(view)
+            rings.prefetch(view)
         plgpu.griddepcontrol_wait()
         entry(*refs)
         plgpu.griddepcontrol_launch_dependents()
 
     return body
-
-
-def interpreting() -> bool:
-    """Whether the launch whose program is tracing runs in Pallas's interpreter (`launches.interpreting`): a
-    family's products issue no instruction the interpreter lacks there (mma.sync's sums,
-    `mosaic_sm80.Mma.products`), whatever a caller states (row 5209's A100 backward: products called with no
-    interpret flag issued mma.sync's)."""
-    return bool(launches.interpreting())
 
 
 def subnormals[T](compute: Callable[..., T], dtype) -> T:

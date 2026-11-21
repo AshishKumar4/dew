@@ -36,6 +36,7 @@ its first should compare a few steps against copies off.
 
 import jax
 import jax.numpy as jnp
+from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray
 from jax.extend import core
 
@@ -132,16 +133,22 @@ def cast_paths(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] = ()
                ) -> dict[tuple[str, ...], jnp.dtype]:
     """The paths of `tree`'s leaves under `within` (relative to it) whose one use in `closed`, a program
     whose first inputs are `tree`'s leaves, is a cast to a narrower float dtype, with that dtype: those
-    leaves' casts alone, the program's other inputs read as it reads them."""
+    leaves' casts alone, the program's other inputs read as it reads them. Uses are counted in its live
+    equations alone (`partial_eval.dce_jaxpr`): a read whose value nothing takes (a selector's probe that
+    declined its cast) is none, the program as it runs reading the weight once."""
     leaves = jax.tree_util.tree_flatten_with_path(tree)[0]
+    # The program its uses are counted in, its dead equations dropped; JAX's dead-code elimination keeps an
+    # effectful equation whatever reads it. Only the counting reads it: the step runs `closed` as traced.
+    live, _ = partial_eval.dce_jaxpr(closed.jaxpr, used_outputs=[True] * len(closed.jaxpr.outvars),
+                                     instantiate=True)
     held = [(tuple(key.key for key in path)[len(within):], leaf, var)
-            for (path, leaf), var in zip(leaves, closed.jaxpr.invars[:len(leaves)], strict=True)
+            for (path, leaf), var in zip(leaves, live.invars[:len(leaves)], strict=True)
             if tuple(key.key for key in path)[:len(within)] == within]
     weights = frozenset(var for _, _, var in held)
     paths = {}
     for path, leaf, var in held:
         if isinstance(var, core.Var) and jnp.issubdtype(leaf.dtype, jnp.floating):
-            dtype = _cast_once(var, closed.jaxpr, weights)
+            dtype = _cast_once(var, live, weights)
             if dtype is not None:
                 paths[path] = dtype
     return paths

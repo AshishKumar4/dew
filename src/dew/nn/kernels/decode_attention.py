@@ -54,15 +54,16 @@ from dew.nn.kernels import launches
 from dew.nn.precision import FP32_PRODUCTS, precision_names
 
 from . import tuning
-from .generation import INHERENT, gpu_target, triton_runs
+from .generation import INHERENT, GpuTarget, gpu_target, triton_runs
 from .selection import Requirement
-from .templates import attention_algebra as algebra
 from .templates.attention import Capped, kernel_dot, prescaled
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
     from dew.nn.attention_kernels import AttentionCase
     from dew.nn.kv_cache import PagedCase
+
+    from .templates import attention_algebra as algebra
 
 BLOCK = 32
 """The keys a cache holds whole blocks of, and a page at most (`SUPPORTS`, `PAGED_GEOMETRY`): the least a step
@@ -86,6 +87,8 @@ def step_keys(dtype, width: int, keys: int | None = None) -> int:
     `algebra.compensates`), whose step then sums its product whole, where a step of `BLOCK` keys would split
     its value tile in registers, a layout change through shared memory (116736 bytes at 256-wide fp32 heads,
     past an sm120 block's 101376)."""
+    from .templates import attention_algebra as algebra
+
     if algebra.compensates(dtype):
         return algebra.CHUNK
     most = max(BLOCK, KEY_STEP_BYTES // (width * jnp.dtype(dtype).itemsize))
@@ -93,8 +96,8 @@ def step_keys(dtype, width: int, keys: int | None = None) -> int:
         return most
     return next(step for step in range(most, BLOCK - 1, -BLOCK) if keys % step == 0)
 
-SPLITS = (1, 2, 4, 8, 16, 32)
-"""The slices a launch may cut each row's keys into (`Split`), each held to the float64 gate on the GPU."""
+MAX_SPLITS = 32
+"""The most slices a launch cuts a row's keys into (`Split`), held to the float64 gate on the GPU."""
 
 @dataclasses.dataclass(frozen=True)
 class Split:
@@ -166,8 +169,8 @@ power-of-two width from 16 to 256, a capacity of whole blocks, one of its dtypes
 run's declared products (`PRODUCTS`)."""
 
 
-def _spec(scale: float, power: float, softcap: float | None, natural: bool | None, dtype, sinks: bool
-          ) -> algebra.Forward:
+def _spec(scale: float, power: float, softcap: float | None, natural: bool | None, dtype, sinks: bool,
+          stored) -> "algebra.Forward":
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`; None:
     natural for fp32 operands, whose edge logit's base-2 conversion rounded before exp2 moves its normal
@@ -176,21 +179,27 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
     `algebra.SCALED_WALK`) and keep their additions' rounding (`algebra.compensates`), folded logits a
     difference of raw products scaled after it is taken (`algebra.Forward.subtracted`: no fold's divergence
     past its reach, row 1955, on a walk the memory bounds). A decode block's rows are a key head's query
-    heads and positions (`grouped_query`), so the hook takes no query positions."""
+    heads and positions (`grouped_query`), so the hook takes no query positions. Its output stored in
+    `stored`, the query's dtype, which its narrowing settles for (`algebra.Forward.narrowed`)."""
+    from .templates import attention_algebra as algebra
+
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else Capped(softcap),
                            natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
                            headroom=algebra.headroom(dtype), initial=sinks,
-                           compensated=algebra.compensates(dtype), prescale=power, subtracted=True)
+                           compensated=algebra.compensates(dtype), prescale=power, subtracted=True,
+                           largest=dtype, narrowed=algebra.narrowed_of(stored))
 
 
-def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
-            interpret: bool, sink: jax.Array | None = None) -> algebra.Partial:
+def _attend(query: jax.Array, span: tuple, read, block: int, spec: "algebra.Forward", steps,
+            interpret: bool, sink: jax.Array | None = None) -> "algebra.Partial":
     """The decode mainloop: `query` `[QUERIES, D]` over the keys of `steps`, a range of the loop's steps
     of `block` keys, those of the row's `span` (its first key and its length) alone, `read(step)` giving
     a step's keys and values `[block, D]`, as a softmax state (`algebra.Partial`). A `sink` `[QUERIES]`
     (each query row's value-free logit, -inf for a slice that does not carry it) starts the softmax as
     its first term."""
+    from .templates import attention_algebra as algebra
+
     first_key, length = span
     rows = jnp.arange(QUERIES)
     spans = ((jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)),)
@@ -225,9 +234,11 @@ def _slice(span: tuple, block: int, split, splits: int) -> tuple:
     return begin, jnp.minimum(begin + per, last)
 
 
-def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
+def _write(out_refs, spec: "algebra.Forward", state: "algebra.Partial"):
     """The row's output normalized where one slice reads it all, else the slice's state, which
     `_combined` merges."""
+    from .templates import attention_algebra as algebra
+
     if len(out_refs) == 1:
         out = algebra.finish(spec, state, initial=True)[0]
         out_refs[0][...] = out.astype(out_refs[0].dtype)
@@ -246,7 +257,7 @@ def _first_slice_sink(sinks_ref) -> jax.Array | None:
     return jnp.where(pl.program_id(2) == 0, sinks_ref[...], -jnp.inf)
 
 
-def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: algebra.Forward, splits: int,
+def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: "algebra.Forward", splits: int,
             interpret: bool, sinks: bool):
     sinks_ref, out_refs = (refs[0], refs[1:]) if sinks else (None, refs)
     block = step_keys(value_ref.dtype, key_ref.shape[-1], key_ref.shape[0])
@@ -262,7 +273,7 @@ def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: algebra.Forwa
 
 
 def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pages: int,
-                  spec: algebra.Forward, splits: int, interpret: bool, sinks: bool):
+                  spec: "algebra.Forward", splits: int, interpret: bool, sinks: bool):
     sinks_ref, out_refs = (refs[0], refs[1:]) if sinks else (None, refs)
     page_size, width = key_ref.shape[-2:]
 
@@ -277,10 +288,12 @@ def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pa
                                    _first_slice_sink(sinks_ref)))
 
 
-def _combined(spec: algebra.Forward, *parts, axis: int):
+def _combined(spec: "algebra.Forward", *parts, axis: int):
     """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima and totals, and
     their rows' scale on the scaled walk, `algebra.exported`) merged at once (`algebra.merged`), as the
     normalized output in fp32: an empty slice's state (a maximum of -inf) merges as nothing."""
+    from .templates import attention_algebra as algebra
+
     return algebra.finish(spec, algebra.merged(spec, algebra.imported(parts), axis), initial=True)[0]
 
 
@@ -291,47 +304,58 @@ def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, 
     if splits == 1:
         return jax.ShapeDtypeStruct(shape, dtype), spec
     split = (*shape[:at], splits, *shape[at:])
+    from .templates import attention_algebra as algebra
+
     sums, rows = jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32)
     count = algebra.exported_rows(scaled)
     return [sums, *[rows] * count], [summed, *[reduced] * count]
+
+
+def _resident(step_bytes: int, target: GpuTarget) -> int:
+    """Programs of `WARPS` warps staging two double-buffered key and value tiles (`4 * step_bytes`) plus each
+    block's `reserved_shared` a multiprocessor of `target` holds at once (`GpuTarget.multiprocessor`,
+    `GpuTarget.shared_limit`; row 1954): 6 on an H100, 4 on an A100 and 3 on a 99 KB sm86/sm89 block."""
+    mp = target.multiprocessor
+    by_threads = min(mp.resident_threads // (WARPS * 32), mp.resident_blocks)
+    if not target.shared_limit or not step_bytes:
+        return max(1, by_threads)
+    sm_shared = target.shared_limit + mp.reserved_shared
+    per_block = 4 * step_bytes + mp.reserved_shared
+    return max(1, min(by_threads, sm_shared // per_block))
 
 
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
     """The slices a launch of `programs` programs a slice over `steps` steps of the loop may take on a
     GPU of `processors` multiprocessors (`GpuTarget.multiprocessors`): one where the programs already
     fill most of them or none are known, as FlashAttention 2 rules (csrc/flash_attn/flash_api.cpp,
-    `num_splits_heuristic`), else any of `SPLITS` up to one a step."""
+    `num_splits_heuristic`), else the powers of two up to `min(steps, processors, MAX_SPLITS)` (row 1954)."""
     if not processors or programs >= 0.8 * processors:
         return {Split(1)}
-    return {Split(splits) for splits in SPLITS if splits <= min(steps, processors)}
+    limit = min(steps, processors, MAX_SPLITS)
+    return {Split(1 << shift) for shift in range(limit.bit_length())} if limit >= 1 else {Split(1)}
 
 
-RESIDENT = 6
-"""Programs a multiprocessor runs at once that a launch fills (`_heuristic`)."""
-
-
-def _variants(programs: int, steps: int, processors: int | None) -> tuple[Split, ...]:
+def _variants(programs: int, steps: int, step_bytes: int, target: GpuTarget) -> tuple[Split, ...]:
     """The rule's slices (`_heuristic`), then the counts of its space either side of them (`_space`): the
     configs an opt-in tuning run times beside it (`tuning.KernelOp.variants`)."""
-    chosen = _heuristic(programs, steps, processors)
-    counts = sorted(split.splits for split in _space(programs, steps, processors))
+    chosen = _heuristic(programs, steps, step_bytes, target)
+    counts = sorted(split.splits for split in _space(programs, steps, target.multiprocessors))
     at = counts.index(chosen.splits)
     return (chosen, *(Split(count) for count in counts[max(at - 1, 0):at + 2] if count != chosen.splits))
 
 
-def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
-    """The most slices a launch may take (`_space`) whose programs fill at most `RESIDENT` a
-    multiprocessor. A program of `WARPS` warps over `BLOCK` keys a step leaves a multiprocessor room
-    for several, which hide each other's reads. Over 60 shapes of Qwen3-0.6B's and Qwen3.5-0.8B's dense
-    and paged decode (1 to 32 rows, 8K to 128K keys) timed at every count of `SPLITS`, this rule's pick
-    ran within 1.010x of the fastest on an H100 (geometric mean; 1.22x at worst) and 1.037x on an A100
-    (1.83x), the same for any `RESIDENT` from 5 to 7; FlashAttention 2's rule (the fewest whose waves
-    run within 85% of the best count's) within 1.35x (2.44x) and 1.06x (1.83x). On the H100, Qwen3-0.6B
-    at 2 rows over 131072 keys took 0.220 ms at this rule's 32 slices against 0.527 at FA2's 8."""
+def _heuristic(programs: int, steps: int, step_bytes: int, target: GpuTarget) -> Split:
+    """The most slices a launch may take (`_space`) whose programs fill at most `_resident(step_bytes,
+    target)`
+    a multiprocessor (derived from `GpuTarget.multiprocessor` and `GpuTarget.shared_limit`, row 1954). Over
+    60 shapes of Qwen3-0.6B's and Qwen3.5-0.8B's dense and paged decode (1 to 32 rows, 8K to 128K keys), 5 to
+    7 resident programs a multiprocessor ran within 1.010x of the fastest on an H100 and 1.037x on an A100."""
+    processors = target.multiprocessors
     counts = sorted(split.splits for split in _space(programs, steps, processors))
     if processors is None:
         return Split(counts[0])
-    return Split(max((splits for splits in counts if programs * splits <= RESIDENT * processors),
+    resident = _resident(step_bytes, target)
+    return Split(max((splits for splits in counts if programs * splits <= resident * processors),
                      default=counts[0]))
 
 
@@ -368,7 +392,7 @@ class DecodeAttention(tuning.KernelOp):
         summed = pl.BlockSpec((None, None, QUERIES, None, width),
                               lambda row, head, split: (row, split, 0, head, 0))
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
-        def launch(spec: algebra.Forward, spans: jax.Array, splits: int = splits) -> jax.Array:
+        def launch(spec: "algebra.Forward", spans: jax.Array, splits: int = splits) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
                                             scaled=spec.headroom)
             out = launches.pallas_call(
@@ -385,7 +409,7 @@ class DecodeAttention(tuning.KernelOp):
             )(spans, query, key, value, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=1).astype(query.dtype)
 
-        spec = _spec(scale, power, softcap, natural, value.dtype, sinks is not None)
+        spec = _spec(scale, power, softcap, natural, value.dtype, sinks is not None, query.dtype)
         return launch(spec, spans), None
 
     def _get_heuristics_config(self, ba) -> Split:
@@ -395,15 +419,13 @@ class DecodeAttention(tuning.KernelOp):
         return _variants(*self._launch(ba))
 
     @staticmethod
-    def _launch(ba) -> tuple[int, int, int | None]:
-        """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop, and
-        the GPU's multiprocessors."""
-        query = ba.arguments['query']
-        return (_rows(query) * query.shape[2],
-                pl.cdiv(ba.arguments['key'].shape[1], step_keys(ba.arguments['value'].dtype,
-                                                                ba.arguments['key'].shape[-1],
-                                                                ba.arguments['key'].shape[1])),
-                gpu_target().multiprocessors)
+    def _launch(ba) -> tuple[int, int, int, GpuTarget]:
+        """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop, a step's
+        key-tile bytes, and the GPU target."""
+        query, key, value = ba.arguments['query'], ba.arguments['key'], ba.arguments['value']
+        step = step_keys(value.dtype, key.shape[-1], key.shape[1])
+        step_bytes = step * key.shape[-1] * jnp.dtype(value.dtype).itemsize
+        return _rows(query) * query.shape[2], pl.cdiv(key.shape[1], step), step_bytes, gpu_target()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -439,7 +461,7 @@ class PagedDecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
 
-        def launch(spec: algebra.Forward, spans: jax.Array, splits: int = splits) -> jax.Array:
+        def launch(spec: "algebra.Forward", spans: jax.Array, splits: int = splits) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
                                             scaled=spec.headroom)
             out = launches.pallas_call(
@@ -457,7 +479,7 @@ class PagedDecodeAttention(tuning.KernelOp):
             )(spans, table, query, key_pages, value_pages, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=2).astype(query.dtype)
 
-        spec = _spec(scale, power, softcap, natural, value_pages.dtype, sinks is not None)
+        spec = _spec(scale, power, softcap, natural, value_pages.dtype, sinks is not None, query.dtype)
         return launch(spec, spans), None
 
     def _get_heuristics_config(self, ba) -> Split:
@@ -467,13 +489,14 @@ class PagedDecodeAttention(tuning.KernelOp):
         return _variants(*self._launch(ba))
 
     @staticmethod
-    def _launch(ba) -> tuple[int, int, int | None]:
+    def _launch(ba) -> tuple[int, int, int, GpuTarget]:
         """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop over
-        its table, `step_keys` a step, and the GPU's multiprocessors."""
+        its table, a step's key-tile bytes, and the GPU target."""
         query, pages = ba.arguments['query'], ba.arguments['value_pages']
-        steps = pl.cdiv(ba.arguments['table'].shape[1],
-                        max(step_keys(pages.dtype, query.shape[-1]) // pages.shape[2], 1))
-        return _rows(query) * query.shape[1], steps, gpu_target().multiprocessors
+        pages_per_step = max(step_keys(pages.dtype, query.shape[-1]) // pages.shape[2], 1)
+        steps = pl.cdiv(ba.arguments['table'].shape[1], pages_per_step)
+        step_bytes = pages_per_step * pages.shape[2] * query.shape[-1] * jnp.dtype(pages.dtype).itemsize
+        return _rows(query) * query.shape[1], steps, step_bytes, gpu_target()
 
 
 _DECODE = DecodeAttention()

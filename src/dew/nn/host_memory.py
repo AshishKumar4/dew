@@ -12,6 +12,7 @@ optimization barrier, so the slice stays the dynamic one a scanned layer takes.
 
 import jax
 import jax.numpy as jnp
+from numpy.lib.array_utils import normalize_axis_tuple
 
 
 def on_host(tree) -> bool:
@@ -30,13 +31,45 @@ def fetched(tree):
     return jax.tree.map(lambda leaf: jax.device_put(leaf, jax.memory.Space.Device), tree)
 
 
-def fetched_at(tree, index: jax.Array | int, axis: int = 0):
-    """Each leaf's entry `index` along `axis` (a bank's layer, a pool's page) in device memory: copied with
-    the axis intact and squeezed there."""
-    index = jax.lax.optimization_barrier(jnp.asarray(index, jnp.int32))
-    return jax.tree.map(
-        lambda leaf: jax.lax.squeeze(fetched(jax.lax.dynamic_slice_in_dim(leaf, index, 1, axis)), (axis,)),
-        tree)
+type Index = jax.Array | int
+"""An entry's place along one axis, traced or not."""
+
+
+def _entry(index: Index | tuple[Index, ...], axis: int | tuple[int, ...]
+           ) -> tuple[tuple[int, ...], tuple[jax.Array, ...]]:
+    """The axes an entry is taken along and its index on each, int32 behind one optimization barrier (a
+    slice's starts share one dtype), so the slice stays the dynamic one a scanned layer takes."""
+    axes = (axis,) if isinstance(axis, int) else axis
+    indices = (index,) if isinstance(axis, int) else index
+    if not isinstance(indices, tuple) or len(indices) != len(axes):
+        raise ValueError(f"an entry along the axes {axes} takes an index on each, not {index!r}")
+    return axes, jax.lax.optimization_barrier(tuple(jnp.asarray(each, jnp.int32) for each in indices))
+
+
+def _placed(ndim: int, axes: tuple[int, ...], indices: tuple[jax.Array, ...]
+            ) -> tuple[tuple[int, ...], list[jax.Array]]:
+    """`axes` of an array of rank `ndim`, each counted from its first (a negative axis from its last; one past
+    its rank refused, as NumPy refuses it), and a slice's starts over its axes: each of `axes` at its index,
+    every other axis at zero."""
+    held = normalize_axis_tuple(axes, ndim)
+    starts = [jnp.zeros((), jnp.int32)] * ndim
+    for axis, index in zip(held, indices, strict=True):
+        starts[axis] = index
+    return held, starts
+
+
+def fetched_at(tree, index: Index | tuple[Index, ...], axis: int | tuple[int, ...] = 0):
+    """Each leaf's entry `index` along `axis` (a bank's layer, a pool's page), or along each of several axes
+    at an index of each (a bank's layer and page), in device memory: copied with the axes intact and
+    squeezed there."""
+    axes, indices = _entry(index, axis)
+
+    def entry(leaf: jax.Array) -> jax.Array:
+        held, starts = _placed(leaf.ndim, axes, indices)
+        sizes = [1 if dimension in held else size for dimension, size in enumerate(leaf.shape)]
+        return jax.lax.squeeze(fetched(jax.lax.dynamic_slice(leaf, starts, sizes)), held)
+
+    return jax.tree.map(entry, tree)
 
 
 def placed_like(leaf: jax.Array, value: jax.Array) -> jax.Array:
@@ -44,9 +77,20 @@ def placed_like(leaf: jax.Array, value: jax.Array) -> jax.Array:
     return jax.device_put(value, jax.memory.Space.Host) if on_host(leaf) else value
 
 
-def stored_at(bank: jax.Array, value: jax.Array, index: jax.Array | int, axis: int = 0) -> jax.Array:
-    """`bank` with `value` its entry `index` along `axis`, where `bank` lies (`fetched_at`'s inverse): the
-    axis restored in device memory, the entry copied to the bank's memory and written there."""
-    index = jax.lax.optimization_barrier(jnp.asarray(index, jnp.int32))
-    entry = placed_like(bank, jnp.expand_dims(value.astype(bank.dtype), axis))
-    return jax.lax.dynamic_update_slice_in_dim(bank, entry, index, axis)
+def stored_at(bank: jax.Array, value: jax.Array, index: Index | tuple[Index, ...],
+              axis: int | tuple[int, ...] = 0, *, kept: jax.Array | None = None) -> jax.Array:
+    """`bank` with `value` its entry `index` along `axis` (or along each of several axes), where `bank` lies
+    (`fetched_at`'s inverse): the axes restored in device memory, the entry copied to the bank's memory and
+    written there; where `kept` is given (a scalar), written only where it holds, the entry copied first
+    whatever it says. That is the one form XLA:GPU's host offloading compiles for a bank in host memory
+    that a loop writes: a copy to the host made inside a conditional's branch, or a write taken
+    unconditionally in a loop's body or unrolled, or a loop whose count the writes kept set, each refuses
+    the bank as a host parameter ("not in host memory space"; armada probes on an A100's compile at
+    c27860888)."""
+    axes, indices = _entry(index, axis)
+    held, starts = _placed(bank.ndim, axes, indices)
+    entry = placed_like(bank, jnp.expand_dims(value.astype(bank.dtype), held))
+    if kept is None:
+        return jax.lax.dynamic_update_slice(bank, entry, starts)
+    return jax.lax.cond(kept, lambda bank: jax.lax.dynamic_update_slice(bank, entry, starts),
+                        lambda bank: bank, bank)

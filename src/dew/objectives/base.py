@@ -42,6 +42,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import struct
+from jax._src import core as jax_core
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
@@ -76,6 +77,7 @@ from dew.nn.precision import (
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectsParameters, StagedStacks
 from dew.nn.sharding import LogicalAxes, abstract, boxed_axes, rows_taken
+from dew.objectives.drawn import WHOLE, drawn_once
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -968,8 +970,13 @@ class Objective(ABC, Generic[Loss, Effects]):
     student, passes as that one does."""
     resumable: ClassVar[tuple[str, ...]] = ()
     """The arguments that weigh how the objective learns rather than say what it trains, which a run resumed
-    under its name may change (`dew.config.RunConfig.check_resume`), as a later phase of training lowers a
-    coefficient; every other argument the resume must keep."""
+    under its name may change (`dew.config.RunConfig.check_resume`, a direct resume's `training_record`), as
+    a later phase of training lowers a coefficient; every other argument the resume must keep. A class's
+    own, beside its bases' (`resumed_freely`)."""
+    executed: ClassVar[tuple[str, ...]] = ()
+    """The settings that say how its programs execute and not what they compute (a head's tiling, which a
+    fit's ladder sets), which a resume may change, as a model's `RunConfig.EXECUTED` fields; a class's own,
+    beside its bases' (`resumed_freely`)."""
     ema_is_reference: ClassVar[bool] = False
     """Whether the objective's average is the frozen reference its loss compares against (an RL
     policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""
@@ -1162,6 +1169,27 @@ class Objective(ABC, Generic[Loss, Effects]):
         return None if own is None else (own, tuple(sorted(held.items())))
 
     @classmethod
+    def resumed_freely(cls) -> frozenset[str]:
+        """The settings a resume may change, its own class's and its bases' (`resumable`, `executed`)."""
+        return frozenset(name for klass in cls.__mro__ for name in (*vars(klass).get("resumable", ()),
+                                                                   *vars(klass).get("executed", ())))
+
+    def training_record(self) -> dict[str, JSON]:
+        """What its loss computes beside its model, as a step records it (`dew.checkpoints.Checkpoints.save`'s
+        `training`), which a direct resume holds a run to (`dew.training.startup.computation_differs`; row
+        9020: an LM's `z_loss` changed and resumed): each public setting its trace key states by value
+        (`trace_key`) that is a number, a string, a truth value, None or a sequence of them, but those a
+        resume may change (`resumed_freely`). A setting of another kind, its modules and held trees among
+        them, which its model's record and its draw state, is left out: a record refuses by what it states."""
+        left = {*type(self)._untraced(), *type(self).resumed_freely(), *HELD}
+        settings: dict[str, JSON] = {}
+        for name, value in sorted(vars(self).items()):
+            recorded = _setting_record(value)
+            if not name.startswith("_") and name not in left and not isinstance(recorded, _Unrecorded):
+                settings[name] = recorded
+        return settings
+
+    @classmethod
     def _untraced(cls) -> dict[str, str]:
         """What its trace key leaves out, by name, each with its reason: its own class's and its bases'
         (`untraced`)."""
@@ -1296,6 +1324,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         objective of several networks overrides this whole.
         """
         held = self.held_variables() if variables is None else variables
+        if jax_core.trace_state_clean():
+            # Outside any trace, one program, not each operation's, its held arrays kept (row 8682): this
+            # body's, which an override calling it then changes once (row 8730's class).
+            return drawn_once(lambda tree, draw: self._initialized(draw, tree), held, key, WHOLE,
+                              kept=(Held(self), "init"))
+        return self._initialized(key, held)
+
+    def _initialized(self, key: jax.Array, held: Variables | None) -> Variables:
+        """`init`'s body over the held tree it resolved, which an override reaches through the base alone."""
         if held is not None and "params" in held:
             # A store a stage-local run handed on is read on its stored layers, whatever this run keeps.
             from dew.nn.backbones.layer_names import stored_layers
@@ -1785,16 +1822,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
-                layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]:
+                layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]:
         """Return the loss over `batch` as `loss` computes it, together with the prediction behind it.
 
         The result holds the statistics, the `Aux` reports and a `Prediction`
         with the token logits (none unless `logits`), the weight of every position and the hidden
-        states of `layers`. The statistics are one `Ratio` over the positions
-        the weights count, so a distillation can mix in terms over the same
-        mass. `train` turns dropout on, as `loss` has it; a frozen teacher
-        scores with it off. Objectives that score no token logits raise
-        `TypeError`.
+        states of `layers`. The statistics are the loss's own: a `Ratio` over the positions the weights
+        count, which a distillation mixes its terms into over the same mass (`prediction_of`), or that
+        `Ratio` beside terms of their own mass (a mixture's router terms, `RoutedStatistics`), which a
+        distillation keeps as they are and its `reduce_loss` adds as the loss's does. `train` turns
+        dropout on, as `loss` has it; a frozen teacher scores with it off. Objectives that score no token
+        logits raise `TypeError`.
         """
         raise TypeError(f"{type(self).__name__} scores no token logits")
 
@@ -1885,6 +1923,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         nests the model beside other networks or frozen ones.
         """
         return self.model_tree(variables)
+
+    def check(self, batch: Batch) -> None:
+        """Refuse a host batch this objective cannot train on, as a run holds its batches
+        (docs/design/training.md, the producer's contract): a field its declared inputs name missing or of
+        another per-example shape (`InputSpec.check`), or an id outside the table it indexes
+        (`InputSpec.bounded`). The admission a fit runs on every training batch its loader hands the model as
+        it is (no device step reshaping it), and one a caller may run on a batch of their own."""
+        if self.inputs is not None:
+            self.inputs.check(batch)
+            self.inputs.bounded(batch)
 
     def bind_widths(self, widths: Mapping[str, object]) -> None:
         """Take the run's static widths, the facts its data's run-scoped steps bound (`Loader.widths`,
@@ -2143,6 +2191,30 @@ def stated_trace[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> Hash
 
 _ABSENT = object()
 """What a class states of a name it does not hold (`Objective._classes`)."""
+
+class _Unrecorded:
+    """A setting no training record states (`_setting_record`)."""
+
+
+_UNRECORDED = _Unrecorded()
+
+
+def _setting_record(value: TracedSetting) -> JSON | _Unrecorded:
+    """`value` as a training record states it (`Objective.training_record`): a number, a string, a truth value
+    or None as itself, a sequence of them as a list; anything else `_UNRECORDED`."""
+    match value:
+        case None | bool() | int() | float() | str() if type(value) in (type(None), bool, int, float, str):
+            return value
+        case list() | tuple() if type(value) in (list, tuple):
+            parts: list[JSON] = []
+            for part in value:
+                recorded = _setting_record(part)
+                if isinstance(recorded, _Unrecorded):
+                    return _UNRECORDED
+                parts.append(recorded)
+            return parts
+        case _:
+            return _UNRECORDED
 
 HELD = frozenset({"variables", "ema"})
 """The attributes every objective's key states its own way (`Objective.traced_by`): the tree it starts

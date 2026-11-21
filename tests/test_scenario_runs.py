@@ -1,8 +1,8 @@
 """Every scenario's covering set over its settings axes (docs/design/testing.md, settings and devices): each
 cell one short run, a user's `dew train` or the scenario's own API in a fresh process that sees the cell's
 devices, held to the contracts its flow touches (tests/scenario_contract.py) on the run it made. The
-contracts a run of their own shows are held once a scenario, on its first cell (`first`): its run resumed,
-its sampling rerun, and its first step under other rows."""
+contracts a run of their own shows are held once a flow of a scenario, on its first cell (`Scenario.firsts`):
+its run resumed and its sampling rerun; and its first step under other rows, once a scenario (`first`)."""
 
 import dataclasses
 import functools
@@ -21,8 +21,8 @@ import scenario_called
 from flax import linen as nn
 from interop_support import extract_fixture
 from placement_parity import layouts_agree
-from run_kinds import cli_settings, lm, saved_record, scalars
-from scenario_called import STEPS, gguf_loaded
+from run_kinds import blockwise, cli_settings, lm, saved_record, scalars
+from scenario_called import CODECS, DIFFUSION_RL, GGUF, STEPS, quantized_loaded
 from scenario_contract import (
     Called,
     Phase,
@@ -42,12 +42,14 @@ from dew.config import ObjectiveConfig, RunConfig
 from dew.config.lm import LMRunConfig
 from dew.data import Memory, presets
 from dew.inference import TextGeneration
+from dew.inference.serving import Server
 from dew.nn.kernels.generation import run_precision
+from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerBase
 from dew.nn.precision import numerics_of
 from dew.quantization import QuantizedDtype
 from dew.registry import mixers, to_record
-from dew.sampling import Sampling
+from dew.sampling import Sampling, Speculative
 
 MODULE = "test_scenario_runs"
 """This module as a fresh process imports it, to call a sampling made through Dew's API."""
@@ -56,12 +58,16 @@ MODULE = "test_scenario_runs"
 @dataclass(frozen=True)
 class Scenario:
     """A scenario's settings axes (the values each takes on the CPU tier) and its cell: one short run at the
-    cell's settings under `root`, held to its claims. Where it trains, its training run at a cell
-    (`trained`), which the resume claim pauses and resumes; where it samples, this module's function that
-    samples a cell (`sampled`), called on the cell and the directory it samples from: the cell's trained run,
-    or the cell's root, where it samples what it writes there itself (`sampled_from`). Where its runs read the
-    LM data path, the axes over whose every value its first cell holds the rows claims (`laid`, none for its
-    first cell alone; `LAID`)."""
+    cell's settings under `root`, held to its claims. Its cells are a covering set of the combinations of
+    its axes' values its flows admit (`admits`, every one where None; `cells`). Where it trains, its
+    training run at a cell (`trained`), which the resume claim pauses and resumes; where it samples, this
+    module's function that samples a cell (`sampled`), called on the cell and the directory it samples from:
+    the cell's trained run, or the cell's root, where it samples what it writes there itself
+    (`sampled_from`). Where an axis's values are flows of their own (an RL method, a diffusion LM's
+    objective, a way of serving: programs and state none of the others runs), each value's first cell holds
+    the claims a run of its own shows (`apart`, `firsts`). Where its runs read the LM data path, the axes
+    over whose every value its first cell holds the rows claims (`laid`, none for its first cell alone;
+    `LAID`)."""
 
     axes: Mapping[str, tuple]
     run: Callable[[Mapping, Path], None]
@@ -69,6 +75,20 @@ class Scenario:
     sampled: str | None = None
     sampled_from: str = "run"
     laid: tuple[str, ...] | None = None
+    admits: Callable[[dict], bool] | None = None
+    apart: tuple[str, ...] = ()
+
+    def cells(self) -> list[dict]:
+        """The scenario's cells: a covering set of what it admits (`scenario_contract.covering`)."""
+        return covering(self.axes, self.admits)
+
+    def firsts(self) -> list[dict]:
+        """The cells where the scenario holds the claims a run of its own shows: its first cell at each value
+        of its axes `apart`, or its first cell alone where it names none."""
+        held: dict[tuple, dict] = {}
+        for cell in self.cells():
+            held.setdefault(tuple(cell[axis] for axis in self.apart), cell)
+        return list(held.values())
 
 
 def settings(cell: Mapping, root: Path, more: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -156,13 +176,30 @@ def float64_twin(served: TextGeneration, canonical: nn.Module) -> tuple[nn.Modul
     return canonical.clone(dtype=jnp.float64, attention_impl="reference"), weights
 
 
-def assert_served_as_its_forward(served: TextGeneration, canonical: nn.Module, prompts: int, compute,
-                                 steps: int = 4) -> None:
+Draws = list[tuple[np.ndarray, int, np.ndarray]]
+"""Served rows, each its tokens (its prompt's, then its new ones), its new tokens' count and their
+log-probabilities."""
+
+
+def draws_of(generation) -> Draws:
+    """A generation's rows (`Generation.host`) as `Draws`."""
+    held = generation.host()
+    return [(np.asarray(held.tokens)[row], int(held.lengths[row]), np.asarray(held.raw_log_probs)[row])
+            for row in range(len(held.lengths))]
+
+
+def called_on(task: TextGeneration) -> Callable[[list[list[int]], int], Draws]:
+    """Prompts served by one greedy call of `task` over them all: `serve(prompts, steps)`."""
+    return lambda prompts, steps: draws_of(task(prompts, steps, key=0, sampling=Sampling(temperature=0)))
+
+
+def assert_served_as_its_forward(served: TextGeneration, serve: Callable[[list[list[int]], int], Draws],
+                                 canonical: nn.Module, prompts: int, compute, steps: int = 4) -> None:
     """A served task's greedy continuation is its model's (testing.md: an argmax held at a stated margin): on
     `prompts` prompts of two tokens drawn so that every step of each one's float64 greedy walk
     (`model_support.greedy_walk` over `float64_twin`) clears the top-2 margin the served `compute` dtype's
-    rounding moves a logit by (`selection_margins`: MARGIN, or NARROW_MARGIN in bfloat16), the served tokens
-    are the walk's and every generated token's log-probability is finite."""
+    rounding moves a logit by (`selection_margins`: MARGIN, or NARROW_MARGIN in bfloat16), the tokens `serve`
+    serves them (`Draws`) are the walk's and every generated token's log-probability is finite."""
     from model_support import greedy_walk
 
     wide, weights = float64_twin(served, canonical)
@@ -184,13 +221,10 @@ def assert_served_as_its_forward(served: TextGeneration, canonical: nn.Module, p
             np.int32)
 
     rows = clearing(drawn, lambda rows: all(walked(row)[1] > least for row in rows))(0)
-    result = served([list(row) for row in rows], steps, key=0, sampling=Sampling(temperature=0)).host()
-    for index, row in enumerate(rows):
-        length = int(result.lengths[index])
+    for row, (tokens, length, log_probs) in zip(rows, serve([list(row) for row in rows], steps), strict=True):
         assert length > 0
-        np.testing.assert_array_equal(np.asarray(result.tokens)[index, :len(row) + length],
-                                      walked(row)[0][:len(row) + length])
-        assert np.isfinite(np.asarray(result.raw_log_probs)[index, :length]).all()
+        np.testing.assert_array_equal(tokens[:len(row) + length], walked(row)[0][:len(row) + length])
+        assert np.isfinite(log_probs[:length]).all()
 
 
 # --- pretrained fine-tuning ---------------------------------------------------------------------------------
@@ -228,7 +262,7 @@ def pretrained(cell: Mapping, root: Path) -> None:
         served = task.quantized(Quantization(weight_only=True))
         numerics = numerics_of(cell["precision"])
         with run_precision(numerics):
-            assert_served_as_its_forward(served, task.model, 1, numerics.dtypes.compute)
+            assert_served_as_its_forward(served, called_on(served), task.model, 1, numerics.dtypes.compute)
 
 
 # --- diffusion language models -----------------------------------------------------------------------------
@@ -248,18 +282,52 @@ def masked_trained(cell: Mapping, root: Path) -> Recorded:
                                           "model.mask_token_id": str(MASK)}), cell["devices"])
 
 
-def unmasked(cell: Mapping, run: str) -> np.ndarray:
-    """The run's sampler's continuation of a prompt (`dew.pipeline`), two denoising steps."""
-    return np.asarray(dew.pipeline(run)([PROMPT], 4, key=0, steps=2).host().tokens)
+def block_trained(cell: Mapping, root: Path) -> Recorded:
+    """A block-diffusion LM: DiffusionGemma's release fine-tuned on the shared LM data path's windows of a
+    token store in the release's own tokenizer (`run_kinds.blockwise`), five batches of its rows of 12 ids,
+    more than a run's steps read, its model's dtype left for the run's precision to derive."""
+    config = blockwise(root, drawn=False, tokens=5 * 8 * 12)
+    fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
+    config = dataclasses.replace(config, model=dataclasses.replace(config.model, fields=fields))
+    return Recorded(saved_record(config, root, "cell"), settings(cell, root), cell["devices"])
 
 
-def masked_diffusion(cell: Mapping, root: Path) -> None:
-    """Train a masked diffusion LM and reload its run to a sampler: every step's gradient finite, and its
-    sample keeping its prompt and leaving no position masked."""
-    run, _ = masked_trained(cell, root).trained()
-    assert_steps_finite(scalars(run).items(), "masked diffusion LM")
-    tokens = unmasked(cell, str(run))
-    assert list(tokens[0, :len(PROMPT)]) == PROMPT and (tokens[0, len(PROMPT):len(PROMPT) + 4] != MASK).all()
+DIFFUSION_LMS = {"masked": masked_trained, "block": block_trained}
+"""Each diffusion LM's training run at a cell, by its objective."""
+
+
+def diffusion_lm_trained(cell: Mapping, root: Path) -> Recorded:
+    """The cell's diffusion LM trained (`DIFFUSION_LMS`)."""
+    return DIFFUSION_LMS[cell["objective"]](cell, root)
+
+
+def windowed(cell: Mapping) -> bool:
+    """Whether a diffusion LM's cell is one its objective admits: a block-diffusion LM trains on the stream's
+    windows, a span of it a row (its run refuses packed documents), and a masked one on documents packed or
+    padded."""
+    return (cell["objective"] == "block") == (cell["rows"] == "windows")
+
+
+def diffusion_sampled(cell: Mapping, run: str) -> np.ndarray:
+    """The run's sampler's continuation of a prompt (`dew.pipeline`): a masked LM's in two denoising steps,
+    a block LM's canvases as its release's process refines them."""
+    steps = {"steps": 2} if cell["objective"] == "masked" else {}
+    return np.asarray(dew.pipeline(run)([PROMPT], 4, key=0, **steps).host().tokens)
+
+
+def diffusion_lm(cell: Mapping, root: Path) -> None:
+    """Train a masked or block diffusion LM and reload its run to a sampler: every step's gradient finite,
+    and its sample keeping its prompt; a masked LM's leaving no position masked, and a block LM's what a
+    generation over its final checkpoint's tree samples (export then reload is identical)."""
+    run, _ = diffusion_lm_trained(cell, root).trained()
+    assert_steps_finite(scalars(run).items(), f"{cell['objective']} diffusion LM")
+    tokens = diffusion_sampled(cell, str(run))
+    assert list(tokens[0, :len(PROMPT)]) == PROMPT
+    if cell["objective"] == "masked":
+        assert (tokens[0, len(PROMPT):len(PROMPT) + 4] != MASK).all()
+        return
+    restored = dew.pipeline(str(run)).bind(Checkpoints(str(run)).variables())
+    np.testing.assert_array_equal(tokens, np.asarray(restored([PROMPT], 4, key=0).host().tokens))
 
 
 # --- hybrid and state-space models --------------------------------------------------------------------------
@@ -268,24 +336,51 @@ LENGTHS = (16, 32)
 """The two lengths a tiny decoder of each kind is built for, whose caches `recurrent` compares."""
 
 
-@functools.cache
-def recurrent() -> tuple[str, ...]:
-    """The registry's recurrent mixer kinds (`mixers.paths`): each whose tiny decoder (`test_mixers.tiny`, at
-    the kind's fields there, `KIND_FIELDS`) states a cache (`cache_spec`, each holder's own statement of it)
-    of the same leaf shapes built for either of `LENGTHS`: a state of its own size, where keys and values
-    grow with the sequence."""
+def cache_shapes(kind: str, length: int, *, initialized: bool = False):
+    """The leaf shapes of the cache a tiny decoder of mixer `kind` (`test_mixers.tiny`, at the kind's fields
+    there, `KIND_FIELDS`) built for `length` states for a row (`cache_spec`, each holder's own statement of
+    it): read with the parameters its statement makes alone (`init_with_output`, no forward: half a second
+    for every kind at both lengths), or, `initialized`, over the decoder's whole variables as an
+    initialization makes them (`jax.eval_shape` of its init, each kind's forward traced: 13 s)."""
     from test_mixers import tiny
 
-    def shapes(kind: str, length: int):
-        fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-        model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=length, **overrides)
-        variables = nn.unbox(jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
-        spec = model.apply(variables, 1, method=lambda module, rows: module.cache_spec(rows))
-        return jax.tree.map(lambda leaf: tuple(leaf.shape), spec)
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=length, **overrides)
 
+    def stated(module, rows):
+        return module.cache_spec(rows)
+
+    if initialized:
+        variables = nn.unbox(jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
+        spec = model.apply(variables, 1, method=stated)
+    else:
+        spec, _ = model.init_with_output(jax.random.key(0), 1, method=stated)
+    return jax.tree.map(lambda leaf: tuple(leaf.shape), spec)
+
+
+def recurrent_of(shapes) -> tuple[str, ...]:
+    """The registry's kinds (`mixers.paths`) whose cache `shapes(kind, length)` states (`cache_shapes`) has
+    the same leaf shapes built for either of `LENGTHS`: a state of its own size, where keys and values grow
+    with the sequence; a kind that states no cache (a token-wise MLP's) holds no state to decode from."""
     stated = {kind: [shapes(kind, length) for length in LENGTHS] for kind in sorted(mixers.paths)}
-    # A kind that states no cache (a token-wise MLP's) holds no state to decode from.
     return tuple(kind for kind, (short, long) in stated.items() if jax.tree.leaves(short) and short == long)
+
+
+@functools.cache
+def recurrent() -> tuple[str, ...]:
+    """The registry's recurrent mixer kinds (`recurrent_of`), each read by its cache statement alone
+    (`cache_shapes`), as every task collecting this file reads them: over its initialized decoder's
+    variables they took 13 s of each task's start (main's train 1089: this file's 112 tasks half their
+    start; the owner's audit, 2026-11-20), which one test holds them to
+    (`test_the_recurrent_kinds_are_those_an_initialized_decoder_states`)."""
+    return recurrent_of(cache_shapes)
+
+
+def test_the_recurrent_kinds_are_those_an_initialized_decoder_states():
+    """The kinds each tiny decoder's cache statement read alone names recurrent (`recurrent`, the hybrid
+    scenario's axis) are those its statement over its initialized decoder's variables names, as a decode
+    reads them: a kind whose statement reads its parameters (a memory's momenta) is named alike."""
+    assert recurrent() == recurrent_of(functools.partial(cache_shapes, initialized=True))
 
 
 def mixer_settings(kind: str) -> dict[str, str]:
@@ -359,12 +454,21 @@ def jepa(cell: Mapping, root: Path) -> None:
 
 # --- online post-training -----------------------------------------------------------------------------------
 
-def online_rl_trained(cell: Mapping, root: Path) -> Recorded:
-    """The recorded GRPO run (`rl_support.recorded_grpo_config`), its rollout's method the cell's (GRPO or
-    RLOO), collecting rollouts from its policy and scoring them by the reward its import path names, its
-    model's dtype left for the run's precision to derive."""
+LANGUAGE_RL = ("grpo", "rloo")
+"""The rollout methods an online post-training cell trains a language policy by (`PromptRollout.method`); a
+diffusion policy's are `scenario_called.DIFFUSION_RL`'s."""
+
+
+def online_rl_trained(cell: Mapping, root: Path) -> Recorded | Called:
+    """The cell's RL run. A language policy's: the recorded GRPO run (`rl_support.recorded_grpo_config`), its
+    rollout's method the cell's (GRPO or RLOO), collecting rollouts from its policy and scoring them by the
+    reward its import path names, its model's dtype left for the run's precision to derive. A diffusion
+    policy's: a tiny DiT's flow RL run through Dew's API, in a fresh process
+    (`scenario_called.diffusion_rl_trained`)."""
     import rl_support
 
+    if cell["method"] in DIFFUSION_RL:
+        return called("diffusion_rl_trained")(cell, root)
     config = rl_support.recorded_grpo_config(root, "--rollout.method", cell["method"])
     fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
     config = dataclasses.replace(config, model=dataclasses.replace(config.model, fields=fields))
@@ -373,9 +477,9 @@ def online_rl_trained(cell: Mapping, root: Path) -> Recorded:
 
 
 def online_rl(cell: Mapping, root: Path) -> None:
-    """Language RL: collect rollouts, score them, update the policy, `dew train` as a user runs it: every
-    step's gradient finite. The run's scalars show no estimator, so which method it ran is not read here
-    (the methods' own tests hold each)."""
+    """Language or diffusion RL: collect rollouts, score them, update the policy, as a user runs it (`dew
+    train`, or Dew's API): every step's gradient finite. The run's scalars show no estimator, so which method
+    it ran is not read here (the methods' own tests hold each)."""
     run, _ = online_rl_trained(cell, root).trained()
     assert_steps_finite(scalars(run).items(), f"online {cell['method']}")
 
@@ -386,76 +490,150 @@ PROMPTS = (1, 3)
 """A served batch's prompts: one alone, or three together."""
 
 
+SERVERS = {"paged": {"kv_cache": KVCache(page_size=16, pages=12)}, "speculative": {}}
+"""Each way a cell serves its prompts through a server (`Server.from_task`), each prompt a request: over a
+paged cache, pages of 16 tokens pooled over its rows; or drafting speculative blocks (its task's
+`Speculative` strategy) over the dense cache a server speculates over."""
+SERVING = ("batch", *SERVERS)
+"""Each way a cell serves its prompts: one call of its task over them all (a batch), or a server's way
+(`SERVERS`)."""
+
+
 def serving_task(cell: Mapping) -> tuple[TextGeneration, nn.Module]:
     """The cell's served task and the canonical float model it serves: a decoder computing in the cell's
-    dtype, quantized after training (PTQ, weight-only) where the cell serves so."""
-    from model_support import serving_task as tiny_task
+    dtype (`model_support.decoder`, its weights drawn), with a prediction depth its task drafts speculative
+    blocks of three by where the cell speculates, quantized after training (PTQ, weight-only) where the cell
+    serves so, traced at the task's default example, a row as long as a prediction depth reads (row 9669)."""
+    from model_support import decoder
 
     from dew.quantization import Quantization
 
-    task = tiny_task(sampling=Sampling(temperature=0))
-    canonical = task.model.clone(dtype=numerics_of(cell["precision"]).dtypes.compute)
-    task = TextGeneration(canonical, task.variables, sampling=Sampling(temperature=0))
+    speculative = cell["serving"] == "speculative"
+    model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=int(speculative))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    canonical = model.clone(dtype=numerics_of(cell["precision"]).dtypes.compute)
+    task = TextGeneration(canonical, variables, sampling=Sampling(temperature=0),
+                          **({"strategy": Speculative(block=3)} if speculative else {}))
     if cell["quantization"] is not None:
         task = task.quantized(Quantization(dtype=cell["quantization"], weight_only=True))
     return task, canonical
 
 
+def served_through(cell: Mapping, task: TextGeneration) -> Callable[[list[list[int]], int], Draws]:
+    """Prompts served the cell's way (`SERVING`) over `task`, greedily: `serve(prompts, steps)`."""
+    if cell["serving"] == "batch":
+        return called_on(task)
+
+    def serve(prompts: list[list[int]], steps: int) -> Draws:
+        server = Server.from_task(task, slots=len(prompts), capacity=64, **SERVERS[cell["serving"]])
+        return [draws_of(generation)[0] for generation in server(prompts, steps, key=0)]
+    return serve
+
+
 def served(cell: Mapping, root: str) -> np.ndarray:
-    """The cell's served greedy continuation of its batch's prompts."""
+    """The cell's served greedy continuation of its batch's prompts, served its way (`served_through`): each
+    row's prompt and new tokens, one row after another."""
     task, _ = serving_task(cell)
     prompts = [[3, 4], [5, 6], [8, 9]][:cell["prompts"]]
     with run_precision(numerics_of(cell["precision"])):
-        return np.asarray(task(prompts, 4, key=0).host().tokens)
+        draws = served_through(cell, task)(prompts, 4)
+    return np.concatenate([tokens[:len(prompt) + length]
+                           for prompt, (tokens, length, _) in zip(prompts, draws, strict=True)])
 
 
 def serving(cell: Mapping, root: Path) -> None:
     """Generation and serving: a decoder computing in the cell's dtype, quantized after training as the cell
-    serves, over one prompt or a batch of three: its greedy continuation its float64 forward's
+    serves, over one prompt or a batch of three, served in one call, by a server over a paged cache or by a
+    server drafting speculative blocks: its greedy continuation its float64 forward's
     (`assert_served_as_its_forward`)."""
     task, canonical = serving_task(cell)
     with run_precision(numerics_of(cell["precision"])):
-        assert_served_as_its_forward(task, canonical, cell["prompts"], canonical.dtype)
+        assert_served_as_its_forward(task, served_through(cell, task), canonical, cell["prompts"],
+                                     canonical.dtype)
 
 
 # --- quantized interchange ----------------------------------------------------------------------------------
 
-def gguf_written(cell: Mapping, root: Path) -> Path:
-    """A llama written as a GGUF file of the cell's quantization under `root`: its directory."""
+def quantized_written(cell: Mapping, root: Path) -> None:
+    """The cell's quantized checkpoint where `scenario_called.quantized_loaded` reads it with `root`: a llama
+    written as a GGUF file of the cell's encoding under `root`, where its format is one (`GGUF`); a codec
+    checkpoint is read where its author wrote it."""
     import gguf
     from test_gguf import hf_tensors, write_gguf
 
-    rng = np.random.default_rng(0)
-    write_gguf(root / "model.gguf", "llama", getattr(gguf.GGMLQuantizationType, cell["format"]),
-               hf_tensors("llama", rng), rng)
-    return root
+    if cell["format"] in GGUF:
+        rng = np.random.default_rng(0)
+        write_gguf(root / "model.gguf", "llama", getattr(gguf.GGMLQuantizationType, cell["format"]),
+                   hf_tensors("llama", rng), rng)
 
 
-def gguf_run(cell: Mapping, root: Path) -> Called:
-    """A GGUF file of the cell's quantization written under `root`, and its llama's training run there
-    (`gguf_trained`), in a fresh process."""
-    gguf_written(cell, root)
-    return called("gguf_trained")(cell, root)
+FORMATS = (*GGUF, "modelopt/tiny", "storage/nvfp4")
+"""A quantized interchange cell's checkpoint formats: a GGUF file of each of its encodings, and ModelOpt's and
+compressed-tensors' NVFP4 checkpoints as their authors wrote them (`scenario_called.CODECS`), ModelOpt's
+quantizing its activations too and compressed-tensors' its weights alone."""
+ACTIVATIONS_QUANTIZED = ("modelopt/tiny",)
+"""The formats whose forward quantizes its activations as well as its weights."""
 
 
-def gguf_served(cell: Mapping, root: str) -> np.ndarray:
-    """A GGUF file of the cell's quantization written under `root`, its llama served: its greedy continuation
-    of a prompt."""
-    source = gguf_loaded(gguf_written(cell, Path(root)))
+def assert_served_alike(task: TextGeneration, vocab: int) -> None:
+    """A checkpoint that quantizes its activations served greedily (row 9704): three prompts of one width
+    served by one call and again, and by a server over a paged cache. The repeated call draws what the
+    first drew, bit for bit. Each server row draws the call's tokens, and every log-probability past the
+    prompt's step bit for bit: each decode step reduces in one order whichever cache it reads, where the
+    prompt's step heads a batch of another width. Every token is in the vocabulary, every row draws each of
+    its steps, and every log-probability is finite. No forward is the truth of its continuation at a margin:
+    an activation at its format's grid midpoint quantizes either way under another path's rounding
+    (docs/design/testing.md)."""
+    prompts, steps = [[3, 4, 5], [6, 7, 8], [9, 10, 11]], 4
+    once = called_on(task)(prompts, steps)
+    again = called_on(task)(prompts, steps)
+    paged = served_through({"serving": "paged"}, task)(prompts, steps)
+    for (tokens, length, log_probs), (tokens_again, length_again, log_probs_again), (
+            served_tokens, served_length, served_log_probs) in zip(once, again, paged, strict=True):
+        assert (length, length_again, served_length) == (steps, steps, steps)
+        drawn = tokens[:len(prompts[0]) + steps]
+        assert drawn.tobytes() == tokens_again[:len(drawn)].tobytes() == served_tokens[:len(drawn)].tobytes()
+        assert log_probs[:steps].tobytes() == log_probs_again[:steps].tobytes()
+        assert log_probs[1:steps].tobytes() == served_log_probs[1:steps].tobytes()
+        assert ((drawn >= 0) & (drawn < vocab)).all()
+        assert np.isfinite(log_probs[:steps]).all() and np.isfinite(served_log_probs[:steps]).all()
+
+
+def quantized_source(cell: Mapping, root: Path):
+    """The cell's quantized checkpoint (`quantized_written`) loaded (`scenario_called.quantized_loaded`)."""
+    quantized_written(cell, root)
+    return quantized_loaded(cell["format"], root)
+
+
+def quantized_run(cell: Mapping, root: Path) -> Called:
+    """The cell's quantized checkpoint (`quantized_written`) and its training run under `root`
+    (`scenario_called.quantized_trained`), in a fresh process."""
+    quantized_written(cell, root)
+    return called("quantized_trained")(cell, root)
+
+
+def quantized_served(cell: Mapping, root: str) -> np.ndarray:
+    """The cell's quantized checkpoint served (`quantized_source`): its greedy continuation of a prompt."""
+    source = quantized_source(cell, Path(root))
     task = TextGeneration(source.model, source.variables, sampling=Sampling(temperature=0))
     return np.asarray(task([[3, 4, 5]], 4, key=0).host().tokens)
 
 
 def quantized_interchange(cell: Mapping, root: Path) -> None:
-    """Quantized interchange: a llama written as a GGUF file of the cell's quantization, loaded, then trained
-    on from its dequantized weights (`gguf_trained`) or served, its greedy continuation its float64
-    forward's."""
+    """Quantized interchange: a quantized checkpoint of the cell's format (`FORMATS`) loaded, then trained on
+    from its decoded weights (`quantized_trained`) or served: a weight-only format's greedy continuation its
+    float64 forward's, one that quantizes its activations served alike by a call and a server
+    (`assert_served_alike`)."""
     if cell["use"] == "train":
-        gguf_run(cell, root).trained()
+        quantized_run(cell, root).trained()
         return
-    source = gguf_loaded(gguf_written(cell, root))
+    source = quantized_source(cell, root)
     task = TextGeneration(source.model, source.variables, sampling=Sampling(temperature=0))
-    assert_served_as_its_forward(task, source.model, 1, source.model.dtype)
+    if cell["format"] in ACTIVATIONS_QUANTIZED:
+        vocab = json.loads((CODECS / cell["format"] / "config.json").read_text())["vocab_size"]
+        assert_served_alike(task, vocab)
+        return
+    assert_served_as_its_forward(task, called_on(task), source.model, 1, source.model.dtype)
 
 
 # --- published diffusion pipelines --------------------------------------------------------------------------
@@ -505,8 +683,9 @@ SCENARIOS: Mapping[str, Scenario] = {
         {"precision": PRECISIONS, "adapter": ("full", "lora"), "quantization": (None, "qat", "ptq"),
          "devices": (1, 2)}, pretrained, pretrained_trained, "generated", laid=()),
     "Diffusion language models": Scenario(
-        {"precision": PRECISIONS, "rows": ("padded", "packed"), "devices": (1, 2)}, masked_diffusion,
-        masked_trained, "unmasked"),
+        {"objective": tuple(DIFFUSION_LMS), "precision": PRECISIONS, "rows": ("padded", "packed", "windows"),
+         "devices": (1, 2)}, diffusion_lm, diffusion_lm_trained, "diffusion_sampled", admits=windowed,
+        apart=("objective",)),
     "Hybrid and state-space models": Scenario(
         {"mixer": recurrent(), "precision": PRECISIONS, "rows": ("padded", "packed"), "devices": (1, 2)},
         hybrid, hybrid_trained, "generated", laid=("mixer",)),
@@ -520,14 +699,15 @@ SCENARIOS: Mapping[str, Scenario] = {
         {"precision": PRECISIONS, "devices": (1, 2), "read": ("memory", "indexed", "streamed")}, jepa,
         called("jepa_trained")),
     "Online post-training": Scenario(
-        {"method": ("grpo", "rloo"), "precision": PRECISIONS, "devices": (1, 2)}, online_rl,
-        online_rl_trained),
+        {"method": (*LANGUAGE_RL, *DIFFUSION_RL), "precision": PRECISIONS, "devices": (1, 2)}, online_rl,
+        online_rl_trained, apart=("method",)),
     "Generation and serving": Scenario(
-        {"precision": PRECISIONS, "quantization": (None, *typing.get_args(QuantizedDtype)),
-         "prompts": PROMPTS}, serving, sampled="served", sampled_from="root"),
+        {"serving": SERVING, "precision": PRECISIONS,
+         "quantization": (None, *typing.get_args(QuantizedDtype)), "prompts": PROMPTS}, serving,
+        sampled="served", sampled_from="root", apart=("serving",)),
     "Quantized interchange": Scenario(
-        {"format": ("Q8_0", "Q4_0"), "use": ("train", "serve")}, quantized_interchange, gguf_run,
-        "gguf_served", "root"),
+        {"format": FORMATS, "use": ("train", "serve")}, quantized_interchange, quantized_run,
+        "quantized_served", "root"),
     "Published diffusion pipelines": Scenario(
         {"family": _pipelines(), "dtype": ("float32", "bfloat16")}, published_pipeline,
         sampled="pipeline_sampled", sampled_from="root"),
@@ -540,7 +720,7 @@ def _named(cell: Mapping) -> str:
 
 
 CELLS = [pytest.param(name, cell, id=f"{name}-{_named(cell)}")
-         for name, scenario in SCENARIOS.items() for cell in covering(scenario.axes)]
+         for name, scenario in SCENARIOS.items() for cell in scenario.cells()]
 
 
 @pytest.mark.parametrize(("name", "cell"), CELLS)
@@ -550,25 +730,50 @@ def test_a_scenarios_cell_holds_the_contracts_its_flow_touches(name, cell, tmp_p
 
 
 def first(name: str) -> dict:
-    """A scenario's first cell, where it holds the claims a run of their own shows."""
-    return covering(SCENARIOS[name].axes)[0]
+    """A scenario's first cell, where it holds its rows claims (`LAID`)."""
+    return SCENARIOS[name].cells()[0]
 
 
-@pytest.mark.parametrize("name", [name for name, scenario in SCENARIOS.items() if scenario.trained])
-def test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs(name, tmp_path):
+def first_cells(held: Callable[[Scenario], object]) -> list:
+    """The first cells of every scenario `held` holds (`Scenario.firsts`), as a test's parameters: the
+    scenario's name and the cell, named by the scenario and the values of its axes apart."""
+    def named(name: str, cell: dict) -> str:
+        apart = {axis: cell[axis] for axis in SCENARIOS[name].apart}
+        return f"{name}-{_named(apart)}" if apart else name
+
+    return [pytest.param(name, cell, id=named(name, cell))
+            for name, scenario in SCENARIOS.items() if held(scenario) for cell in scenario.firsts()]
+
+
+@pytest.mark.parametrize(("name", "cell"), first_cells(lambda scenario: scenario.trained))
+def test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs(name, cell,
+                                                                                          tmp_path):
     """Resume equals the uninterrupted run, and a resumed run reuses its compiled programs (testing.md's
-    contracts), once a scenario on its first cell (`assert_resumes_onto_its_uninterrupted_run`)."""
-    assert_resumes_onto_its_uninterrupted_run(SCENARIOS[name].trained(first(name), tmp_path), tmp_path)
+    contracts), once a flow of a scenario on its first cell (`assert_resumes_onto_its_uninterrupted_run`); and
+    where the scenario samples its trained run, a repeated run reuses its compiled programs, sampling
+    (`samples_from_its_cached_programs`), over that uninterrupted run, where a test of its own trained the
+    run again first (row 10137's cut)."""
+    scenario = SCENARIOS[name]
+    whole = assert_resumes_onto_its_uninterrupted_run(scenario.trained(cell, tmp_path), tmp_path)
+    if scenario.sampled is not None and scenario.sampled_from == "run":
+        samples_from_its_cached_programs(name, cell, whole, tmp_path)
 
 
-@pytest.mark.parametrize("name", [name for name, scenario in SCENARIOS.items() if scenario.sampled])
-def test_a_scenarios_sampling_reruns_from_its_compiled_programs(name, tmp_path):
-    """A repeated run reuses its compiled programs, sampling (testing.md's contracts), once a scenario on its
-    first cell: its sampling of the cell's trained run, or of what it writes under the cell's root, twice in
-    fresh processes over one persistent cache (`assert_samples_from_its_cached_programs`)."""
-    scenario, cell = SCENARIOS[name], first(name)
-    source = scenario.trained(cell, tmp_path).trained()[0] if scenario.sampled_from == "run" else tmp_path
-    assert_samples_from_its_cached_programs(MODULE, scenario.sampled, cell, str(source), root=tmp_path)
+def samples_from_its_cached_programs(name: str, cell: Mapping, source: Path, root: Path) -> None:
+    """A repeated run reuses its compiled programs, sampling (testing.md's contracts), once a flow of a
+    scenario on its first cell: its sampling of `source`, the cell's trained run or its root, where it samples
+    what it writes there itself, twice in fresh processes over one persistent cache under `root`
+    (`assert_samples_from_its_cached_programs`)."""
+    assert_samples_from_its_cached_programs(MODULE, SCENARIOS[name].sampled, cell, str(source), root=root)
+
+
+@pytest.mark.parametrize(("name", "cell"), first_cells(
+    lambda scenario: scenario.sampled and (scenario.sampled_from == "root" or not scenario.trained)))
+def test_a_scenarios_sampling_reruns_from_its_compiled_programs(name, cell, tmp_path):
+    """A repeated run reuses its compiled programs, sampling, of what a scenario's first cell writes under its
+    root (`samples_from_its_cached_programs`); a scenario that samples its trained run holds it beside its
+    resume (`test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs`)."""
+    samples_from_its_cached_programs(name, cell, tmp_path, tmp_path)
 
 
 # --- a first step however its rows are laid or split ------------------------------------------------------

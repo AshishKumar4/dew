@@ -658,7 +658,7 @@ def checked(state: TrainState | ReplicaState) -> dict[str, Variables | optax.Opt
     """The trees of `state` (a run's, or DiLoCo's replicas' inner copies) a finite step keeps finite and a
     save refuses non-finite: the parameters, the optimizer state and the averages. The one statement of
     them, which the step's acceptance (`finish_attempt`) and a save's refusal
-    (`dew.training.trainer.refuse_non_finite`) read. The optimizer state is read without the
+    (`refuse_non_finite`) read. The optimizer state is read without the
     hyperparameters injected beside it at any depth (`_numerical`): control values a schedule or the user
     sets, not written by a step's gradient, and legally infinite (a clip's bound of `math.inf`)."""
     return {"variables": state.variables, "opt_state": _numerical(state.opt_state), "ema": state.ema}
@@ -905,12 +905,17 @@ def batch_statistics_shapes[LossT, EffectsT](
                           state.key, state.updates)
 
 
-def placed_as_rows(index: jax.Array, batch) -> jax.Array:
+def placed_as_rows(index: jax.Array | jax.ShapeDtypeStruct, batch: Batch) -> jax.Array | jax.ShapeDtypeStruct:
     """`index`, an entry for each of `batch`'s rows, placed as the batch's rows are, so each device
-    reads its own rows' entries alone."""
+    reads its own rows' entries alone: an array resharded, its shape (a pass over shapes) carrying the
+    placement (`placed_shapes`)."""
     like = next(leaf for leaf in jax.tree.leaves(batch) if np.ndim(leaf))
     placed = rows_spec(like, 1)
-    return index if placed is None else jax.sharding.reshard(index, placed)
+    if placed is None:
+        return index
+    if isinstance(index, jax.ShapeDtypeStruct):
+        return jax.ShapeDtypeStruct(index.shape, index.dtype, sharding=placed, weak_type=index.weak_type)
+    return jax.sharding.reshard(index, placed)
 
 
 class Transaction:
@@ -1569,12 +1574,15 @@ class Transaction:
             return None
         if holds_back(state.opt_state) or clips_qk(state.opt_state):
             return None
-        if not consumed_where_made(self.optimizer, state, 1, shared=self.shared,
-                                   progressed=self.bound is not None):
-            return None
+        # The model's runs and its optimizer's copies first, read off the trees: the optimizer's update is
+        # traced (`consumed_where_made`) only for a run that could be updated so (row 6740: a model with no
+        # stacked run traced a whole update it then discarded).
         params = state.variables["params"]
         runs = _stage_runs(params)
         if not runs or not _held_in_copies(state.opt_state, params):
+            return None
+        if not consumed_where_made(self.optimizer, state, 1, shared=self.shared,
+                                   progressed=self.bound is not None):
             return None
         copies = _param_copies(state.opt_state, params)
         names = tuple(f"{in_backward.MOMENTS}_{index}" for index in range(len(copies)))
@@ -1885,33 +1893,62 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
     def loss(variables, batch, microstep, key, step, ema, updates):
         shared = batch_statistics_shapes(objective, state, batch, window, split)
         stats = None if shared is None else tuple(jnp.zeros(x.shape, x.dtype) for x in shared)
-        return objective._loss(variables, batch, _first_attempt(state, window, split, variables, batch,
+        return objective._loss(variables, batch, _first_attempt(state, window, split, None, variables, batch,
                                                                 microstep, key, step, ema, updates, stats))
 
     return loss, (variables, state.microstep, state.key, state.step, state.ema, state.updates)
 
 
-def _first_attempt(state, window: int, split: int, variables, batch, microstep, key, count, ema, updates,
-                   statistics) -> Step:
+def _first_attempt(state, window: int, split: int, watched: Watched | None, variables, batch, microstep, key,
+                   count, ema, updates, statistics) -> Step:
     """The `Step` of a step's first attempt of its first part over `state` at these of its fields, as the
-    transaction reads it (`attempt_step`): what a trace of the step's loss alone takes (`traced_loss`,
-    `loss_arguments`)."""
+    transaction reads it (`attempt_step`), watching `watched` where given (a sampled step's): what a trace
+    of the step's loss alone takes (`traced_loss`, `loss_arguments`)."""
     current = dataclasses.replace(state, microstep=microstep, key=key, step=count, updates=updates)
     return attempt_step(current, variables, ema, batch, split=split, slots=window, attempt=count * split,
-                        part=0, slot=microstep % window, batch_statistics=statistics)
+                        part=0, slot=microstep % window, batch_statistics=statistics, watched=watched)
 
 
 def loss_arguments[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, batch: Batch,
-                                    window: int, split: int) -> tuple[Variables, Step]:
+                                    window: int, split: int, *, watched: Watched | None = None
+                                    ) -> tuple[Variables, Step]:
     """The abstract variables and `Step` a step evaluates `objective`'s loss over (`objective._loss`), for
     `state` and a microbatch of `batch`'s shapes, its update a `window` of microbatches, each step read in
-    `split`: its first attempt's of its first part (`_first_attempt`), every value a step varies (its key,
-    its microstep, its examples, its pooled batch statistics) among its leaves, shapes and dtypes alone: what
-    a step's loss is compiled over apart from the step (a streamed step's priced program,
-    `dew.training.streaming`)."""
+    `split`: its first attempt's of its first part (`_first_attempt`), a sampled step's where it `watched`
+    its outputs (`Trainer.inspection`), every value a step varies (its key, its microstep, its examples, its
+    pooled batch statistics) among its leaves, shapes and dtypes alone: what a step's loss is compiled over
+    apart from the step (a streamed step's priced program, `dew.training.streaming`)."""
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
     shared = batch_statistics_shapes(objective, state, batch, window, split)
-    abstract = jax.eval_shape(functools.partial(_first_attempt, state, window, split), variables, batch,
-                              state.microstep, state.key, state.step, state.ema, state.updates,
-                              None if shared is None else tuple(shared))
+    attempted = functools.partial(_first_attempt, state, window, split, watched)
+    abstract = jax.eval_shape(attempted, variables, batch, state.microstep, state.key, state.step, state.ema,
+                              state.updates, None if shared is None else tuple(shared))
     return variables, abstract
+
+
+def first_non_finite(state: TrainState) -> str | None:
+    """The first leaf of `state`'s checked trees (`transaction.checked`: the parameters, every optimizer
+    leaf and the averages, and under DiLoCo each replica's inner copy of them) holding a value that is not
+    finite, by its path; None where none does. Read wherever the leaves are placed, one compiled check a
+    placement (`transaction.finite_flags`), the same on every process."""
+    trees = {**checked(state), **({} if state.inner is None else
+                                  {f"inner.{name}": tree for name, tree in checked(state.inner).items()})}
+    leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
+              for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
+              if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
+    finite = finite_flags([leaf for _, leaf in leaves])
+    return next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
+
+
+def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
+    """Refuse to save a `state` holding a value that is not finite (`first_non_finite`), on any tier: no
+    checkpoint is written and none rotated out, and the run stops, naming the step and the first such leaf,
+    so the checkpoint a resume finds is the last finite one (`latest`, read only to say so) (training.md,
+    checkpoints and resume). Read at the writers' own boundary (`Checkpoints.save`, `save_local`), so a
+    direct save is held to it as a trainer's is (row 9021)."""
+    first = first_non_finite(state)
+    if first is not None:
+        kept = latest()
+        said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
+        raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
+                           f"is written and {said} is the one a resume finds")

@@ -100,9 +100,11 @@ __all__ = [
     "DecoderTraining",
     "Decoding",
     "DenoisingModel",
+    "DrawsAlone",
     "Exposing",
     "Generating",
     "HiddenStates",
+    "HookedDecoder",
     "IntervalModel",
     "Lacks",
     "LayerScalars",
@@ -276,10 +278,24 @@ class OutputTable:
 @runtime_checkable
 class ComputesIn(Protocol):
     """A model that states the dtype it computes in (`dtype`), a field of its own or its decoder's
-    (DiffusionGemma's); None computes in its parameters' dtype."""
+    (DiffusionGemma's); None computes in its parameters' dtype (`computes_in`)."""
 
     @property
     def dtype(self) -> Dtype | None: ...
+
+
+def computes_in(stated: DTypeLike | None, params) -> jnp.dtype:
+    """The dtype a module computes in: `stated` where given (its `dtype`, `ComputesIn`), else what Flax
+    promotes its float parameters (`params`, arrays or their shapes) to, as its products with an input of
+    theirs give, float32 where it holds none. A quantized store's codes (floats of one byte or less: fp8,
+    fp6, fp4) are no dtype a product computes in, their scales the store's: the one rule a cache's dtype
+    (`dew.nn.kv_cache.compute_dtype`), a streamed step's price (`dew.training.streaming.compute_dtype`) and
+    a release's (`dew.interop.release.computed_in`) read."""
+    if stated is not None:
+        return jnp.dtype(stated)
+    floats = [leaf.dtype for leaf in jax.tree.leaves(params)
+              if jnp.issubdtype(leaf.dtype, jnp.floating) and jnp.dtype(leaf.dtype).itemsize > 1]
+    return jnp.dtype(jnp.result_type(*floats)) if floats else jnp.dtype(jnp.float32)
 
 
 @runtime_checkable
@@ -1067,12 +1083,6 @@ class BlockReading(Protocol):
     def block_chunks(self) -> tuple[int | None, ...]: ...
 
 
-def block_chunks_of(model: nn.Module) -> tuple[int | None, ...]:
-    """The attention chunk of each trunk layer that reads blocks whole, None where a layer has none; empty for
-    a model that says nothing, or whose layers read none (`BlockReading`)."""
-    return model.block_chunks() if isinstance(model, BlockReading) else ()
-
-
 def whole_block(chunks: tuple[int | None, ...]) -> bool:
     """Whether a layer that reads blocks reads every block whole: one with no attention chunk. A chunk is
     a run of places counted from 0 (`chunk_mask`), and a block's places start wherever its tokens sit in
@@ -1176,6 +1186,18 @@ class Layered(Protocol):
     def with_kv_cache(self, layout: KVCache) -> Self: ...
 
 
+class HookedDecoder(Bounded, CacheCapacity, Layered, Protocol):
+    """A decoder a module around it forwards its hooks to (`dew.nn.wrapping.DecoderHooks`): its vocabulary
+    and bounds, its cache's layout and the same decoder at another layout or capacity. The rest the module
+    reads through the protocol the decoder states, where it states one."""
+
+
+def block_chunks_of(model: nn.Module | HookedDecoder) -> tuple[int | None, ...]:
+    """The attention chunk of each trunk layer that reads blocks whole, None where a layer has none; empty for
+    a model that says nothing, or whose layers read none (`BlockReading`)."""
+    return model.block_chunks() if isinstance(model, BlockReading) else ()
+
+
 @runtime_checkable
 class Exposing(Protocol):
     """A decoder that hands back its hidden states beside its logits, which a
@@ -1187,10 +1209,12 @@ class Exposing(Protocol):
 @runtime_checkable
 class Selective(Protocol):
     """A decoder that scores one position per row instead of them all, so its
-    prefill runs the head only on the slot the first draw reads."""
+    prefill runs the head only on the slot the first draw reads; its prediction
+    states beside the logits, or None for a decoder that keeps none, whose decode
+    steps carry none (`dew.sampling.strategies.DecoderState.hidden`)."""
 
     def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: ModelKwarg
-                             ) -> tuple[jax.Array, jax.Array]: ...
+                             ) -> tuple[jax.Array | None, jax.Array]: ...
 
 
 @runtime_checkable
@@ -1340,6 +1364,17 @@ class IntervalModel(Protocol):
 
     @property
     def interval(self) -> bool: ...
+
+
+@runtime_checkable
+class DrawsAlone(Protocol):
+    """A decoder whose decode state moves with every token it reads, past what a cache's cursor rewinds
+    (an in-context level's chain, `dew.objectives.lm.adaptation.InContextDecoder`): it draws one token a
+    row at a time (`dew.sampling.strategies.Sample`), and a strategy that reads tokens it then rejects or
+    reorders (a speculative block's, a beam's) is refused, naming `draws_alone`'s reason."""
+
+    @property
+    def draws_alone(self) -> str: ...
 
 
 @runtime_checkable

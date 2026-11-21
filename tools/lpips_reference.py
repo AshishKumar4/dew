@@ -88,7 +88,9 @@ def distances(vgg, linear, images, references, dtype, *, gradient: bool) -> dict
         result = {"distance": value.detach().reshape(-1).numpy()}
         if gradient:
             value.mean().backward()
-            result["gradient"] = first.grad.permute(0, 2, 3, 1).numpy()
+            if (grad := first.grad) is None:
+                raise RuntimeError("the backward pass left the image without its gradient")
+            result["gradient"] = grad.permute(0, 2, 3, 1).numpy()
     return result
 
 
@@ -120,7 +122,7 @@ def main() -> None:
     for dtype, tail in ((torch.float64, "_f64"), (torch.float32, "")):
         for key, value in distances(vgg, linear, first, second, dtype, gradient=True).items():
             arrays[f"{key}{tail}"] = value
-    np.savez(FIXTURE / "drawn.npz", **arrays)
+    np.savez(FIXTURE / "drawn.npz", allow_pickle=False, **arrays)
 
     assert hashlib.md5(published_file("vgg.pth").read_bytes()).hexdigest() == LPIPS_MD5
     state = torch.load(published_file("vgg16-397923af.pth"), map_location="cpu", weights_only=True)
@@ -132,7 +134,7 @@ def main() -> None:
     for dtype, tail in ((torch.float64, "_f64"), (torch.float32, "")):
         published[f"distance{tail}"] = distances(vgg, linear, first, second, dtype,
                                                  gradient=False)["distance"]
-    np.savez(FIXTURE / "published.npz", **published)
+    np.savez(FIXTURE / "published.npz", allow_pickle=False, **published)
     print(f"{FIXTURE}: drawn {arrays['distance_f64']}, published {published['distance_f64']}")
 
 

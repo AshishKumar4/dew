@@ -28,6 +28,7 @@ scope and contracted with the taps as one 2D product (stride 1 train 3.9 times, 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import math
@@ -52,6 +53,14 @@ from dew.nn.derivatives import (
     surrogate,
     with_gradients_formed_at,
     with_tangents_formed,
+)
+from dew.nn.float_bits import (
+    exact_power2,
+    lowered_rounded,
+    raw_fields,
+    split_bits,
+    two_factor_reach,
+    widened_exactly,
 )
 from dew.nn.nested import nested
 from dew.nn.programs import UNROUNDED, equations
@@ -85,6 +94,7 @@ __all__ = [
     "bf16_logits",
     "bf16_product",
     "biased",
+    "biased_value",
     "capped_logits",
     "compensated_add",
     "compensated_difference",
@@ -258,10 +268,12 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     return _biased(product, bias)
 
 
-def _biased_value(product: jax.Array, bias: jax.Array) -> jax.Array:
+def biased_value(product: jax.Array, bias: jax.Array) -> jax.Array:
     """`biased`'s value: `product` plus `bias` spread at fp32 (`broadcast_summed`) over the product's
     trailing axes, as flax's layers reshape it, so no rank is promoted implicitly; rounded back, it adds as
-    flax adds it (XLA folds the round trip, so the product and bias fuse as before)."""
+    flax adds it (XLA folds the round trip, so the product and bias fuse as before). Differentiated as it
+    is, its bias's gradient sums at fp32 (`broadcast_summed`'s): a projection's rule over its product and
+    bias together reads it so (`dew.nn.kernels.projections.dot_general`'s `bias`)."""
     dtype = jnp.result_type(product, bias)
     leading = product.ndim - bias.ndim
     spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)), dtype=dtype)
@@ -279,7 +291,7 @@ def _biased_tangent(primals, tangents):
     product, bias = primals
     d_product, d_bias = tangents
     d_product, d_bias = with_tangents_formed(d_product, d_bias)
-    value = _biased_value(product, bias)
+    value = biased_value(product, bias)
     dtype = value.dtype
     leading = product.ndim - bias.ndim
     terms = ([] if isinstance(d_product, SymbolicZero) else [d_product.astype(dtype)]) + (
@@ -292,7 +304,7 @@ def _biased_tangent(primals, tangents):
 
 
 _biased = contracted("test_a_biased_sum_holds_every_order")(
-    declared_tangent(Protected(), _biased_value, _biased_tangent, symbolic_zeros=True))
+    declared_tangent(Protected(), biased_value, _biased_tangent, symbolic_zeros=True))
 
 
 def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...], *,
@@ -471,13 +483,56 @@ def _exp_value(base2: bool, x) -> jax.Array:
         n = jnp.round(x * (1.0 / math.log(2.0)))
         r = (x - n * _LN2_HI) - n * _LN2_LO
     summed = functools.reduce(lambda p, term: p * r + term, _EXP_TERMS[1:], jnp.full_like(r, _EXP_TERMS[0]))
-    half = jnp.floor(n * 0.5)
-    return summed * _power_of_two(half) * _power_of_two(n - half)
+    return power2(summed, n, reach=150)
 
 
-def _power_of_two(n) -> jax.Array:
-    """`2^n`, fp32, of an integral `n` within fp32's normal exponents, set in its exponent bits."""
-    return jax.lax.bitcast_convert_type((n.astype(jnp.int32) + 127) << 23, jnp.float32)
+def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
+    """`x * 2^k` for an integral `k` of any size, exactly wherever `x` and the result are normal values of
+    its format (`x`'s, at least float32's, `at_least_fp32`), by exact powers of two of `k`'s sign
+    (`exact_power2`), `k` held within `reach` (by default the format's saturating bound, 279 in float32):
+    the one owner of scaling by a power of two (`scalar_power2` a Mosaic kernel's scalar `k`). A backend that
+    flushes subnormals flushes a subnormal `x` first (`raised_exactly` raises one from its bits).
+
+    Past `two_factor_reach`, `x` takes `2^o 2^(k - 2o) 2^o`, its own reverse: `o` zero where `k` is a normal
+    exponent, else `k`'s half held within the normal exponents, at least half of `-minexp` (float32's 63),
+    past `nmant`. So on a backend that keeps subnormals a result below the least normal rounds once, at the
+    last factor (the product before it is normal wherever the result rounds to no zero), and so does its
+    pullback, which applies the same factors in reverse before it sums a broadcast operand's cotangent
+    (base review 44e282c4f F1).
+    Within it, a caller stating its `reach` takes `k`'s two halves, each built as its product takes it, one
+    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half."""
+    # Held at least in float32: an 8-bit float promotes implicitly to nothing.
+    dtype = at_least_fp32(jnp.asarray(x).dtype)
+    x = jnp.asarray(x, dtype)
+    limits = jnp.finfo(dtype)
+    least, largest = limits.minexp, limits.maxexp - 1
+    held = (largest + 1) - (least - limits.nmant) + 2 if reach is None else min(
+        reach, (largest + 1) - (least - limits.nmant) + 2)
+    # A Python integer held before it converts: one past float32's range raised in its host conversion.
+    if isinstance(k, int):
+        k = min(max(k, -held), held)
+    # Held as float32, which holds every exponent within the bound exactly: no narrow integer `k` wraps.
+    k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
+    if held <= two_factor_reach(dtype):
+        # The half truncated by its conversion, an integer only at each factor's bias: an int32 half or a
+        # float `trunc` spilled the A100's recurrence and attention launches (row 2519).
+        half = (k * np.float32(0.5)).astype(jnp.int32)
+        return (x * exact_power2(half, dtype)
+                * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32), dtype))
+    # The middle `k - 2o` within `nmant + 4` of zero wherever `o` is held: `held` is at most three times
+    # `-minexp`.
+    outer = jnp.where(jnp.abs(k) <= -least, 0,
+                      jnp.clip((k * np.float32(0.5)).astype(jnp.int32), least, -least))
+    side = exact_power2(outer, dtype)
+    return x * side * exact_power2(k.astype(jnp.int32) - 2 * outer, dtype) * side
+
+
+def scalar_power2(x: jax.Array, k: jax.Array) -> jax.Array:
+    """`x` times `2^k` for a scalar integral `k` from -252 to 254, as two scalar normal powers of two
+    (`floor(k/2)` and the rest; `exp2` of an integer, a GPU's exactly): `power2`'s form for a Mosaic GPU
+    kernel's scalar `k`, which takes no bitcast of a scalar and no tile of exponent bits (et-c7512)."""
+    half = jnp.floor(k * 0.5)
+    return x * jnp.exp2(half) * jnp.exp2(k - half)
 
 
 def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:
@@ -737,8 +792,9 @@ def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
     @_protected
     def wide(*operands):
         with jax.enable_x64(new_val=True):
-            reduced = reduction(*(operand.astype(jnp.float64) if operand.dtype == jnp.float32 else operand
-                                  for operand in operands))
+            # Widened from its bits, where XLA:CPU's cast flushes a subnormal (`widened_exactly`).
+            reduced = reduction(*(widened_exactly(operand, jnp.float64) if operand.dtype == jnp.float32
+                                  else operand for operand in operands))
             return tuple(term.astype(jnp.float32) if term.dtype == jnp.float64 else term for term in reduced)
 
     return tuple(jax.lax.platform_dependent(*operands, cpu=wide, default=lambda *operands: tuple(
@@ -881,7 +937,7 @@ def _summed_wide(product: Callable, preferred_element_type, *operands, counts: i
         pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
         with jax.enable_x64(new_val=True):
             wide = _widened(operands, counts)
-            wide_cotangent = cotangent.astype(jnp.float64)
+            wide_cotangent = widened_exactly(cotangent, jnp.float64)
 
             def transposed(index):
                 # The product is linear in each operand alone, so its transpose there forms the
@@ -1298,13 +1354,87 @@ def _protected(transform: Callable) -> Callable:
     return bound_span(Protected(), transform)
 
 
+MARKED_BACKENDS = ("cpu", "cuda")
+"""The platforms whose compiler rounds an operation the fork's no-contract attribute marks on its own, so a
+marked transform's operands need no barrier there (`uncontracted`, chosen as the program lowers for its
+platform): XLA:CPU's fusion compiler fences the mark (the fork's xla no_contract_mark patch); XLA:GPU's
+native fusion emitters on CUDA contract no float add, subtract or multiply, marked or not, NVPTX fusing only
+an operation flagged to contract, which no emitter but the CPU's sets (row 10135: a marked and a plain
+`a * b + c` bitwise the separately rounded one on an A100 and a GH200 at post115;
+`test_no_contract.a_marked_multiply_add_rounds_each_step` fails should a later XLA contract one). ROCm's and
+a TPU's take the barrier."""
+
+TRACED_MARKED = ("cpu",)
+"""The platforms a call's code is chosen for (`dew.nn.kernels.generation.backend`) whose traces are marked
+(`rounding_alone`): a CPU's, which may lower for a platform of `MARKED_BACKENDS` or another (`uncontracted`'s
+platform choice). A GPU's trace keeps the barrier: a raw `pallas_call`'s body traced on a GPU outside Dew's
+launches would meet the platform choice, which Pallas's Triton and Mosaic GPU lowerings refuse, and no public
+JAX predicate states a Pallas trace yet (row 10138)."""
+
+def _as_they_are(values: tuple) -> tuple:
+    """`values` unbarriered: a platform choice's branch where its compiler fences the mark
+    (`uncontracted`)."""
+    return values
+
+
+_UNBARRIERED = dict.fromkeys(MARKED_BACKENDS, _as_they_are)
+"""`uncontracted`'s branches by the platform a program lowers for, each that fences the mark's."""
+
+_MARKING = contextvars.ContextVar("dew.nn.precision.marking", default=False)
+"""Whether the arithmetic traced now is marked to round alone (`rounding_alone`), so the operands it reads
+need no barrier (`uncontracted`)."""
+
+
+def no_contract() -> str | None:
+    """The frontend attribute under which a compiler of `MARKED_BACKENDS` rounds a float add, subtract or
+    multiply on its own, never contracted into a fused multiply-add (`jax.extend.backend
+    .no_contract_attribute`, the fork's from post112); None where the jaxlib marks nothing (a stock jaxlib),
+    or where the suite asks the barrier path (`dew._cache.BARRIERED`)."""
+    from jax.extend.backend import no_contract_attribute
+
+    from dew import _cache
+
+    return None if _cache.BARRIERED.value else no_contract_attribute()
+
+
+@contextlib.contextmanager
+def rounding_alone():
+    """Every float add, subtract and multiply traced in the block marked to round on its own, never
+    contracted into a fused multiply-add, where the jaxlib marks so (`no_contract`, `set_xla_metadata`) and
+    the trace is for a platform `TRACED_MARKED` names (the platform a call's code is chosen for,
+    `dew.nn.kernels.generation.backend`): an error-free transform's arithmetic, each step's rounded value the
+    one every later step reads, its operands read without a barrier where the platform the program lowers for
+    fences the mark too (`uncontracted`). Elsewhere, and in the body of a kernel Dew launches
+    (`dew.nn.kernels.launches.interpreting`), nothing is marked and the transforms hold their operands behind
+    a barrier. A raw `pallas_call` outside Dew's launches, traced for a CPU and lowered for CUDA, meets the
+    platform choice, which Triton's lowering refuses by name: no public JAX predicate states a Pallas trace
+    yet (row 10138)."""
+    from dew.nn.kernels.generation import backend
+    from dew.nn.kernels.launches import interpreting
+
+    name = no_contract()
+    if name is None or backend() not in TRACED_MARKED or interpreting() is not None:
+        yield
+        return
+    from jax.experimental.xla_metadata import set_xla_metadata
+
+    held = _MARKING.set(True)
+    try:
+        with set_xla_metadata(**{name: True}):
+            yield
+    finally:
+        _MARKING.reset(held)
+
+
 @_protected
 def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum). Each operand is read as
-    one value (`uncontracted`): a compiler that fused the multiply making an operand into the sum (an FMA,
-    XLA's CPU and GPU contract one) would add its exact product where the steps after read its rounded
-    one, counting that rounding twice."""
-    return _two_sum(*uncontracted(left, right))
+    one value: a compiler that fused the multiply making an operand into the sum (an FMA, XLA's CPU and GPU
+    contract one) would add its exact product where the steps after read its rounded one, counting that
+    rounding twice; its additions are marked to round alone where the jaxlib marks (`rounding_alone`), its
+    operands held behind a barrier elsewhere (`uncontracted`)."""
+    with rounding_alone():
+        return _two_sum(*uncontracted(left, right))
 
 
 def _two_sum(left, right):
@@ -1323,7 +1453,10 @@ def uncontracted(*values):
     compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses, on
     the value where it is made, so every reader sees the one rounded value (`two_sum`'s operands,
     `two_product`'s product); a caller whose plain float32 arithmetic leaned on the contractions a barrier
-    splits around it takes its sum compensated (`summed_once`, row 7979).
+    splits around it takes its sum compensated (`summed_once`, row 7979). Inside a transform whose own
+    arithmetic is marked to round alone (`rounding_alone`), the values as they are where the platform the
+    program lowers for fences the mark (`MARKED_BACKENDS`, `jax.lax.platform_dependent`): no step reading
+    them contracts, and no barrier splits the fusions around them (row 8378); the barrier on any other.
 
     In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
     `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
@@ -1333,86 +1466,17 @@ def uncontracted(*values):
     from dew.nn.kernels.generation import backend
     from dew.nn.kernels.launches import interpreting
 
-    in_tpu_kernel = interpreting() is False and backend() == "tpu"
-    return values if in_tpu_kernel else jax.lax.optimization_barrier(values)
-
-
-def binade_of(x: jax.Array) -> jax.Array:
-    """`floor(log2(|x|))` of an fp32 `x` from its bits, int32, a subnormal's by its significand's leading
-    bit (its arithmetic on a process that flushes subnormal operands reads none of it), -1024 for zero."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
-    subnormal = jnp.where(fraction > 0, leading - 149, -1024)
-    return jnp.where(biased > 0, biased - 127, subnormal)
-
-
-def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
-    """An fp32 `x` times `2^k` (`k` int32, at least 0, broadcast against `x`), exactly, from its bits: a
-    subnormal `x` normalized by its significand's leading bit, so a process whose float32 multiply flushes a
-    subnormal operand (XLA's CPU, row 4023) still raises it. The result at most fp32's largest; an infinity
-    or NaN as it is."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    sign = bits & np.uint32(0x80000000)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    target = binade_of(x) + k
-    # A subnormal's significand, its leading bit at bit 23 of a normal one, the rest its fraction.
-    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
-    up = jnp.clip(23 - leading, 0, 23).astype(jnp.uint32)
-    normalized = jnp.where(biased > 0, fraction, (fraction << up) & np.uint32(0x7FFFFF))
-    normal = sign | (jnp.clip(target + 127, 1, 254).astype(jnp.uint32) << 23) | normalized
-    # Still below the least normal: the subnormal's significand shifted up by `k`.
-    below = sign | (fraction << jnp.clip(k, 0, 31).astype(jnp.uint32))
-    raised = jnp.where(target >= -126, normal, below)
-    kept = (biased == 0xFF) | ((biased == 0) & (fraction == 0))
-    return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
-
-
-def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
-    """`x` (fp32) times `2^-k` (`k` int32, at least 0, broadcast against `x`) rounded once to nearest even
-    into fp32 however far below its least normal, in integer arithmetic on its bits: a process whose
-    float32 multiply or conversion flushes a subnormal result (XLA's CPU, per primitive, row 4023) still
-    returns it, as an IEEE multiply by the power of two would. A finite `x` alone; an infinity or NaN
-    returns as it is."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    sign = bits & np.uint32(0x80000000)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    # A subnormal `x` holds its significand at the least normal's exponent, its leading bit none.
-    held = jnp.maximum(biased, 1)
-    significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
-    target = held - k
-    normal = sign | (jnp.maximum(target, 1).astype(jnp.uint32) << 23) | fraction
-    # Below the least normal: the significand shifted right by the binades past it, rounded to nearest even.
-    shift = jnp.clip(1 - target, 0, 31).astype(jnp.uint32)
-    kept = significand >> shift
-    rest = significand & ((np.uint32(1) << shift) - np.uint32(1))
-    half = np.uint32(1) << (jnp.maximum(shift, np.uint32(1)) - np.uint32(1))
-    even = (kept & np.uint32(1)) == np.uint32(1)
-    up = (shift > 0) & ((rest > half) | ((rest == half) & even))
-    subnormal = sign | (kept + up.astype(jnp.uint32))
-    lowered = jnp.where((target >= 1) & (biased > 0), normal, subnormal)
-    rounded = jax.lax.bitcast_convert_type(lowered, jnp.float32)
-    return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
-
-
-def _split_bits(dtype) -> tuple[type, int, int]:
-    """A float's significand split for `two_product`'s `bit_split`: its unsigned bits' type, the mask keeping
-    its high part and the low bits masked, `p - floor(p / 2)` of its `p`, so its high part holds
-    `floor(p / 2)` bits. An even `p`'s truncated remainder holds the other half (fp32's 12, bfloat16's 4); an
-    odd `p`'s would hold one bit more (float64's 27, float16's 6), its low parts' product past `p` bits, so
-    the cut rounds to nearest there (`_odd`), its remainder signed and at most half the high part's last
-    bit: every product of two parts exact (Dekker's)."""
-    limits = jnp.finfo(dtype)
-    unsigned = np.dtype(f'uint{limits.bits}').type
-    low = (limits.nmant + 2) // 2
-    return unsigned, ~((1 << low) - 1) & np.iinfo(unsigned).max, low
+    if (interpreted := interpreting()) is not None:
+        # A kernel's body, whose platform is its launch's: a compiled TPU kernel's as it is, any other's
+        # barriered (an interpreted body's lowers to XLA's programs, whose platform choice a body takes none).
+        return values if not interpreted and backend() == "tpu" else jax.lax.optimization_barrier(values)
+    if not _MARKING.get():
+        return jax.lax.optimization_barrier(values)
+    return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
 
 
 def _odd(dtype) -> bool:
-    """Whether a float's significand holds an odd count of bits (`_split_bits`' rounded cut)."""
+    """Whether a float's significand holds an odd count of bits (`split_bits`' rounded cut)."""
     return (jnp.finfo(dtype).nmant + 1) % 2 == 1
 
 
@@ -1422,7 +1486,7 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     """Dekker's rounded product and its residual, with a Veltkamp significand split.
 
     Guidance keeps the multiply split. `bit_split` truncates the significands
-    instead (`_split_bits`: a float's low half of its bits masked, fp32's 12,
+    instead (`split_bits`: a float's low half of its bits masked, fp32's 12,
     float64's 27, a 16-bit float's), with no splitter to overflow: the multiply
     split's `2^(p/2) + 1` overflowed past 2^115 in fp32 and 2^996 in float64
     (base reviews 9bc4326dd F1, 1fe546a10 F1); near underflow the splits differ.
@@ -1432,6 +1496,13 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     With each arithmetic step rounded, the residual is exact where intermediates
     neither overflow nor underflow.
     """
+    with rounding_alone():
+        return _two_product(left, right, bit_split=bit_split, subtract=subtract, rounding=rounding)
+
+
+def _two_product(left, right, *, bit_split: bool, subtract: bool,
+                 rounding: Callable[[jax.Array], jax.Array] | None) -> tuple[jax.Array, jax.Array]:
+    """`two_product`'s arithmetic, its steps' roundings each their own (`rounding_alone`, `uncontracted`)."""
     def rounded(value):
         return value if rounding is None else rounding(value)
 
@@ -1439,7 +1510,7 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         if bit_split and isinstance(value, np.generic | np.ndarray):
             # A constant (a kernel's static factor) splits where it is known, on the host.
             constant = np.asarray(value, np.float32)
-            unsigned, mask, _ = _split_bits(np.float32)
+            unsigned, mask, _ = split_bits(np.float32)
             high = (constant.view(unsigned) & unsigned(mask)).view(np.float32)
             return jnp.asarray(high), jnp.asarray(constant - high)
         # The value read as one (`uncontracted`): its split reads it twice (its high part from its bits or a
@@ -1447,7 +1518,7 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         # would read exactly at one and rounded at the other, a spurious low part.
         (value,) = uncontracted(value)
         if bit_split:
-            unsigned, mask, low = _split_bits(value.dtype)
+            unsigned, mask, low = split_bits(value.dtype)
             mask = np.array(mask, unsigned)
             bits = jax.lax.bitcast_convert_type(value, unsigned)
             if _odd(value.dtype):
@@ -1538,25 +1609,27 @@ def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
     plain = numerator / denominator
     if not (isinstance(lowered, int) and lowered == 0):
         plain = lowered_rounded(plain, jnp.broadcast_to(jnp.asarray(lowered, jnp.int32), plain.shape))
-    top_bits, bottom_bits = (jax.lax.bitcast_convert_type(value, jnp.uint32)
-                             for value in (numerator, denominator))
-    top_field, bottom_field = (((bits >> 23) & 0xFF).astype(jnp.int32) for bits in (top_bits, bottom_bits))
+    (_, top_sign, top_field, top_fraction), (_, bottom_sign, bottom_field, bottom_fraction) = (
+        raw_fields(value) for value in (numerator, denominator))
+    top_field, bottom_field = top_field.astype(jnp.int32), bottom_field.astype(jnp.int32)
     special = (top_field == 0) | (top_field == 255) | (bottom_field == 0) | (bottom_field == 255)
-    negative = ((top_bits ^ bottom_bits) >> 31) != 0
+    negative = top_sign != bottom_sign
     # A normal operand's significand, exact in [1, 2); any bits give one in that range, so a special
     # lane's steps stay normal too, and its result is the division's.
-    top, bottom = (jax.lax.bitcast_convert_type((bits & 0x007FFFFF) | 0x3F800000, jnp.float32)
-                   for bits in (top_bits, bottom_bits))
+    top, bottom = (jax.lax.bitcast_convert_type(fraction | np.uint32(0x3F800000), jnp.float32)
+                   for fraction in (top_fraction, bottom_fraction))
     significand, residual = _rounded_significand(top, bottom)
     exponent = top_field - bottom_field - lowered
-    bits = jax.lax.bitcast_convert_type(significand, jnp.int32)
-    # The rounded significand's biased exponent once scaled: 1 to 254 is a normal float.
-    field = ((bits >> 23) & 0xFF) + exponent
-    normal = jax.lax.bitcast_convert_type(bits + (exponent << 23), jnp.float32)
+    # The rounded significand's fields (`raw_fields`), a positive normal's: its biased exponent once scaled,
+    # 1 to 254 a normal float, set back in its bits.
+    bits, _, significand_field, _ = raw_fields(significand)
+    field = significand_field.astype(jnp.int32) + exponent
+    normal = jax.lax.bitcast_convert_type(bits + jax.lax.bitcast_convert_type(exponent << 23, jnp.uint32),
+                                          jnp.float32)
     # Below the normal range: the significand on the grid of 2^-149, a value under 2^23 whose
     # integer part and half are exact in fp32; within the float32 range scaled by 2^shift.
     shift = jnp.clip(exponent + 149, -126, 127)
-    scaled = significand * jax.lax.bitcast_convert_type((shift + 127) << 23, jnp.float32)
+    scaled = significand * exact_power2(shift, jnp.float32)
     whole = jnp.floor(scaled)
     fraction = scaled - whole
     odd = (whole.astype(jnp.int32) & 1) == 1
@@ -1623,6 +1696,27 @@ correctly_rounded_divide_p.def_impl(_correctly_rounded_divide)
 correctly_rounded_divide_p.def_effectful_abstract_eval(jax.lax.div_p.abstract_eval)
 mlir.register_lowering(correctly_rounded_divide_p,
                        mlir.lower_fun(_correctly_rounded_divide, multiple_results=False))
+
+
+@functools.cache
+def triton_lowerings() -> None:
+    """Register `correctly_rounded_divide_p`'s Pallas Triton lowering lazily
+    (`dew.nn.kernels.launches.pallas_call`, row 9794) so importing `precision` loads no Pallas Triton
+    machinery."""
+    from jax._src.pallas.triton import lowering as triton_lowering
+    from jax.experimental.pallas import triton as pltriton
+
+    def divided(numerator, denominator):
+        numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
+        [quotient] = pltriton.elementwise_inline_asm(
+            "div.rn.f32 $0, $1, $2;", args=[numerator, denominator], constraints="=r,r,r", pack=1,
+            result_shape_dtypes=[jax.ShapeDtypeStruct(numerator.shape, numerator.dtype)])
+        return quotient
+
+    triton_lowering.register_lowering(correctly_rounded_divide_p)(
+        triton_lowering.lower_fun(divided, multiple_results=False))
+
+
 batching.defbroadcasting(correctly_rounded_divide_p)
 correctly_rounded_divide_p.elementwise = True
 # It rounds the quotient to float32 whatever its operands' dtype: at a wider width it is the quotient.
@@ -1698,7 +1792,7 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     tiny = jnp.finfo(product.dtype).tiny
     once = product * first
     kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
-    return jnp.where(kept, once * second, product * second * first)
+    return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
 
 
 @_protected
@@ -1712,7 +1806,8 @@ def compensated_add(left, right):
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
+    with rounding_alone():
+        return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
 
 
 @_protected
@@ -1756,10 +1851,12 @@ def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """The sum of `values` over `axes` its compensated pair rounds once, its tangent the plain sum's: a
     protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
     algebra pass must not cancel."""
-    # Each value read as one (`uncontracted`) where it is made: the reduction's pairs are its additions'.
-    (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
-    zero = jnp.zeros((), wide.dtype)
-    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
+    # Each value read as one (`uncontracted`) where it is made, or the reduction's additions marked to round
+    # alone (`rounding_alone`): the reduction's pairs are its additions'.
+    with rounding_alone():
+        (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
+        zero = jnp.zeros((), wide.dtype)
+        hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
     return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
 
 
@@ -1848,17 +1945,21 @@ _compensated_sum = contracted("test_the_precision_seams_hold_every_order")(
 def summed_once(values: Sequence[jax.Array], products: Sequence[tuple[jax.Array, jax.Array]] = ()
                 ) -> jax.Array:
     """The sum of `values` and of `products` (each a `(left, right)` pair, broadcasting as `*` does), every
-    product's rounding (`two_product`) and every addition's (`two_sum`) kept and added back once at the end:
-    the sum as one rounding of its twice-precise value leaves it (Ogita, Rump and Oishi's Dot2), whatever a
-    compiler fuses or keeps apart, so no contraction of a multiply into an add (an FMA) it takes or leaves
-    rounds it more (row 7953: a barrier in a step's arithmetic split its fusion and lost the contractions its
-    plain float32 sum leaned on, row 7979). Its tangent is the plain sum's."""
+    product's rounding (`two_product`) and every addition's (`two_sum`) carried apart in one plain sum and
+    added back once at the end (Ogita, Rump and Oishi's Dot2), its value read as a compensated sum's is
+    (`compensated_total`): the sum as one rounding of its twice-precise value leaves it, whatever a compiler
+    fuses or keeps apart, so no contraction of a multiply into an add (an FMA) it takes or leaves rounds it
+    more (row 7953: a barrier in a step's arithmetic split its fusion and lost the contractions its plain
+    float32 sum leaned on, row 7979), and a sum reaching an infinity is the plain sum's, as `jnp.sum`'s is
+    (row 8453). Its residuals are carried apart, not renormalized into the running pair as `compensated_add`
+    renormalizes it: added back as they come, `M + 2^102 + 2^102 - M` (`M` float32's largest) rounded the
+    running value past `M` to an infinity, and a residual a later one cancels was rounded away first. Its
+    tangent is the plain sum's."""
     return _summed_once(tuple(values), tuple(products))
 
 
 def _summed_once_value(values, products):
-    total = values[0]
-    carried = jnp.zeros_like(total)
+    total, carried = values[0], jnp.zeros_like(values[0])
     for left, right in products:
         product, lost = two_product(left, right, bit_split=True)
         total, dropped = two_sum(total, product)
@@ -1866,7 +1967,8 @@ def _summed_once_value(values, products):
     for value in values[1:]:
         total, dropped = two_sum(total, value)
         carried = carried + dropped
-    return total + carried
+    # Each sum's rounded half the plain running sum, which reads an infinity as `jnp.sum` does.
+    return compensated_total((total, carried), total)
 
 
 def _summed_once_tangent(primals, tangents):

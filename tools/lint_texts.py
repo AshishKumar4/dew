@@ -90,7 +90,7 @@ class _Taint:
         func, called = node.func, _resolved(node.func, self.tables)
         attribute = func.attr if isinstance(func, ast.Attribute) else ""
         return (attribute in IR_TEXTS
-                or (attribute in FILE_READERS and self.path(func.value))
+                or (attribute in FILE_READERS and isinstance(func, ast.Attribute) and self.path(func.value))
                 or (called == "open" and bool(node.args) and self.path(node.args[0]))
                 or (called in ("str", "repr") and bool(node.args) and self.program(node.args[0])))
 

@@ -189,7 +189,7 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
         options = step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size)
         compiled = jax.jit(step, out_shardings=shardings["params"]).trace(placed, batch).lower().compile(
             compiler_options=options)
-    ran = collective_axes(compiled.as_text(), mesh)
+    ran = collective_axes(compiled, mesh)
     for axis, ops in report.collectives.items():
         for op in ops:
             assert any(kind == op and axis in axes for kind, axes in ran), (axis, op)
@@ -311,7 +311,7 @@ class Traced(LMObjective):
 def test_a_fresh_state_is_built_from_the_one_trace_of_its_init():
     """Placing a fresh state traces the objective's init once: its shapes, the run's layout read off its
     draw's shapes (`Objective.drawn_shapes`, `StageLocal.of`) and the program that builds it on the devices
-    come from one trace (`traced_start`), the program replaying it, where a 4B decoder's start traced its
+    come from one trace (`traced_draw`), the program replaying it, where a 4B decoder's start traced its
     draw for the layout and again for the shapes (9.5 and 6.2 s on a CPU host), and once more for the
     program (36 s on a B200 host)."""
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)

@@ -130,6 +130,21 @@ def test_two_conditions_cannot_share_one_batch_field():
         InputSpec(sample=Field("image", (8, 8, 3)), conditions=conditions)
 
 
+def test_a_caption_condition_holds_its_captions_at_the_widths_its_encoder_tokenizes_them():
+    """A condition that reads captions holds them as its encoder tokenizes them, each field a row as wide as
+    its context: a batch whose captions an encoder of another context tokenized is refused as the run admits
+    it, before a step, and one its own encoder tokenized passes (row 9063: only the field's presence was
+    checked, and the encoder read captions at whatever width they came)."""
+    from dew.inputs import CharTable
+
+    spec = InputSpec(sample=Field("image", (8, 8, 3)),
+                     conditions={"textcontext": Condition(CharTable.from_pretrained(tokens=8))})
+    image, captions = np.zeros((2, 8, 8, 3), np.float32), ["a cat", "a dog"]
+    spec.check({"image": image, "text": CharTable.from_pretrained(tokens=8).tokenize(captions)})
+    with pytest.raises(ValueError):
+        spec.check({"image": image, "text": CharTable.from_pretrained(tokens=4).tokenize(captions)})
+
+
 class Echo(ConditionEncoder[str, TextContext]):
     """A user's encoder that is no dataclass, which records its checkpoint alone."""
 

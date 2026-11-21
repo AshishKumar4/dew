@@ -20,9 +20,14 @@ token at a time in torch float64 (`minimal_truth`), written apart from Dew's and
 import itertools
 import os
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
+
+COHORT = "mamba-ssm"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 
 FIXTURE = (Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba"
            / "selective_mamba_ssm_seeded.npz")
@@ -128,7 +133,7 @@ def mamba_ssm_run(scan, arrays, dtype) -> dict[str, np.ndarray]:
             zip(("y", *names), (output, *grads), strict=True)}
 
 
-def _extension(checkout: str):
+def _extension(checkout: str) -> types.ModuleType:
     """mamba_ssm's `selective_scan_cuda` for this GPU: the installed one, else built from the checkout's
     sources by torch's JIT build, as mamba_ssm's setup.py compiles them."""
     import importlib
@@ -147,8 +152,10 @@ def _extension(checkout: str):
              "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
              "-U__CUDA_NO_BFLOAT16_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
              f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"]
-    return load(name="selective_scan_cuda", sources=sources, extra_include_paths=[source],
-                extra_cflags=["-O3", "-std=c++17"], extra_cuda_cflags=flags)
+    built = load(name="selective_scan_cuda", sources=sources, extra_include_paths=[source],
+                 extra_cflags=["-O3", "-std=c++17"], extra_cuda_cflags=flags)
+    assert isinstance(built, types.ModuleType)  # An extension module, as load builds by default.
+    return built
 
 
 def serve(checkout: str) -> None:
@@ -168,7 +175,9 @@ def serve(checkout: str) -> None:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
     init = Path(checkout, "mamba_ssm", "__init__.py").read_text()
-    version = re.search(r'__version__ = "([^"]+)"', init).group(1)
+    found = re.search(r'__version__ = "([^"]+)"', init)
+    assert found is not None  # mamba_ssm's __init__ states its version.
+    version = found.group(1)
 
     def run(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         dtype = str(arrays.pop("dtype"))

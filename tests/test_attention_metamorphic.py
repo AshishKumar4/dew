@@ -27,6 +27,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_portable,
     attention_triton,
+    merged,
 )
 from dew.nn.kernels.templates.attention import Kept
 
@@ -51,37 +52,62 @@ def _portable(query, key, value, spans):
     return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK), query,
                                            key, value, spans)
 
+_FULL_SPANS = template.spans(QUERIES, KEYS, ROWS)
+_CAUSAL_SPANS = template.spans(QUERIES, KEYS, ROWS, causal=True)
+
+
+def _full_permuted(query, key, value, order):
+    return _portable(query, key[:, order], value[:, order], _FULL_SPANS)
+
+
+def _full_reference(query, key, value, _order):
+    return template.reference(query, key, value, _FULL_SPANS)
+
+
+def _causal_whole_masked(query, key, value, prefix):
+    mask = (jnp.arange(QUERIES) < prefix)[None, :, None, None]
+    return jnp.where(mask, _portable(query, key, value, _CAUSAL_SPANS), 0)
+
+
+def _causal_cut_masked(query, key, value, prefix):
+    mask = (jnp.arange(QUERIES) < prefix)[None, :, None, None]
+    cut = template.spans(QUERIES, KEYS, ROWS, causal=True, lengths=jnp.full((ROWS,), prefix, jnp.int32))
+    return jnp.where(mask, template.reference(query, key, value, cut), 0)
+
+
+def _heads_permuted(query, key, value, order, kv_order, back):
+    out = _portable(query[:, :, order], key[:, :, kv_order], value[:, :, kv_order], _CAUSAL_SPANS)
+    return out[:, :, back]
+
+def _causal_reference(query, key, value, _order, _kv_order, _back):
+    return template.reference(query, key, value, _CAUSAL_SPANS)
+
+
+_FULL_PERMUTED = jax.jit(_full_permuted)
+_FULL_REFERENCE = jax.jit(_full_reference)
+_CAUSAL_WHOLE_MASKED = jax.jit(_causal_whole_masked)
+_CAUSAL_CUT_MASKED = jax.jit(_causal_cut_masked)
+_HEADS_PERMUTED = jax.jit(_heads_permuted)
+_CAUSAL_REFERENCE = jax.jit(_causal_reference)
+
 
 @DENSE
 @hypothesis.given(order=st.permutations(range(KEYS)))
 def test_a_full_calls_output_is_its_keys_permuted_together_with_their_values(order):
     """A call that sees every key: permuting its keys and values together leaves each query's output."""
     order = jnp.asarray(order, jnp.int32)
-    spans = template.spans(QUERIES, KEYS, ROWS)
-
-    def permuted(query, key, value):
-        return _portable(query, key[:, order], value[:, order], spans)
-
-    assert_as_exact(jax.jit(permuted), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
-                    _dense_draw, "full call, keys permuted", seeds=SEEDS)
+    assert_as_exact(_FULL_PERMUTED, _FULL_REFERENCE, lambda seed: (*_dense_draw(seed), order),
+                    "full call, keys permuted", seeds=SEEDS)
 
 
 @DENSE
 @hypothesis.given(prefix=st.integers(1, QUERIES - 1))
 def test_a_causal_calls_first_queries_are_the_call_cut_to_them(prefix):
     """A causal call's first `prefix` queries see only the first `prefix` keys: the whole call's outputs there
-    are the call cut to those queries and keys."""
-    spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
-    cut = template.spans(prefix, prefix, ROWS, causal=True)
-
-    def whole(query, key, value):
-        return _portable(query, key, value, spans)[:, :prefix]
-
-    def reference(query, key, value):
-        return template.reference(query[:, :prefix], key[:, :prefix], value[:, :prefix], cut)
-
-    assert_as_exact(jax.jit(whole), jax.jit(reference), _dense_draw, "causal call's first queries",
-                    seeds=SEEDS)
+    are the call cut to those queries and keys (row 10555: `prefix` dynamic so all 30 draws share one JIT)."""
+    limit = jnp.asarray(prefix, jnp.int32)
+    assert_as_exact(_CAUSAL_WHOLE_MASKED, _CAUSAL_CUT_MASKED, lambda seed: (*_dense_draw(seed), limit),
+                    "causal call's first queries", seeds=SEEDS)
 
 
 @DENSE
@@ -92,16 +118,10 @@ def test_a_calls_heads_permuted_with_the_key_heads_they_read_permute_its_output(
     group = HEADS // KV_HEADS
     order = jnp.asarray([kv * group + member for kv in heads for member in within], jnp.int32)
     kv_order = jnp.asarray(heads, jnp.int32)
-    spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     back = jnp.argsort(order)
-
-    def permuted(query, key, value):
-        out = _portable(query[:, :, order], key[:, :, kv_order], value[:, :, kv_order], spans)
-        return out[:, :, back]
-
-    assert_as_exact(jax.jit(permuted), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
-                    _dense_draw, "heads permuted with their key heads", seeds=SEEDS)
-
+    assert_as_exact(_HEADS_PERMUTED, _CAUSAL_REFERENCE,
+                    lambda seed: (*_dense_draw(seed), order, kv_order, back),
+                    "heads permuted with their key heads", seeds=SEEDS)
 
 DECODE_ROWS, DECODE_KEYS, DECODE_HEADS, DECODE_KV = 2, 512, 8, 2
 """A decode step's geometry on the interpreter: rows of their own lengths over 512 keys."""
@@ -122,20 +142,27 @@ def _decode_spans(lengths):
 def _slices_merged(query, key, value, spans, *, slices: int = 8, subtracted: bool = False):
     """A folded decode step (`natural=False`) cut into `slices` slices a row at the decode plan's config
     (the fold's raw products where `subtracted`, as `attention_decode.attend` walks them), merged after the
-    launch (`algebra.merged_slices`), interpreted."""
+    launch (`algebra.merged_state`), interpreted."""
     with generation.assumed("sm90"):
         rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
         config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
                                        target=generation.gpu_target()).config
         with tuning.pinned({attention_mosaic.MosaicForward: config}):
-            out, maximum, total = attention_mosaic.forward(
+            walked = attention_mosaic.forward(
                 rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
                 residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=slices,
-                subtracted=subtracted)[:3]
+                subtracted=subtracted)
             spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-            # One slice's output its rows' whole (`attention_decode.attend`'s), nothing to merge.
-            merged = out if slices == 1 else algebra.merged_slices(spec, out, maximum, total)
-        return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
+            if slices == 1:
+                # One slice's output its rows' whole (`attention_decode.attend`'s), nothing to merge.
+                merged_rows = walked[0]
+            else:
+                # The slices merged where the launch wrote them, as `attention_decode.attend` merges them.
+                assert isinstance(walked, attention_mosaic.SplitOutput)
+                state = merged.merged_padded(spec, walked.padded, walked.stacked,
+                                             queries=rows.shape[1], width=value.shape[-1])
+                merged_rows = algebra.finish(spec, state, initial=True, normalized=True)[0]
+        return template.ungrouped_rows(merged_rows, DECODE_HEADS).astype(query.dtype)
 
 
 @INTERPRETS

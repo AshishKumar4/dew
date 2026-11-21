@@ -144,6 +144,23 @@ def token_corpus(directory: Path, records: int, seq_len: int, rows: int | None =
 
 
 @pytest.mark.distributed
+def test_a_pool_agrees_a_steps_fit_on_each_processs_own_read_and_a_failed_read_ends_every_check(tmp_path):
+    """Each process reads its own devices' headroom for a step over both processes' devices and the pool
+    answers alike in the same round (`memory.step_fits`): the step fits where every process's holds, a
+    process reading none holding, a refused compile none; and a process whose read fails ends every
+    process's check with its error, its peer naming it, where its peer had waited in an exchange it never
+    reached (row 8767: the read came before the agreement)."""
+    script = Path(__file__).with_name("step_fits_worker.py")
+    reports = run_pool("step_fits", tmp_path / "pool", 2, script=script)
+    # Each: the pool's answer, whether this process's headroom holds, whether it read none.
+    assert [[report[name] for name in ("roomy", "tight", "unread", "refused")] for report in reports] == [
+        [[True, True, False], [False, True, False], [True, True, False], [False, True, False]],
+        [[True, True, False], [False, False, False], [True, False, True], [False, False, True]]], reports
+    assert [report["failed"] for report in reports] == [
+        ["PeerFailure", "a step's fit", 1], ["RuntimeError", "the allocator's statistics could not be read"]]
+
+
+@pytest.mark.distributed
 
 def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
     """Each process places its share of the rows, so a batch as placed is
@@ -1144,6 +1161,7 @@ def packed_checkpoint(tmp_path_factory):
 
 
 @pytest.mark.distributed
+@pytest.mark.shared_setup("packed_checkpoint")
 @pytest.mark.parametrize("processes", [1, 4])
 def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
                                                                  packed_checkpoint,
@@ -1178,15 +1196,16 @@ def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
 
 
 @pytest.mark.distributed
+@pytest.mark.shared_setup("packed_checkpoint")
 def test_a_packed_pool_reads_the_windows_one_process_reads(tmp_path, packed_checkpoint):
     """The same claim without a checkpoint in it: the union of the windows a
-    pool reads at a step is the step one process reads, row for row."""
+    pool reads at a step, the checkpointed pool's (`packed_checkpoint`, the same
+    fit), is the step one process reads, row for row."""
     flags = {"name": "packed", "fsdp_size": 1, "steps": POOL_STEPS,
              "tokens": packed_checkpoint["corpus"].train, "seq_len": PACKED_SEQ_LEN}
     single = run_worker("packed_fit", tmp_path / "single.json", devices=MESH_DEVICES,
                         run_dir=tmp_path / "single-run", **flags)
-    pool = run_pool("packed_fit", tmp_path / "pool", 2,
-                    run_dir=tmp_path / "pool-run", **flags)
+    pool = packed_checkpoint["reports"]
 
     for step in range(POOL_STEPS):
         rows = [row for held in zip(*(report["windows"][step] for report in pool), strict=True)

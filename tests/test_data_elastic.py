@@ -18,7 +18,7 @@ from typing import ClassVar
 
 import numpy as np
 import pytest
-from data_support import WideDraw, listed
+from data_support import Fetched, WideDraw, listed
 
 from dew import _position
 from dew.batch import VALID_ROWS
@@ -831,16 +831,6 @@ def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_cuts_it_alike_on_
     for at, step in enumerate(whole):
         assert [step[place] for place in range(len(step))] == [
             shares[place % count][at][place // count] for place in range(len(step))]
-
-
-@dataclasses.dataclass(frozen=True)
-class Fetched:
-    """A record as a live fetch returns it, which may differ between reads (`Volatile`)."""
-
-    volatile: bool = True
-
-    def __call__(self, row):
-        return row
 
 
 @dataclasses.dataclass(frozen=True)

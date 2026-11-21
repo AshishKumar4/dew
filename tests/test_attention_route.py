@@ -53,9 +53,17 @@ MESH_TENSOR, MESH_HEADS = 4, 8
 """The tensor shards of the per-shard test's mesh, beside its `ROWS` data shards, and its query heads: two on
 each tensor shard, over one or two key heads, which is fewer than the shards."""
 MESH_SEEDS = 512
-"""The per-shard test's draws, sized by `seeds_for` with one device compared with
-itself: the fewest, doubling from `FEWEST_SEEDS`, that resolve the factor for each
-case, which is 512 for lengths and starts over two key heads."""
+"""A per-shard site's draws where none is sized for it (`seeds_for` with one device compared with itself:
+the fewest, doubling from `FEWEST_SEEDS`, that resolve the factor)."""
+DATA_AND_HEAD_SEEDS = {
+    ("own-documents", 1): 16, ("own-documents", 2): 16,
+    ("cross-documents", 1): 8, ("cross-documents", 2): 32,
+    ("lengths-and-starts", 1): 8, ("lengths-and-starts", 2): 64,
+    ("own-documents-blocks", 1): 8, ("own-documents-blocks", 2): 8,
+    ("own-documents-valid-places", 1): 16, ("own-documents-valid-places", 2): 16}
+"""The data-and-head mesh sites' draws by case and key heads, as `seeds_for` sizes them (et-qualify-mesh at
+main 106b45f48), where 512 each held the ten sites to 24-40 s a site on an idle vessel and 21 minutes on a
+starved one, past its stall window (row 7388)."""
 WIDE_SEEDS = {6: 64, 8: 8}
 """The partly split and gathered key heads' sites' draws by their key heads, sized by `seeds_for` paired,
 the split run against each arm it is compared with (the shares on one device and the reference path): 16
@@ -89,9 +97,9 @@ def keywords(case: dict) -> dict:
     if case.get("segment_ids") == "cross":
         keywords["segment_ids"], keywords["key_segment_ids"] = cross_documents()
     if case.get("lengths"):
-        keywords["key_value_seq_lengths"] = LENGTHS
+        keywords["key_value_seq_lengths"] = jnp.asarray(LENGTHS, jnp.int32)
     if case.get("starts"):
-        keywords["key_value_seq_starts"] = STARTS
+        keywords["key_value_seq_starts"] = jnp.asarray(STARTS, jnp.int32)
     if case.get("block_groups"):
         keywords["block_groups"], keywords["image_groups"] = (jnp.asarray(groups)
                                                               for groups in block_groups(geometry(case)[1]))
@@ -233,10 +241,12 @@ def shares_on_one_device(routed, heads: int, kv_heads: int, shards: int):
 
 
 def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_heads: int, rules, label: str,
-                       moves=(), shards: int | None = None, seeds: int = MESH_SEEDS) -> None:
+                       moves=(), reductions=(), shards: int | None = None, seeds: int = MESH_SEEDS) -> None:
     """`case`'s named template call on `mesh`, its arguments placed by `specs` and the logical axis `rules` in
     context, runs per shard (`sharded.assert_runs_per_shard`), and its compiled step moves no operand between
-    devices beyond `moves`. Its output and gradients are on par with one device's whole call over the site's
+    devices beyond `moves` and sums across them only an operand's gradient over the axes it is whole along and
+    the `reductions` it names (`sharded.split_checked`). Its output and gradients are on par with one device's
+    whole call over the site's
     `seeds` draws (check 1), measured from float64 on the reference path. With `shards`, they are on par
     with the shares of the same route run on one device (`shares_on_one_device`) instead, and the split is
     also asserted against the fp32 reference path: its own error within 1.5 times that path's on every
@@ -250,14 +260,14 @@ def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_he
     with nn.logical_axis_rules(rules):
         # With `shards`, the one split run of each draw compared with both arms (row 2156).
         assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, label, seeds=seeds,
-                              truth_fn=truth, moves=moves, arm=arm,
+                              truth_fn=truth, moves=moves, reductions=reductions, arm=arm,
                               also=None if shards is None else ("the reference path", truth))
 
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("key_heads", [1, 2], ids=["one-key-head", "two-key-heads"])
-@pytest.mark.parametrize("case", MESH_CASES.values(), ids=list(MESH_CASES))
-def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh(case, key_heads):
+@pytest.mark.parametrize("name", list(MESH_CASES))
+def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh(name, key_heads):
     """A named template call on a mesh of two rows by four heads, with one or two key heads, fewer than the
     four tensor shards. It runs per shard (`sharded.assert_runs_per_shard`): its output and its gradients of
     the query, key, value and sinks are on par with one device's over the site's draws (check 1), measured
@@ -267,7 +277,8 @@ def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh
     # Fewer key heads than tensor shards: no shard splits them, so each holds them whole, split by rows alone.
     rows = PartitionSpec("data")
     specs = [rows_and_heads, rows, rows, PartitionSpec("tensor"), rows_and_heads]
-    per_shard_contract(case, mesh, specs, heads=MESH_HEADS, kv_heads=key_heads, rules=DEFAULT_RULES,
+    per_shard_contract(MESH_CASES[name], mesh, specs, heads=MESH_HEADS, kv_heads=key_heads,
+                       rules=DEFAULT_RULES, seeds=DATA_AND_HEAD_SEEDS[name, key_heads],
                        label=f"template split over rows and heads, {key_heads} key heads")
 
 
@@ -301,8 +312,10 @@ def test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expe
     keys = PartitionSpec(None, None, ("expert", "tensor"))
     specs = [heads, keys, keys, PartitionSpec(("tensor", "expert")), heads]
     case = MESH_CASES["own-documents"]
+    # The key heads gathered, their gradient summed back over both axes (the gather's transpose).
     per_shard_contract(case, mesh, specs, heads=WIDE_HEADS, kv_heads=8,
                        rules=KEY_HEADS_LEADING_THE_OTHER_WAY, moves=("all-gather",),
+                       reductions=(("all-reduce", ("expert", "tensor")),),
                        label="template split eight ways, key heads the other way", shards=WIDE_SHARDS,
                        seeds=WIDE_SEEDS[8])
 
@@ -1316,3 +1329,22 @@ def test_a_value_given_as_its_keys_leading_columns_is_a_static_argument_of_a_jit
     found = jax.jit(attended)(query, key, attention.KeyColumns(48))
     np.testing.assert_array_equal(np.asarray(found, np.float32),
                                   np.asarray(attended(query, key, key[..., :48]), np.float32))
+
+
+def test_backward_route_declines_and_runs_with_its_rounded_flag():
+    """Row 6729: `attention_mosaic.backward_declined` and `attention_route.backward` accept `rounded=False`
+    consistently, matching `operand_dtype`'s unrounded key/value gradient execution."""
+    from dew.nn.kernels.templates import attention_mosaic, attention_route
+
+    q = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
+    spans = template.spans(64, 64, 1)
+    row = jnp.zeros((1, 1, 64), jnp.float32)
+    acc = jnp.zeros((1, 1, 64, 64), jnp.float32)
+    residuals = (row, jnp.ones_like(row), jnp.zeros((1, 1, 64), jnp.int32),
+                 template.Split(acc, row, jnp.ones_like(row), row))
+    with generation.assumed("sm90"):
+        assert attention_mosaic.backward_declined(q, q, q, spans, template.Hooks(), q, residuals=residuals,
+                                                  rounded=False) is None
+        grads = attention_route.backward(q, q, q, spans, template.Hooks(), q, residuals=residuals,
+                                         rounded=False, interpret=True)
+    assert grads.key.dtype == jnp.float32 and grads.value.dtype == jnp.float32

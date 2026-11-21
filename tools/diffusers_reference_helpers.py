@@ -17,6 +17,15 @@ if TYPE_CHECKING:
     from recorded_draws import Tape
 
 
+def returned[T](value: object, kind: type[T]) -> T:
+    """What a Diffusers call returns at its default `return_dict=True`, `kind` (a scheduler's
+    `from_config`, a model's `encode`, a pipeline's output), which the library types as that or the tuple
+    `return_dict=False` gives; anything else refused."""
+    if not isinstance(value, kind):
+        raise TypeError(f"expected {kind.__name__}, the call returned {type(value).__name__}")
+    return value
+
+
 def restore_transformers_names() -> None:
     """Put back the two names diffusers 0.34.0's pipeline modules import from
     `transformers.utils`, which transformers 5 dropped (`FLAX_WEIGHTS_NAME`,

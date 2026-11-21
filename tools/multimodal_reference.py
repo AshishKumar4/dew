@@ -17,6 +17,7 @@ per row exercise numeric batch alignment.
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -92,11 +93,11 @@ def _row_slices(encoded: dict, model) -> list[dict]:
     image_id = model.config.image_token_id
     grid = encoded.get("image_grid_thw")
     image_offset = video_offset = clip_offset = 0
-    video_pixels = encoded.get("pixel_values_videos")
-    video_positions = encoded.get("video_position_ids")
-    if video_pixels is not None:
-        video_pixels = video_pixels.flatten(0, 1)
-        video_positions = video_positions.flatten(0, 1)
+    videos = None
+    if (video_pixels := encoded.get("pixel_values_videos")) is not None:
+        if (video_positions := encoded.get("video_position_ids")) is None:
+            raise ValueError("the processor gave video frames without their positions")
+        videos = video_pixels.flatten(0, 1), video_positions.flatten(0, 1)
     singles = []
     for row in range(encoded["input_ids"].shape[0]):
         ids = encoded["input_ids"][row][valid[row]]
@@ -110,14 +111,15 @@ def _row_slices(encoded: dict, model) -> list[dict]:
             if "image_position_ids" in encoded:
                 single["image_position_ids"] = encoded["image_position_ids"][
                     image_offset:image_offset + images]
-        elif "pixel_values" in encoded and images:
+        elif "pixel_values" in encoded and images and grid is not None:
             patches = grid.prod(dim=1)
             start = int(patches[:image_offset].sum())
             stop = int(patches[:image_offset + images].sum())
             single["pixel_values"] = encoded["pixel_values"][start:stop]
             single["image_grid_thw"] = grid[image_offset:image_offset + images]
         image_offset += images
-        if video_pixels is not None:
+        if videos is not None:
+            video_pixels, video_positions = videos
             frames = _runs(ids, model.config.video_token_id)
             if frames:
                 single["pixel_values_videos"] = video_pixels[video_offset:video_offset + frames, None]
@@ -192,7 +194,10 @@ def numerics(model, encoded: dict) -> dict[str, np.ndarray]:
             updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
     found = {"logits": logits.numpy(), "loss": loss.detach().numpy(), "updated_logits": updated.numpy()}
     if pixel_inputs:
-        found["pixel_gradient"] = torch.cat([pixels.grad for pixels in pixel_inputs]).numpy()
+        gradients = [gradient for pixels in pixel_inputs if (gradient := pixels.grad) is not None]
+        if len(gradients) != len(pixel_inputs):
+            raise RuntimeError("the backward pass left a pixel input without its gradient")
+        found["pixel_gradient"] = torch.cat(gradients).numpy()
     return found
 
 
@@ -435,6 +440,8 @@ def write_gemma4_unified_native() -> None:
 
     destination = ROOT / "gemma4-unified-native-tiny"
     destination.mkdir(parents=True, exist_ok=True)
+    # The wrapper's own special ids, which transformers keeps though its signature names none.
+    special: dict[str, Any] = {"pad_token_id": 0, "bos_token_id": 1, "eos_token_id": 2}
     config = Gemma4UnifiedConfig(
         text_config={"vocab_size": 64, "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 4,
                      "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
@@ -445,8 +452,7 @@ def write_gemma4_unified_native() -> None:
         vision_config={"patch_size": 2, "pooling_kernel_size": 2, "mm_embed_dim": 24,
                        "output_proj_dims": 24, "mm_posemb_size": 32},
         audio_config={"audio_embed_dim": 16}, image_token_id=60, video_token_id=56,
-        audio_token_id=57, boa_token_id=58, eoa_token_index=59,
-        pad_token_id=0, bos_token_id=1, eos_token_id=2)
+        audio_token_id=57, boa_token_id=58, eoa_token_index=59, **special)
     config._attn_implementation = "eager"
     torch.manual_seed(2410)
     model = Gemma4UnifiedForConditionalGeneration(config).float().eval()
@@ -517,7 +523,7 @@ def write_llama4_native() -> None:
 
     model, destination = _copied("llama4-tiny-mm", "llama4-native-tiny", Llama4Config,
                                  Llama4ForConditionalGeneration)
-    processor = llama4_processor(destination, model.config.text_config.vocab_size)
+    processor = llama4_processor(destination, model.config.get_text_config().vocab_size)
     images = np.random.default_rng(1707).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <|image|> token9", "token5 <|image|> token8 <|image|> token6"]
     # Its numerics are its drawn site's (tools/multimodal_worker.py, multimodal_families.DRAWN).

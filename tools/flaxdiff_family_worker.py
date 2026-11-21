@@ -39,10 +39,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flaxdiff_family_cases import CASES
+from reference_releases import commit
 from reference_source import github
 from reference_worker import Applied, answered, serve
 
-REPO, COMMIT = "AshishKumar4/FlaxDiff", "15c55b001304604147a2a8002a76cf5d4c32092f"
+REPO, COMMIT = "AshishKumar4/FlaxDiff", commit("flaxdiff-trainer", "flaxdiff")
 # In import order: each module's own imports come before it.
 FILES = {
     "hilbert": "24b7c9bf77539c0b15ca54ac372d93eba4cdd4fd8ce85e5e95a3ab3d9f7faff7",
@@ -100,7 +101,8 @@ def flaxdiff(wide: bool) -> dict[str, types.ModuleType]:
         module = types.ModuleType(name)
         module.__package__, module.__file__ = "flaxdiff.models", str(local)
         sys.modules[name] = module
-        module.FOURIER_TABLE = fourier_table
+        # A module made here, its constant set before its code runs.
+        setattr(module, "FOURIER_TABLE", fourier_table)
         exec(compile(source, str(local), "exec"), module.__dict__)
         setattr(sys.modules["flaxdiff.models"], stem, module)
         modules[stem] = module

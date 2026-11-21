@@ -74,10 +74,10 @@ class Parts:
         return self
 
     def value(self) -> jax.Array:
-        """The tile in registers, in its dtype: its parts summed in fp32, exactly."""
+        """The tile in registers, in its dtype: its parts summed in fp32, exactly (`product.whole`)."""
         if len(self.refs) == 1:
             return self.refs[0][...]
-        return functools.reduce(jnp.add, (ref[...].astype(jnp.float32) for ref in self.refs))
+        return product.whole([ref[...] for ref in self.refs])
 
 
 class Issuer:

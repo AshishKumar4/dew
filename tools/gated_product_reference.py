@@ -50,7 +50,7 @@ def gelu_tanh(g):
 
 
 def gelu_erf(g):
-    cdf = 0.5 * ERFC(-g / math.sqrt(2)).astype(np.float64)
+    cdf = 0.5 * np.asarray(ERFC(-g / math.sqrt(2)), np.float64)
     return g * cdf, cdf + g * np.exp(-g * g / 2) / math.sqrt(2 * math.pi)
 
 
@@ -101,8 +101,10 @@ def main():
         up.requires_grad_()
         output = activate(gate) * up
         output.backward(cotangent)
+        d_gate, d_up = gate.grad, up.grad
+        assert d_gate is not None and d_up is not None  # Leaves of the backward pass.
         for key, value in (("gate", gate), ("up", up), ("cotangent", cotangent), ("output", output),
-                           ("d_gate", gate.grad), ("d_up", up.grad)):
+                           ("d_gate", d_gate), ("d_up", d_up)):
             assert value.dtype == torch.bfloat16, (name, key, value.dtype)
             arrays[f"{name}/{key}"] = value.detach().float().numpy()
     np.savez_compressed(args.out, torch=torch.__version__, **arrays)

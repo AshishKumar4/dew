@@ -43,6 +43,7 @@ import kernel_matrix
 import numpy as np
 import pytest
 import test_fla_gdn as fla_gdn
+import test_lightning_template as lightning
 import test_mamba_ssd as mamba_ssd
 import test_recurrence_chunk as chunked
 import test_recurrence_mosaic as forward
@@ -230,12 +231,18 @@ recurrence lane, 11-11): a cell each GPU kind runs, its family's own."""
 
 
 def template_stability_cells() -> list[Cell]:
-    """The template finite and on par where chunked forms break, every form, regime and product."""
+    """The template finite and on par where chunked forms break, every form, regime and product, plus KDA's
+    512-seed `FLOOR_GATES` gradient check."""
     finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
-    return [Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
-                 f"{'' if forms is None else f' ({forms} forms)'}",
-                 functools.partial(finite, name, regime, product, forms), fault=STRESS)
-            for name, regime, product, forms in template_stability.CASES]
+    return [
+        *(Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
+               f"{'' if forms is None else f' ({forms} forms)'}",
+               functools.partial(finite, name, regime, product, forms), fault=STRESS)
+          for name, regime, product, forms in template_stability.CASES),
+        Cell("Kimi delta attention under tiny gates at the floor is as exact as fla",
+             template_stability.kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla,
+             fault=STRESS),
+    ]
 
 
 def portable_cells() -> list[Cell]:
@@ -303,12 +310,25 @@ def port_training_cells() -> list[Cell]:
     ]
 
 
+TURNED_TAKEN = ("sm90", "sm100")
+"""The generations whose template takes a turned state's forked training (jsf-turnroute at main 079c0949c:
+an sm80's refuses it at its backward's eligibility, `template.Mosaic.trains`, under either precision; an
+sm90's and an sm100's take it)."""
+
+
 def forked_cells() -> list[Cell]:
-    """The template over a forked call."""
-    return [Cell(f"the template's forked documents are as exact as each alone: {hooks}",
-                 functools.partial(chunked.the_templates_forked_documents_are_as_exact_as_each_alone, hooks),
-                 fault=FORKED)
-            for hooks in chunked.FORKED_TEMPLATE]
+    """The template over a forked call, a turned state's on each generation whose template takes it
+    (`TURNED_TAKEN`), each its own cell: the cell names its kernel, so an A100 ran it to a refusal (row 4994:
+    main 1645e8eea's A100 tier)."""
+    forked = chunked.the_templates_forked_documents_are_as_exact_as_each_alone
+
+    def cell(hooks, generation=None):
+        return Cell(f"the template's forked documents are as exact as each alone: {hooks}"
+                    f"{'' if generation is None else f' on an {generation}'}",
+                    functools.partial(forked, hooks), generation, fault=FORKED)
+
+    return [each for hooks in chunked.FORKED_TEMPLATE
+            for each in ([cell(hooks, taken) for taken in TURNED_TAKEN] if hooks.turns else [cell(hooks)])]
 
 
 def fp32_template_cells() -> list[Cell]:
@@ -353,7 +373,18 @@ def decode_cells() -> list[Cell]:
     ]
 
 
+def lightning_cells() -> list[Cell]:
+    """Lightning attention's fast forms on the template held to fla's own `chunk_simple_gla`
+    (`simple_gla_support.fla_simple_gla`), the bar its CPU cell states in JAX."""
+    from simple_gla_support import fla_simple_gla
+
+    return [Cell("lightning attention's fast forms on the template are as exact as fla",
+                 functools.partial(lightning.lightning_fast_forms_are_as_exact_as, as_given(fla_simple_gla)),
+                 native={"launch": "lightning template"})]
+
+
 FAMILIES = {"two-role walk": walk_cells, "template stability": template_stability_cells,
+            "lightning": lightning_cells,
             "portable": portable_cells, "SSD port": ssd_port_cells, "selective scan": selective_cells,
             "forked template": forked_cells, "fp32 template": fp32_template_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}

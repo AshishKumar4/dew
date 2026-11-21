@@ -22,13 +22,13 @@ from dew.nn.kernels.templates.attention_algebra import (
     WEIGHT_SHIFT,
     Parts,
     Recompute,
+    anchor_split,
     expand,
     exponent,
     finite,
     hooked,
     inverse,
     normalized_rows,
-    power2,
     split_output,
     tiles_walked,
     weights_parts,
@@ -38,9 +38,11 @@ from dew.nn.precision import (
     added_to,
     compensated_sum,
     compensates_loops,
+    power2,
     running_sum,
     running_total,
     two_sum,
+    uncontracted,
 )
 
 
@@ -151,16 +153,14 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
     """A tile's weights `exp(s - m)` at the forward's maximum, fp32, at the forward's weights' shift,
     `2^-min(shift, WEIGHT_SHIFT)`; them narrowed to the values' `dtype` as the forward rounds
     them, zero at the anchor key (`at_anchor`), the left operand of `B`'s product; the anchor key's
-    narrowed weight, fp32; and the weights that shift would push below fp32's least normal, unshifted
-    and narrowed, whose product the mainloop issues apart (`off_anchor`), as the forward's small weights'
-    (`at_scale`)."""
+    weight as it is, fp32, as the forward keeps it (`algebra.anchor_split`); and the weights that shift
+    would push below fp32's least normal, unshifted and narrowed, whose product the mainloop issues apart
+    (`off_anchor`), as the forward's small weights' (`at_scale`)."""
     exponentials = below(logits, maximum, how)
     weight = expand(jnp.minimum(shift, WEIGHT_SHIFT), exponentials)
     small = jnp.where(exponentials < power2(jnp.float32(1.0), weight - 126.0), exponentials, 0.0)
     exponentials = power2(exponentials - small, -weight)
-    rounded = exponentials.astype(dtype)
-    rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
-    own = jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
+    rest, own = anchor_split(exponentials, at_anchor, dtype)
     return exponentials, rest, own, small.astype(dtype)
 
 
@@ -239,7 +239,8 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
                 state_total: jax.Array, anchor_value: jax.Array, dout: jax.Array,
                 key_index: jax.Array, shift: jax.Array, *,
-                rows: Callable[[jax.Array, jax.Array], jax.Array]) -> tuple[jax.Array, jax.Array, jax.Array]:
+                rows: Callable[[jax.Array, jax.Array], jax.Array], dropped: float = 1.0, power: float = 1.0
+                ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """`off_anchor_delta` from a training forward's split sums (`training_step`), the backward's first
     pass taken by the forward: `B` with the initial state's share inside it, the other keys' weights'
     sum, the anchor's own weight, the denominator `total` and the initial state's own `state_total`, all
@@ -249,21 +250,66 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     sums are at each row's `2^-shift` (`Scale`), and `total` is taken there; a row at the shift
     `NORMALIZED` holds normalized sums (an output residual's, `normalized_rows`), its total 1. Each sum is
     taken over the total before its product with dO, as the reference's output is, so none overflows where
-    the sums are near fp32's largest (a state's). Each row's product with dO is `rows`'
-    (`off_anchor_delta`'s), of the sums as dO reads them (`read`)."""
+    the sums are near fp32's largest (a state's). A dropping call's `B` holds its kept keys' weights alone
+    and its anchor's value row arrives where its draw keeps it (`algebra.kept`), its sums at the
+    multiplier's reach `power` (`algebra.Forward.units`): its D and centre are taken without the
+    draw's multiplier `dropped`, which multiplies them once (`algebra.Forward.dropped`), as nearer centre is
+    chosen alike at any scale; a normalized row's sums (an output's) took it already. Taken
+    with each weight over the total, sums near fp32's largest times 4/3 overflowed where D is finite (row
+    8652). Each row's product with dO is `rows`' (`off_anchor_delta`'s), of the sums as dO reads them
+    (`read`)."""
+    multiplier = np.float32(dropped)
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
-    anchor = rows(anchor_value, cotangent)
-    others = others * expand(over, others)
-    own, others_total = own * over, others_total * over
-    about_zero = rows(read(split_output(others, own, anchor_value), cotangent), cotangent)
-    off_anchor = others - expand(others_total, anchor_value) * anchor_value
-    about_anchor = rows(read(off_anchor, cotangent), cotangent) - state_weight * anchor
-    return nearer_centre(anchor, about_anchor, about_zero, key_index)
+    mean = others * expand(over, others)
+
+    def centred(others: jax.Array, unit) -> tuple[jax.Array, jax.Array, jax.Array]:
+        # D's centre and numerators about it and about 0, each term in the units `unit` of `others`, the
+        # anchor's product scaled on whichever factor cannot overflow `unit` (row 9096: 2^80 * 2^53 -> inf
+        # before a zero or tiny dO, while 2^-126 * 2^-40 rounded to 0 before 2^53, 6a57b66de F1).
+        own_held, others_held = own * over * unit, others_total * over * unit
+        if isinstance(unit, float):
+            anchor = rows(read(anchor_value, cotangent), cotangent)
+        else:
+            scale = expand(unit, anchor_value)
+            small = jnp.abs(anchor_value) < 1.0
+            lhs = jnp.where(small, anchor_value * scale, anchor_value)
+            rhs = jnp.where(small, cotangent, cotangent * scale)
+            anchor = rows(read(lhs, rhs), rhs)
+        others_dot = rows(read(others, cotangent), cotangent)
+        about_zero_combined = rows(read(split_output(others, own_held, anchor_value), cotangent), cotangent)
+        about_zero = jnp.where(finite(about_zero_combined), about_zero_combined,
+                               others_dot + (own * over) * anchor)
+        off_anchor_combined = rows(
+            read(others - expand(others_held, anchor_value) * anchor_value, cotangent), cotangent)
+        off_anchor = jnp.where(finite(off_anchor_combined), off_anchor_combined,
+                               others_dot - (others_total * over) * anchor)
+        return anchor, off_anchor - state_weight * anchor, about_zero
+
+    if dropped == 1.0:
+        return nearer_centre(*centred(mean, 1.0), key_index)
+    # A dropping call's: in the units its sums hold (its power, `algebra.Forward.units`; a normalized row's,
+    # an output's, the multiplier), contracted with dO before they come out, so a mean they take below fp32's
+    # least subnormal keeps its bits (2^-126 at a weight of e^-22 and a power of 2^53, dQ 0 where it is
+    # -2.79e-10, the base review of eb3ab2670, F1; a normalized row's divided by 2^53 first, the range audit
+    # of row 8652, #1); where those pass fp32's largest, the units taken out first, after the total where the
+    # mean is finite, else in one division with it (18 2^126 over 4, the base review of e2b671ce9, F2).
+    held = jnp.where(normalized_rows(shift), multiplier, np.float32(power))
+    divisor = jnp.where(normalized_rows(shift), multiplier, power2(total, -shift) * np.float32(power))
+    divided = others / expand(jnp.where(finite(divisor) & (divisor > 0), divisor, 1.0), others)
+    in_units = centred(mean, held)
+    taken = jnp.where(normalized_rows(shift), np.float32(1 / dropped), np.float32(1 / power))
+    plain = centred(jnp.where(finite(mean), mean * expand(taken, mean), divided), 1.0)
+    kept = finite(in_units[0]) & finite(in_units[1]) & finite(in_units[2])
+    centre, about_anchor, about_zero = (jnp.where(kept, held_term, plain_term)
+                                        for held_term, plain_term in zip(in_units, plain, strict=True))
+    anchor, delta, chosen = nearer_centre(centre, about_anchor, about_zero, key_index)
+    factor = jnp.where(kept, multiplier / held, multiplier)
+    return anchor * factor, delta * factor, chosen
 
 
 def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift: jax.Array) -> jax.Array:
@@ -483,7 +529,8 @@ def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.A
     against a centre that rounded it, so every centre and cotangent takes this one rounding."""
     if multiplier is None:
         return products
-    return jax.lax.optimization_barrier(products * multiplier)
+    (dropped,) = uncontracted(products * multiplier)
+    return dropped
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],
@@ -502,16 +549,17 @@ def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: t
 
 
 class Centre(NamedTuple):
-    """Dropout's first pass over a query's keys (`centre_step`): `centre`, the least-magnitude product in
-    the query's first visible tile, the shift each dropped product is centred about; `seen`, whether a key
-    is visible yet; and the centred running sums (`running_sum`) at the scale `centre_scale` gives:
-    `residual`, the weights' sum of the products less the centre, and `mass`, the weights' sum. A product
-    equal to the centre contributes exactly zero, so identical products cancel before any reduction, and
-    the sums stay finite for finite products."""
+    """Dropout's first pass over a query's keys (`centre_step`): `centre`, the dropped product at the
+    forward's anchor, the row's heaviest key; and the running sums (`running_sum`) at the scale
+    `centre_scale` gives: `residual`, the weights' sum of the products less the centre, `zero`, of the
+    products themselves, and `mass`, the weights' sum. About the centre the heaviest key's term is exactly
+    zero and identical products cancel before any reduction, so a query whose weight one key holds takes D
+    as that key's product; about zero a query whose weights spread over many keys keeps its products' own
+    rounding; each query takes the nearer (`nearer_centre`). The sums stay finite for finite products."""
 
     centre: jax.Array
-    seen: jax.Array
     residual: Running
+    zero: Running
     mass: Running
 
 
@@ -522,82 +570,81 @@ def centre_scale(keys: int) -> float:
     return -(2.0 + math.ceil(math.log2(max(keys, 1))))
 
 
-def centre_start(rows: int) -> Centre:
-    """The centre of `rows` queries that have seen no key."""
-    zero = jnp.zeros((rows,), jnp.float32)
-    return Centre(zero, jnp.zeros((rows,), bool), running_sum((rows,), jnp.float32),
-                  running_sum((rows,), jnp.float32))
+def centre_start(centre: jax.Array) -> Centre:
+    """The centre of queries that have seen no key, about `centre` `[rows]` (`Centre.centre`)."""
+    return Centre(centre, *(running_sum(centre.shape, jnp.float32) for _ in range(3)))
 
 
-def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: jax.Array, positions: jax.Array,
-                exponent: float) -> Centre:
+def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: jax.Array,
+                at_anchor: jax.Array, exponent: float) -> Centre:
     """A key tile's part of dropout's centre (`Centre`): `weights` `[bq, bk]` (unnormalized, `exp(s - m)`),
-    the tile's dropped `products` (`dropped_products`), `seen` where a key counts, and each entry's key index
-    `positions` (broadcasting). A query's centre is its first visible tile's product nearest zero, ties
-    broken by position, selected exactly: the sum of one nonzero term and zeros is that term. D is the
-    centre plus the weighted mean about it whatever the centre, and the least one keeps the mean's two
-    rounded sums from carrying a large common offset that their quotient cancels back (a centre of -21.3
-    left D 2.8e-6 from float64's at -2.43); identical products still subtract exactly. The sums run as
-    the loop's running sums (`added_to`), each tile's rows summed compensated where loops are
-    (`compensates_loops`). Each product is taken at `2^exponent` before the subtraction; no difference or
-    sum overflows, and a power of two is exact where the product is normal."""
+    the tile's dropped `products` (`dropped_products`) and `seen` where a key counts, each product taken at
+    `2^exponent`, about the row's anchor's and about zero, before any sum, so no difference or sum overflows
+    and a power of two is exact where the product is normal. About a lighter key's product the heaviest's
+    term rounded at the scale of the products (a product near 2^123 against a key near 2^30 made dQ infinite
+    where it is 1e-127, row 8652), and about the first tile's heaviest a later tile's dominant one was lost
+    (the base review of 4e2eb287e, F4). The sums run as the loop's running sums (`added_to`), each tile's
+    rows summed compensated where loops are (`compensates_loops`). The anchor's own centred product is
+    zero, as in the score cotangents, even when the separate row and tile contractions round it
+    differently."""
     # The scale a Python float, exact (`centre_scale`'s exponent is within fp32's normal range), so no
     # scalar arithmetic runs in a kernel (Mosaic GPU holds no rank-0 vector).
     factor = 2.0 ** exponent
-    nearest = jnp.min(jnp.where(seen, jnp.abs(products), jnp.inf), axis=-1)
-    first = jnp.min(jnp.where(seen & (jnp.abs(products) == expand(nearest, products)), positions,
-                              jnp.iinfo(jnp.int32).max), axis=-1)
-    picked = seen & (positions == expand(first, products))
-    tile_centre = jnp.sum(jnp.where(picked, products, 0.0), axis=-1)
-    centre = jnp.where(state.seen, state.centre, tile_centre)
-    # Whether a key of the tile counts, a row's maximum (a kernel's rows reduce no booleans).
-    counted = jnp.max(jnp.where(seen, 1, 0), axis=-1) > 0
-    scaled = products * factor - expand(centre * factor, products)
+    scaled = products * factor
 
     def row_sum(values):
-        return (compensated_sum(values, (values.ndim - 1,)) if compensates_loops()
-                else values.sum(axis=-1))
+        values = jnp.where(seen, values, 0.0)
+        return compensated_sum(values, (values.ndim - 1,)) if compensates_loops() else values.sum(axis=-1)
 
-    return Centre(centre, state.seen | counted,
-                  added_to(state.residual, row_sum(jnp.where(seen, weights * scaled, 0.0))),
-                  added_to(state.mass, row_sum(jnp.where(seen, weights, 0.0))))
+    centred = jnp.where(at_anchor, 0.0, weights * (scaled - expand(state.centre * factor, scaled)))
+    return Centre(state.centre, added_to(state.residual, row_sum(centred)),
+                  added_to(state.zero, row_sum(weights * scaled)), added_to(state.mass, row_sum(weights)))
 
 
-def centre_finish(state: Centre, state_total: jax.Array, initial: jax.Array, exponent: float) -> jax.Array:
-    """Dropout's D from its centre: the centre plus the mean of the centred products over the weights, with
-    the initial state's share (`state_total` its weight, `initial` its values' mean's product with the
-    cotangent) centred the same way. The mean is taken at the scale, so no sum overflows: D is
-    `centre + mean` where that is finite, the scaled sum otherwise, and 0 where a row saw no key and has
-    no initial state. Where the products agree the mean is exactly zero, so D is their product. The keys'
-    sum and the state's share are each taken over the total before they add: the state's weight over the
-    total is at most 1, so its centred value is never multiplied by a denominator that overflows it."""
+def centre_finish(state: Centre, state_total: jax.Array, initial: jax.Array, exponent: float,
+                  key_index: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Dropout's D from its first pass (`Centre`) as the second sweep takes it, `(anchor, delta, chosen)`:
+    about the nearer of the centre and zero (`nearer_centre`), the centre, D less it and the anchor's key
+    `key_index`, or zero, D and -1. Each mean is its sum over the weights with the initial state's share
+    (`state_total` its weight, `initial` its values' mean's product with the cotangent) centred the same
+    way, at the scale, the keys' sum and the state's share each over the total before they add (the state's
+    weight over the total at most 1), taken back where finite; 0 where a row saw no key and has no initial
+    state. D less the centre is passed apart, never added back into it: a residual of 3.9e-9 beside a centre
+    of 4/3 was lost (the base review of a648b3279, F4)."""
     k = jnp.asarray(exponent, jnp.float32)
-    scaled_centre = power2(state.centre, k)
-    scaled_initial = power2(initial, k) - scaled_centre
     total = running_total(state.mass) + state_total
     divisor = jnp.where(total > 0, total, 1.0)
-    mean = jnp.where(total > 0, running_total(state.residual) / divisor
-                     + (state_total / divisor) * scaled_initial, 0.0)
-    shifted = state.centre + power2(mean, -k)
-    scaled = power2(scaled_centre + mean, -k)
-    return jnp.where(total > 0, jnp.where(finite(shifted), shifted, scaled), 0.0)
+    share = state_total / divisor
+
+    def mean(summed: Running, centre: jax.Array) -> jax.Array:
+        # Taken back in the division where the total holds it (a scaled mean below fp32's least normal lost
+        # bits, a state of 2^126 beside products of 1), at the scale where it does not.
+        direct = running_total(summed) / power2(divisor, k) + share * (initial - centre)
+        scaled = running_total(summed) / divisor + share * (power2(initial, k) - power2(centre, k))
+        scaled = power2(scaled, -k)
+        return jnp.where(total > 0, jnp.where(finite(direct), direct, scaled), 0.0)
+
+    about_anchor, about_zero = mean(state.residual, state.centre), mean(state.zero, jnp.zeros_like(total))
+    # A residual past fp32's largest about the centre takes zero's, which holds D whole.
+    return nearer_centre(state.centre, jnp.where(finite(about_anchor), about_anchor, jnp.inf), about_zero,
+                         jnp.where(total > 0, key_index, -1))
 
 
 def dropout_centre(lo, hi, terms: Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array, jax.Array]],
-                   keys: int, rows: int, state_total: jax.Array, initial: jax.Array, *,
+                   keys: int, centre: jax.Array, key_index: jax.Array, state_total: jax.Array,
+                   initial: jax.Array, *,
                    most: int | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Dropout's first pass over a query block (`Centre`): `terms(j)` gives key tile `j`'s unnormalized
-    weights `exp(s - m)`, its dropped products (`dropped_products`), where its entries are seen, and their
-    key indices. Each product is centred about its query's least-magnitude product in its first visible
-    tile and scaled before any sum (`centre_step`), and D is rebuilt from that centre (`centre_finish`).
-    Returns the second sweep's `(anchor, delta, chosen)`: no anchor, D about zero, and no key chosen, so
-    identical products cancel exactly in its cotangents. Its tiles at most `most` (`tiles_walked`)."""
+    weights `exp(s - m)`, its dropped products (`dropped_products`), its visibility and its key indices.
+    Each product is taken about its query's `centre` (the dropped product at the forward's anchor key
+    `key_index`) and about zero, scaled, before any sum (`centre_step`), and D is rebuilt about the nearer
+    (`centre_finish`): the second sweep's `(anchor, delta, chosen)`, identical products cancelling exactly in
+    its cotangents. Its tiles at most `most` (`tiles_walked`)."""
     exponent = centre_scale(keys)
 
     def step(j, state):
-        weights, products, seen, positions = terms(j)
-        return centre_step(state, weights, products, seen, positions, exponent)
+        weights, products, seen, columns = terms(j)
+        return centre_step(state, weights, products, seen, columns == key_index[:, None], exponent)
 
-    centred = tiles_walked(lo, hi, step, centre_start(rows), most)
-    return (jnp.zeros((rows,), jnp.float32), centre_finish(centred, state_total, initial, exponent),
-            jnp.full((rows,), -1, jnp.int32))
+    centred = tiles_walked(lo, hi, step, centre_start(centre), most)
+    return centre_finish(centred, state_total, initial, exponent, key_index)

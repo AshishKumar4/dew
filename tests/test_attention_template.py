@@ -41,8 +41,8 @@ def cross_documents():
     return CrossDocuments(queries, keys)
 
 
-LENGTHS = jnp.asarray([96, 61], jnp.int32)
-STARTS = jnp.asarray([0, 17], jnp.int32)
+LENGTHS = (96, 61)
+STARTS = (0, 17)
 
 
 def key_validity(keys: int) -> jax.Array:
@@ -173,9 +173,9 @@ def arguments(case: dict) -> dict:
     if "segment_ids" in case:
         keywords["segment_ids"] = ids[case["segment_ids"]]()
     if case.get("lengths"):
-        keywords["lengths"] = LENGTHS
+        keywords["lengths"] = jnp.asarray(LENGTHS, jnp.int32)
     if case.get("starts"):
-        keywords["starts"] = STARTS
+        keywords["starts"] = jnp.asarray(STARTS, jnp.int32)
     if case.get("block_groups"):
         keywords["block_groups"], keywords["image_groups"] = block_groups(geometry(case)[1])
     if case.get("valid"):
@@ -345,7 +345,7 @@ def drawing(queries: int, keys: int, dtype=jnp.float32):
     return draw
 
 
-SINKS = jnp.asarray([0.5, -1.0, 2.0, -3.0], jnp.float32)
+SINKS = (0.5, -1.0, 2.0, -3.0)
 SOFTCAP = 0.5
 
 
@@ -372,7 +372,8 @@ def hooks_of(hooks: dict, queries: int) -> template.Hooks:
         return s
 
     params = (template.Param(slopes, template.Kind.HEAD),) if hooks.get("alibi") else ()
-    initial = template.sinks(SINKS, ROWS, queries, 32) if hooks.get("sinks") else None
+    initial = (template.sinks(jnp.asarray(SINKS, jnp.float32), ROWS, queries, 32)
+               if hooks.get("sinks") else None)
     used = cap is not None or hooks.get("alibi")
     return template.Hooks(score_mod if used else None, params, initial)
 
@@ -407,7 +408,7 @@ def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, 
     mask = jnp.asarray(case_keep(case))[:, None]
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
-    sinks = SINKS if hooks.get("sinks") else None
+    sinks = jnp.asarray(SINKS, jnp.float32) if hooks.get("sinks") else None
     softcap = SOFTCAP if hooks.get("softcap") else None
     alibi = alibi_bias(jnp.arange(keys)[None], 4, dtype=jnp.float32) if hooks.get("alibi") else None
 
@@ -828,8 +829,9 @@ def test_a_window_over_the_widest_places_neither_wraps_nor_aliases(window):
 
 
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
-    """A compiled call takes the hooks as its argument: new parameter and state values run the one
-    program it traced, and their gradients flow back into a `Hooks` of the same structure."""
+    """A compiled call takes the hooks as its argument: new parameter and state values in the same structure
+    (the state's static marks its own, `Initial.valueless`) run the one program it traced, and their
+    gradients flow back into a `Hooks` of the same structure."""
     queries, keys = geometry(CASES["causal-window"])
     spans = template.spans(queries, keys, ROWS, **arguments(CASES["causal-window"]))
     query, key, value = drawing(queries, keys)(0)
@@ -843,7 +845,7 @@ def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
     alibi = hooks_of(HOOKS["softcap-sinks-alibi"], queries)
     steeper = template.Hooks(alibi.score_mod, (template.Param(2 * alibi.score_params[0].value,
                                                               template.Kind.HEAD),),
-                             template.Initial(alibi.initial.m + 1, alibi.initial.total, alibi.initial.acc))
+                             dataclasses.replace(alibi.initial, m=alibi.initial.m + 1))
     outputs = compiled(alibi), compiled(steeper)
     assert len(traces) == 1
     assert not np.array_equal(np.asarray(outputs[0]), np.asarray(outputs[1]))

@@ -3,6 +3,10 @@ receipt names the directories of the host that ran it (bible §2; rows 2785, 286
 
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 ROOT = Path(__file__).resolve().parents[1]
 """The checkout a tool runs from."""
@@ -22,7 +26,7 @@ def named(path: str | Path, parts: int = 1) -> str:
     return "/".join([part for part in local.parts if part != local.anchor][-parts:])
 
 
-def recorded(config: object, paths: tuple[str, ...] = ()) -> dict:
+def recorded(config: "DataclassInstance", paths: tuple[str, ...] = ()) -> dict:
     """`config`'s fields (a dataclass's) as a receipt records them: each path, and each field `paths` names
     that holds one as a string, `named`."""
     return {name: named(value) if isinstance(value, Path) or (name in paths and isinstance(value, str))

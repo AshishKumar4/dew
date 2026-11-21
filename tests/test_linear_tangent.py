@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh, PartitionSpec
+from reference_error import assert_as_exact
 
 from dew.nn.derivatives import KernelGlue
 from dew.nn.kernels import generation
@@ -99,3 +100,75 @@ def test_forward_over_reverse_differentiates_the_portable_pullback():
     x, index = jnp.arange(8.0), jnp.arange(8)
     tangent = jax.jvp(lambda x: jax.grad(summed)(x, index), (x,), (jnp.ones_like(x),))[1]
     np.testing.assert_array_equal(np.asarray(tangent), np.zeros(x.shape))
+
+
+def squared(x):
+    """`x` squared through a kernel whose derivative runs its forward held still (`nested` off): its forward
+    `x^2` saving `x`, its backward twice the saved `x` times the cotangent, its portable arithmetic `x^2`."""
+    return generation.linear_tangent(
+        lambda x: (jax.lax.stop_gradient(x * x), jax.lax.stop_gradient(x)),
+        lambda saved, operands, cotangent: (2 * saved * cotangent,),
+        lambda x: x * x, kind=KernelGlue(), nested=False)(x)
+
+
+def _orders(square):
+    """Each higher-order derivative of the loss `sum(square(x)^2)`, nonlinear in `square`'s output, along a
+    direction: the Hessian's product with it by `jax.jvp` of the gradient and by the gradient of the
+    gradient's product with it, `12 x^2` times it, and the third derivative twice along it, `24 x` times its
+    square."""
+    def loss(x):
+        return jnp.sum(square(x) ** 2)
+
+    def forward_over_reverse(x, direction):
+        return jax.jvp(jax.grad(loss), (x,), (direction,))[1]
+
+    return {
+        "forward over reverse": forward_over_reverse,
+        "reverse over reverse": lambda x, direction: jax.grad(
+            lambda x: jnp.vdot(jax.grad(loss)(x), direction))(x),
+        "third order": lambda x, direction: jax.jvp(
+            lambda x: forward_over_reverse(x, direction), (x,), (direction,))[1],
+    }
+
+
+ORDERS = {label: (dew, _orders(lambda x: x * x)[label]) for label, dew in _orders(squared).items()}
+"""Each order's Dew arm, through `squared`'s kernel, beside its reference, through the portable `x * x`."""
+
+SEEDS = {"forward over reverse": 8, "reverse over reverse": 16, "third order": 8}
+"""Each order's declared seeds, sized paired (`seeds_for` with its Dew arm) at 1d187ee02f6 on armada."""
+
+
+def held_still_draw(draw: int) -> tuple[jax.Array, jax.Array]:
+    """A draw's point and direction, 257 values each: the point's magnitudes spread over two decades, so the
+    curvature `12 x^2` and the third derivative `24 x` round at every scale."""
+    point = jax.random.normal(jax.random.fold_in(jax.random.key(81), draw), (257,), jnp.float32)
+    direction = jax.random.normal(jax.random.fold_in(jax.random.key(82), draw), (257,), jnp.float32)
+    return point * 10.0 ** jax.random.uniform(jax.random.fold_in(jax.random.key(83), draw), (257,),
+                                              minval=-1.0, maxval=1.0), direction
+
+
+@pytest.mark.parametrize("order", list(ORDERS))
+def test_a_held_still_kernels_higher_orders_keep_its_loss_curvature(order):
+    """Through a kernel whose derivative runs its forward held still (`nested` off), the loss `sum(x^4)`'s
+    Hessian along a direction, by forward over reverse and by reverse over reverse, and its third derivative
+    twice along it, are on par with the portable composition's (check 1, truth float64): its curvature `J^T H
+    J` among them, where the output held still carried no tangent of its own and both second orders gave `4
+    x^2` (row 8648), and the third order lost its part, 32 at two where `24 x` is 48 (row 8573's head
+    review)."""
+    dew, reference = ORDERS[order]
+    assert_as_exact(jax.jit(dew), jax.jit(reference), held_still_draw, order, seeds=SEEDS[order])
+
+
+def test_a_linear_maps_batched_pullback_sums_after_it_pulls_back():
+    """A linear map that quarters its operand (`generation.linear_map`), shared by two lanes of a `jax.vmap`,
+    transposed at float32 cotangents of `2^127` each: `2^126`, each lane's cotangent pulled back before the
+    batch's sum, where summed first the sum overflowed to infinity before its quarter (base review 7fa8fe6c2
+    F1); a narrowing pullback asks for the sum first itself (`summed_first`, an exact widening's)."""
+    from dew.nn.kernels.generation import linear_map
+
+    def quartered(x):
+        return linear_map(lambda _, moving: moving * 0.25, lambda _, cotangent: cotangent * 0.25, (), x)
+
+    lanes = jax.vmap(quartered, in_axes=None, axis_size=2)
+    (pulled,) = jax.linear_transpose(lanes, jnp.float32(1.0))(jnp.full((2,), 2.0 ** 127, jnp.float32))
+    assert pulled.dtype == jnp.float32 and float(pulled) == 2.0 ** 126

@@ -20,6 +20,7 @@ Run with Transformers 5.16.1 and timm 1.0.29 / torchvision 0.29.0 on the path:
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -46,7 +47,14 @@ from transformers import (
 from transformers.models.gemma3n.modeling_gemma3n import Gemma3nForConditionalGeneration
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
 
+
 SEED = 2718
+SPECIAL: dict[str, Any] = {"pad_token_id": 0, "bos_token_id": 2, "eos_token_id": 1}
+"""The special tokens' ids: keywords every config takes (PretrainedConfig's), which a multimodal config's own
+signature does not name."""
+BATCHED: dict[str, Any] = {"padding": True, "return_tensors": "np"}
+"""The processor's batching: keywords its call takes, routed to its tokenizer, which its signature types
+under each modality's kwargs."""
 WORDS = {0: "<pad>", 1: "</s>", 2: "<s>", 3: "<boi>", 4: "<boa>", 5: "listen", 6: "<unk>", 7: "ok",
          8: "say", 9: "again", 48: "<eoi>", 49: "<image>", 50: "<|video|>", 56: "<eoa>", 57: "<audio>"}
 
@@ -74,7 +82,7 @@ def gemma3n():
     config = Gemma3nConfig(text_config=text, vision_config=vision, audio_config=audio_config("gemma3n"),
                            image_token_id=49, audio_token_id=57, boi_token_id=3, eoi_token_id=48,
                            boa_token_id=4, eoa_token_id=56, vision_soft_tokens_per_image=4,
-                           audio_soft_tokens_per_image=3, pad_token_id=0, bos_token_id=2, eos_token_id=1)
+                           audio_soft_tokens_per_image=3, **SPECIAL)
     config._attn_implementation = "eager"
     torch.manual_seed(SEED)
     model = Gemma3nForConditionalGeneration(config).eval()
@@ -93,13 +101,14 @@ def gemma4():
                                 standardize=True)
     config = Gemma4Config(text_config=text, vision_config=vision, audio_config=audio_config("gemma4"),
                           image_token_id=49, video_token_id=50, audio_token_id=57, boi_token_id=3,
-                          eoi_token_id=48, boa_token_id=4, eoa_token_index=56,
-                          pad_token_id=0, bos_token_id=2, eos_token_id=1)
+                          eoi_token_id=48, boa_token_id=4, eoa_token_index=56, **SPECIAL)
     config._attn_implementation = "eager"
     torch.manual_seed(SEED)
     model = Gemma4ForConditionalGeneration(config).eval()
-    model.model.audio_tower.config._attn_implementation = "sdpa"
-    if model.model.audio_tower.config._attn_implementation != "sdpa":
+    tower = model.model.audio_tower
+    assert tower is not None  # The config names an audio tower.
+    tower.config._attn_implementation = "sdpa"
+    if tower.config._attn_implementation != "sdpa":
         raise RuntimeError("the audio tower must run with the boolean sdpa mask")
     processor = Gemma4Processor(Gemma4AudioFeatureExtractor(feature_size=16), Gemma4ImageProcessor(),
                                 tokenizer(), Gemma4VideoProcessor())
@@ -119,14 +128,17 @@ def write(root: Path):
         torch.manual_seed(SEED)
         perturb(model)
         prompts = ["listen <audio> ok", "say <audio> again ok"]
-        inputs = processor(text=prompts, audio=sounds, padding=True, return_tensors="np")
+        inputs = processor(text=prompts, audio=sounds, **BATCHED)
         tensors = {key: torch.from_numpy(np.asarray(value)) for key, value in inputs.items()}
         forward = {key: value for key, value in tensors.items()
                    if key in ("input_ids", "attention_mask", "input_features", "input_features_mask",
                               "token_type_ids", "mm_token_type_ids")}
         with torch.no_grad():
             logits = model(**forward, use_cache=False).logits
-            generated = model.generate(**forward, max_new_tokens=3, do_sample=False)
+            # generate takes its model as GenerationMixin's host protocol, which the model meets at run
+            # time and no model class statically: read untyped.
+            generating: Any = model
+            generated = generating.generate(**forward, max_new_tokens=3, do_sample=False)
         save_file({name: value.contiguous().clone() for name, value in model.state_dict().items()},
                   str(directory / "model.safetensors"), metadata={"format": "pt"})
         (directory / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
@@ -135,8 +147,8 @@ def write(root: Path):
         processor.save_pretrained(str(directory))
         for index, waveform in enumerate(sounds):
             np.save(directory / f"waveform_{index}.npy", waveform)
-        np.savez(directory / "reference.npz", logits=logits.numpy(), generated=generated.numpy(),
-                 **{key: np.asarray(value) for key, value in inputs.items()})
+        np.savez(directory / "reference.npz", allow_pickle=False, logits=logits.numpy(),
+                 generated=generated.numpy(), **{key: np.asarray(value) for key, value in inputs.items()})
         (directory / "meta.json").write_text(json.dumps({
             "torch": torch.__version__, "transformers": transformers.__version__, "seed": SEED,
             "prompts": prompts, "sampling_rate": 16000, "backend": "cpu", "dtype": "float32",

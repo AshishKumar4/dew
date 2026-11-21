@@ -91,7 +91,10 @@ def decoder(statements) -> dict:
         # not, so the batches count many right predictions and many wrong.
         tokens = rng.integers(0, MODEL["vocab_size"], (rows, LENGTH)).astype(np.int32)
         for position in range(1, LENGTH):
-            chosen = np.asarray(jnp.argmax(model.apply(params, jnp.asarray(tokens))[:, position - 1], -1))
+            logits = model.apply(params, jnp.asarray(tokens))
+            if isinstance(logits, tuple):
+                raise TypeError("the model applied without mutable collections returned its variables too")
+            chosen = np.asarray(jnp.argmax(logits[:, position - 1], -1))
             greedy = rng.random(rows) < 0.6
             tokens[greedy, position] = chosen[greedy]
         roles = np.full((rows, LENGTH), USER, np.int32)
@@ -134,8 +137,8 @@ def ties(statements) -> dict:
 def main() -> None:
     statements = accuracy_statements()
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE / "decoder.npz", **decoder(statements))
-    np.savez(FIXTURE / "ties.npz", **ties(statements))
+    np.savez(FIXTURE / "decoder.npz", allow_pickle=False, **decoder(statements))
+    np.savez(FIXTURE / "ties.npz", allow_pickle=False, **ties(statements))
     print(f"{FIXTURE}: decoder.npz and ties.npz")
 
 

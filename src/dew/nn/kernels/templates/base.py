@@ -107,11 +107,34 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
         """Whether a program of the launch of `ba` at `config` fits a block of `target`
-        (`generation.shared_budget`) and its threads hold their registers (`registers`,
-        `register_budget`), a compile of this process having found it spill nothing (`report.refused`):
-        a generated kernel spills nothing."""
+        (`generation.shared_budget`), a compile of this process having found it spill nothing and its
+        warpgroup MMAs unserialized (`report.refused`): its registers and its products' issue are the
+        assembler's verdict (`tuning`'s certification, a program's compile, `report.settled`), not a
+        model's, and a generated kernel spills nothing."""
         return (self.staged_bytes(ba, config, target) <= self.program_shared(config, target)
-                and self._held(ba, config) and not report.refused(self, ba, config))
+                and not report.refused(self, ba, config))
+
+    def ranks_alone(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Whether the launch's derivation takes its ranking's first legal config for `ba` on `target`
+        (`takes`): where a receipt measured the ranking's first faster than the config its register model
+        proposes (M-FS-15). Else the model proposes (`held`): today's pick, which no receipt has moved. A
+        launch says where it moves."""
+        del ba, target
+        return False
+
+    def takes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
+        """Whether the launch's derivation takes `config` for `ba` on `target`: a legal config (`legal`) it
+        proposes (`proposes`). The model proposes and the assembler decides: a config it proposes that spills
+        or whose warpgroup MMAs ptxas serializes is refused by the compile that finds it, and the
+        derivation steps past it (`report.refused`)."""
+        return self.legal(ba, config, target) and self.proposes(ba, config, target)
+
+    def proposes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget, *,
+                 held: Callable[[], bool] | None = None) -> bool:
+        """Whether the derivation offers `config` for `ba` on `target` to its legality: any config where the
+        call ranks alone (`ranks_alone`), else one its register model holds (`held`, evaluated lazily so a
+        rank-only launch computes no register estimate, row 9477)."""
+        return self.ranks_alone(ba, target) or (self.held(ba, config) if held is None else held())
 
     def program_shared(self, config: Config, target: generation.GpuTarget) -> int:
         """The shared memory a program of the launch at `config` may stage on `target`: a block's
@@ -126,7 +149,7 @@ class Template[Config: Hashable](tuning.KernelOp):
         if self.GENERATES:
             config = self.derived(ba, target)
             return () if config is None or not self.legal(ba, config, target) else (config,)
-        return tuple(config for config in self.space(ba) if self.legal(ba, config, target))
+        return tuple(config for config in self.space(ba) if self.takes(ba, config, target))
 
     def pinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> bool:
         # A generating launch's pin may name any legal config of its type; a fixed space's, one of the
@@ -136,19 +159,23 @@ class Template[Config: Hashable](tuning.KernelOp):
             return False
         if self.GENERATES:
             return self.legal(ba, config, target)
-        try:
-            return config in self.fitting(ba, target)
-        except Unfitted:
-            return False
+        return config in self.space(ba) and self.legal(ba, config, target)
 
     def _typed(self, config: Hashable) -> TypeGuard[Config]:
         """Whether `config` is of the launch's config type (`config_cls`)."""
         return isinstance(config, self.config_cls)
 
-    def _held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
-        """Whether `config`'s threads hold their registers (`registers` within `register_budget`); a launch
-        stating none (a TPU's, the XLA program's) holds any."""
-        registers = self.registers(ba, config)
+    def held(self, ba: tokamax.BoundArguments, config: Config, *, reverse: bool = False) -> bool:
+        """Whether the launch's register model proposes `config` (`takes`): its threads' modeled registers
+        (`registers`) within `register_budget`; a launch stating none (a TPU's, the XLA program's) proposes
+        any. `reverse` asks about the launches reverse-mode certification compiles (a multi-launch template's
+        backward launches; a single-launch template checks its own). A proposal, not legality: the
+        assembler's compile decides (`legal`)."""
+        del reverse
+        return self.within(self.registers(ba, config), config)
+
+    def within(self, registers: int | None, config: Config) -> bool:
+        """Whether register estimate `registers` fits `config`'s `register_budget` (None fits any)."""
         return registers is None or registers <= self.register_budget(config)
 
     def offering(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
@@ -169,7 +196,7 @@ class Template[Config: Hashable](tuning.KernelOp):
         their registers stages, against the budget; None where none does (a generating launch that
         generates none)."""
         named = () if self.GENERATES else self.space(ba)
-        held = [config for config in named if self._held(ba, config)]
+        held = [config for config in named if self.held(ba, config)]
         least = min((self.staged_bytes(ba, config, target) for config in held), default=None)
         return Unfitted(type(self).__name__, least, generation.shared_budget(target), target.generation)
 
@@ -179,14 +206,15 @@ class Template[Config: Hashable](tuning.KernelOp):
         return generation.gpu_target()
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
-        """Why `config` is no pin for `ba` (`pinnable`): no config of the launch's type, holding more
-        registers than a thread does, staging more shared memory than a block of the GPU holds, or
-        outside what the launch's kernel takes (its legality's other rules, or a fixed space)."""
+        """Why `config` is no pin for `ba` (`pinnable`): no config of the launch's type, staging more shared
+        memory than a block of the GPU holds, refused where a compile of this process assembled it
+        (`report.refused`: spilling, or its warpgroup MMAs serialized), or outside what the launch's kernel
+        takes (its legality's other rules, or a fixed space)."""
         if not self._typed(config):
             return f"it is no {self.config_cls.__name__}"
-        if not self._held(ba, config):
-            return (f"its threads hold {self.registers(ba, config)} registers live, past the "
-                    f"{self.register_budget(config)} a thread has")
+        if report.refused(self, ba, config):
+            return ("its kernel spilled or serialized its warpgroup MMAs where a compile of this process "
+                    "assembled it")
         target = self.launch_target()
         staged, shared = self.staged_bytes(ba, config, target), self.program_shared(config, target)
         if staged > shared:
@@ -237,7 +265,7 @@ class Template[Config: Hashable](tuning.KernelOp):
             return (first,)
         target = self.launch_target()
         return tuple(dict.fromkeys((first, *(config for config in self.neighbours(ba, first)
-                                             if self.legal(ba, config, target)))))
+                                             if self.takes(ba, config, target)))))
 
 
 class Unfitted(report.Exhausted):

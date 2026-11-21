@@ -65,6 +65,7 @@ def write(name: str, item: str) -> None:
         logged.add((name, item))
     if not item.startswith(EVIDENCE) and checkout_file(path := item.partition(followed.CODE)[0]):
         seen.add(path)
+    assert log is not None  # Opened by `start`, before any event.
     log.write(f"{name}\t{item}\n")
 
 
@@ -77,6 +78,7 @@ def switch(name: str) -> None:
     recorded again under it, and the visit logged: a file a session parameter revisits holds what ran
     between its visits (`recorded`)."""
     owners[0] = name
+    assert log is not None  # Opened by `start`, before any visit.
     log.write(f"{name}\t{VISIT}\n")
     if len(owners) == 1:
         os.environ["DEW_EXECUTED_FILE"] = name
@@ -160,6 +162,7 @@ def peaked() -> None:
 def leading() -> None:
     """The recorder's import finder put first again, ahead of one a later import system user put first
     (pytest's assertion rewriter, which finds a module it rewrites itself), so it still sees every import."""
+    assert importer is not None  # Made by `start`.
     sys.meta_path.remove(importer)
     sys.meta_path.insert(0, importer)
 

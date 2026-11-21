@@ -7,6 +7,7 @@ past the fold's reach, and the builders' inverse (`unpacked` of `packed`) and th
 covering each row's keys.
 """
 
+import dataclasses
 import itertools
 
 import jax
@@ -16,13 +17,17 @@ import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
+from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
     attention_decode,
     attention_mosaic,
+    attention_mosaic_forward,
     bundles,
+    cost,
+    emission,
     report,
 )
 
@@ -74,6 +79,61 @@ def _operands(query_shape: tuple[int, ...], keys: int):
         return query, key, value
 
     return draw
+
+
+@INTERPRETS
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_steps_rows_whose_sums_pass_fp32s_largest_walk_again_scaled_interpreted(device):
+    """A bf16 decode step (`attention_decode.attend`) whose first row's values are positive and near 2^124, so
+    its walk's unscaled sums over its 200 keys pass fp32's largest, each value within bf16's, beside a row of
+    ordinary values, interpreted as an H100 or an A100 runs it: on par with the reference path at a scale its
+    sums hold (check 1), the first row's programs walking their keys again scaled in their launch
+    (`after_walk.Decided`) and the second's not, with no pass over the values before the launch to choose its
+    walk."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)
+
+    def draw(seed: int):
+        query, key, value, _ = drawn(seed)
+        return query, key, value.at[0].set(jnp.abs(value[0]) * jnp.bfloat16(2.0 ** 124))
+
+    def ours(query, key, value):
+        with generation.assumed(device):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value):
+        # The reference path's first row's sums pass fp32's largest too: that row run at its values' scale
+        # (2^-124 each, exact) and its output taken back by it, the same path at a scale its sums hold.
+        scaled = value.at[0].multiply(jnp.asarray(2.0 ** -124, value.dtype))
+        out = template.reference(query, key, scaled, spans)
+        return out.at[0].multiply(jnp.asarray(2.0 ** 124, out.dtype))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template decode {device} past fp32's largest",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_step_over_a_value_it_reads_not_a_number_is_the_references_interpreted(device):
+    """A bf16 decode step whose first row reads a value of NaN at one key: its rows' sums are no number, so
+    its programs walk their keys again scaled, and the step's output is NaN where the reference path's is,
+    never made finite; the second row, its values ordinary, bit for bit its own without the NaN beside it."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    poisoned = value.at[0, 5, 0, 3].set(jnp.nan)
+    ours = np.asarray(_assumed_attend(device, query, key, poisoned, spans), np.float32)
+    theirs = np.asarray(template.reference(query, key, poisoned, spans), np.float32)
+    np.testing.assert_array_equal(np.isnan(ours), np.isnan(theirs))
+    assert np.isnan(theirs[0]).any() and not np.isnan(theirs[1]).any()
+    alone = np.asarray(_assumed_attend(device, query, key, value, spans), np.float32)
+    np.testing.assert_array_equal(ours[1].view(np.uint32), alone[1].view(np.uint32))
+
+
+def _assumed_attend(device: str, query, key, value, spans):
+    with generation.assumed(device):
+        return attention_decode.attend(query, key, value, spans, interpret=True)
 
 
 @INTERPRETS
@@ -312,7 +372,7 @@ def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk
 @INTERPRETS
 def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_interpreted():
     """A decode step on an H100 of two rows over 4096 keys, its four programs' keys cut into slices (`plan`)
-    whose states merge by their masses (`algebra.merged_slices`): the first row reads every key, whole key
+    whose states merge by their masses (`algebra.merged_state`): the first row reads every key, whole key
     tiles and whole slices, the second none. On par with the reference path (check 1), the empty row zero.
     The merge at fp32's edges is the stability suite's (tests/test_attention_stability.py's template
     decode at fp32's edges)."""
@@ -531,11 +591,10 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
 
 QUANTIZED = [(device, page, stored) for stored in ("int8", "float8_e4m3fn")
              for device, page in (("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 16),
-                                  ("sm80", 128))
-             if stored == "int8" or device == "sm90"]
+                                  ("sm80", 128))]
 """The quantized decode's devices, layouts and codes: dense, pages of 16 keys several to a key tile, their
-rows gathered (`Transport.gathers_rows`), and on an A100 of whole key tiles; FP8 codes where the device
-converts them (`mosaic.converts`, sm_89 on)."""
+rows gathered (`Transport.gathers_rows`), and on an A100 of whole key tiles; both int8 and FP8 on every GPU
+(`mosaic.converts`, row 8549)."""
 
 
 @INTERPRETS
@@ -706,7 +765,8 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
         initial = template.Initial(sink, jnp.ones_like(sink), jnp.zeros((*sink.shape, values.shape[-1])))
         spec = algebra.Forward("spans", 40, ids=False, scale=1.0, natural=True, initial=True)
         out, maximum, total = _states(logits, values, cuts)
-        return algebra.merged_slices(spec, out, maximum, total, initial)
+        state = algebra.merged_state(spec, out, maximum, total, initial)
+        return algebra.finish(spec, state, initial=True, normalized=True)[0]
 
     def whole(logits, values, sink):
         scores = jnp.concatenate([logits, jnp.transpose(sink, (0, 2, 1))[..., None]], axis=-1)
@@ -736,7 +796,7 @@ def _resumed(maximum: jax.Array, acc: jax.Array) -> template.Initial:
 @pytest.mark.parametrize("slices", [1, 3])
 def test_merging_slices_with_a_resumed_maximum_past_fp32s_largest_in_raw_units_keeps_its_share(slices):
     """A row's slices in the raw fold's units fp16's decode takes (`attention_decode._spec`: a scale of 1/8),
-    merged in XLA with a resumed state whose first row's maximum is `RESUMED` (`algebra.merged_slices`): the
+    merged in XLA with a resumed state whose first row's maximum is `RESUMED` (`algebra.merged_state`): the
     state's maximum saturates there as the walk's does (`algebra.initial_state`, `raw_maximum`), so that row
     is the state's own sums over its denominator, every row on par with the whole softmax (check 1)."""
     cuts = np.linspace(0, 40, slices + 1).astype(int)
@@ -745,7 +805,8 @@ def test_merging_slices_with_a_resumed_maximum_past_fp32s_largest_in_raw_units_k
 
     def ours(logits, values, maximum, acc):
         out, peak, total = _states(logits, values, cuts)
-        return algebra.merged_slices(spec, out, peak / spec.scale, total, _resumed(maximum, acc))
+        state = algebra.merged_state(spec, out, peak / spec.scale, total, _resumed(maximum, acc))
+        return algebra.finish(spec, state, initial=True, normalized=True)[0]
 
     def whole(logits, values, maximum, acc):
         initial = _resumed(maximum, acc)
@@ -860,3 +921,201 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
             with tuning.pinned({attention_mosaic.MosaicForward: again.config}):
                 chosen = op.taken(launch)
     assert chosen != refused
+
+
+@COMPILES_ON_CPU
+def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_steps():
+    """A decode step's price (`attention_decode.priced_step`: its launches' work as their emission counts it,
+    `cost.seconds` its seconds) for one row of 8 query heads over 2 key heads 128 wide in bf16 on an H100:
+    twice the keys read more device bytes, walk at least as many steps and take longer, and the same keys
+    from a paged pool of 64-key pages walk no fewer steps than from a dense cache, every step's tile within a
+    page (row 7420: a server's choice between the two reads what each costs)."""
+    def priced(keys, page_size=None):
+        return attention_decode.priced_step(generation.gpu_target("sm90"), rows=1, queries=1, keys=keys,
+                                            heads=8, kv_heads=2, width=128, dtype=jnp.bfloat16,
+                                            page_size=page_size)
+
+    dense, longer, paged = priced(4096), priced(8192), priced(4096, page_size=64)
+    assert dense is not None and longer is not None and paged is not None
+    assert dense.kernels >= 1 and dense.device_bytes > 0
+    assert longer.device_bytes > dense.device_bytes and longer.span >= dense.span
+    assert paged.span >= dense.span
+    # Its seconds on the device (`cost.seconds`), the server's comparison, grow with the keys it reads.
+    target = generation.gpu_target("sm90")
+    assert cost.seconds(longer, target) > cost.seconds(dense, target) > 0
+
+
+SPLIT_SPANS = {
+    "ten tiles in three": ("full", 64, 640, 1, "wgmma", 3, 4, (10, 10)),
+    "a causal pair in two": ("causal", 256, 256, 2, "wgmma", 2, 3, (10, 10)),
+}
+"""Each split launch's spans' form, queries, keys, consumers a program and family, slices, the span its
+longest program walks, and its consumers' steps a head beside its unsplit launch's: ten 64-key tiles a query
+tile, split three ways, slices of 3, 3 and 4 tiles, ten steps either way; a causal 256 by 256 call at 64 by
+64 tiles, two consumers a program, two slices, whose last pair's consumers reach 3 and 4 tiles, their
+second slices [1, 3) and [2, 4), which its producer streams as one, [1, 4) (the base review of 71686face,
+F3), each consumer walking its own slices, 10 steps either way. A forward on a layout whose consumers feed
+their own rings (`TileWalk.common`) takes one consumer (`MosaicForward.legal`, row 2599), so no split
+launch's holders walk a common envelope."""
+
+
+def _split_work(form: str, queries: int, keys: int, consumers: int, family: str, splits: int):
+    """The work of a launch over `form`'s spans of `queries` and `keys` at 64 by 64 tiles, `consumers` a
+    program on `family`'s walk, in `splits` slices, traced for an H100 as its costed launch counts it
+    (`emission.work_of`): its walk's launch, beside the guard's natural rewalk
+    (`attention_mosaic_forward.NATURAL_NAME`)."""
+    query = jnp.zeros((1, queries, 2, 64), jnp.bfloat16)
+    key = jnp.zeros((1, keys, 2, 64), jnp.bfloat16)
+    spans = template.spans(queries, keys, 1, causal=form == "causal")
+    with generation.assumed("sm90"):
+        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None, natural=False,
+                                                  splits=splits, out_dtype=jnp.float32)
+        tiles = attention_mosaic.Tiles(64, 64, 2, consumers, family=family)
+        with tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+            # A split launch's slices keep their rows, which the step's merge reads (`attention_decode`).
+            kept = template.Kept.OUTPUT if splits > 1 else template.Kept.NONE
+            traced = jax.make_jaxpr(lambda *operands: op(*operands, residuals=kept, interpret=False))(*args)
+    (work,) = [emission.work_of(equation) for equation in programs.equations(traced.jaxpr)
+               if equation.primitive in programs.NATIVE_KERNELS
+               and attention_mosaic_forward.NATURAL_NAME not in equation.params["name"]]
+    assert work is not None
+    return work
+
+
+@pytest.mark.parametrize(("form", "queries", "keys", "consumers", "family", "splits", "span", "steps"),
+                         SPLIT_SPANS.values(), ids=SPLIT_SPANS.keys())
+def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumers, family, splits, span,
+                                                   steps):
+    """A split launch (`MosaicForward.splits`, `_Program._sliced`) traced for an H100 at 64 by 64 tiles: its
+    work as its costed launch counts it (`_split_work`) spans its longest program's walk
+    (`cost.Stated.longest`), where its programs' mean was 10/3 for ten tiles in three (row 8844; the base
+    review of 31b5fe85b, F2), and issues its consumers' steps as the kernel slices and streams them, its
+    unsplit launch's tensor work by their ratio to its steps (`attention_mosaic_program.walks`)."""
+    split = _split_work(form, queries, keys, consumers, family, splits)
+    unsplit = _split_work(form, queries, keys, consumers, family, 1)
+    assert split.span == span
+    assert split.flops * steps[1] == unsplit.flops * steps[0]
+
+
+def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
+    """A decode step of 256 rows of one query, 8 heads over 2 key heads 128 wide in bf16, on an H100 over
+    4096 keys (`attention_decode.priced_step`): its programs, 512, pass the multiprocessors' count, so no
+    split merge's reads hide its walk's, which price at least its keys and values read once, where its
+    launch, packed into spans of every key, stated none and the step's price was Work() (the base review of
+    56a716c95, F3)."""
+    rows, keys, kv_heads, width = 256, 4096, 2, 128
+    priced = attention_decode.priced_step(generation.gpu_target("sm90"), rows=rows, queries=1, keys=keys,
+                                          heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
+    assert priced is not None
+    assert priced.device_bytes >= 2 * rows * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
+    # Non-deciding fallback (`natural_form=True`, row 8813 F2) prices only the common bounded arm, not both.
+    sm90 = generation.gpu_target("sm90")
+    with generation.assumed(sm90):
+        q90 = jnp.zeros((1, 1, 8, width), jnp.bfloat16)
+        k90 = jnp.zeros((1, keys, kv_heads, width), jnp.bfloat16)
+        base_plan, *_ = attention_decode.planned(q90, k90, k90, attention_decode.key_spans(1, keys, 1),
+                                                 template.Hooks())
+        assert base_plan is not None
+        non_deciding = dataclasses.replace(base_plan["plain"].config, natural_form=True)
+        with tuning.pinned({attention_mosaic.MosaicForward: non_deciding}):
+            plan90, *_ = attention_decode.planned(q90, k90, k90, attention_decode.key_spans(1, keys, 1),
+                                                  template.Hooks())
+            fallback = attention_decode.priced_step(sm90, rows=1, queries=1, keys=keys, heads=8,
+                                                    kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
+    assert plan90 is not None and "bounded" in plan90 and "scaled" in plan90
+    expected_kernels = 1 + int(plan90["bounded"].slices > 1)
+    assert fallback is not None and fallback.kernels == expected_kernels
+    assert fallback.device_bytes >= 2 * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [128, 256])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(generation_name, width):
+    """A bf16 inference forward compiled for a compile-only A100, H100, B200 and RTX PRO 6000
+    (`kernel_compile.compile_mosaic_kernels`): every kernel spills nothing, whether its launch decides its
+    scaled walk itself (`MosaicForward.decided`: the scaled walk's registers held at the unscaled walk's
+    config, priced at them) or takes the fallback, the scaled op its own launch (row 5274)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    query = jax.ShapeDtypeStruct((1, 256, 8, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 2048, 2, width), jnp.bfloat16)
+    spans = template.spans(256, 2048, 1, causal=False)
+
+    def forward(q, k, v):
+        return attention_mosaic.forward(q, k, v, spans, natural=False)
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels([KernelCase("inference", lambda: (forward, (query, key, key)))],
+                                       generation_name)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+@COMPILES_ON_CPU
+def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
+    """A split decode step on an H100 (`attention_decode.priced_step`: 1 row, 1 query, 8 heads over 2 key
+    heads 128 wide over 8192 keys) prices its native `merged_padded` launch independently of
+    `merged.launch_work` (rows 8845, 10533): its kernel count, span (`3 * chunks`) and device bytes equal the
+    split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
+    from test_merged import _traced_merge_bytes
+
+    from dew.algebra import means
+    from dew.nn.kernels.templates import merged
+
+    target = generation.gpu_target("sm90")
+    priced = attention_decode.priced_step(target, rows=1, queries=1, keys=8192, heads=8, kv_heads=2,
+                                          width=128, dtype=jnp.bfloat16)
+    assert priced is not None and priced.kernels >= 2.0
+    query = jax.ShapeDtypeStruct((1, 1, 8, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 8192, 2, 128), jnp.bfloat16)
+    spans = template.spans(1, 8192, 1, causal=False)
+    with generation.assumed(target):
+        traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(
+            q, k, v, spans, None, scale=None, interpret=False, table=None, sources=None,
+            scales=None, bounds=None, finished=True, in_key=False))(query, key, key)
+    (merge_eq,) = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive is merged.merged_padded_p]
+    padded_s = jax.ShapeDtypeStruct(merge_eq.invars[0].aval.shape, merge_eq.invars[0].aval.dtype)
+    stacked_s = jax.ShapeDtypeStruct(merge_eq.invars[1].aval.shape, merge_eq.invars[1].aval.dtype)
+    queries, width = merge_eq.params["queries"], merge_eq.params["width"]
+    out_dtype, out_heads = merge_eq.params.get("out_dtype"), merge_eq.params.get("out_heads")
+    block = merged._channel_block(merge_eq.params["units"], padded_s, stacked_s, queries, width, target,
+                                  out_dtype=out_dtype, out_heads=out_heads)
+    emitted_bytes = _traced_merge_bytes(merge_eq.params["units"], padded_s, stacked_s, queries, width, block,
+                                        out_dtype=out_dtype, out_heads=out_heads)
+    slices = padded_s.shape[1]
+    merge_span = float(3 * -(-slices // means.chunk_width(slices)))
+    walk_launches = [w for eq in programs.equations(traced.jaxpr)
+                     if eq.primitive in programs.NATIVE_KERNELS
+                     and (w := emission.work_of(eq)) is not None]
+    assert merge_span >= 3.0 and emitted_bytes > 0
+    assert priced.kernels == len(walk_launches) + 1.0
+    assert priced.span == sum(w.span for w in walk_launches) + merge_span
+    assert priced.device_bytes == sum(w.device_bytes for w in walk_launches) + emitted_bytes
+
+
+@INTERPRETS
+def test_a_decode_step_resuming_an_initial_state_near_fp32s_largest_keeps_its_mass():
+    """A decode step through the public entry (`attention_decode.attend`) resuming an `Initial` state whose
+    total is `1.5 * 2^126` (rows 6904, 6928, 6984): `initial_state` divides through `means.finished` without
+    XLA:CPU reciprocal underflow so the resumed state's value is preserved instead of flushing to zero."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    query, _, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    total = jnp.full((query.shape[0], heads, positions), np.float32(1.5 * 2.0 ** 126), jnp.float32)
+    m = jnp.full((query.shape[0], heads, positions), np.float32(20.0), jnp.float32)
+    acc = total[..., None] * jnp.ones((query.shape[0], heads, positions, value.shape[-1]), jnp.float32)
+    def ours(q, k, v, im, it, ia):
+        with generation.assumed("sm90"):
+            hooks = template.Hooks(initial=template.Initial(im, it, ia))
+            return attention_decode.attend(q, k, v, spans, hooks, interpret=True)
+
+    def reference(q, k, v, im, it, ia):
+        return template.reference(q, k, v, spans, template.Hooks(initial=template.Initial(im, it, ia)))
+
+    def draw(seed: int):
+        q, k, v, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(seed)
+        return q, k, v, m, total, acc
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    "decode step resuming initial state near fp32s largest", seeds=SEEDS)

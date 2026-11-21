@@ -4,7 +4,6 @@ import collections
 import copy
 import functools
 import itertools
-import operator
 from dataclasses import replace
 from pathlib import Path
 
@@ -218,22 +217,19 @@ def gradient(objective, variables, batch):
     return jax.grad(total)(variables)
 
 
-def located(tree, path: tuple[str, ...], held, same=lambda mine, its: np.array_equal(np.asarray(mine),
-                                                                                     np.asarray(its))
-            ) -> tuple[str, ...]:
+def located(tree, path: tuple[str, ...], held) -> tuple[str, ...]:
     """Where in a parameters tree a module whose scope is `path` holds `held`, its own parameters as its
     apply read them: its model applies it at the tree's root or under one of its top-level modules, a
-    backbone's and a head's scopes alike (`layers_0/self_attn` in both), so the one place whose
-    parameters are `held`'s is its, each leaf the `same` as `held`'s (equal values, or under a trace the
-    very arrays, `operator.is_`: `AttentionTerms`). A place none or several of whose places hold them is
-    refused, naming its path."""
+    backbone's and a head's scopes alike (`layers_0/self_attn` in both), so the one place whose leaves are
+    the very arrays `held` holds is its, read as a trace reads them (`AttentionTerms`). A path none or
+    several of whose places hold them is refused, naming it."""
     found = []
     for root in ((), *((name,) for name, child in tree.items() if isinstance(child, dict))):
         reached = tree
         for name in (*root, *path):
             reached = reached.get(name) if isinstance(reached, dict) else None
         if reached is not None and jax.tree.structure(reached) == jax.tree.structure(held) and all(
-                same(mine, its)
+                mine is its
                 for mine, its in zip(jax.tree.leaves(reached), jax.tree.leaves(held), strict=True)):
             found.append((*root, *path))
     assert len(found) == 1, f"{path} is at {len(found)} places of the parameters"
@@ -254,7 +250,7 @@ class AttentionTerms:
     `float64_terms` sizes a leaf by its final sum's terms alone. The attentions' inputs and outputs are
     read through Flax's method interception, the outputs' cotangents as the gradient of a zero added to
     each, in one program traced once. Each attention's place in the parameters is read as it is traced,
-    the one place whose leaves are the very arrays its module reads (`located` by `operator.is_`), so the
+    the one place whose leaves are the very arrays its module reads (`located`), so the
     terms are a program of the variables a prepare traces and compiles ahead (row 7359)."""
 
     def __init__(self, objective, batch):
@@ -272,8 +268,7 @@ class AttentionTerms:
                 path = module.scope.path
                 self.names[path] = module.names
                 if path not in self.places:
-                    self.places[path] = located(variables["params"], path, module.variables["params"],
-                                                operator.is_)
+                    self.places[path] = located(variables["params"], path, module.variables["params"])
                 record = held.setdefault(path, {})
                 out = call(*args, **kwargs)
                 if context.method_name == "_heads":
@@ -289,17 +284,18 @@ class AttentionTerms:
 
         self.total = total
         self.read = jax.jit(jax.grad(total, argnums=1, has_aux=True))
-        self.added: dict | None = None
+        self.outputs: dict | None = None
 
     def __call__(self, variables) -> dict:
         """The terms carried to each attention's projections, by its place in the parameters (`located`):
         each projection's input and its heads' terms."""
-        if self.added is None:
-            # Every draw's variables are of one tree, so its attentions' outputs of one shape.
+        if self.outputs is None:
+            # Every draw's variables are of one tree, so its attentions' outputs of one shape: their shapes
+            # kept, the zeros made in each call, as one made in a trace is that trace's own.
             _, shapes = jax.eval_shape(self.total, variables, {})
-            self.added = {path: jnp.zeros(record["out"].shape, record["out"].dtype)
-                          for path, record in shapes.items()}
-        cotangents, held = self.read(variables, self.added)
+            self.outputs = {path: record["out"] for path, record in shapes.items()}
+        added = {path: jnp.zeros(shape.shape, shape.dtype) for path, shape in self.outputs.items()}
+        cotangents, held = self.read(variables, added)
         carried = {}
         for path, record in held.items():
             query_name, key_name, value_name, out_name = self.names[path]
@@ -319,46 +315,6 @@ class AttentionTerms:
                 (query_name, into_queries, query_terms), (key_name, into_keys, key_terms),
                 (value_name, into_keys, value_terms))}
         return carried
-
-
-def test_an_attentions_terms_find_its_parameters_by_their_trace_where_their_values_place_them():
-    """`AttentionTerms` reads each attention's place in the parameters as it is traced, the one place whose
-    leaves are the very arrays its module reads (`located` by `operator.is_`), so its terms are a program a
-    prepare traces and compiles ahead (row 7359: value comparisons of traced arrays failed there). On the
-    joint arm's packed window (its head's attentions), traced whole (`jax.jit`), it places each attention
-    where its parameters' values do, read from an eager apply's (`located` by value), so its terms are the
-    value-located ones; a tree holding no such arrays, as a copy does, or holding them at two places, is
-    refused."""
-    objective = objective_for("joint")
-    rows = apart(windows(objective, 1))
-    wide = copy.copy(objective)
-    wide.substitute((objective.model.backbone.clone(dtype=jnp.float64, attention_impl="reference"),
-                     objective.model.head.clone(dtype=jnp.float64)))
-    with jax.enable_x64(new_val=True):
-        variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
-                                 nn.unbox(objective.init(jax.random.key(0))))
-        traced = AttentionTerms(wide, rows)
-        jax.jit(traced)(variables)
-        # Each attention's parameters as an eager apply reads them, placed by their values.
-        held = {}
-
-        def read(call, args, kwargs, context):
-            if isinstance(context.module, NormalAttention) and context.method_name == "__call__":
-                held[context.module.scope.path] = context.module.variables["params"]
-            return call(*args, **kwargs)
-
-        with nn.intercept_methods(read):
-            wide.loss(variables, rows, Step(jnp.asarray(0), jax.random.key(0), None, training=False))
-    assert held and traced.places == {path: located(variables["params"], path, params)
-                                      for path, params in held.items()}
-    path, params = next(iter(held.items()))
-    # Its place's top-level module, or the tree where it sits at the root, held under two names.
-    root = traced.places[path][:len(traced.places[path]) - len(path)]
-    under = node(variables["params"], root) if root else variables["params"]
-    copied, twice = jax.tree.map(np.copy, variables["params"]), {"one": under, "other": under}
-    for tree in (copied, twice):
-        with pytest.raises(AssertionError):
-            located(tree, path, params, operator.is_)
 
 
 def with_attention_terms(sized, carried: dict):
@@ -400,6 +356,20 @@ def test_a_packed_window_of_parallel_rows_decides_each_row_as_the_row_alone():
     """A packed window decides each row as the row alone (`packed_rows_decided_alone`) through the
     parallel arm, its seeds drawn by CI's map tasks (`check1_shards`)."""
     packed_rows_decided_alone("parallel")
+
+
+def test_a_packed_windows_site_prepares_its_terms_whole_and_runs_from_its_store(tmp_path):
+    """The marker arm's packed window (`packed_rows_decided_alone`) prepared into a store as a GPU tier
+    part's prepare compiles it (`truths_ahead.compiled_truths`): its site's terms program, the truth's
+    float64 terms beside each attention's (`AttentionTerms`), traces whole and compiles, and its run
+    computes its truths and terms from those programs, nothing deferred or unprepared (row 7359; the review
+    of train 1058: its truth's float64 terms converted to the host, and its prepare raised)."""
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+
+    for prepare in (True, False):
+        with compiled_truths(tmp_path, prepare=prepare, stamp="a"):
+            packed_rows_decided_alone("marker")
+    assert not (tmp_path / UNPREPARED).exists() and not (tmp_path / DEFERRED).exists()
 
 
 def packed_rows_decided_alone(arm: str) -> None:

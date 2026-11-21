@@ -71,7 +71,7 @@ from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
-from .kernels.templates import attention as template, attention_quantized, attention_route
+from .kernels.templates import attention as template
 from .precision import (
     asks_default_precision,
     at_least_fp32,
@@ -427,10 +427,13 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
         if quantized:
+            from .kernels.templates import attention_quantized
+
             # A quantized model's products, which the template forms as its rule does (row 4858).
             return attention_quantized.attend(query, key, value, spans, hooks)
-        return attention_route.attend(query, key, value, spans, hooks, in_key=in_key)
+        from .kernels.templates import attention_route
 
+        return attention_route.attend(query, key, value, spans, hooks, in_key=in_key)
     # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
     # rows and heads. A dropping call's draw takes each shard's global rows and heads from the query's own
     # split (`on_attention_shards`'s coordinates), so it does not depend on the mesh or on the rules of the
@@ -1270,11 +1273,12 @@ def quantized_rule(sinks: bool, dropout: bool = False) -> str | None:
     """`AttentionCase.quantized`'s kernel for a call with `sinks` or `dropout`: the template's quantized
     attention where a quantized model's rule owning its products takes it, the reference path where it does
     not; None where no rule owns them or it quantizes no activation."""
+    from .kernels.templates import attention_quantized
+
     rule = attention_quantized.quantizing()
     if rule is None:
         return None
     return 'template' if attention_quantized.takes(rule) and not (sinks or dropout) else 'reference'
-
 
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,

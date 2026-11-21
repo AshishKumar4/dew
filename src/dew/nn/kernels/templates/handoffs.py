@@ -5,12 +5,14 @@ whose barriers count the arrivals of the roles that fill and give back each."""
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 from collections.abc import Callable, Sequence
 from typing import Any
 
 from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic.gpu.utils import WARPS_IN_WARPGROUP as WARPS
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
@@ -21,19 +23,27 @@ from dew.nn.kernels.templates.bodies import MOVES, RESIDENT
 @dataclasses.dataclass(frozen=True)
 class Role:
     """One of a program's roles (`Schedule`): `count` units, warpgroups or (`warp`) warps of the program's
-    last warpgroup, each running the body `Schedule.run` binds to `name`; `weight` its warpgroups' share of
-    the registers the program's raises divide (`resources.role_registers`), 0 lowering them to setmaxnreg's
-    least (the last warpgroup's). Warp roles share their warpgroup, so its least too."""
+    last warpgroup (`places`), each running the body `Schedule.run` binds to `name` at its index among them;
+    `weight` its warpgroups' share of
+    the registers the program's raises divide (`resources.role_registers`), a fraction of a consumer's where a
+    role holds fewer (a correction warpgroup's half), 0 lowering them to setmaxnreg's least (the last
+    warpgroup's). Warp roles share their warpgroup, so its least too."""
     name: str
     count: int = 1
     warp: bool = False
-    weight: int = 1
+    weight: float = 1
 
     @property
     def arrivals(self) -> int:
         """A barrier's arrivals this role makes at it in a turn: one a warpgroup, where a role's threads
         arrive; one, where a warp's copy or a product's commit does."""
         return 1 if self.warp else self.count
+
+
+REDUCER = Role("reducer", warp=True, weight=0)
+"""A launch's reducers: a warp of its last warpgroup a compute role, each issuing the TMA adds its role stages
+into a ring for it (`Family.scheduled`'s `reducer`), so no compute role waits on its own adds' reads, nor on
+another role's."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,10 +62,10 @@ class HandOff:
 class Schedule:
     """A program's roles and the buffers between them: its warpgroup roles in turn, each its `count`
     warpgroups, its register budget raised to its weight's share (`registers`); then one warpgroup at
-    setmaxnreg's least, which holds either a role of weight 0 (a register family's producer) or the warp
-    roles (tcgen05's load and product warps, each a warp of it). A program of one role runs it on every
-    warpgroup and moves no registers. Its hand-offs' barriers count arrivals by the roles that fill and give
-    back each (`HandOff`), so no template states an arrival count."""
+    setmaxnreg's least, which holds either a role of weight 0 (a register family's producer) or the warp roles
+    (tcgen05's load and product warps, each its `count` warps of it, `places`). A program of one role runs it
+    on every warpgroup and moves no registers. Its hand-offs' barriers count arrivals by the roles that fill
+    and give back each (`HandOff`), so no template states an arrival count."""
     roles: tuple[Role, ...]
     handoffs: tuple[HandOff, ...] = ()
     axis: str | None = "wg"
@@ -84,6 +94,26 @@ class Schedule:
 
     def role(self, name: str) -> Role:
         return next(role for role in self.roles if role.name == name)
+
+    def joined(self, role: Role, count: int, *handoffs: HandOff) -> Schedule:
+        """The schedule with `count` units of `role` and the `handoffs` it fills or gives back: a warp role
+        among its last warpgroup's warp roles (a launch's `REDUCER`, a warp a compute role); a warpgroup role
+        of a weight after its raised roles, before its last warpgroup's (a correction warpgroup beside an
+        attention launch's consumers, FlashAttention-4's), its registers its weight's share of the raise
+        (`registers`). A warpgroup role of weight 0 has no warpgroup to join: the last is the lowered one."""
+        placed = dataclasses.replace(role, count=count)
+        if role.warp:
+            if not any(other.warp for other in self.roles):
+                raise ValueError(f"{role.name} joins a schedule's warp roles, which {self.roles} holds "
+                                 f"none of")
+            roles = (*self.roles, placed)
+        elif role.weight:
+            raised = self.raised
+            roles = (*raised, placed, *self.roles[len(raised):])
+        else:
+            raise ValueError(f"{role.name}, a warpgroup role of weight 0, has no warpgroup of a schedule "
+                             f"to join")
+        return dataclasses.replace(self, roles=roles, handoffs=(*self.handoffs, *handoffs))
 
     def warpgroups(self) -> int:
         """The warpgroups a program of this schedule runs (`kernel`'s `warpgroups`)."""
@@ -117,19 +147,34 @@ class Schedule:
         return tuple(shape.opened(*(ref if isinstance(ref, tuple) else (ref,)))
                      for shape, ref in zip(self.stated(), refs, strict=True))
 
-    def run[R](self, *, exclusive: bool = False, **bodies: Callable[..., R]) -> R | None:
-        """Each role's body by its name: on a schedule of one role, `body(index)` on every warpgroup, its
-        index along `axis` (the value it returns, a program's whose consumers keep theirs); otherwise each
-        raised role's `body(index)` on its warpgroups, its index among them, their registers raised to its
-        share at the launch's residency (`registers`, `bodies.RESIDENT`), and the last warpgroup's, lowered
-        to the least, its role's `body()` or each warp role's on its warp, each body its register
+    def places(self) -> dict[str, int]:
+        """Each warp role's first warp of the last warpgroup: the warp roles in turn, each its `count` warps
+        (`run`'s; at most a warpgroup's together)."""
+        warp_roles = [role for role in self.roles if role.warp]
+        starts = itertools.accumulate((role.count for role in warp_roles), initial=0)
+        places = dict(zip((role.name for role in warp_roles), starts, strict=False))
+        if sum(role.count for role in warp_roles) > WARPS:
+            raise ValueError(f"warp roles of {[role.count for role in warp_roles]} warps hold more than a "
+                             f"warpgroup's {WARPS}")
+        return places
+
+    def run[R](self, *, exclusive: bool = False, static: str | None = None,
+               **bodies: Callable[..., R]) -> R | None:
+        """Each role's body by its name, at its index among its role's units: on a schedule of one role,
+        `body(index)` on every warpgroup, its index along `axis` (the value it returns, a program's whose
+        consumers keep theirs); otherwise each raised role's `body(index)` on its warpgroups, their
+        registers raised to its share at the launch's residency (`registers`, `bodies.RESIDENT`), and the
+        last warpgroup's, lowered to the least, its role's `body(0)` or each warp role's `body(index)` on
+        each of its warps (`places`, each warp's body traced at its own index), each body its register
         instruction first. Each role is a conditional of its own, or, `exclusive`, a branch of one switch
         on the warpgroup, for bodies that form every value they read within themselves (an attention
         forward's `_placed`): conditionals apart are regions the compiler allocates apart around the
         producer's register drop, where a B200's forward at width 256 held the consumers' values across it
         and spilled 172 bytes, 112 under one switch and none with its values formed in each role (row
         5466); a switch commons a value both bodies read above their register instructions, where a
-        recurrence's persistent tile index and its count spilled 52 bytes, conditionals apart none."""
+        recurrence's persistent tile index and its count spilled 52 bytes, conditionals apart none.
+        `static` names a role each of whose warpgroups is a branch of its own, its index a static number, so
+        the warpgroup index selects the branch alone, none of it carried across the register move."""
         if set(bodies) != {role.name for role in self.roles}:
             raise ValueError(f"a schedule of {[role.name for role in self.roles]} given bodies for "
                              f"{sorted(bodies)}")
@@ -145,32 +190,39 @@ class Schedule:
         moving = MOVES.get()
         branches, bounds, first = [], [], 0
         for role in self.raised:
-            def raised(role=role, first=first):
+            def raised(role=role, first=first, index=None):
                 if moving:
                     plgpu.set_max_registers(budgets[role.name], action="increase")
                 # The first role's warpgroups are those below its count, each its own index: no bound and no
                 # shift is traced for it (an attention forward's spill-free registers on an H100 turn on it,
                 # test_attention_mosaic's compile gate).
-                bodies[role.name](wg if first == 0 else wg - first)
+                bodies[role.name]((wg if first == 0 else wg - first) if index is None else index)
 
-            branches.append(raised)
+            if role.name == static and role.count > 1:
+                branches.extend(functools.partial(raised, index=index) for index in range(role.count))
+                bounds.extend(range(first + 1, first + role.count + 1))
+            else:
+                branches.append(raised)
+                bounds.append(first + role.count)
             first += role.count
-            bounds.append(first)
         lowered = [role for role in self.roles if not role.weight]
 
         def lower():
             if moving:
                 plgpu.set_max_registers(budgets[lowered[0].name], action="decrease")
             if not lowered[0].warp:
-                bodies[lowered[0].name]()
+                bodies[lowered[0].name](0)
                 return
+            places = self.places()
 
             @plgpu.warp_map
             def _(warp):
-                for place, role in enumerate(lowered):
-                    @pl.when(warp == place)
-                    def _(body=bodies[role.name]):
-                        body()
+                for role in lowered:
+                    for index in range(role.count):
+                        def each(body=bodies[role.name], index=index) -> None:
+                            body(index)
+
+                        pl.when(warp == places[role.name] + index)(each)
 
         if not exclusive:
             for (start, bound), branch in zip(itertools.pairwise((0, *bounds)), branches, strict=True):
@@ -186,3 +238,10 @@ class Schedule:
             index = jnp.where(wg >= first, 0, index + 1)
         lax.switch(index, branches)
         return None
+
+
+def runs_alone(family: str, joined: tuple) -> None:
+    """Refuse `joined` roles (`Family.role_schedule`'s) to `family`, whose program runs its own roles alone:
+    one warpgroup, or a core, moving no registers between roles."""
+    if joined:
+        raise ValueError(f"{family} runs its own roles alone, no {[role.name for role, *_ in joined]}")

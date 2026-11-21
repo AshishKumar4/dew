@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Regenerate the frozen legacy loader oracle on remote CPU compute."""
+"""Regenerate the frozen legacy loader oracle on remote CPU compute: the cases tests/test_pipeline_golden.py
+pins to the baseline. Its `images_*` cases and the fields it names as Dew's own are Dew's, re-recorded where
+Dew changed them on purpose (README.md), which a regeneration does not reproduce."""
 
 from __future__ import annotations
 

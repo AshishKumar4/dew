@@ -32,6 +32,7 @@ What lands in tests/fixtures/mla:
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -65,7 +66,10 @@ YARN = {
     "mscale_all_dim": 1.0,
     "original_max_position_embeddings": 4096,
 }
-V3 = dict(
+EAGER: dict[str, Any] = {"attn_implementation": "eager"}
+"""The eager attention path: a keyword every config takes (PretrainedConfig's), which a model's own config
+signature does not name."""
+V3: dict[str, Any] = dict(
     hidden_size=HIDDEN, num_attention_heads=HEADS, num_key_value_heads=HEADS,
     q_lora_rank=Q_LORA, kv_lora_rank=KV_LORA, qk_nope_head_dim=NOPE,
     qk_rope_head_dim=ROPE, v_head_dim=V, rope_theta=10000.0,
@@ -75,7 +79,7 @@ V3 = dict(
 # Biased projections, so the bias path is exercised; the indexer keeps two
 # heads of width 16 over the rope width of 8, and a top-k the sequence
 # exceeds, so selection actually drops keys.
-V32 = dict(
+V32: dict[str, Any] = dict(
     hidden_size=HIDDEN, num_attention_heads=HEADS, num_key_value_heads=HEADS,
     q_lora_rank=Q_LORA, kv_lora_rank=KV_LORA, qk_nope_head_dim=NOPE,
     qk_rope_head_dim=ROPE, v_head_dim=V, rope_theta=10000.0,
@@ -123,8 +127,8 @@ def block_weights(module: torch.nn.Module) -> dict:
             for name, tensor in module.named_parameters()}
 
 
-def run_v3(directory: Path, settings: dict, seed: int, name: str) -> None:
-    config = DeepseekV3Config(**settings, attn_implementation="eager")
+def run_v3(directory: Path, settings: dict[str, Any], seed: int, name: str) -> None:
+    config = DeepseekV3Config(**settings, **EAGER)
     block = DeepseekV3Attention(config, layer_idx=0).to(torch.float32)
     scatter_weights(block, seed=seed)
     block.eval()
@@ -152,7 +156,7 @@ def run_v32(directory: Path) -> None:
     # the indices to the kernel as a keyword, which the eager fallback then
     # ignores. A fixture written that way is the dense block, and the sparse
     # port differs from it by 3.4.
-    config = DeepseekV32Config(**V32, attn_implementation="eager")
+    config = DeepseekV32Config(**V32, **EAGER)
     block = DeepseekV32Attention(config, layer_idx=0).to(torch.float32)
     scatter_weights(block, seed=19)
     block.eval()

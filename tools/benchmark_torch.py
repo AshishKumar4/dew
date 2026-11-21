@@ -54,6 +54,7 @@ import math
 import os
 import sys
 import time
+from typing import Any
 
 # Triton and gcc use the system temporary directory while torch.compile runs.
 # This workstation's /tmp is a quota-limited tmpfs. Keep compiler scratch and
@@ -83,7 +84,7 @@ SIGMA_DATA = 0.5
 P_MEAN, P_STD = -0.4, 1.0
 UNCONDITIONAL_PROB = 0.12
 EMA_DECAY = 0.999
-ADAM = dict(lr=1e-4, betas=(0.9, 0.999), eps=1e-8)
+ADAM: dict[str, Any] = dict(lr=1e-4, betas=(0.9, 0.999), eps=1e-8)
 
 
 # ----------------------------------------------------------------------------
@@ -265,6 +266,9 @@ class CausalTransformer(nn.Module):
     """Tied embeddings, swiglu, qk RMSNorm, rotary positions, the head in
     the compute dtype with fp32 logits."""
 
+    cos: torch.Tensor
+    sin: torch.Tensor
+
     def __init__(self, cfg, attention, head_dtype=BF16):
         super().__init__()
         d, L, H = cfg['emb_features'], cfg['num_layers'], cfg['num_heads']
@@ -329,6 +333,8 @@ def sincos_2d_pos_embed(dim, H, W):
 
 
 class FourierEmbedding(nn.Module):
+    freqs: torch.Tensor
+
     def __init__(self, features, scale=16):
         super().__init__()
         freqs = np.random.RandomState(42).normal(size=(features // 2,)).astype(np.float32) * scale
@@ -393,6 +399,10 @@ class ModulatedBlock(nn.Module):
 
 
 class SimpleDiT(nn.Module):
+    pos_embed: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+
     def __init__(self, cfg, attention, image_size):
         super().__init__()
         d, L, H, p = cfg['emb_features'], cfg['num_layers'], cfg['num_heads'], cfg['patch_size']
@@ -583,6 +593,7 @@ class Unet(nn.Module):
         x = self.stem(x)
         downs = [x]
         for i, blocks in enumerate(self.down_blocks):
+            assert isinstance(blocks, nn.ModuleList)  # Each a ModuleList (__init__).
             for j, block in enumerate(blocks):
                 x = block(x, temb)
                 if j == len(blocks) - 1:
@@ -590,11 +601,14 @@ class Unet(nn.Module):
                 downs.append(x)
             if i < len(self.downsamples):
                 x = self.downsamples[i](x)
-        for res1, attn, res2 in self.middle:
+        for triple in self.middle:
+            assert isinstance(triple, nn.ModuleList)  # Each a triple (__init__).
+            res1, attn, res2 = triple
             x = res1(x, temb)
             x = attn(x, textcontext) if not isinstance(attn, nn.Identity) else x
             x = res2(x, temb)
         for i, blocks in enumerate(self.up_blocks):
+            assert isinstance(blocks, nn.ModuleList)  # Each a ModuleList (__init__).
             for j, block in enumerate(blocks):
                 x = torch.cat([x, downs.pop()], dim=1)
                 x = block(x, temb)
@@ -676,14 +690,16 @@ def make_batch(case: Case, seed=0):
 
 
 def profile_step(step, n_steps):
-    from torch.profiler import ProfilerActivity, profile
+    from torch.profiler import DeviceType, ProfilerActivity, profile
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         for _ in range(n_steps):
             step()
         torch.cuda.synchronize()
-    kernels = sorted(((e.name, e.time_range.start, e.time_range.end) for e in prof.events()
-                      if e.device_type == torch.autograd.DeviceType.CUDA), key=lambda kernel: kernel[1])
+    events = prof.events()
+    assert events is not None  # The profile has ended.
+    kernels = sorted(((e.name, e.time_range.start, e.time_range.end) for e in events
+                      if e.device_type == DeviceType.CUDA), key=lambda kernel: kernel[1])
     if not kernels:
         return None
     split = trace.window_split(kernels)
@@ -744,7 +760,7 @@ def _timed(step, warmup: int, steps: int):
     the device fed), and the last step's outputs."""
     t0 = time.perf_counter()
     for _ in range(warmup):
-        loss, aux, finite = step()
+        step()
     torch.cuda.synchronize()
     warmup_s = time.perf_counter() - t0
     torch.cuda.reset_peak_memory_stats()
@@ -752,16 +768,19 @@ def _timed(step, warmup: int, steps: int):
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(steps)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(steps)]
     t0 = time.perf_counter()
+    outputs = None
     for i in range(steps):
         starts[i].record()
-        loss, aux, finite = step()
+        outputs = step()
         ends[i].record()
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     per_step = np.array([s.elapsed_time(e) for s, e in zip(starts, ends)])
     # Gaps between consecutive steps show whether the host kept the device fed
     gaps = np.array([ends[i].elapsed_time(starts[i + 1]) for i in range(steps - 1)])
-    return warmup_s, wall, per_step, gaps, (loss, aux, finite)
+    if outputs is None:
+        raise ValueError("no timed steps: the last one's outputs are what this returns")
+    return warmup_s, wall, per_step, gaps, outputs
 
 
 def main():
@@ -847,12 +866,14 @@ def main():
     if args.profile:
         row['profile'] = profile_step(step, args.profile_steps)
     if args.nsys:
+        runtime = torch.cuda.cudart()
+        assert runtime is not None  # CUDA's runtime, which this benchmark runs on.
         torch.cuda.synchronize()
-        torch.cuda.cudart().cudaProfilerStart()
+        runtime.cudaProfilerStart()
         for _ in range(args.profile_steps):
             step()
         torch.cuda.synchronize()
-        torch.cuda.cudart().cudaProfilerStop()
+        runtime.cudaProfilerStop()
     print(json.dumps(row, indent=1))
     if args.json_out:
         rows = []

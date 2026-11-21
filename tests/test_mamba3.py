@@ -164,6 +164,36 @@ def test_the_chunked_form_is_as_exact_as_the_recurrence(packed, rank):
                     seeds=SEEDS[packed, rank], terms=RESET_TERMS)
 
 
+def along(fn):
+    """`fn(x, dt, A, B, C, lam, theta, state)` in forward mode: its output and final state's tangent along
+    a direction a draw gives in place of its cotangents (`directed`'s, a tangent of each operand)."""
+    def tangent(x, dt, A, B, C, lam, theta, state, direction):
+        operands = (x, dt, A, B, C, lam, theta, state)
+        return jax.jvp(fn, operands, direction)[1]
+
+    return tangent
+
+
+def directed(rank: int, seed: int):
+    """`draw`'s operands of `rank` and a direction of each, normal draws scaled as their operands."""
+    *operands, _ = draw(rank, seed)
+    normal = np.random.default_rng([seed, 8573]).standard_normal
+    return (*operands, tuple(hosted(0.1 * normal(np.shape(t))) for t in operands))
+
+
+@pytest.mark.parametrize('rank', RANKS)
+def test_the_chunked_forms_forward_mode_is_as_exact_as_the_recurrence(rank):
+    """The chunked form's output and final state's tangent (`jax.jvp`) along a drawn direction, packed, on par
+    with the recurrence a token at a time's from float64 (check 1): its turned call forward mode through its
+    launch's own tangent (the portable walk's token replay), where the turned rule's custom VJP refused a
+    jvp (row 8573)."""
+    starts = marks(DOCUMENTS)
+    reference = jax.jit(along(functools.partial(recurrent_mamba3, starts=starts)))
+    assert_as_exact(jax.jit(along(functools.partial(chunked, starts=starts))), reference,
+                    functools.partial(directed, rank), f'mamba3 forward mode rank={rank}', seeds=64,
+                    terms=RESET_TERMS)
+
+
 def test_a_rank_whose_chunk_cuts_its_groups_walks_whole_ones():
     """Three ranks a token over a chunk of 16 op tokens, which no group of three divides: the portable walk
     takes the largest chunk of whole groups within it (`recurrence_chunk._portable`, 15), never refused for a

@@ -42,6 +42,7 @@ import pstats
 import sys
 import time
 from pathlib import Path
+from typing import TypedDict
 
 import numpy as np
 
@@ -360,7 +361,14 @@ def closed_loop(streamed):
     return request
 
 
-def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, int | bool]:
+class VllmParallelism(TypedDict, total=False):
+    """vLLM's engine arguments for its parallelism (`vllm_parallelism`)."""
+
+    tensor_parallel_size: int
+    enable_expert_parallel: bool
+
+
+def vllm_parallelism(mesh: dict[str, int] | None) -> VllmParallelism:
     """vLLM's engine flags for a `--mesh` of 'tensor' and 'expert' sizes: tensor parallelism over
     their product, its experts split over those ranks where 'expert' is above 1
     (`enable_expert_parallel`), vLLM's one engine's way to spread an MoE's experts over GPUs."""

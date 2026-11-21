@@ -128,8 +128,11 @@ def refused_where_traced(objective, batch) -> bool:
 
     variables = nn.unbox(objective.init(jax.random.key(0)))
     with fixed_routers() as found:
-        jax.vjp(lambda params: objective.scalar_loss({**variables, "params": params}, batch, step())[0],
-                variables["params"])
+        # Traced, as a training step realizes it, and run nothing: its eager dispatch compiled each of the
+        # model's operations alone (176 compiles, row 8419).
+        jax.eval_shape(lambda params: jax.vjp(
+            lambda params: objective.scalar_loss({**variables, "params": params}, batch, step())[0], params),
+            variables["params"])
     try:
         refuse_fixed_routers(found)
     except UntrainedRouter:

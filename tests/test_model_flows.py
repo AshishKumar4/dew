@@ -22,9 +22,11 @@ import numpy as np
 import pytest
 import tier_wire
 from arm_forms import WITHOUT_YNN, without_ynn
+from generation_support import node_topology
 from process_support import relayed
 from reference_error import ahead_arm, assert_as_exact, over_windows, run_to_run, windows
-from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
+from tool_support import load
+from truths_ahead import AT_RUN, UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
@@ -120,6 +122,61 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
         model_flows.judge(flow, {}, kind)
 
 
+def test_a_packed_flows_exact_banks_are_its_banks_values():
+    """A packed flow's truths read each bank's exact matrix from its bits (`model_flows.exact_banks`, by
+    integer arithmetic and casts, its products in the truth's float64): each value its bfloat16 decode (code
+    times block scale over 2^8, exact) times its factor (2^8 times its expert's scale), multiplied on the
+    host in float64, where their product is exact, bit for bit."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.nn.kernels.formats import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    flow = next(flow for flow in model_flows.FLOWS if isinstance(flow, model_flows.Flow) and flow.packed)
+    drawn = flow.taken(flow.model.init(jax.random.key(0), *flow.initialized()))
+    banks = flatten_dict(dict(drawn[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
+
+    def widened(leaf):
+        # As check 1 widens a draw's floats for its truth.
+        return jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+
+    with jax.enable_x64(new_val=True):
+        exact = flatten_dict(model_flows.exact_banks(jax.tree.map(widened, drawn))[QUANTIZATION])
+        assert exact.keys() == banks.keys()
+        for path, matrix in exact.items():
+            bank = banks[path]
+            want = (np.asarray(bank.decoded(), np.float64)
+                    * np.asarray(bank.factor, np.float64)[..., None, None])
+            assert matrix.dtype == jnp.float64
+            np.testing.assert_array_equal(np.asarray(matrix), want)
+
+
+def test_a_packed_flows_training_moves_its_parameters_and_never_its_banks():
+    """A flow whose experts are packed NVFP4 banks (`Flow.packed`, row 8492) trains its parameters alone: two
+    SGD steps over its training step's gradients, on the CPU's portable route, move its parameters and leave
+    every bank's words and scales bit for bit as drawn, the banks frozen beside them as a packed load holds
+    them (`model_flows.packed_variables`)."""
+    from dew.quantization import QUANTIZATION
+
+    flow = next(flow for flow in model_flows.FLOWS if isinstance(flow, model_flows.Flow) and flow.packed)
+    flow = dataclasses.replace(flow, rows=1, length=32, prefill=24)
+    drawn = flow.taken(flow.model.init(jax.random.key(0), *flow.initialized()))
+    # The flow's own training step (`programs_of`'s), its Dew arm's named kernel a GPU's alone.
+    step = jax.jit(flow.program("train", flow.model))
+    ids = np.random.default_rng(0).integers(0, flow.vocab, (flow.rows, flow.length), np.int32)
+    trained = drawn
+    for _ in range(2):
+        _, gradients = step(trained, ids)
+        assert jax.tree.structure(gradients) == jax.tree.structure(trained["params"])
+        moved = jax.tree.map(lambda held, gradient: held - 0.1 * gradient, trained["params"], gradients)
+        assert any(not np.array_equal(np.asarray(held), np.asarray(after)) for held, after in
+                   zip(jax.tree.leaves(trained["params"]), jax.tree.leaves(moved), strict=True))
+        trained = {**trained, "params": moved}
+        for held, kept in zip(jax.tree.leaves(drawn[QUANTIZATION]), jax.tree.leaves(trained[QUANTIZATION]),
+                              strict=True):
+            assert np.array_equal(np.asarray(kept), np.asarray(held))
+
+
 @pytest.mark.parametrize("lane", [True, False], ids=["the lane's", "a user's"])
 def test_a_flow_holds_in_a_process_of_its_variant_alone(lane):
     """A flow holds only in a process opened under its variant's XLA flags and matmul precision
@@ -144,18 +201,18 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     """A GPU part's prepare as its node's CPU runs it (`DEW_TIER_PREPARE=1`): a flow prepared in a process
     of its own (`model_flows.prepared_apart`) over the node's serialized topology (here a compile-only
     A100's, serialized as a host serializes its own), its Dew and reference programs compiled for that GPU
-    and its truths' programs compiled into the tier's store, and what it took reported."""
-    from jax.experimental import topologies
+    and its truths' programs compiled into the tier's store, and what it took reported. The dense fp32
+    decoder's flow, the cheapest of two kinds to prepare: with the selective scan's this test took 120 s on
+    CI at main 4f7110c66 and 117 s at 84cba23c0, against a 120 s group target (row 9709); prepared apart
+    on armada, the dense fp32 flow took 77 s and the selective scan's 152."""
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = store / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(store / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    monkeypatch.setenv(tier_wire.UNIT, "a selective scan's unit")
-    flow = model_flows.flow_named("selective scan")
+    monkeypatch.setenv(tier_wire.UNIT, "a dense decoder's unit")
+    flow = model_flows.flow_named("dense fp32")
     took = model_flows.prepared_apart(flow)
     store = model_flows.store_of(flow)
     assert took is not None and took["written_bytes"] > 0 and took["seconds"] > 0
@@ -166,20 +223,19 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     [needs] = (store.parent / "needs").iterdir()
     filed = json.loads(needs.read_text())
     stated = json.loads((store / model_flows.NEED).read_text())["programs"]
-    assert (filed["unit"], filed["programs"]) == ("a selective scan's unit", stated)
+    assert (filed["unit"], filed["programs"]) == ("a dense decoder's unit", stated)
 
 
 def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monkeypatch):
     """A flow whose programs hold convolutions (the UNet denoiser's), prepared over a compile-only A100's
     topology, prepares none of them: a convolution compiled without its GPU leaves its algorithm to run
-    time (`report.CompiledOnDevice`), so its store names each program its run compiles on its GPU
-    (`model_flows.ON_DEVICE`) and holds none of them, its truths compiled all the same."""
-    from jax.experimental import topologies
+    time (`report.CompiledOnDevice`), so its store names each program its run compiles on its GPU by the
+    refusal's reason (`model_flows.ON_DEVICE`) and holds none of them, its truths compiled all the same;
+    its run names each in the run's summary as its prepare declared (`truths_ahead.AT_RUN`), as an at-run
+    site's truths are (row 8636)."""
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = store / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(store / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
@@ -189,8 +245,13 @@ def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monk
     held = model_flows.store_of(flow)
     on_device = json.loads((held / model_flows.ON_DEVICE).read_text())["programs"]
     assert sorted(on_device) == sorted(f"{kind} {arm}" for kind in flow.kinds for arm in ("dew", "reference"))
+    assert all("convolution compiled without its GPU" in why for why in on_device.values())
     assert not (held / "dew.programs").exists() and not (held / "reference.programs").exists()
     assert len(list((held / "truths").iterdir())) == len(flow.kinds)
+    assert sorted(model_flows.loaded(flow)) == sorted(on_device)
+    named = json.loads((held / "truths" / AT_RUN).read_text())["reasons"]
+    assert sorted(reason["error"] for reason in named) == sorted(
+        f"{flow.name} {name}: {why}" for name, why in on_device.items())
 
 
 def _site(salt: int = 5461):
@@ -358,13 +419,10 @@ def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
     truths', every truth's with the arms' state held beside it, so the lane sizes the unit's worker by
     them; before it filed none, and the lane admitted the unit on no needs at all."""
     import tier_wire
-    from jax.experimental import topologies
     from truths_ahead import compiled_memory, prepared
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = tmp_path / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(tmp_path / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.UNIT, "a unit")
     monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
@@ -388,13 +446,10 @@ def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_p
     unprepared; before, the prepare compiled both for the GPU and its run refused their load, and then its
     truths for the host's CPU, dense float64 on the node's CPU in the run (row 8576)."""
     import tier_wire
-    from jax.experimental import topologies
     from truths_ahead import AT_RUN, prepared
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = tmp_path / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(tmp_path / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.UNIT, "a unit")
     monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
@@ -411,12 +466,15 @@ def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_p
     with prepared(store, stamp="a", target=model_flows.node_target()):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
     sites = [json.loads(site.read_text()) for site in store.glob("*/site.json")]
+    # Its truths, its arms, and its reference's twin as written (`arm_forms._written_twin`), apart.
     assert sorted((site["arms"], site["host"], "at_run" in site) for site in sites) == [
-        (False, False, True), (True, False, True)], sites
+        (False, False, True), (True, False, True), (True, False, True)], sites
+    # Their memory read offline, by which the lane sizes the run's worker (`compiled_memory`).
+    assert all(site["memory"] for site in sites), sites
     with compiled_truths(store, prepare=False, stamp="a"):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
-    # Its truths and its two arms, each named once.
-    assert len(json.loads((store / AT_RUN).read_text())["reasons"]) == 3
+    # Its truths, its two arms and its reference's twin, each named once.
+    assert len(json.loads((store / AT_RUN).read_text())["reasons"]) == 4
     assert not (store / UNPREPARED).exists()
 
 
@@ -693,6 +751,24 @@ def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags(held):
     assert (opened.returncode, opened.stdout.split()[-1:]) == (0, ["1"]), opened.stderr[-2000:]
 
 
+def test_a_parts_prepare_collects_the_recurrence_tiers_files(tmp_path):
+    """A GPU part's prepare as its lane starts it (`lane_environment.configured`: `DEW_TIER_PREPARE=1` on the
+    node's CPU, the node an A100 by its serialized topology) collects the recurrence tier's files in a
+    process of its own, their imports reading the node's generation as gpu_flow's does (row 9540)."""
+
+
+    topology = node_topology(tmp_path / "topology.bin")
+    prepare = lane_environment.configured({"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu",
+                                            tier_wire.PREPARE: "1", model_flows.TOPOLOGY: str(topology),
+                                            tier_wire.TRUTHS: str(tmp_path / "tier")})
+    # As CI's pytest runs (`pytest_environment`): none of this process's selection or plugins inherited.
+    environment = load("session", "tools/armada").pytest_environment(prepare)
+    collected = relayed([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+                         "tests/test_gpu_recurrence.py", "tests/test_native_certificates.py"],
+                        environment, timeout=600)
+    assert collected.returncode == 0, collected.output[-3000:]
+
+
 def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
     """A GPU part's prepare on its node's CPU (`DEW_TIER_PREPARE=1`, the node an A100 by its serialized
     topology) runs every cell of a flow pinned to the node's generation, Mosaic's among them, as its run
@@ -700,12 +776,10 @@ def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
     for a GPU the prepare's process holds none of (row 7868: the recurrence matrix's five cells skipped
     there, then compiled on the held GPU)."""
     import gpu_flow
-    from jax.experimental import topologies
 
     from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = store / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(store / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     ran: list[int] = []
@@ -913,7 +987,7 @@ def test_a_site_whose_truths_alone_are_at_run_computes_its_reference_as_its_trut
 
     def refusing_truths(store, label, programs, held, **options):
         # A choice its GPU makes, which no compile without that GPU holds, in its truths' programs alone.
-        if programs and not options.get("arms", False):
+        if programs and not options.get("arms", False) and options.get("at_run") is None:
             raise report.CompiledOnDevice(jax.jit(lambda x: x).lower(np.zeros(1, np.float32)), ["truth"])
         return real(store, label, programs, held, **options)
 

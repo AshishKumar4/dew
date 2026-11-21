@@ -10,18 +10,18 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import generation, grouped_launch, grouped_matmul
 from dew.nn.kernels.templates import mosaic_sm90
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
 
 pytestmark = pytest.mark.kernel
 
 DENSE_GRADIENT_TILES = {
-    "wgmma, four stages": mosaic_gpu.Tiles(128, 128, 64, 4, 1, warpgroups=2, family='wgmma'),
-    "wgmma, three stages": mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma'),
-    "wgmma fed": mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family=mosaic_sm90.FED.name),
-    "mma.sync": mosaic_gpu.Tiles(128, 64, 32, 3, 1, family='mma.sync'),
-    "tcgen05": mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05'),
+    "wgmma, four stages": tiling.Tiles(128, 128, 64, 4, 1, warpgroups=2, family='wgmma'),
+    "wgmma, three stages": tiling.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma'),
+    "wgmma fed": tiling.Tiles(128, 128, 64, 3, 1, warpgroups=2, family=mosaic_sm90.FED.name),
+    "mma.sync": tiling.Tiles(128, 64, 32, 3, 1, family='mma.sync'),
+    "tcgen05": tiling.Tiles(128, 128, 64, 4, 1, family='tcgen05'),
 }
 """A dense kernel gradient's tiles on each family: wgmma's rings of four and three stages, walked a rotation a
 trip into bf16 and a step a trip exactly summed; its consumers feeding their own rings; mma.sync's, whose
@@ -50,7 +50,7 @@ def test_a_dense_kernel_gradient_reads_its_stages_as_loaded(name, rows, depth, o
     expected = np.asarray(x, np.float32).T @ np.asarray(dy, np.float32)
     with generation.assumed(GENERATION_OF[tiles.family]):
         got = mosaic_gpu.tgmm(x, dy, jnp.asarray([rows], jnp.int32), tiles=tiles, out_dtype=out_dtype,
-                              multiprocessors=8, interpret=grouped_matmul.INTERPRETED, dense=True,
+                              multiprocessors=8, interpret=grouped_launch.INTERPRETED, dense=True,
                               exact_sums=bool(jnp.dtype(out_dtype) == jnp.float32))
     np.testing.assert_array_equal(np.asarray(got[0], np.float32), expected)
 
@@ -81,7 +81,7 @@ def test_an_exact_kernel_gradients_depth_split_sums_its_partials_once(generation
             def dew(splits, group_sizes=group_sizes, dense=dense, tile=tile):
                 return mosaic_gpu.tgmm(x, dy, group_sizes, tiles=dataclasses.replace(tile, splits=splits),
                                        out_dtype=jnp.float32, multiprocessors=8,
-                                       interpret=grouped_matmul.INTERPRETED, dense=dense, exact_sums=True)
+                                       interpret=grouped_launch.INTERPRETED, dense=dense, exact_sums=True)
 
             whole = np.asarray(dew(1))
             for splits in (2, 3):
@@ -92,14 +92,14 @@ def test_an_exact_kernel_gradients_depth_split_sums_its_partials_once(generation
 @INTERPRETS
 def test_a_split_kernel_gradient_reads_each_groups_side_operand_at_its_own_group():
     """A kernel gradient split in two (`Tiles.splits`), each group's rows two runs of their own groups
-    (`mosaic_gpu._sliced`), whose prologue scales each group's rows by its group's own vector (`('groups',
+    (`row_tiles.sliced`), whose prologue scales each group's rows by its group's own vector (`('groups',
     'depth')`, an expert's input scale): each run reads its own group's vector (it read the run's index
     modulo the groups, so a group's second run took the next group's), and over ones the gradient is each
     group's rows times its scale, 128 and 256, as unsplit."""
     rows, depth, width = 256, 64, 128
     x, dy = jnp.ones((rows, depth), jnp.bfloat16), jnp.ones((rows, width), jnp.bfloat16)
     scales = jnp.asarray([[1.0] * depth, [2.0] * depth], jnp.float32)
-    tiles = mosaic_gpu.Tiles(64, 128, 64, 2, 1, family='wgmma')
+    tiles = tiling.Tiles(64, 128, 64, 2, 1, family='wgmma')
 
     def scaled(stage, scale):
         return (stage * scale).astype(stage.dtype)
@@ -107,7 +107,7 @@ def test_a_split_kernel_gradient_reads_each_groups_side_operand_at_its_own_group
     def dew(splits):
         return mosaic_gpu.tgmm(x, dy, jnp.asarray([128, 128], jnp.int32),
                                tiles=dataclasses.replace(tiles, splits=splits), out_dtype=jnp.float32,
-                               multiprocessors=8, interpret=grouped_matmul.INTERPRETED, prologue=scaled,
+                               multiprocessors=8, interpret=grouped_launch.INTERPRETED, prologue=scaled,
                                prologue_operands=(scales,), prologue_axes=(("groups", "depth"),),
                                exact_sums=True)
 

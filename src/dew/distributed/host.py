@@ -69,7 +69,10 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
     probe = jax.make_array_from_callback(
         (mesh.size,), placement, lambda _: np.ones((1,), np.int32))
     try:
-        total = program(jnp.sum)(probe)
+        # Run now, whatever the caller traces (a trainer's state mesh first read inside its start's trace,
+        # row 9693: the probe's sum was a tracer, and `int` refused it).
+        with jax.ensure_compile_time_eval():
+            total = program(jnp.sum)(probe)
         if int(total) != mesh.size:
             raise ValueError("the companion CPU collective did not include every device")
     except RuntimeError as error:

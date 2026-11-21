@@ -65,8 +65,8 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
             if item not in alone:
                 alone[item] = ci.cache_key("", "", "", [item], reading)
             return alone[item]
-        return ({(name, group): ci.cache_key(common, name, group, last[(name, group)], reading)
-                 for name, group in rows if last.get((name, group))}, single)
+        return ({(name, group): ci.cache_key(common, name, group, depends, reading)
+                 for name, group in rows if (depends := last.get((name, group)))}, single)
 
     now, single_now = keyed()
     try:
@@ -74,7 +74,7 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
         then, single_then = keyed()
         # Each input as the key covers it (`inputs`: the test's own code whole, the lookups that found each
         # module), so a changed lookup or the test's own change is a tier-one move (review).
-        moved = {each: [item for item in ci.inputs(each[0], last[each])
+        moved = {each: [item for item in ci.inputs(each[0], last[each] or [])
                         if single_then(item) != single_now(item)]
                  for each, key in now.items() if then.get(each) != key}
     finally:
@@ -89,7 +89,7 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
 
 
 def main(arguments: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.partition("\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base")
     parser.add_argument("--target", type=float, required=True)
     parser.add_argument("--timings", type=Path, required=True)

@@ -146,7 +146,7 @@ class Celled(Protocol):
     """A case an op with declared cells reads (`Op.declared`): its `cell`, the scope a receipt measures
     (a template's instruction family, `generation.family`, None outside every family; a standalone
     kernel's device generation, `generation.device_generation`) and the kind of call it is, the object
-    its op states it by (a GEMM's `grouped_matmul.Kind`, a norm's rows' dtype, a recurrence's product)."""
+    its op states it by (a GEMM's `grouped_cells.Kind`, a norm's rows' dtype, a recurrence's product)."""
 
     @property
     def cell(self) -> tuple[str | None, Hashable]: ...
@@ -154,20 +154,20 @@ class Celled(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class Op[C]:
-    """A family of ops one selector serves: its `choice` (the name `chosen` and routes use), its `kernels`
-    in the order the selector tries them after the preferred one, `preferred(case)` the op's own rule for
-    the kernel it prefers (else the first of its kernels that takes the case, `select`), `unlowered(kernel)`
-    why this host cannot lower the target's kernel, None where it lowers it (`Unlowerable`), and
-    `declared`: the cells where
-    a measurement found another kernel faster than the op's preference (a template's old route, owner,
-    bible da64ae5; a standalone kernel against XLA's program), each cell (`Celled.cell`: the scope the
-    receipt measured, a template's instruction family or a device's generation, and the kind of call) to
-    that kernel (one of `kernels`, the object itself) and the receipt. A declared cell runs its kernel where
-    it takes the call; any other call, and a declared one its kernel cannot run, the op's order."""
+    """A family of ops one selector serves: its `choice` (the name `chosen` and routes use), its `kernels` in
+    the order the selector tries them after the preferred one, `preferred(case)` the op's own rule for the
+    kernel it prefers (where it names none, or the op states no rule, the first of its kernels that takes the
+    case, `select`), `unlowered(kernel)` why this host cannot lower the target's kernel, None where it lowers
+    it (`Unlowerable`), and `declared`: the cells where a measurement found another kernel faster than the
+    op's preference (a template's old route, owner, bible da64ae5; a standalone kernel against XLA's program),
+    each cell (`Celled.cell`: the scope the receipt measured, a template's instruction family or a device's
+    generation, and the kind of call) to that kernel (one of `kernels`, the object itself) and the receipt. A
+    declared cell runs its kernel where it takes the call; any other call, and a declared one its kernel
+    cannot run, the op's order."""
 
     choice: Choice
     kernels: tuple[Kernel[C], ...]
-    preferred: Callable[[C], str] | None = None
+    preferred: Callable[[C], str | None] | None = None
     unlowered: Callable[[str], str | None] = lambda kernel: None
     # A cell's kind is its op's own object (`Celled.cell`); a mapping's keys are invariant, so each op's
     # table states its own kind and the field takes any.
@@ -276,9 +276,18 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple
     for the target raises (`Unlowerable`)."""
     from . import generation
 
+    return generation.published(decided(op, case, named, preference=preference))
+
+
+def decided[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple[str, ...] = ()) -> Route:
+    """`select`'s route for `case`, reported nowhere (`generation.routed`): what a caller asking which kernel
+    a call would run holds, publishing it where that dispatch runs (`generation.published`;
+    `gemm._one_launch`'s, the products of one launch), raising as `select` does."""
+    from . import generation
+
     kernel, preferred, refusal, insisted = _decided(op, case, named, preference)
-    return generation.route(op.choice, kernel=_lowered(op, kernel).name, preferred=preferred,
-                            refusal=refusal, forced=insisted)
+    return generation.routed(op.choice, kernel=_lowered(op, kernel).name, preferred=preferred,
+                             refusal=refusal, forced=insisted)
 
 
 def selected[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple[str, ...] = ()
@@ -363,9 +372,11 @@ def _old_route[C](op: Op[C], case: C, *, reported: bool = True
 
 
 def _preferred[C](op: Op[C], case: C) -> str:
-    """The kernel `op` prefers for `case`: its measured preference where it states one; else the first
-    non-generic kernel that takes it, else the first of them, whose refusal the route then names."""
-    if op.preferred is not None:
-        return op.preferred(case)
+    """The kernel `op` prefers for `case`: its measured preference where it states one for the case (its
+    `preferred` naming a kernel, not None); else the first non-generic kernel that takes it, else the first
+    of them, whose refusal the route then names."""
+    stated = None if op.preferred is None else op.preferred(case)
+    if stated is not None:
+        return stated
     native = [kernel for kernel in op.kernels if not kernel.generic and kernel.refused(case) is None]
     return (native or [kernel for kernel in op.kernels if not kernel.generic] or list(op.kernels))[0].name

@@ -1,6 +1,7 @@
-"""The digest and the input writers the frozen loader capture (`data_oracle.py`, which runs the capture
-script of `LEGACY_SCRIPT` inside the reference checkout) shares with tests/test_pipeline_golden.py: a
-capture and the test's reading of it are one format, over the same stores."""
+"""The digest and the input writers of the frozen loader capture (`data_oracle.py`, which runs the capture
+script at `LEGACY_SCRIPT` inside the reference checkout, with its own copies of them), copied here for
+tests/test_pipeline_golden.py: the golden fixture the capture wrote holds them to it, so an edit here that
+changes a digest or a store fails the golden test rather than drifting from the capture."""
 
 from __future__ import annotations
 

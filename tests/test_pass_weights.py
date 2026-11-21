@@ -12,7 +12,7 @@ import pytest
 from decision_support import decision_rows
 from flax import linen as nn
 from model_support import float64_twin
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, dew_path
 
 from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data.dataset import DataPartition
@@ -172,9 +172,10 @@ def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_wei
             return loss, grad
         return run
 
-
-    assert_as_exact(jax.jit(loss_of(weighed)), jax.jit(apart(model)), draw, "pass-weighed decision loss",
-                    seeds=PASS_SEEDS, truth_fn=jax.jit(apart(float64_twin(model), float64_twin(head))))
+    # Each pass's own model is Dew's (`dew_path`): an invariance claim, held against it compiled alike.
+    assert_as_exact(jax.jit(loss_of(weighed)), dew_path(jax.jit(apart(model))), draw,
+                    "pass-weighed decision loss", seeds=PASS_SEEDS,
+                    truth_fn=jax.jit(apart(float64_twin(model), float64_twin(head))))
 
 
 @pytest.mark.parametrize("loss", [False, True], ids=["metrics alone", "with the loss"])
@@ -392,16 +393,23 @@ def test_a_phase_whose_program_plans_other_copies_counts_them_built_in_its_fit(m
     as it is handed the state, the first's let go, so its plan's fit counts them built, as a fresh state's
     step's does (train 769's review: the fit counted them only where the state held none, and a tight
     phase could run out of memory the plan said it fit)."""
-    from test_plan import LIMIT, free
+    import gc
+
+    from model_support import allocating
+    from test_plan import LIMIT
 
     from dew.nn.kernels.generation import chosen
 
     tokens, _ = phased_draw(0)
     narrow = looped(steps=1).clone(dtype=jnp.bfloat16)
-    free(monkeypatch, LIMIT)
+    # Each run on an allocator counting what it places (its copies as its plan's search builds them, or
+    # beside its step where its compile builds none), nothing of the run before it live.
+    allocating(monkeypatch, LIMIT, LIMIT)
     with chosen(narrow_copies="on"):
         phased = phased_trainer(narrow, 0, (3, 1))
         phased_params(phased, tokens)
+        gc.collect()
+        allocating(monkeypatch, LIMIT, LIMIT)
         fresh = phased_trainer(narrow, 0, None)
         state, _, _ = fresh.place()
         fresh.compile(state, {"text": jnp.asarray(tokens)})

@@ -22,6 +22,11 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
+
+COHORT = "torch-qwen35"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 
 BASE_PINS = {
     "annotated-doc": "0.0.5", "anyio": "4.15.1", "certifi": "2026.7.22", "click": "8.5.0",
@@ -57,6 +62,7 @@ class Requirements(argparse.Action):
     """Print the wheel lock before required training arguments are considered."""
 
     def __call__(self, parser, namespace, values, option_string=None):
+        assert isinstance(values, str)  # One choice (nargs=None).
         for package, version in (BASE_PINS | (CUDA_PINS if values == "cuda" else {})).items():
             wheel_package = "torch" if values == "cpu" else "causal-conv1d"
             print(WHEELS[values] if package == wheel_package else f"{package}=={version}")
@@ -266,7 +272,10 @@ def load_backbone(smoke: bool):
         config._attn_implementation = attention_implementation
         if not qwen.is_fast_path_available:
             raise RuntimeError("HF's FLA/causal-conv1d fast path is unavailable")
-        backbone = qwen.Qwen3_5TextModel(config).to(device=device, dtype=torch.float32)
+        backbone = qwen.Qwen3_5TextModel(config)
+        # Moved in place by its own `to` (PreTrainedModel's), whose functools.wraps hides its signature.
+        placed: Any = backbone
+        placed.to(device=device, dtype=torch.float32)
         index_path = hf_hub_download(MODEL, "model.safetensors.index.json", revision=REVISION)
         index = json.loads(Path(index_path).read_text())
         wanted = {"model.language_model." + key: parameter for key, parameter in backbone.named_parameters()}
@@ -297,6 +306,8 @@ def backbone_loss(backbone, device, batch: int, seq: int):
     config = backbone.config
 
     class BackboneLoss(torch.nn.Module):
+        projection: torch.Tensor
+
         def __init__(self):
             super().__init__()
             self.backbone = backbone
@@ -403,7 +414,7 @@ def training_window(args: argparse.Namespace, model, network, optimizer, device,
     loss_values = torch.stack(losses).float().cpu().numpy()
     if not np.isfinite(loss_values).all():
         raise RuntimeError("non-finite training loss")
-    if args.smoke and torch.equal(before, next(model.parameters()).detach()):
+    if before is not None and torch.equal(before, next(model.parameters()).detach()):
         raise RuntimeError("tiny proof failed to update the backbone")
     state_dtypes = sorted({str(value.dtype) for state in optimizer.state.values() for value in state.values()
                            if isinstance(value, torch.Tensor)})

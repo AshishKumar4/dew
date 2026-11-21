@@ -28,6 +28,10 @@ from hackable_diffusion.lib.training.discrete_loss import NoWeightDiscreteLoss
 from hackable_diffusion.lib.training.time_sampling import UniformTimeSampler
 from safetensors.numpy import save_file
 
+COHORT = "gemma-diffusion"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/diffusion-gemma-sft"
 SEED = 2
 
@@ -57,7 +61,7 @@ def reference_model(*, self_cond_prob=0.5, stop_encoder=False):
         k_eq_v_global=True, global_key_size=4, num_global_kv_heads=1,
         global_base_frequency=10000, local_base_frequency=10000)
     model = _models.DiffusionGemma_26B_A4B(
-        config=config, dtype=jnp.float32,
+        config=config, dtype=jnp.dtype(jnp.float32),
         self_conditioning_config=_transformer.SelfConditioningConfig(features=8, hidden_dim=16))
     network = hd_gemma_network.WrappedDiffusionGemmaNetwork(gemma_model=model)
     return PairedKeysSFT(

@@ -769,18 +769,19 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
     tune(lambda: program.lower(*arguments))
     compiled = program.compiled(*arguments)
     formats = joined(*compiled.output_formats[1][:2])
-    return formats, _reusable(compiled, formats)
+    return formats, _reusable(program, compiled, formats)
 
 
 type Step = Callable[..., tuple[checkify.Error, tuple[Slots, Slots, Draws]]]
 """A step program as a server calls it: `_stepped`'s arguments, the static ones among them."""
 
 
-def _reusable(compiled: jax.stages.Compiled, formats: Formats) -> Step | None:
-    """`compiled`, the layout-choosing decode step, as a `Step`, where it reads every leaf of the state
-    in `formats` (an input left at the default layout reads a row-major leaf as one), so it takes the
+def _reusable(program: OuterProgram, compiled: jax.stages.Compiled, formats: Formats) -> Step | None:
+    """`compiled`, `program`'s layout-choosing decode step, as a `Step`, where it reads every leaf of the
+    state in `formats` (an input left at the default layout reads a row-major leaf as one), so it takes the
     state its own outputs leave; else None. An executable takes its jit's dynamic arguments alone, so
-    the static ones, the same every call of one server, are dropped."""
+    the static ones, the same every call of one server, are dropped; each call runs inside the `running`
+    blocks it runs in, as `dispatched`'s (`OuterProgram.ran`)."""
     resident, carried = compiled.input_formats[0][1:3]
 
     def read_as_left(taken: Format | None, left: Format | None) -> bool:
@@ -800,7 +801,10 @@ def _reusable(compiled: jax.stages.Compiled, formats: Formats) -> Step | None:
 
     def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
              grammar, progress):
-        return compiled(params, resident, carried, admission, transforms, stopping, grammar, progress)
+        arguments = (model, params, pad_id, placement, steps, resident, carried, admission, transforms,
+                     stopping, grammar, progress)
+        with program.ran(compiled, arguments, {}):
+            return compiled(params, resident, carried, admission, transforms, stopping, grammar, progress)
     return step
 
 
@@ -973,12 +977,13 @@ def dispatched(program: OuterProgram) -> Step:
              grammar, progress):
         size = None if admission is None else tuple(jnp.shape(leaf) for leaf in jax.tree.leaves(admission))
         key = (size, jax_config.trace_context())
+        arguments = (model, params, pad_id, placement, steps, resident, carried, admission, transforms,
+                     stopping, grammar, progress)
         executable = executables.get(key)
         if executable is None:
-            executable = executables[key] = program.executable(
-                model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
-                grammar, progress)
-        return executable(params, resident, carried, admission, transforms, stopping, grammar, progress)
+            executable = executables[key] = program.executable(*arguments)
+        with program.ran(executable, arguments, {}):
+            return executable(params, resident, carried, admission, transforms, stopping, grammar, progress)
     return step
 
 

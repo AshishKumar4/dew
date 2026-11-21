@@ -7,13 +7,36 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A host step's startup, a sampled streamed step's admission, a rollout's and a fetched executable's
+  admission share the planner's paths: the streamed step of an inspecting run is admitted with its
+  sampled step; a rollout's copy and generation are admitted as a step is (`memory.admitted`); an
+  executable fetched to be called each step enters every `running` block; a startup's compiles are read
+  from the one ledger of JAX's events, another thread's compiles none of them; a host step under AutoPGLE
+  reports what its trial guided in its compile record, and its trial steps a window of its own.
+- One rule for the dtype a model computes in (`dew.nn.protocols.computes_in`): a release of fp8 codes that
+  states no dtype computes in its scales' dtype.
 - `Trainer(lower_for=...)` lowers a step that keeps its variables on the host: its dry run's `Lowered`
   holds each program its steady steps call (`Lowered.programs`), the realizations' lowered for the GPU and
   the companion's for this host, none compiled. `Lowered.lowered` is a device step's one program.
 - A run that keeps its variables on the host samples its rollout from a copy of its weights on its
   devices, made once a call; the copy and each program the rollout compiles beside it (a generation's KV
-  cache and activations) are refused by name where the devices cannot hold them. The streamed layout's
-  choice considers a run with a rollout, its plan's price counting the copy (`StepPrice.rollout`).
+  cache and activations) are refused by name where the devices cannot hold them, and the copy's bytes are
+  logged (`train/rollout_copied_gib`, on a run that copies any). The streamed layout's choice keeps a run with a rollout on its
+  devices: its stream's first batch is the rollout's input, no step's, so no step is priced before a
+  rollout runs.
+- A step's fit counts the bytes placed beside its temporaries (its copies, its window, its batches) where a
+  BFC allocator may put them, its largest free block among the places, and a fresh run's first step builds
+  its narrow copies before it is judged on the allocator holding them. An H100's 4B run was admitted with
+  its copies in the one block its temporaries needed, and refused on its first step.
+- A fresh fit plans its step once over the batch its loop hands the step, where the layout's choice
+  planned over the batch as read and the first compile planned and compiled it again, a ramped or phased
+  run's too, whose choice planned before its stages were read; it compiles no streamed step where the
+  device plan is priced no dearer than the streamed step's update on the host alone, or where it is not
+  priced at all (a float32 or float16 step, which no datasheet rates), which keeps the devices' plan.
+- A step's fit is agreed with each process's read of its devices in one exchange: a process whose read
+  fails ends every process's check with its error, where its peers waited on it.
+- A fresh run searches its first step before placing its state once, where a run whose devices held
+  neither its step nor the streamed one searched it again in its start.
 - Under AutoPGLE (`jax_enable_pgle`) a step that keeps its variables on the host is profiled on a trial
   after its startup and runs its accelerator programs guided by the profile, as a device plan does
   (`HostStartup.pgle` records it); the streamed layout's choice considers such a run.
@@ -149,8 +172,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post113 and, on Linux x86_64 and aarch64, its own jaxlib build
-  0.12.0.1.post111, with its CUDA and PJRT plugins 0.12.0.1.post111 (post96's until now). A GPU compile takes a
+- Dew requires its JAX build 0.12.0.1.post117 and, on Linux x86_64 and aarch64, its own jaxlib build
+  0.12.0.1.post117, with its CUDA and PJRT plugins 0.12.0.1.post117 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
   executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the buffers
@@ -183,8 +206,21 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   deviceless capture with no CUDA plugin raises `NoCudaPlugin`; and Triton's pipeliner sizes a load's buffers by
   each wgmma reader's stage, where a wgmma a stage after a register use was one buffer short and the next copy
   overwrote a tile it still read. The Pallas fuser gives every unary elementwise primitive and the optimization
-  barrier its block-spec rules, so a GEMM's SwiGLU or GELU epilogue fuses into it. Elsewhere jaxlib stays the stock
-  0.12.0.1.
+  barrier its block-spec rules, so a GEMM's SwiGLU or GELU epilogue fuses into it. XLA:CPU rounds a float add,
+  subtract or multiply labeled `xla_no_contract` on its own, where it made each contractible, and HLO CSE keeps a
+  labeled one apart from its unlabeled twin, so `jax.extend.backend.no_contract_attribute()` names the label on
+  this jaxlib (rows 8554, 8638); XLA:GPU's small-dot rewrite multiplies as an F16, BF16, F64 or F8 precision
+  algorithm states, where it refused such a dot (row 8554); and a program's Mosaic GPU kernels instantiating at
+  once leave the compile threads free while they wait on LLVM's options lock (row 8602); and a Mosaic GPU kernel's
+  lowering cache keys its placement only where the kernel reads it, so a kernel that reads no mesh is one cache entry
+  under any mesh (row 8793), its equations' placement (a nested jit's context mesh, a broadcast's or a reshard's
+  sharding) among it, so a launch certified alone and its program's per-shard lowering share one entry (row 6740: a
+  hybrid decoder's cold step lowered 11 of 13 kernels again, 4 now); the Pallas fuser carries a cast along manual
+  mesh axes through a fused stage, so a fused epilogue in a checked `shard_map` reads a value each device holds its
+  own of (row 9808); and a CPU executable read back from the compilation cache keeps one collective communicator
+  across a while loop's body, a call's and a conditional's branches and the sequence holding them, where ranks
+  entered a loop's all-reduce and an all-gather beside it in different orders until their rendezvous timed out (row
+  10128: a sharded Mamba step's cached program). Elsewhere jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes

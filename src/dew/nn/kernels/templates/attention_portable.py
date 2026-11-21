@@ -41,8 +41,10 @@ from dew.nn.kernels.templates.attention import (
     prologues_taken,
     ranges_walk,
     shared_place,
+    sums_units,
     within,
 )
+from dew.nn.precision import power2
 
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
@@ -221,10 +223,15 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
     # Every form scales its rows' sums in the walk where they can pass fp32's largest
     # (`algebra.Forward.headroom`, `algebra.SCALED_WALK`), and the fold guards its logits' reach
     # (`algebra.walked`).
+    headroom = hooks.rounds is None and algebra.headroom(value.dtype)
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None, scale, hooks.score_mod,
-                           natural, hooks.rounds is None and algebra.headroom(value.dtype),
-                           hooks.initial is not None, compensated=algebra.compensates(value.dtype),
-                           prescale=power, rounds=hooks.rounds)
+                           natural, headroom, hooks.initial is not None,
+                           compensated=algebra.compensates(value.dtype), prescale=power, rounds=hooks.rounds,
+                           dropped=1.0 if hooks.drop is None else hooks.drop.bound,
+                           units=sums_units(hooks.drop, headroom=headroom,
+                                                    initial=hooks.initial is not None),
+                           largest=algebra.largest_of(value.dtype, hooks),
+                           narrowed=algebra.narrowed_of(query.dtype))
     # A quantized call's weights round at each row's maximum, which its training walk finds first
     # (`attention_program.walk`), its residuals let go where the call keeps none.
     if not residuals and hooks.rounds is None:
@@ -333,14 +340,19 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         others, own, others_total, prior = (part[row, head, rows] for part in sums)
         m = maxima
         if draw is not None:
-            # Dropout's D: each dropped product centred about its query's first visible tile's least one.
+            # Dropout's D: each dropped product centred about its query's heaviest key before any
+            # reduction, which split_delta's D from the forward's split sums cannot replace: those sums
+            # round before the subtraction, so identical keys' dQ stood 5e-8 off its exact zero and a
+            # tiny kept anchor's product lost its accuracy (row 9510).
             def terms(j):
                 columns, seen, _, v_tile, logits, _ = formed(j)
                 products = gradient.dropped_products(interpreted_dot(do, v_tile.T),
                                                     draw(q_pos, columns[None, :]))
                 return gradient.below(logits, m, how), products, seen, columns[None, :]
 
-            anchor, delta, chosen = gradient.dropout_centre(lo, hi, terms, keys, block_q, state_total,
+            centre = gradient.dropped_products(interpreted_rows(anchor_rows, do)[:, None],
+                                               draw(q_pos, chosen[:, None]))[:, 0]
+            anchor, delta, chosen = gradient.dropout_centre(lo, hi, terms, keys, centre, chosen, state_total,
                                                            mean0, most=keys // block_k)
         else:
             # The forward took the first pass (`gradient.split_delta`).
@@ -358,7 +370,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 first = gradient.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
                                                  key_index[row, head, rows], shifts, rows=interpreted_rows)
                 kept = shifts < 0
-                prior = jnp.where(kept, prior, algebra.power2(walked.total, shifts))
+                prior = jnp.where(kept, prior, power2(walked.total, shifts))
                 anchor, delta, chosen = (jnp.where(kept, ours, theirs)
                                          for ours, theirs in zip((anchor, delta, chosen), first, strict=True))
 

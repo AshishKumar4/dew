@@ -32,6 +32,7 @@ MiniMax masks its softmax layers (modeling_minimax.py:660-690). The config class
 `MiniMaxText01`, which the fixture's config.json states as the release's does, `minimax_text_01`.
 """
 
+import importlib
 import json
 import math
 import sys
@@ -92,13 +93,12 @@ def masked(forward):
 def remote():
     """The release's configuration and modeling modules, imported from its pinned remote code as a
     package, with `is_torch_fx_available` and flash attention stood in for (the module docstring)."""
-    import transformers.utils.import_utils as import_utils
-
+    import_utils = importlib.import_module("transformers.utils.import_utils")
     if not hasattr(import_utils, 'is_torch_fx_available'):
-        import_utils.is_torch_fx_available = lambda: False
+        vars(import_utils)["is_torch_fx_available"] = lambda: False
     configuration, modeling = hub_modules(f"minimax_remote_{REVISION[:8]}", REPO, REVISION,
                                           ('configuration_minimax_text_01.py', 'modeling_minimax_text_01.py'))
-    modeling._flash_supports_window_size = False
+    vars(modeling)["_flash_supports_window_size"] = False
     modeling.MiniMaxText01ForCausalLM._tied_weights_keys = {'lm_head.weight': 'model.embed_tokens.weight'}
     modeling.MiniMaxText01FlashAttention2._flash_attention_forward = flash
     modeling.MiniMaxText01FlashAttention2.forward = masked(modeling.MiniMaxText01FlashAttention2.forward)

@@ -20,7 +20,7 @@ from egglog import DagCostModel, EGraph, get_callable_args
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
-from dew.algebra.terms import EXPONENTIALS, RESCALE, Region, Term, integer, key, text
+from dew.algebra.terms import OPERATIONS, RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
@@ -75,15 +75,32 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     CUDA-core operations, one an element of its operand; a reduction and a product each a kernel of XLA's
     fusion, its root (elementwise work fuses into it); a conversion's conversions and a special
     function's exponentials, one an element of their result; any other elementwise node's CUDA-core
-    operations; a layout change none."""
+    operations, an entrywise equation's outside the language (a derivative's `add_any`, a leaf of the region,
+    `terms.OPERATIONS`) among them, one an element as the template's emission prices it, where it was work no
+    comparison read (the audit of 2026-11-19pm, 8964); a layout change none. What XLA's fusion keeps on chip
+    (`Work.kept_bytes`, a TPU's VMEM
+    traffic, row 7283): a leaf's bytes read once into the vector registers, a reduction's and a product's
+    result written once and read once by its reader (a product's at its result's dtype, a reduction's at a
+    vector lane's four bytes an element, as the e-graph holds no dtype), and elementwise work fused into a
+    kernel none, its values in the registers."""
     if (args := get_callable_args(node, Term.leaf)) is not None:
         # The leaf's own shape from its region (a callback may read no table at a node it was not given).
         leaf = key(Term.leaf(args[0]))
         extent = region.extents.get(leaf)
-        return Work() if extent is None else Work(
-            device_bytes=math.prod(extent) * region.dtypes[leaf].itemsize)
+        if extent is None:
+            return Work()
+        stored = math.prod(extent) * region.dtypes[leaf].itemsize
+        outside = region.made_by.get(integer(args[0]))
+        entrywise = outside is not None and programs.entrywise(outside.equation.primitive)
+        computed = math.prod(extent) if entrywise else 0
+        return Work(device_bytes=stored, kept_bytes=stored, operations=computed)
     if (args := get_callable_args(node, Term.reduce)) is not None:
-        return Work(operations=made(graph, args[:1], held), kernels=1.0)
+        operand = shape_of(graph, args[0], held)
+        _, params = region.params[integer(args[3])]
+        # Its result's elements: its operand's unreduced extents (an empty reduction's too).
+        moved = 0 if operand is None else kept(math.prod(
+            size for axis, size in enumerate(operand) if axis not in params["axes"]))
+        return Work(operations=made(graph, args[:1], held), kernels=1.0, kept_bytes=moved)
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand, held) for operand in args[:2])
         if left is None or right is None:
@@ -96,17 +113,20 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         free = (math.prod(size for axis, size in enumerate(left) if axis not in (*contracted, *batch))
                 * math.prod(size for axis, size in enumerate(right)
                             if axis not in (*right_contracted, *right_batch)))
-        operands = region.products[index]
+        product = region.products[index]
         read = sum(math.prod(extent) * np.dtype(dtype).itemsize
-                   for extent, dtype in zip((left, right), operands, strict=True))
-        flops = 2.0 * math.prod(left[axis] for axis in batch) * free * length
-        mode, passes = _mode(params.get("precision"), *operands)
-        return Work(shared_bytes=read, kernels=1.0, **{_MODES[mode]: flops * passes})
+                   for extent, dtype in zip((left, right), product.operands, strict=True))
+        elements = math.prod(left[axis] for axis in batch) * free
+        # Its result at the dtype the product makes (`terms.Product.made`, JAX's own rule: a bfloat16 by a
+        # float16 product is bfloat16, which NumPy's promotion refused, base review 0b8b7ed98 F1).
+        mode, passes = _mode(params.get("precision"), *product.operands)
+        moving = Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize))
+        return moving + _moded(mode, 2.0 * elements * length * passes)
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.unary)) is not None:
         elements = made(graph, args[:1], held)
-        special = text(args[1]) in EXPONENTIALS
+        special = text(args[1]) in _special_functions()
         return Work(exponentials=elements) if special else Work(operations=elements)
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == RESCALE:
         # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an element.
@@ -123,9 +143,36 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     return Work()
 
 
+@functools.cache
+def _special_functions() -> frozenset[str]:
+    """The symbols of the operations the special-function units evaluate, by the kernels' counter's one rule
+    (`emission.SPECIAL_FUNCTIONS`), read where a price first asks: the emission's module loads the templates'
+    resources, which no process reading the algebra alone imports (the test cache keys a row on each module
+    it loads)."""
+    from dew.nn.kernels.templates import emission
+
+    return frozenset(operation.symbol for primitive, operation in OPERATIONS.items()
+                     if primitive in emission.SPECIAL_FUNCTIONS)
+
+LANE_BYTES = 4
+"""The bytes a reduction's result element takes in what XLA's fusion keeps on chip (`work`): a vector lane's,
+32 bits, the width a TPU's vector unit reduces in."""
+
+
+def kept(elements: float, itemsize: float = LANE_BYTES) -> float:
+    """The bytes a kernel's result of `elements` of `itemsize` moves on chip (`Work.kept_bytes`): written
+    once by the kernel and read once by its reader, the one rule of every kernel's result `work` and the chunk
+    forms (`dew.algebra.linear_scan`) price."""
+    return 2.0 * elements * itemsize
+
 _MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "operations"}
 """The `Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes; IEEE fp32 is
 the CUDA cores')."""
+
+
+def _moded(mode: str, flops: float) -> Work:
+    """`flops` of a product's `mode`, in the `Work` field its mode's are told in (`_MODES`)."""
+    return dataclasses.replace(Work(), **{_MODES[mode]: flops})
 
 TPU_PASSES = {"DEFAULT": 1, "HIGH": 3, "HIGHEST": 6}
 """The bfloat16 passes a TPU's matrix units multiply fp32 operands in, by precision (`jax.lax.Precision`'s own
@@ -162,10 +209,12 @@ def _mode(precision, lhs_dtype, rhs_dtype) -> tuple[str, int]:
 def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=jnp.float32,
                  precision: jax.lax.PrecisionLike = None) -> Work:
     """`count` products of `[rows, depth] @ [depth, columns]` operands of `dtype` at `precision` (the default
-    where unstated), in their mode (`_mode`), each a kernel of XLA's fusion, its root (`work`'s products): a
-    chunk form's products (`dew.algebra.linear_scan`, at the precision they run at), Dew's fp32 products."""
+    where unstated), in their mode (`_mode`), each a kernel of XLA's fusion, its root, its result of `dtype`
+    kept on chip, written and read (`work`'s products): a chunk form's products (`dew.algebra.linear_scan`, at
+    the precision they run at), Dew's fp32 products."""
     mode, passes = _mode(precision, dtype, dtype)
-    return Work(kernels=float(count), **{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
+    held = Work(kernels=float(count), kept_bytes=kept(rows * columns * count, np.dtype(dtype).itemsize))
+    return held + _moded(mode, 2.0 * rows * depth * columns * count * passes)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -246,9 +295,10 @@ def cheaper(form: Seconds, than: Seconds) -> bool:
 class Fused:
     """XLA's schedule (the compile-time pass's): a reduction or a product reads its operands in one pass over
     device memory and elementwise work fuses into its consumer, costing its units' work, each at the whole
-    device's rate (`templates.cost.rates`), in series, and each kernel the part's fixed latency (its launch
-    and first byte, `Measured.fixed`; row 4081: a small fusion's time is that latency, 0.02 of it priced
-    without), or its span at a loop iteration's latency where longer (the work-span model,
+    device's rate (`templates.cost.rates`), in series, what its kernels keep on chip a TPU's VMEM traffic at
+    its rate (`Work.kept_bytes`, row 7283), and each kernel the part's fixed latency (its launch and first
+    byte, `Measured.fixed`; row 4081: a small fusion's time is that latency, 0.02 of it priced without), or
+    its span at a loop iteration's latency where longer (the work-span model,
     `templates.cost.spanned`); no tie to break."""
 
     facts: generation.GpuTarget
@@ -292,7 +342,8 @@ class Walk:
         return tuple(kernel_cost.units(done, kernel_cost.rates(self.facts, device=False))[0])
 
     def spanned(self, done: Work) -> float:
-        return kernel_cost.spanned(done, kernel_cost.step_latency(self.facts, device=False))[0]
+        # The walk's longest dependent path, the peak its greedy price reads too (`templates.cost.path`).
+        return kernel_cost.path(done, self.facts)
 
     def __call__(self, done: Work) -> float:
         return kernel_cost.walked(done, self.facts)

@@ -597,10 +597,15 @@ EXPONENTIALS = {2: "exp2", "e": "exp"}
 
 
 DECOUPLED = rules.Rules("decoupled", "reorders", _decoupled(),
-                        receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py")
+                        receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py; measured M-IE-1 "
+                                "(the derived attention forward against the hand forms it replaced, GH200: "
+                                "at parity, 0.986x to 1.008x, and bitwise)")
 """The derivation's rules, run beside the engine's sets (`rules.admitted`) and never among them."""
 DECOUPLED_RESCALED = rules.Rules("decoupled rescaled", "reorders", _decoupled(rescaling=True),
-                                 receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py")
+                                 receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py; "
+                                         "measured M-ET-80 (the accurate form's derived training step on the "
+                                         "route, GH200) and M-ET-76 (its kernels at the stability entries, "
+                                         "A100 and GH200)")
 """`DECOUPLED` for a declaration that states its own rescale (`Reduction.rescale`)."""
 PLAIN = _plain()
 

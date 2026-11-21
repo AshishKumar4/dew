@@ -2,15 +2,24 @@
 mode, its kernels' reverse rules, the paged decode kernel, a head's sinks (ledger 2641; the harness is
 tests/contract_support.py)."""
 
+import functools
 import itertools
 
 import jax
 import jax.numpy as jnp
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
+from attention_oracle import plain_merged
+from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw
+from reference_error import FEWEST_SEEDS
 
 from dew.nn import attention, kv_cache
-from dew.nn.kernels.templates import attention as template, attention_quantized
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_quantized,
+    merged,
+)
 from dew.nn.sharding import manual_map
 
 
@@ -21,23 +30,15 @@ def plain_attention(query, key, value):
     return jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(logits, axis=-1), value)
 
 
-def attention_draw(seed: int, shape: tuple, edge: str) -> tuple:
-    """A query, key and value of `shape` at `edge`'s scale, a direction for each and an output cotangent."""
-    primals = normal_draw(seed, shape, shape, shape, scale=EDGES[edge])
-    direction = normal_draw(seed + 1, shape, shape, shape, scale=EDGES[edge])
-    (cotangent,) = normal_draw(seed + 2, shape)
-    return primals, direction, cotangent
+def attention_inputs(salt: int, shape: tuple):
+    """One `assert_drawn_contract` builder of a query, key and value of `shape`, their directions at `scale`
+    and an output cotangent, `salt` and the two after it keeping its streams apart."""
+    def inputs(seed: int, scale: float) -> tuple:
+        return (normal_draw([salt, seed], shape, shape, shape, scale=scale),
+                normal_draw([salt + 1, seed], shape, shape, shape, scale=scale),
+                normal_draw([salt + 2, seed], shape)[0])
 
-
-def attention_drawn(salt: int, shape: tuple):
-    """`attention_draw`'s check-1 draw at unit scale (the mesh order's, `assert_contract`'s `draw`): a seed's
-    query, key and value of `shape`, their directions and an output cotangent, `salt` and the two after it
-    keeping its streams apart."""
-    def draw(seed: int) -> tuple:
-        return (normal_draw([salt, seed], shape, shape, shape),
-                normal_draw([salt + 1, seed], shape, shape, shape), normal_draw([salt + 2, seed], shape)[0])
-
-    return draw
+    return inputs
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -46,15 +47,13 @@ def test_a_fused_attention_call_in_forward_mode_holds_every_order(edge):
     the reference path's tangent, a custom JVP): every order runs, finite wherever float64 is a normal
     float32 and the plain attention formula is, at queries, keys and values whose products near float32's
     ends."""
-    primals, direction, cotangent = attention_draw(2654, (1, 16, 2, 16), edge)
-
     def fused(query, key, value):
         with attention.forward_mode_attention():
             return attention.scaled_dot_product_attention(query, key, value, implementation="template")
 
-    assert_contract(fused, primals, direction, cotangent, f"a fused call in forward mode {edge}",
-                    truth_fn=plain_attention, plain_fn=plain_attention,
-                    draw=attention_drawn(2654, (1, 16, 2, 16)) if edge == "normal" else None)
+    assert_drawn_contract(fused, attention_inputs(2654, (1, 16, 2, 16)), EDGES[edge],
+                          f"a fused call in forward mode {edge}", truth_fn=plain_attention,
+                          plain_fn=plain_attention)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -62,20 +61,16 @@ def test_a_heads_sinks_hold_every_order(edge):
     """`template.sinks`' spread of each head's sink over its batch rows and queries (reverse mode one
     compensated sum, row 4524): every order runs, finite wherever float64 is a normal float32 and the plain
     broadcast is."""
-    (values,) = normal_draw(4524, (3,), scale=EDGES[edge])
-    (direction,) = normal_draw(4525, (3,), scale=EDGES[edge])
-    (cotangent,) = normal_draw(4526, (2, 3, 5))
+    def inputs(seed: int, scale: float) -> tuple:
+        return (normal_draw([4524, seed], (3,), scale=scale),
+                normal_draw([4525, seed], (3,), scale=scale),
+                normal_draw([4526, seed], (2, 3, 5))[0])
 
     def plain(values):
         return jnp.broadcast_to(values[None, :, None], (2, 3, 5))
 
-    def draw(seed):
-        """A seed's sinks, direction and cotangent at unit scale (the mesh order's check 1)."""
-        return (normal_draw([4524, seed], (3,)), normal_draw([4525, seed], (3,)),
-                normal_draw([4526, seed], (2, 3, 5))[0])
-
-    assert_contract(lambda values: template.sinks(values, 2, 5, 4).m, (values,), (direction,), cotangent,
-                    f"a head's sinks {edge}", plain_fn=plain, draw=draw if edge == "normal" else None)
+    assert_drawn_contract(lambda values: template.sinks(values, 2, 5, 4).m, inputs, EDGES[edge],
+                          f"a head's sinks {edge}", plain_fn=plain)
 
 
 @pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(("template", "tpu"), EDGES)))
@@ -84,14 +79,12 @@ def test_a_fused_attention_kernel_holds_its_reverse_orders(implementation, edge)
     TPU), each a reverse-only custom derivative: its primal and its reverse derivative run, finite wherever
     float64 is a normal float32 and the plain attention formula is, at queries, keys and values whose
     products near float32's ends. Its other orders do not run (`REVERSE_ONLY`, ledger 2654)."""
-    primals, direction, cotangent = attention_draw(2657, (1, 128, 2, 64), edge)
-
     def fused(query, key, value):
         return attention.scaled_dot_product_attention(query, key, value, implementation=implementation)
 
-    assert_contract(fused, primals, direction, cotangent, f"{implementation} attention {edge}",
-                    truth_fn=plain_attention, plain_fn=plain_attention, without=REVERSE_ONLY,
-                    draw=attention_drawn(2657, (1, 128, 2, 64)) if edge == "normal" else None)
+    assert_drawn_contract(fused, attention_inputs(2657, (1, 128, 2, 64)), EDGES[edge],
+                          f"{implementation} attention {edge}", truth_fn=plain_attention,
+                          plain_fn=plain_attention, without=REVERSE_ONLY)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -100,7 +93,6 @@ def test_a_quantized_attention_holds_its_reverse_orders(edge):
     custom derivative: its primal and its straight-through reverse derivative run, finite wherever float64
     is a normal float32 and the plain attention formula is, at queries, keys and values whose products near
     float32's ends, over a causal call. Its other orders do not run (`REVERSE_ONLY`)."""
-    primals, direction, cotangent = attention_draw(4858, (1, 128, 2, 64), edge)
     spans = template.spans(128, 128, 1, causal=True)
 
     def plain(query, key, value):
@@ -109,11 +101,11 @@ def test_a_quantized_attention_holds_its_reverse_orders(edge):
         return jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(jnp.where(causal, logits, -jnp.inf), axis=-1),
                           value)
 
-    assert_contract(lambda query, key, value: attention_quantized.attend(query, key, value, spans,
-                                                                         template.Hooks()),
-                    primals, direction, cotangent, f"quantized attention {edge}", truth_fn=plain,
-                    plain_fn=plain, without=REVERSE_ONLY,
-                    draw=attention_drawn(4858, (1, 128, 2, 64)) if edge == "normal" else None)
+    assert_drawn_contract(lambda query, key, value: attention_quantized.attend(query, key, value, spans,
+                                                                               template.Hooks()),
+                          attention_inputs(4858, (1, 128, 2, 64)), EDGES[edge],
+                          f"quantized attention {edge}", truth_fn=plain, plain_fn=plain,
+                          without=REVERSE_ONLY)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -130,18 +122,17 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
     lengths = jnp.asarray([page + 5, 2 * page], jnp.int32)
     shapes = ((2, 4, 64), (2, 4, page, 64), (2, 4, page, 64), (4,))
 
-    def drawn(seeds: tuple, scale: float) -> tuple:
-        # The query, pages and sinks, their directions and the output's cotangent from `seeds`; the
-        # template's decode takes 16-bit operands, a bf16 cache's step.
-        primals, direction = (normal_draw(seed, *shapes, scale=scale) for seed in seeds[:2])
-        (cotangent,) = normal_draw(seeds[2], shapes[0])
+    def inputs(seed: int, scale: float) -> tuple:
+        # The query, pages and sinks, their directions and the output's cotangent; the template's decode
+        # takes 16-bit operands, a bf16 cache's step.
+        primals = normal_draw([2660, seed], *shapes, scale=scale)
+        direction = normal_draw([2661, seed], *shapes, scale=scale)
+        (cotangent,) = normal_draw([2662, seed], shapes[0])
         if kernel == "template_paged":
             primals, direction = ((*(x.astype(jnp.bfloat16) for x in drawn[:3]), drawn[3])
                                   for drawn in (primals, direction))
             cotangent = cotangent.astype(jnp.bfloat16)
         return primals, direction, cotangent
-
-    primals, direction, cotangent = drawn((2660, 2661, 2662), EDGES[edge])
 
     def paged(query, key, value, sinks):
         # Launched per shard as a decode step launches it (`kv_cache.decode_specs`): a kernel takes no axis
@@ -163,12 +154,114 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
         weights = jax.nn.softmax(jnp.concatenate([logits, sunk], axis=-1), axis=-1)[..., :-1]
         return jnp.einsum("rhk,rkhd->rhd", weights, values)
 
-    def draw(seed):
-        """A seed's query, pages, sinks, directions and cotangent at unit scale (the mesh order's check 1)."""
-        return drawn(([2660, seed], [2661, seed], [2662, seed]), 1.0)
+    # Declared seed count so prepared GPU-tier runs (`test_gpu_attention.py`'s `template_paged` cell) never
+    # call `seeds_for` under `COMPILED` (row 9656).
+    assert_drawn_contract(paged, inputs, EDGES[edge], f"the paged decode kernel {edge} {kernel}",
+                          truth_fn=plain, plain_fn=plain, seeds=8)
 
-    assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge} {kernel}",
-                    truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None)
+
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
+    """`merged.merged_padded` (a split decode step's slices merged where its launch wrote them; its value one
+    launch on a GPU, its tangent the law's path's, a custom JVP): every order runs, finite wherever float64
+    is a normal float32 and the plain merge (`attention_oracle.plain_merged`, independent of the law) is, at
+    padded outputs and maxima near float32's ends, two slices' totals drawn positive, the plain merge its
+    truth; each order set a case of its own (`ORDER_SETS`: every order in one case, the law's path its plain
+    formula and truth, held its group to 1,798 s)."""
+    spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
+
+    def inputs(seed: int, scale: float) -> tuple:
+        # Two slices' padded outputs (three rows of which two are queries, 12 columns of which 8 are its
+        # width) and maxima at `scale`, totals drawn positive, their directions and a cotangent.
+        padded, maxima, totals = normal_draw([7124, seed], (1, 2, 3, 1, 12), (1, 1, 2, 3), (1, 1, 2, 3),
+                                             scale=scale)
+        direction = normal_draw([7125, seed], (1, 2, 3, 1, 12), (2, 1, 1, 2, 3), scale=scale)
+        (cotangent,) = normal_draw([7126, seed], (1, 2, 1, 8))
+        return (padded, jnp.stack([maxima, jnp.abs(totals)])), direction, cotangent
+
+    def merge(padded, stacked):
+        return merged.merged_padded(spec, padded, stacked, queries=2, width=8).acc
+
+    plain = functools.partial(plain_merged, rate=1.0, queries=2, width=8)
+    assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge} ({taken})", truth_fn=plain,
+                          plain_fn=plain, seeds=FEWEST_SEEDS, taking=ORDER_SETS[taken])
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_narrowing_settle_holds_every_order(edge):
+    """`attention.narrowing_settled` (a surrogate whose derivative is its quotient's on every entry): every
+    order finite wherever float64 is a normal float32 and the plain quotient is, the quotient's own, over
+    drawn fp32 quotients of sums over a divisor of 3/2 as an fp16 output narrows them."""
+    divisor = jnp.full((9,), 1.5, jnp.float32)
+
+    def settled(out):
+        return template.narrowing_settled(out, out * divisor, divisor, jnp.float16)
+
+    def plain(out):
+        return out
+
+    def inputs(seed, scale):
+        """A seed's quotients and their direction at `scale`, and its cotangent."""
+        (out, along, cotangent) = normal_draw(seed, (9,), (9,), (9,), scale=scale)
+        return (out,), (along,), cotangent
+
+    assert_drawn_contract(settled, inputs, EDGES[edge], f"the narrowing settle {edge}", truth_fn=plain,
+                          plain_fn=plain)
+
+
+def test_a_nudged_quotient_narrows_once_and_keeps_its_tangent():
+    """`attention.narrowing_settled` at an fp16 tie it nudges: the quotient 1 + 2^-11 formed of sums
+    1 + 2^-11 - 2^-23 over a divisor 1 - 2^-24, whose exact value is below the tie, narrows to 1 as that
+    value rounds once, and its tangent along the quotient is the quotient's own, 1 (the head review of
+    fd1af38ac, F1: a nudged entry's tangent was none)."""
+    tie = jnp.float32(1 + 2.0 ** -11)
+    acc, divisor = jnp.float32(1 + 2.0 ** -11 - 2.0 ** -23), jnp.float32(1 - 2.0 ** -24)
+    settled, tangent = jax.jvp(lambda out: template.narrowing_settled(out, acc, divisor, jnp.float16), (tie,),
+                               (jnp.float32(1.0),))
+    assert settled.astype(jnp.float16) == 1.0 and tangent == 1.0
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_sparse_latent_kernel_holds_every_order(edge):
+    """`sparse_selection.templated_context` (the attention template's decode over each query's selected
+    latents, its value, interpreted off a GPU), the blocked XLA path's derivatives through
+    `generation.linear_tangent`: every order runs in the absorbed queries, the rope queries, the latents and
+    the rope heads, finite wherever float64 is a normal float32 and the plain formula, each query's softmax
+    over its selected latents and rope heads, is; a slot naming no key reads nothing."""
+    from dew.nn import sparse_selection
+
+    shapes = ((1, 3, 2, 32), (1, 3, 2, 32), (1, 3, 32), (1, 3, 32))
+    selected = jnp.asarray([[[0, -1], [1, 0], [2, 0]]], jnp.int32)
+    scale = 64 ** -0.5
+
+    def inputs(seed, size: float) -> tuple:
+        # The operands, their directions and the context's cotangent from `seed`, bf16: the template's
+        # decode reads 16-bit latents.
+        primals, direction = (tuple(x.astype(jnp.bfloat16)
+                                    for x in normal_draw([tag, seed], *shapes, scale=size))
+                              for tag in (9023, 9024))
+        (cotangent,) = normal_draw([9025, seed], (1, 3, 2, 32))
+        return primals, direction, cotangent.astype(jnp.bfloat16)
+
+    def sparse(absorbed, query_rot, latent, rot):
+        return sparse_selection.templated_context(scale, None, 4)(absorbed, query_rot, latent, rot,
+                                                                  selected)
+
+    def plain(absorbed, query_rot, latent, rot):
+        at = jnp.maximum(selected, 0)
+        keys, rots = (jax.vmap(lambda rows, where: rows[where])(table, at) for table in (latent, rot))
+        logits = (jnp.einsum("bqhr,bqkr->bqhk", absorbed, keys)
+                  + jnp.einsum("bqhp,bqkp->bqhk", query_rot, rots)) * scale
+        logits = jnp.where(selected[:, :, None, :] >= 0, logits, -jnp.inf)
+        return jnp.einsum("bqhk,bqkr->bqhr", jax.nn.softmax(logits, axis=-1), keys)
+
+    # Off a GPU, Mosaic GPU's interpreter uses OrderedIOEffect callbacks that JAX's checkpoint/remat refuses
+    # to differentiate (same as `template_paged` above); on a GPU, every order including remat runs.
+    without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
+    with generation.assumed("sm80"):
+        assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge}",
+                              truth_fn=plain, plain_fn=plain, without=without, seeds=8)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -179,44 +272,11 @@ def test_a_sink_softmax_holds_every_order(edge):
     (`_weights`, its float64 run the truth) is, at logits near float32's ends."""
     from dew.nn.attention_sinks import _weights, sink_softmax
 
-    primals = normal_draw(6175, (2, 4, 8, 16), (4,), scale=EDGES[edge])
-    direction = normal_draw(6176, (2, 4, 8, 16), (4,), scale=EDGES[edge])
-    (cotangent,) = normal_draw(6177, (2, 4, 8, 16))
-    def draw(seed):
-        """A seed's logits and sinks, their directions and a cotangent at unit scale (the mesh order's
-        check 1)."""
-        return (normal_draw([6175, seed], (2, 4, 8, 16), (4,)),
-                normal_draw([6176, seed], (2, 4, 8, 16), (4,)), normal_draw([6177, seed], (2, 4, 8, 16))[0])
+    def inputs(seed: int, scale: float) -> tuple:
+        return (normal_draw([6175, seed], (2, 4, 8, 16), (4,), scale=scale),
+                normal_draw([6176, seed], (2, 4, 8, 16), (4,), scale=scale),
+                normal_draw([6177, seed], (2, 4, 8, 16))[0])
 
-    assert_contract(sink_softmax, primals, direction, cotangent, f"a sink softmax {edge}",
-                    plain_fn=lambda logits, sinks: _weights(logits, sinks, None),
-                    draw=draw if edge == "normal" else None)
+    assert_drawn_contract(sink_softmax, inputs, EDGES[edge], f"a sink softmax {edge}",
+                          plain_fn=lambda logits, sinks: _weights(logits, sinks, None))
 
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_the_finished_merges_mean_holds_every_order(edge):
-    """The finished merge's mean of its states' outputs by their masses (`attention_algebra._mean`, a
-    declared tangent: the mean's own derivative, its coefficients formed at a scale that passes fp32 only
-    where they do, row 6827): every order, forward and reverse, finite wherever float64 is a normal float32
-    and the plain mean, sum(w o) / sum(w), is, its outputs at `edge` over masses of every size."""
-    from dew.nn.kernels.templates.attention_algebra import _mean
-
-    def drawn(seeds: tuple, scale: float) -> tuple:
-        # Masses of every size from a quarter up, outputs and their directions at `scale`, from `seeds`.
-        weights, outputs = normal_draw(seeds[0], (3, 4), (3, 4, 8))
-        direction = normal_draw(seeds[1], (3, 4), (3, 4, 8))
-        return ((jnp.abs(weights) + 0.25, outputs * scale), (direction[0], direction[1] * scale),
-                normal_draw(seeds[2], (4, 8))[0])
-
-    primals, direction, cotangent = drawn((6827, 6828, 6829), EDGES[edge])
-
-    def plain(weights, outputs):
-        return jnp.sum(weights[..., None] * outputs, axis=0) / jnp.sum(weights, axis=0)[..., None]
-
-    def draw(seed):
-        """A seed's masses, outputs, directions and cotangent at unit scale (the mesh order's check 1)."""
-        return drawn(([6827, seed], [6828, seed], [6829, seed]), 1.0)
-
-    assert_contract(lambda weights, outputs: _mean(weights, outputs, 0), primals, direction, cotangent,
-                    f"the finished merge's mean {edge}", plain_fn=plain,
-                    draw=draw if edge == "normal" else None)

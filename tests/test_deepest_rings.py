@@ -116,13 +116,25 @@ flags and qualification)."""
 @pytest.mark.parametrize(("cell", "generation_name"),
                          [(cell, name) for cell, (_, names) in CELLS.items() for name in names])
 def test_a_launch_at_its_deepest_ring_compiles_within_its_resources(cell, generation_name):
-    """`cell`'s launches at the deepest ring the GPU's shared memory holds them at (`deepest`), lowered and
-    compiled by ptxas for it: every launch within its shared memory, spilling nothing."""
+    """`cell`'s launches at the tile its certification holds (`taken`, as a run's launch takes it: a derived
+    proposal that spills steps to the next), at the deepest ring the GPU's shared memory holds that tile at
+    (`deepest`), lowered and compiled by ptxas for it: every launch within its shared memory, spilling
+    nothing. The derivation's raw proposal is no launch a run takes: compiled whole, a backward's q192 at two
+    stages spilled where its certified q64 holds eight (sm80) and eleven (sm100) spill-free."""
     with generation.assumed(generation_name):
         op, ba, config = CELLS[cell][0]()
         assert config is not None, f"{cell} derives no config on {generation_name}"
-        at = deepest(op, ba, config, generation.gpu_target())
-        case = KernelCase(f"{cell} at {at.stages} stages", lambda: op.lowering(ba, at))
+        target = generation.gpu_target()
+        _, shapes = op.lowering(ba, config)
+
+        def launch(*arrays):
+            # Certified as the compile gate's process certifies (`compile_mosaic_kernels`), then deepened.
+            certified = op.taken(ba)
+            assert certified is not None, f"certification holds no config of {cell} on {generation_name}"
+            lowered, _ = op.lowering(ba, deepest(op, ba, certified, target))
+            return lowered(*arrays)
+
+        case = KernelCase(f"{cell} at its certified tile's deepest ring", lambda: (launch, shapes))
         found = compile_mosaic_kernels([case], generation_name)
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)

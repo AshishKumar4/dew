@@ -17,7 +17,7 @@ import re
 import sys
 from collections.abc import Iterator, Sequence, Set
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeGuard
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_scopes as scopes
@@ -169,8 +169,8 @@ def _returned(tree: ast.Module) -> dict[str, frozenset[int] | None]:
                 found[function.name] = None
             elif isinstance(node.value, ast.Tuple) and (positions := frozenset(
                     index for index, element in enumerate(node.value.elts) if _captured(element, names))
-            ) and found.get(function.name, frozenset()) is not None:
-                found[function.name] = found.get(function.name, frozenset()) | positions
+            ) and (held := found.get(function.name, frozenset())) is not None:
+                found[function.name] = held | positions
     return found
 
 
@@ -192,8 +192,9 @@ def _bound_captured(node: ast.Assign | ast.AnnAssign | ast.AugAssign, names: Set
     positions = returned[called]
     if positions is None:
         return bound
-    return {target.elts[index].id for target in targets if isinstance(target, ast.Tuple)
-            for index in positions if index < len(target.elts) and isinstance(target.elts[index], ast.Name)}
+    return {element.id for target in targets if isinstance(target, ast.Tuple)
+            for index in positions
+            if index < len(target.elts) and isinstance(element := target.elts[index], ast.Name)}
 
 
 def _held(tree: ast.Module) -> dict[int, frozenset[str]]:
@@ -282,7 +283,7 @@ def _laid_out(expr: ast.expr) -> bool:
                and re.search(r"\S {2,}\S", text.value) is not None for text in texts)
 
 
-def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> bool:
+def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> TypeGuard[ast.Compare | ast.Call]:
     """Does `node` look for a sentence the source spells in a process's `stdout` or `stderr`, by
     `in`, `startswith`, `endswith` or `count`, or match a caught error's text (`str` or `repr` of
     it) so or by `==`? A process's whole output compared, or parsed first, is the value it reports."""

@@ -52,7 +52,7 @@ from dew.nn.kernels.options import (
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
-from dew.telemetry.compiles import EVENTS, Compiles
+from dew.telemetry.compiles import Ledger
 from dew.telemetry.instrumentation import compiled_memory
 from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed
@@ -149,7 +149,8 @@ class Candidate:
     prepared: TrainState
     held: int
     built: int
-    """The bytes of `held` the step's arguments hold: the copies and accumulator its first call builds."""
+    """The bytes the step's arguments hold of what `held` charges, as XLA counts them, one allocation's
+    rounding short of their charge (`allocated_bytes`): the copies and accumulator its first call builds."""
     program: jax.stages.Lowered | None
     kernels: KernelReport
     sampled: Callable[[], jax.stages.Lowered] | None = None
@@ -694,11 +695,8 @@ def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
             "probes": [probe.record() for probe in probes], **search.kernels,
             "pool": pool_record(local_devices(search.mesh)),
             # Read at autotune 0 where compiled offline for a GPU kind (`report.autotuned`): its memory
-            # XLA's default choices', which a tuned one on the device may exceed; and whether it leaves a
-            # convolution's algorithm to run time there (`report.at_run_time`), which a run compiles anew.
-            "autotuned": report.autotuned(local_devices(search.mesh)),
-            "at_run_time": planned.candidate.program is not None and report.at_run_time(
-                planned.candidate.program), **above}
+            # XLA's default choices', which a tuned one on the device may exceed.
+            "autotuned": report.autotuned(local_devices(search.mesh)), **above}
 
 
 def pool_record(devices: Sequence) -> dict[str, JSON]:
@@ -750,18 +748,12 @@ class Lower(Protocol):
     def __call__(self, split: int, narrow: bool, ns_group: int | None) -> Candidate: ...
 
 
-class _Spent(Compiles):
-    """Every program JAX traces, lowers or compiles while it is open, each kind of its events held."""
-
-    COUNTED = frozenset(EVENTS.values())
-
-
 @contextlib.contextmanager
 def spending(candidate: Candidate | None = None) -> Iterator[dict[str, float]]:
     """The seconds JAX records of the work within the block, by kind (`EVENTS`: traced, lowered, compiled),
     added to `candidate`'s (`Candidate.spent`), in the dict it yields once the block ends."""
     held = dict({} if candidate is None else candidate.spent)
-    with _Spent(None) as compiles:
+    with Ledger(None) as compiles:
         yield held
     for made in compiles.programs:
         held[made.kind] = held.get(made.kind, 0.0) + made.seconds
@@ -1017,7 +1009,8 @@ class FitSearch[LossT, EffectsT]:
         with spending(candidate) as spent:
             began = time.perf_counter()
             early, firsts, relowered = None, [], None
-            kept = held(self.compiled_key(candidate.lowered, options))
+            looked = self.compiled_key(candidate.lowered, options)
+            kept = held(looked)
             if ahead is not None:
                 executable, self.ahead = ahead.taken(candidate.lowered), None
             elif candidate.sampled is None and kept is not None:
@@ -1033,7 +1026,9 @@ class FitSearch[LossT, EffectsT]:
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
             fit, headroom = self.fitting(executable, candidate)
-            key = self.compiled_key(candidate.lowered, options)
+            # Its lowering's own key, derived again only where a spill relowered it.
+            key = looked if relowered is None or relowered.last is None else self.compiled_key(
+                candidate.lowered, options)
             if relowered is not None and executable is not None and (fit or self.provisional):
                 # Under the program it compiled: the relowered one past a spill, which a plan after it lowers
                 # directly, the spill's refusal held for the process. One that misses on the devices the

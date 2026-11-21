@@ -14,16 +14,18 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import logging
+import math
 import re
 import shutil
 import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
@@ -61,7 +63,7 @@ def shared_asked(error: BaseException) -> int | None:
     return None if asked is None else int(asked.group(1))
 
 
-LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
+LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})(?:__(\d+))?$")
 """The suffix a kernel's name carries within the launch that traced it (`named`): the digest of its identity
 there, its launch's digest where the launch states no kernel's part (`tuning.KernelOp.emitted`)."""
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
@@ -69,15 +71,15 @@ KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
 (jax/experimental/mosaic/gpu/core.py) and GPU outlining's `_kernel`."""
 
 
-def kernel_of(name: str) -> tuple[str, str | None]:
-    """`(kernel, identity)` of a kernel's `name` as it traced (`named`), its function in its binary or its PTX
-    entry (`KERNEL_FUNCTION`) or its call's location: its name less its suffix, and the suffix's digest
-    (`LAUNCH_SUFFIX`: its launch's, where its launch states no kernel's part; a Mosaic GPU call carries its
-    launch beside, `launch_metadata`), None where it carries none."""
+def kernel_of(name: str) -> tuple[str, str | None, str | None]:
+    """`(kernel, identity, index)` of a kernel's `name` as it traced (`named`), its function in its binary
+    or its PTX entry (`KERNEL_FUNCTION`) or its call's location: its name less its suffix, the suffix's
+    digest (`LAUNCH_SUFFIX`), and any XLA uniquification index (`__<digits>`), None where absent."""
     function = KERNEL_FUNCTION.fullmatch(name)
     kernel = function.group("kernel") if function else name
-    launch = LAUNCH_SUFFIX.search(kernel)
-    return LAUNCH_SUFFIX.sub("", kernel), launch.group(1) if launch else None
+    if not (launch := LAUNCH_SUFFIX.search(kernel)):
+        return kernel, None, None
+    return kernel[:launch.start()], launch.group(1), launch.group(2)
 KERNEL_PROTO_VERSION = 4
 """The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
 MOSAIC_TARGET = b"mosaic_gpu_v2"
@@ -107,7 +109,7 @@ kernel (3, `CustomKernelProto`), whose loader spec (2) holds its cubin (2, `Cuda
 states the dynamic shared memory its launch asks for (6, `shared_memory_bytes`)."""
 ELF = b"\x7fELF"
 """A cubin's first bytes."""
-REGISTER_COUNT, FRAME_SIZE = 0x2F, 0x11
+REGISTER_COUNT, FRAME_SIZE, MAX_THREADS = 0x2F, 0x11, 0x05
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
 (EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill."""
 
@@ -150,6 +152,48 @@ class _Pending:
 
 _TRACING: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("tracing_launch", default=None)
 """The pending launch whose Mosaic kernels acquire their digest through `named`."""
+_NAMING: contextvars.ContextVar[list | None] = contextvars.ContextVar("kernel_naming", default=None)
+"""The kernels named within a `naming` block, in order, as `named` was asked and answered."""
+
+
+@contextlib.contextmanager
+def naming() -> Iterator[list[tuple[str | None, "RegisterModel | None", str | None]]]:
+    """Each kernel named within the block (`named`): the name and model it was asked with and the name it
+    took, which a held trace names again as it is bound for another launch (`renamed`)."""
+    names: list = []
+    token = _NAMING.set(names)
+    try:
+        yield names
+    finally:
+        _NAMING.reset(token)
+
+
+@contextlib.contextmanager
+def replayed() -> Iterator[None]:
+    """Within the block, no launch traces: the state a held trace is kept under (`tuning.lowered_once`),
+    which reads the launch tracing it only as it names its kernels and carries the launch on their calls:
+    its key holds the launch (`launch_metadata`), so a held trace is the launch's own, its names replayed as
+    it is bound (`renamed`)."""
+    tracing, form, naming = _TRACING.set(None), _FORM.set(((), None)), _NAMING.set(None)
+    try:
+        yield
+    finally:
+        _NAMING.reset(naming)
+        _FORM.reset(form)
+        _TRACING.reset(tracing)
+
+
+def renamed(names: Sequence[tuple[str | None, "RegisterModel | None", str | None]]) -> None:
+    """The kernels a held trace named (`naming`) named again for the launch tracing now, each registered on
+    it as `named` registers a kernel traced afresh: each takes the name it took, as its trace's key holds what
+    its launch was given (`tuning.lowered_once`); one that takes another is refused, its name no digest of
+    what its body read."""
+    for name, model, took in names:
+        if (now := named(name, model=model)) != took:
+            raise ValueError(f"a held kernel named {took} is named {now} for the launch tracing now: its "
+                             "name reads what its launch was not given (`KernelOp.emitted`, `lowered_once`)")
+
+
 _FORM: contextvars.ContextVar[tuple[Hashable, Hashable]] = contextvars.ContextVar("kernel_form",
                                                                                default=((), None))
 """The form of the kernel tracing and the config it is emitted at (`forming`)."""
@@ -177,11 +221,18 @@ hands a cached trace back without tracing it again, so no trace states when its 
 RECORDS_HELD = 4096
 """The misses, rewrites and pass timings a registry keeps (`_Registry`), the latest; a reader of one
 search's own takes them in a `recording` scope."""
+Refused = tuple[str, tuple[str, ...] | None]
+"""A kernel a compile refused, by its name, and the roles its spill stood in where the compile read them
+(`Binary.spilled_in`: `()` read and spilling none, its warpgroup MMAs serialized alone; None unread): one
+record of both, a kernel once a refusal (`_record` joins its roles), so whatever keys, copies or hands on a
+refusal (`derivation_inputs`, `_proposing`, `refusal_entries`) carries what a launch's ladder steps by."""
+
+
 @dataclasses.dataclass
 class _Registry:
-    """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), by the names of its
-    kernels that spilled, and each miss."""
-    refused: dict[tuple[str, Hashable], frozenset[str]] = dataclasses.field(default_factory=dict)
+    """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), by its kernels that
+    spilled with their roles (`Refused`), and each miss."""
+    refused: dict[tuple[str, Hashable], frozenset[Refused]] = dataclasses.field(default_factory=dict)
     missed: collections.deque["Miss"] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
     rewritten: collections.deque = dataclasses.field(
@@ -336,6 +387,13 @@ def named(name: str | None, *, model: "RegisterModel | None" = None) -> str | No
     a Mosaic GPU call's metadata (`launch_metadata`); a kernel whose call carries none (Triton's) is read back
     to its launch by its name alone, which is its launch's digest wherever its emission reads the whole config
     in no form. Its register `model`, where given, is recorded on that launch (`Launch.kernels`)."""
+    took = _named(name, model)
+    if (names := _NAMING.get()) is not None:
+        names.append((name, model, took))
+    return took
+
+
+def _named(name: str | None, model: "RegisterModel | None") -> str | None:
     digest = launch_digest()
     if digest is None:
         return name
@@ -364,10 +422,11 @@ def launch_metadata() -> bytes:
     return b"" if digest is None else digest.encode()
 
 
-def launch_name(kernel: str, launch: str | None) -> str:
-    """`kernel`'s name carrying the digest `launch` (`LAUNCH_SUFFIX`), as is where None: `kernel_of`'s
-    inverse, the key a kernel's evidence goes by beside its launch."""
-    return kernel if launch is None else f"{kernel}__l{launch}"
+def launch_name(kernel: str, launch: str | None, index: str | None = None) -> str:
+    """`kernel`'s name carrying the digest `launch` (`LAUNCH_SUFFIX`) and optional XLA uniquification
+    `index`, as is where None: the lossless key a kernel's evidence goes by beside its launch."""
+    named = kernel if launch is None else f"{kernel}__l{launch}"
+    return named if index is None else f"{named}__{index}"
 
 
 class KernelsOfOneName(ValueError):
@@ -404,17 +463,25 @@ def kernel_modules(calls: Iterable["KernelCall"]) -> dict[str, str]:
             for name, call in kernel_bodies(call for call in calls if call.kind == "mosaic_gpu").items()}
 
 
+def _launched(identity: str, config: Hashable, reverse: bool) -> str:
+    """The digest of the launch of `identity` at `config` (`launch_digest`): a kernel's identity in its
+    default form (`named`), what its emission reads the whole config, its form none; a gradient's product's
+    digest apart from its call's own, as its verdict is (`_held`)."""
+    return _digest(f"{identity}|{config!r}|{()!r}{'|reverse' if reverse else ''}")
+
+
 def launch_digest() -> str | None:
-    """The digest of the launch tracing (`launching`), which its kernels' names carry (`named`), or None
-    where none is."""
+    """The digest of the launch tracing (`launching`), its identity, config and mode (`Launch.reverse`: a
+    gradient's product or a call's own), which its calls carry beside their kernels' names
+    (`launch_metadata`), or None where none is. The mode is the launch's alone: a kernel's name reads its
+    launch's identity and config (`named`), the body both modes share, so a kernel whose call carries no
+    caller (Triton's) names its launch's forward."""
     pending = _TRACING.get()
     if pending is None:
         return None
     if pending.digest is None:
         identity = pending.identity()
-        # A kernel's identity in its default form (`named`): what its emission reads the whole config, its
-        # form none, so a kernel whose call carries no caller (Triton's) names its launch.
-        digest = _digest(f"{identity}|{pending.config!r}|{()!r}")
+        digest = _launched(identity, pending.config, pending.reverse)
         with _GUARD:
             _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config, pending.padded(),
                                                 emitted=pending.emitted, reverse=pending.reverse))
@@ -435,11 +502,12 @@ def traced(digest: str) -> Launch | None:
 
 
 def derivation_inputs(op, arguments: tokamax.BoundArguments, target
-                      ) -> tuple[str, Hashable, frozenset[tuple[Hashable, frozenset[str]]], bool]:
+                      ) -> tuple[str, Hashable, frozenset[tuple[Hashable, frozenset[Refused]]], bool]:
     """What a launch's derivation of its config for `arguments` on `target` reads of the launch and its
     compiles: the launch's identity (`_identity`: the op, its arguments' shapes and dtypes, its hooks), the
-    whole target, whose facts price its schedules, each config this context's compiles refused it
-    (`refused`), so a refusal recorded after a derivation derives it again, and whether the run asked XLA for
+    whole target, whose facts price its schedules, each config this context's compiles refused it with the
+    roles its kernels spilled in (`refused`, `Refused`), so a refusal recorded after a derivation derives it
+    again, and whether the run asked XLA for
     deterministic ops, which a launch's legality reads (a fused attention backward's atomic dQ sums,
     `attention_mosaic.MosaicBackward`), so a flag flipped within a process derives it again."""
     identity = _identity(op, arguments)
@@ -447,9 +515,10 @@ def derivation_inputs(op, arguments: tokamax.BoundArguments, target
 
 
 @generation.traced_fact
-def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[str]]]:
+def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]:
     """Each config this context's compiles refused the launch of `identity` (`_identity`), with the kernels
-    refused at it: what a launch's derivation and legality read of the refusals, the one way a trace reads
+    refused at it and their roles (`Refused`): what a launch's derivation and legality read of the
+    refusals, the one way a trace reads
     them (`traced_fact`), so a trace kept past a refusal of another launch holds."""
     with _GUARD:
         registry = _registry()
@@ -476,14 +545,33 @@ def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> froze
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    return dict(refusals_of(_identity(op, arguments))).get(config, frozenset())
+    return names(dict(refusals_of(_identity(op, arguments))).get(config, ()))
 
 
-def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels) -> None:
+def names(kernels: Iterable[Refused]) -> frozenset[str]:
+    """The names of refused `kernels` (`Refused`): what a refusal's readers step by, its roles aside."""
+    return frozenset(kernel for kernel, _ in kernels)
+
+
+def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable) -> dict[str, tuple[str, ...]]:
+    """The roles each of `op`'s kernels a compile refused at `config` for `arguments` spilled in, as its
+    refusal states them (`Refused`), by kernel name: what a launch's ladder steps it by (row 6744). A kernel
+    whose roles its compile left unread is absent; one read and spilling none (its warpgroup MMAs serialized
+    alone) states `()`."""
+    found = dict(refusals_of(_identity(op, arguments))).get(config, ())
+    return {kernel: roles for kernel, roles in found if roles is not None}
+
+
+def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels,
+                  spilled_in: Mapping[str, tuple[str, ...] | None] | None = None) -> None:
     """`op`'s launch of `arguments` at `config` refused in this context as a compile that found `kernels`
     spilling refuses it (`settled`), so its derivation takes the next config: a compile gate's, which
-    compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727)."""
-    _record((_identity(op, arguments), config), None, frozenset(kernels))
+    compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727). `spilled_in`, the
+    roles each kernel's spill stood in where the compile read them (`Binary.spilled_in`), kept with it
+    (`Refused`) for its ladder (`spilled_in`)."""
+    roles = spilled_in or {}
+    _record((_identity(op, arguments), config), None,
+            frozenset((kernel, roles.get(kernel)) for kernel in kernels))
 
 
 _CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device", default=None)
@@ -559,26 +647,33 @@ def certifying(device) -> Iterator[None]:
 
 @dataclasses.dataclass(frozen=True)
 class _AsideLaunch:
-    """A launch certified aside (`certifying_aside`): what `certified` read of it, and its compile's
-    kernels (`_launch_binaries`) to come."""
+    """A launch certified aside (`certifying_aside`): what `certified` read of it, and, once the block's
+    trace reached its call (`capture`), its replay's kernels to come (`replay.replayed`: its kernels, their
+    verdict's key, and whether that verdict was read back)."""
     op: "KernelOp"
     arguments: tokamax.BoundArguments
     config: Hashable
     reverse: bool
     device: Hashable
     stored: str | None
-    kernels: Future
+    kernels: Future | None = None
 
 
 @dataclasses.dataclass
 class Aside:
     """The launches a block certified aside (`certifying_aside`), by `certified`'s key, compiling on
-    `pool`."""
+    `pool`; and each whose call the block's trace has not reached yet (`awaiting`), by its launch's digest
+    (`launch_digest`) and mode: its `pending` key."""
     pool: ThreadPoolExecutor
     pending: dict[tuple, _AsideLaunch] = dataclasses.field(default_factory=dict)
+    awaiting: dict[tuple[str, bool], tuple] = dataclasses.field(default_factory=dict)
 
 
-_ASIDE: contextvars.ContextVar[Aside | None] = contextvars.ContextVar("certifying_aside", default=None)
+# Untraced (`_cache.untraced`), as `_RECORDING`: the block's pending launches change as it captures them, and
+# a trace keyed on them lowered a second layer's calls apart from its first's, so a cold build lowered
+# another program than a warm run (rows 7322, 8299, 8372).
+_ASIDE: contextvars.ContextVar[Aside | None] = _cache.untraced(
+    contextvars.ContextVar("certifying_aside", default=None))
 
 
 @contextlib.contextmanager
@@ -600,26 +695,32 @@ def certifying_aside() -> Iterator[Aside]:
             _ASIDE.reset(token)
 
 
-def settled_aside(aside: Aside) -> bool:
+def settled_aside(aside: Aside) -> None:
     """Each launch `aside` certified, kept as `certified` keeps one: a launch whose kernels the assembler
     refuses refused (`refuse_launch`) and its misses recorded, stepped where its derivation offers another
-    config now, so the program lowered within the block holds a refused config and is lowered afresh.
-    Whether any was refused."""
-    refused = False
+    config now, so the program lowered within the block holds a refused config (`refused_in`) and is lowered
+    afresh."""
     for key, each in aside.pending.items():
+        # A launch a derivation certified (a route's eligibility) and no trace called: no program holds it.
+        # One certified in turn meanwhile (a refusal's ladder, `tuning.KernelOp._certified`) is certified.
+        with _GUARD:
+            done = key in _CERTIFIED
+        if each.kernels is None or done:
+            continue
         try:
-            kernels = each.kernels.result()
+            kernels, lowered, read = each.kernels.result()
         except jax.errors.JaxRuntimeError as error:
             _uncertified_launch(key, each.op, each.config, error)
             continue
-        spilling = _kept_certification(key, each.op, each.config, each.reverse, kernels, each.stored,
-                                       each.device).refused
+        # Its verdict stored by its tree's key and, compiled here, its kernels' (`_lowered_verdict_key`).
+        stored = (each.stored,) if read else (each.stored, lowered)
+        spilling = _kept_certification(key, each.op, each.config, each.reverse, kernels, stored, each.device,
+                                       read=read).refused
         if spilling:
-            refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling})
+            refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
+                          {binary.kernel: binary.spilled_in for binary in spilling})
             missed(each.op, each.arguments, each.config, spilling,
                    stepped=each.op.remaining(each.arguments) is not None)
-            refused = True
-    return refused
 
 
 def _refused_before(op, arguments: tokamax.BoundArguments) -> bool:
@@ -655,9 +756,9 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     assembly the PTX compiler rejects), which its program's compile reads as before (`settled`) and
     `uncertified` names;
     a launch Mosaic refuses as it lowers (a block past its shared memory) raises here as its program's
-    lowering would. Once a process, by launch (`certifications`), and once a GPU model a
-    machine: each verdict, an accepted config's and a refused one's, is stored with the kernel picks
-    (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
+    lowering would. Once a process, by launch (`certifications`), and once a compile target a
+    machine: each verdict, an accepted config's and a refused one's, is stored beside the kernel picks
+    (`_verdict_key`, `verdict_target`), so a warm start traces and compiles nothing to certify."""
     device = _certifying_device()
     if device is None or arguments.arguments.get("interpret"):
         return ()
@@ -671,23 +772,31 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         if key in _UNCERTIFIED:
             return None
     stored = _verdict_key(_identity(op, arguments), config, reverse)
-    verdict = None if stored is None else tuning.stored_verdict(device.device_kind, stored)
+    verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
     if isinstance(verdict, dict):
-        return _kept_certification(key, op, config, reverse, verdict, stored, device, read=True).refused
+        return _kept_certification(key, op, config, reverse, verdict, (), device, read=True).refused
     aside = _ASIDE.get()
-    if aside is not None and not _refused_before(op, arguments):
-        # Taken as holding while it compiles aside (`certifying_aside`), once a block.
-        if key not in aside.pending:
-            lowered, modules = _lowered_launch(op, arguments, config, device, reverse)
-            compiling = aside.pool.submit(contextvars.copy_context().run, _launch_binaries, lowered, modules)
-            aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, compiling)
+    if aside is not None and key in aside.pending:
         return ()
+    if aside is not None and not _refused_before(op, arguments):
+        # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
+        # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
+        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored)
+        aside.awaiting[(_launched(key[0], config, reverse), reverse)] = key
+        return ()
+    # Its verdict where its kernels' was stored however their Dew tree named it (`_lowered_verdict_key`),
+    # stored by this tree's key too, so its next start reads it tracing nothing.
+    lowered, modules, lowered_key = _lowered_launch(op, arguments, config, device, reverse)
+    verdict = None if lowered_key is None else tuning.stored_verdict(verdict_target(device), lowered_key)
+    if isinstance(verdict, dict):
+        return _kept_certification(key, op, config, reverse, verdict, (stored,), device, read=True).refused
+    unstored = (stored, lowered_key)
     try:
-        kernels = _compiled_launch(op, arguments, config, device, reverse)
+        kernels = _launch_binaries(lowered, modules)
     except jax.errors.JaxRuntimeError as error:
         _uncertified_launch(key, op, config, error)
         return None
-    return _kept_certification(key, op, config, reverse, kernels, stored, device).refused
+    return _kept_certification(key, op, config, reverse, kernels, unstored, device).refused
 
 
 def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> None:
@@ -699,29 +808,61 @@ def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> N
         _UNCERTIFIED[key] = str(error)[:400]
 
 
-def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels: dict, stored: str | None,
-                        device, *, read: bool = False) -> "Certification":
+def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels: dict,
+                        stored: tuple[str | None, ...], device, *, read: bool = False) -> "Certification":
     """A launch's certification recorded once a process (`certifications`): its kernels `read` back from the
-    picks' store, else compiled here, their verdict stored for the GPU model by `stored` (None where no key
-    states the installation's code)."""
+    picks' store, else compiled here, their verdict stored for the GPU model by each of `stored`'s keys that
+    found none (None where no key states the installation's code)."""
     from dew.nn.kernels import tuning
 
-    if not read and stored is not None:
-        tuning.store_verdict(device.device_kind, stored, kernels)
+    for each in stored:
+        if each is not None:
+            tuning.store_verdict(verdict_target(device), each, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, read, device)
     with _GUARD:
         _CERTIFIED[key] = found
     return found
 
 
+def verdict_target(device) -> str:
+    """The compile target whose verdicts a certification on `device` stores and reads
+    (`tuning.stored_verdict`): its generation (`generation.device_target`), which names what the assembler
+    builds a launch's kernels for, the verdict's one hardware input. An H100, a GH200 and a compile-only H100
+    share sm90's, so a build certifying for a compile-only GPU stores the verdicts a run on its GPU reads,
+    where by GPU model a GH200's run read none of them (row 6717)."""
+    return generation.device_target(device).generation
+
+
+def _lowered_verdict_key(calls) -> str | None:
+    """What decides a lowered launch's certification on a GPU model, as its stored verdict's key once it has
+    lowered (`tuning.stored_verdict`): each Mosaic GPU and Pallas-Triton kernel it compiles, by its name, its
+    IR's digest and its config, the installed JAX, jaxlib and CUDA plugins, whose compiler assembles them (the
+    Pallas lowering cache's seal), and the environment a kernel's compile reads (that cache's policy); the
+    store's file names the GPU model. Its kernels decide its verdict, not the Dew tree that lowered them: a
+    tree whose own key (`_verdict_key`) finds none, an edit's anywhere outside them, lowers the launch and
+    reads its verdict, compiling nothing (row 8650: 23 of an edited tree's 51 seconds certifying a hybrid
+    decoder's step ahead, FS-8650-SPLIT). None where the installation has no seal."""
+    from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
+    from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
+
+    installed = seal().digest
+    if installed is None:
+        return None
+    kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
+                     for call in calls if call.kind in ("mosaic_gpu", "triton"))
+    stated = ["lowered", installed.hex(), kernels, _keyed_environment()]
+    return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
+
 def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
-    """What decides a launch's certification on a GPU model before it traces, as its stored verdict's key
-    (`tuning.stored_verdict`): the launch's `identity` (`_identity`, the same in every process), its config,
-    whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the installed
-    JAX, jaxlib and CUDA plugins, whose compiler assembles it (the Pallas lowering cache's seal of them), and
-    the environment a kernel's lowering and compile read (that cache's policy); the store's file names the
-    GPU model. None where the installation has no seal (an edited or a source install of JAX), whose code
-    no key states: its verdicts are not stored."""
+    """What decides a launch's certification for a compile target (the store's file, `verdict_target`,
+    `tuning.stored_verdict`) before it traces, as its stored verdict's key: the launch's `identity`
+    (`_identity`, the same in every process), its config, whether reverse mode runs it, Dew's code
+    (`package_digest`: a Dew edit certifies again), the installed JAX, jaxlib and CUDA plugins, whose Mosaic
+    GPU and XLA lower and compile it (the Pallas lowering cache's seal of them), the ptxas that assembles it
+    (`_assemblers`), and the environment a kernel's lowering and compile read (that cache's policy). None
+    where the installation has no seal (an edited or a source install of JAX), whose code no key states: its
+    verdicts are not stored."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
@@ -731,8 +872,22 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
     installed = seal().digest
     if installed is None:
         return None
-    stated = [package_digest(), installed.hex(), identity, encoded(config), reverse, _keyed_environment()]
+    stated = [package_digest(), installed.hex(), _assemblers(), identity, encoded(config), reverse,
+              _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
+
+@functools.cache
+def _assemblers() -> list[str]:
+    """The installed distributions holding the ptxas a kernel's PTX is assembled with, CUDA's nvcc wheels
+    (`nvidia-cuda-nvcc`, `nvidia-cuda-nvcc-cu12`), each as `name==version`: a relock that moves one
+    certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another ptxas
+    judged. A system CUDA's ptxas, outside every wheel, none names (row 7309: the ptxas Mosaic GPU's own
+    assembler names, `_get_assembler`, with its version, once Dew's JAX build states it)."""
+    named = (((distribution.metadata.get("Name") or "").lower(), distribution)
+             for distribution in importlib.metadata.distributions())
+    return sorted(f"{name}=={distribution.version}" for name, distribution in named
+                  if re.fullmatch(r"nvidia-cuda-nvcc(-cu\d+)?", name))
 
 
 def certifications() -> tuple[Certification, ...]:
@@ -785,31 +940,24 @@ def _certifying_device():
     return devices[0]
 
 
-def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,
-                     reverse: bool) -> dict[str, tuple[str, "Binary"]]:
-    """`op`'s launch of `arguments` at `config` as a resource derivation lowers it (`KernelOp.lowering`),
-    compiled alone on `device`, as a call without a gradient runs it or, `reverse`, as reverse mode does (its
-    forward and its pullback of a unit cotangent): its Mosaic GPU and Pallas-Triton kernels' modules (a Triton
-    call's config) and binaries, by name and launch, none for a launch of none. A launch that does not trace
-    alone raises: certification is no optional pass."""
-    return _launch_binaries(*_lowered_launch(op, arguments, config, device, reverse))
-
-
 def _lowered_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device, reverse: bool
-                    ) -> tuple[jax.stages.Lowered, dict]:
-    """`_compiled_launch`'s launch lowered, beside its kernels' modules (a Triton call's config) by name."""
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
-    from dew.nn.kernels.lowered import kernel_calls
+                    ) -> tuple[jax.stages.Lowered, dict, str | None]:
+    """`op`'s launch of `arguments` at `config` lowered alone for `device` (as reverse mode runs it where
+    `reverse`), beside its kernels' modules (a Triton call's config) by name, and their verdict's key
+    (`_lowered_verdict_key`)."""
     from dew.nn.kernels.options import owned_program
     from dew.nn.programs import meshless
 
-    mesh = Mesh([device], ("launch",))
-    placed = NamedSharding(mesh, PartitionSpec())
-    # A program of its own on one device (`meshless`): none of the enclosing trace's mesh nor its axes (a
-    # checked shard_map's body, whose abstract values the launch's own must not vary over), its operands' too.
-    with meshless(), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+    mesh, manual = _certifying_placement(device)
+    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    # A program of its own on one device (`meshless`): none of the enclosing trace's mesh nor its axes, its
+    # operands' too, but the mesh its program runs on where that is one device's (`_certifying_placement`),
+    # within a map holding the axes manual its program's call holds manual (`sharding.manual_map`'s).
+    with meshless(mesh):
         launch, shapes = op.lowering(arguments, config)
+        if manual:
+            launch = jax.shard_map(launch, mesh=mesh, in_specs=jax.sharding.PartitionSpec(),
+                                   out_specs=jax.sharding.PartitionSpec(), axis_names=manual, check_vma=False)
         specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
 
         def pulled_back(*operands):
@@ -822,21 +970,73 @@ def _lowered_launch(op, arguments: tokamax.BoundArguments, config: Hashable, dev
         def certified(*operands):
             return (pulled_back if reverse else launch)(*operands)
 
-        # Named by its launch and config in JAX's trace, lowering and compile events, so a start's receipt
-        # tells each certification's program apart: its op, its launch's identity and its config, digested.
-        certified.__name__ = certified.__qualname__ = (
-            f"certified_{type(op).__name__}_l{_digest(_identity(op, arguments))}_c{_digest(repr(config))}"
-            f"{'_reverse' if reverse else ''}")
+        certified.__name__ = certified.__qualname__ = _certification_name(type(op).__name__,
+                                                                          _identity(op, arguments), config,
+                                                                          reverse)
         lowered = owned_program(certified).trace(*specs).lower()
-    # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
-    # process). A Pallas-Triton kernel compiles again with each executable, the same kernel the same binary:
-    # read here too, its call's config its identity, so its derivation steps a spilling config at trace as a
-    # Mosaic launch's does (an H100's float32 attention forward at width 256 spilled at every four-warp tile
-    # and held at eight, row 6507), rather than ending its program's compile Exhausted.
+    return lowered, *_lowered_kernels(lowered)
+
+
+def _certification_name(op: str, identity: str, config: Hashable, reverse: bool) -> str:
+    """A certification's program's name in JAX's trace, lowering and compile events, so a start's receipt
+    tells each certification's program apart: its op, its launch's identity and its config, digested."""
+    return f"certified_{op}_l{_digest(identity)}_c{_digest(repr(config))}{'_reverse' if reverse else ''}"
+
+
+def _lowered_kernels(lowered: jax.stages.Lowered) -> tuple[dict, str | None]:
+    """A certification's lowered launch's Mosaic GPU and Pallas-Triton kernels' modules (a Triton call's
+    config) by name, and their verdict's key (`_lowered_verdict_key`). A Mosaic GPU kernel compiled alone is
+    the one its program loads (Mosaic compiles a module once a process). A Pallas-Triton kernel compiles again
+    with each executable, the same kernel the same binary: read here too, its call's config its identity, so
+    its derivation steps a spilling config at trace as a Mosaic launch's does (an H100's float32 attention
+    forward at width 256 spilled at every four-warp tile and held at eight, row 6507), rather than ending its
+    program's compile Exhausted."""
+    from dew.nn.kernels.lowered import kernel_calls
+
     calls = kernel_calls(lowered, unrun=True)
     modules = kernel_modules(calls) | {name: call.config for name, call in
                                        kernel_bodies(call for call in calls if call.kind == "triton").items()}
-    return lowered, modules
+    return modules, _lowered_verdict_key(calls)
+
+
+def awaiting() -> tuple | None:
+    """The `pending` key of the launch tracing here (`launching`) where the block it traces in certifies it
+    aside and no trace has called it yet (`certified`), taken: its call is captured
+    (`tuning.KernelOp.__call__`, `capture`). None for every other call, which runs as it is."""
+    aside, pending, digest = _ASIDE.get(), _TRACING.get(), launch_digest()
+    if aside is None or pending is None or digest is None:
+        return None
+    with _GUARD:
+        return aside.awaiting.pop((digest, pending.reverse), None)
+
+
+def capture(key: tuple, closed) -> None:
+    """The launch certified aside under `key` (`certified`), its call as its block's trace made it
+    (`closed`, its `ClosedJaxpr`: at the operands' own abstract values, a shard's inside a shard_map),
+    replayed and compiled on the block's pool (`replay.replayed`) on the mesh it was traced on
+    (`replay.replay_mesh`): no kernel body traced a second time, and its kernels lowered as its program
+    lowers them, which the lowering cache then holds once (row 8720: 22 of a hybrid decoder's 36 kernels
+    lowered twice, a launch alone on one device and a shard's in its program). A launch whose operands are
+    placed on meshes of two shapes certifies by its program's compile (`settled`)."""
+    from dew.nn.kernels.templates.replay import replay_mesh, replayed
+
+    aside = _ASIDE.get()
+    assert aside is not None, "a capture is of a block's trace"
+    with _GUARD:
+        each = aside.pending.get(key)
+        done = key in _CERTIFIED
+    if each is None or each.kernels is not None or done:
+        return
+    mesh = replay_mesh(closed, each.device)
+    if mesh is None:
+        with _GUARD:
+            aside.pending.pop(key, None)
+            _UNCERTIFIED[key] = "its trace placed its operands on meshes of two shapes"
+        return
+    name = _certification_name(type(each.op).__name__, key[0], each.config, each.reverse)
+    compiling = aside.pool.submit(contextvars.copy_context().run, replayed, closed, mesh, each.reverse,
+                                  each.device, name)
+    aside.pending[key] = dataclasses.replace(each, kernels=compiling)
 
 
 def _launch_binaries(lowered: jax.stages.Lowered, modules: dict) -> dict[str, tuple[str, "Binary"]]:
@@ -844,12 +1044,30 @@ def _launch_binaries(lowered: jax.stages.Lowered, modules: dict) -> dict[str, tu
     and launch, none for a launch of none."""
     if not modules:
         return {}
-    # Compiled to be read, never run (`read_offline`): its kernels' binaries are what it states, so a prepare
-    # for devices no run has tuned (`for_devices`) certifies as any compile does, its fusions untuned.
-    with read_offline():
+    # Compiled to be read, never run (`kernels_read`): its kernels' binaries are what it states, so a prepare
+    # for devices no run has tuned (`for_devices`) certifies as any compile does, its fusions untuned, and an
+    # attached GPU's certification is the compile a deviceless build of its generation made (row 8372).
+    with kernels_read():
         compiled = xla_compiled(lowered, None)
-    return {name: (modules[name], binary) for binary in binaries(compiled)
+    return {name: (modules[name], binary) for binary in binaries(compiled, spills=True)
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
+
+
+def _certifying_placement(device) -> tuple[jax.sharding.Mesh, frozenset]:
+    """The mesh certification places a launch's operands on `device` on and sets its program on
+    (`_lowered_launch`), and the axes its launch holds manual: its program's where that runs
+    on `device` alone (the concrete mesh, `jax.set_mesh`'s, its axes manual where the call is in a map
+    holding them, `sharding.manual_map`'s), so the launch lowers to the jaxpr and the mesh its program's call
+    does (the GPU it states and each jit's recorded mesh among them) and the program reads its kernels'
+    lowerings back (the Pallas lowering cache keys both); else a mesh of its own on `device`, as a program of
+    no mesh or a launch of many devices' (row 6327): its own compile cannot hold the program's devices, so
+    its program lowers its kernels again."""
+    from jax._src import mesh as mesh_lib
+
+    placed = mesh_lib.get_concrete_mesh()
+    if not placed.empty and list(placed.devices.flat) == [device]:
+        return placed, frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    return jax.sharding.Mesh([device], ("launch",)), frozenset()
 
 
 def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
@@ -860,23 +1078,40 @@ def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
 
 
 @generation.traced_fact
-def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
-    """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
-    the process's), ordered. A validated plan can hand them to another process explicitly (`refuse` within
-    `refusals`); a shared compilation cache alone must not transfer them between programs. A trace after a
-    refusal derives the next config, so a program kept after one is another than a process without it
-    traces (`traced_fact`)."""
+def refusal_entries() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
+    """Every (launch identity, config, spilled kernels with their roles, `Refused`) refused in this context (a
+    `refusals` scope's or the process's), ordered. A validated plan can hand them to another process
+    explicitly, the roles with them (`refuse` within `refusals`); a shared compilation cache alone must not
+    transfer them between programs. A trace after a refusal derives the next config, so a program kept after
+    one is another than a process without it traces (`traced_fact`): a trace's key holds them, roles and
+    all (`options.held_context`)."""
     with _GUARD:
         return tuple(sorted(((identity, config, kernels)
                              for (identity, config), kernels in _registry().refused.items()), key=repr))
 
 
+def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
+    """`refusal_entries`, each launch's spilled kernels by their names: what a plan's record lists
+    (`dew.training.planning.refusal_record`)."""
+    return tuple((identity, config, names(kernels)) for identity, config, kernels in refusal_entries())
+
+
 def refuse(entries) -> None:
-    """Each `(identity, config, kernels)` of `entries` (`refused_launches`') refused in this context, as a
-    compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope, not unioned with
-    unrelated decisions that the receiving process already holds."""
+    """Each `(identity, config, kernels)` of `entries` (`refusal_entries`', its kernels with their roles,
+    `Refused`, or a pair a decoded record gives as a list; a kernel by its name alone states none) refused in
+    this context, as a compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope,
+    not unioned with unrelated decisions that the receiving process already holds."""
     for identity, config, kernels in entries:
-        _record((identity, config), None, frozenset(kernels))
+        _record((identity, config), None, frozenset(map(_refused, kernels)))
+
+
+def _refused(kernel) -> Refused:
+    """A kernel `refuse` is handed as its record (`Refused`): its name alone, no roles stated, or its name and
+    roles, a tuple's or a list's."""
+    if isinstance(kernel, str):
+        return kernel, None
+    name, roles = kernel
+    return name, None if roles is None else tuple(roles)
 
 
 def misses() -> tuple[Miss, ...]:
@@ -937,15 +1172,15 @@ def refusals() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[Recorded]:
-    """Refusals visible while deriving and compiling a replacement, without changing the kept program's
-    registry or its file; every rewrite and pass the replacement's trace records, which a successful
-    replacement commits after this scope ends (`_commit`)."""
+def _proposing(entries: list[tuple[tuple[str, Hashable], Refused]]) -> Iterator[Recorded]:
+    """Refusals visible while deriving and compiling a replacement, each kernel with its roles (`Refused`),
+    without changing the kept program's registry or its file; every rewrite and pass the replacement's trace
+    records, which a successful replacement commits after this scope ends (`_commit`)."""
     registry = _registry()
     with _GUARD:
         proposed = dict(registry.refused)
     for identity, kernel in entries:
-        proposed[identity] = proposed.get(identity, frozenset()) | {kernel}
+        proposed[identity] = _joined(proposed.get(identity, frozenset()) | {kernel})
     # A replacement's records reach the registry and a `recording` only once it is kept (`_commit`).
     proposal = Recorded()
     token, held = _SCOPE.set(_Registry(refused=proposed)), _RECORDING.set((proposal,))
@@ -972,8 +1207,21 @@ def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Seq
             held.passes.extend(passes)
 
 
+def _joined(kernels: frozenset[Refused]) -> frozenset[Refused]:
+    """Refused `kernels` (`Refused`) a kernel once: each kernel's roles every record of it read, joined, None
+    where none read them."""
+    roles: dict[str, set[str] | None] = {}
+    for kernel, read in kernels:
+        if read is not None:
+            roles[kernel] = (roles.get(kernel) or set()) | set(read)
+        else:
+            roles.setdefault(kernel, None)
+    return frozenset((kernel, None if read is None else tuple(sorted(read)))
+                     for kernel, read in roles.items())
+
+
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
-            kernels: frozenset[str] = frozenset()) -> bool:
+            kernels: frozenset[Refused] = frozenset()) -> bool:
     """`refusal` and `miss` recorded; whether `miss` is new to this context's registry. A miss is recorded
     once a holder, the registry and each `recording` open: a launch's derivation asked again (its route's
     eligibility, then its call, `tuning.KernelOp.taken`) reads its certification back and finds the same
@@ -982,7 +1230,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
     registry = _registry()
     with _GUARD:
         if refusal is not None:
-            registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
+            registry.refused[refusal] = _joined(registry.refused.get(refusal, frozenset()) | kernels)
             registry.by_launch.pop(refusal[0], None)
         if miss is None:
             return False
@@ -1015,10 +1263,12 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     compiled in turn, as it would have been lowered after them. At most `compile_threads()` compile at
     once."""
     firsts = attempts([(lowered, options) for lowered, options, _ in programs])
-    held = refused_launches()
+    held = refusal_entries()
     kept_programs = []
     for (lowered, options, relower), first in zip(programs, firsts, strict=True):
-        if refused_launches() != held:
+        # A program launching a config an earlier one's compile refused after its trace took it, each program
+        # by what it launches (row 8603); refusals held before every trace, its derivations read.
+        if refusal_entries() != held and refused_in(lowered):
             lowered, first = relower(), None
         kept_programs.append(compiled(lowered, options, relower=relower, first=first))
     return kept_programs
@@ -1109,17 +1359,44 @@ def at_run_time(lowered: jax.stages.Lowered) -> bool:
     devices = target_devices(lowered)
     if DEVICELESS_CONVOLUTION_PICKS or not devices or not deviceless(next(iter(devices))):
         return False
+    return any_op(lowered, lambda op: op.name == "stablehlo.convolution")
+
+
+def any_op(lowered: jax.stages.Lowered, holds: Callable[[ir.Operation], bool]) -> bool:
+    """Whether an operation of `lowered`'s StableHLO `holds`, its walk stopped at the first."""
     found = False
 
     def visit(op: ir.Operation) -> ir.WalkResult:
         nonlocal found
-        found = op.name == "stablehlo.convolution"
+        found = holds(op)
         return ir.WalkResult.INTERRUPT if found else ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir("stablehlo")
     assert module is not None, "a lowered program states its StableHLO module"
     module.operation.walk(visit)
     return found
+
+
+def left_at_run(compiled: jax.stages.Compiled) -> bool:
+    """Whether `compiled` holds a cuDNN convolution whose algorithm its compile left to run time (its backend
+    config's `algo_id` -1), as every compile without the GPU leaves it (`DEVICELESS_CONVOLUTION_PICKS`):
+    an executable compiled ahead that its load must not take (`dew.training.ahead.AheadOfTime.at_run`),
+    each module's instructions read through XLA's own schema (`jax.extend.xla.instructions`) and a call's
+    kind by the one table of custom call targets (`instrumentation.custom_call_kind`)."""
+    from jax.extend import xla
+
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    executable = compiled.runtime_executable()
+    for module in [] if executable is None else executable.hlo_modules():
+        for read in xla.instructions(module):
+            proto = read.proto
+            if read.opcode != "custom-call" or custom_call_kind(proto.custom_call_target) != "convolution":
+                continue
+            config = json.loads(proto.backend_config or "{}")
+            if config.get("cudnn_conv_backend_config", {}).get("algorithm", {}).get("algo_id") == "-1":
+                return True
+    return False
 
 
 def target_devices(lowered: jax.stages.Lowered) -> Sequence | None:
@@ -1183,13 +1460,27 @@ def xla_compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
     devices = target_devices(lowered)
     if devices is not None and not offline(devices) and at_run_time(lowered):
         raise CompiledOnDevice(lowered)
+    compiled_with = targeted(lowered, options)
+    # Its options as JAX's persistent cache keys its compile by them (tests/cache_keys.py reads them),
+    # written only where the log is read.
+    _log.debug("a compile's options: %s", Said(compiled_with))
     try:
         with compile_slots().held(background=background):
-            return lowered.compile(targeted(lowered, options))
+            return lowered.compile(compiled_with)
     except jax.errors.JaxRuntimeError as error:
         if untuned(error.error_code_string, str(error)):
             raise Untuned(str(error), lowered) from error
         raise
+
+
+class Said:
+    """A compile's options as a log line writes them, made only where the line is written (`str`)."""
+
+    def __init__(self, options: jax.stages.CompilerOptions | None):
+        self.options = options
+
+    def __str__(self) -> str:
+        return json.dumps(sorted((self.options or {}).items()), default=str)
 
 
 CUB_NO_FALLBACK = 3
@@ -1232,11 +1523,28 @@ def read_offline() -> Iterator[None]:
         _FOR_DEVICES.reset(held)
 
 
+_KERNELS_READ: contextvars.ContextVar[bool] = contextvars.ContextVar("dew_kernels_read", default=False)
+
+
+@contextlib.contextmanager
+def kernels_read() -> Iterator[None]:
+    """Within the block, a GPU compile is one read for its kernels' binaries alone and run nowhere (a
+    certification's, `_launch_binaries`): read offline on an attached GPU as on a compile-only one
+    (`offline`), so a run's certifications and a deviceless build's are one compile under one key."""
+    held = _KERNELS_READ.set(True)
+    try:
+        yield
+    finally:
+        _KERNELS_READ.reset(held)
+
+
 def offline(devices: Sequence) -> bool:
     """Whether a program compiled for `devices` is read offline, for its memory or text alone, no device to
-    run it (`targeted`): compile-only GPUs outside `for_devices` (or within `read_offline`)."""
+    run it (`targeted`): compile-only GPUs outside `for_devices` (or within `read_offline`), and any GPU's
+    compile read for its kernels alone (`kernels_read`)."""
     device = next(iter(devices), None)
-    return device is not None and device.platform == "gpu" and deviceless(device) and not _FOR_DEVICES.get()
+    return device is not None and device.platform == "gpu" and (
+        _KERNELS_READ.get() or (deviceless(device) and not _FOR_DEVICES.get()))
 
 
 def compiled_as_here(devices: Sequence, *, tuned: bool, at_run: bool) -> bool:
@@ -1301,32 +1609,27 @@ def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> b
     from dew.nn.precision import FP32_PRODUCTS, declares_fp32_products
     from dew.nn.programs import algorithm_arithmetic, dot_arithmetic
 
-    wrong = False
-
-    def visit(op: ir.Operation) -> ir.WalkResult:
-        nonlocal wrong
+    def wrong(op: ir.Operation) -> bool:
         if op.name != "stablehlo.dot_general":
-            return ir.WalkResult.ADVANCE
+            return False
         types = [ir.RankedTensorType(operand.type).element_type for operand in list(op.operands)[:2]]
         if any(isinstance(each, ir.IntegerType) and ir.IntegerType(each).width == 8 for each in types):
-            wrong = not target.int8_triton_gemm
-        elif all(isinstance(each, ir.F32Type) for each in types):
-            attributes = op.attributes
-            if "precision_config" in attributes:
-                # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
-                lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
-                            for each in ir.ArrayAttr(attributes["precision_config"]))
-                wrong = declares_fp32_products((lhs, rhs))
-            if not wrong and "algorithm" in attributes:
-                stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
-                wrong = any(stated == dot_arithmetic(name, jnp.float32, jnp.float32)
-                            for name in FP32_PRODUCTS)
-        return ir.WalkResult.INTERRUPT if wrong else ir.WalkResult.ADVANCE
+            return not target.int8_triton_gemm
+        if not all(isinstance(each, ir.F32Type) for each in types):
+            return False
+        attributes = op.attributes
+        if "precision_config" in attributes:
+            # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
+            lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
+                        for each in ir.ArrayAttr(attributes["precision_config"]))
+            if declares_fp32_products((lhs, rhs)):
+                return True
+        if "algorithm" in attributes:
+            stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
+            return any(stated == dot_arithmetic(name, jnp.float32, jnp.float32) for name in FP32_PRODUCTS)
+        return False
 
-    module = lowered.compiler_ir("stablehlo")
-    assert module is not None, "a lowered program states its StableHLO module"
-    module.operation.walk(visit)
-    return wrong
+    return any_op(lowered, wrong)
 
 
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]
@@ -1391,13 +1694,17 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     executable = first.executable
     assert executable is not None
     found, compiled_from = _misses_of(_refused_binaries(lowered, executable, read)), lowered
+    # The refusals this compile relowered past: a spill at a config another caller refused after this
+    # program's trace took it (another thread's compile, a certification elsewhere) is relowered past as
+    # any, never read as held, which kept a spilling program (row 8603).
+    past: set[tuple[tuple[str, Hashable], str]] = set()
     while True:
-        # Each step refuses a config no step refused before, of the finitely many its launches derive.
-        held = _registry().refused
-        refusals = [(refusal, report.kernel) for refusal, report, _ in found
-                    if refusal is not None and report.kernel not in held.get(refusal, frozenset())]
+        # Each step refuses a config no step of this compile did, of the finitely many its launches derive.
+        refusals = [(refusal, (report.kernel, report.spilled_in)) for refusal, report, _ in found
+                    if refusal is not None and (refusal, report.kernel) not in past]
         if not refusals:
             break
+        past.update((refusal, kernel) for refusal, (kernel, _) in refusals)
         try:
             with _proposing(refusals) as proposal:
                 program, alone = _stepped_alone(relower, options, {identity for (identity, _), _ in refusals})
@@ -1414,7 +1721,8 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         if replacement is None:
             break
         _commit(proposal)
-        for refusal, kernel in [*refusals, *((refusal, report.kernel) for refusal, report, _ in alone)]:
+        for refusal, kernel in [*refusals, *((refusal, (report.kernel, report.spilled_in))
+                                             for refusal, report, _ in alone)]:
             _record(refusal, None, frozenset({kernel}))
         _held(found, compiled_from)
         _held(alone, program)
@@ -1556,22 +1864,23 @@ def _stepped_alone(relower: Callable[[], jax.stages.Lowered], options: jax.stage
         found = [(refusal, report, launch)
                  for refusal, report, launch in _misses_of([binary for each in alone.values()
                                                             for binary in each.binaries if binary.refused])
-                 if refusal is not None and report.kernel not in held.get(refusal, frozenset())]
+                 if refusal is not None and report.kernel not in names(held.get(refusal, ()))]
         if not found:
             return program, missed
         for refusal, report, _ in found:
-            _record(refusal, None, frozenset({report.kernel}))
+            _record(refusal, None, frozenset({(report.kernel, report.spilled_in)}))
         missed += found
 
 
 def _held(found: list, program: jax.stages.Lowered) -> None:
-    """Each config `found` refuses (a compile's misses of `program`'s kernels, `_misses_of`'s form) stored as
-    its launch's certification verdict (`_verdict_key`, in the mode its kernels traced in), as `certified`
-    stores its own: the program's compile is the authority, its kernels the bodies that run, so its refusal
-    replaces an alone compile's acceptance, which no later process compiles again to write back (`certified`
-    reads a stored verdict first). A later process's derivation refuses the config at trace, no program
-    compiled and relowered to learn it again (LF-PROMO3: a warm start walked the 4B's whole step-down
-    again, 375 of its 577 s)."""
+    """Each config `found` refuses (a compile's misses of `program`'s kernels, `_misses_of`'s form: each
+    refusal its launch's identity and config, the launch the one its call ran, `called`) stored as that
+    launch's certification verdict (`_verdict_key`, in the mode it traced in), as `certified` stores its own,
+    whatever other config a kernel of one body shares its name with (`named`): the program's compile is the
+    authority, its kernels the bodies that run, so its refusal replaces an alone compile's acceptance, which
+    no later process compiles again to write back (`certified` reads a stored verdict first). A later
+    process's derivation refuses the config at trace, no program compiled and relowered to learn it again (LF-
+    PROMO3: a warm start walked the 4B's whole step-down again, 375 of its 577 s)."""
     from dew.nn.kernels import tuning
     from dew.nn.kernels.lowered import kernel_calls
 
@@ -1588,21 +1897,34 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
         verdicts.setdefault((identity, config, launch.reverse), {})[name] = (modules.get(name, ""), binary)
     for (identity, config, reverse), kernels in verdicts.items():
         if (key := _verdict_key(identity, config, reverse)) is not None:
-            tuning.store_verdict(device.device_kind, key, kernels)
+            tuning.store_verdict(verdict_target(device), key, kernels)
 
 
-def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], str]]
-             ) -> list[tuple[tuple[str, Hashable], str]]:
-    """Each of `refusals` (a launch's identity and config, and its spilling kernel's name) that `program`,
-    relowered under them, launches again: its launch's derivation did not read the refusal. Each is logged,
-    so the launch whose rule ignores its refusals is named."""
+def _launches(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
+    """Each launch `program` makes, its identity and config (`called`): every call JAX compiles, a branch's
+    no run takes among them (a forward's scaled op's)."""
     from dew.nn.kernels.lowered import kernel_calls
 
-    # Every call JAX compiles, a branch's no run takes among them (a forward's scaled op's).
-    launched = {(launch.identity, launch.config) for call in kernel_calls(program, unrun=True)
-                if (launch := called(call)) is not None}
+    return {(launch.identity, launch.config) for call in kernel_calls(program, unrun=True)
+            if (launch := called(call)) is not None}
+
+
+def refused_in(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
+    """The launches `program` makes at a config refused in this context (`refusal_entries`): a refusal
+    committed after its trace took the config (another program's compile, another thread's certification),
+    past which it is lowered afresh before it compiles (row 8603)."""
+    refused = {(identity, config) for identity, config, _ in refusal_entries()}
+    return _launches(program) & refused if refused else set()
+
+
+def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], Refused]]
+             ) -> list[tuple[tuple[str, Hashable], Refused]]:
+    """Each of `refusals` (a launch's identity and config, and its spilling kernel, `Refused`) that `program`,
+    relowered under them, launches again: its launch's derivation did not read the refusal. Each is logged,
+    so the launch whose rule ignores its refusals is named."""
+    launched = _launches(program)
     untaken = [(refusal, kernel) for refusal, kernel in refusals if refusal in launched]
-    for (_, config), kernel in untaken:
+    for (_, config), (kernel, _) in untaken:
         _log.warning("kernel %s's refusal at %s did not take: the program relowered under it launches it "
                      "again, its launch's derivation not reading it", kernel, config)
     return untaken
@@ -1631,7 +1953,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
             tried.setdefault((launch.identity, launch.config), (kernel, launch))
     asked_by = {kernel_of(name)[0]: bytes_asked for name, bytes_asked in alone.items()}
     try:
-        with _proposing([(refusal, kernel) for refusal, (kernel, _) in tried.items()]) as proposal:
+        with _proposing([(refusal, (kernel, None)) for refusal, (kernel, _) in tried.items()]) as proposal:
             replacement, spilling = _compiled_reported(relower(), options)
     except (Exhausted, jax.errors.JaxRuntimeError) as again:
         if isinstance(again, jax.errors.JaxRuntimeError) and shared_asked(again) is None:
@@ -1641,7 +1963,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         raise error from again
     _commit(proposal)
     for refusal, (kernel, launch) in tried.items():
-        _record(refusal, None, frozenset({kernel}))
+        _record(refusal, None, frozenset({(kernel, None)}))
         _missed_block(kernel, launch, asked_by.get(kernel, asked), stepped=True)
     _recorded(_misses_of(spilling), stepped=False)
     return replacement
@@ -1707,6 +2029,12 @@ class AssemblerNote:
     message: str
 
 
+def refuses(frame: int, codes: Collection[str]) -> bool:
+    """Whether a kernel the assembler built with a `frame`-byte stack frame, noting `codes`
+    (`ASSEMBLER_NOTES`' codes), is refused for its config: it spills, or its warpgroup MMAs were serialized
+    (`SERIALIZED`). Certification's verdict (`Binary.refused`) and the compile gate's alike."""
+    return bool(frame) or bool(SERIALIZED & set(codes))
+
 @dataclasses.dataclass(frozen=True)
 class Binary:
     """A Mosaic GPU or Pallas-Triton kernel's binary as its executable carries it (`binaries`): its name less
@@ -1714,11 +2042,12 @@ class Binary:
     stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), the
     dynamic shared memory its launch asks for (a Mosaic kernel proto's `smem_bytes`, a custom kernel's
     `shared_memory_bytes`), None where its proto states none, and, read `decoded`, what its machine code
-    breaks of the SASS rules (`sass_findings`), None where no disassembler read it."""
+    breaks of the SASS rules (`sass_findings_of`), None where no disassembler read it."""
     kernel: str
     launch: str | None
     registers: int
     frame: int
+    kind: str
     shared: int | None = None
     sass: tuple[str, ...] | None = ()
     caller: str | None = None
@@ -1727,6 +2056,22 @@ class Binary:
     notes: tuple["AssemblerNote", ...] = ()
     """What ptxas noted of a loss of performance as it assembled it, in its order (`ASSEMBLER_NOTES`, a
     Mosaic GPU kernel's); none where its call states none (a Pallas-Triton kernel's, a build without them)."""
+    spilled_in: tuple[str, ...] | None = ()
+    """The roles whose code its spill stands in where it spills (`spilled_roles`: `PRODUCER`, `CONSUMERS`),
+    read `decoded` or for its `spills` (`binaries`, certification's), none where it spills none; None where
+    it was not read, or no disassembler listed it (`disassembler`)."""
+    threads: int | None = None
+    """Its threads a block, as its `.nv.info` states them (`MAX_THREADS`, its PTX's `.maxntid`); None where
+    it states none."""
+    decreased: int | None = None
+    raised: int | None = None
+    """The registers its producer lowers to and its consumers raise to, as its machine code reconfigures
+    them (`reconfigured`: USETMAXREG's deallocation and allocation, its PTX's `setmaxnreg.dec` and `.inc`);
+    None where it reconfigures none that way, or no disassembler read it."""
+    uses_tmem: bool | None = None
+    """Whether its decoded SASS issues Blackwell tensor-memory ops (`_uses_tmem`); None undecoded."""
+    index: str | None = None
+    """XLA uniquification suffix (`__1`) where a second cubin shares `(kernel, launch)`; None otherwise."""
 
     @property
     def launched(self) -> str | None:
@@ -1736,12 +2081,11 @@ class Binary:
 
     @property
     def refused(self) -> bool:
-        """Whether its config is refused for it: it spills (`frame`), or the assembler serialized its
-        warpgroup MMAs (`SERIALIZED`)."""
-        return bool(self.frame) or any(note.code in SERIALIZED for note in self.notes)
+        """Whether its config is refused for it (`refuses`)."""
+        return refuses(self.frame, [note.code for note in self.notes])
 
 
-def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[Binary]:
+def binaries(executable: jax.stages.Compiled, *, decoded: bool = False, spills: bool = False) -> list[Binary]:
     """Every Mosaic GPU and Pallas-Triton kernel binary `executable` carries, read from its own serialized
     form: XLA keeps a Mosaic kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this
     compile ran ptxas for it, another thread's program compiled it first (Mosaic compiles a module once a
@@ -1751,38 +2095,55 @@ def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[
     kernel's code in it. Nothing is read from or written to the process's environment or disk: a compile
     that set Mosaic's dump settings around itself handed its directory to every other thread's compile and
     removed it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has
-    (row 2816). `decoded`, each binary's SASS findings too (`sass_findings`, the compile gate's), each
-    cubin disassembled from a file of its own."""
+    (row 2816). `decoded`, each binary's SASS findings too (`sass_findings_of`, the compile gate's), each
+    cubin disassembled from a file of its own; `spills`, each spilling binary's roles its spill stands in
+    (`Binary.spilled_in`, certification's: its ladder steps by them), its cubin disassembled alike."""
     runtime = executable.runtime_executable()
     if runtime is None:
         raise ValueError("a compiled program with no runtime executable carries no kernel binaries to read")
-    return _carried(runtime.serialize(), decoded)
+    return _carried(runtime.serialize(), decoded, spills)
 
 
-def _carried(serialized: bytes, decoded: bool = False) -> list[Binary]:
+def _carried(serialized: bytes, decoded: bool = False, spills: bool = False) -> list[Binary]:
     """`binaries`' reading of an executable as XLA serializes it (a program's, or a kernel's compiled alone,
     `compiled_alone`)."""
     found: list[Binary] = []
     for name, proto in _thunk_protos(serialized):
-        found.extend(thunk_kernels(proto, decoded=decoded))
+        found.extend(thunk_kernels(proto, decoded=decoded, spills=spills))
         # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins too: a template launch's
         # names its launch (`named`).
         kernel = custom_kernel(proto) if LAUNCH_SUFFIX.search(name) else None
         if kernel is not None:
             elf, shared = kernel
-            found.append(dataclasses.replace(_binary(name, elf, decoded), shared=shared))
+            found.append(dataclasses.replace(_binary(name, elf, decoded, spills, kind="triton"),
+                                             shared=shared))
     return found
 
 
-def launched_kernels(executable: jax.stages.Compiled) -> list[tuple[str, int]]:
-    """Every custom kernel `executable` launches, by the name its thunk gives it, with the shared bytes its
-    launch asks for (`custom_kernel`): a Pallas-Triton call's whatever its name (`binaries` keeps a
-    template launch's), and XLA's own custom kernels, read from its serialized form as `binaries`."""
+def custom_kernels(executable: jax.stages.Compiled) -> list[tuple[str, bytes, int]]:
+    """Every custom kernel `executable` launches, by the name its thunk gives it, with its cubin and the
+    shared bytes its launch asks for (`custom_kernel`): a Pallas-Triton call's whatever its name (`binaries`
+    keeps a template launch's), and XLA's own custom kernels, read from its serialized form as `binaries`."""
     runtime = executable.runtime_executable()
     if runtime is None:
         raise ValueError("a compiled program with no runtime executable launches no kernel to read")
-    return [(name, kernel[1]) for name, proto in _thunk_protos(runtime.serialize())
+    return [(name, *kernel) for name, proto in _thunk_protos(runtime.serialize())
             if (kernel := custom_kernel(proto)) is not None]
+
+
+def launched_thunks(executable: jax.stages.Compiled) -> list[str]:
+    """Every thunk `executable` launches, in order, by its kernel's name (`_thunk_protos`): XLA's own (a
+    fusion of one operation's `wrapped_<operation>`) beside the custom kernels, a run's every launch."""
+    runtime = executable.runtime_executable()
+    if runtime is None:
+        raise ValueError("a compiled program with no runtime executable launches no kernel to read")
+    return [name for name, _ in _thunk_protos(runtime.serialize())]
+
+
+def launched_kernels(executable: jax.stages.Compiled) -> list[tuple[str, int]]:
+    """Every custom kernel `executable` launches (`custom_kernels`), by its name, with the shared bytes its
+    launch asks for."""
+    return [(name, shared) for name, _, shared in custom_kernels(executable)]
 
 
 def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
@@ -1811,10 +2172,10 @@ def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
     return found
 
 
-def thunk_kernels(proto: bytes, *, decoded: bool = False) -> list[Binary]:
+def thunk_kernels(proto: bytes, *, decoded: bool = False, spills: bool = False) -> list[Binary]:
     """The kernel binaries of a thunk's serialized proto (`_kernels`), one for each Mosaic GPU call it names:
     a call whose binary is missing would read as a kernel that does not spill, so it raises."""
-    kernels, calls = _kernels(proto, decoded)
+    kernels, calls = _kernels(proto, decoded, spills)
     if len(kernels) != calls:
         raise ValueError(f"a thunk names {calls} Mosaic GPU calls but carries {len(kernels)} kernel binaries")
     return kernels
@@ -1852,7 +2213,7 @@ def proto_fields(message: bytes) -> dict[int, list]:
     return fields
 
 
-def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
+def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
     version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, whose
     `SHARED_BYTES` its launch's dynamic shared memory, whose `CALLER_METADATA` the launch its call carried
@@ -1872,7 +2233,8 @@ def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
         stated_caller = caller[0].decode() if len(caller) == 1 and isinstance(caller[0], bytes) else None
         notes = tuple(AssemblerNote(*(part[0].decode() for part in (note.get(1, [b""]), note.get(2, [b""]))))
                       for note in map(proto_fields, fields.get(ASSEMBLER_NOTES, [])))
-        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded), shared=stated,
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills, kind="mosaic_gpu"),
+                                    shared=stated,
                                     caller=stated_caller, notes=notes)], 0
     found, calls = [], 0
     for values in fields.values():
@@ -1880,16 +2242,19 @@ def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
             if value == MOSAIC_TARGET:
                 calls += 1
             elif isinstance(value, bytes):
-                kernels, named = _kernels(value, decoded)
+                kernels, named = _kernels(value, decoded, spills)
                 found += kernels
                 calls += named
     return found, calls
 
 
-def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
-    """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers and
-    frame (`REGISTER_COUNT`, `FRAME_SIZE`; a Mosaic module compiles one kernel function), and `decoded` its
-    SASS findings (`sass_findings`)."""
+def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False, *,
+            kind: str = "mosaic_gpu") -> Binary:
+    """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers,
+    frame and threads (`REGISTER_COUNT`, `FRAME_SIZE`, `MAX_THREADS`; a Mosaic module compiles one kernel
+    function), `decoded` its SASS findings (`sass_findings_of`), and its register reconfiguration
+    (`reconfigured`) and, where it spills, the roles its spill stands in (`spilled_roles`) wherever its one
+    listing is read (`sass_listing`: `decoded`, or `spills` where it spills)."""
     (sections_at,) = struct.unpack_from("<Q", elf, 0x28)
     entry, count, names = struct.unpack_from("<HHH", elf, 0x3A)
     headers = [struct.unpack_from("<IIQQQQIIQQ", elf, sections_at + index * entry) for index in range(count)]
@@ -1908,17 +2273,28 @@ def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
                 if attribute in (REGISTER_COUNT, FRAME_SIZE):
                     (value,) = struct.unpack_from("<I", elf, at + 8)
                     stated[attribute] = max(stated.get(attribute, 0), value)
+                elif attribute == MAX_THREADS:
+                    # A function's own section's: its block's three extents, no symbol before them.
+                    stated[attribute] = math.prod(struct.unpack_from("<III", elf, at + 4))
                 at += 4 + length
             else:
                 at += 4
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
-    return Binary(*kernel_of(function), stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0),
-                  sass=sass_findings(elf) if decoded else ())
+    frame = stated.get(FRAME_SIZE, 0)
+    listing = sass_listing(elf) if decoded or (spills and frame) else None
+    decreased, raised = (None, None) if listing is None else reconfigured(listing)
+    sass = (None if listing is None else sass_findings_of(listing)) if decoded else ()
+    uses_tmem = None if listing is None else _uses_tmem(listing)
+    kernel, launch, index = kernel_of(function)
+    return Binary(kernel, launch, stated[REGISTER_COUNT], frame, kind=kind, sass=sass,
+                  spilled_in=(None if listing is None else spilled_roles(listing)) if frame else (),
+                  threads=stated.get(MAX_THREADS), decreased=decreased, raised=raised,
+                  uses_tmem=uses_tmem, index=index)
 
 
 def disassembler() -> Path | None:
-    """NVIDIA's nvdisasm, which the SASS rules read a kernel's machine code through (`sass_findings`): the
+    """NVIDIA's nvdisasm, which the SASS rules read a kernel's machine code through (`sass_listing`): the
     nvdisasm wheel's (`nvidia/cu13/bin`), which the `ci` extra installs in every lock the suite runs on, or
     the PATH's; None where neither is installed, a user's install among them."""
     spec = importlib.util.find_spec("nvidia")
@@ -1929,9 +2305,9 @@ def disassembler() -> Path | None:
     return None if found is None else Path(found)
 
 
-def sass_findings(elf: bytes) -> tuple[str, ...] | None:
-    """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, nvdisasm's
-    listing of it); None where no disassembler is installed (`disassembler`), the rules unread."""
+def sass_listing(elf: bytes) -> str | None:
+    """nvdisasm's listing of the machine code of the cubin `elf`; None where no disassembler is installed
+    (`disassembler`)."""
     tool = disassembler()
     if tool is None:
         return None
@@ -1939,7 +2315,48 @@ def sass_findings(elf: bytes) -> tuple[str, ...] | None:
         cubin.write(elf)
         cubin.flush()
         listing = subprocess.run([str(tool), "-c", cubin.name], capture_output=True, text=True, check=True)
-    return sass_findings_of(listing.stdout)
+    return listing.stdout
+
+
+PRODUCER, CONSUMERS = "producer", "consumers"
+"""A warpgroup-specialized kernel's roles, as its SASS places them (`spilled_roles`)."""
+
+
+def spilled_roles(listing: str) -> tuple[str, ...]:
+    """The roles whose code a kernel's spill stands in, from nvdisasm's `listing`: each local-memory store
+    and load (STL, LDL) the role of the last setmaxnreg before it, ptxas laying each role's branch out after
+    its own, the producer's drop (`USETMAXREG.DEALLOC`) or the consumers' raise (`USETMAXREG.TRY_ALLOC`); one
+    before either, a prologue's, neither role's (row 6744: a B200's decayed keys spilled after its producer's
+    drop to the least, an H100's output walk between the consumers' raise and the producer's drop)."""
+    roles, role = set(), None
+    for line in listing.splitlines():
+        if not (found := _INSTRUCTION.search(line)):
+            continue
+        opcode = _parsed(found.group(2))[0]
+        if opcode.startswith("USETMAXREG"):
+            role = PRODUCER if ".DEALLOC" in opcode else CONSUMERS
+        elif role is not None and opcode.split(".")[0] in ("STL", "LDL"):
+            roles.add(role)
+    return tuple(sorted(roles))
+
+
+_RECONFIGURED = re.compile(r"\bUSETMAXREG\.(DEALLOC|ALLOC|TRY_ALLOC)\S*\s+(?:UP\d+,\s*)?(0x[0-9a-f]+|\d+)")
+
+
+def _uses_tmem(listing: str) -> bool:
+    """Whether nvdisasm's `listing` issues Blackwell tensor-memory ops (`LDTM`, `STTM`, `UTC*`)."""
+    return any(_parsed(found.group(2))[0].split(".")[0].startswith(("LDTM", "STTM", "UTC"))
+               for line in listing.splitlines() if (found := _INSTRUCTION.search(line)))
+
+
+def reconfigured(listing: str) -> tuple[int | None, int | None]:
+    """The registers a kernel's machine code (nvdisasm's `listing`) lowers its producer to and raises its
+    consumers to: its first USETMAXREG deallocation's and allocation's (a try's too) counts, as its PTX's
+    `setmaxnreg.dec` and `.inc` state them; None for one it makes none of."""
+    found: dict[str, int] = {}
+    for kind, count in _RECONFIGURED.findall(listing):
+        found.setdefault("dec" if kind == "DEALLOC" else "inc", int(count, 0))
+    return found.get("dec"), found.get("inc")
 
 
 _INSTRUCTION = re.compile(r"/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;")

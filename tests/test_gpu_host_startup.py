@@ -10,50 +10,22 @@ from pathlib import Path
 
 import jax
 import pytest
+from cache_keys import unread
 
 pytestmark = pytest.mark.gpu(reason="the host step's accelerator runs on the GPU it was prepared for")
 
 COMMON = """
-import logging
-import re
-
 import jax.numpy as jnp
 import numpy as np
+from cache_keys import keyed
 
 from test_host_training import HOST, streaming_decoder
 
 TOKENS = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
-
-
-class Keyed(logging.Handler):
-    \"\"\"Each program JAX keys its persistent cache by, as it logs them: its module's name, whether the cache
-    held it, and the hash of each part of its key (the computation, the backend's version, the compile
-    options, the accelerator's config, ...), gathered by the thread that keyed it. Its records are taken one
-    at a time under the handler's own lock (`logging.Handler.handle`), which `emit` runs within.\"\"\"
-
-    PART = re.compile(r"get_cache_key hash of serialized (.+): ([0-9a-f]+)$")
-    READ = re.compile(r"(Persistent compilation cache hit|PERSISTENT COMPILATION CACHE MISS) for '(.+)' "
-                      r"with key")
-
-    def __init__(self):
-        super().__init__(logging.DEBUG)
-        self.programs, self.parts = [], {}
-
-    def emit(self, record):
-        message, thread = record.getMessage(), record.thread
-        if part := self.PART.match(message):
-            self.parts.setdefault(thread, {})[part[1]] = part[2]
-        elif read := self.READ.match(message):
-            self.programs.append([read[2], read[1].startswith("Persistent"), self.parts.pop(thread, {})])
-
-
-KEYED = Keyed()
-for name in ("jax._src.cache_key", "jax._src.compiler"):
-    logging.getLogger(name).setLevel(logging.DEBUG)
-    logging.getLogger(name).addHandler(KEYED)
+KEYED = keyed()
 """
 """What both processes build: the bf16 decoder whose layers bank on the host, its one-row batch, and the
-record of each program's persistent-cache key (`Keyed`)."""
+record of each program's persistent-cache key (`cache_keys.keyed`)."""
 
 PREPARE = COMMON + """
 import json
@@ -76,15 +48,18 @@ import jax
 from dew.distributed.batches import batch_shardings
 from dew.telemetry.compiles import executable_only
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+from dew.training.ahead import step_batch
 
 count_compilation_cache()
 trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
 state, _, _ = trainer.place()
-batch = {"text": jnp.asarray(TOKENS)}
+# The batch as `fit` hands its step one (`step_batch`), as the prepare compiled for it (rows 8372, 8446: the
+# raw batch made the start, the begun step and its end other programs than the prepared ones).
+batch = step_batch(trainer, {"text": jnp.asarray(TOKENS)})
 batch = jax.device_put(batch, batch_shardings(trainer.device_mesh, batch))
-before, keyed = compilation_cache_counts(), len(KEYED.programs)
+before, at = compilation_cache_counts(), len(KEYED.programs)
 step = trainer.compile(state, batch)
-after, keys = compilation_cache_counts(), KEYED.programs[keyed:]
+after, keys = compilation_cache_counts(), KEYED.programs[at:]
 for _ in range(3):
     with executable_only():
         state, *_ = step(state, batch)
@@ -120,25 +95,18 @@ def test_a_host_step_prepared_without_a_gpu_starts_here_reading_every_program_fr
     for name, text in (("prepare.py", PREPARE), ("run.py", RUN)):
         (tmp_path / name).write_text(text)
     generation = BuildTarget.of(jax.devices()[:1]).generation
+    # Each side's programs dumped (`JAX_DUMP_IR_TO`), which a miss names how they differ by.
     prepared = reported(tmp_path / "prepare.py", [generation, str(topology)],
                         {**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu",
-                         "XLA_FLAGS": companion})
+                         "XLA_FLAGS": companion, "JAX_DUMP_IR_TO": str(tmp_path / "prepared")})
     ran = reported(tmp_path / "run.py", [],
-                   {**environment, "JAX_PLATFORMS": "cuda,cpu", "XLA_FLAGS": companion})
+                   {**environment, "JAX_PLATFORMS": "cuda,cpu", "XLA_FLAGS": companion,
+                    "JAX_DUMP_IR_TO": str(tmp_path / "ran")})
     assert set(prepared["startup"]["by_backend"]) == {"cpu", "gpu"}, prepared["startup"]
-    assert ran["counts"]["train/cache_misses"] == 0 and ran["counts"]["train/cache_hits"] > 0, (
-        ran["counts"], unread(ran["keys"], prepared["keys"]))
+    # Text whole: pytest cuts a dict's repr in an assertion's message at a few entries.
+    missed = unread(ran["keys"], tmp_path / "ran", prepared["keys"], tmp_path / "prepared")
+    assert ran["counts"]["train/cache_misses"] == 0 and ran["counts"]["train/cache_hits"] > 0, json.dumps(
+        {"counts": ran["counts"], "missed": missed}, indent=1, default=str)
     started, built = ran["startup"], prepared["startup"]
     assert started["programs"] == built["programs"], (started, built)
 
-
-def unread(ran: list, prepared: list) -> dict[str, list[str]]:
-    """Each program the run's startup missed the cache for, by its module's name, with the parts of its
-    key no program of that name the build prepared shares (all of them where the build prepared none of
-    that name): what keyed the run's compile apart from the build's."""
-    built: dict[str, list[dict[str, str]]] = {}
-    for module, _, parts in prepared:
-        built.setdefault(module, []).append(parts)
-    return {module: sorted(part for part, value in parts.items()
-                           if all(other.get(part) != value for other in built.get(module, [])))
-            for module, held, parts in ran if not held}

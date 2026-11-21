@@ -46,6 +46,7 @@ import tarfile
 import tempfile
 import types
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,10 @@ import numpy as np
 
 # Importing Dew sets its numerical policy before the JAX backend opens, as in a test.
 from dew.diffusion.presets import EDM
+
+COHORTS = ["flaxdiff-source", "diffusers-0.34"]
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "flaxdiff_pipeline" / "reference.npz"
@@ -196,8 +201,9 @@ def flaxdiff_samples(weights, clip: Path, vae: Path, unit, noise, *, towers: str
     model = SimpleUDiT(**{key: value for key, value in MODEL.items()
                           if key not in ("activation", "dtype", "precision")}, dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained(clip)
-    encoder = CLIPTextEncoder(model=TorchCLIP(clip, "float64" if wide else towers), tokenizer=tokenizer,
-                              modelname=str(clip), backend="jax")
+    # TorchCLIP stands in for the Flax CLIP model the encoder's signature names, called the same way.
+    encoder = CLIPTextEncoder(**dict[str, Any](model=TorchCLIP(clip, "float64" if wide else towers)),
+                              tokenizer=tokenizer, modelname=str(clip), backend="jax")
     input_config = DiffusionInputConfig(sample_data_key="image", sample_data_shape=(IMAGE, IMAGE, 3),
                                         conditions=[condition(encoder)])
     autoencoder = StableDiffusionVAE(modelname=str(vae), dtype=jnp.float64 if wide else getattr(jnp, towers))
@@ -231,7 +237,7 @@ def imported() -> None:
     # never uses it; that module imports FlaxCLIPTextModel, which
     # transformers 5 dropped, so an empty module stands in for it.
     pipeline = types.ModuleType("diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion")
-    pipeline.FlaxStableDiffusionPipeline = None
+    vars(pipeline)["FlaxStableDiffusionPipeline"] = None
     sys.modules.setdefault(pipeline.__name__, pipeline)
 
 
@@ -320,8 +326,9 @@ def main() -> None:
             jnp.asarray(0.05 * rng.standard_normal(leaf.shape), jnp.bfloat16), np.float32), shapes["params"])
 
         tokenizer = AutoTokenizer.from_pretrained(clip)
-        encoder = CLIPTextEncoder(model=TorchCLIP(clip, "float32"), tokenizer=tokenizer, modelname=str(clip),
-                                  backend="jax")
+        # TorchCLIP stands in for the Flax CLIP model the encoder's signature names, called the same way.
+        encoder = CLIPTextEncoder(**dict[str, Any](model=TorchCLIP(clip, "float32")), tokenizer=tokenizer,
+                                  modelname=str(clip), backend="jax")
         serialized = DiffusionInputConfig(sample_data_key="image", sample_data_shape=(IMAGE, IMAGE, 3),
                                           conditions=[condition(encoder)]).serialize()
         step = root / "1"

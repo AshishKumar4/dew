@@ -145,8 +145,8 @@ class _File:
                 return ast.dump(node.test)
             return None
         called = self.resolved(node.func) if isinstance(node, ast.Call) else ""
-        own = isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in self.defined
-        if not called and own:
+        if not called and isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and \
+                node.func.id in self.defined:
             called = f"{self.name}.{node.func.id}"
         return "" if any(called == path or called.endswith("." + path) for path in WIDE) else None
 
@@ -189,7 +189,7 @@ class _File:
         if self.resolved(function) == "copy.deepcopy":
             return bool(node.args) and self.module(node.args[0], held)
         method = function.attr if isinstance(function, ast.Attribute) else None
-        if method in PRESERVING and self.module(function.value, held):
+        if method in PRESERVING and isinstance(function, ast.Attribute) and self.module(function.value, held):
             return True
         built = ((isinstance(function, ast.Name) and (function.id in self.classes or any(
                      id(definition) in self.factories for definition in self.called(node))))
@@ -251,7 +251,7 @@ def _at_float64(file: _File, call: ast.Call) -> bool:
 def _executed(node: ast.AST | Sequence[ast.AST]) -> Iterator[ast.AST]:
     """Every node that runs where `node` does: a function, lambda or class defined there is its own
     statement, its body running later, elsewhere."""
-    for each in node if isinstance(node, list) else [node]:
+    for each in node if isinstance(node, Sequence) else [node]:
         yield each
         if not isinstance(each, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
             yield from _executed(list(ast.iter_child_nodes(each)))
@@ -352,7 +352,7 @@ def _modules(file: _File, body: Sequence[ast.stmt], around: Mapping[str, ast.AST
         for key, value in pairs:
             held = {kept: origin for kept, origin in held.items()
                     if kept != key and not kept.startswith(key + ".")}
-            if file.module(value, now):
+            if file.module(value, now) and value is not None:
                 held[key] = _origin(value, now)
     return held
 
@@ -400,8 +400,8 @@ def _origin(node: ast.AST, held: Mapping[str, ast.AST]) -> ast.AST:
         elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
               and node.func.attr in PRESERVING):
             node = node.func.value
-        elif isinstance(node, ast.expr) and _key(node) in held:
-            return held[_key(node)]
+        elif isinstance(node, ast.expr) and (key := _key(node)) is not None and key in held:
+            return held[key]
         else:
             return node
 

@@ -61,11 +61,11 @@ def markers(encoded: Encoded) -> list[int]:
 
 FIXTURE = TINY / "seeds.npz"
 LAYA_SEEDS = 64
+"""The declared seeds, sized by `seeds_for` paired as the recording confirmed them
+(tools/venv_reference.py's `laya` site, tools/laya_worker.py)."""
 SLIP_SEEDS = 16
 """The seeds the rule's negative proof draws: a slip needs only the seeds that decide it, and fewer than that
 raise Inconclusive, which the proof refuses; 8 decide it on armada (row 6429), 16 hold it with room."""
-"""The declared seeds, sized by `seeds_for` paired as the recording confirmed them
-(tools/venv_reference.py's `laya` site, tools/laya_worker.py)."""
 OUTPUTS = ("sequential", "parallel")
 """The leaves `dew` gives: every question's option logits of every case in key order, by layout."""
 

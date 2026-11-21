@@ -483,6 +483,22 @@ def test_an_mxfp8_operand_of_zero_blocks_and_least_scales_quantizes_to_its_value
     np.testing.assert_array_equal(np.asarray(out), expected)
 
 
+def test_an_mxfp8_operand_decodes_in_a_narrow_dtype_at_its_own_range():
+    """MXFP8's decode (`formats.MxFp8.decoded`) in float16 of a block whose scale is 2^16 (its largest value
+    2^24): float16 values, each the float16 of its value, 2^16 and 2^24 past float16's largest infinite and
+    1024 and 1536 exact, where the decode scaled in float32 (`precision.power2`) handed back float32 (the
+    review of b676f0a14, F3)."""
+    from dew.nn.kernels.formats import MxFp8
+
+    x = np.zeros((1, 32), np.float32)
+    x[0, :4] = (2.0 ** 24, 2.0 ** 16, 1024.0, 1536.0)
+    out = jax.jit(lambda x: MxFp8.quantized(x).decoded(jnp.float16))(x)
+    assert out.dtype == jnp.float16
+    expected = np.zeros((1, 32), np.float16)
+    expected[0, :4] = (np.inf, np.inf, 1024.0, 1536.0)
+    np.testing.assert_array_equal(np.asarray(out), expected)
+
+
 def test_a_recipe_projection_on_a_data_parallel_mesh_lowers_for_cuda():
     """Row 6719: under the 'fp8' numerics, a feed-forward's projection and its gradients on two compile-only
     H100s whose automatic data axis splits the rows (a data-parallel run's mesh, `MeshSpec().build`), the

@@ -95,10 +95,15 @@ import numpy as np
 import pytest
 from lane_environment import outside_suite
 from flax import linen as nn
-from float64_terms import float64_forward
-from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
+from interop_support import (
+    assert_restores,
+    assert_same_stored_tensors,
+    clearing_selections,
+    reference_read,
+    token_draw,
+    written_tensors,
+)
 from model_support import cached_round_trips, encoded_form, flat_tree, prediction_logits, streamed_export
-from one_draw import assert_as_exact_as_the_reference
 from process_support import raised
 from reference_error import (
     FACTOR,
@@ -147,6 +152,30 @@ GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next"
 # gradients and the cases reading GLM-5 Next's round trip 41-55 s.
 
 
+EXPORT_SEEDS = {"mixtral": 8, "qwen3_moe": 8, "glm4_moe": 8, "glm_moe_dsa": 32, "deepseek_v2": 8,
+                "deepseek_v3": 8, "deepseek_v32": 8, "deepseek_v4": 32, "kimi_k2": 8, "kimi_k25": 8,
+                "llama4_text": 8, "olmo3": 8, "opt": 8, "gpt_neox": 8, "mamba2": 8, "glm5_next": 16}
+"""Each family's check-1 seeds over its trained export's logits (`export_logits_site`), the fewest whose
+verdict resolves, paired with Dew's arm (`reference_error.seeds_for`, armada's CPU, 2026-11-20)."""
+
+
+def export_logits_site(trip, label: str):
+    """Check 1's site of a trained export's logits (row 1305: it held one draw, the fixture's own ids): Dew's
+    forward over the trained weights, and transformers' over the exported files (`interop_support
+    .reference_read`), on ids drawn in the fixture's own range (`token_draw`: 23 to 246, clear of every
+    family's special and media placeholder ids, whose rules the two implementations read apart), redrawn
+    where a selection would break apart between the runs (`clearing_selections`: a mixture's routing, a
+    lightning indexer's top-k); the truth transformers in float64 over the same files. Its arms, draw and
+    truth, as `assert_as_exact` and `seeds_for` take them."""
+    forward = jax.jit(trip.source.model.apply)
+    ids = np.asarray(trip.ids)
+    drawn = token_draw(0xDE0, int(ids.max()) + 1, ids.shape, low=int(ids.min()))
+    return (as_given(lambda tokens: np.asarray(forward(trip.trained, tokens), np.float64)),
+            reference_read(trip.case, trip.export, wide=False),
+            clearing_selections(trip.reloaded, drawn, label),
+            reference_read(trip.case, trip.export, wide=True))
+
+
 @pytest.fixture(scope="module")
 def workspace(tmp_path_factory):
     return tmp_path_factory.mktemp("decoder-export")
@@ -178,6 +207,7 @@ def indexed(request, trips):
     return found, bindings
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 def test_every_source_tensor_is_bound_or_retained_and_written_back(trip):
     """No tensor of the checkpoint disappears on the way out: each one is
     either bound to a leaf or retained by name, and the export holds the
@@ -198,6 +228,7 @@ def test_every_source_tensor_is_bound_or_retained_and_written_back(trip):
             assert trip.exported_tensors[name].dtype == tensor.dtype, name
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
     """One SGD step moves every tensor kind the checkpoint holds, and it is
     the moved values the source layout writes back. Every decoder holds an
@@ -213,12 +244,14 @@ def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
         assert moved > MOVEMENT, f"{kind} moved {moved:.3e}"
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip):
     """`Pretrained.load` reads the export back into the same model with the
     trained values bit for bit, so it computes the same logits."""
     assert_restores(trip.source.model, trip.trained, trip.reloaded, trip.ids)
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 def test_transformers_reads_the_trained_export(trip, tmp_path):
     """The export is a checkpoint the reference implementation loads with a
     clean report (`tool.reference_model`), and Dew's trained logits are as
@@ -237,8 +270,8 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
     assert actual == expected
     label = f"{trip.case.name} logits"
     if not trip.case.orders:
-        _, terms = float64_forward(trip.source.model, trip.trained, np.asarray(trip.ids, np.int32))
-        assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, label, terms=terms)
+        ours, theirs, draw, truth = export_logits_site(trip, label)
+        assert_as_exact(ours, theirs, draw, label, seeds=EXPORT_SEEDS[trip.case.name], truth_fn=truth)
         return
     forward = jax.jit(trip.source.model.apply)  # one compile for every order
     mine, theirs = [], [distance(trip.theirs, trip.truth)]
@@ -280,6 +313,7 @@ def test_a_bfloat16_source_exports_its_trained_float32_masters(tmp_path):
     assert_restores(source.model, trained, reloaded, ids)
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 def test_a_rotated_expert_index_writes_a_model_that_disagrees(indexed, tmp_path):
     """`expert_index` decides which slice of a stacked leaf a per-expert
     tensor holds. Rotating every index writes the same tensor table with
@@ -306,6 +340,7 @@ def test_a_rotated_expert_index_writes_a_model_that_disagrees(indexed, tmp_path)
     assert difference > LOGITS * scale, f"rotating {len(bindings)} experts moved the logits {difference:.3e}"
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 def test_an_expert_index_past_the_stack_is_refused(indexed):
     """A binding that asks for an expert the leaf does not hold names the
     tensor and the shape it found rather than writing a reshaped slice."""
@@ -318,6 +353,7 @@ def test_an_expert_index_past_the_stack_is_refused(indexed):
         beyond.export(trip.trained)
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", COPIED_MTP, ids=COPIED_MTP)
 def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
     """GLM's prediction depth ships copies of the trunk's embedding and
@@ -335,10 +371,13 @@ def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
         assert moved > MOVEMENT, f"{copy} still holds the checkpoint's values"
 
 
-def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
+@pytest.mark.parametrize("name", ["glm5_next"])
+def test_glm5_next_trained_prediction_depth_reads_its_export(name, trips):
     """The trained depth's logits, compiled (op by op they took 44 s of the test, ledger 3842), read
-    as the reference's composition reads the export."""
-    trip = trips('glm5_next')
+    as the reference's composition reads the export; keyed by its family, with the other tests reading its
+    round trip (`shared_setup`)."""
+    trip = trips(name)
     model = trip.source.model
     states, _ = jax.eval_shape(functools.partial(model.apply, method=model.states_and_logits), trip.trained,
                                trip.ids)
@@ -352,6 +391,7 @@ def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
     assert np.any(trip.exported_tensors[projection] != trip.source_tensors[projection])
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", GRADIENTS, ids=GRADIENTS)
 def test_the_gradients_match_the_reference_implementation(name, trips):
     """Compare all trunk next-token CE gradients by source tensor name.
@@ -384,6 +424,7 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
         f"dew's largest deviation is on {worst}")
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", BALANCED, ids=BALANCED)
 def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trips):
     """The routers' balancing bias is state the step moves, not a
@@ -405,12 +446,14 @@ def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trip
             f"{bias} moved by {sorted(set(moved.tolist()))}, not by whole rate steps")
 
 
-def test_deepseek_v4_trained_mtp_export_matches_reference(trips):
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
+@pytest.mark.parametrize("name", ["deepseek_v4"])
+def test_deepseek_v4_trained_mtp_export_matches_reference(name, trips):
     import torch
 
     from tools.deepseek_v4_reference import load_mtp_reference
 
-    trip = trips('deepseek_v4')
+    trip = trips(name)
     model = trip.source.model
     # Compiled: op by op the reads took most of the test's Dew side (ledger 3842).
     actual = jax.jit(functools.partial(prediction_logits, model))(trip.trained, trip.ids)
@@ -1330,20 +1373,35 @@ def glm5_exported(variant: str, directory: Path):
     return model, variables, ids, Pretrained.load(directory, dtype="float32", attention_impl="reference")
 
 
+@pytest.fixture(scope="module")
+def glm5_exports(workspace):
+    """Each GLM-5 variant written standalone once (`glm5_exported`) and its directory, shared by the tests
+    reading it, which a group keyed by the variant holds together (`shared_setup`)."""
+    made = {}
+
+    def exported(variant: str):
+        if variant not in made:
+            directory = workspace / f"glm5-{variant}"
+            made[variant] = (*glm5_exported(variant, directory), directory)
+        return made[variant]
+    return exported
+
+
+@pytest.mark.shared_setup("glm5_standalone", by=r"[a-z_]+")
 @pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
-def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
+def test_standalone_glm5_export_preserves_native_and_source_computation(variant, glm5_exports):
     """A GLM-5 decoder written standalone reloads to its own logits and leaves, and transformers reads
-    the export to them; its prediction depths' logits and drafts are the next test's, apart so each fits
-    its group (ledger 4287)."""
+    the export to them; its prediction depths' logits and drafts are the next tests', apart so each fits
+    its group (ledger 4287), the variant's export written once for the three (`glm5_exports`)."""
     import jax.numpy as jnp
 
-    model, variables, ids, restored = glm5_exported(variant, tmp_path)
+    model, variables, ids, restored, directory = glm5_exports(variant)
     expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
     actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)
-    np.testing.assert_allclose(tool.reference_logits(CASES["glm5_next"], tmp_path, ids),
+    np.testing.assert_allclose(tool.reference_logits(CASES["glm5_next"], directory, ids),
                                expected, atol=LOGITS, rtol=0)
-    written = json.loads((tmp_path / "config.json").read_text())
+    written = json.loads((directory / "config.json").read_text())
     assert written["index_share_for_mtp_iteration"] == model.index_share_for_mtp_iteration
     for collection in ("params", "moe"):
         if collection in variables:
@@ -1352,33 +1410,35 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
                 np.testing.assert_array_equal(actual_leaves[name], value)
 
 
+@pytest.mark.shared_setup("glm5_standalone", by=r"[a-z_]+")
 @pytest.mark.parametrize("variant", ["released", "native_geometry"])
-def test_a_standalone_glm5_exports_prediction_depths_whose_logits_are_its_own(variant, tmp_path):
+def test_a_standalone_glm5_exports_prediction_depths_whose_logits_are_its_own(variant, glm5_exports):
     """A GLM-5 decoder with prediction depths (the dense variant has none), written standalone: its
     reloaded depths' logits are its own and transformers' over the export; that the reload drafts as the
     original decodes is the test beside it, where the two in one took 159 s (train 1003, row 7452)."""
     import jax.numpy as jnp
 
-    model, variables, ids, restored = glm5_exported(variant, tmp_path)
+    model, variables, ids, restored, directory = glm5_exports(variant)
     assert model.num_nextn_predict_layers and restored.model.num_nextn_predict_layers
     # Each forward compiled once, as a user runs it, not op by op.
     prediction = jax.jit(functools.partial(prediction_logits, model))(variables, jnp.asarray(ids))
     reloaded_prediction = jax.jit(functools.partial(prediction_logits, restored.model))(
         restored.variables, jnp.asarray(ids))
     np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
-    np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
+    np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], directory, ids),
                                prediction, atol=LOGITS, rtol=0)
 
 
+@pytest.mark.shared_setup("glm5_standalone", by=r"[a-z_]+")
 @pytest.mark.parametrize("variant", ["released", "native_geometry"])
-def test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did(variant, tmp_path):
+def test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did(variant, glm5_exports):
     """A GLM-5 decoder with prediction depths, written standalone: the reload drafts speculatively the
     greedy tokens the original decodes."""
     import jax.numpy as jnp
 
     from dew.sampling import Sampling, Speculative, generate
 
-    model, variables, ids, restored = glm5_exported(variant, tmp_path)
+    model, variables, ids, restored, _ = glm5_exports(variant)
     assert model.num_nextn_predict_layers and restored.model.num_nextn_predict_layers
     ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
                         sampling=Sampling(temperature=0)).host()

@@ -27,6 +27,7 @@ def main() -> None:
     args = parser.parse_args()
 
     from dew.data.images import DecodeImage
+    from dew.data.pipeline import Rejected
     from dew.data.sources.records import ArrayRecords
 
     # Dew's ArrayRecord reader over the shards in the order given, each record decoded as Dew decodes a
@@ -35,7 +36,13 @@ def main() -> None:
     try:
         if len(records) < args.images:
             raise ValueError(f"the shards hold {len(records)} records, {args.images} are needed")
-        images = [decode.map(records[index])["image"] for index in range(args.images)]
+        images = []
+        for index in range(args.images):
+            if (record := records[index]) is None:
+                raise ValueError(f"record {index} of the shards is empty")
+            if isinstance(decoded := decode.map(record), Rejected):
+                raise ValueError(f"record {index} of the shards is no image: {decoded.reason}")
+            images.append(decoded["image"])
     finally:
         records.close()
     generator = np.random.default_rng(args.seed)

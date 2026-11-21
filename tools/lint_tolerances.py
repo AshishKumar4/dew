@@ -16,7 +16,7 @@ import inspect
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Protocol, TypeGuard
 
 import lint_scopes as scopes
 
@@ -42,7 +42,8 @@ TOLERANT: dict[str, tuple[str, ...] | None] = {
 they are imported: each with the names of its tolerances, whose places and defaults the API itself states
 (`_declared`), where a call can name them all zero and compare exactly (`_exact`), or None where it cannot.
 `assert_array_equal` and `==` compare exactly, and stay."""
-UNSIGNED = {name: {"rtol": (2, 1e-5), "atol": (3, 1e-8)} for name in ("torch.allclose", "torch.isclose")}
+UNSIGNED: dict[str, dict[str, tuple[int | None, object]]] = {
+    name: {"rtol": (2, 1e-5), "atol": (3, 1e-8)} for name in ("torch.allclose", "torch.isclose")}
 """The tolerances' places and defaults of torch's builtins, which carry no signature `inspect` reads, as
 torch's documentation states them: `allclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False)`."""
 
@@ -135,14 +136,15 @@ def _targets(target: ast.AST, value: ast.AST) -> list[tuple[ast.AST, ast.AST]]:
     call, else the whole target with the whole value."""
     flat = isinstance(target, ast.Tuple | ast.List) and not any(isinstance(element, ast.Starred)
                                                                 for element in target.elts)
-    if flat and isinstance(value, ast.Tuple | ast.List) and len(target.elts) == len(value.elts) and not any(
-            isinstance(element, ast.Starred) for element in value.elts):
-        parts = zip(target.elts, value.elts, strict=True)
+    elements = target.elts if flat and isinstance(target, ast.Tuple | ast.List) else None
+    if elements is not None and isinstance(value, ast.Tuple | ast.List) and len(elements) == len(
+            value.elts) and not any(isinstance(element, ast.Starred) for element in value.elts):
+        parts = zip(elements, value.elts, strict=True)
         return [pair for inner, part in parts for pair in _targets(inner, part)]
-    if flat and isinstance(value, ast.Call):
+    if elements is not None and isinstance(value, ast.Call):
         places = [ast.Subscript(value=value, slice=ast.Constant(index), ctx=ast.Load())
-                  for index in range(len(target.elts))]
-        pairs = zip(target.elts, places, strict=True)
+                  for index in range(len(elements))]
+        pairs = zip(elements, places, strict=True)
         return [pair for inner, place in pairs for pair in _targets(inner, place)]
     return [(target, value)]
 
@@ -189,9 +191,10 @@ def _known(value: ast.Subscript, scope: _Scope) -> list[ast.AST] | None:
     if written:
         return list(written)
     bound = [found for names, found in scope.bindings if container.id in names]
-    if not bound or not all(isinstance(found, ast.Dict) and None not in found.keys for found in bound):
+    literals = [found for found in bound if isinstance(found, ast.Dict) and None not in found.keys]
+    if not bound or len(literals) != len(bound):
         return None
-    return [found for literal in bound for field_, found in zip(literal.keys, literal.values, strict=True)
+    return [found for literal in literals for field_, found in zip(literal.keys, literal.values, strict=True)
             if isinstance(field_, ast.Constant) and field_.value == key.value]
 
 
@@ -221,7 +224,8 @@ def _parts(value: ast.AST, scope: _Scope, reading: _Reading | None = None) -> It
             continue
         if isinstance(node, ast.Attribute) and node.attr in SHAPES:
             continue
-        if isinstance(node, ast.Subscript) and (known := _known(node, scope)) is not None:
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and isinstance(
+                node.slice, ast.Constant) and (known := _known(node, scope)) is not None:
             key = (node.value.id, node.slice.value)
             if key not in expanded:
                 expanded.add(key)
@@ -353,7 +357,8 @@ def _erring(value: ast.AST, scope: _Scope, reading: _Reading) -> bool:
         if isinstance(inner, ast.Name) and inner.id in scope.errors:
             return True
         if (places := _placed(inner, scope, reading)) is not None:
-            if inner.slice.value in places:
+            if isinstance(inner, ast.Subscript) and isinstance(inner.slice, ast.Constant) and \
+                    inner.slice.value in places:
                 return True
             continue
         if _measured(inner, scope, reading)[1]:
@@ -425,9 +430,8 @@ def _read_scope(scope_node: ast.AST, reading: _Reading) -> _Scope:
                 pairs = [(target, ast.BinOp(target, node.op, node.value))] if isinstance(
                     node, ast.AugAssign) else _targets(target, node.value)
                 for written, found in pairs:
-                    keyed = isinstance(written, ast.Subscript) and isinstance(written.value, ast.Name) and \
-                        isinstance(written.slice, ast.Constant)
-                    if keyed:
+                    if isinstance(written, ast.Subscript) and isinstance(written.value, ast.Name) and \
+                            isinstance(written.slice, ast.Constant):
                         fields.setdefault((written.value.id, written.slice.value), []).append(found)
                     else:
                         bindings.append((_bound_names(written), found))
@@ -550,7 +554,8 @@ def _written(bound: ast.AST, scope: _Scope) -> ast.AST | None:
 
 def _number(bound: ast.AST | None) -> float | None:
     """A written-out bound's value (`1 / 8`, `-1.0`), or None where it is not arithmetic of numbers."""
-    if isinstance(bound, ast.Constant) and type(bound.value) in (int, float):
+    if isinstance(bound, ast.Constant) and isinstance(bound.value, int | float) and not isinstance(
+            bound.value, bool):
         return float(bound.value)
     if isinstance(bound, ast.UnaryOp) and isinstance(bound.op, ast.USub | ast.UAdd):
         operand = _number(bound.operand)
@@ -611,7 +616,7 @@ def _chained_band(node: ast.Compare, scope: _Scope, reading: _Reading) -> bool:
     return False
 
 
-def _conjunction(node: ast.AST) -> bool:
+def _conjunction(node: ast.AST) -> TypeGuard[ast.BoolOp | ast.BinOp]:
     return (isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And)) or (
         isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd))
 
@@ -683,8 +688,8 @@ def _read(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Call
                     held.add(id(function))
                     grew = True
             if id(function) in reading.erring_at:
-                places = {place for value in returned for place, element in enumerate(value.elts)
-                          if _erring(element, scope, reading)}
+                places = {place for value in returned if isinstance(value, ast.Tuple)
+                          for place, element in enumerate(value.elts) if _erring(element, scope, reading)}
                 if not places <= reading.erring_at[id(function)]:
                     reading.erring_at[id(function)] |= places
                     grew = True
@@ -706,7 +711,7 @@ def support_functions(tree: ast.Module, tables: Mapping[int, Mapping[str, str]],
 
 def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
                 imported: Callable[[str], Imported | None] = lambda called: None
-                ) -> Iterator[tuple[ast.AST, str]]:
+                ) -> Iterator[tuple[ast.expr | ast.stmt, str]]:
     """Each place a file compares floats within a tolerance, and what it is (its nodes' import tables
     `tables`, its calls' definitions `calls`, and what its own file proves of a function it imports,
     `imported` of its dotted name): a call of the gate's one-draw rules (`ONE_DRAW`), a tolerance API
@@ -731,7 +736,8 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
                 if called in ONE_DRAW:
                     yield node, f"`{called.rsplit('.', 1)[1]}`, the one-draw rule, not check 1's drawn seeds"
                 elif (called in TOLERANT or method) and not _exact(node, called):
-                    yield node, f"`{called or node.func.attr}`"
+                    named = called or (node.func.attr if isinstance(node.func, ast.Attribute) else "")
+                    yield node, f"`{named}`"
                 elif called in BOUNDED and node.args and _erring(node.args[0], scope, reading):
                     yield node, f"`{called}` of an error"
                 elif called not in TOLERANT and any(keyword.arg in TOLERANCE_KEYWORDS

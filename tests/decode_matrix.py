@@ -10,6 +10,8 @@ selector taking a paged kernel (`select(PAGED, case)`, as the layer asks it,
 `CausalSelfAttention._decode_attention`).
 """
 
+import contextlib
+
 import flax.linen as nn
 import generation_support
 import jax
@@ -56,13 +58,20 @@ def _hooks(case: dict[str, str], sinks):
             "sinks": sinks if case["hook"] == "sinks" else None}
 
 
+def _precision(case: dict[str, str]):
+    """The matmul precision `case` runs at: JAX's default (`None`) on a TPU (where a user's default run
+    takes `jax`'s Pallas paged attention, which a v5e refuses under the suite's 'highest', rows 7373/8278),
+    the ambient precision elsewhere."""
+    return jax.default_matmul_precision(None) if case["generation"] == "v5e" else contextlib.nullcontext()
+
+
 def supported(case: dict[str, str]) -> bool:
     """Whether its choice's selector serves `case` on its GPU at its kernel (tests/kernel_matrix.py): the
     decode selector takes a dense step (`decodes`), the paged selector a paged one, each by the kernel named
     (`selection.select`), which takes it; one this host does not lower for the GPU (`selection.Unlowerable`:
     cuDNN where it loads no cuDNN library) served by that decision there, its cell native alone."""
     heads, kv_heads, width, dtype = head_shapes(case, HEADS)
-    with generation.assumed(case["generation"]):
+    with generation.assumed(case["generation"]), _precision(case):
         if case["layout"] == "dense":
             query = jnp.zeros((ROWS, 1, heads, width), dtype)
             key = jnp.zeros((ROWS, CAPACITY, kv_heads, width), dtype)
@@ -181,6 +190,8 @@ CASES = (
     ('sm80', 'paged', 'gqa-16-8', 'plain', 'bfloat16', '64', 'triton'),
     ('sm90', 'dense', 'gqa-16-8', 'sinks', 'float32', '64', 'decode'),
     ('sm90', 'dense', 'gqa-16-8', 'softcap', 'float16', '64', 'decode'),
+    ('v5e', 'paged', 'gqa-16-8', 'plain', 'bfloat16', '128', 'tpu'),
+    ('v5e', 'paged', 'mha-8', 'softcap', 'bfloat16', '128', 'tpu'),
 )
 """The cells' cases, each its axis values in `AXES`' order: the cases a ledger row names
 (`kernel_matrix.SEEDED`) and every pair of axis values the choices serve (`kernel_matrix.covering("decode")`,
@@ -194,7 +205,7 @@ def a_decode_step_is_on_par(case: tuple[str, ...]) -> None:
     """A decode step of `case` on its device, through its choice's route at its kernel, on par with the
     reference path's (check 1); its routes its layout's choice at that kernel (`KERNELS`)."""
     named = dict(zip(AXES["decode"], case, strict=True))
-    with generation.routes() as routes:
+    with _precision(named), generation.routes() as routes:
         assert_as_exact(jax.jit(_step(named, reference=False)), jax.jit(_step(named, reference=True)),
                         _drawn(named), "-".join(case), seeds=SEEDS, terms=_terms(named))
     recorded = {(found.choice, found.kernel) for found in routes}
@@ -220,8 +231,6 @@ def per_shard(choice: str, kernel: str) -> dict:
     cases = [dict(zip(AXES["decode"], case, strict=True)) for case in CASES
              if case[1] == layout and case[-1] == kernel]
     if not cases:
-        # A kernel the matrix declares no cell of: a TPU's paged decode, which a v5e refuses at the fp32
-        # sums the matrix's arms ask (`kv_cache`'s `fp32_by_bf16_precise`), and no split flow launches.
         return {}
     case = next((case for case in cases if case["generation"] == "sm90"), cases[0])
 
@@ -230,6 +239,10 @@ def per_shard(choice: str, kernel: str) -> dict:
         heads = PartitionSpec(None, None, "tensor")
         return [heads, heads, heads, heads, PartitionSpec("tensor")]
 
+    @contextlib.contextmanager
+    def shard_context():
+        with nn.logical_axis_rules(DEFAULT_RULES), _precision(case):
+            yield
+
     return {"tensor": Shard(_step(case, reference=False), _drawn(case), specs, _step(case, reference=True),
-                            SEEDS, "tensor", context=lambda: nn.logical_axis_rules(DEFAULT_RULES),
-                            target=case["generation"])}
+                            SEEDS, "tensor", context=shard_context, target=case["generation"])}

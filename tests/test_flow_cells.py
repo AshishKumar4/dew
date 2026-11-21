@@ -6,6 +6,7 @@ import inspect
 
 import gpu_flow
 import pytest
+from generation_support import node_topology
 from gpu_flow import Cell, CellsFailed, cells_of, run_cells
 
 
@@ -188,12 +189,9 @@ def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_pa
     import generation_support
     import model_flows
     import tier_wire
-    from jax.experimental import topologies
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = tmp_path / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(tmp_path / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     ran: list[str] = []
@@ -231,3 +229,85 @@ def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path
     with pytest.raises(CellsFailed) as raised:
         run_cells(flow)
     assert raised.value.labels == ["computes"]
+
+
+def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unrecorded(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare, a cell that compiled a site and then raised, checking what its prepare
+    gives in its programs' place (`ahead_arm`'s zeros), passes its prepare with nothing recorded, its run
+    judging it (row 8555: every such cell was recorded deferred and its test named unprepared, falsely);
+    a cell whose site's prepare did not finish, its compile raised, its arm's trace raised after its
+    truths were written, or a second check's truth trace raised after a first was prepared whole, is
+    deferred, its failure recorded where it raised (the review)."""
+    import arm_store
+    import jax
+    import numpy as np
+    import tier_wire
+    from reference_error import ahead_arm, assert_as_exact
+    from truths_ahead import DEFERRED, UNPREPARED, CompiledTruths, compiled_truths
+
+    def checked():
+        made = ahead_arm(jax.jit(lambda x: x + 1.0), "a checked product")(np.zeros(3, np.float32))
+        assert np.asarray(made).tolist() == [1.0, 1.0, 1.0]
+
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells([Cell("checks its product", checked)])
+    assert not (tmp_path / DEFERRED).exists() and not (tmp_path / UNPREPARED).exists()
+
+    def unfinished(store, programs, compiled, host=False):
+        raise RuntimeError("its compile failed")
+
+    with monkeypatch.context() as failing:
+        failing.setattr(CompiledTruths, "_compiled", unfinished)
+        failed = ahead_arm(jax.jit(lambda x: x * 2.0), "a failed product")
+        with compiled_truths(tmp_path / "unfinished", prepare=True, stamp="a"):
+            run_cells([Cell("compiles nothing", lambda: failed(np.zeros(3, np.float32)))])
+    assert (tmp_path / "unfinished" / DEFERRED).is_file()
+
+    # A site whose truths are written and whose arm's trace then raises.
+    def traced_badly(*arguments, **options):
+        raise RuntimeError("its arm's trace failed")
+
+    def site():
+        assert_as_exact(jax.jit(lambda x: x * 2.0), jax.jit(lambda x: x * 2.0),
+                        lambda seed: (np.full(3, seed, np.float32),), "a product whose arm failed", seeds=8)
+
+    with monkeypatch.context() as failing:
+        failing.setattr(arm_store, "_arm_program", traced_badly)
+        with compiled_truths(tmp_path / "arms", prepare=True, stamp="a"):
+            run_cells([Cell("traces its arm badly", site)])
+    assert (tmp_path / "arms" / DEFERRED).is_file()
+
+    # A check prepared whole, then a second check whose truth's trace raises before it compiles any site.
+    def two_checks():
+        ahead_arm(jax.jit(lambda x: x + 1.0), "a first product")(np.zeros(3, np.float32))
+
+        def truth(x):
+            raise RuntimeError("its truth's trace failed")
+
+        assert_as_exact(jax.jit(lambda x: x * 3.0), jax.jit(lambda x: x * 3.0),
+                        lambda seed: (np.full(3, seed, np.float32),), "a product whose truth failed", seeds=8,
+                        truth_fn=truth)
+
+    with compiled_truths(tmp_path / "second", prepare=True, stamp="a"):
+        run_cells([Cell("prepares one check and fails the next", two_checks)])
+    assert (tmp_path / "second" / DEFERRED).is_file()
+
+
+def test_a_flow_module_importing_gpu_flow_first_imports_in_a_parts_prepare():
+    """In a GPU tier part's prepare (`tier_wire.PREPARE`) a module importing gpu_flow first imports: gpu_flow
+    read the generation helpers at its import, which in a prepare read model_flows' node target, whose
+    module imports gpu_flow, a circular import that refused such a module in every prepare and left its
+    sites unprepared (the native certificates on a GH200 tier)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import tier_wire
+
+    done = subprocess.run([sys.executable, "-c", "import gpu_flow"], cwd=Path(__file__).parent,
+                          env={**os.environ, tier_wire.PREPARE: "1"}, capture_output=True, text=True,
+                          check=False)
+    assert done.returncode == 0, done.stderr[-2000:]
+

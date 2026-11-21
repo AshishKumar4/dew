@@ -7,7 +7,8 @@ on a GPU and records (tests/fixtures/fla/gdn_seeded.npz), and the rule's hooks.
 - `walk/<geometry>`: a two-role walk's one sequence, values 64 wide (test_recurrence_mosaic_gradient).
 - `near two`: write gates near two on aligned keys (test_recurrence_mosaic).
 - `stability/<name>/<regime>/<product>`: test_recurrence_stability's regimes of the delta rule with a decay,
-  the forward's draws and the gradient's (`stressed`, `cotangents`).
+  and of a write gate without it under a decay a head (fla-core's `chunk_simple_gla`, its keys gated), the
+  forward's draws and the gradient's (`stressed`, `cotangents`).
 - `rwkv6/<dtype>/<layout>`: RWKV6's recurrence (`RWKV6`: a decay a key dimension, read before its update,
   its own write weighed), test_recurrence_chunk's draws of one sequence and of packed documents, against
   fla-core's `chunk_rwkv6`.
@@ -27,7 +28,23 @@ from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk
 
 RECORDED = Path(__file__).resolve().parent / "fixtures" / "fla" / "gdn_seeded.npz"
-"""fla-core's recording at every site (tools/fla_gdn_reference.py)."""
+"""fla-core's recording at every site of its delta rules and RWKV6 (tools/fla_gdn_reference.py)."""
+
+SIMPLE_RECORDED = Path(__file__).resolve().parent / "fixtures" / "fla" / "simple_gla_seeded.npz"
+"""fla-core's recording at every site of its simple GLA (`simple_gla`), recorded after `RECORDED`'s sites
+under a provenance of its own (its truth fla's naive simple GLA), so a site added to one recording leaves the
+other's pinned recording as it stands."""
+
+
+def simple_gla(hooks) -> bool:
+    """Whether fla-core's simple GLA runs a site's form: a write gate without the delta rule under a decay a
+    head (`chunk_simple_gla`, its keys gated)."""
+    return hooks.write_gate and not hooks.delta and hooks.decay == 'scalar'
+
+
+def recorded_at(site: str) -> Path:
+    """The recording that holds `site` (`RECORDED` or `SIMPLE_RECORDED`)."""
+    return SIMPLE_RECORDED if simple_gla(sites()[site].hooks) else RECORDED
 
 LEAVES = ("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
 """A recorded site's leaves: the output and final memory, then each operand's gradient."""
@@ -178,10 +195,72 @@ def _rwkv6_sites() -> dict[str, Site]:
     return sites
 
 
+FLOOR_GATES = "kda/tiny gates at the floor/gradient"
+"""Kimi delta attention's site of decays at its floor and write gates down to 2^-60 (`_floor_gate_sites`)."""
+
+
+def _floor_gate_sites() -> dict[str, Site]:
+    """Kimi delta attention under unit keys (test_recurrence_stability's 'vector delta', `write_bound`
+    declared) with every token's log decay near Kimi Linear's floor ((-5, -4.5) a key dimension) and write
+    gates `2^U(-60, 0)`, in 16 bits with their cotangents: a chunk's own pairs and its system's rows into
+    fp32's subnormals at once, which no stability regime draws (row 7906)."""
+    import test_recurrence_chunk as chunked
+    import test_recurrence_stability as stability
+    import test_recurrence_template_stability as template_stability
+
+    hooks = stability.SITES['vector delta']
+
+    def gradient(seed):
+        operands, (out, final) = stability.cotangents(hooks, 'the decay bound', seed)
+        rng = np.random.default_rng([seed, 7906])
+        operands = dataclasses.replace(
+            operands, log_decay=chunked.hosted(rng.uniform(-5.0, -4.5, operands.log_decay.shape)),
+            beta=chunked.hosted(2.0 ** rng.uniform(-60.0, 0.0, operands.beta.shape)))
+        return template_stability.bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
+
+    return {FLOOR_GATES: Site(hooks, gradient)}
+
+
+FAINT_CROSS = "kda/a faint cross term/gradient"
+"""Kimi delta attention's site of faint write gates beside large ones over one key (`_faint_cross_sites`)."""
+
+
+def _faint_cross_sites() -> dict[str, Site]:
+    """Kimi delta attention (test_recurrence_stability's 'vector delta') with every token's key and value the
+    unit `e0`, no decay, write gates alternating faint (2^-U(20, 40)) and large (U[1/2, 1]), the queries
+    `e0` but each faint token's zero, in 16 bits with their cotangents: each large token's own pair beside
+    the faint cross term the token before left, which its log decay's gradient takes once its own pair is
+    summed apart (row 7906; its cell compared one gradient bitwise outside the gate, row 8569)."""
+    import test_recurrence_chunk as chunked
+    import test_recurrence_stability as stability
+    import test_recurrence_template_stability as template_stability
+
+    hooks = stability.SITES['vector delta']
+
+    def gradient(seed):
+        operands, (out, final) = stability.cotangents(hooks, 'the decay bound', seed)
+        rng = np.random.default_rng([seed, 8569])
+        unit = np.zeros(operands.key.shape)
+        unit[..., 0] = 1.0
+        faint = np.arange(operands.beta.shape[1])[None, :, None] % 2 == 0
+        beta = np.where(faint, 2.0 ** -rng.uniform(20.0, 40.0, operands.beta.shape),
+                        rng.uniform(0.5, 1.0, operands.beta.shape))
+        query = np.where(faint[..., None], 0.0, unit)
+        value = np.zeros(operands.value.shape)
+        value[..., 0] = 1.0
+        operands = dataclasses.replace(
+            operands, query=chunked.hosted(query), key=chunked.hosted(unit), value=chunked.hosted(value),
+            log_decay=chunked.hosted(np.zeros(operands.log_decay.shape)), beta=chunked.hosted(beta))
+        return template_stability.bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
+
+    return {FAINT_CROSS: Site(hooks, gradient)}
+
+
 @functools.cache
 def sites() -> dict[str, Site]:
     """Every recorded site by name."""
-    return {**_mosaic_sites(), **_stability_sites(), **_rwkv6_sites()}
+    return {**_mosaic_sites(), **_stability_sites(), **_rwkv6_sites(), **_floor_gate_sites(),
+            **_faint_cross_sites()}
 
 
 def the_template_is_as_exact_as_fla(rule: Callable[[Chunk], tuple], site: str,
@@ -194,9 +273,10 @@ def the_template_is_as_exact_as_fla(rule: Callable[[Chunk], tuple], site: str,
     from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
     from test_recurrence_chunk import token_by_token
 
-    seeds, hooks = declared_seeds(RECORDED)[site], sites()[site].hooks
+    held = recorded_at(site)
+    seeds, hooks = declared_seeds(held)[site], sites()[site].hooks
     draw, reference, truth = indexed_recording(
-        recording(RECORDED), site, seeds, inputs_of=sites()[site].arrays, leaves=leaves,
+        recording(held), site, seeds, inputs_of=sites()[site].arrays, leaves=leaves,
         truth_fn=jax.jit(lambda arrays: ruled(functools.partial(token_by_token, hooks), arrays, leaves)))
 
     def run(index, arrays):

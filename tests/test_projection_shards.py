@@ -169,9 +169,12 @@ def test_a_projection_no_kernel_launches_per_shard_is_on_par_with_one_device(nam
     mesh = Mesh(np.asarray(jax.devices()[:2]), (case["axis"],))
     with (generation.assumed("sm90", interpreted=True), nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT),
           _declared()):
+        # An fsdp weight gathered, its gradient reduce-scattered back (the gather's transpose).
+        fsdp = case["axis"] == "fsdp"
         assert_runs_per_shard(with_gradients(_call(case)), _draw(case), _specs(case, mesh), mesh, name,
                               seeds=SEEDS, truth_fn=_exact(case.get("join")),
-                              moves=("all-gather",) if case["axis"] == "fsdp" else ())
+                              moves=("all-gather",) if fsdp else (),
+                              reductions=(("reduce-scatter", ("fsdp",)),) if fsdp else ())
 
 
 @pytest.mark.mesh(devices=2)
@@ -207,7 +210,8 @@ def test_a_projection_read_apart_from_its_layer_runs_per_shard_as_its_layer_does
           nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT), _declared()):
         assert_runs_per_shard(with_gradients(call), draw, [PartitionSpec(axis), kernel, PartitionSpec(axis)],
                               mesh, f"a projection apart from its layer {axis}", seeds=SEEDS, truth_fn=truth,
-                              moves=("all-gather",) if axis == "fsdp" else ())
+                              moves=("all-gather",) if axis == "fsdp" else (),
+                              reductions=(("reduce-scatter", ("fsdp",)),) if axis == "fsdp" else ())
 
 
 @pytest.mark.mesh(devices=2)
@@ -230,10 +234,13 @@ def test_a_projections_weight_gradient_leaves_its_map_as_its_placement_states(ax
     H100s: its forward gathers the weight where the layout splits it and moves nothing on a data axis; its
     step reduce-scatters the weight's gradient back on fsdp and sums it whole on a data axis, moving no
     activation between devices (the template's kernel an opaque call the partitioner would read whole);
-    and its temporaries are no more than the partitioner's step of the same product (`jnp.dot`, no map)."""
+    and its temporaries are no more than the partitioner's step of the same product (`jnp.dot`, no map),
+    each compiled for H100s stating 128 MiB, below the step's need, so XLA's scheduler holds the least it can
+    and the temporaries are the route's alone (an H100's 80 GB lets it hold the step's twice over, 99.6 MB
+    against the partitioner's 49.8 MB; a compile-only GPU stated 0 bytes before row 8768)."""
     from kernel_compile import _device
 
-    mesh = _device("sm90", ((axis, 2),))
+    mesh = _device("sm90", ((axis, 2),), memory=2**27)
     shapes = ((8, 4096, 2560), (2560, 9728), (9728,), (8, 4096, 9728))
     with (jax.sharding.use_abstract_mesh(mesh.abstract_mesh), nn.logical_axis_rules(DEFAULT_RULES),
           _declared()):
@@ -249,7 +256,7 @@ def test_a_projections_weight_gradient_leaves_its_map_as_its_placement_states(ax
             return jax.jit(fn).lower(*arguments).compile()
 
     def ops(executable):
-        return {op for op, _ in collectives(executable.as_text())}
+        return {op for op, _ in collectives(executable)}
 
     def partitioned(x, kernel, bias):
         return (jnp.dot(x, kernel) + bias).astype(jnp.bfloat16)
@@ -259,7 +266,7 @@ def test_a_projections_weight_gradient_leaves_its_map_as_its_placement_states(ax
     summed = {"all-gather", "reduce-scatter"} if split else {"all-reduce"}
     step = compiled(with_gradients(dense), placed)
     assert summed <= ops(step) <= summed | {"all-reduce"}, ops(step)
-    moved = [(op, shapes) for op, shapes in collectives(step.as_text()) if op in MOVES]
+    moved = [(op, shapes) for op, shapes in collectives(step) if op in MOVES]
     # The weight's gather alone, whatever dimension XLA gathers it on: its whole elements.
     assert all(op == "all-gather" and [math.prod(each) for each in found] == [math.prod(shapes[1])]
                for op, found in moved), moved
@@ -286,3 +293,52 @@ def test_a_projection_no_launch_takes_runs_as_it_ran_before():
             return jax.jit(with_gradients(_call(case))).lower(*arguments).as_text()
 
     assert lowered(placing(LAYOUT)) == lowered()
+
+
+def test_a_one_member_batched_projection_runs_as_the_dense_product_it_is():
+    """A bf16 `DenseGeneral` batched over one member (`[1, 32, 64]` rows, a `[1, 64, 48]` kernel) on an
+    assumed B200, nothing named: its launch is the dense product's (`dense` bound), the one its probe asked
+    about, where the probe asked the dense product's cells and the call ran one group's grouped launch (head
+    review of 0099a4701 F3)."""
+    from dew.nn.dense import DenseGeneral
+    from dew.nn.kernels import tuning
+
+    layer = DenseGeneral(48, batch_dims=(0,), axis=-1, use_bias=False, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((1, 32, 64), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+    with generation.assumed("sm100"), tuning.seen() as launches:
+        jax.eval_shape(layer.apply, params, x)
+    assert launches.taken and all(bound.arguments["dense"] for _, bound in launches.taken), launches.taken
+
+
+def test_a_batched_projection_runs_its_members_as_one_grouped_gemm():
+    """A bf16 `DenseGeneral` batched over 4 groups (DeepSeek V4's grouped `o_a_proj`: `[4, 32, 64]` rows, a
+    `[4, 64, 48]` kernel) on an assumed H100, the GEMM template named and interpreted: its members run as one
+    grouped GEMM's uniform groups (`projections.grouped_rows`, Appendix C row 4), the template's route taken,
+    and its output and the gradients of its rows and kernel are XLA's batched dot's within
+    tests/reference_error.py's rule from float64 (check 1), where the batched call bypassed the template
+    (spec alignment SA20261119pm F36)."""
+    from reference_error import assert_as_exact
+
+    from dew.nn.dense import DenseGeneral
+
+    layer = DenseGeneral(48, batch_dims=(0,), axis=-1, use_bias=False, dtype=jnp.bfloat16)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        kernel = jax.random.normal(keys[0], (4, 64, 48)).astype(jnp.bfloat16)
+        return ({"params": {"kernel": kernel}}, jax.random.normal(keys[1], (4, 32, 64)).astype(jnp.bfloat16),
+                jax.random.normal(keys[2], (4, 32, 48)).astype(jnp.bfloat16))
+
+    def under(kernel, run):
+        def arm(*operands):
+            with generation.chosen(grouped_matmul=kernel):
+                return run(*operands)
+        return arm
+
+    truth = under("xla", with_gradients(layer.clone(dtype=jnp.float64).apply))
+    with generation.assumed("sm90", interpreted=True), generation.routes() as routes:
+        run = with_gradients(layer.apply)
+        assert_as_exact(under("mosaic", run), under("xla", run), draw, "a batched projection's grouped GEMM",
+                        seeds=8, truth_fn=truth)
+    assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes

@@ -109,7 +109,7 @@ def write_maxtext_fixture() -> None:
             # MaxText's scale goes negative).
             clip = maxtext_clip_mla_weight()
             with jax.enable_x64(new_val=True):
-                wide = clip_scale(np.max(max_logits.astype(np.float64), axis=0), 100.0)
+                wide = clip_scale(jnp.asarray(np.max(max_logits.astype(np.float64), axis=0)), 100.0)
                 truth = np.asarray(clip(
                     layer, jnp.asarray(param, jnp.float64), jnp.asarray(wide, jnp.float64), nope))
             cases.append({

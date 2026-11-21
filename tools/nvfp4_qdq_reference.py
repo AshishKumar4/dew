@@ -27,15 +27,23 @@ import numpy as np
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import forward_quantize
+from compressed_tensors.quantization.quant_args import DynamicType
 from compressed_tensors.quantization.utils.helpers import generate_gparam
 from compressed_tensors_mxfp4_reference import TIES
-from nvfp4_storage_reference import ARGS, compress
+from nvfp4_storage_reference import ARGS, compress, set_state
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 from _dew_torch.precision import float64, float64_twin, native
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "nvfp4_qdq"
+
+
+def calibrating(calibration: dict[str, torch.Tensor], name: str):
+    """A forward pre-hook keeping the input a module named `name` is called with under `calibration`."""
+    def hook(_, args):
+        calibration[name] = args[0].detach()
+    return hook
 
 
 def quantize_wide(module, value, base_name, args):
@@ -62,7 +70,7 @@ def checkpoint(e4m3: bool) -> None:
                         max_position_embeddings=64, tie_word_embeddings=True)
     config._attn_implementation = "eager"
     model = Qwen3ForCausalLM(config).eval()
-    inputs = QuantizationArgs(**ARGS["nvfp4"], dynamic="local",
+    inputs = QuantizationArgs(**ARGS["nvfp4"], dynamic=DynamicType("local"),
                               scale_dtype=torch.float8_e4m3fn if e4m3 else None)
     scheme = QuantizationScheme(targets=["Linear"], weights=QuantizationArgs(**ARGS["nvfp4"]),
                                 input_activations=inputs)
@@ -72,8 +80,7 @@ def checkpoint(e4m3: bool) -> None:
     hooks = []
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear) and name != "lm_head":
-            hooks.append(module.register_forward_pre_hook(
-                lambda _, args, name=name: calibration.update({name: args[0].detach()})))
+            hooks.append(module.register_forward_pre_hook(calibrating(calibration, name)))
     with torch.no_grad():
         model(ids, use_cache=False)
     for hook in hooks:
@@ -101,7 +108,7 @@ def checkpoint(e4m3: bool) -> None:
         reference = model(ids, use_cache=False).logits.numpy()
     for module in model.modules():
         if hasattr(module, "quantization_status"):
-            module.quantization_status = QuantizationStatus.COMPRESSED
+            set_state(module, quantization_status=QuantizationStatus.COMPRESSED)
     with torch.no_grad():
         np.testing.assert_array_equal(model(ids, use_cache=False).logits.numpy(), reference)
     arrays = {"ids": ids.numpy(), "logits": reference}
@@ -115,8 +122,10 @@ def checkpoint(e4m3: bool) -> None:
         arrays[name + "/inputs"] = value.numpy()
         arrays[name + "/qdq"] = quantized.numpy()
         arrays[name + "/qdq_bf16"] = quantized_bf16.float().numpy()
-        arrays[name + "/global"] = module.input_global_scale.numpy()
-        arrays[name + "/weight"] = module.weight.detach().numpy()
+        # The scale compressed-tensors registers on the module beside its weight.
+        state = module.state_dict()
+        arrays[name + "/global"] = state["input_global_scale"].numpy()
+        arrays[name + "/weight"] = state["weight"].numpy()
     probe = torch.randn(4, 64, generator=torch.Generator().manual_seed(2041))
     probe[0] = 0
     probe[1] = -0.0
@@ -135,14 +144,14 @@ def checkpoint(e4m3: bool) -> None:
         directory, dtype=torch.float64, attn_implementation="eager"))
     for module in exact.modules():
         if hasattr(module, "quantization_status"):
-            module.quantization_status = QuantizationStatus.COMPRESSED
+            set_state(module, quantization_status=QuantizationStatus.COMPRESSED)
     with float64(), torch.no_grad(), quantized_as_published():
         arrays["logits_f64"] = exact(ids, use_cache=False).logits.numpy()
     for module in model.modules():
-        module.quantization_enabled = False
+        set_state(module, quantization_enabled=False)
     with torch.no_grad():
         arrays["weight_only_logits"] = model(ids, use_cache=False).logits.numpy()
-    np.savez(directory / "reference.npz", **arrays)
+    np.savez(directory / "reference.npz", allow_pickle=False, **arrays)
     rms = float(np.sqrt(np.mean((reference - arrays["logits_f64"]) ** 2)))
     apart = float(np.sqrt(np.mean((reference - arrays["weight_only_logits"]) ** 2)))
     print(directory.name, "reference RMS from float64", rms,

@@ -9,6 +9,7 @@ import dataclasses
 import functools
 import gc
 import os
+import subprocess
 import time
 import weakref
 
@@ -146,64 +147,98 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
 
 RECURRENT_AHEAD = """
 import json
+import sys
 import jax
 import optax
 from token_support import token_rows
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.templates import report
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
 from dew.training.ahead import compile_ahead
 
-lowered = []
+# Each program lowered, by name, and each Mosaic GPU kernel Pallas lowered afresh, by its module's text.
+import hashlib
+from jax._src.pallas.mosaic_gpu import lowering as pallas_lowering
+events, modules = [], []
 jax.monitoring.register_event_duration_secs_listener(
-    lambda event, seconds, *, fun_name=None, **_: lowered.append(fun_name)
+    lambda event, seconds, *, fun_name=None, **_: events.append(fun_name)
     if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" else None)
+afresh = pallas_lowering.lower_unpipelined_jaxpr_to_module
+
+
+def lowered_afresh(*args, **kwargs):
+    lowered = afresh(*args, **kwargs)
+    modules.append(hashlib.sha256(str(lowered.module).encode()).hexdigest())
+    return lowered
+
+
+pallas_lowering.lower_unpipelined_jaxpr_to_module = lowered_afresh
 # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide, over a row of 12,288 tokens.
 model = CausalTransformer(vocab_size=64, emb_features=512, num_layers=1, num_heads=4, head_dim=128,
                           mlp_features=512, max_seq_len=12288, dtype="bfloat16", mixer=GatedDeltaNetMixer())
+devices = compile_only_gpus(sys.argv[1], 1, 80 * 2**30)
 trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)))
+                  mesh=MeshSpec().build(devices))
 compile_ahead(trainer, token_rows(64, 1, 12289))
-print(json.dumps({"lowered": lowered}))
+print(json.dumps({"events": events, "modules": modules, "kind": devices[0].device_kind,
+                  "stored": [certification.stored for certification in report.certifications()]}))
 """
-"""A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only H100, each program
-it lowered by name."""
+"""A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only GPU of the generation
+or the kind argv[1] names (`compile_only_gpus`): each program it lowered by name, each Mosaic GPU kernel
+lowered afresh by its module's text, the kind its device reported, and whether each launch it certified
+read its verdict back from the store (`report.certifications`' `stored`)."""
 
 
-@lowers("sm90")
+@pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
+                                    pytest.param("sm100", marks=lowers("sm100"))])
 @pytest.mark.parametrize("deterministic", [False, True], ids=["keeping picks", "deterministic ops"])
-def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, deterministic):
-    """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100
-    (`RECURRENT_AHEAD`), twice over one cache: at its derived tiles its output launch spills (8 bytes at 128
-    registers under the cuda12 build's ptxas), and each process lowers the step once. Certification compiles
-    a launch with its outputs live, as a step reads them, so it refuses the spilling config and steps the
-    launch's producer down at trace, each rung compiled alone; and a later process reads the verdicts stored,
-    compiling nothing to certify. Certification that dropped the outputs never compiled the output launch,
-    and the program's compile stepped it down a whole-step relowering a rung, again in every process
-    (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each certification's program is named by its
-    launch and config (`certified_<op>_l<launch>_c<config>`), so a start's events tell its rungs apart: the
-    cold process lowers each once, two configs of the output launch among them, and the warm one none,
-    under deterministic ops too, which keep no picks but keep the verdicts (row 7308: every warm start under
+def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, deterministic):
+    """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100 and a
+    compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: each process lowers the step once, the cold
+    one certifies each launch's configs once each (whatever its walk takes: a config refused steps the
+    launch's producer down at trace, each rung compiled alone with its outputs live, as a step reads them),
+    and the warm one reads the verdicts stored, certifying nothing. Certification that dropped the outputs
+    never compiled the output launch, and the program's compile stepped it down a whole-step relowering a
+    rung, again in every process (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each
+    certification's program is named by its launch, direction and config
+    (`certified_<op>_l<launch>_c<config>[_reverse]`), so a start's events tell each apart. Each kernel is
+    lowered afresh once in the cold process: the step's kernels certification lowered are the lowerings it
+    made (a launch's trace held, `tuning.lowered_once`, bound into the step as certification traced it,
+    under the step's own mesh), where the step lowered its kernels again, each a cache miss, 34 of a 4B's 36
+    kernels on a B200 the ones certification had made (FS-CERTSPLIT4: 27 s of its lowering). Under
+    deterministic ops too, which keep no picks but keep the verdicts (row 7308: every warm start under
     --xla_gpu_deterministic_ops certified every launch again)."""
     cache = tmp_path / "cache"
     # The lane's own flags each time, without deterministic ops and with them, whatever the lane's are.
     flags = f"{keeping_picks()} {DETERMINISTIC_OPS}" if deterministic else keeping_picks()
-    cold, warm = (fresh(RECURRENT_AHEAD, cache_dir=cache, flags=flags)["lowered"] for _ in range(2))
+    runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache, flags=flags) for _ in range(2)]
+    cold, warm = (run["events"] for run in runs)
+    modules = runs[0]["modules"]
+    assert len(set(modules)) == len(modules), collections.Counter(modules).most_common(3)
     assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
     certified = [name for name in cold if name.startswith("jit(certified_")]
-    assert len(set(certified)) == len(certified), certified
-    # The configs certified a launch in each direction: a forward's and its reverse's certification of one
-    # config are one config, not the two a step down is.
-    configs = collections.defaultdict(set)
-    for name in certified:
-        name = name.removeprefix("jit(").removesuffix(")")
-        reverse = name.endswith("_reverse")
-        launch, config = name.removesuffix("_reverse").rsplit("_c", 1)
-        configs[launch, reverse].add(config)
-    assert max(map(len, configs.values())) >= 2, certified
+    assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
+
+
+@lowers("sm90")
+def test_a_verdict_certified_for_a_gpu_is_read_by_another_kind_of_its_generation(tmp_path):
+    """Certification's verdicts are the compile target's (`report.verdict_target`): a step compiled ahead for
+    a compile-only H100 certifies its launches and stores their verdicts, and a process certifying the same
+    launches on another kind of sm90 (a compile-only GH200) reads them, certifying
+    nothing (rows 6717, 7322: a GH200's run read none of a compile-only H100's verdicts and certified each
+    launch again)."""
+    cache = tmp_path / "cache"
+    flags = keeping_picks()
+    h100 = fresh(RECURRENT_AHEAD, "sm90", cache_dir=cache, flags=flags)
+    gh200 = fresh(RECURRENT_AHEAD, "NVIDIA GH200 480GB", cache_dir=cache, flags=flags)
+    assert h100["kind"] != gh200["kind"] == "NVIDIA GH200 480GB", (h100["kind"], gh200["kind"])
+    # Each launch certified (`report.certifications`): the H100's compiled there, the GH200's read back.
+    assert h100["stored"] and not any(h100["stored"]), h100["stored"]
+    assert gh200["stored"] and all(gh200["stored"]), gh200["stored"]
 
 
 HANDED = """
@@ -250,12 +285,12 @@ from dew.training.ahead import AheadOfTime, handed
 
 step = AheadOfTime.load(sys.argv[1])
 identity, config, names = step.refusals[0]
-foreign = (identity, config, frozenset({"another kernel"}))
+foreign = (identity, config, frozenset({("another kernel", None)}))
 report.refuse([foreign])
 with assumed(step.target), handed(step):
     within = report.refused_launches()
 print(json.dumps({"within": sorted(map(repr, within)), "step": sorted(map(repr, step.refusals)),
-                  "after": repr(foreign) in map(repr, report.refused_launches())}))
+                  "after": repr(foreign) in map(repr, report.refusal_entries())}))
 """
 """A process on the step's GPU (`AheadOfTime.target`) that refused a launch of another program, handed the
 step compiled ahead at argv[1]."""
@@ -700,6 +735,23 @@ def test_a_launch_spilling_at_two_configs_steps_down_alone_and_its_program_compi
     assert compiles.count == 1
 
 
+@lowers("sm90")
+def test_a_program_lowered_before_another_compile_refused_its_config_is_relowered_past_it():
+    """Two lowerings of one step through a launch whose first tile spills (`Uncounted`), both traced before
+    either compiles, compiled for a compile-only H100 one after the other (`report.compiled`), as another
+    thread's compile or a certification elsewhere commits a refusal after a program's trace took the config:
+    the second, whose compile spills at the config the first's refused, is lowered afresh past it, so no
+    program kept spills (no miss left unstepped), where its spill read as already held kept it (row 8603)."""
+    devices, lowered = _paired_step(Uncounted())
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        first, second = lowered(), lowered()
+        report.compiled(first, relower=lowered)
+        report.compiled(second, relower=lowered)
+        misses = report.misses()
+    assert misses and all(miss.stepped for miss in misses), misses
+
+
 class SpillingOnly(Uncounted):
     """`Uncounted`'s first tile alone, which spills in every compile, and no tile once a compile refused it: a
     launch whose every legal config spills."""
@@ -1104,6 +1156,56 @@ def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
     assert "register operand A before its group retired" in finding
 
 
+def test_the_compile_gate_fails_a_kernel_above_the_register_cap_its_launch_runs_at():
+    """A kernel allocating more registers a thread than the cap its launch runs at (its record's `cap`, as its
+    compile states it: its consumers' raise, else its threads' share of the multiprocessor's registers at the
+    programs it is launched to hold), spilling nothing, is a kernel the gate fails, and one at its cap passes
+    (row 6670): an allocation above the launch's leaves a multiprocessor fewer programs than it was planned
+    for. One whose record states no cap fails too, where its allocation went unjudged."""
+    import kernel_compile as kc
+
+    held = kc.Report("kernel", 1024, 0, 168, 0, cap=168)
+    assert held.failure(232448, 512) is None
+    over = dataclasses.replace(held, registers=192)
+    assert over.failure(232448, 512) is not None, over
+    # A record stating no cap (no thread count, no raise) is no evidence it holds its launch's (row 6670).
+    uncapped = dataclasses.replace(held, cap=None)
+    assert uncapped.failure(232448, 512) is not None, uncapped
+
+
+CONSUMERS_SPILL_LISTING = """
+.text.recurrence_scores_back_mosaic_gpu_kernel:
+        /*0000*/                   LDC R1, c[0x0][0x28] ;
+        /*0e60*/               @P2 BRA `(.L_x_0) ;
+.L_x_1:
+        /*0e80*/                   USETMAXREG.TRY_ALLOC.CTAPOOL UP0, 0xe8 ;
+        /*0ea0*/              @!P1 BRA `(.L_x_1) ;
+        /*27b0*/                   LDS.64 R192, [R25+0xa4a0] ;
+        /*27c0*/                   STL [R1], R173 ;
+        /*3950*/                   LDL.LU R203, [R1] ;
+        /*9a30*/               @P1 BRA `(.L_x_13) ;
+        /*9a50*/                   USETMAXREG.DEALLOC.CTAPOOL 0x18 ;
+        /*9a60*/                   S2R R4, SR_CTAID.X ;
+"""
+"""An H100's write-gated scores' backward at its producer's least (the termwise sums' 47b93b22f; its listing
+cut to its roles' setmaxnreg and a spill's store and load): its consumers raised to 232 registers, its
+16-byte spill in their code, before the producer's drop to 24."""
+
+
+def test_a_spills_roles_are_read_from_where_its_setmaxnreg_places_it():
+    """A kernel's spill stands in the role whose setmaxnreg precedes it in nvdisasm's listing (row 6744): the
+    write-gated scores' backward's after its consumers' raise, its consumers'; the same store and load after
+    the producer's drop, as a B200's decayed keys spilled (row 6747), its producer's; both where each role
+    spills; neither role's in a prologue before either setmaxnreg."""
+    spill = ("        /*27c0*/                   STL [R1], R173 ;\n"
+             "        /*3950*/                   LDL.LU R203, [R1] ;\n")
+    after_drop = CONSUMERS_SPILL_LISTING.replace(spill, "") + spill
+    assert report.spilled_roles(CONSUMERS_SPILL_LISTING) == (report.CONSUMERS,)
+    assert report.spilled_roles(after_drop) == (report.PRODUCER,)
+    assert report.spilled_roles(CONSUMERS_SPILL_LISTING + spill) == (report.CONSUMERS, report.PRODUCER)
+    assert report.spilled_roles(spill + CONSUMERS_SPILL_LISTING.replace(spill, "")) == ()
+
+
 def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read():
     """The SASS rules' disassembler comes with the compile gate (nvdisasm, the ci extra's, in every lock the
     suite runs on), and a kernel whose machine code went unread (no disassembler) is no kernel the gate
@@ -1112,7 +1214,85 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     import kernel_compile as kc
 
     assert report.disassembler() is not None
-    unread = report.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, 1024, sass=None)
+    unread = report.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, "mosaic_gpu", 1024, sass=None)
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None
+
+
+class SpillingFirst(Uncounted):
+    """`Uncounted` with the grouped forward's own candidates, its space the tile its derivation takes and a
+    paired product's widest, 128 x 256 at two stages, which spills in every compile (two accumulators of 128
+    registers a thread): a launch whose tuner meets a spilling candidate beside one that holds."""
+
+    def candidate(self, ba, config, target):
+        return super(Uncounted, self).candidate(ba, config, target)
+
+    def _get_autotuning_configs(self, ba):
+        return {ba.heuristics_config, widest(ba.heuristics_config)}
+
+
+def widest(derived):
+    """`derived`'s paired product at its widest, 128 x 256 at two stages (`SpillingFirst`)."""
+    columns = derived.grid_block_n * derived.block_n
+    return dataclasses.replace(derived, block_n=256, grid_block_n=columns // 256, stages=2)
+
+
+@lowers("sm90")
+def test_a_tuner_times_no_candidate_the_gpus_assembler_refuses():
+    """The configs a measuring tuner times (`tuning._candidates`) are those its launch's certification holds
+    (`report.certified`, as a run's derivation certifies its config): a paired launch's widest tile, which
+    spills in every compile, is never timed nor chosen, where uncertified it was timed as slow as its spills
+    and could be picked; the tile its derivation takes, which holds, is."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    op = SpillingFirst()
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((ROWS, FEATURES), jnp.bfloat16), ((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+        ((EXPERTS,), jnp.int32))]
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.refusals():
+        bound = op.bind(*operands, paired=jax.ShapeDtypeStruct((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+                        out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                        hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u))
+        derived = bound.heuristics_config
+        # The widest is a config a pin may name, which uncertified the tuner timed.
+        assert op.pinnable(bound, widest(derived))
+        assert tuning._candidates(op, bound) == [derived]
+
+
+RECONFIGURING_PTX = """
+.version 8.8
+.target sm_90a
+.address_size 64
+
+.visible .entry reconfiguring() .maxntid 384, 1, 1 .maxnreg 168
+{
+	.reg .b32 %r<2>;
+	.reg .pred %p<2>;
+	mov.u32 %r1, %tid.x;
+	setp.lt.u32 %p1, %r1, 128;
+	@%p1 bra PRODUCER;
+	setmaxnreg.inc.sync.aligned.u32 232;
+	ret;
+PRODUCER:
+	setmaxnreg.dec.sync.aligned.u32 40;
+	ret;
+}
+"""
+
+
+def test_a_binary_states_its_threads_and_the_registers_its_roles_reconfigure_to(tmp_path):
+    """A kernel of 384 threads whose producer lowers to 40 registers and whose consumers raise to 232
+    (`setmaxnreg`), assembled for an H100 by the gate's ptxas (`kernel_compile.assemblers`): its binary
+    (`report._binary`, decoded) states its threads from its `.nv.info` and the two counts from its machine
+    code (USETMAXREG), the facts the compile gate reads where no PTX of a kernel was dumped (row 7105)."""
+    from kernel_compile import assemblers
+
+    source = tmp_path / "reconfiguring.ptx"
+    source.write_text(RECONFIGURING_PTX)
+    cubin = tmp_path / "reconfiguring.cubin"
+    subprocess.run([str(assemblers("sm90")[0]), "-arch=sm_90a", str(source), "-o", str(cubin)], check=True)
+    binary = report._binary("reconfiguring", cubin.read_bytes(), decoded=True)
+    assert (binary.threads, binary.decreased, binary.raised) == (384, 40, 232), binary
+

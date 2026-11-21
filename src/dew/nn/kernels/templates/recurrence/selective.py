@@ -27,7 +27,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew._devices import deterministic_ops_requested
 from dew.nn import derivatives
 from dew.nn.kernels import generation, launches, recurrence_algebra as algebra, tuning
-from dew.nn.kernels.chunked_launch import AlignedDocuments, Forked, zero_padded
+from dew.nn.kernels.chunked_launch import Forked, zero_padded
 from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan, swizzling
 from dew.nn.kernels.templates.recurrence import mainloop
 
@@ -63,8 +63,8 @@ class Scan:
     """Whether the backward's programs own their partial sums, the run asking its reductions ordered
     (`backward`)."""
     count: int = 0
-    """A forked call's given states a row (`Forked`; zero for none): its documents laid from chunks' edges
-    (`chunked_launch.AlignedDocuments`), each chunk taking a document up from a slot of its table."""
+    """A forked call's given states a row (`Forked`; zero for none): its documents walked in place, each
+    taking its state up from a slot of its table at its first token."""
     held: int = 0
     """A forked call's stored slots a row, each a document's final a later one takes up."""
 
@@ -134,7 +134,7 @@ def forward_allocations(family: mosaic.Family, chunk: int, block: int, states: i
 
 def _slot_at(row, slot, slots: int):
     """Row `row`'s slot `slot` of its `slots`, in range: one-based, a given slot's a chunk's load
-    (`AlignedDocuments.loads`, `slots` `Scan.count`), a stored slot's a store or a load past the given slots
+    (`Chunk.loads`, `slots` `Scan.count`), a stored slot's a store or a load past the given slots
     less their count (`slots` `Scan.held`)."""
     return row * slots + jnp.clip(slot - 1, 0, slots - 1)
 
@@ -153,12 +153,11 @@ def _entered(scan: Scan, row, load, given, stored):
 @dataclasses.dataclass(frozen=True)
 class Documents:
     """A forked call's documents as a forward program walks its row (`Scan.forked`; kernel-templates.md
-    section 3, the recurrence template's `table.Taking`): before a chunk that takes a document up
-    (`AlignedDocuments.loads`: one-based, zero a zero state, -1 none, the chunk continuing the state before
-    it), its state the table's slot's, given or stored by an earlier document of the row; after a chunk
-    that ends a storing document (`AlignedDocuments.stores`), its state written to the row's stored slot,
-    which a later chunk of the same program reads back (`Family.kept`). The program's columns of each slot's
-    `[N, D]` state, a vector a state."""
+    section 3): before a document's first token (`Forked.tokens`' loads: one-based, zero a zero state, -1
+    none, the token continuing the state before it), its state the table's slot's, given or stored by an
+    earlier document of the row; after a storing document's last token (its stores), its state written to
+    the row's stored slot, which a later token of the same program reads back (`Family.kept`). The program's
+    columns of each slot's `[N, D]` state, a vector a state."""
 
     scan: Scan
     given: Any
@@ -173,21 +172,21 @@ class Documents:
     def _slot(self, ref, base) -> list:
         return [ref[base, n, self.columns] for n in range(self.scan.states)]
 
-    def taken(self, index, h) -> list:
-        """The state chunk `index` enters: `h`, or where it takes a document up, its slot's (`_entered`)."""
-        load = self.loads[self.row, index]
+    def taken(self, position, h) -> list:
+        """The state token `position` enters: `h`, or where it begins a document, its slot's (`_entered`)."""
+        load = self.loads[self.row, position]
         def take():
             return _entered(self.scan, self.row, load, functools.partial(self._slot, self.given),
                             functools.partial(self._slot, self.stored))
 
         return lax.cond(load >= 0, take, lambda: list(h))
 
-    def kept(self, index, h, *, smem) -> None:
-        """Chunk `index`'s final state `h` written to its stored slot where it ends a storing document."""
+    def kept(self, position, h, *, smem) -> None:
+        """Token `position`'s state `h` written to its stored slot where it ends a storing document."""
         stored = self.stored
         if stored is None:
             return
-        slot = self.stores[self.row, index]
+        slot = self.stores[self.row, position]
 
         @pl.when(slot > 0)
         def _():
@@ -199,15 +198,15 @@ class Documents:
 @tuning.lowered_once(("scan",))
 def forward(x, dt, b, c, parameters, state, resets, scan: Scan, table: tuple = ()):
     """The scan's outputs from padded operands: `x`, `dt` `[R, T, D]`, `b`, `c` `[R, T, N]`, `parameters`
-    `[N + PARAMETER_ROWS, D]` fp32 (the rates `A log2(e)` transposed, then the skip `D`), `state` `[R, N, D]`
+    `[N + PARAMETER_ROWS, D]` fp32 (the rates `A` transposed, then the skip `D`), `state` `[R, N, D]`
     fp32 and `resets` `[R, T, RESET_WIDTH]` int8 (a token's flag in every column; ignored unless
     `scan.packed`). Returns `y` `[R, T, D]` in `x`'s dtype, the final state `[R, N, D]` fp32, with
     `scan.entered` the entering state of each chunk opening a backward block `[R, chunks / opening, N, D]`
     fp32 (`Scan.opening`; None without): every chunk's kept 64 times what 2048-token blocks of 32-token
     chunks read (4.3 GB at Falcon 7B's step, 2970); and a forked call's stored slots `[R * held, N, D]`
     fp32 (None without). A forked call's `table` (`scan.forked`) is its given states `[R * count, N, D]`
-    fp32 and the slot each chunk takes up and stores (`AlignedDocuments.loads`, `stores` `[R, chunks]`),
-    the walk from a zero state."""
+    fp32 and the slot each token takes up and stores (`Forked.tokens`' loads and stores `[R, T]`), the walk
+    from a zero state."""
     family, chunk, block, states = scan.family, scan.chunk, scan.block, scan.states
     streams, allocations = forward_allocations(family, chunk, block, states, (x.dtype, dt.dtype, b.dtype,
                                                                               c.dtype), scan.packed)
@@ -255,7 +254,9 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan, table: tuple = (
 
                 def step(index, slots, h, accumulators):
                     if documents is not None:
-                        h = documents.taken(index, h)
+                        # A document beginning at the chunk's first token, its state the one the backward's
+                        # block opening here keeps.
+                        h = documents.taken(index * chunk, h)
                     if scan.entered:
                         @pl.when(index % scan.opening == 0)
                         def _():
@@ -266,6 +267,8 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan, table: tuple = (
                     resets = slots["resets"] if scan.packed else None
 
                     def token(t, h):
+                        if documents is not None:
+                            h = documents.taken(index * chunk + t, h)
                         step_ = dts[t, :].astype(jnp.float32)
                         value = xs[t, :].astype(jnp.float32)
                         kept = None if resets is None else 1.0 - resets[t, 0].astype(jnp.float32)
@@ -275,13 +278,13 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan, table: tuple = (
                         c = [cs[t, n].astype(jnp.float32) for n in range(states)]
                         read = algebra.selective_read(h, c, skip, value)
                         out_smem[t, :] = read.astype(out_smem.dtype)
+                        if documents is not None:
+                            documents.kept(index * chunk + t, h, smem=state_smem)
                         return h
 
                     h = lax.fori_loop(0, chunk, token, h, unroll=UNROLLED)
                     family.stored([out_smem[...]], [y_ref.at[row, pl.ds(index * chunk, chunk), columns]],
                                   smem=out_smem)
-                    if documents is not None:
-                        documents.kept(index, h, smem=state_smem)
                     return h, accumulators
 
                 h, _ = family.walk(family.fed(walked, views, 0, scan.chunks, wg), ((step, 0, scan.chunks),),
@@ -388,8 +391,10 @@ def block_positions(length: int, positions: int) -> int:
 @dataclasses.dataclass(frozen=True)
 class DocumentsBack:
     """A forked call's documents as a backward program walks a row's channel (`Scan.forked`; the design of
-    row 5288, kernel-templates.md section 3). Documents start at chunks' edges
-    (`AlignedDocuments`), where the forward took each one's state `L` up from its table. A block's states are
+    row 5288, kernel-templates.md section 3). Documents start at any token, where the forward took each one's
+    state `L` up from its table; a block walks the documents starting inside it alone (`ranges`), each
+    document's first token, slot and stored slot its own (`firsts`, `loads`, `stores` `[R, D]`, the call's
+    `Chunk.loads`). A block's states are
     scanned from its kept entering state, each document starting inside it from its `L` (`before`). Its
     cotangents are the token recurrence's `q_t = a_t (C_t dy_t + q_{t+1})` with each document isolated at its
     first token, where `q_{t0}`, the true decay's, is the gradient of `L` (`dm`), and the cotangent a
@@ -408,8 +413,12 @@ class DocumentsBack:
     scan: Scan
     given: Any
     stored: Any
+    firsts: Any
     loads: Any
     stores: Any
+    ranges: Any
+    """Each block's documents, those whose first tokens fall in it, `[R, blocks + 1]`: block `k`'s are the
+    row's `ranges[k]` to `ranges[k + 1]`."""
     dslots: Any
     exchanged: Any
     """The block scan's exchange (`block_scan.exchange_scratch`)."""
@@ -446,20 +455,23 @@ class DocumentsBack:
     def scans(self, k, n, firsts, a, written, read, entering, carried):
         """Block `k`'s states before each token, the cotangents each takes from past it, and the cotangent
         it passes the block before, at state `n`, from its documents' first tokens `firsts` (1 or 0)."""
-        scan, interpret, loads = self.scan, self.scan.interpret, self.loads
+        interpret = self.scan.interpret
         size = self.tokens.shape[1]
-        opening = size // scan.chunk
         # The states documents starting inside the block enter, at their first tokens, and the block's tokens
-        # each ending one (a chunk's last before such a first).
+        # each ending one (the token before such a first).
         self._cleared(0, 1)
         mosaic.synced(interpret)
-        for j in range(1, opening):
-            load = loads[self.row, k * opening + j]
 
-            @pl.when(load >= 0)
-            def _(j=j, load=load):
-                self.tokens[0, j * scan.chunk] = self._taken(load, n)
-                self.tokens[1, j * scan.chunk - 1] = jnp.float32(1.0)
+        def opened(d, carry):
+            at = self.firsts[self.row, d] - k * size
+
+            @pl.when(at > 0)
+            def _():
+                self.tokens[0, at] = self._taken(self.loads[self.row, d], n)
+                self.tokens[1, at - 1] = jnp.float32(1.0)
+            return carry
+
+        lax.fori_loop(self.ranges[self.row, k], self.ranges[self.row, k + 1], opened, None)
         mosaic.synced(interpret)
         entered, lasts = self._vector(0), self._vector(1)
         index = plgpu.layout_cast(lax.broadcasted_iota(jnp.int32, (size,), 0), self.layout)
@@ -480,54 +492,52 @@ class DocumentsBack:
         plgpu.store(self.tokens.at[3], products * firsts, optimized=False)
         self._cleared(4)
         mosaic.synced(interpret)
-        self._resolved(k, n, opening)
+        self._resolved(k, n, size)
         injected = self._vector(4)
         after, passed = block_scan.linear_scan(a * cut, a * read * cut + injected, carried, self.exchanged,
                                                reverse=True, exclusive=True, interpret=interpret)
         return before, after, passed
 
-    def _resolved(self, k, n, opening: int) -> None:
+    def _resolved(self, k, n, size: int) -> None:
         """Block `k`'s documents resolved from its last at state `n`: each one's `dm` sent to the slot it took
         up (a given slot's gradient, or summed into a stored one's `G`), and the `G` of the document before
         each written at its first token (`tokens[4]`) for the cotangents' last scan."""
         scan, interpret = self.scan, self.scan.interpret
         loads, stores, dslots = self.loads, self.stores, self.dslots
-        chunk = scan.chunk
-        later = jnp.int32(-1)
-        for j in reversed(range(opening)):
-            chunked = k * opening + j
-            load = loads[self.row, chunked]
+        lo, hi = self.ranges[self.row, k], self.ranges[self.row, k + 1]
+
+        def resolved(i, carry):
+            d = hi - 1 - i
+            at = self.firsts[self.row, d] - k * size
+            load = loads[self.row, d]
             # The document starting here ends inside the block where one starts after it: its `G` the stored
-            # sum of its slot, held at its last chunk's store.
-            ends = later >= 0
-            store = stores[self.row, jnp.maximum(later - 1, 0)]
+            # sum of its slot.
+            ends = d + 1 < hi
+            store = stores[self.row, d]
             final = 0.0
             if scan.held:
                 final = jnp.where(ends & (store > 0), self._slot(dslots, self._summed(store), n), 0.0)
-            dm = self.tokens[2, j * chunk] + jnp.where(ends, self.tokens[3, j * chunk] * final, 0.0)
-            taken = load >= 0
+            dm = self.tokens[2, at] + jnp.where(ends, self.tokens[3, at] * final, 0.0)
             # The slot `dm` is sent to: a given one's gradient, or a stored one's sum past the given slots.
-            sent = [(taken & (load > 0) & (load <= scan.count), _slot_at(self.row, load, scan.count))]
+            sent = [((load > 0) & (load <= scan.count), _slot_at(self.row, load, scan.count))]
             if scan.held:
-                sent.append((taken & (load > scan.count), self._summed(load - scan.count)))
+                sent.append((load > scan.count, self._summed(load - scan.count)))
             sums = [(when, at, self._slot(dslots, at, n)) for when, at in sent]
             mosaic.synced(interpret)
-            for when, at, summed in sums:
+            for when, slot, summed in sums:
                 @pl.when(when)
-                def _(at=at, summed=summed, dm=dm):
-                    dslots[at, n, self.channel] = summed + dm
+                def _(slot=slot, summed=summed, dm=dm):
+                    dslots[slot, n, self.channel] = summed + dm
             mosaic.synced(interpret)
             # The document before this one ends at its first token: its `G`, every later document's `dm`
             # summed into its stored slot by now.
-            before = stores[self.row, jnp.maximum(chunked - 1, 0)]
             if scan.held:
-                ended = jnp.where((chunked > 0) & (before > 0), self._slot(dslots, self._summed(before), n),
-                                  0.0)
+                before = stores[self.row, jnp.maximum(d - 1, 0)]
+                self.tokens[4, at] = jnp.where((d > 0) & (before > 0),
+                                               self._slot(dslots, self._summed(before), n), 0.0)
+            return carry
 
-                @pl.when(taken)
-                def _(j=j, ended=ended):
-                    self.tokens[4, j * chunk] = ended
-            later = jnp.where(taken, chunked, later)
+        lax.fori_loop(0, hi - lo, resolved, None)
         mosaic.synced(interpret)
 
 
@@ -544,7 +554,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
     block's entering state by a scan (`block_scan.linear_scan`, each token's state before it, `h_{t-1}`), then
     its cotangents back by a reverse one from the state's carried from the block after (`dfinal` past the
     last): `q_t = a_t (C_t dy_t + q_{t+1})`, the cotangent a token passes the state before it, so
-    `g_t = C_t dy_t + q_{t+1}` the state's own, its decay `a_t = exp2(dt_t rate)` (zero at a document's
+    `g_t = C_t dy_t + q_{t+1}` the state's own, its decay `a_t = exp(dt_t A)` (zero at a document's
     first token). The channel's gradients sum over its states in registers; the states' B and C gradients
     sum over the channels in global memory, each program's added atomically (mamba_ssm's atomicAdd), a
     block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped), into one of
@@ -560,8 +570,6 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
     states, positions = b.shape[1], block_positions(length, scan.positions)
     blocks = length // positions
     interpret = scan.interpret
-    if scan.forked and positions % scan.chunk:
-        raise ValueError(f"a backward block of {positions} tokens holds no whole chunks of {scan.chunk}")
     layout = block_scan.blocked(positions)
     owned = scan.owned
     partials = math.gcd(PARTIALS, channels) if owned else min(PARTIALS, channels)
@@ -573,11 +581,12 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
         row = lax.axis_index("rows")
         walked = None
         if scan.forked:
-            (given_ref, stored_ref, loads_ref, stores_ref, dbc_ref, dslots_ref, dx_ref, ddt_ref, da_ref,
-             dd_ref, dstate_ref, exchanged, staged, carried, tokens) = refs
+            (given_ref, stored_ref, firsts_ref, loads_ref, stores_ref, ranges_ref, dbc_ref, dslots_ref,
+             dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried, tokens) = refs
             # A channel's walk of the row's documents.
-            walked = functools.partial(DocumentsBack, scan, given_ref, stored_ref, loads_ref, stores_ref,
-                                       dslots_ref, exchanged, tokens, layout, x.shape[0], row)
+            walked = functools.partial(DocumentsBack, scan, given_ref, stored_ref, firsts_ref, loads_ref,
+                                       stores_ref, ranges_ref, dslots_ref, exchanged, tokens, layout,
+                                       x.shape[0], row)
         else:
             dbc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried = refs
 
@@ -601,9 +610,10 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
             documents, firsts = ((None, None) if walked is None else
                                  (walked(channel), load(resets_ref.at[row, span])))
 
+            skip = parameters_ref[states, channel]
+            dx_init, dx_step, dx_inv = algebra.selective_dx_scale(skip, dys, dts)
             def state(n, sums):
-                # A state a turn, rolled: unrolled, the states' operands lived together and spilled 12 KB
-                # a thread (255 registers, an H100's compile, scanbwd-ptxas-sm90 at 5de7abaa0).
+                # Rolled: unrolled, the states spilled 12 KB/thread (scanbwd-ptxas-sm90 at 5de7abaa0).
                 dx, ddt = sums
                 rate = parameters_ref[n, channel]
                 bs, cs = load(b_ref.at[row, n, span]), load(c_ref.at[row, n, span])
@@ -616,7 +626,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
                     if documents is None else
                     documents.scans(k, n, firsts, a, written, read, entering, carried[0, n]))
                 d_value, d_step, d_b, d_c, d_rate = algebra.selective_adjoint(
-                    read + after, before, a, written, dts, xs, bs, dys, rate)
+                    read + after, before, a, written, dts, xs, bs, dys, rate, dx_step=dx_step)
                 # The rate's gradient so far read before the sum's barriers, so no thread reads another's
                 # write of it: read after, an A100's threads added the block's sum twice over (1.6e-2 of
                 # dA from float64 against the rest's 4e-7, mamba1-scan-a100-7d3152837).
@@ -627,9 +637,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
                 added(dbc_ref.at[0, partial, row, n, span], d_b)
                 added(dbc_ref.at[1, partial, row, n, span], d_c)
                 return dx + d_value, ddt + d_step
-
-            zeros = jnp.zeros((positions,), jnp.float32)
-            dx, ddt = lax.fori_loop(0, states, state, (parameters_ref[states, channel] * dys, zeros))
+            dx, ddt = lax.fori_loop(0, states, state, (dx_init, jnp.zeros((positions,), jnp.float32)))
+            dx = dx * dx_inv
             plgpu.store(dx_ref.at[row, channel, span], dx, optimized=False)
             plgpu.store(ddt_ref.at[row, channel, span], ddt, optimized=False)
             return d_skip + block_scan.summed(dys * xs, exchanged, interpret=interpret)
@@ -668,10 +677,13 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
                        *, programs: int, partials: int):
     """`backward`'s launch of its program `entry`, a row's `programs` a program each, and its outputs:
     `(dx, ddt, db, dc, dA, dD, dstate)`, B's and C's gradients summed over their `partials` buffers; a forked
-    call's (`table`: its given states, its stored slots, the slots each chunk takes up and stores) the given
+    call's (`table`: its given states, its stored slots, its documents' firsts, slots and stored slots, and
+    each block's documents, `DocumentsBack`) the given
     states' gradient `[R * count, N, D]` after them, its stored slots' sums a scratch of the launch's."""
     rows, channels, _ = x.shape
     states, positions = b.shape[1], block_positions(x.shape[2], scan.positions)
+    if scan.forked and positions % scan.chunk:
+        raise ValueError(f"a backward block of {positions} tokens holds no whole chunks of {scan.chunk}")
     interpret = scan.interpret
     sized = jax.ShapeDtypeStruct
     out_type = (sized(x.shape, jnp.float32), sized(x.shape, jnp.float32),
@@ -725,10 +737,10 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     Returns `(y [B, S, D], final state [B, D, N])` in `x`'s dtype. The sequence is padded to whole chunks
     with a zero step, which neither decays nor writes. `chunk` divides the backward's block
     (`block_positions`), which starts from a chunk's entering state the forward keeps. A forked call
-    (`forked`, `recurrence_chunk.Chunk.loads`; `state` `[B, S', D, N]` its table's given states) lays each
-    document from a chunk's edge, each taking its state up there from its table and a storing one leaving
-    its final in its slot (`Documents`, `AlignedDocuments`), the portable scan's arithmetic; its final state
-    is the row's last."""
+    (`forked`, `recurrence_chunk.Chunk.loads`; `state` `[B, S', D, N]` its table's given states) walks its
+    documents in place, each taking its state up at its first token from its table and a storing one leaving
+    its final in its slot at its last (`Documents`), the portable scan's arithmetic; its final state is the
+    row's last."""
     # The backward's plan its caller derived (`Selective.derived`), else this device's, interpreted the
     # interpreted target's (`generation.interpreted_target`).
     positions, resident = plan or backward_plan(generation.interpreted_target() if interpret
@@ -738,52 +750,55 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
                          f"{block_scan.THREADS * positions}: its blocks start at no kept state")
     rows, length, channels = x.shape
     states = A.shape[-1]
-    table, count, held, aligned = (), 0, 0, None
+    padded = -(-length // chunk) * chunk
+    table, count, held = (), 0, 0
     if forked is not None:
-        aligned = AlignedDocuments.of(forked, length, chunk)
-        x, dt, B, C = aligned.laid(x, dt, B, C)
-        # The given states `[B, S', D, N]` as the walk reads a slot, `[N, D]`, rows leading.
+        # The given states `[B, S', D, N]` as the walk reads a slot, `[N, D]`, rows leading; each token's
+        # load and store (`Forked.tokens`), a padded token's none.
         given = jnp.swapaxes(jnp.asarray(state, jnp.float32), 2, 3)
-        count, held, starts, state = given.shape[1], forked.held, None, None
-        table = (given.reshape(rows * count, states, channels), aligned.loads, aligned.stores)
-    padded = -(-x.shape[1] // chunk) * chunk
+        count, held, state = given.shape[1], forked.held, None
+        loads, stores = (jnp.pad(t, ((0, 0), (0, padded - length)), constant_values=fill)
+                         for t, fill in zip(forked.tokens(length)[:2], (-1, 0), strict=True))
+        # Each document's first token (past the padded row where it holds none), slot and stored slot, the
+        # backward's (`DocumentsBack`).
+        documents = (jnp.where(forked.firsts < length, forked.firsts, padded).astype(jnp.int32),
+                     jnp.asarray(forked.loads, jnp.int32), jnp.asarray(forked.stores, jnp.int32))
+        table = (given.reshape(rows * count, states, channels), loads, stores, *documents)
+        # A forked call's documents' first tokens: the backward's isolation, the forward's take its table's
+        # (`scan.packed` off).
+        starts = loads[:, :length] >= 0
 
     pad = functools.partial(zero_padded, axis=1, size=padded)
-    if aligned is not None:
-        # A forked call's documents' first tokens, each a chunk's first that takes one up: the backward's
-        # isolation, the forward's take its table's (`scan.packed` off).
-        starts = jnp.repeat(aligned.loads >= 0, chunk, axis=1) & (jnp.arange(padded) % chunk == 0)
     resets = (jnp.zeros((rows, padded, RESET_WIDTH), jnp.int8) if starts is None else
               jnp.broadcast_to(pad(jnp.asarray(starts, jnp.int8))[..., None], (rows, padded, RESET_WIDTH)))
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
                 else jnp.swapaxes(jnp.asarray(state, jnp.float32), 1, 2))
     scan = Scan(rows, padded, channels, states, chunk, block, family, positions, resident, interpret,
-                packed=starts is not None and aligned is None, launch=report.launch_digest(),
+                packed=starts is not None and forked is None, launch=report.launch_digest(),
                 owned=deterministic_ops_requested(), count=count, held=held)
     y, final = _scan(pad(x), pad(dt), jnp.asarray(A, jnp.float32), pad(B), pad(C),
                      jnp.asarray(D, jnp.float32), entering, resets, scan, *table)
-    y = y[:, :x.shape[1]] if aligned is None else aligned.unlaid(y)
     return y[:, :length], jnp.swapaxes(final, 1, 2).astype(x.dtype)
 
 
 def _parameters(A, D, channels: int):
-    """`forward`'s parameter tile: the rates `A log2(e)` transposed, then the skip, padded to the stream's
-    rows."""
+    """`forward`'s parameter tile: the rates `A` transposed (`algebra.selective_decay` takes them to base 2
+    after the step multiplies them), then the skip, padded to the stream's rows."""
     padding = jnp.zeros((PARAMETER_ROWS - 1, channels), jnp.float32)
-    return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], padding])
+    return jnp.concatenate([A.T, D[None], padding])
 
 
 def _scan_primal(x, dt, A, B, C, D, entering, resets, scan: Scan, *table):
     """`forward` over padded operands, its gradient `backward`'s: `(y, final [R, N, D] fp32)`; a forked
     call's `table` (`forward`'s)."""
-    y, final, *_ = forward(x, dt, B, C, _parameters(A, D, scan.channels), entering, resets, scan, table)
+    y, final, *_ = forward(x, dt, B, C, _parameters(A, D, scan.channels), entering, resets, scan, table[:3])
     return y, final
 
 
 def _scan_forward(x, dt, A, B, C, D, entering, resets, scan: Scan, *table):
     kept = dataclasses.replace(scan, entered=True)
     y, final, entered, stored = forward(x, dt, B, C, _parameters(A, D, scan.channels), entering, resets,
-                                        kept, table)
+                                        kept, table[:3])
     return (y, final), (x, dt, A, B, C, D, entered, resets, table, stored)
 
 
@@ -791,17 +806,16 @@ def _scan_backward(scan: Scan, residuals, grads):
     x, dt, A, B, C, D, entered, resets, table, stored = residuals
     dy, dfinal = grads
     # A forked call's table as the backward reads it: given, stored (one slot of zeros where none is held),
-    # then each chunk's slots taken up and stored.
+    # then its documents' firsts, slots and stored slots, and each block's documents (`DocumentsBack`).
     positions = block_positions(scan.length, scan.positions)
     padded = -(-scan.length // positions) * positions
     tabled = ()
     if table:
-        given, loads, stores = table
-        chunks = padded // scan.chunk
-        widened = (jnp.pad(loads, ((0, 0), (0, chunks - loads.shape[1])), constant_values=-1),
-                   jnp.pad(stores, ((0, 0), (0, chunks - stores.shape[1]))))
+        given, _, _, firsts, loads, stores = table
+        edges = jnp.arange(padded // positions + 1, dtype=jnp.int32) * positions
+        ranges = jax.vmap(lambda row: jnp.searchsorted(row, edges, side='left'))(firsts).astype(jnp.int32)
         tabled = (given, stored if stored is not None else jnp.zeros((1, *given.shape[1:]), jnp.float32),
-                  *widened)
+                  firsts, loads, stores, ranges)
 
     def leading(t):
         """`t` `[R, T, ...]` with its tokens last, padded to whole blocks: a zero token decays nothing,
@@ -824,7 +838,7 @@ def _scan_backward(scan: Scan, residuals, grads):
               trailing(dc).astype(C.dtype), dstate, dgiven)
     (dx, ddt, db, dc, dstate, dgiven), (da, dd) = derivatives.with_gradients_formed(
         inputs, (da.sum(0).T.astype(A.dtype), dd.sum(0).astype(D.dtype)))
-    return (dx, ddt, da, db, dc, dd, dstate, None, *(() if not table else (dgiven, None, None)))
+    return (dx, ddt, da, db, dc, dd, dstate, None, *(() if not table else (dgiven, *(None,) * 5)))
 
 
 _scan = derivatives.contracted("test_the_selective_scan_holds_its_orders")(

@@ -93,6 +93,7 @@ from dew.nn.precision import (
     correctly_rounded_divide,
     float32_einsum,
     twice_scaled,
+    uncontracted,
 )
 from dew.nn.sharding import abstract
 
@@ -562,14 +563,15 @@ def expert_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]) -
 
 def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
     """The logical axes of each leaf of an expert bank's `matrix` (`expert_matrix`), its own `[experts, in,
-    out]` being `axes`: one leaf, the matrix; a packed bank's three (`NvFp4`), its words and block scales
-    `[experts, out, in / 8 or in / 16]` and its tensor scales `[experts]`, in its leaves' order."""
+    out]` being `axes`: one leaf, the matrix; a packed bank's four (`NvFp4`), its words and block scales
+    `[experts, out, in / 8 or in / 16]`, its tensor scales `[experts]` and its form's version bytes, whole on
+    every device, in its leaves' order."""
     from dew.nn.kernels.formats import NvFp4
 
     if not isinstance(matrix, NvFp4):
         return [tuple(axes)]
     experts, inputs, outputs = axes
-    return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,)]
+    return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,), (None,)]
 
 
 def decoded_expert_banks(variables: Variables) -> Variables:
@@ -766,7 +768,7 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     multiplier = declared(reciprocal(safe) * E4M3_MAX)
     scale = reciprocal(multiplier)
     # The composed GPU forward must round this product before the FP8 cast.
-    quotients = jax.lax.optimization_barrier(values * multiplier)
+    (quotients,) = uncontracted(values * multiplier)
     broadcast_shape = (1,) * values.ndim
     quantized = _cast(qwix, quotients, jnp.float8_e4m3fn)
     quantized = quantized.replace(scale=scale.reshape(broadcast_shape))

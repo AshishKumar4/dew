@@ -30,6 +30,7 @@ stand-in and logvar-head weights among them, are a seeded NumPy draw
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import functools
 import types
@@ -67,7 +68,8 @@ def published(repo: str, commit: str, path: str, dtype: str,
         return module
     kept = selected(source, keep, filename=url)
     for node in kept:
-        node.decorator_list = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            node.decorator_list = []
     module.__dict__.update(torch=torch, np=np)
     ran(kept, module.__dict__, url)
     return module
@@ -132,7 +134,8 @@ def draw(seed: int) -> dict[str, np.ndarray]:
         "normals": generator.standard_normal(IMAGES).astype(np.float32),
         "noise": generator.standard_normal((IMAGES, CHANNELS, SIZE, SIZE)).astype(np.float32),
         "a": generator.normal(0.5, 0.2, CHANNELS).astype(np.float32),
-        "b": np.float32(generator.normal(0.3, 0.1)), "c": np.float32(generator.normal(-0.1, 0.1)),
+        "b": np.asarray(generator.normal(0.3, 0.1), np.float32),
+        "c": np.asarray(generator.normal(-0.1, 0.1), np.float32),
         "logvar/freqs": (2 * np.pi * generator.standard_normal(LOGVAR_CHANNELS)).astype(np.float32),
         "logvar/phases": (2 * np.pi * generator.uniform(0, 1, LOGVAR_CHANNELS)).astype(np.float32),
         "logvar/weight": generator.standard_normal((1, LOGVAR_CHANNELS)).astype(np.float32),
@@ -150,7 +153,7 @@ def main() -> None:
     for dtype in (torch.float32, torch.float64):
         name = str(dtype).removeprefix("torch.")
         networks = published("NVlabs/edm", EDM, "training/networks.py", name)
-        networks.Affine = functools.partial(Affine, dtype)
+        vars(networks)["Affine"] = functools.partial(Affine, dtype)  # the published module's own, replaced
         edm2 = published("NVlabs/edm2", EDM2, "training/networks_edm2.py", name)
         built[dtype] = (networks, published("NVlabs/edm", EDM, "training/loss.py", name, keep={"EDMLoss"}),
                         edm2, published("NVlabs/edm2", EDM2, "training/training_loop.py", name,

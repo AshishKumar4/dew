@@ -36,6 +36,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
 from dew.nn import derivatives
+from dew.nn.aligned import aligned_cotangents
 from dew.nn.kernels import launches
 
 from ..precision import exact_float32
@@ -127,7 +128,7 @@ def _bottom(size: int):
     """`mask[i, j] = (i == C - 1)`, the bottom row of a `[C, C]` tile. Reading
     and writing that row is a masked reduction here because neither backend
     lowers a slice of a value."""
-    return jax.lax.broadcasted_iota(jnp.int32, (size, size), 0) == size - 1
+    return jax.lax.broadcasted_iota(jnp.int32, (size, size), 0) == jnp.int32(size - 1)
 
 
 def _last_row(matrix):
@@ -186,107 +187,237 @@ def _chunk_backward(x, b, c, a, state, dy, dnext):
     return dx, db, dc, da, dstate
 
 
-def _tpu_forward(x_ref, b_ref, c_ref, a_ref, state_ref, *refs, documents: bool = False, held: int = 0,
-                 entered: bool = False):
+def _tpu_forward(x_ref, b_ref, c_ref, a_ref, state_ref, y_ref, final_ref, *saved):
     """`grid=(batch, heads, chunks)` with the chunk innermost. `final_ref`'s
     window does not move with the chunk, so it carries the state as well as
     returning it; on the chunk that opens a head it holds nothing yet, and the
-    state the caller passed is read instead. A forked call's (`documents`,
-    `_ssd_scan`'s): a chunk whose `load` is past -1 enters that one-based table
-    slot's memory (`given`'s first, then the `held` stored; zero a zero memory)
-    in place of the carried one, and one whose `store` is past zero leaves its
-    memory in that stored slot (`table`, whose window, as `final_ref`'s, does
-    not move with the chunk); where `entered`, a chunk taking a slot up adds its
-    entry write (`entry_ref`) to the memory it takes."""
-    forked = table = entry_ref = None
-    if documents:
-        given_ref, load_ref, store_ref, *refs = refs
-        entry_ref = refs.pop(0) if entered else None
-        y_ref, final_ref, *saved = refs
-        table = saved.pop(0) if held else None
-        forked = (given_ref, load_ref, store_ref)
-    else:
-        y_ref, final_ref, *saved = refs
+    state the caller passed is read instead."""
     opening = pl.program_id(2) == 0
     carried = jnp.where(opening, state_ref[...], final_ref[...])
-    if forked is not None:
-        given, load_ref, _ = forked
-        if table is not None:
-            emptied = table
-
-            @pl.when(opening)
-            def _():
-                emptied[...] = jnp.zeros(emptied.shape, emptied.dtype)
-        load = load_ref[...]
-        taken = jnp.zeros_like(carried)
-        count = given.shape[0]
-        for slot in range(count):
-            taken = jnp.where(load == slot + 1, given[slot], taken)
-        if table is not None:
-            for slot in range(held):
-                taken = jnp.where(load == count + slot + 1, table[slot], taken)
-        carried = jnp.where(load >= 0, taken if entry_ref is None else taken + entry_ref[...], carried)
     for entered_ref in saved:
         entered_ref[...] = carried
     y, leaving = _chunk_forward(x_ref[...], b_ref[...], c_ref[...], a_ref[...], carried)
     y_ref[...] = y
     final_ref[...] = leaving
-    if forked is not None and table is not None:
-        store = forked[2][...]
-        for slot in range(held):
-            table[slot] = jnp.where(store == slot + 1, leaving, table[slot])
 
 
-def _tpu_backward(x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref, dfinal_ref, *refs,
-                  documents: bool = False, held: int = 0, entered: bool = False):
+def _tpu_backward(x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref, dfinal_ref, dx_ref, db_ref, dc_ref, da_ref,
+                  dstate_ref):
     """`_tpu_forward` read backwards. The grid still counts up; the index maps
     hand it the chunks in reverse, and `dstate_ref` carries as `final_ref`
-    did. A forked call's: at a chunk that stored a slot, the slot's gradient
-    (`dtable`, each later chunk that took it up's) joins the state it left; at a
-    chunk that took a slot up, the gradient of the state it entered goes to that
-    slot's (`dgiven` for a given memory's), and to its entry write's
-    (`dentry_ref`, where `entered`), and none carries before it."""
-    forked = table = dentry_ref = None
-    if documents:
-        load_ref, store_ref, dx_ref, db_ref, dc_ref, da_ref, dstate_ref, dgiven, *dtable = refs
-        forked = (load_ref, store_ref, dgiven)
-        dentry_ref = dtable.pop() if entered else None
-        table = dtable[0] if held else None
-    else:
-        dx_ref, db_ref, dc_ref, da_ref, dstate_ref = refs
+    did."""
     opening = pl.program_id(2) == 0
     dnext = jnp.where(opening, dfinal_ref[...], dstate_ref[...])
-    if forked is not None:
-        load_ref, store_ref, dgiven = forked
-        emptied = [ref for ref in (dgiven, table) if ref is not None]
-
-        @pl.when(opening)
-        def _():
-            for ref in emptied:
-                ref[...] = jnp.zeros(ref.shape, ref.dtype)
-
-        if table is not None:
-            store = store_ref[...]
-            for slot in range(held):
-                stored = store == slot + 1
-                dnext = dnext + jnp.where(stored, table[slot], 0.0)
-                table[slot] = jnp.where(stored, 0.0, table[slot])
     dx, db, dc, da, dstate = _chunk_backward(
         x_ref[...], b_ref[...], c_ref[...], a_ref[...], entered_ref[...], dy_ref[...], dnext)
     dx_ref[...], db_ref[...], dc_ref[...], da_ref[...] = dx, db, dc, da
-    if forked is not None:
-        load_ref, _, dgiven = forked
-        load = load_ref[...]
-        count = dgiven.shape[0]
-        for slot in range(count):
-            dgiven[slot] = dgiven[slot] + jnp.where(load == slot + 1, dstate, 0.0)
-        if table is not None:
-            for slot in range(held):
-                table[slot] = table[slot] + jnp.where(load == count + slot + 1, dstate, 0.0)
-        if dentry_ref is not None:
-            dentry_ref[...] = jnp.where(load >= 0, dstate, 0.0)
-        dstate = jnp.where(load >= 0, 0.0, dstate)
     dstate_ref[...] = dstate
+
+
+def _marked(loads_ref, t):
+    """Whether token `t` of a chunk opens one of its segments: its first, or a document's first (its `load`
+    past -1, `recurrence_chunk.Chunk.loads`), read from the chunk's loads in scalar memory."""
+    return (t == jnp.int32(0)) | (loads_ref[0, t] >= jnp.int32(0))
+
+
+def _segment_count(loads_ref, count: int):
+    """The segments (documents) opening inside a chunk of `count` tokens (row 9078)."""
+    return jax.lax.fori_loop(jnp.int32(0), jnp.int32(count),
+                             lambda t, n: n + _marked(loads_ref, t).astype(jnp.int32), jnp.int32(0))
+
+
+def _segment_after(loads_ref, origin, count: int):
+    """The token after the segment opening at `origin`: the next token opening one, else the chunk's end."""
+    end = jnp.int32(count)
+
+    def found(t, after):
+        return jnp.where((after == end) & _marked(loads_ref, t), t, after)
+
+    return jax.lax.fori_loop(origin + jnp.int32(1), end, found, end)
+
+def _windowed(x, b, c, a, origin, through):
+    """A chunk's operands with every token outside `[origin, through]` the identity step: no input, read or
+    write, a unit decay (`a` zero), as the portable math's window (`scan.Derived.prepare`'s `window`)."""
+    rows = jax.lax.broadcasted_iota(jnp.int32, (x.shape[0], 1), 0)
+    steps = jax.lax.broadcasted_iota(jnp.int32, a.shape, a.ndim - 1)
+    inside = (rows >= origin) & (rows <= through)
+    held = inside.astype(x.dtype)
+    return (x * held, b * held, c * held, jnp.where((steps >= origin) & (steps <= through), a, 0.0)), inside
+
+
+def _slot(given_ref, table, at, zero):
+    """The memory at one-based table slot `at`: `given_ref`'s first, then the stored `table`'s; zero at slot
+    zero."""
+    count = given_ref.shape[0]
+    taken = zero
+    for slot in range(count):
+        taken = jnp.where(at == jnp.int32(slot + 1), given_ref[slot], taken)
+    if table is not None:
+        for slot in range(table.shape[0]):
+            taken = jnp.where(at == jnp.int32(count + slot + 1), table[slot], taken)
+    return taken
+
+
+def _opened(given_ref, table, entry, load, add, document, zero):
+    """The memory a document opening at a token enters: its one-based table slot's (`_slot`) and the slot
+    it adds (`add`, `Chunk.adds`: zero, none), its entry write added where the call gives one (`entry`: each
+    document's keys `[R, N]`, values `[P, R]` and weight `[1, 1]`, a term's three factors at a time,
+    `precision.twice_scaled`)."""
+    taken = _slot(given_ref, table, load, zero) + _slot(given_ref, table, add, zero)
+    if entry is None:
+        return taken
+    # Imported here: the kernels' package imports this module, and the launch's module reaches the run's
+    # stated values (`dew._stated`) through its tuning, which a test imports before the package.
+    from dew.nn.kernels.chunked_launch import entry_write
+
+    key, value, weight = (ref[document] for ref in entry)
+    # Its terms' outer products summed aligned to the largest, which may leave fp32's range where the
+    # sum is in it (`aligned.aligned_sum`).
+    return taken + entry_write(key, value, weight, values_first=True)
+
+
+def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_ref, c_ref, a_ref, state_ref,
+                        given_ref, *refs, held: int, entered: bool, keep: bool):
+    """A forked call's chunk (`_forked_forward`), its documents walked in place: the chunk's segments in turn,
+    a segment a document's tokens within it, each from the memory entering it, the chunk's own where its
+    document continued from the chunk before, else its document's, taken up from its table at its first token
+    (`_opened`, the stored slots as the segments before left them, so a document stores and a later one of the
+    same chunk loads); each its window of the chunk (`_windowed`, `_chunk_forward`), its state left in its
+    document's stored slot where the segment ends a storing document, and carried where it ends the chunk.
+    Each token's load, store and document are the chunk's in scalar memory, its segments' bounds read from
+    them."""
+    entry = refs[:3] if entered else None
+    y_ref, final_ref, *outputs = refs[3:] if entered else refs
+    table = outputs.pop(0) if held else None
+    count = x_ref.shape[0]
+    opening = pl.program_id(2) == 0
+    carried = jnp.where(opening, state_ref[...], final_ref[...])
+    if table is not None:
+        @pl.when(opening)
+        def _():
+            table[...] = jnp.zeros(table.shape, table.dtype)
+    if keep:
+        outputs[0][...] = carried
+    x, b, c, a = x_ref[...], b_ref[...], c_ref[...], a_ref[...]
+    segments = _segment_count(loads_ref, count)
+
+    def segment(_, state):
+        y, leaving, origin = state
+        after = _segment_after(loads_ref, origin, count)
+        through = after - jnp.int32(1)
+        load = loads_ref[0, origin]
+        memory = jnp.where(load < jnp.int32(0), carried, _opened(given_ref, table, entry, load,
+                                                                 adds_ref[0, origin], begun_ref[0, origin],
+                                                                 jnp.zeros_like(carried)))
+        operands, inside = _windowed(x, b, c, a, origin, through)
+        out, left = _chunk_forward(*operands, memory)
+        if table is not None:
+            store = stores_ref[0, through]
+            for slot in range(held):
+                table[slot] = jnp.where(store == jnp.int32(slot + 1), left, table[slot])
+        return jnp.where(inside, out, y), jnp.where(through == jnp.int32(count - 1), left, leaving), after
+
+    y, leaving, _ = jax.lax.fori_loop(jnp.int32(0), segments, segment,
+                                      (jnp.zeros(y_ref.shape, jnp.float32), carried, jnp.int32(0)))
+    y_ref[...] = y
+    final_ref[...] = leaving
+
+
+def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_ref, c_ref, a_ref, entered_ref,
+                         dy_ref, dfinal_ref, given_ref, *refs, held: int, entered: bool):
+    """`_tpu_forked_forward` read backwards, the chunks in reverse and each chunk's segments last first, the
+    table the forward's last (`table`: each slot stored once, before every document that loads it): a
+    segment's gradients from its window (`_chunk_backward`), the state it left's its slot's gradient where it
+    stored one (each later document that took it up's) and the next chunk's where it ends the chunk; the
+    gradient of the memory it entered the chunk before's where its document continued, else its slot's
+    (`dgiven` for a given memory's, `dtable` for a stored one's) and its entry write's operands'."""
+    table, *refs = refs if held else (None, *refs)
+    entry = refs[:3] if entered else None
+    refs = refs[3:] if entered else refs
+    dx_ref, db_ref, dc_ref, da_ref, dstate_ref, dgiven, *outputs = refs
+    dtable = outputs.pop(0) if held else None
+    dentry = outputs if entered else None
+    count = x_ref.shape[0]
+    opening = pl.program_id(2) == 0
+
+    @pl.when(opening)
+    def _():
+        for ref in (dgiven, *(() if dtable is None else (dtable,)), *(dentry or ())):
+            ref[...] = jnp.zeros(ref.shape, ref.dtype)
+
+    dnext = jnp.where(opening, dfinal_ref[...], dstate_ref[...])
+    x, b, c, a, dy, start = x_ref[...], b_ref[...], c_ref[...], a_ref[...], dy_ref[...], entered_ref[...]
+    segments = _segment_count(loads_ref, count)
+
+    def origin_of(k):
+        def counted(t, state):
+            seen, origin = state
+            marked = _marked(loads_ref, t)
+            return seen + marked.astype(jnp.int32), jnp.where(marked & (seen == k), t, origin)
+
+        return jax.lax.fori_loop(jnp.int32(0), jnp.int32(count), counted, (jnp.int32(0), jnp.int32(0)))[1]
+
+    def segment(i, state):
+        dx, db, dc, da, dprev = state
+        k = segments - jnp.int32(1) - i
+        origin = origin_of(k)
+        through = _segment_after(loads_ref, origin, count) - jnp.int32(1)
+        load, add = loads_ref[0, origin], adds_ref[0, origin]
+        document = begun_ref[0, origin]
+        memory = jnp.where(load < jnp.int32(0), start, _opened(given_ref, table, entry, load, add, document,
+                                                               jnp.zeros_like(start)))
+        dleft = jnp.where(through == jnp.int32(count - 1), dnext, 0.0)
+        if dtable is not None:
+            store = stores_ref[0, through]
+            for slot in range(held):
+                stored = store == jnp.int32(slot + 1)
+                dleft = dleft + jnp.where(stored, dtable[slot], 0.0)
+                dtable[slot] = jnp.where(stored, 0.0, dtable[slot])
+        operands, inside = _windowed(x, b, c, a, origin, through)
+        steps = jax.lax.broadcasted_iota(jnp.int32, a.shape, a.ndim - 1)
+        within = (steps >= origin) & (steps <= through)
+        wx, wb, wc, wa, dmemory = _chunk_backward(*operands, memory, jnp.where(inside, dy, 0.0), dleft)
+        count_given = given_ref.shape[0]
+        # The slot a document loads and the one it adds (zero, none) each take its memory's gradient.
+        for at in (load, add):
+            for slot in range(count_given):
+                dgiven[slot] = dgiven[slot] + jnp.where(at == jnp.int32(slot + 1), dmemory, 0.0)
+            if dtable is not None:
+                for slot in range(held):
+                    dtable[slot] = dtable[slot] + jnp.where(at == jnp.int32(count_given + slot + 1), dmemory,
+                                                            0.0)
+        if entry is not None and dentry is not None:
+            # Formed only where the segment opens its document: a continuation's memory gradient is the
+            # chunk's, against which a term's products left fp32's range where the document's are in it,
+            # and masked after, inf times zero gave every key gradient NaN (base review 13abb0d6b F1).
+            entries, gradients = entry, dentry
+
+            @pl.when(load >= jnp.int32(0))
+            def _():
+                from dew.nn.kernels.chunked_launch import entry_terms
+
+                key, value, weight = (ref[document] for ref in entries)
+                dkey, dvalue, dweight = gradients
+                # The entry write's transpose in its own layout (`entry_terms`), each distinct factor's
+                # cotangent in order of first appearance (`aligned_cotangents`): the shared weight's one, its
+                # terms' products summed aligned before they round (each term's rounded apart, two past
+                # fp32's largest that cancel gave inf - inf), then each term's value column's and key row's.
+                # A write of rank zero, none: its gradients none, its weight's zero (row 8967).
+                if terms := entry_terms(key, value, weight, values_first=True):
+                    weighed, *factors = aligned_cotangents(terms, dmemory)
+                    dkey[document] = dkey[document] + jnp.concatenate(factors[1::2], axis=0)
+                    dvalue[document] = dvalue[document] + jnp.concatenate(factors[0::2], axis=1)
+                    dweight[document] = dweight[document] + weighed
+        return (jnp.where(inside, dx + wx, dx), jnp.where(inside, db + wb, db),
+                jnp.where(inside, dc + wc, dc), jnp.where(within, da + wa, da),
+                jnp.where(load < jnp.int32(0), dmemory, dprev))
+
+    zero = jnp.zeros
+    dx, db, dc, da, dprev = jax.lax.fori_loop(
+        jnp.int32(0), segments, segment,
+        (zero(x.shape, jnp.float32), zero(b.shape, jnp.float32), zero(c.shape, jnp.float32),
+         zero(a.shape, jnp.float32), zero(start.shape, jnp.float32)))
+    dx_ref[...], db_ref[...], dc_ref[...], da_ref[...], dstate_ref[...] = dx, db, dc, da, dprev
 
 
 def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
@@ -294,10 +425,9 @@ def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
     """The block specs of the arrays a chunk reads or writes, in the kernel's
     own layout: `[B, H, T, P]` for `x` and `y`, `[B, H, T, N]` for `b` and
     `c`, each chunk `chunk_size` steps of the time, `[B, H, NC, 1, C]` for
-    `a`, `[B, H, NC, P, N]` for the state each chunk entered, `[B, H, P, N]`
-    for the state crossing the sequence, and `[B, H, NC, 1, 1]` for the
-    slot each chunk takes up or leaves its memory in (`documents`). Returned
-    in that order; `_slots` gives a table's.
+    `a`, `[B, H, NC, P, N]` for the state each chunk entered, and `[B, H, P, N]`
+    for the state crossing the sequence. Returned in that order; a forked
+    call's tokens (`_tokens_spec`) and whole tables (`_whole`) have their own.
 
     Mosaic blocks the last two dimensions or nothing, which is what puts the
     heads ahead of the time here (`_heads_first`), and `a`'s chunk in a
@@ -329,17 +459,7 @@ def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
             pl.BlockSpec((None, None, chunk_size, state_size), over_time),
             pl.BlockSpec((None, None, None, None, chunk_size), over_chunk),
             pl.BlockSpec((None, None, None, head_dim, state_size), over_chunk),
-            pl.BlockSpec((None, None, head_dim, state_size), over_carry),
-            pl.BlockSpec((None, None, None, 1, 1), over_chunk))
-
-
-def _slots(slots: int, head_dim: int, state_size: int):
-    """The block spec of a forked call's table of `slots` memories `[B, H, slots, P, N]` (`documents`), its
-    window a head's whole table, not moving with the chunk."""
-    def over_carry(*grid):
-        return tuple(jnp.asarray(value, jnp.int32) for value in (grid[0], grid[1], 0, 0, 0))
-
-    return pl.BlockSpec((None, None, slots, head_dim, state_size), over_carry)
+            pl.BlockSpec((None, None, head_dim, state_size), over_carry))
 
 
 def _heads_first(t):
@@ -370,99 +490,120 @@ def _call(body, name: str, platform: str, grid: tuple[int, ...], in_specs, out_s
                                 interpret=_interpreting(platform), name=name)
 
 
-def _documents_blocks(documents, heads: int):
-    """`_ssd_scan`'s forked `documents` `(given [B, S', H, P, N], loads [B, NC], stores [B, NC], entries
-    [B, NC, H, P, N] or None)` in the kernel's layout: the memories `[B, H, ., P, N]` float32 and the slots
-    `[B, H, NC, 1, 1]` float32, the entries where given."""
-    given, loads, stores, entries = documents
-    batch, chunks = loads.shape
+def _forked_blocks(forked, heads: int, chunk_size: int):
+    """`_ssd_scan`'s `forked` `(given [B, S', H, P, N], tokens (loads, stores, documents [B, T] int32),
+    entry (keys [B, D, R, H, N], values [B, D, R, H, P], weights [B, D, H]) or None)` in the kernels'
+    layout: each token's load, store and document a chunk's row `[B, NC, 1, C]` int32 (`_tokens_spec`), the
+    memories `[B, H, S', P, N]` and the entry write's operands each head's, `[B, H, D, R, N]` keys,
+    `[B, H, D, P, R]` values (a term a column) and `[B, H, D, 1, 1]` weights, float32."""
+    given, tokens, entry = forked
+    batch, total = tokens[0].shape
+    chunked = tuple(jnp.asarray(t, jnp.int32).reshape(batch, total // chunk_size, 1, chunk_size)
+                    for t in tokens)
+    memories = jnp.swapaxes(given, 1, 2).astype(jnp.float32)
+    if entry is None:
+        return chunked, memories, ()
+    key, value, weight = entry
+    return chunked, memories, (jnp.moveaxis(key, 3, 1).astype(jnp.float32),
+                               jnp.moveaxis(jnp.swapaxes(value, 2, 4), 3, 1).astype(jnp.float32),
+                               jnp.moveaxis(weight, 2, 1).astype(jnp.float32)[..., None, None])
 
-    def chunked(slots):
-        return jnp.broadcast_to(jnp.asarray(slots, jnp.float32)[:, None, :, None, None],
-                                (batch, heads, chunks, 1, 1))
 
-    return (jnp.swapaxes(given, 1, 2).astype(jnp.float32), chunked(loads), chunked(stores),
-            *(() if entries is None else (jnp.swapaxes(entries, 1, 2).astype(jnp.float32),)))
+def _tokens_spec(chunks: int, chunk_size: int, *, reverse: bool = False):
+    """The block spec of a chunk's tokens' loads, stores or documents (`_forked_blocks`), in scalar memory,
+    which the forked kernels read a token at a time: a row of one chunk's tokens `[1, C]`, the array's own
+    last two dimensions, as the TPU lowering takes a block in scalar memory (a squeezed second-to-last
+    dimension it refuses)."""
+    def over_chunk(*grid):
+        chunk = chunks - 1 - grid[2] if reverse else grid[2]
+        return tuple(jnp.asarray(value, jnp.int32) for value in (grid[0], chunk, 0, 0))
+
+    return pl.BlockSpec((None, None, 1, chunk_size), over_chunk, memory_space=pltpu.SMEM)
 
 
-def _forward(x, b, c, a, state, chunk_size: int, platform: str, *, keep_entered: bool, documents=None,
+def _whole(shape: tuple[int, ...]):
+    """The block spec of a head's whole `shape` (an entry write's operands, a table), not moving with the
+    chunk."""
+    def over_carry(*grid):
+        return tuple(jnp.asarray(value, jnp.int32) for value in (grid[0], grid[1], *(0,) * len(shape)))
+
+    return pl.BlockSpec((None, None, *shape), over_carry)
+
+
+def _forward(x, b, c, a, state, chunk_size: int, platform: str, *, keep_entered: bool, forked=None,
              held: int = 0):
     """The forward kernel. Operands arrive as `_chunk_scan` takes them and
     the output leaves so; `keep_entered` also returns the state every chunk
     entered with, which is the residual the backward pass reads; a forked call's
-    chunks take their table's memories up (`documents`, `held` stored,
-    `_tpu_forward`)."""
+    documents are walked in place (`forked`, `held` stored, `_tpu_forked_forward`),
+    its stored slots returned beside."""
     batch, total, heads, head_dim = x.shape
     chunks, state_size = total // chunk_size, b.shape[-1]
-    x_spec, b_spec, c_spec, a_spec, entered_spec, carry_spec, slot_spec = _specs(
-        chunks, chunk_size, head_dim, state_size)
+    x_spec, b_spec, c_spec, a_spec, entered_spec, carry_spec = _specs(chunks, chunk_size, head_dim,
+                                                                      state_size)
     chunked = jax.ShapeDtypeStruct((batch, heads, chunks, head_dim, state_size), jnp.float32)
     out_shape = [jax.ShapeDtypeStruct((batch, heads, total, head_dim), jnp.float32),
                  jax.ShapeDtypeStruct(state.shape, jnp.float32)]
     out_specs = [x_spec, carry_spec]
-    inputs = ()
-    entered = documents is not None and documents[3] is not None
-    if documents is not None:
-        inputs = (_slots(documents[0].shape[1], head_dim, state_size), slot_spec, slot_spec,
-                  *((entered_spec,) if entered else ()))
+    operands = (_heads_first(x), _heads_first(b), _heads_first(c), _decay_blocks(a, chunk_size), state)
+    in_specs = (x_spec, b_spec, c_spec, a_spec, carry_spec)
+    body = _tpu_forward
+    if forked is not None:
+        tokens, given, entry = _forked_blocks(forked, heads, chunk_size)
+        operands = (*tokens, *operands, given, *entry)
+        in_specs = ((_tokens_spec(chunks, chunk_size),) * 4 + in_specs
+                    + tuple(_whole(part.shape[2:]) for part in (given, *entry)))
         if held:
             out_shape.append(jax.ShapeDtypeStruct((batch, heads, held, head_dim, state_size), jnp.float32))
-            out_specs.append(_slots(held, head_dim, state_size))
+            out_specs.append(_whole((held, head_dim, state_size)))
+        body = functools.partial(_tpu_forked_forward, held=held, entered=bool(entry), keep=keep_entered)
     if keep_entered:
         out_shape.append(chunked)
         out_specs.append(entered_spec)
-    run = _call(functools.partial(_tpu_forward, documents=documents is not None, held=held, entered=entered),
-                "ssd_forward",
-                platform, (batch, heads, chunks), (x_spec, b_spec, c_spec, a_spec, carry_spec, *inputs),
-                out_specs, out_shape)
-    y, final, *rest = run(_heads_first(x), _heads_first(b), _heads_first(c), _decay_blocks(a, chunk_size),
-                          state, *(() if documents is None else _documents_blocks(documents, heads)))
-    if documents is not None and held:
-        rest.pop(0)
+    y, final, *rest = _call(body, "ssd_forward", platform, (batch, heads, chunks), in_specs, out_specs,
+                            out_shape)(*operands)
     return (_heads_first(y), final, *rest)
 
 
-def _backward(x, b, c, a, states, dy, dfinal, chunk_size: int, platform: str, documents=None,
+def _backward(x, b, c, a, states, dy, dfinal, chunk_size: int, platform: str, forked=None, table=None,
               held: int = 0):
     """The backward kernel, one reverse pass over the same blocks from the states each chunk entered
-    (`states`); a forked call's (`documents`, `held` stored) also gives its given memories' gradients
-    `[B, S', H, P, N]`, and its entry writes' `[B, NC, H, P, N]` where it gives them (`_tpu_backward`)."""
+    (`states`); a forked call's (`forked`, its stored slots `table` the forward's, `held` of them) also gives
+    its given memories' gradients `[B, S', H, P, N]` and its entry write's operands' where it gives them
+    (`_tpu_forked_backward`)."""
     batch, total, heads, head_dim = x.shape
     chunks, state_size = total // chunk_size, b.shape[-1]
-    x_spec, b_spec, c_spec, a_spec, entered_spec, carry_spec, slot_spec = _specs(
+    x_spec, b_spec, c_spec, a_spec, entered_spec, carry_spec = _specs(
         chunks, chunk_size, head_dim, state_size, reverse=True)
     widths = (head_dim, state_size, state_size)
     out_shape = [jax.ShapeDtypeStruct((batch, heads, total, width), jnp.float32) for width in widths]
     out_shape.append(jax.ShapeDtypeStruct((batch, heads, chunks, 1, chunk_size), jnp.float32))
     out_shape.append(jax.ShapeDtypeStruct(dfinal.shape, jnp.float32))
     out_specs = [x_spec, b_spec, c_spec, a_spec, carry_spec]
-    blocks, inputs = (), ()
-    entered = documents is not None and documents[3] is not None
-    if documents is not None:
-        given, *blocks = _documents_blocks(documents, heads)
-        blocks = blocks[:2]
-        inputs = (slot_spec, slot_spec)
-        for slots in (given.shape[2], *((held,) if held else ())):
-            out_shape.append(jax.ShapeDtypeStruct((batch, heads, slots, head_dim, state_size), jnp.float32))
-            out_specs.append(_slots(slots, head_dim, state_size))
-        if entered:
-            out_shape.append(jax.ShapeDtypeStruct((batch, heads, chunks, head_dim, state_size), jnp.float32))
-            out_specs.append(entered_spec)
-    run = _call(functools.partial(_tpu_backward, documents=documents is not None, held=held, entered=entered),
-                "ssd_backward",
-                platform, (batch, heads, chunks),
-                (x_spec, b_spec, c_spec, a_spec, entered_spec, x_spec, carry_spec, *inputs), out_specs,
-                out_shape)
-    dx, db, dc, da, dstate, *dforked = run(
-        _heads_first(x), _heads_first(b), _heads_first(c), _decay_blocks(a, chunk_size), states,
-        _heads_first(dy), dfinal, *blocks)
-    taken = dforked[:1] + (dforked[len(dforked) - 1:] if entered else [])
+    operands = (_heads_first(x), _heads_first(b), _heads_first(c), _decay_blocks(a, chunk_size), states,
+                _heads_first(dy), dfinal)
+    in_specs = (x_spec, b_spec, c_spec, a_spec, entered_spec, x_spec, carry_spec)
+    body, entry = _tpu_backward, ()
+    if forked is not None:
+        tokens, given, entry = _forked_blocks(forked, heads, chunk_size)
+        stored = () if table is None else (table,)
+        operands = (*tokens, *operands, given, *stored, *entry)
+        in_specs = ((_tokens_spec(chunks, chunk_size, reverse=True),) * 4 + in_specs
+                    + tuple(_whole(part.shape[2:]) for part in (given, *stored, *entry)))
+        for part in (given, *stored, *entry):
+            out_shape.append(jax.ShapeDtypeStruct(part.shape, jnp.float32))
+            out_specs.append(_whole(part.shape[2:]))
+        body = functools.partial(_tpu_forked_backward, held=held, entered=bool(entry))
+    dx, db, dc, da, dstate, *dforked = _call(body, "ssd_backward", platform, (batch, heads, chunks), in_specs,
+                                             out_specs, out_shape)(*operands)
+    if forked is not None:
+        # The stored slots' gradients are the walk's own (each joined its storing segment's).
+        dforked = [dforked[0], *dforked[1 + bool(held):]]
     return (_heads_first(dx), _heads_first(db), _heads_first(dc),
-            _heads_first(da.reshape(batch, heads, total)), dstate,
-            *(jnp.swapaxes(gradient, 1, 2) for gradient in taken))
+            _heads_first(da.reshape(batch, heads, total)), dstate, *dforked)
 
 
-def _ssd_scan(x, b, c, a, state, documents, chunk_size: int, platform: str,
+def _ssd_scan(x, b, c, a, state, forked, chunk_size: int, platform: str,
               held: int = 0) -> tuple[jax.Array, ...]:
     """Run the chunked SSD scan on the Pallas kernel for `platform`.
 
@@ -470,34 +611,57 @@ def _ssd_scan(x, b, c, a, state, documents, chunk_size: int, platform: str,
     `[B, T, H, P]` already scaled by `dt`, `b` and `c` `[B, T, H, N]` with the
     groups expanded, `a` `[B, T, H]` the per-step `A dt`, the length whole
     chunks of `chunk_size`, `state` `[B, H, P, N]` entering the sequence, and
-    `documents` None or a forked call's `(given [B, S', H, P, N] float32,
-    loads [B, NC], stores [B, NC] int32, entries [B, NC, H, P, N] float32 or
-    None)` for documents each starting a chunk, a chunk's entry write added to
-    the memory it takes up (`recurrence_chunk.Chunk.loads`, `held` stored
-    slots). Returns the output
-    `[B, T, H, P]` and the final state, the same pair `xla_chunk_scan` returns.
+    `forked` None or a forked call's `(given [B, S', H, P, N] float32, tokens
+    (loads, stores, documents [B, T] int32, `chunked_launch.Forked.tokens`),
+    entry (keys [B, D, R, H, N], values [B, D, R, H, P], weights [B, D, H]) or
+    None)`, its documents walked in place, each taking its memory up at its
+    first token with its entry write added (`recurrence_chunk.Chunk.loads`,
+    `held` stored slots). Returns the output `[B, T, H, P]` and the final
+    state, the same pair `xla_chunk_scan` returns.
     """
-    return tuple(_forward(x, b, c, a, state, chunk_size, platform, keep_entered=False, documents=documents,
-                          held=held))
+    return tuple(_forward(x, b, c, a, state, chunk_size, platform, keep_entered=False, forked=forked,
+                          held=held)[:2])
 
 
-def _ssd_fwd(x, b, c, a, state, documents, chunk_size: int, platform: str, held: int = 0):
-    y, final, entered = _forward(x, b, c, a, state, chunk_size, platform, keep_entered=True,
-                                 documents=documents, held=held)
-    return (y, final), (x, b, c, a, entered, documents)
+@functools.cache
+def _ssd_rule(chunk_size: int, platform: str, held: int):
+    """`_chunk_scan`'s first-order reverse-mode rule (`derivatives.declared_derivative`): its forward and
+    backward the TPU Pallas kernels (`ssd_forward`, `ssd_backward`). Forward mode and every higher order are
+    its route's: the products' wrapper (`recurrence_chunk._per_product`) takes them through the portable
+    chunked op, as it does every kernel's (row 9698)."""
+    def primal(x, b, c, a, state, forked):
+        return _ssd_scan(x, b, c, a, state, forked, chunk_size, platform, held)
+
+    def forward(x, b, c, a, state, forked):
+        y, final, *kept = _forward(x, b, c, a, state, chunk_size, platform, keep_entered=True,
+                                   forked=forked, held=held)
+        table, entered = (kept[0], kept[1]) if forked is not None and held else (None, kept[0])
+        return (y, final), ((entered, table), (x, b, c, a, forked))
+
+    def backward(saved, cotangent):
+        (entered, table), (x, b, c, a, forked) = saved
+        dy, dfinal = cotangent
+        dx, db, dc, da, dstate, *dforked = _backward(x, b, c, a, entered, dy, dfinal, chunk_size, platform,
+                                                     forked=forked, table=table, held=held)
+        dtaken = None
+        if forked is not None:
+            given, tokens, entry = forked
+            dentry = None
+            if entry is not None:
+                dkey, dvalue, dweight = dforked[1:]
+                dentry = (jnp.moveaxis(dkey, 1, 3).astype(entry[0].dtype),
+                          jnp.swapaxes(jnp.moveaxis(dvalue, 1, 3), 2, 4).astype(entry[1].dtype),
+                          jnp.moveaxis(dweight[..., 0, 0], 1, 2).astype(entry[2].dtype))
+            no_tokens = tuple(jnp.zeros(t.shape, jax.dtypes.float0) for t in tokens)
+            dtaken = (jnp.swapaxes(dforked[0], 1, 2).astype(given.dtype), no_tokens, dentry)
+        return dx, db, dc, da, dstate, dtaken
+
+    return derivatives.contracted("test_the_tpu_ssd_scan_holds_its_orders")(
+        derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward))
 
 
-def _ssd_bwd(chunk_size: int, platform: str, held: int, residual, cotangent):
-    x, b, c, a, entered, documents = residual
-    dy, dfinal = cotangent
-    dx, db, dc, da, dstate, *dforked = _backward(x, b, c, a, entered, dy, dfinal, chunk_size, platform,
-                                                 documents=documents, held=held)
-    ddocuments = None if documents is None else (
-        dforked[0].astype(documents[0].dtype), None, None,
-        None if documents[3] is None else dforked[1].astype(documents[3].dtype))
-    return dx, db, dc, da, dstate, ddocuments
-
-
-_chunk_scan = derivatives.contracted("test_the_tpu_ssd_scan_holds_its_orders")(
-    derivatives.declared_derivative(derivatives.KernelGlue(), _ssd_scan, _ssd_fwd, _ssd_bwd,
-                                    nondiff_argnums=(6, 7, 8)))
+def _chunk_scan(x, b, c, a, state, forked, chunk_size: int, platform: str,
+                held: int = 0) -> tuple[jax.Array, ...]:
+    """Run the chunked SSD scan on the Pallas kernel for `platform`, reverse mode its own (`_ssd_rule`), every
+    other order its route's (`recurrence_chunk._ssd_tpu` under `_per_product`)."""
+    return _ssd_rule(chunk_size, platform, held)(x, b, c, a, state, forked)

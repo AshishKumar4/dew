@@ -31,6 +31,7 @@ from dew.nn.kernels.templates import (
     persistent,
     report,
     resources,
+    rings,
     stores,
     swizzling,
 )
@@ -71,8 +72,8 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
         if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
             continue
         known = isinstance(lo, int) and isinstance(hi, int)
-        rings = _gathered_slots(streams.pipeline, hi - lo if known else None)
-        stages = rings[0].shape[0]
+        scoped = _gathered_slots(streams.pipeline, hi - lo if known else None)
+        stages = scoped[0].shape[0]
 
         def walked(*slots, step=step, lo=lo, hi=hi, stages=stages, carry=carry):
             def load(index) -> None:
@@ -108,11 +109,11 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
                 slot = lax.rem(index - lo, stages)
                 started, accumulators = carried
                 tiles = {name: ring.at[slot] for name, ring in zip(names, slots, strict=True)}
-                return step(index, mosaic.WholeSlots(tiles), started, accumulators)
+                return step(index, rings.WholeSlots(tiles), started, accumulators)
 
             return lax.fori_loop(lo, hi, body, carry)
 
-        carry = pl.run_scoped(walked, *rings)
+        carry = pl.run_scoped(walked, *scoped)
     return carry
 
 
@@ -253,6 +254,25 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     relay: Any = dataclasses.field(default=None, compare=False)
     """A consumer's shared-memory tile its register left operands relay through where its warps split their
     columns (`relaying`, `relay_bytes`)."""
+
+    held_registers = 40
+    """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
+    indices, the walk's carry), a measured whole (`scalars_whole`): CUTLASS's cooperative sm90 kernel's 168
+    less its accumulator's 128; an A100's attention dQ holds 13 to 43 integers live at its peaks, places and
+    addresses together. Its derivations need it: without it the GEMM's gate picks on sm80, sm86, sm89 and
+    sm120 spill 36 to 784 bytes, where its operands' fragments share the registers (FS-HELDREG). A
+    pre-lowering prior, which certification overrules (`report.certified`): the count a lowering holds is
+    not derived from the traced kernel, whose shared-memory tile addresses and loop carries predicted the
+    lowered peak's scalars no better than a family's constant over 260 sm80 GEMM and recurrence kernels
+    (FS-DERIVED-HELD2-sm80, row 8377: correlation 0.49 and 0.39; a recurrence's peak 4 to 97 scalars, two to
+    five times its traced count, the lowering's shared-memory addresses and swizzles)."""
+
+    scalars_whole = True
+
+    def scalar_registers(self, addressed=()) -> int:
+        # Its measured whole, its addresses among them.
+        del addressed
+        return self.held_registers
 
     rows = 16
 
@@ -429,10 +449,15 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         mosaic.synced(interpret=False)
         return loaded
 
-    def relay_bytes(self, rows: int, depth: int) -> int:
+    @property
+    def rows_whole(self) -> bool:
         # Its warps along a tile's rows alone (four of them) hold whole rows of the accumulator and the
-        # operand alike; fewer split the accumulator's columns among warps, which no register cast crosses.
-        return 0 if self.m_warps == 4 else rows * depth * self.dtype.itemsize
+        # operand alike; fewer split the accumulator's columns among warps.
+        return self.m_warps == 4
+
+    def relay_bytes(self, rows: int, depth: int) -> int:
+        # No register cast crosses the warps a row's columns are split among.
+        return 0 if self.rows_whole else rows * depth * self.dtype.itemsize
 
     def relaying(self, tile) -> Self:
         # A plain tile (`swizzling.plain`).
@@ -452,7 +477,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return out
 
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         if not accumulate:
             # A fresh product: onto zeros, its accumulator a value (`read` is that value).
             acc = self.zeros(acc.shape)
@@ -505,7 +530,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         (dV, dK, dQ, independent of each other) and held 170 words of their fragments at once, an A100's step
         at 64 x 64, width 64, under a softcap spilling 96 bytes; looped, 20 (one slice's), none spilled, the
         same 320 mma.sync instructions issued (row 5477). Interpreted, `products`."""
-        if bodies.interpreting():
+        if launches.interpreting():
             return self.products(acc, lhs, rhs, accumulate=accumulate)
         if jnp.dtype(lhs.dtype) != self.dtype:
             return self.for_dtype(lhs.dtype).looped_products(acc, lhs, rhs, accumulate=accumulate)
@@ -605,6 +630,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     gathers_rows = True  # its one warpgroup's cp.async copies gather a step's rows (`_gathered_walk`)
+    # `emit_pipeline` would allocate a folded once block a slot per stage in the walk's scope, where its
+    # planned once allocation (`lifetimes`) holds one: no once stream walks here until the plan counts it.
+    walks_once = False
     gathers_alone = False  # its walk gathers every stream's rows or none (`streams`)
     gathers_interpreted = True
 
@@ -619,10 +647,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def lhs(self) -> plgpu_core.SomeLayout:
         """The layout a tile loaded through registers takes (`loaded`): its issuer's left operand's."""
 
-    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
+                  joined: tuple = ()) -> int:
         # Each role at its thread's share of the multiprocessor's 64K registers: two programs' 256 threads
         # hold 255 each.
         _one(consumers)
+        handoffs.runs_alone(self.name, joined)
         return resources.entry_registers(consumers, programs)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
@@ -630,18 +660,23 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
-               producer: int | None = None, shared: int | None = None,
-               moves: bool | None = None) -> Callable:
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
+               producer: int | None = None, shared: int | None = None, tmem: int = 0,
+               moves: bool | None = None, joined: tuple = ()) -> Callable:
+        handoffs.runs_alone(self.name, joined)
         # Its one warpgroup its consumer, no producer beside it, and no cluster; its kernels' default
-        # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
+        # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`), where it
+        # `reduces`.
         # Its programs read a table from global memory as any operand, and no producer runs beside them.
-        del reducing_warpgroups, scalars, producer, moves  # one warpgroup: no roles to move registers between
+        del reducing_warpgroups, scalars, producer, tmem, moves  # one warpgroup: no roles to move registers
         _one(consumers, clustered=cluster > 1)
         built = launches.kernel(bodies.dependent(entry, interpret, prefetched=prefetched),
                                 name=name or self.name,
                                 out_type=outputs.structs(out_type), grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,
+                                                                     reduction_scratch_bytes=(
+                                                                         self.reduction_scratch if reduces
+                                                                         else 0),
                                                                      min_blocks_per_sm=resident,
                                                                      metadata=report.launch_metadata()),
                                 interpret=bodies.interpreted(interpret),
@@ -662,7 +697,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()):
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()):
+        del joined  # a pair a stream (`Family.streams`)
         _one(consumers, clustered=bool(multicast))
         if gathered and set(gathered) != set(blocks):
             raise NotImplementedError("an A100's walk gathers every stream's rows or none")
@@ -686,8 +722,15 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi) -> None:
-        del streams, views, lo, hi
+    def stored_swizzle(self, shape: tuple[int, int], dtype) -> int:
+        """The swizzle an output tile of `shape` in `dtype` stages at (`output_staging`): plain where its
+        issuer states none (`Mma.stored_swizzle`)."""
+        del shape, dtype
+        return swizzling.UNSWIZZLED
+
+    def stream(self, streams, views, lo, hi, *, again=None) -> None:
+        # No producer role: a decided walk's consumers feed their second pass themselves.
+        del streams, views, lo, hi, again
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
@@ -706,10 +749,16 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 plgpu.wait_gmem_to_smem(0)
 
             def copied(smem):
-                # The row-copy ladder needs strided layouts, not optimized-only transfers.
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
-                stores.store_rows(smem, ref, *place, copy=swizzling.copied,
-                                  widest=resources.copied_rows(smem.shape[1], smem.dtype))
+                swizzle = swizzling.UNSWIZZLED if len(smem.shape) != 2 else self.stored_swizzle(smem.shape,
+                                                                                                   smem.dtype)
+                if interpret or swizzle == swizzling.UNSWIZZLED:
+                    # The row-copy ladder needs strided layouts, not optimized-only transfers.
+                    stores.store_rows(smem, ref, *place, copy=swizzling.copied,
+                                      widest=resources.copied_rows(smem.shape[1], smem.dtype))
+                else:
+                    # A swizzled tile's rows out by its threads, whole tiles read (`output_staging`).
+                    stores.swizzled_rows_out(smem, ref, *place[:4], swizzle=swizzle)
 
             pl.run_scoped(copied, staging[output])
             if not interpret:
@@ -749,7 +798,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             def body(indices, *refs, step=step, lo=lo):
                 (index,), (carried, accumulators) = indices, refs[-1]
-                slots = mosaic.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
+                slots = rings.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
             specs = _specs(streams.pipeline,
@@ -823,6 +872,37 @@ class Mma(MmaIssuer, CpAsync):
     # spilled where the forward derived them (sm80 width 64, split residuals), and no GEMM derived them;
     # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
     consumers = 1
+
+    def output_staging(self, outputs: tuple, consumers: int) -> list:
+        # Each output tile staged at the swizzle its accumulator's stores pass the banks fewest times at
+        # (`stored_swizzle`), copied out a 16-byte piece a thread over whole tiles (`persist`'s store,
+        # `stores.swizzled_rows_out`).
+        del consumers
+        return [swizzling.staged(shape, dtype, self.stored_swizzle(shape, dtype)) if len(shape) == 2
+                else plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
+
+    def stored_swizzle(self, shape: tuple[int, int], dtype) -> int:
+        """The swizzle an output tile of `shape` in `dtype` stages at: of the swizzles its rows fill whole
+        (`swizzling.SWIZZLE_BYTES` down to the narrowest) and plain, the one its accumulator's stores pass
+        shared memory's banks fewest times at (`swizzling.wavefronts`, by the staging's address arithmetic),
+        the widest on a tie. A warp stores mma.sync's accumulator fragment an 8-row slab by 8 columns at a
+        time, lane `l` two adjacent elements of row `l // 4` at column `2 (l % 4)`: plain, 64 16-bit columns
+        put a slab's 8 rows in the same banks, 8 passes a store, where a 128-byte swizzle gives each row's
+        piece its own banks, one pass (row 5271: the A100's dense kernel gradient's 4x cuBLAS's bank
+        conflicts, FS-DW-NCU2)."""
+        rows, columns = shape
+        itemsize = jnp.dtype(dtype).itemsize
+        stagings = [swizzle for swizzle in (swizzling.SWIZZLE_BYTES, 64, swizzling.NARROWEST_SWIZZLE_BYTES)
+                    if (columns * itemsize) % swizzle == 0 and rows % swizzling.TILE_ROWS == 0]
+        stagings.append(swizzling.UNSWIZZLED)
+
+        def passes(swizzle: int) -> int:
+            return sum(swizzling.wavefronts(
+                [swizzling.staged_address(slab + lane // 4, (block + 2 * (lane % 4)) * itemsize,
+                                          columns * itemsize, swizzle) for lane in range(32)], 2 * itemsize)
+                for slab in range(0, rows, swizzling.TILE_ROWS) for block in range(0, columns, 8))
+
+        return min(stagings, key=lambda swizzle: (passes(swizzle), -swizzle))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

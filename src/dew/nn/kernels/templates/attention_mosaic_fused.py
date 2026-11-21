@@ -11,7 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
@@ -22,6 +22,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    head_layout,
+    head_slice,
     launch_scope,
     modelled,
     reducing,
@@ -246,16 +248,16 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     q_steps = queries // block_q
     grouped, group = heads != kv_heads, heads // kv_heads
     leaves, treedef = jax.tree.flatten((spans, drop))
-    # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
-    shapes = [(batch, keys_padded, kv_heads, width)] * 2
-    groups = mosaic.stacked_groups(shapes)
-
+    kv_shape = ((batch, kv_heads, keys_padded, width) if family.copies_tiled_rows
+                else (batch, keys_padded, kv_heads, width))
+    shapes = [kv_shape] * 2
+    groups = stacked.groups(shapes)
     def body(*refs, streams, after=None):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         (spans_of, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         if grouped:
             dq_ref, dkv_ref, *refs = refs
-            dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
+            dk_ref, dv_ref = stacked.views([dkv_ref], groups)
         else:
             dq_ref, dk_ref, dv_ref, *refs = refs
         # The output stage where the walks' adds read it; else the epilogue's own, scoped after the walks.
@@ -264,7 +266,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, group)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
-        views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head), **statistics}
+        views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         pair_first = family.program_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
@@ -272,7 +274,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
         def consumer(index):
             k_first = pair_first + index * block_k
-            keys_view = (row, pl.ds(k_first, block_k), key_head)
+            keys_view = head_slice(family, row, key_head, pl.ds(k_first, block_k))
             family.loaded(((k_ref.at[keys_view], k_smem.at[index], k_loaded.at[index]),
                            (v_ref.at[keys_view], v_smem.at[index], v_loaded.at[index])))
             lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
@@ -318,8 +320,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
 
     # dK and dV as their own arrays' axes (`outputs.Output`).
+    axis_order = (0, 2, 1) if family.copies_tiled_rows else (0, 1, 2)
     gradients = tuple(outputs.output(array.dtype if typed else jnp.float32,
-                                     *(outputs.axis(array, index) for index in range(3)), width)
+                                     *(outputs.axis(array, index) for index in axis_order), width)
                       for array in (key, value))
     launch = family.kernel(
         entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
@@ -333,15 +336,16 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
+    query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    return _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
-                         grouped=grouped)
+    dq, dk, dv = _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
+                               grouped=grouped)
+    return head_layout(family, dq), head_layout(family, dk), head_layout(family, dv)
 
-
-def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: int, grouped: bool
+def _fused_called(launch: Callable, operands: tuple, grads: tuple, *, copies: int, grouped: bool
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fused launch called on its `operands` (`_fused_launch`'s): dQ added into zeros in place, and
-    grouped dK and dV in one ref of both (`mosaic.stacked_zeros`, `[2, B, Kp, KV, D]`, `stacked` their shapes
+    grouped dK and dV in one ref of both (`stacked.zeros`, `[2, B, Kp, KV, D]`, `grads` their shapes
     and grouping: where XLA wraps the launch in a dynamic-slice fusion, a step's stacked forward rows sliced
     for this launch's operands, two refs of equal zeros were one buffer, dK and dV each the sum of both, row
     3180, ET-3180-PLAIN-h100): one copy of dQ, or each consumer's own interpreted (`Family.added`,
@@ -351,8 +355,9 @@ def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: 
     dq = jax.new_ref(launches.filled((copies, batch, queries, heads, width), jnp.float32, *operands[:4]))
     if not grouped:
         dk, dv = launch(*operands, dq)
-        return mosaic.added_copies(dq), dk, dv
-    dkv = mosaic.stacked_zeros(*stacked, *operands[:4])
+        return stacked.added(dq), dk, dv
+    shapes, groups = grads
+    dkv = stacked.zeros(shapes, groups, *operands[:4])
     launch(*operands, dq, *dkv)
-    dk, dv = mosaic.stacked_read(dkv, stacked[1])
-    return mosaic.added_copies(dq), dk, dv
+    dk, dv = stacked.read(dkv, groups)
+    return stacked.added(dq), dk, dv

@@ -24,6 +24,7 @@ float64.
 
 import argparse
 import importlib
+import types
 from pathlib import Path
 
 import jax
@@ -46,7 +47,7 @@ STEPS = 1000
 SHAPE = (6, 4, 4, 3)
 
 
-def published() -> object:
+def published() -> types.ModuleType:
     """diffusion_distillation's dpm module, from its own files at the pinned commit."""
     package("diffusion_distillation",
             published_files(REPO, COMMIT, FILES) / "diffusion_distillation" / "diffusion_distillation")
@@ -95,7 +96,7 @@ def main() -> None:
     landed["noise"] = np.asarray(jax.random.normal(next(draws), SHAPE, jnp.float32))
     landed["indices"] = np.asarray(jax.random.randint(next(draws), (SHAPE[0],), 0, STEPS))
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, **landed)
+    np.savez(out, allow_pickle=False, **landed)
     print(f"{out}: loss {landed['loss_f64']}")
 
 

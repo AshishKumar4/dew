@@ -15,14 +15,13 @@ from dew.objectives import base
 from dew.objectives.lm import chunked
 
 
-def categorical_draw(seed: int, edge: str) -> tuple:
-    """Logits [3, 6] at `edge`'s scale, labels, soft targets and a reference distribution's logits."""
+def categorical_draw(seed: int) -> tuple:
+    """Labels of 3 rows of 6 classes, soft targets and a reference distribution's logits."""
     rng = np.random.default_rng(seed)
-    logits = jnp.asarray(rng.standard_normal((3, 6)) * EDGES[edge], jnp.float32)
     labels = jnp.asarray(rng.integers(0, 6, (3,)), jnp.int32)
     targets = jnp.asarray(rng.dirichlet(np.ones(6), 3), jnp.float32)
     reference = jnp.asarray(rng.standard_normal((3, 6)), jnp.float32)
-    return logits, labels, targets, reference
+    return labels, targets, reference
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -30,7 +29,7 @@ def test_the_categorical_losses_hold_every_order(edge):
     """`categorical`'s probabilities, cross entropy, soft cross entropy and KL divergence (each a custom
     derivative): every order in the logits finite wherever float64 is a normal float32 and the plain formula,
     jax.nn's softmax and log-softmax as written, is."""
-    _, labels, targets, reference = categorical_draw(2645, edge)
+    labels, targets, reference = categorical_draw(2645)
     rows = jnp.arange(3)
     sites = {
         "probabilities": (categorical.probabilities, lambda x: jax.nn.softmax(x, axis=-1), (3, 6)),

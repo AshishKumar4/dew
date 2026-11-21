@@ -12,29 +12,20 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from data_support import record_batches
-from diffusion_stubs import batch_for
-from diffusion_support import images_of
-from interop_support import extract_fixture
 from objective_cases import cases
 from objective_data import corpus_windows
 from reference_error import assert_computes_the_oracle, chain_roundings
-from test_guidance_distillation import FIXTURES, FLUX
+from test_guidance_distillation import FIXTURES
 
 from dew import Evaluation
 from dew.batch import VALID_ROWS, padded_rows
-from dew.config import ObjectiveConfig
-from dew.config.diffusion import DiffusionRunConfig
 from dew.data import Loading
 from dew.data.chat import Role
 from dew.data.dataset import DataPartition, rows_of
-from dew.diffusion.presets import Flow
-from dew.inputs import TextCondition
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.base import TEACHER, Step
-from dew.objectives.diffusion import GuidanceDistillationObjective
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective, Perplexity
-from dew.registry import ModelConfig, objectives
-from dew.sampling import Euler
+from dew.registry import objectives
 
 ROWS = 8
 """A batch's rows: one per device of the lane's eight."""
@@ -45,26 +36,6 @@ RECORDS = 9
 a batch before the other's and covers it with a copy of its last."""
 ROLLOUT = {"grpo", "ppo", "flow_grpo", "diffusion_nft"}
 """Trained on rollouts: a validation split holds prompts, which their loss does not read."""
-
-
-def runnable(name: str, windows, tmp_path):
-    """`name`'s recipe case, or for guidance distillation, whose student must
-    read a guidance input, a guidance-embedded Flux on the committed tiny
-    pipeline's towers distilling its own initialization."""
-    if name != "guidance_distillation":
-        return cases(windows)[name]()
-    extract_fixture(FIXTURES / "flux_source.tar.xz", tmp_path / "flux")
-    teacher = DiffusionRunConfig(
-        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=images_of("tfds://oxford_flowers102", 8), preset=Flow(), val_metrics=(),
-        text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline")),
-        objective=ObjectiveConfig("diffusion",
-                                  {"solver": Euler(), "guidance": None, "steps": 2,
-                                   "ema_decay": None})).build()
-    objective = GuidanceDistillationObjective(teacher.model, teacher.process, teacher.inputs,
-                                              variables={TEACHER: jax.jit(teacher.init)(jax.random.key(0))},
-                                              steps=2)
-    return objective, batch_for(teacher, 8)
 
 
 @pytest.fixture(scope="module")
@@ -135,13 +106,12 @@ EVALUATED = sorted(set(objectives) - ROLLOUT)
 """Every registered objective with an evaluation loss."""
 
 POOLED = (("block_diffusion", "distillation", "lm", "mean_flow", "masked_diffusion", "supervised"),
-          ("guidance_distillation",), ("ladd",), ("decision", "shortcut"), ("jepa", "dpo"),
-          ("diffusion", "rcm"))
+          ("guidance_distillation",), ("ladd", "decision", "shortcut"), ("jepa", "dpo", "diffusion", "rcm"))
 """`EVALUATED` in the parts `tests/test_multiprocess.py` runs its passes on a pool in, so no part passes
 CI's group target on a pool's own seconds, which its two processes' start and compiles dominate. With each
-case's init and loss statistics compiled whole (`evaluated`), the parts took 49, 58, 35, 30, 26 and 40 s on
-armada (11-06), guidance distillation's Flux alone the second. The first, the lightest, also scores
-`Perplexity`."""
+case's init and loss statistics compiled whole (`evaluated`), six parts took 49, 58, 35, 30, 26 and 40 s on
+armada (11-06), guidance distillation's Flux alone the second, each paying its pool's start: the last
+four are two pools now (armada cut, 11-20). The first, the lightest, also scores `Perplexity`."""
 
 
 def evaluated(name: str, windows, tmp_path) -> dict:
@@ -151,7 +121,7 @@ def evaluated(name: str, windows, tmp_path) -> dict:
     another record's. Each pass's scores and counts, and for a loss that draws
     nothing (the same under two keys) the loss of every record in one batch
     with the roundings of its computation (`chain_roundings`)."""
-    objective, batch = runnable(name, windows, tmp_path)
+    objective, batch = cases(windows)[name]()
     records = records_of(batch, RECORDS)
     with jax.enable_x64(new_val=True):
         # Compiled whole, as a run compiles them: a Flux's init and loss run op by op took most of a case.

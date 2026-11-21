@@ -96,7 +96,7 @@ def forecasts(text: str, day: datetime.date) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", help="the ref HEAD's change is read from (its merge-base with it)")
     options = parser.parse_args()
     head = written("HEAD")

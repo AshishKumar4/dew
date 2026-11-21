@@ -217,9 +217,12 @@ def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
 
 
 def scanned_pair(build):
+    """`build`'s plain loop and scanned stack, the plain loop's variables and the ids it was initialized
+    over: its initializer one program, where run op by op Gemma 3n's compiled 448 programs, 16 s of a cold
+    test (row 7860)."""
     plain, scanned = build(), build(scan_layers=True)
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
-    variables = nn.unbox(plain.init(jax.random.key(0), ids))
+    variables = nn.unbox(jax.jit(plain.init)(jax.random.key(0), ids))
     return plain, scanned, variables, ids
 
 
@@ -801,23 +804,36 @@ def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches
     """The objective's loss, metrics and gradients on `spec`'s mesh over
     `devices` (every device by default), with the pipeline's schedule of
     `microbatches` in context the way the trainer's compiled step puts it
-    there."""
+    there (`stepping`'s, at one batch)."""
+    return stepping(objective, spec, variables, devices, microbatches)(batch)
+
+
+def stepping(objective, spec, variables, devices=None, microbatches=None):
+    """A batch's loss, metrics and gradients (`loss_and_grads`'), the objective's variables placed on `spec`'s
+    mesh once and its step compiled once for every batch of one shape, the batch its argument: a check's
+    draws each one call, where each draw placed, traced and compiled its step anew (rows 10147, 10162: a
+    pipelined arm's eight draws, 864 s of a CI task)."""
     mesh = spec.build(devices)
     layout = Layout(min_shard=TINY_SHARD)
     # The run's table of its parameters' axes, as the trainer holds it while it places and steps.
     with boxed(objective.parameter_axes):
         placed = jax.device_put(variables, layout.shardings(mesh, variables))
     assert_sharded(placed["params"], mesh)
-    batch = shard_batch(mesh, batch)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
-    def loss(params):
+    def loss(params, batch):
         return objective.scalar_loss({**variables, "params": params}, batch, step)
 
-    with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
-        (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
-    return (float(value), {name: float(number) for name, number in aux.metrics.items()},
-            jax.tree.map(np.asarray, grads))
+    program = jax.jit(jax.value_and_grad(loss, has_aux=True))
+
+    def run(batch):
+        batch = shard_batch(mesh, batch)
+        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
+            (value, aux), grads = program(placed["params"], batch)
+        return (float(value), {name: float(number) for name, number in aux.metrics.items()},
+                jax.tree.map(np.asarray, grads))
+
+    return run
 
 
 def layer_states(model, variables, ids):
@@ -1005,6 +1021,54 @@ def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spe
     assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
 
 
+FUSED_DELTA_STACK = {"layer_types": ("linear_attention",) * 4, "kinds": {
+    "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+        "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4, "fused_in_proj": True}}}}}
+"""Four gated delta nets on Qwen3-Next's fused projections at a tiny width: no attention layer, whose query a
+rule giving the heads the stage axis places on it, which a stage's vmap refuses."""
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_to_its_vmap():
+    """Two stages beside a sequence axis of two, under rules giving the heads the stage axis, train a stack of
+    gated delta nets (their fused projections, which place no heads) split over the sequence as the plain
+    step does: the split places their heads over the axes the rows, the sequence and the stage's
+    vmap leave (`linear.sequence_delta_rule`), where a placement naming the stage axis is one the stage's
+    vmapped map refuses (row 1437 link 2's head review). Loss and gradients check 1's against the plain step
+    from float64 on the host (no accelerator's emulated float64)."""
+    from dew.mesh import DEFAULT_RULES
+
+    model = tiny(max_seq_len=16, **FUSED_DELTA_STACK)
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 16), jnp.int32)))
+    four = jax.devices()[:4]
+    with jax.enable_x64(new_val=True):
+        twin, wide = tiny(max_seq_len=16, dtype=jnp.float64, **FUSED_DELTA_STACK), float64_held(variables)
+
+    def stepped(model, variables, spec, microbatches=None, devices=four):
+        # Each arm placed and compiled on its own mesh at its first draw, in the context the check calls it
+        # in (the truth's x64), and called as given at every draw after (`stepping` sets its mesh).
+        held = []
+
+        @as_given
+        def step(text):
+            if not held:
+                held.append(stepping(LMObjective(model, 16), spec, variables, devices, microbatches))
+            loss, _, grads = held[0]({"text": text})
+            return np.float32(loss) if model is not twin else np.float64(loss), grads
+
+        return step
+
+    def draw(seed):
+        return (np.random.default_rng([0x5EA, seed]).integers(0, VOCAB, size=(BATCH, 17)).astype(np.int32),)
+
+    with nn.logical_axis_rules((("activation_heads", "stage"), *DEFAULT_RULES)):
+        assert_as_exact(stepped(model, variables, MeshSpec(stage=2, sequence=2), 4),
+                        stepped(model, variables, MeshSpec()), draw, "delta nets piped over the sequence",
+                        seeds=FEWEST_SEEDS,
+                        truth_fn=stepped(twin, wide, MeshSpec(), devices=jax.devices("cpu")[:1]))
+
+
 @mesh_lane
 def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_statistics():
     """A dense first layer before eight routed ones over four stages runs the prefix beside the pipeline
@@ -1172,6 +1236,7 @@ def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_dec
         assert our_paths == their_paths
 
 
+@pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
     """A scanned run of host-resident layers runs one layer at a time in a scope of its
     own (`decoder_stack.run_stack`, `_prefetched_run`), reading each layer's slice of
@@ -1179,7 +1244,9 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     balancing biases off zero, two calls and a decode through the cache they allocate
     and reuse give the resident stack's state, its routing exactly, and its logits, scores
     and cache as exact as the resident's own, both measured from the resident stack in
-    float64 (tests/reference_error.py), the two paths compiling the same layers apart."""
+    float64 (tests/reference_error.py), the two paths compiling the same layers apart. Its
+    512 seeds took 78 s alone cold, most of it their draws' arms and truth computing, on armada's CI
+    CPU and 123 s in train 1021's CI: CI draws them in map tasks of 128 (row 7860)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import Mixture
 
@@ -1188,7 +1255,7 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
                               attention_impl="reference", scan_layers=True,
                               mixture=Mixture(experts=4, top_k=2, bias=True))
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32)
-    variables = nn.unbox(model.init(jax.random.key(0), tokens))
+    variables = nn.unbox(jax.jit(model.init)(jax.random.key(0), tokens))
     variables = {**variables, "moe": jax.tree.map(lambda bias: bias + 4.0 * (jnp.arange(bias.shape[-1]) % 3),
                                                   variables["moe"])}
     assert any(count > 1 for _, count in model.bind(variables).groups)
@@ -1202,7 +1269,9 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
         """The fixed tokens at seed 0, else tokens drawn uniformly from the vocabulary."""
         if seed == 0:
             return (tokens,)
-        return (np.random.default_rng(seed).integers(0, model.vocab_size, tokens.shape).astype(np.int32),)
+        # A JAX array: a draw holding NumPy runs each arm once first (`arm_forms._refuse_numpy_arms`).
+        drawn = np.random.default_rng(seed).integers(0, model.vocab_size, tokens.shape)
+        return (jnp.asarray(drawn, jnp.int32),)
 
     def run(model, tree, tokens):
         calls = []

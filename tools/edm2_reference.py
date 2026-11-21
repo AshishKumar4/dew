@@ -32,6 +32,7 @@ import contextlib
 import json
 import types
 from pathlib import Path
+from typing import Any
 
 import jax
 import numpy as np
@@ -47,7 +48,7 @@ LAYOUT = FIXTURE.with_name("layout.json")
 """The reference's state, each name's shape, in its order: what `draw` draws."""
 STEPS = 3
 # A rate that moves the weights and the output visibly in STEPS steps.
-SGD = {"lr": 0.002}
+SGD: dict[str, Any] = {"lr": 0.002}
 CONFIG = {"img_resolution": 8, "img_channels": 3, "label_dim": 4, "model_channels": 8,
           "channel_mult": [1, 2], "num_blocks": 1, "attn_resolutions": [4],
           "channels_per_head": 4}

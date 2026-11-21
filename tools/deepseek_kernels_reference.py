@@ -99,7 +99,7 @@ def main():
     v3 = kernel("v3")
     for rows, cols in V3_SHAPES:
         codes = (rng.integers(0, 0x7F, (rows, cols), dtype=np.uint8)
-                 | rng.choice(np.uint8([0, 0x80]), (rows, cols)))
+                 | rng.choice(np.array([0, 0x80], np.uint8), (rows, cols)))
         grid = (-(-rows // 128), -(-cols // 128))
         scales = (rng.standard_normal(grid) * np.exp2(rng.integers(-30, 30))).astype(np.float32)
         scales.flat[0] = np.float32(2.0 ** -127)  # subnormal products

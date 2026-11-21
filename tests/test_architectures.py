@@ -49,6 +49,7 @@ from dew.objectives.jepa import JepaObjective
 from dew.objectives.lm import LMObjective
 from dew.registry import ModelConfig, from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
+from dew.state import TrainState
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.model_flops import prepare_counts
 
@@ -315,6 +316,14 @@ def orbit(width: int):
     return orders
 
 
+_ONE_DEVICE: dict[tuple, list] = {}
+"""Each case's one-device step, its trainer and the step compiled (`drawn_steps`), by the case's name,
+whether it runs in float64 and the trace's context an arm first calls it in (`options.trace_context`: check
+1's own sums among it), where an arm compiles its own: the same program for every cell of the case and every
+step count (a count is the steps it runs, not a program), built once a process for the cells a group of the
+case holds (`shared_setup`)."""
+
+
 def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: int, *, exact: bool = False):
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
@@ -322,11 +331,22 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
     a function of the raw batch and the order returning
     the stepped state's variables, optimizer state and EMA taken back to the identity order
     (`in_identity_order`). `exact` runs one device in float64 from the state widened, the batch's
-    samples widened (`wide`), built at its first call, so under the caller's float64."""
-    built = []
+    samples widened (`wide`), built at its first call, so under the caller's float64. One device's
+    trainer and step are the case's (`_ONE_DEVICE`), from its cached initial state (`case_setup`)."""
+    one_device = mesh == MeshSpec() and devices == 1
+    bound: list = []
 
     @as_given
     def stepped(raw, order):
+        from dew.nn.kernels.options import trace_context
+
+        # The step compiled in the context of this arm's first call, which every later call runs whatever
+        # context it is in, as one arm's own compile does: one device's the case's compiled in that context
+        # (`_ONE_DEVICE`), any other's its own.
+        if not bound:
+            bound.append(_ONE_DEVICE.setdefault((case.name, exact, trace_context()), []) if one_device
+                         else [])
+        built = bound[0]
         if not built:
             directory = tmp_path / f"drawn-{devices}-{mesh.fsdp}-{mesh.stage}-{steps}-{exact}"
             trainer, _ = make_trainer(case, directory, mesh, RecordingTracker(), devices)
@@ -372,11 +392,12 @@ def test_a_residual_order_is_the_same_decoder(case):
     with jax.enable_x64(new_val=True):
         wide = widened(variables)
         identity = np.asarray(model.clone(dtype=jnp.float64).apply(wide, ids))
+        # The identity's longest chains, which no order changes: traced once for both orders.
+        roundings = chain_roundings(jax.make_jaxpr(
+            lambda variables: model.clone(dtype=jnp.float64).apply(variables, ids))(wide))
         for seed in (1, 2):
             order = np.random.default_rng([0x0BB17, seed]).permutation(width)
             reordered = model.clone(dtype=jnp.float64).apply(permuted(wide, order, axes), ids)
-            roundings = chain_roundings(jax.make_jaxpr(
-                lambda variables: model.clone(dtype=jnp.float64).apply(variables, ids))(wide))
             assert_computes_the_oracle(np.asarray(reordered), identity, f"{case.name} order {seed}",
                                        roundings=roundings)
 
@@ -424,6 +445,8 @@ JEPA_VIDEO_CELLS = cells_of("jepa_video_encoder")
 VIDEO_DIT_CELLS = [cell for cell in cells_of("video_dit") if cell[2] == "2x4 fsdp"]
 GEMMA4_MOE_CELLS = [cell for cell in cells_of("causal_transformer+gemma4_moe") if cell[2] == "2x4 fsdp"]
 MLA_CELLS = [cell for cell in cells_of("causal_transformer+mla") if cell[2] == "2x4 fsdp"]
+DIT_FSDP_CELLS = [cell for cell in cells_of("simple_dit", "simple_udit", "simple_mmdit", "hybrid_dit")
+                  if cell[2] == "2x4 fsdp"]
 """The cases whose layout cells' draws run as armada's map tasks (`check1_shards`), each a test of its own
 with the seeds a task draws within 120 s on one core: a map task records its draws (70 to 93 s fixed,
 `map_judge.record_units`), and the one that draws an arm's placed seed checks that arm's `fit` beside them
@@ -433,14 +456,18 @@ seeds of one GPT-OSS cell took 38 to 75 s, of 32 seeds of a GLM-4 MoE cell 40 to
 each task drawing every cell of its test. The video DiT's, Gemma 4 MoE's and MLA's fsdp cells took 138,
 129 and 114 s whole (CI's durations record, train 569), each the test's one cell, as a task draws them. The
 JEPA video encoder's two cells took 137 and 134 s whole (CI's durations record at main 8063e3557, row
-7403)."""
+7403). The DiTs' fsdp cells took 144 to 171 s whole in CI and 76 to 130 s alone cold, 39 to 60 s of it
+compiling, 30 s of that both arms' `fit` (armada at c27860888, rows 7652 and 8533)."""
 
 SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *QWEN35_CELLS, *GPT_OSS_CELLS,
                  *GLM4_MOE_CELLS, *JEPA_STAGE_CELLS, *JEPA_VIDEO_CELLS, *VIDEO_DIT_CELLS, *GEMMA4_MOE_CELLS,
-                 *MLA_CELLS]
+                 *MLA_CELLS, *DIT_FSDP_CELLS]
 UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
 
 
+# A case's cells share its fresh state and one device's steps (`case_setup`, `_ONE_DEVICE`), and a selecting
+# case's its compiled selection capture (`selections_forward`), one a process.
+@pytest.mark.shared_setup("architecture_case", by=r"[a-z0-9_+]+(?=-)")
 @pytest.mark.parametrize(("case", "steps", "layout"), UNSHARDED_CELLS, ids=cell_ids(UNSHARDED_CELLS))
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
@@ -508,6 +535,7 @@ FIT_APART = [*HIERARCHICAL_MMDIT_CELLS, *THREE_D_UNET_CELLS]
 beside them (rows 7457, 7633)."""
 
 
+@pytest.mark.shared_setup("architecture_case", by=r"[a-z0-9_+]+(?=-)")
 @pytest.mark.parametrize("arm", ["one device", "layout"])
 @pytest.mark.parametrize(("case", "steps", "layout"), FIT_APART, ids=cell_ids(FIT_APART))
 def test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave(case, steps, layout, arm, tmp_path):
@@ -539,6 +567,31 @@ def test_a_gemma4_moe_decoders_fsdp_cell_trains_as_on_one_device(case, steps, la
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
+CHECK1_SHARDS = {
+    "test_a_dits_fsdp_cells_train_as_on_one_device[simple_dit-1-step-fsdp]": {"seeds": 8, "per_task": 4},
+    "test_a_dits_fsdp_cells_train_as_on_one_device[simple_udit-2-steps-fsdp]": {"seeds": 8, "per_task": 4},
+    "test_a_dits_fsdp_cells_train_as_on_one_device[simple_mmdit-2-steps-fsdp]": {"seeds": 8, "per_task": 4},
+    "test_a_dits_fsdp_cells_train_as_on_one_device[hybrid_dit-2-steps-fsdp]": {"seeds": 8, "per_task": 4},
+}
+"""The DiTs' fsdp cells, each a check-1 site of its own whose seeds run as map tasks (`check1_shards`), by
+node id, a literal the CI plan reads as it reads a mark's (tools/armada/ci.py): one mark over the test's four
+cells had each task draw every cell, 255 to 280 s a task (armada, run IG-TIMING1)."""
+
+
+def dit_fsdp_cells() -> list:
+    """`DIT_FSDP_CELLS` as parameters, each marked from `CHECK1_SHARDS` by its node id."""
+    test = "test_a_dits_fsdp_cells_train_as_on_one_device"
+    return [pytest.param(*cell, id=name, marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{name}]"]))
+            for cell, name in zip(DIT_FSDP_CELLS, cell_ids(DIT_FSDP_CELLS), strict=True)]
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), dit_fsdp_cells())
+def test_a_dits_fsdp_cells_train_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the DiTs' fsdp cells, each arm's `fit`
+    checked in the map task that draws its placed seed."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
 @pytest.mark.parametrize(("case", "steps", "layout"), MLA_CELLS, ids=cell_ids(MLA_CELLS))
 @pytest.mark.check1_shards(seeds=32, per_task=8)
 def test_an_mla_decoders_fsdp_cell_trains_as_on_one_device(case, steps, layout, tmp_path):
@@ -560,12 +613,31 @@ def test_a_glm4_moe_decoder_trains_on_every_layout_as_on_one_device(case, steps,
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
+def initial_state(trainer: Trainer) -> TrainState:
+    """`trainer`'s fresh state (`Trainer.initial_state`), computed by one program: run eagerly its model's
+    initializer compiled 300 to 570 programs, 9 to 13 s of a cold cell (rows 7652, 8533)."""
+    return jax.jit(trainer.initial_state)()
+
+
+_SETUPS: dict[str, tuple] = {}
+"""Each case's one-device trainer, its encoder and its fresh state (`case_setup`), by the case's name."""
+
+
+def case_setup(case: Case, tmp_path) -> tuple:
+    """`case`'s one-device trainer, its encoder and its fresh state (`initial_state`), made once a process
+    for every cell of the case a group holds (`shared_setup`): the state is never donated, each draw and
+    each fit stepping a copy of it."""
+    if case.name not in _SETUPS:
+        trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
+        _SETUPS[case.name] = trainer, encoder, initial_state(trainer)
+    return _SETUPS[case.name]
+
+
 def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path, *, fits: bool = True):
     """A cell of `test_architecture_trains_on_every_layout_as_on_one_device`: `case` trained `steps` steps
     on `layout` as on one device (check 1), each arm's `fit` checked beside its draws where `fits`, else
     by a test of its own (`assert_fits_on_the_layout`)."""
-    trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
-    initial = trainer.initial_state()
+    trainer, encoder, initial = case_setup(case, tmp_path)
 
     def copied():
         # Each fit donates the state it was handed.
@@ -634,8 +706,7 @@ def assert_fits_on_the_layout(case, steps, layout, placed: bool, tmp_path):
     """One arm's `fit` of a cell of `test_architecture_trains_on_every_layout_as_on_one_device` against its
     drawn steps on the cell's own batch (`assert_fits_as_drawn`), as the cell checks it beside its draws:
     the layout's where `placed`, else one device's."""
-    trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
-    initial = trainer.initial_state()
+    trainer, encoder, initial = case_setup(case, tmp_path)
     width = residual_width(initial.variables, trainer.objective.parameter_axes) if case.is_lm else 0
     mesh, devices = (LAYOUTS[layout], None) if placed else (MeshSpec(), 1)
     ours = drawn_steps(case, tmp_path, mesh, devices, initial, steps)(next(batches(case, encoder)()),

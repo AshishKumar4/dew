@@ -124,6 +124,32 @@ def test_a_grouped_gemm_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_matrices_side_by_side_hold_every_order(edge):
+    """`gemm.gemm` of matrices side by side (`beside`: the rows' products with each, each its own output,
+    its custom derivative the grouped GEMM's, through `generation.linear_tangent`): every order runs in the
+    rows and the matrices, finite wherever float64 is a normal float32 and wherever the products apart are
+    (each row's product with its group's matrix, by a mask, its float64 run the truth), at values whose
+    products near float32's ends."""
+    sizes = jnp.asarray([3, 0, 5], jnp.int32)
+    groups = jnp.repeat(jnp.arange(3), sizes, total_repeat_length=8)
+    shapes = ((8, 16), (3, 16, 4), (3, 16, 8))
+    primals = normal_draw(6794, *shapes, scale=EDGES[edge])
+    direction = normal_draw(6795, *shapes, scale=EDGES[edge])
+    (cotangent,) = normal_draw(6796, (8, 12))
+
+    def side_by_side(rows, first, second):
+        return jnp.concatenate(gemm.gemm(rows, first, sizes, beside=(second,), out_dtype=rows.dtype), axis=-1)
+
+    def plain(rows, first, second):
+        hot = jax.nn.one_hot(groups, 3, dtype=rows.dtype)
+        products = [jnp.einsum("rg,rk,gkn->rn", hot, rows, matrices) for matrices in (first, second)]
+        return jnp.concatenate(products, axis=-1)
+
+    assert_contract(side_by_side, primals, direction, cotangent, f"matrices side by side {edge}",
+                    truth_fn=plain, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_an_adapted_product_holds_every_reverse_order(edge):
     """`low_rank.low_rank` (LoRA's adapted product as one product over the depth its rank extends, its custom
     VJP declared through `derivatives.declared_derivative`): every reverse order, under a nested jit and a
@@ -821,10 +847,36 @@ def test_an_xla_projection_in_its_layer_holds_every_order(edge, form):
     primals = normal_draw(6027, rows, matrix, scale=EDGES[edge])
     direction = normal_draw(6028, rows, matrix, scale=EDGES[edge])
     (cotangent,) = normal_draw(6029, out)
-    product = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None)
+    taken = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None)
+
+    def product(rows, matrix):
+        return taken(rows, (matrix,))
 
     def plain(rows, matrix):
         return jax.lax.dot_general(rows, matrix, dimensions)
 
     assert_contract(product, primals, direction, cotangent, f"an xla projection in its layer {edge}",
+                    plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_biased_xla_projection_in_its_layer_holds_every_order(edge):
+    """A biased projection's product no launch takes, its bias added inside its rule
+    (`projections._in_layer_product` with a bias: the input's cotangent leaving with the kernel's and the
+    bias's gradients, one barrier for both): every order, forward and reverse, under a nested jit and a
+    scan, in the rows, the matrix and the bias, finite wherever float64 is a normal float32 and wherever the
+    plain dot plus its bias (its float64 run the truth) is, at values whose products near float32's ends."""
+    rows, matrix, out, dimensions = XLA_FORMS["dense"]
+    primals = normal_draw(6740, rows, matrix, out[-1:], scale=EDGES[edge])
+    direction = normal_draw(6741, rows, matrix, out[-1:], scale=EDGES[edge])
+    (cotangent,) = normal_draw(6742, out)
+    taken = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None)
+
+    def product(rows, matrix, bias):
+        return taken(rows, (matrix, bias))
+
+    def plain(rows, matrix, bias):
+        return jax.lax.dot_general(rows, matrix, dimensions) + bias
+
+    assert_contract(product, primals, direction, cotangent, f"a biased xla projection in its layer {edge}",
                     plain_fn=plain)

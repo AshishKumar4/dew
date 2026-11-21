@@ -34,21 +34,35 @@ from typing import ClassVar, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.typing import DTypeLike
 
 from dew._hashing import fmix32
-from dew.nn.derivatives import Protected, contracted
+from dew.nn.derivatives import Protected, contracted, surrogate
+from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import bodies
 from dew.nn.precision import (
     at_least_fp32,
-    binade_of,
     compensated_sum,
     exact_float32,
     float32_einsum,
     lowered_divide,
-    raised_exactly,
+    two_product,
     two_sum,
 )
+
+DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
+"""The operand dtypes the attention template's kernels take, one on queries, keys and values alike."""
+
+WARPS = 4
+"""A program's warps: one warpgroup, its tile's rows over its four warps, FlashAttention 2's."""
+
+ROWS = 32
+"""A warp's rows of the block: two mma.sync instructions' sixteen."""
+
+BLOCK = WARPS * ROWS
+"""The most rows or keys a tile takes, the block a call pads to (`padded_call`): a warp's rows a warp
+(FlashAttention 2's 128 a program)."""
 
 
 @jax.tree_util.register_dataclass
@@ -532,15 +546,18 @@ def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
     return jnp.where(jnp.all(blocks == first, axis=-1), first[..., 0], 0)
 
 
-def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int) -> tuple:
+def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int, *,
+              minimum: Callable = jnp.minimum, div: Callable = jax.lax.div) -> tuple:
     """The key tiles `[lo, hi)` a query block of `block_q` queries from `first_query` walks in a call of no
     spans, by its form (`attention_algebra.Forward.form`): under the causal one the tiles at or before its
-    last query, else every tile of the `keys`. A call of spans walks its `BlockMap`'s (`block_map`)."""
+    last query, else every tile of the `keys`, by `minimum` and `div` (a traced walk's; a price's integers'
+    `min` and `operator.floordiv`, `attention_mosaic_program.walks`). A call of spans walks its
+    `BlockMap`'s (`block_map`)."""
     tiles = -(-keys // block_k)
     if form == "causal":
         # Its queries' first place is no negative number: a truncating division rounds it up, as every
         # kernel language lowers.
-        return 0, jnp.minimum(jax.lax.div(first_query + block_q + block_k - 1, block_k), tiles)
+        return 0, minimum(div(first_query + block_q + block_k - 1, block_k), tiles)
     return 0, tiles
 
 
@@ -711,12 +728,13 @@ class Param:
 class Initial:
     """Where each query's online softmax starts: its running maximum `m` `[B, H, Q]` (natural log), its
     unnormalized denominator `total` `[B, H, Q]` and numerator `acc` `[B, H, Q, Dv]`, fp32 or wider.
-    Sinks are `m` the head's sink, `total` one and `acc` zero (`sinks`); a resumed partial is its own
-    state."""
+    Sinks are `m` the head's sink, `total` one and `acc` zero (`sinks`), `valueless`: the output a mean of
+    the values and zeros (`attention_algebra.largest_of`); a resumed partial is its own state."""
 
     m: jax.Array
     total: jax.Array
     acc: jax.Array
+    valueless: bool = dataclasses.field(default=False, metadata={"static": True})
 
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
@@ -724,7 +742,7 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     dtype (`at_least_fp32`), each head's gradient its rows' terms summed once rounded (`_spread_sinks`)."""
     wide = at_least_fp32(values.dtype)
     m = _spread_sinks((batch, values.shape[0], queries))(values.astype(wide))
-    return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
+    return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide), valueless=True)
 
 
 @functools.cache
@@ -844,6 +862,11 @@ class Draw:
         """The multiplier a kept entry takes, `1 / (1 - rate)`, the largest an entry's weight takes."""
         return 1.0 / (1.0 - self.rate)
 
+    @property
+    def reach(self) -> float:
+        """The least power of two at or above `bound` (`dropped_reach`)."""
+        return dropped_reach(self.bound)
+
     def keep(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
         """Whether the draw keeps the entries at `queries` and `keys` (indices that broadcast): the keep bits
         every mainloop and the reference share, each taking its own scale for a kept entry. Where the draw
@@ -945,6 +968,52 @@ class Dropout:
     def bound(self) -> float:
         """The multiplier a kept entry takes, every draw's (`Draw.bound`)."""
         return 1.0 / (1.0 - self.rate)
+
+    @property
+    def reach(self) -> float:
+        """The least power of two at or above `bound`, every draw's (`dropped_reach`)."""
+        return dropped_reach(self.bound)
+
+
+def dropped_reach(bound: float) -> float:
+    """The least power of two at or above a dropout multiplier `bound`, the units a walk's sums hold a kept
+    weight in (`attention_algebra.Forward.units`), the most its bounds take one by (`frexp`'s exponent,
+    less one where `bound` is a power of two): at most 2^53, a rate below 1 in float64 its multiplier's."""
+    mantissa, exponent = math.frexp(bound)
+    return float(2.0 ** (exponent - 1 if mantissa == 0.5 else exponent))
+
+
+def kept(weights: jax.Array, multiplier: jax.Array | None, power: float = 1.0) -> jax.Array:
+    """`weights` where a dropout draw's `multiplier` keeps their keys, zero where it drops them, each kept one
+    taken exactly by `power` (`Forward.units`; a value's 1); `weights` where no call drops."""
+    return weights if multiplier is None else jnp.where(multiplier > 0, weights * np.float32(power), 0.0)
+
+
+def drops_in_place(dtype, reach: float) -> bool:
+    """Whether dropped weights taken by a multiplier's `reach` (`Dropout.reach`) narrow to `dtype` as they
+    are, the forward's (`kept_parts`) and the backward's for dV's product (`value_parts`, `value_weights`):
+    `reach` within its largest binade (fp16's 2^15)."""
+    return reach <= float(2.0 ** (jnp.finfo(dtype).maxexp - 1))
+
+
+def sums_units(drop: "Dropout | None", *, headroom: bool, initial: bool) -> float:
+    """`Forward.units`, what a dropping call's sums hold a kept weight by: its multiplier's reach, a state's
+    sums taken up into it by less than 2 on a walk whose headroom scales them; beside a state on a walk of
+    none, the multiplier, the products taken down to it (`in_units`) and the state's as they are (taken up,
+    3 2^126 overflowed, the base review of a648b3279, F2), which no in-place mainloop takes (`refused`)."""
+    if drop is None:
+        return 1.0
+    return drop.bound if initial and not headroom else drop.reach
+
+
+def anchor_multipliers(drop: Dropout, anchors: jax.Array) -> jax.Array:
+    """Each row's anchor's dropout multiplier (`Draw`) at its query and its anchor key `anchors`
+    `[B, H, Qp]`, every batch row and query head its draw's: the factor its own weight takes in the output
+    (`joined`) and its value in D (a dropping backward's `gradient.split_delta`)."""
+    batch, heads, queries = anchors.shape
+    draw = Draw((drop.seed[0], drop.seed[1]), drop.rows.reshape(batch, 1, 1), drop.heads.reshape(1, heads, 1),
+                drop.rate, drop.queries, drop.keys)
+    return draw(jnp.arange(queries, dtype=jnp.int32), anchors)
 
 
 def coded(p: jax.Array, bound: float) -> jax.Array:
@@ -1245,11 +1314,25 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
     total = total0 * carried + jnp.sum(p, axis=-1)
 
-    def valued(weights: jax.Array) -> jax.Array:
-        # The weights narrowed to the values' dtype times the values, a query group's over its key head.
-        grouped = weights.astype(value.dtype).reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
-        return float32_einsum("bhgqk,bkhd->bhgqd", grouped, value, precision=REFERENCE_PRECISION,
-                              preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
+    def valued(weights: jax.Array, *, cotangent_wide: bool = False) -> jax.Array:
+        # The weights narrowed to the values' dtype times the values, a query group's over its key head. With
+        # `cotangent_wide` the weights' cotangent dO·Vᵀ fp32, the product's value and the values' cotangent
+        # the narrowed one's as they are: an fp16 dropping call's reached 8 x 2^15 before the small weight
+        # that takes it finite, inf in fp16 (row 9506's gradients).
+        def product(grouped, operand):
+            return float32_einsum("bhgqk,bkhd->bhgqd", grouped, operand, precision=REFERENCE_PRECISION,
+                                  preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
+
+        grouped = weights.reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
+        narrowed = product(grouped.astype(value.dtype), value)
+        if not cotangent_wide:
+            return narrowed
+        # Its value the narrowed product's; its derivatives at every order the same bilinear product's in
+        # fp32, the narrowing straight through, both operands live (`derivative_of`).
+        rounded = grouped.astype(value.dtype).astype(grouped.dtype)
+        wide_product = product(grouped + jax.lax.stop_gradient(rounded - grouped),
+                               value.astype(grouped.dtype))
+        return jax.lax.stop_gradient(narrowed) + derivative_of(wide_product)
 
     drop = hooks.drop
     if hooks.rounds is not None:
@@ -1259,6 +1342,11 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+        if hooks.initial is None or hooks.initial.valueless:
+            normalized = held_mean(normalized, acc, value.dtype)
+        if hooks.output_mod is None and jnp.dtype(query.dtype).itemsize == 2:
+            # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
+            normalized = narrowing_settled(normalized, acc, total, query.dtype)
     else:
         # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's z
         # times its normalized weight stays in the values' range where z times the unnormalized one may not
@@ -1273,11 +1361,105 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 
         drawn = jax.vmap(jax.vmap(multiplier, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch),
                                                                                     jnp.arange(heads))
-        normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn)
+        normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
+                                                                   cotangent_wide=value.dtype == jnp.float16)
 
     out = output_hooked(normalized, hooks.output_mod, hooks.output_params)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out
+
+
+def saturated(x: jax.Array, finite_operands: jax.Array, dtype=None) -> jax.Array:
+    """`x` saturated at `dtype`'s (default `x.dtype`'s) largest magnitude where `finite_operands` holds and
+    `|x|` passes it (rows 6882, 9519): one rule shared by `base2_maximum`, `raw_maximum`,
+    `attention_algebra.quotient` and `held_mean`. A mean of finite values of `dtype` is within `dtype`'s
+    largest, so one past it is its weights' or sums' rounding (narrowed to fp16 for their product, the
+    weights round up by as much as 2^-11 of each where the denominator sums them unrounded, the mean of 1001
+    values of 65504 at 65522, inf in fp16). An infinite or NaN operand's result stays as it is."""
+    largest = jnp.finfo(x.dtype if dtype is None else dtype).max
+    past = finite_operands & (jnp.abs(x) > largest)
+    return jnp.where(past, jnp.where(x > 0, largest, -largest).astype(x.dtype), x)
+
+
+def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`narrowing_settled`'s value."""
+    if out.dtype != jnp.float32:
+        return out
+    divisor = jax.lax.broadcast_in_dim(divisor, acc.shape, tuple(range(divisor.ndim)))
+    above = _remainder_sign(acc, out, divisor)
+    bits = jax.lax.bitcast_convert_type(out, jnp.int32)
+    # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side, its
+    # side read from its sign bit (a subnormal's comparison with zero reads it as zero where the CPU treats
+    # subnormal operands as zero).
+    toward = jnp.where((above > 0) == (bits > 0), 1, -1).astype(jnp.int32)
+    odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
+    nudged = (_between(bits, dtype) & (above != 0) & jnp.isfinite(out) & jnp.isfinite(acc)
+              & (divisor > 0))
+    return jnp.where(nudged, odd, out)
+
+
+narrowing_settled = contracted("test_the_narrowing_settle_holds_every_order")(
+    surrogate(_narrowing_settled, lambda dtype, primals, tangents, value: tangents[0], nondiff_argnums=(3,)))
+"""`out`, the sums `acc` over `divisor` as the finish formed it (fp32; a recovered subnormal's bits,
+`attention_algebra.quotient`), rounded to odd where it narrows to the 16-bit `dtype`: where it lands exactly
+between two values of `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it, so the
+narrowing rounds once as the exact quotient would: the exact output 65519.9995 of one kept key of 65504
+rounded to fp32's 65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). The side is
+the sign of `acc` less `out` times `divisor`, exact (`_remainder_sign`). A finite fp32 `out` over a positive
+divisor alone; any other, a held one (its dtype's largest, no tie) and a guarded zero as they are, selected,
+no arithmetic on them. Its derivative is `out`'s on every entry, nudged or not (`surrogate`). The bound left
+at fp32's resolution, as the fp32 reference's: `divisor` is the one rounded (a dropping call's total times
+its multiplier's rest, `dropped_total`), and the sums and exponentials before it round as the reference's
+do, so an exact output within their rounding of a boundary may narrow past it."""
+
+
+def _remainder_sign(acc: jax.Array, quotient: jax.Array, divisor: jax.Array) -> jax.Array:
+    """A value of the sign of `acc - quotient * divisor` (fp32, finite), exact: `quotient` and `divisor` each
+    normalized to [1, 2) from its bits (`float_bits.binade_of`, raised or lowered exactly, a subnormal's
+    too), so their product's rounding and its residual (`two_product`'s bit split) are normal, and `acc`
+    taken by the same powers of two, which leaves it near the product where the quotient is near
+    `acc / divisor`: no operand or residual passes fp32's range or flushes, at bf16's midpoint over a
+    divisor near 2^126 as at a quotient near fp32's least normal."""
+    def normalized(x):
+        binade = binade_of(x)
+        return jnp.where(binade < 0, raised_exactly(x, jnp.maximum(-binade, 0)),
+                         lowered_rounded(x, jnp.maximum(binade, 0))), binade
+
+    (quotient, at), (divisor, by) = normalized(quotient), normalized(divisor)
+    high, low = two_product(quotient, divisor, bit_split=True)
+    shift = at + by
+    taken = jnp.where(shift < 0, raised_exactly(acc, jnp.maximum(-shift, 0)),
+                      lowered_rounded(acc, jnp.maximum(shift, 0)))
+    return (taken - high) - low
+
+
+def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """Whether each fp32 value of `bits` (its int32 bits) lies exactly between two neighbouring values of the
+    16-bit `dtype`, the tie its narrowing rounds to even: the significand bits the narrowing drops (16 of
+    bf16's, 13 of fp16's normals, more below its least normal, 2^-14) are a one and zeros."""
+    found = jnp.finfo(dtype)
+    exponent = jnp.right_shift(bits, 23) & 0xFF
+    significand = (bits & 0x7FFFFF) | jnp.where(exponent > 0, 0x800000, 0)
+    dropped = 23 - (found.nmant)
+    if found.minexp > -126:
+        # Below the dtype's least normal its narrowing drops a bit more a binade, down to the significand's
+        # whole 24 (half the least subnormal, 2^-25 in fp16, its last tie).
+        dropped = dropped + jnp.clip(127 + found.minexp - exponent, 0, 24 - dropped)
+    half = jnp.left_shift(1, dropped - 1)
+    return (significand & (2 * half - 1)) == half
+
+
+def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
+    """The reference's mean saturation (`saturated`): its value, its derivative the mean's, `out`'s
+    (`derivative_of`)."""
+    return saturated(jax.lax.stop_gradient(out), jnp.abs(sums) < jnp.inf, dtype) + derivative_of(out)
+
+
+def derivative_of(out: jax.Array) -> jax.Array:
+    """Zero with `out`'s derivative, where `out` is finite (an infinite one's difference from itself NaN):
+    added to a value formed from `out`'s, it carries `out`'s derivative and leaves the value as it is."""
+    value = jax.lax.stop_gradient(out)
+    return jnp.where(jnp.isfinite(value), out - value, 0.0)
 
 
 def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Param, ...]) -> jax.Array:
@@ -1328,6 +1510,19 @@ def blocked(depth: int) -> bool:
     return depth % FP32_BLOCK == 0 and blocks >= 2 and not blocks & (blocks - 1)
 
 
+def _compensated_blocks(lefts: list[jax.Array], rights: list[jax.Array],
+                        reduce_block: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
+    """Sum `reduce_block(left, right)` across `FP32_BLOCK`-deep blocks with TwoSum compensation
+    (`compensated_total`), shared by `kernel_dot` and `kernel_rows`."""
+    from dew.nn.precision import compensated_total, two_sum
+
+    total, carried = two_sum(reduce_block(lefts[0], rights[0]), reduce_block(lefts[1], rights[1]))
+    for left, right in zip(lefts[2:], rights[2:], strict=True):
+        total, dropped = two_sum(total, reduce_block(left, right))
+        carried = carried + dropped
+    return compensated_total((total, carried), total)
+
+
 def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product;
     for fp32 operands IEEE fp32 products, a contraction of blocks (`blocked`) summed a block at a time, each
@@ -1341,20 +1536,26 @@ def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
         return interpreted_dot(a, b)
     from jax.experimental.pallas import triton as plgpu
 
-    from dew.nn.precision import compensated_total, two_sum
-
-    def dot(a, b):
-        return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+    def dot(x, y):
+        return plgpu.dot(x, y, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
     if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
         return dot(a, b)
     blocks = a.shape[-1] // FP32_BLOCK
-    lefts, rights = jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0)
-    total, carried = two_sum(dot(lefts[0], rights[0]), dot(lefts[1], rights[1]))
-    for left, right in zip(lefts[2:], rights[2:], strict=True):
-        total, dropped = two_sum(total, dot(left, right))
-        carried = carried + dropped
-    return compensated_total((total, carried), total)
+    return _compensated_blocks(jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0), dot)
+
+
+def kernel_rows(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """Each row's `a · b` over the last axis as a Triton kernel forms D and the anchor's `v_c · dO`
+    (`attention_triton._dq_kernel`, rows 9113, 9114, 9610, 9611): `interpreted_rows` when interpreted, else
+    `FP32_BLOCK`-blocked TwoSum compensation matching `kernel_dot` on fp32 operands."""
+    if interpret:
+        return interpreted_rows(a, b)
+    if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
+        return jnp.sum(a * b, axis=-1)
+    blocks = a.shape[-1] // FP32_BLOCK
+    return _compensated_blocks(jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=-1),
+                               lambda x, y: jnp.sum(x * y, axis=-1))
 
 
 def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
@@ -1876,11 +2077,14 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             numerator = raised_exactly(delta, raised) * half * half
             divisor = jnp.where(total > 0, total, 1.0)
             return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
+        from dew.nn.kernels.templates import bodies
 
         weighed = bodies.subnormals(weighed_by, delta.dtype)
-        initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
-                          total=(-weighed).astype(state.total.dtype),
-                          acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
+        # In the state's own structure, its static marks with it (`Initial.valueless`).
+        initial = dataclasses.replace(
+            state, m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
+            total=(-weighed).astype(state.total.dtype),
+            acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded

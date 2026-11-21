@@ -43,7 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -584,6 +584,39 @@ def compiled_sample(printed: str) -> tuple[float, dict, dict | None]:
     return float(compiled["seconds"]), compiled["plan"], compiled.get("parts")
 
 
+STEP_PARTS = ("traced", "lowered", "compiled")
+"""The parts of a step's planning that are its step's own compile (`AheadOfTime.planned_parts`, JAX's traces,
+lowerings and compiles, `dew.telemetry.compiles.EVENTS`): a tree whose parts hold `start`, the initializer's
+fresh state's own trace, lowering and compile, keeps it apart from them (6740: since 62a8603cb2 put that
+compile in the planning, its whole gained work a step's compile did not, and dit and finetune read as
+regressed)."""
+SHOWN_PARTS = ("start", "algebra")
+"""The planning's other parts, each a row of its own beside the step's (`compile_rows`), gated as it is."""
+
+
+def compile_rows(name: str) -> list[Row]:
+    """Compile row `name`'s rows (`compile_battery`): the step's own compile (`STEP_PARTS`) and each of the
+    planning's other parts (`SHOWN_PARTS`), each gated, so a head that slows the initializer's compile or
+    the algebra's is no faster to its first step than it was (train 1104's review F3); and the whole
+    planning and prepare under its own name, as every earlier gate recorded it, shown, not gated, as a tree
+    that moved a compile into it reads more work there that no part of it took longer at (6740). A base
+    whose tree records no start apart compares none of the parts (`compile_samples`)."""
+    return [Row(f"{name} step", "s", "", floor=COMPILE_FLOOR),
+            Row(name, "s", "", gated=False, floor=COMPILE_FLOOR),
+            *(Row(f"{name} {part}", "s", "", floor=COMPILE_FLOOR) for part in SHOWN_PARTS)]
+
+
+def compile_samples(name: str, seconds: float, parts: Mapping[str, float] | None) -> dict[str, object]:
+    """Compile row `name`'s samples of one round (`compile_rows`): the whole planning's `seconds`, and its
+    `parts`' step and others where the tree records `start` apart; else each of those not measured, as a
+    tree before it mixes its initializer into its step's parts (`STEP_PARTS`), never compared as a step's."""
+    if not parts or "start" not in parts:
+        apart = "not measured: its tree records no start part apart from its step's (6740)"
+        return {name: seconds, f"{name} step": apart, **{f"{name} {part}": apart for part in SHOWN_PARTS}}
+    return {name: seconds, f"{name} step": sum(float(parts.get(part, 0.0)) for part in STEP_PARTS),
+            **{f"{name} {part}": float(parts.get(part, 0.0)) for part in SHOWN_PARTS}}
+
+
 def ahead_battery(args: argparse.Namespace) -> int:
     """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, for one
     compile-only GPU of the kind, `COMPILE_TARGETS`), in each tree's environment of `--lock`, into
@@ -650,7 +683,7 @@ def compile_battery(args: argparse.Namespace) -> int:
              for name, case in STEP_CASES.items()
              if (not args.only or any(word in name for word in args.only))
              and device in STEP_HARDWARE.get(name, (device,))}
-    rows = [Row(name, "s", "", floor=COMPILE_FLOOR) for name in cases]
+    rows = [row for name in cases for row in compile_rows(name)]
     arms = arms_of(base, head, base_path, head_path)
     results = {"base": base, "head": head, "alone": f"{base}{ALONE}", "rounds": args.rounds,
                "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in ARMS}, "orders": [],
@@ -668,7 +701,7 @@ def compile_battery(args: argparse.Namespace) -> int:
             taken, plans, parts = {}, {}, {}
             for name, case in cases.items():
                 if tree in unbuilt:
-                    taken[name] = unbuilt[tree]
+                    taken |= {row.name: unbuilt[tree] for row in compile_rows(name)}
                     continue
                 with tempfile.TemporaryDirectory(dir=work) as cache:
                     argv = [str(script), json.dumps(case), generation, str(gib << 30), AHEAD_ATTENTION,
@@ -676,9 +709,10 @@ def compile_battery(args: argparse.Namespace) -> int:
                     done = _run(path, pythons[tree], "", argv, head_path / "tools", 3600,
                                 Path(cache) / "compiles")
                 if done.returncode != 0:
-                    taken[name] = f"not run: {done.stderr[-400:]}"
+                    taken |= {row.name: f"not run: {done.stderr[-400:]}" for row in compile_rows(name)}
                     continue
-                taken[name], plans[name], parts[name] = compiled_sample(done.stdout)
+                seconds, plans[name], parts[name] = compiled_sample(done.stdout)
+                taken |= compile_samples(name, seconds, parts[name])
             results["plans"][arm].append(plans)
             results["parts"][arm].append(parts)
             return taken
@@ -904,8 +938,7 @@ def main() -> int:
     aheading = operations.add_parser("ahead", help="each step compiled ahead of its run, into a directory "
                                                    "`run --ahead` hands its step rows (`ahead_battery`)")
     for flag in ("--base", "--head", "--kind", "--lock", "--out"):
-        aheading.add_argument(flag, required=True, **({"choices": sorted(COMPILE_TARGETS)} if flag == "--kind"
-                                                       else {}))
+        aheading.add_argument(flag, required=True, choices=sorted(COMPILE_TARGETS) if flag == "--kind" else None)
     aheading.add_argument("--environments", default="")
     aheading.add_argument("--only", nargs="*", default=[])
     args = parser.parse_args()

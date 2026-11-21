@@ -33,10 +33,13 @@ class Dim:
     divisor: int = 1
     ceil: bool = False
     multiple: int = 1
+    stated: int | None = None
 
     @property
     def size(self) -> int:
-        """Its size, from its operands' own shapes."""
+        """Its size, from its operands' own shapes, or the one its launch states (`sized`)."""
+        if self.stated is not None:
+            return self.stated
         product = self.constant * math.prod(operand.shape[index] for operand, index in self.axes)
         quotient = -(-product // self.divisor) if self.ceil else product // self.divisor
         return -(-quotient // self.multiple) * self.multiple
@@ -58,6 +61,12 @@ class Dim:
     def ceil_div(self, divisor: int) -> Dim:
         """It over `divisor`, rounded up (a tile count over a ragged edge)."""
         return self._divided(divisor, ceil=True)
+
+    def sized(self, size: int) -> Dim:
+        """It at `size`, which its launch computes of its axes otherwise than a product, a quotient or a
+        padding states (a GEMM's rows: its walked rows less the extension past its last tile): the axes it
+        descends from its own, its size the launch's."""
+        return dataclasses.replace(self, stated=size)
 
     def padded(self, multiple: int) -> Dim:
         """It rounded up to a multiple of `multiple` (a tile's rows past a ragged edge)."""
@@ -87,10 +96,14 @@ class Output:
     dtype: jax.typing.DTypeLike
 
     @property
+    def shape(self) -> tuple[int, ...]:
+        """Its sizes, its dimensions' (`Dim.size`), as a `jax.ShapeDtypeStruct`'s are read."""
+        return tuple(dim if isinstance(dim, int) else dim.size for dim in self.dims)
+
+    @property
     def struct(self) -> jax.ShapeDtypeStruct:
-        """Its shape and dtype, its sizes its dimensions' (`Dim.size`)."""
-        return jax.ShapeDtypeStruct(tuple(dim if isinstance(dim, int) else dim.size for dim in self.dims),
-                                    self.dtype)
+        """Its shape and dtype."""
+        return jax.ShapeDtypeStruct(self.shape, self.dtype)
 
 
 def output(dtype: jax.typing.DTypeLike, *dims: Dim | int) -> Output:

@@ -16,9 +16,11 @@ from flax.typing import PrecisionLike
 from dew import _cache
 from dew.mesh import mesh_axes
 from dew.nn.derivatives import (
+    Protected,
     Surrogate,
     contracted,
     declared_derivative,
+    marked,
     portable_formed,
     with_gradients_formed,
 )
@@ -33,6 +35,7 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_product,
 )
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
+from dew.nn.precision import biased, biased_value
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -40,7 +43,6 @@ from dew.nn.sharding import (
     logical_spec,
     on_shards,
     placed_layout,
-    seen_whole,
     shard_shapes,
 )
 
@@ -340,47 +342,74 @@ def dot_general(xla, path: tuple | None = None):
     """`xla`, a layer's product (a `jax.lax.dot_general`, as flax's `Dense` takes one), in the run's
     low-precision recipe where its role takes the matrix product (`recipe_projection`), else through the
     template's dense product (`gemm` of one group) where the call is a matrix product (`lhs`'s last axis
-    against a matrix's first, no batch axes, both of one dtype) and a launch takes any of its products: the
-    forward, the input gradient or the kernel gradient (`launched`). A call no launch takes is `xla`'s own
+    against a matrix's first, no batch axes, both of one dtype), or its grouped product where it batches
+    (each batch member a group, `grouped_rows`), and a launch takes any of its products: the forward, the
+    input gradient or the kernel gradient (`launched`). A call no launch takes is `xla`'s own
     program, differentiated by JAX, each of its products' routes reported with the reason no launch takes
     it (a declared cell's old route, a mesh axis splitting the operands, a CPU), so a layer runs as it ran
     before wherever the template declares XLA faster; every other product is `xla`'s. On a mesh whose
     automatic axes split the rows alone, where a launch takes a device's rows' product, each device's rows
     are its own call (`mapped_shards`), its matrix, the parameter at its variables `path`, placed by the
-    traced program's layout: a kernel launch per device on its own rows (bible §7, rows 1306 and 1923)."""
-    def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
+    traced program's layout: a kernel launch per device on its own rows (bible §7, rows 1306 and 1923).
+
+    A `bias`, shaped to broadcast over the product's trailing axes, is added as `precision.biased` adds
+    it; XLA's own product takes it inside its rule, the input's cotangent returned only with the kernel's
+    and the bias's gradients formed, one barrier for both where the bias's own rule would add two (row
+    6740)."""
+    def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, bias=None,
+                **kwargs):
+        def added(out):
+            # A product another rule takes, the bias added past it by its own (`precision.biased`).
+            return out if bias is None else biased(out, bias)
+
         (contracted, against), batch = dimension_numbers
         out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
         # The run's low-precision recipe takes the product where the projection's role takes it.
         if not kwargs and (recipe := recipe_general(lhs, rhs, dimension_numbers, out_dtype)) is not None:
-            return recipe
+            return added(recipe)
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
         if plain and path is not None and (shards := mapped_shards(lhs, (rhs,), (path,), out_dtype,
                                                                      precision)) is not None:
             split, gathered = shards
-            return on_shards(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
-                                                      preferred_element_type), split, (lhs, rhs),
-                             gathered=gathered)
+            return added(on_shards(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
+                                                            preferred_element_type), split, (lhs, rhs),
+                                   gathered=gathered))
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
             if launched(rows, rhs, out_dtype, precision):
                 out = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
-                return out.reshape(*lhs.shape[:-1], rhs.shape[1])
+                return added(out.reshape(*lhs.shape[:-1], rhs.shape[1]))
+        elif not kwargs and lhs.dtype == rhs.dtype and batch[0] and not automatic_axes():
+            # A batched projection's members as uniform groups (`grouped_rows`, Appendix C row 4): one
+            # grouped GEMM where a launch takes any of its products, as a dense one's (DeepSeek V4's
+            # `o_a_proj`, a `DenseGeneral` over its groups; spec alignment SA20261119pm F36).
+            rows, matrices, count, shape = grouped_rows(lhs, rhs, dimension_numbers)
+            # One member is the dense product it is, probed and run as one: the dense product's cells, not
+            # one group's (head review of 0099a4701 F3).
+            matrix, sizes = ((matrices[0], None) if matrices.shape[0] == 1
+                             else (matrices, jnp.full((matrices.shape[0],), count, jnp.int32)))
+            if launched(rows, matrix, out_dtype, precision):
+                return added(gemm(rows, matrix, sizes, out_dtype=out_dtype, precision=precision).reshape(
+                    shape))
         taken = _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs)
-        return taken(lhs, rhs)
+        return taken(lhs, (rhs,) if bias is None else (rhs, bias))
 
     return product
 
 
 def _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs):
     """A projection's product no launch takes, XLA's own (`xla`, any of its forms: a batched one's, DeepSeek
-    V4's grouped `o_a_proj`), through the rule as the template's is (`derivatives.portable_formed`): the
-    input's cotangent returned only with the kernel's gradient formed."""
-    def portable(lhs, rhs):
-        return xla(lhs, rhs, dimension_numbers, precision=precision,
-                   preferred_element_type=preferred_element_type, **kwargs)
+    V4's grouped `o_a_proj`), of its rows and its parameters, its kernel and its bias where it has one
+    (added as `precision.biased` adds it, a span the algebra pass keeps as that one is), through the rule as
+    the template's is (`derivatives.portable_formed`): the input's cotangent returned only with the
+    parameters' gradients formed, one barrier for both."""
+    def portable(lhs, parameters):
+        rhs, *bias = parameters
+        out = xla(lhs, rhs, dimension_numbers, precision=precision,
+                  preferred_element_type=preferred_element_type, **kwargs)
+        return marked(Protected(), biased_value)(out, *bias) if bias else out
 
     return portable_formed(portable)
 
@@ -462,16 +491,31 @@ def extents(lhs_shape: tuple[int, ...], rhs_shape: tuple[int, ...], dimension_nu
 
 def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
     """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) in the run's low-precision recipe
-    (`recipe_projection`), as matrices: a dense projection's free rows against its kernel's contracted
-    axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch member a
-    group of rows against its own matrix, the result in `dot_general`'s order (batch, `lhs`'s free axes,
-    `rhs`'s); None where `recipe_projection` takes none of it, and where the run trains in no recipe before
-    any operand is laid out as matrices: an operand an explicit mesh axis splits takes no reshape that does
-    not state where its rows lie."""
+    (`recipe_projection`), as matrices (`grouped_rows`): a dense projection's free rows against its kernel's
+    contracted axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch
+    member a group of rows against its own matrix, the result in `dot_general`'s order; None where
+    `recipe_projection` takes none of it, and where the run trains in no recipe before any operand is laid
+    out as matrices: an operand an explicit mesh axis splits takes no reshape that does not state where its
+    rows lie."""
     from dew.nn.precision import recipe_role
 
     if recipe_role() is None:
         return None
+    rows, matrices, count, shape = grouped_rows(lhs, rhs, dimension_numbers)
+    groups = matrices.shape[0]
+    batched = bool(dimension_numbers[1][0])
+    out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype)
+           if batched else recipe_projection(rows, matrices[0], out_dtype=out_dtype))
+    return None if out is None else out.reshape(shape)
+
+
+def grouped_rows(lhs: jax.Array, rhs: jax.Array, dimension_numbers
+                 ) -> tuple[jax.Array, jax.Array, int, tuple]:
+    """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) laid out as a grouped GEMM's operands:
+    its rows `[groups * count, depth]` (each batch member's free rows, `count` a member, in turn), its
+    matrices `[groups, depth, width]` (a member's kernel each; one group where it batches none), the rows a
+    group, and the result's shape in `dot_general`'s order (batch, `lhs`'s free axes, `rhs`'s): Appendix C
+    row 4's batch axes as uniform groups, the one layout the recipe's and the template's products read."""
     (contracted, against), (batched, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
     free = [axis for axis in range(lhs.ndim) if axis not in contracted + batched]
     free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
@@ -480,36 +524,32 @@ def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype)
     depth, width = extents(lhs.shape, rhs.shape, dimension_numbers)
     rows = jnp.transpose(lhs, (*batched, *free, *contracted)).reshape(groups * count, depth)
     matrices = jnp.transpose(rhs, (*batched_rhs, *against, *free_rhs)).reshape(groups, depth, width)
-    out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype)
-           if batched else recipe_projection(rows, matrices[0], out_dtype=out_dtype))
-    if out is None:
-        return None
-    return out.reshape(*(lhs.shape[axis] for axis in (*batched, *free)),
-                       *(rhs.shape[axis] for axis in free_rhs))
+    shape = (*(lhs.shape[axis] for axis in (*batched, *free)), *(rhs.shape[axis] for axis in free_rhs))
+    return rows, matrices, count, shape
 
 
 def launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:
-    """Whether a launch takes any of the dense product `rows @ matrix`'s products on the call's target
-    (`grouped_matmul.GROUPED`): its forward, its input gradient or its kernel gradient, as `gemm` and
-    its reverse mode make them, each read without its report (`selection.selected`). Where none does, the
-    forward's route is reported, as XLA runs it. Decided once a key (`_decided`), its routes reported again
-    at every call: a model's projections ask the same question at every layer's trace (row 3213: a warm
-    start spent 10.9 of its 75.6 seconds selecting)."""
+    """Whether a launch takes any of the product `rows @ matrix`'s products on the call's target
+    (`grouped_matmul.GROUPED`), `matrix` one `[depth, width]` (a dense product) or `[groups, depth, width]`
+    (a batched one's uniform groups of rows, `grouped_rows`): its forward, its input gradient or its kernel
+    gradient, as `gemm` and its reverse mode make them, each read without its report (`selection.selected`).
+    Where none does, the forward's route is reported, as XLA runs it. Decided once a key (`_decided`), its
+    routes reported again at every call: a model's projections ask the same question at every layer's
+    trace (row 3213: a warm start spent 10.9 of its 75.6 seconds selecting)."""
     rows_type, matrix_type = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (rows, matrix))
-    whole = seen_whole(rows) and seen_whole(matrix)
+    whole = not automatic_axes()
     return launches(rows_type, matrix_type, out_dtype, precision, whole=whole)
 
 
 def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, precision: PrecisionLike, *,
              whole: bool) -> bool:
-    """`launched` of a product's operands by their shapes and dtypes, where they are seen `whole`
-    (`seen_whole`): a product formed later in the call (a fused MLP's down product, `dew.nn.gated_mlp`)."""
+    """`launched` of a product's operands by their shapes and dtypes, where a launch sees them `whole` (no
+    automatic mesh axis splits them): a product formed later in the call (a fused MLP's down product,
+    `dew.nn.gated_mlp`)."""
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole, generation.gpu_target(),
                             _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value)
-    for route in found:
-        generation.route(route.choice, kernel=route.kernel, preferred=route.preferred, refusal=route.refusal,
-                         forced=route.forced)
+    generation.reported(found)
     return taken
 
 
@@ -530,15 +570,18 @@ def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
 def _launched_once(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, product,
                    whole: bool) -> bool:
     """`launched`'s decision, its routes reported."""
-    width = matrix.shape[1]
+    width = matrix.shape[-1]
     abstract = functools.partial(jax.ShapeDtypeStruct, dtype=rows.dtype)
-    matrices, sizes = abstract((1, *matrix.shape)), jax.ShapeDtypeStruct((1,), jnp.int32)
+    # Dense as `gemm` runs it: a `[depth, width]` matrix, never a stack of one group (row 9707).
+    dense = matrix.ndim == 2
+    matrices = abstract(matrix.shape if matrix.ndim == 3 else (1, *matrix.shape))
+    sizes = jax.ShapeDtypeStruct((matrices.shape[0],), jnp.int32)
     calls = (grouped_matmul.gmm_call(rows, matrices, sizes, out_dtype=out_dtype, trans_rhs=False,
-                                     interpret=False, promoted=product.promoted, dense=True),
+                                     interpret=False, promoted=product.promoted, dense=dense),
              grouped_matmul.gmm_call(abstract((rows.shape[0], width)), matrices, sizes, out_dtype=rows.dtype,
-                                     trans_rhs=True, interpret=False, promoted=product.promoted, dense=True),
+                                     trans_rhs=True, interpret=False, promoted=product.promoted, dense=dense),
              grouped_matmul.tgmm_call(rows, abstract((rows.shape[0], width)), sizes, out_dtype=matrix.dtype,
-                                      interpret=False, promoted=product.promoted, dense=True))
+                                      interpret=False, promoted=product.promoted, dense=dense))
     cases = [grouped_matmul.grouped_case(*call, product=product, whole=whole) for call in calls]
     if any(selection.selected(grouped_matmul.GROUPED, case).name != 'xla' for case in cases):
         return True

@@ -73,6 +73,8 @@ def walked(release: str) -> list[list[int]]:
     from dew.interop import Pretrained
 
     spec = importlib.util.spec_from_file_location(f"{release}_generation_utils", release_code(release))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"{release}'s generation utilities are no module to load")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     source = Pretrained.load(FIXTURES / "dream-tiny", dtype="float32", attention_impl="reference")

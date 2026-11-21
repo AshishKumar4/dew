@@ -734,6 +734,35 @@ def test_a_layer_norms_variance_is_its_centered_mean_square():
                     truth_fn=normalized(nn.LayerNorm(epsilon=1e-5, dtype=jnp.float64)))
 
 
+def test_a_layer_norms_recompute_reduces_no_more_than_flaxs():
+    """A layer norm's forward names and saves its rows' shift (`dew.nn.norms.SHIFT`), which its backward's
+    recompute reuses without reducing the rows again: it reduces them no more often than flax's own norm
+    rematerialized saving nothing does, where a shift recomputed there was a mean of its own in every
+    norm's backward (row 6740)."""
+    from jax.extend.core import primitives
+
+    from dew.nn.programs import bodies, equations
+
+    x = jnp.ones((2, 6, 16), jnp.float32)
+
+    def recomputed(norm):
+        variables = norm.init(jax.random.key(0), x)
+
+        def loss(params, x):
+            return jnp.sum(norm.apply({"params": params}, x) ** 2)
+
+        program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(variables["params"], x).jaxpr
+        # The backward's recompute: the rematerialized body its differentiation runs again.
+        again = [eqn for eqn in equations(program)
+                 if eqn.primitive is primitives.remat_p and eqn.params["differentiated"]]
+        assert again, "no rematerialized body is recomputed"
+        return sum(each.primitive is jax.lax.reduce_sum_p for eqn in again for body in bodies(eqn)
+                   for each in equations(body))
+
+    flaxs = recomputed(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)(epsilon=1e-5))
+    assert recomputed(LayerNorm(epsilon=1e-5)) <= flaxs, flaxs
+
+
 TOWER_NORM_SEEDS = 8
 """The tower norms' declared seeds for check 1 (`assert_as_exact`)."""
 
@@ -840,9 +869,9 @@ LAYER_NORM_SEEDS = 64
 
 
 def test_every_production_layer_norm_is_dews_rematerialized_one():
-    """The decoder block's exact-variance layer norm, the offset layer norm's core and Gemma 4 Unified's
-    patch norm are Dew's `LayerNorm`, rematerialized saving nothing, as every other is (ledger 3010):
-    each one's differentiated program checkpoints its normalization."""
+    """The decoder block's exact-variance layer norm, the offset layer norm's core and Gemma 4 Unified's patch
+    norm are Dew's `LayerNorm`, rematerialized saving nothing but its rows' shift, as every other is (ledger
+    3010): each one's differentiated program checkpoints its normalization."""
     from dew.nn.backbones.decoder_block import decoder_norm
     from dew.nn.norms import OffsetLayerNorm
     from dew.nn.vision.gemma4_unified import Gemma4UnifiedVision
@@ -864,10 +893,10 @@ def test_every_production_layer_norm_is_dews_rematerialized_one():
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize('dtype', [None, jnp.bfloat16, jnp.float32])
 def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_scale, use_bias, dtype):
-    """`dew.nn.norms.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing, its variance
-    centered: the same parameter tree and auto-named scope; its output and the gradients of its input and
-    parameters as near float64 over drawn inputs and parameters as flax's own (check 1); and its
-    pullback holds the input as it arrived, no wider copy of the activations."""
+    """`dew.nn.norms.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing but its rows'
+    shift, its variance centered: the same parameter tree and auto-named scope; its output and the gradients
+    of its input and parameters as near float64 over drawn inputs and parameters as flax's own (check 1);
+    and its pullback holds the input as it arrived, no wider copy of the activations."""
     x = jax.random.normal(rng, (2, 6, 16), jnp.float32)
     x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
     fields = {"epsilon": 1e-5, "use_scale": use_scale, "use_bias": use_bias, "dtype": dtype}

@@ -2,6 +2,7 @@
 a refit or a resume in the same process reads the step its equal traced (row 3873), and apart for one
 whose loss reads another setting, module or held tree, or a head at another policy."""
 
+import collections
 import copy
 import dataclasses
 import functools
@@ -18,6 +19,7 @@ from dew.decision import DecisionObjective, Specials
 from dew.decision.layout import SegmentLayout
 from dew.diffusion.discrete import MDLM
 from dew.nn.backbones import CausalTransformer
+from dew.nn.kernels import generation, recurrence_chunk
 from dew.objectives.base import HELD, UNKEYED, Objective, frozen_value, stated_trace
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm.objective import LMObjective
@@ -113,20 +115,28 @@ class Other:
     name: str
 
 
-KEYLESS = frozenset({"diffusion", "flow_grpo", "guidance_distillation", "ladd", "mean_flow", "rcm",
-                     "shortcut", "run diffusion"})
-"""The registered objectives that state no key, so a refit of theirs traces its step again: each holds what
-states no value and no class leaves out (a diffusion process, its grid's class, its inputs' encoders; row
+KEYLESS: frozenset[str] = frozenset()
+"""The registered objectives that state no key, so a refit of theirs traces its step again: none, each
+diffusion objective's process, grid, inputs' encoders, teacher tree and constant average stating theirs (row
 6297)."""
 
 
-def rolled_out(name: str, batch):
+def rolled_out(name: str, batch, objective):
     """A case's batch as its step trains on it: a PPO pack with the columns its rollout adds (`PPORollout`),
-    the critic's baseline and its targets; every other case's as it is."""
-    if name != "ppo":
+    the critic's baseline and its targets; a flow-GRPO batch with a walk's transitions over its latents
+    (`FlowRollout`'s layout, `transition_rows`); every other case's as it is."""
+    if name == "ppo":
+        mask = np.asarray(batch["response_mask"], np.float32)
+        return {**batch, "old_values": np.zeros_like(mask), "returns": mask}
+    if name != "flow_grpo":
         return batch
-    mask = np.asarray(batch["response_mask"], np.float32)
-    return {**batch, "old_values": np.zeros_like(mask), "returns": mask}
+    from dew.objectives.rl.flow import transition_rows
+
+    rows = len(next(iter(batch.values())))
+    states = np.zeros((rows, 3, *objective.latent_shape), np.float32)
+    times = np.asarray([1.0, 0.5, 0.25], np.float32)
+    densities, stochastic = np.zeros((rows, 2), np.float32), np.ones((rows, 2), bool)
+    return {**batch, **transition_rows(states, times, densities, stochastic, np.zeros((rows,), np.float32))}
 
 
 def unvalued(objective) -> list[str]:
@@ -201,7 +211,7 @@ def test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_bui
         objective, batch = build()
         if batch is None:
             continue
-        batch = rolled_out(name, batch)
+        batch = rolled_out(name, batch, objective)
         before = stated_trace(objective)
         held = {key: frozen_value(value) for key, value in vars(objective).items()}
         variables = objective.drawn_shapes()
@@ -245,7 +255,7 @@ def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(built_
         objective, batch = build()
         if batch is None:
             continue
-        batch = rolled_out(name, batch)
+        batch = rolled_out(name, batch, objective)
         rows = len(next(iter(batch.values())))
         loader = Loader(train=lambda partition, batch=batch: iter([batch] * 2), val=None, records=None,
                         batch=rows)
@@ -411,3 +421,60 @@ def test_a_trainers_refit_traces_its_step_again_where_xlas_flags_change(monkeypa
         traced.append(sum(program.kind == "traced" for program in heard.programs))
     first, changed, unchanged = traced
     assert first > 0 and changed > 0 and unchanged == 0, traced
+
+
+def test_a_diffusion_process_states_its_value():
+    """A diffusion process (its schedule and prediction transform, `ByValue`) states a value, equal to a
+    process of its settings built anew and to no other, which a diffusion objective's key holds (row 6297:
+    it stated none, and no diffusion objective kept its trace)."""
+    from dew.diffusion.presets import EDM, Flow, build_process
+    from dew.diffusion.process import Process
+
+    for preset, other in ((Flow(), Flow(shift=3.0)), (EDM(regime="pixel"), EDM(regime="latent"))):
+        built = build_process(preset)
+        assert isinstance(built, Process) and built == build_process(preset), preset
+        assert hash(built) == hash(build_process(preset)) and built != build_process(other), preset
+
+
+def walk_programs(jaxpr) -> list:
+    """Every forked walk's program (`recurrence_chunk._walk_once`'s nested `recurrence_walk`) a traced
+    program calls, at any depth, as its calls hold them."""
+    found = []
+    for eqn in jaxpr.eqns:
+        inner = [value for value in eqn.params.values() if isinstance(value, jax.extend.core.ClosedJaxpr)]
+        if eqn.params.get("name") == "recurrence_walk":
+            found.extend(inner)
+        for program in inner:
+            found.extend(walk_programs(program.jaxpr))
+    return found
+
+
+def test_a_forked_walk_traces_once_under_every_route_receipt():
+    """A forked call (documents taking their memories up, three layers of it) traced twice, each under a route
+    receipt of its own (`generation.routes`), on the portable math: every call of its walk in the second
+    trace holds the very program its call held in the first (`_walk_once`'s, run unrecorded, its trace
+    cached), its routes recorded alike by both receipts, where each receipt's identity keyed the walk a
+    trace of its own (row 6740: a decision step's walk traced twice, 0.84 s of its lowering against 0.30;
+    its body run twice over two receipts' training on main, once on this fix, jsf-walktr)."""
+    sig = jax.ShapeDtypeStruct
+    queries, values = sig((4, 2048, 1, 8), jnp.float32), sig((4, 2048, 3, 8), jnp.float32)
+    gates, state = sig((4, 2048, 3), jnp.float32), sig((4, 1, 3, 8, 8), jnp.float32)
+    starts, slots = sig((4, 2048), jnp.bool_), sig((4, 7), jnp.int32)
+
+    def layers(q, k, v, g, beta, state, starts, loads, stores):
+        for _ in range(3):
+            v, _ = recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, state, starts=starts,
+                                                           loads=loads, stores=stores, held=3,
+                                                           write_bound=1.0)
+        return v
+
+    def traced():
+        with generation.routes() as found:
+            program = jax.make_jaxpr(layers)(queries, queries, values, gates, gates, state, starts, slots,
+                                             slots)
+        return walk_programs(program.jaxpr), collections.Counter(found)
+
+    with generation.chosen(gated_delta_rule='xla'):
+        (first, routed), (second, rerouted) = traced(), traced()
+    held = [one is other for one, other in zip(first, second, strict=True)]
+    assert (len(first), all(held), bool(routed), routed == rerouted) == (3, True, True, True)

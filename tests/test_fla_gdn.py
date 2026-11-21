@@ -16,6 +16,7 @@ import pytest
 from delta_rule_support import NAMES, checkpointed, fla_math, fla_side, math as portable, recurrence, through
 from flax import linen as nn
 from gdn_cases import CASES
+from generation_support import interprets
 from port_support import row_names_port
 from reference_error import (
     FEWEST_SEEDS,
@@ -38,7 +39,7 @@ from dew.nn.precision import l2norm
 
 pytestmark = pytest.mark.kernel
 
-INTERPRETED = jax.default_backend() != "gpu"
+INTERPRETED = interprets()
 
 SHARDED_SEEDS = {False: 64, True: 8}
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`) with a decay per

@@ -154,6 +154,22 @@ def _seeded(form: _Seeded, primitive, args, signed: bool, equation):
 
 # --- each step's meaning over Z3's bit-vectors --------------------------------------------------------------
 
+def _word(expr: object) -> z3.BitVecRef:
+    """`expr`, a 32-bit word: z3's `If` and `Concat` over words, which its stubs type as any expression or
+    tactic (`If` builds both)."""
+    if not isinstance(expr, z3.BitVecRef):
+        raise TypeError(f"{expr}: not a word")
+    return expr
+
+
+def _read(model: z3.ModelRef, term: z3.ExprRef) -> int:
+    """`term`'s value in `model` (completed: a term the model leaves free is its default), as an integer."""
+    value = model.eval(term, model_completion=True)
+    if not isinstance(value, z3.BitVecNumRef):
+        raise TypeError(f"{term}: no word in the model")
+    return value.as_long()
+
+
 def _z3_step(op: BitOp, operands: list, immediate, table) -> z3.BitVecRef:
     """`op`'s value over bit-vector `operands`, its `immediate` and `table` bit-vectors (`bits._run`'s)."""
     zero, word = z3.BitVecVal(0, 32), z3.BitVecVal(bits.WORD, 32)
@@ -180,7 +196,7 @@ def _z3_step(op: BitOp, operands: list, immediate, table) -> z3.BitVecRef:
     if op is BitOp.MINMAX:
         signed, greatest = z3.Extract(0, 0, table) == 1, z3.Extract(1, 1, table) == 1
         less = z3.If(signed, first < second, z3.ULT(first, second))
-        return z3.If(greatest, z3.If(less, second, first), z3.If(less, first, second))
+        return _word(z3.If(greatest, z3.If(less, second, first), z3.If(less, first, second)))
     if op is BitOp.SHR:
         return z3.LShR(first, immediate)
     if op is BitOp.SHL:
@@ -189,7 +205,7 @@ def _z3_step(op: BitOp, operands: list, immediate, table) -> z3.BitVecRef:
         return first >> immediate
     if op in (BitOp.SHRV, BitOp.SHLV):
         shifted = z3.LShR(first, second) if op is BitOp.SHRV else first << second
-        return z3.If(z3.ULT(second, word), shifted, zero)
+        return _word(z3.If(z3.ULT(second, word), shifted, zero))
     if op is BitOp.CMP:
         signed = z3.Extract(3, 3, table) == 1
         code = z3.Extract(2, 0, table)
@@ -202,9 +218,9 @@ def _z3_step(op: BitOp, operands: list, immediate, table) -> z3.BitVecRef:
         holds = predicates[bits.COMPARISONS[-1]]
         for index, name in reversed(list(enumerate(bits.COMPARISONS[:-1]))):
             holds = z3.If(code == index, predicates[name], holds)
-        return z3.If(holds, z3.BitVecVal(1, 32), zero)
+        return _word(z3.If(holds, z3.BitVecVal(1, 32), zero))
     if op is BitOp.SEL:
-        return z3.If(first != zero, operands[1], operands[2])
+        return _word(z3.If(first != zero, operands[1], operands[2]))
     if op is BitOp.PRMT:
         low, high = operands[0], operands[-1]
         sources = [z3.Extract(8 * (k % 4) + 7, 8 * (k % 4), low if k < 4 else high) for k in range(8)]
@@ -215,7 +231,7 @@ def _z3_step(op: BitOp, operands: list, immediate, table) -> z3.BitVecRef:
             for index in range(6, -1, -1):
                 byte = z3.If(nibble == index, sources[index], byte)
             made.append(byte)
-        return z3.Concat(*reversed(made))
+        return _word(z3.Concat(*reversed(made)))
     raise ValueError(f"{op}: not in the synthesis vocabulary")
 
 
@@ -348,9 +364,8 @@ def _cegis(shape, symbols, target, inputs: int):
         if solver.check() != z3.sat:
             return None
         model = solver.model()
-        concrete = [(model.eval(immediate, model_completion=True).as_long(),
-                     model.eval(table, model_completion=True).as_long(),
-                     [model.eval(choice, model_completion=True).as_long() for choice in choices])
+        concrete = [(_read(model, immediate), _read(model, table),
+                     [_read(model, choice) for choice in choices])
                     for immediate, table, choices, _ in program_unknowns]
         checked = z3.Solver()
         checked.set("timeout", 10000)
@@ -362,7 +377,7 @@ def _cegis(shape, symbols, target, inputs: int):
         if verdict != z3.sat:
             return None
         witness = checked.model()
-        examples.append([witness.eval(symbol, model_completion=True).as_long() for symbol in symbols])
+        examples.append([_read(witness, symbol) for symbol in symbols])
     return None
 
 

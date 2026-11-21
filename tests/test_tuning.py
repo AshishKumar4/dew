@@ -452,6 +452,52 @@ def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
     assert set(alone.prune_errors()) == set(norm.autotuning_configs)
 
 
+TWO_CPU_MEASURE = """
+import json, os, threading, time
+os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2])
+import jax
+from tuned import recorded
+from test_tuning import operands, step
+from dew.nn.kernels import norm_swiglu, tuning
+
+compile_ = jax.stages.Lowered.compile
+held, running, most = threading.Lock(), [0], [0]
+
+
+def compiled(lowered, *args, **kwargs):
+    with held:
+        running[0] += 1
+        most[0] = max(most[0], running[0])
+    try:
+        time.sleep(0.05)
+        return compile_(lowered, *args, **kwargs)
+    finally:
+        with held:
+            running[0] -= 1
+
+
+jax.stages.Lowered.compile = compiled
+[norm] = [ba for ba in recorded(step(), *operands(15)) if type(ba.op) is norm_swiglu.RmsForward]
+measured = tuning._measured(norm.op, norm)
+print(json.dumps({"configs": len(norm.autotuning_configs), "measured": len(measured), "most": most[0]}))
+"""
+"""A launch measured in a process of two CPUs (`os.sched_setaffinity`), each of its compiles counted as JAX
+runs it: the candidates' count, those measured and the most compiling at once."""
+
+
+def a_launchs_measurement_compiles_its_candidates_in_the_processs_compile_slots():
+    """A launch measured on this GPU (`tuning._measured`) in a process of two CPUs, whose compile slots are
+    one (half its CPUs, `report.compile_threads`), compiles one candidate config at a time, as every compile
+    of Dew's takes a slot: its pool compiled them raw, a compile a CPU the process may use, beside the slots
+    a step's compiles take (base review of 58fdadba6, F4: four compiles at once on a four-vCPU quota, past
+    its two slots)."""
+    from process_support import fresh
+
+    found = fresh(TWO_CPU_MEASURE)
+    assert found["configs"] > 1 and found["measured"] == found["configs"], found
+    assert found["most"] == 1, found
+
+
 VERSIONED_OP = """
 import dataclasses
 from typing import ClassVar
@@ -599,3 +645,24 @@ def test_a_launch_lowered_once_keeps_its_program_only_for_a_hook_it_may_hold(mad
         del hook
         gc.collect()
         assert (kept() is not None) == cached
+
+
+def _halved_score(scores):
+    """A module's score hook (the prepared-hook witness's)."""
+    return scores * 0.5 + 1.0
+
+
+def test_a_prepared_hook_pickles_as_its_source_and_is_rebuilt_by_the_constructor_that_made_it():
+    """A prepared hook pickles as its source, rebuilt by the constructor that made it (`Prepared.__reduce__`):
+    one the pass rewrites (`prepared`) runs the pass's form again, one taken as prepared (`prepared_as`) its
+    source itself, each equal to the hook pickled and computing what it did, so a launch a GPU tier part's
+    prepare held is its run's (rows 9582 on: a held launch's score hook refused the truths store)."""
+    import pickle
+
+    scores = jnp.arange(8.0).reshape(2, 4)
+    rewritten, taken = tuning.prepared(_halved_score), tuning.prepared_as(_halved_score)
+    loaded_rewritten, loaded_taken = (pickle.loads(pickle.dumps(made)) for made in (rewritten, taken))
+    assert loaded_rewritten == rewritten and loaded_taken == taken
+    assert loaded_rewritten.run is not loaded_rewritten.source and loaded_taken.run is loaded_taken.source
+    for loaded, made in ((loaded_rewritten, rewritten), (loaded_taken, taken)):
+        assert jnp.array_equal(loaded(scores), made(scores))

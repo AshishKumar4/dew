@@ -38,6 +38,7 @@ import json
 import runpy
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import torch
@@ -49,7 +50,7 @@ AUDIO_FIXTURE = FIXTURES / "mimo-audio-tiny"
 MIMO_REPO, MIMO_REVISION = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
                                                / "release_pins.py"))["MIMO_V2"][:2]
 
-MIMO_VISION = dict(
+MIMO_VISION: dict[str, Any] = dict(
     depth=4, hidden_size=32, intermediate_size=48, num_heads=4, num_key_value_heads=2, qk_channels=8,
     in_chans=3, patch_size=4, spatial_merge_size=2, temporal_patch_size=2, hidden_act="silu",
     rms_norm_eps=1e-6, fullatt_block_indexes=[0, 3], vit_window_attn_types=[-1, 0, 1, -1], use_sink=True,
@@ -140,7 +141,7 @@ def write(directory: Path, config: dict, tower: dict, projector: dict, arrays: d
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
     save_file({name: tensor.contiguous() for name, tensor in tower.items()}, directory / "model.safetensors")
     save_file({name: tensor.contiguous() for name, tensor in projector.items()}, directory / "projector.safetensors")
-    np.savez(directory / "refs.npz", precision="ieee",
+    np.savez(directory / "refs.npz", precision="ieee", allow_pickle=False,
              **{name: np.asarray(value, np.float64 if name.endswith("_f64") else np.float32)
                 for name, value in arrays.items() if not name.startswith("_")},
              **{name[1:]: value for name, value in arrays.items() if name.startswith("_")})
@@ -422,7 +423,8 @@ def write_mimo_audio_tiny() -> None:
                **{f"encoder/speech_embeddings.{name}": tensor for name, tensor in embeddings.state_dict().items()}}
     AUDIO_FIXTURE.mkdir(parents=True, exist_ok=True)
     width = max(len(m) for m in mels)
-    np.savez(AUDIO_FIXTURE / "model.npz", precision="ieee", **{name: t.numpy() for name, t in tensors.items()},
+    np.savez(AUDIO_FIXTURE / "model.npz", precision="ieee", allow_pickle=False,
+             **{name: t.numpy() for name, t in tensors.items()},
              mels=np.stack([np.pad(m, ((0, width - len(m)), (0, 0))) for m in mels]),
              lengths=np.asarray(LENGTHS, np.int32), **arrays)
     (AUDIO_FIXTURE / "config.json").write_text(json.dumps({"audio_config": AUDIO, "tokenizer": TOKENIZER},

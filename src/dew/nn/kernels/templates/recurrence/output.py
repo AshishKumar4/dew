@@ -17,11 +17,11 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Held,
     Tiles,
     addressed,
+    building,
     chunk_liveness,
     f32,
     held_tile,
     launch_kernel,
-    lowered_once,
     masks,
     product_fragments,
     staging_tiles,
@@ -67,9 +67,7 @@ def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> Non
 
     def read(operand, ref, column):
         tiles = [family.tile_of(view) for view in operand.views(ref, row, chunk, column, call.block)]
-        if len(tiles) == 1:
-            return tiles[0]
-        return functools.reduce(jnp.add, (tile.astype(jnp.float32) for tile in tiles))
+        return tiles[0] if len(tiles) == 1 else product.whole(tiles)
 
     for c, tile in enumerate(staged):
         column = c * call.block
@@ -127,11 +125,15 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     # Accurate three-part products each take a fresh accumulator (`Issuer.apart`), the memory's output
     # beside the local product's sums: two stated, an unrounded fp32 write gate's output was admitted where
     # ptxas serialized its warpgroup MMAs (C7512, sm90; armada output-values-fresh-sums). Two parts issue
-    # into one accumulator (`Issuer.__call__`).
+    # into one accumulator a product (`Issuer.__call__`), each key block's memory product its own beside
+    # the local product's, all in flight at once (`algebra.chunk_output`): two stated, a 192-wide value
+    # head's output stated 248 registers where its three accumulators alone held 288 and ptxas serialized
+    # them (C7512, row 7151).
     fresh = (max(len(product.terms(given.parts, memories.parts)),
                  len(product.terms(held.parts, held.parts)))
              if family.products_overlap and max(given.parts, memories.parts, held.parts) > 2 else 1)
-    values = ([f32(chunk, bv)] * (1 + fresh if family.products_overlap else 1)
+    memory = call.width // call.block if fresh == 1 else 1
+    values = ([f32(chunk, bv)] * (memory + fresh if family.products_overlap else 1)
               + held_tile(held, chunk, bv))
     # The prologue's high and low prefixes as a row's vectors, read by the first step's scores and by every
     # value block's output (`algebra.chunk_output`'s decay), held across the walk: unstated, a 192-wide value
@@ -171,7 +173,7 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     return Held(carried=prefixes, phases=(values + products, *(stage + scored for stage in stages)))
 
 
-@lowered_once
+@building(lambda launch: ("recurrence_output",))
 def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Tiles, *, scale: float,
                   out_dtype, scores=None, skip=None):
     """Each chunk's output `[R, HV * Dv]` in `out_dtype`, a program a chunk and value head and a step each

@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import tokamax
 from jax.experimental import pallas as pl
+from jax.typing import DTypeLike
 
 from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.selection import Refusal
@@ -33,10 +34,13 @@ from dew.nn.kernels.templates import (
 )
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
+    BLOCK,
     DKV_GRADS,
     DQ_GRADS,
+    DTYPES,
     NATURAL,
     TRACED_TILE,
+    WARPS,
     AttentionLaunch,
     Gradients,
     Hooks,
@@ -49,9 +53,9 @@ from dew.nn.kernels.templates.attention import (
     by_power,
     gradients,
     interpreted_dot,
-    interpreted_rows,
     kept_dtype,
     kernel_dot,
+    kernel_rows,
     key_tiles,
     launch_arguments,
     output_split,
@@ -62,9 +66,7 @@ from dew.nn.kernels.templates.attention import (
     within,
 )
 from dew.nn.kernels.templates.base import Template
-
-DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
-"""The operand dtypes the kernels take, one on queries, keys and values alike."""
+from dew.nn.precision import power2
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -78,19 +80,8 @@ class Tiles:
     stages: int
 
 
-WARPS = 4
-"""A program's warps: one warpgroup, its tile's rows over its four warps, FlashAttention 2's."""
-
 STAGES = 2
 """A launch's pipeline stages: one tile loading beside the one consumed (`resources.Launch.floor`)."""
-
-ROWS = 32
-"""A warp's rows of the block: two mma.sync instructions' sixteen."""
-
-BLOCK = WARPS * ROWS
-"""The most rows or keys a tile takes, the block a call pads to (`padded_call`): a warp's rows a warp
-(FlashAttention 2's 128 a program)."""
-
 LEAST = 16
 """The fewest rows, and keys, a tile takes: one mma.sync instruction's sixteen, for a launch no tile of a
 warp's rows holds (a scaled fp32 training walk at width 256, its small weights fp32 and their products' sums
@@ -338,6 +329,9 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     """Whether its kernel walks scaled (`algebra.SCALED_WALK`): the op a call some row of which can be scaled
     launches in its common op's place (`_fwd`, `algebra.may_scale`), its own tiles derived from its own
     registers and shared memory (`registers`, `staged_bytes`)."""
+    largest: DTypeLike | None = None
+    """The dtype whose largest its output is within, held there (`algebra.largest_of`, derived where the
+    call's hooks are known, `_forward_call`); None where its output may pass it."""
 
     def launched_ops(self, dtype) -> tuple["TritonForward", ...]:
         """The ops a call of values `dtype` launches (`_fwd`): this op, and where it walks unscaled and the
@@ -432,7 +426,9 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         headroom = scaled and algebra.headroom(value.dtype)
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, scale,
                                self.score_mod, self.natural, headroom, initial,
-                               compensated=algebra.compensates(value.dtype), prescale=power)
+                               compensated=algebra.compensates(value.dtype), prescale=power,
+                               largest=self.largest,
+                               narrowed=algebra.narrowed_of(query.dtype))
         kernel = functools.partial(
             _forward_kernel, score_kinds=self.score_kinds, output_kinds=self.output_kinds, initial=initial,
             residuals=residuals, output_mod=self.output_mod, block_k=block_k, interpret=interpret)
@@ -614,7 +610,7 @@ def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundAr
     for warps in (WARPS, 2 * WARPS):
         legal = [config for rows in (extent for extent in EXTENTS if held % extent == 0)
                  for config in (tiles(rows, walk, warps) for walk in EXTENTS if walked % walk == 0)
-                 if launch.legal(ba, config, target)]
+                 if launch.takes(ba, config, target)]
         if legal and fp32:
             return next((config for config in legal if _resident(launch, ba, config, target) >= 2), legal[0])
         if legal:
@@ -717,7 +713,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
-                       keys=spans.keys, natural=natural)
+                       keys=spans.keys, natural=natural,
+                       largest=algebra.largest_of(value.dtype, hooks))
     return op, (call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
                 call.score_params, call.output_params, m0, total0, acc0), call.queries
 
@@ -773,7 +770,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     peak, total = peak_ref[...], total_ref[...]
     product = functools.partial(_issued, interpret=interpret)
     # D's and the anchor's products with dO, summed as `product` sums dP (`gradient.off_anchor_delta`).
-    row_products = interpreted_rows if interpret else gradient.summed_rows
+    row_products = functools.partial(kernel_rows, interpret=interpret)
     intervals = _intervals(start_ref, end_ref)
     query_ids = [ref[...] for ref in id_refs[:1]]
 
@@ -811,7 +808,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     else:
         state = program.off_anchor_pass(bounds_ref[0], bounds_ref[1], formed, before, maximum, key_index,
                                         shift, how, product)
-        prior = algebra.power2(state.total, shift)
+        prior = power2(state.total, shift)
         anchor, delta, key_index = gradient.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
                                                             shares[1], key_index, shift,
                                                             rows=row_products)

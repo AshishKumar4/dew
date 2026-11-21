@@ -24,6 +24,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "mamba-ssm"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba2" / "ssd_mamba_ssm.npz"
 SEED = 2026
 CASES = {
@@ -92,7 +96,7 @@ def minimal_truth(minimal, arrays, chunk):
     for row in range(batch):
         cuts = ([0, length] if seq is None else
                 [0, *(1 + np.flatnonzero(seq[row, 1:] != seq[row, :-1])), length])
-        outputs = []
+        outputs, final = [], None
         for start, end in itertools.pairwise(cuts):
             reset = seq is not None and (start > 0 or seq[row, 0] > 0)
             initial = h0[row:row + 1, None] * (0 if reset else 1)
@@ -104,6 +108,7 @@ def minimal_truth(minimal, arrays, chunk):
             output, final = minimal(*blocked, chunk, initial_states=initial)
             outputs.append(output[:, :end - start] + x[row:row + 1, start:end] * D[None, None, :, None])
         rows.append(torch.cat(outputs, dim=1))
+        assert final is not None  # A row is one segment at least (`cuts`).
         finals.append(final)
     output, final = torch.cat(rows, dim=0), torch.cat(finals, dim=0)
     cotangents = tuple(torch.tensor(arrays[name], dtype=torch.float64, device="cuda")
@@ -126,13 +131,15 @@ def write_seeded(scan, minimal, version, revision):
     from ssd_support import mamba_ssd_draw, mamba_ssd_xla, ssd_orbit
 
     stored = {"precision": np.asarray("ieee")}
-    for case, (*shape, chunk, dtype, documents) in SEEDED_CASES.items():
+    for case, (batch, tokens, heads, width, groups, state, chunk, dtype, documents) in SEEDED_CASES.items():
+        shape = (batch, tokens, heads, width, groups, state)
         narrow_dtype, dtype = jnp.dtype(dtype), getattr(torch, dtype)
         exact_run = jax.jit(lambda arrays, chunk=chunk: mamba_ssd_xla(arrays, chunk))
 
         def draw(seed, shape=shape, dtype=dtype, documents=documents, narrow_dtype=narrow_dtype):
-            inputs = ssd_orbit(operands(np.random.default_rng(seed), *shape,
-                                        lambda value: torch.tensor(value, dtype=dtype).float().numpy(),
+            batch, tokens, heads, width, groups, state = shape
+            inputs = ssd_orbit(operands(np.random.default_rng(seed), batch, tokens, heads, width, groups,
+                                        state, lambda value: torch.tensor(value, dtype=dtype).float().numpy(),
                                         documents), seed)
             redrawn = mamba_ssd_draw(seed, shape, narrow_dtype, documents)
             assert inputs.keys() == redrawn.keys(), f"mamba_ssm seed {seed}: regenerated inputs differ"
@@ -161,10 +168,10 @@ def write_seeded(scan, minimal, version, revision):
             return reference, truth
 
         stored.update(record_case(case, draw, evaluate, store_inputs=False, summary=True))
-        stored[f"{case}.chunk"] = np.int32(chunk)
+        stored[f"{case}.chunk"] = np.asarray(chunk, np.int32)
         stored[f"{case}.dtype"] = np.asarray(str(narrow_dtype))
         stored[f"{case}.shape"] = np.asarray(shape, np.int32)
-        stored[f"{case}.documents"] = np.bool_(documents)
+        stored[f"{case}.documents"] = np.asarray(documents, np.bool_)
     stored["provenance"] = provenance(
         f"mamba_ssm {version}", revision, torch.cuda.get_device_name(),
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu "
@@ -194,9 +201,10 @@ def main() -> None:
 
     rng = np.random.default_rng(SEED)
     stored = {}
-    for name, (*shape, chunk, dtype, documents) in CASES.items():
+    for name, (batch, tokens, heads, width, groups, state, chunk, dtype, documents) in CASES.items():
+        shape = (batch, tokens, heads, width, groups, state)
         dtype = getattr(torch, dtype)
-        arrays = operands(rng, *shape,
+        arrays = operands(rng, batch, tokens, heads, width, groups, state,
                            lambda value, dtype=dtype: torch.tensor(value, dtype=dtype).float().numpy(),
                            documents)
         cuda = {key: torch.tensor(value, device="cuda") for key, value in arrays.items()}
@@ -210,7 +218,7 @@ def main() -> None:
         names = ("y", "final", "x", "dt", "A", "B", "C", "D", "h0")
         found = dict(zip(names, (y, final, *grads), strict=True))
         arrays.update({f"mamba.{key}": value.detach().float().cpu().numpy() for key, value in found.items()})
-        arrays.update(chunk=np.int32(chunk), dtype=np.asarray(str(dtype).removeprefix("torch.")))
+        arrays.update(chunk=np.asarray(chunk, np.int32), dtype=np.asarray(str(dtype).removeprefix("torch.")))
         stored.update({f"{name}.{key}": value for key, value in arrays.items()})
     np.savez_compressed(FIXTURE, precision=np.asarray("ieee"), version=np.asarray(__version__),
              device=np.asarray(torch.cuda.get_device_name()), **stored)
