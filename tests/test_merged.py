@@ -288,14 +288,16 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("cases", ["widths", "shapes"])
 @pytest.mark.parametrize("name", ["sm90", "sm100"])
-def test_a_padded_merge_compiles_as_one_launch(name):
+def test_a_padded_merge_compiles_as_one_launch(name, cases):
     """The padded merge's one launch (`merged._kernel`, a GPU's lowering) compiles for a compile-only H100
     and B200 in one process per GPU across: value widths 80, 96, 100, 128 and 192 (a row's channels one block
     of the least power of two past the width, its loads and stores past the columns masked); a `jax.vmap`
     batch of three splits (the batch folded into its rows, beside nothing but the one transpose that folds it,
     every launch typed by `report.launched_thunks`); and long splits of 64 and 256 slices (row 8439: its
-    program a chunk of the law's at a time, `merged._chunks`)."""
+    program a chunk of the law's at a time, `merged._chunks`). The widths and the other shapes compile apart,
+    each a group's work within its target (134 s whole in train 1156's CI)."""
     from fla_gdn_support import KernelCase
 
     def one_case(label: str, *, slices: int, width: int) -> KernelCase:
@@ -312,12 +314,13 @@ def test_a_padded_merge_compiles_as_one_launch(name):
     finished_stacked = jax.ShapeDtypeStruct((2, 1, 8, 16, 16), jnp.float32)
     finished = functools.partial(merged.merged_finished, SPECS["natural"], queries=4, width=128,
                                  out_dtype=jnp.bfloat16, out_heads=32)
-    cases = [*(one_case(f"width-{width}", slices=16, width=width) for width in (80, 96, 100, 128, 192)),
-             KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
-             KernelCase("finished", lambda: (finished, (finished_padded, finished_stacked))),
-             *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256))]
+    named = {"widths": [one_case(f"width-{width}", slices=16, width=width)
+                        for width in (80, 96, 100, 128, 192)],
+             "shapes": [KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
+                        KernelCase("finished", lambda: (finished, (finished_padded, finished_stacked))),
+                        *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256))]}
     with generation.assumed(name):
-        records = compile_kernels(cases, name)
+        records = compile_kernels(named[cases], name)
     for record in records:
         assert "error" not in record, record
         expected = (["merged_padded", "wrapped_transpose"] if record["name"] == "batched"
