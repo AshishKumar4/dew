@@ -459,6 +459,11 @@ def test_a_file_refreshed_whole_takes_no_time_from_a_row_that_is_no_planning_evi
         assert ci.main() == 0
         folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
         assert folded == {a: 40.0, b: 100.0, c: 175.0}
+    # A red isolated retry (its last outcome, timed out alone too) still raises what it timed past its record.
+    rows[1] = {**rows[1], "exitCode": 1, "kind": "deadline", "tests": {b: 400.0}}
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
+    assert ci.main() == 0
+    assert json.loads((tmp_path / "tests/test_durations.json").read_text())[b] == 400.0
 
 
 def test_a_file_armada_has_not_timed_weighs_no_less_than_its_tests_recorded_costs(ci, tmp_path):
