@@ -87,7 +87,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4, group_sizes: jax.Array | None =
          precision: PrecisionLike = None, interpret_on_cpu: bool = False, prologue_jvp=None, compute=None,
          layer: jax.Array | None = None, paired: jax.Array | None = None, gather: jax.Array | None = None,
          scatter: jax.Array | None = None, applied: jax.Array | None = None, named: tuple = (),
-         beside: tuple = (), selected: "generation.Route | None" = None):
+         beside: tuple = (), selected: generation.Route | None = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default (explicitly or
     through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in the kernels: the
@@ -1260,7 +1260,7 @@ def _added(acc, prior):
 
 
 def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *,
-                 whole: bool) -> "generation.Route | None":
+                 whole: bool) -> generation.Route | None:
     """The forward's route where a launch takes `rows` (`[rows, depth]`) by `matrices` side by side (`gemm`'s
     `beside`, each `[depth, width]`, one output each in `out_dtype`) as `gemm` binds them, else None: their
     forward, or their input gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's
