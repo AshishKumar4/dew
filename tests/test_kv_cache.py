@@ -669,7 +669,9 @@ def test_a_tpu_decode_steps_paged_kernel_is_one_branch_of_a_conditional_on_a_mes
     def step(params, cache, tokens):
         return decoder.apply({**params, "cache": cache}, tokens, decode=True, mutable=["cache"])
 
-    text = tpu_lowering(step, (placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, "data")), mesh)
+    with jax.default_matmul_precision("default"):
+        text = tpu_lowering(step, (placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, "data")),
+                            mesh)
     found, outside = _kernel_branches(text, "mosaic_tpu")
     holding = [branches for branches in found if any(branches)]
     assert holding and all(sum(branches) == 1 for branches in holding) and not outside, (found, outside)
@@ -684,16 +686,9 @@ SOFTCAP_PAGED_SEEDS = 8
 """The softcapped paged decode's declared draws (check 1)."""
 
 
-def a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache():
-    """A bf16 decoder with a logit softcap decodes a paged cache on a GPU (where the step used to raise),
-    its logits step by step on par with the compact cache's (check 1), the compact cache's reference
-    decode in float64 the truth."""
-    def model(layout, dtype, implementation="auto"):
-        # Heads 16 wide, which the paged kernel's geometry takes.
-        return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": dtype,
-                                    "attn_logit_softcap": 20.0, "kv_cache": layout,
-                                    "attention_impl": implementation})
-
+def assert_paged_decode_on_par(model, label: str, *, steps: int = 8, seeds: int = SOFTCAP_PAGED_SEEDS,
+                               ref_impl: str = "auto"):
+    """Assert a paged `CausalTransformer` decode is on par with its compact cache (check 1)."""
     def decoded(layout, dtype, implementation="auto"):
         def run(params, tokens):
             decoder = model(layout, dtype, implementation)
@@ -709,12 +704,25 @@ def a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache():
         return jax.jit(run)
 
     def draw(seed):
-        tokens = jax.random.randint(jax.random.key(seed), (2, 8), 0, 64)
+        tokens = jax.random.randint(jax.random.key(seed), (2, steps), 0, 64)
         return model(KVCache(), "bfloat16").init(jax.random.key(seed + 1000), tokens), tokens
 
-    paged = decoded(KVCache(page_size=16), "bfloat16")
-    assert_as_exact(paged, decoded(KVCache(), "bfloat16"), draw, "softcapped paged decode",
-                    seeds=SOFTCAP_PAGED_SEEDS, truth_fn=decoded(KVCache(), "float64", "reference"))
+    assert_as_exact(decoded(KVCache(page_size=16), "bfloat16"),
+                    decoded(KVCache(), "bfloat16", ref_impl), draw, label,
+                    seeds=seeds, truth_fn=decoded(KVCache(), "float64", "reference"))
+
+
+def a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache():
+    """A bf16 decoder with a logit softcap decodes a paged cache on a GPU (where the step used to raise),
+    its logits step by step on par with the compact cache's (check 1), the compact cache's reference
+    decode in float64 the truth."""
+    def model(layout, dtype, implementation="auto"):
+        # Heads 16 wide, which the paged kernel's geometry takes.
+        return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": dtype,
+                                    "attn_logit_softcap": 20.0, "kv_cache": layout,
+                                    "attention_impl": implementation})
+
+    assert_paged_decode_on_par(model, "softcapped paged decode")
 
 
 @pytest.mark.parametrize("quantized", ["float8_e4m3fn", "int8"])
