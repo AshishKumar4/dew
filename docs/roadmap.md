@@ -19,7 +19,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900]
 - Convolution repairs above their owner. [5665]
-- The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 683 s (a check-1 site: its longest draws task 621 s (1 draws),…. [7603]
@@ -73,7 +72,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- The saved data plan as recorded rules, one last version, and the resume modes. [10567, 10568, 10569]
+- The saved data plan as recorded rules, one last version, and the resume modes. [10569]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 
