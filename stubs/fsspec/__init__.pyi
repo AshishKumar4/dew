@@ -5,7 +5,11 @@ overloads describe its documented rb/wb and text modes separately.
 """
 
 from . import core as core
+from collections.abc import Mapping
+
 from .spec import AbstractFileSystem
+
+registry: Mapping[str, type[AbstractFileSystem]]
 
 def filesystem(protocol: str, **storage_options: object) -> AbstractFileSystem: ...
 def get_filesystem_class(protocol: str) -> type[AbstractFileSystem]: ...

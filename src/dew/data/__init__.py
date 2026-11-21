@@ -21,7 +21,14 @@ import fsspec
 
 from dew._exports import lookup as _lookup
 
-fsspec.register_implementation("dewcache", "dew.data.storage.BoundedFileCache", clobber=True)
+if "dewcache" in fsspec.registry:
+    # A class another caller registered first, which fsspec's registry holds before any name: Dew's
+    # mirror takes its place, its byte limit and pins with it.
+    from dew.data.storage import BoundedFileCache
+
+    fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
+else:
+    fsspec.register_implementation("dewcache", "dew.data.storage.BoundedFileCache", clobber=True)
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.data import audio, chat, images, preferences, presets, prompts, text, video

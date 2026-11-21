@@ -109,6 +109,32 @@ reader.close()
     assert reported == {"refused": "TOMLDecodeError", "cached": "cached bytes", "ids": list(range(8))}
 
 
+def test_the_data_layer_registers_its_cache_protocol_without_importing_storage_and_over_another():
+    """Importing dew.data registers `dewcache::` by its class's name and imports no storage module, which a
+    URL naming the protocol imports; where another class was registered under the name first, Dew's takes
+    its place."""
+    script = r"""
+import json, sys
+import fsspec
+from fsspec.implementations.memory import MemoryFileSystem
+if sys.argv[1] == "before":
+    fsspec.register_implementation("dewcache", MemoryFileSystem, clobber=True)
+import dew.data
+imported = "dew.data.storage" in sys.modules
+print(json.dumps({"storage": imported, "class": fsspec.get_filesystem_class("dewcache").__name__}))
+"""
+
+    def run(order: str) -> dict:
+        result = subprocess.run([sys.executable, "-c", script, order], capture_output=True, text=True,
+                                timeout=300, env={**os.environ, "PYTHONPATH": str(SOURCE),
+                                                  "JAX_PLATFORMS": "cpu"})
+        assert result.returncode == 0, result.stderr[-2000:]
+        return json.loads(result.stdout.splitlines()[-1])
+
+    assert run("none") == {"storage": False, "class": "BoundedFileCache"}
+    assert run("before") == {"storage": True, "class": "BoundedFileCache"}
+
+
 @pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])
 def test_a_config_or_a_package_imports_no_trainer_until_a_run_trains(module):
     """A run's configuration reads its dataclasses' types and none of the trainer, which a run reads

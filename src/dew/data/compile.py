@@ -18,6 +18,7 @@ import dataclasses
 import functools
 import itertools
 import os
+import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -1241,7 +1242,8 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     holds no more documents than tokens. A corpus that shows no packing
     while another packs into the same batches holds windows packed where
     none of this can see, so then each declares its window's length."""
-    from dew.data.packing import PackedSource
+    # A packed source exists only where the packer was imported, which a chain that packs nothing never does.
+    packing = sys.modules.get("dew.data.packing")
 
     fields: dict[str, tuple[str, ...]] = {}
     bounds: dict[str, int] = {}
@@ -1281,7 +1283,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
                 declare(stage, stage.segments if documents is None else documents, not itself)
                 packed = True
         *_, source = beneath(source, ("read", "materialized"))
-        if isinstance(source, PackedSource):
+        if packing is not None and isinstance(source, packing.PackedSource):
             declare(source.plan.pack, source.plan.most_documents, not itself)
             packed = True
         unseen = unseen or not packed
