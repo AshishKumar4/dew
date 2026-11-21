@@ -510,7 +510,9 @@ def test_a_forward_alones_kernels_are_refused_at_its_own_tiles():
     with generation.assumed(facts):
         bound = template.MOSAIC.bind(*operands, None, **options)
         tiles = template.MOSAIC.derived(bound, facts)
-        jax.eval_shape(lambda *x: template.MOSAIC(*x, None, **options), *operands)
+        # Lowered, as a compile names its kernels (`report.named`).
+        jax.jit(lambda *x: template.MOSAIC(*x, None, **options)).trace(*operands).lower(
+            lowering_platforms=("cuda",))
     identity = report._identity(template.MOSAIC, bound)
     ran = {kernel for launch in report._LAUNCHES.values()
            if launch.identity == identity and launch.config == tiles.forward for kernel in launch.kernels}
