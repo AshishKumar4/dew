@@ -69,6 +69,7 @@ with assumed(stated, portable=True), report.certifying(gpu), jax.set_mesh(mesh):
 print(json.dumps({"cold_digest": program_digest(cold), "warm_digest": program_digest(warm),
                   "certified": len(report.certifications())}))
 """
+    untuned = f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0".strip()
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
-                   variables={"CUDA_VISIBLE_DEVICES": ""}, flags=f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0".strip())
+                   variables={"CUDA_VISIBLE_DEVICES": ""}, flags=untuned)
     assert result["certified"] > 0 and result["cold_digest"] == result["warm_digest"], result
