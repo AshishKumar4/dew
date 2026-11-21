@@ -597,12 +597,6 @@ class GemmCase(NamedTuple):
     consumers: int | None
     case: support.KernelCase
 
-    @property
-    def kernel(self) -> tuple:
-        """Its kernel's identity: its form and tile, the band its tiles are walked in apart
-        (`Tiles.grid_block_n`), a contract case's count the tile's consumers stating it."""
-        return self.form, dataclasses.replace(self.tile, grid_block_n=0)
-
 
 def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False,
                          form: str | None = None, settled: bool = False) -> list[GemmCase]:
@@ -773,7 +767,7 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     whose kernels spill, its derivation taking the next), compiled by Mosaic for a compile-only device of the
     generation on this CPU through ptxas, with the JAX this checkout pins. Required launches must spill
     nothing; compiler errors and missing reports fail any. Beside them, each launch form of the form's family
-    contract (`_family_cases`: each consumer count) lowers within the block spilling nothing, before any
+    contract (`_contract_cases`: each consumer count) lowers within the block spilling nothing, before any
     consumer adopts a Family head; no version guard skips it."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -781,7 +775,7 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     # derivation (`report.refusals`).
     with report.refusals():
         cases = [each.case for each in _gate_cases(generation_name, form)]
-        contract = ([each.case for each in _family_cases(generation_name, form)]
+        contract = ([each.case for each in _contract_cases(generation_name, form)]
                     if form in _family_forms(generation_name) else [])
         assert cases
         # The contract's witnesses first, each its own kernels' first compile in the process, whose reports
@@ -960,12 +954,6 @@ def _contract_cases(generation_name: str, form: str | None = None) -> list:
                    for name in target_forms):
                 break
     return list(found.values())
-
-
-def _family_cases(generation_name: str, form: str) -> list:
-    """A form's family contract cases (`_contract_cases`), each compiled at its own tile: the gate's cases
-    compile the tiles their launches settle on, which certification may have moved off a witness's."""
-    return _contract_cases(generation_name, form)
 
 
 def _family_forms(generation_name: str) -> set[str]:
