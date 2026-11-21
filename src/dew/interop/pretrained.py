@@ -54,7 +54,7 @@ from dew.interop.generation_config import (
     source_cache,
     source_decoding,
 )
-from dew.interop.layouts import SourceLayout, Unwritable, refuse_extensions
+from dew.interop.layouts import SourceLayout, Unwritable, unwritten_extension
 from dew.interop.pipeline_assembly import (
     SourceTask,
     assemble_pipeline,
@@ -822,7 +822,8 @@ class Pretrained:
         from dew.nn.projections import unpacked
         from dew.nn.protocols import Differential
 
-        refuse_extensions(self.model)
+        if (reason := unwritten_extension(self.model)) is not None:
+            raise ValueError(reason)
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.

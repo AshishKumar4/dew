@@ -847,7 +847,7 @@ class DecoderBlock(nn.Module):
     @nn.nowrap
     def message_flops(self, lengths, blocks: int, *, trained: bool) -> float:
         """Its work in a looped pass that reads a bank of `blocks` summaries (`cross_pass`): a merge at each
-        of its mixer's input sites and its feed-forward's (`CrossPassMerge.merge_flops`), and its input
+        of its mixer's input sites and its feed-forward's (`CrossPass.merge_flops`), and its input
         norm run again at each site past the first and at a shared parallel norm's feed-forward, each
         normed apart (`trained` counting learned matrices' work alone)."""
         spec = self.cross_pass
@@ -856,8 +856,7 @@ class DecoderBlock(nn.Module):
         mixer = self.mixer(parent=None)
         sites = len(mixer.input_sites) if isinstance(mixer, InputSites) else 1
         merges = sites + int(self.feedforward is not None)
-        merge = CrossPassMerge(spec, self.emb_features, self._stated_eps('cross-pass messages'), parent=None)
-        count = merges * merge.merge_flops(lengths, blocks, trained=trained)
+        count = merges * spec.merge_flops(lengths, self.emb_features, blocks, trained=trained)
         if NormSite.INPUT in self._built_norms():
             reruns = sites - 1 + int(self.feedforward is not None and self.wiring.shared_parallel_norm)
             count += reruns * gate_flops(self.norms, (NormSite.INPUT,), self.emb_features, lengths,

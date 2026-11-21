@@ -727,25 +727,28 @@ CROSSING_UNWRITTEN = ("the source's format holds no cross-attention layers; a ru
 """Why a decoder that reads a context through cross-attention is written in no family's layout."""
 
 
-def refuse_extensions(model: nn.Module) -> None:
-    """Refuse writing `model` in a family's layout where it extends its source with what no family's format
-    holds, read off the model alone: cross-attention (`CROSSING_UNWRITTEN`), a loop's cross-pass messages
+def unwritten_extension(model: nn.Module) -> str | None:
+    """Why no family's format holds `model`, where it extends its source with what none does, read off the
+    model alone: cross-attention (`CROSSING_UNWRITTEN`), a loop's cross-pass messages
     (`dew.nn.cross_pass.MESSAGES_UNWRITTEN`), or attention residuals whose values it normalizes
-    (`dew.nn.attention_residuals.NORMALIZED_UNWRITTEN`); a run's checkpoint or native release keeps each."""
+    (`dew.nn.attention_residuals.NORMALIZED_UNWRITTEN`); None where it extends it with none. `source_layout`
+    answers it as `Unwritable`, and an export refuses it before it converts a weight."""
     from dew.nn.attention_residuals import NORMALIZED_UNWRITTEN
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.cross_pass import MESSAGES_UNWRITTEN
     from dew.nn.protocols import CrossAttending, MediaWrapper
 
-    if isinstance(model, CrossAttending) and model.cross_attention is not None:
-        raise ValueError(CROSSING_UNWRITTEN)
     decoder = model.language_model if isinstance(model, MediaWrapper) else model
+    if (isinstance(model, CrossAttending) and model.cross_attention is not None) or (
+            isinstance(decoder, CrossAttending) and decoder.cross_attention is not None):
+        return CROSSING_UNWRITTEN
     if not isinstance(decoder, CausalTransformer):
-        return
+        return None
     if decoder.loop is not None and decoder.loop.messages is not None:
-        raise ValueError(MESSAGES_UNWRITTEN)
+        return MESSAGES_UNWRITTEN
     if decoder.attention_residuals is not None and decoder.attention_residuals.normalize_values:
-        raise ValueError(NORMALIZED_UNWRITTEN)
+        return NORMALIZED_UNWRITTEN
+    return None
 
 
 def source_layout(model: nn.Module, *,
@@ -767,13 +770,15 @@ def source_layout(model: nn.Module, *,
     if isinstance(model, MediaWrapper):
         from dew.interop.wrappers import wrapper_layout
 
-        return wrapper_layout(from_record(MultimodalTransformer, model), config=config)
+        reason = unwritten_extension(model)
+        return Unwritable(reason) if reason is not None else wrapper_layout(
+            from_record(MultimodalTransformer, model), config=config)
     try:
         decoder = from_record(CausalTransformer, unadapted(model))
     except ValueError as error:
         return _wrapper_layout(model, config, error)
-    if decoder.cross_attention is not None:
-        return Unwritable(CROSSING_UNWRITTEN)
+    if (reason := unwritten_extension(decoder)) is not None:
+        return Unwritable(reason)
     # A differential extension is folded into each layer's output projection and an adapter's factors
     # merged into their kernels as it is written (`Pretrained.export`): the layout is the decoder's they
     # extend.

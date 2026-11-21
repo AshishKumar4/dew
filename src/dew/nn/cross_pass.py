@@ -63,6 +63,15 @@ class CrossPass:
                              f"controller of rank at least 1, got block_size={self.block_size}, "
                              f"rank={self.rank}")
 
+    def merge_flops(self, lengths, width: int, blocks: int, *, trained: bool = False) -> float:
+        """One merge's work (`CrossPassMerge`) over `lengths` tokens of `width` and `blocks` summaries: its
+        depth mixture's (its learned score's alone where `trained` counts learned matrices' work) and its
+        controller's five projections (four with no added term) through rank `rank`."""
+        depth = DepthAttention(width, parent=None)
+        mixed = (depth.depth_parameter_flops if trained else depth.depth_flops)(lengths, blocks)
+        projections = 4 + int(self.additive)
+        return mixed + projections * projection_flops(lengths, width, self.rank)
+
     def blocks(self, first: int, end: int) -> tuple[tuple[int, int], ...]:
         """The blocks layers [first, end) cut into, each `[start, stop)`, the last shorter where
         `block_size` does not divide them."""
@@ -114,13 +123,3 @@ class CrossPassMerge(nn.Module):
             sent = sent + jnp.tanh(times(state, self.added))
         kept = (1 - jnp.tanh(times(state, self.forget))) * u
         return (kept + (sigma * sent if self.spec.scale_by_input_rms else sent)).astype(read.dtype)
-
-    @nn.nowrap
-    def merge_flops(self, lengths, blocks: int, *, trained: bool = False) -> float:
-        """A merge's work over `lengths` tokens and `blocks` summaries: its depth mixture's (its learned
-        score's alone where `trained` counts learned matrices' work) and its controller's five projections
-        (four with no added term) through rank `rank`."""
-        depth = DepthAttention(self.emb_features, parent=None)
-        mixed = (depth.depth_parameter_flops if trained else depth.depth_flops)(lengths, blocks)
-        projections = 4 + int(self.spec.additive)
-        return mixed + projections * projection_flops(lengths, self.emb_features, self.spec.rank)
