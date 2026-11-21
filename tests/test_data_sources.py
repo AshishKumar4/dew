@@ -2027,6 +2027,75 @@ def _indexed_source(kind: str, root: Path):
                      ("records:2048", described, 2048, 2056, 8)]
 
 
+def test_a_streamed_line_store_with_a_provisioned_index_places_each_record_at_its_index(tmp_path):
+    """A JSON-lines store whose offset index is provisioned (`dew data provision`), streamed by more shares
+    than its files, numbers each record by its place in the store (`map_with_index`), as its indexed read
+    numbers it: its ranges and their parts count their records from the index (row 9051), alone or joined
+    with another (`Concatenate`). Unprovisioned, its ranges state no rows and the streamed numbering is
+    refused, as before, joined too."""
+    from dew.data.pipeline import Pipeline
+
+    files, number = [], 0
+    for name, count in (("a.jsonl", 5), ("b.jsonl", 2)):
+        path = tmp_path / name
+        lines = []
+        for _ in range(count):
+            lines.append(json.dumps({"id": number, "text": "x" * (3 + 7 * number % 11)}))
+            number += 1
+        # A blank line holds no record, which neither the index nor a range counts.
+        path.write_text("\n".join([*lines[:2], "", *lines[2:]]) + "\n")
+        files.append(str(path))
+
+    def placed(source) -> list[tuple[int, int]]:
+        # The batch size is global: three rows give each of the three shares one.
+        chain = Pipeline(source).map_with_index(lambda index, row: {**row, "place": index},
+                                                identity="place@1").batch(3)
+        read = compile(chain, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1), epochs=1)
+        held = []
+        for share in range(3):
+            stream = read.train(DataPartition(share, 3))
+            try:
+                held += [(int(batch["id"][at]), int(batch["place"][at]))
+                         for batch in stream for at in range(len(batch["id"]))]
+            finally:
+                stream.close()
+        return sorted(held)
+
+    from dew.data.sources.concatenate import Concatenate
+
+    urls = tuple(files)
+    alone = [Files((url,), format="jsonl") for url in urls]
+    with pytest.raises(ValueError):
+        placed(Files(urls, format="jsonl"))
+    # Joined unprovisioned, their ranges' unknown rows stay unknown, never read as none.
+    with pytest.raises(ValueError):
+        placed(Concatenate(tuple(alone)))
+    Files(urls, format="jsonl").provision()
+    expected = [(row, row) for row in range(number)]
+    # Its files cut into parts for the shares (`_subdivided`), and its files' byte ranges.
+    for shard_bytes in (64 * 2**20, 16):
+        assert placed(Files(urls, format="jsonl", shard_bytes=shard_bytes)) == expected
+    joined = Concatenate(tuple(Files((url,), format="jsonl", shard_bytes=16) for url in urls))
+    assert placed(joined) == expected
+    # A producer's one index listing the second file's records first numbers them first in an indexed read,
+    # which no stream of the files in their order follows: its ranges state no rows, and the numbering is
+    # refused rather than placed otherwise than the indexed read places it.
+    entries = []
+    for shard, path in reversed(list(enumerate(urls))):
+        offset = 0
+        for line in Path(path).read_bytes().splitlines(keepends=True):
+            if line.strip():
+                entries.append((shard, offset, len(line)))
+            offset += len(line)
+    index = tmp_path / "reordered.index.npy"
+    encoded = io.BytesIO()
+    np.save(encoded, np.array(entries, dtype=[("shard", "<u4"), ("offset", "<u8"), ("bytes", "<u8")]),
+            allow_pickle=False)
+    index.write_bytes(encoded.getvalue())
+    with pytest.raises(ValueError):
+        placed(Files(urls, format="jsonl", index=str(index)))
+
+
 @pytest.mark.parametrize("kind", ["memory", "tfds", "tokens", "windows", "generation", "planned"])
 def test_an_indexed_source_streams_as_bounded_shards_of_its_records(tmp_path, kind):
     """A source read by index streams as consecutive shards of its records, each named by its first
