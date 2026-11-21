@@ -801,8 +801,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     grads = _dkv_launched(walk, launch, (query, key, value, dout, peak, total, anchor, delta, key_index,
                                          *leaves), graded, buffers, groups)
-    return (head_layout(family, grads[0]), head_layout(family, grads[1]), *grads[2:])
-
+    swapped = 3 if walk.fused else 2
+    return (*(head_layout(family, grad) for grad in grads[:swapped]), *grads[swapped:])
 
 def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:
     """A dK/dV program's stages past its resident blocks and output stages, as `_dkv_allocations` lays them:

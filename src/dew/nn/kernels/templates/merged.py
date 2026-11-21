@@ -57,7 +57,7 @@ def _value(padded, stacked, *extra, units: windows.Units, queries: int, width: i
     if out_dtype is None:
         return tuple(state[:3])
     assert out_heads is not None
-    return (ungrouped_rows(state.acc, out_heads).astype(out_dtype),)
+    return (ungrouped_rows(algebra.normalized_output(state), out_heads).astype(out_dtype),)
 def merged_split(spec: algebra.Forward, padded, stacked, *, queries: int, width: int,
                  initial: Initial | None = None) -> algebra.Partial:
     """A split walk's padded slices merged (`_trimmed`'s layout) with the call's `initial` state where it has
@@ -347,7 +347,7 @@ def _launch(padded, stacked, *extra, units: windows.Units, queries: int, width: 
         state = algebra.finished_merged_chunked(units, *_chunks(total_slices, read))
         if out_dtype is not None:
             (merged_ref,) = out_refs
-            merged_ref[...] = state.acc.astype(out_dtype)
+            merged_ref[...] = algebra.normalized_output(state).astype(out_dtype)
         else:
             merged_ref, maximum_ref, total_ref = out_refs
             merged_ref[...] = state.acc

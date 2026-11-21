@@ -1897,6 +1897,12 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
     return m, power2(state.total, state.scale.exponent, reach=TWO_FACTOR_REACH)
 
 
+def normalized_output(state: Partial) -> jax.Array:
+    """A normalized `Partial`'s output (`finish(normalized=True)`, `merged`): its sums where it holds mass,
+    else 0 (row 10675)."""
+    return jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
+
+
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
            output_params: tuple[jax.Array, ...] = (), normalized: bool = False, held: bool = False
            ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -1909,7 +1915,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     largest (`Forward.largest`), or at fp32's where `held` (an fp32 call's walk, `quotient`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
-        out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
+        out = normalized_output(state)
     else:
         acc, total = dropped_total(spec, state.acc, state.total)
         state = state._replace(acc=acc, total=total)
