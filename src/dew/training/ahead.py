@@ -1437,7 +1437,8 @@ class LaterPlans:
         finally:
             pool.shutdown(wait=False)
         _log.info("planning the steps of data phases %s off the loop", begun)
-        return cls(futures)
+        # A sampled run's counts compiling off the loop already (`LaterCounts`) are waited for alike.
+        return cls({**(trainer._later.futures if trainer._later is not None else {}), **futures})
 
     def waited(self, passes: int | None) -> None:
         """The plan of the phase whose step runs `passes` waited for, so the executables it compiled, which
@@ -1460,6 +1461,58 @@ class LaterPlans:
             if (error := future.exception()) is not None:
                 _log.warning("planning the step of %d passes off the loop failed: %r", passes, error)
         self.futures.clear()
+
+
+UPCOMING_STEPS = 64
+"""The steps of draws ahead whose counts a sampled run compiles first off its loop (`LaterCounts`)."""
+
+
+class LaterCounts:
+    """The steps of a sampled run's pass counts below its cap (`dew.training.phase_passes.SampledPasses`),
+    each admitted at the cap's plan on a thread of this process, over an objective and compiler of its own
+    (`PhasePasses.apart`), so the loop's objectives and counts are never touched, in the order the run's
+    draws will ask them from its first (`DrawingStep.upcoming`): each compiled executable the process holds
+    (`dew.nn.kernels.options.hold`), which the loop's own admission of a count, as a call first draws it
+    (`DrawingStep.admit`), finds made once it waited for it. One thread, waited for as the run ends with the
+    later phases' plans (`LaterPlans`, the trainer's `_later`). A run of several processes admits each
+    count on its loop alone, every process at once, its admission's collectives no thread may race (rows
+    7959, 8067)."""
+
+    @staticmethod
+    def begun(trainer, cap: Planned, shapes: TrainState, batch: Batch) -> Callable | None:
+        """What begins compiling `trainer`'s counts off its loop at its first draw (`DrawingStep.begin`),
+        none where it runs on several processes or where its later phases are planned on the loop
+        (`LaterPlans.started`'s exceptions)."""
+        if (jax.process_count() > 1 or trainer.host_master or trainer.rollout is not None
+                or trainer.tune_kernels or pgle_runs() or shapes.inner is not None):
+            return None
+        entered = carried()
+
+        def compiled(count: int) -> None:
+            from dew.training.compiler import StepCompiler
+
+            with entered():
+                phases = trainer.phase_passes.apart(count)
+                links = trainer._compiler.links(trainer.device_mesh)
+                compiler = StepCompiler(phases.base, links, None, phases)
+                compiler.admitted_at(trainer._stepping(phases.base, compiler), shapes, batch, cap,
+                                     count).released()
+
+        def begin(step, position: int) -> None:
+            order = [count for count in step.upcoming(position, UPCOMING_STEPS * step.split)
+                     if count not in step.plans]
+            pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-later-counts")
+            try:
+                futures = {count: pool.submit(contextvars.copy_context().run, compiled, count)
+                           for count in order}
+            finally:
+                pool.shutdown(wait=False)
+            held = trainer._later.futures if trainer._later is not None else {}
+            later = LaterPlans({**held, **futures})
+            trainer._later = later
+            step.waited = later.waited
+            _log.info("compiling the steps of pass counts %s off the loop, as the draws ask them", order)
+        return begin
 
 
 def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,

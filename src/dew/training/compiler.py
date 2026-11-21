@@ -10,7 +10,7 @@ import functools
 import json
 import logging
 import time
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -621,10 +621,11 @@ class DrawingStep:
     (`SampledPasses.count`), from the position it holds (`position`): a fit draws them before the call from
     the microbatches the run dispatched (`drawn`), and a call no fit drew for, as `Trainer.compile`'s caller
     makes (`dew inspect`, a step called by hand), draws its own from where it stands, its first at its
-    state's step's microbatches."""
+    state's step's microbatches. A count none admitted yet is admitted as a call first draws it (`admit`),
+    on the loop, where every process draws it at once (rows 7959, 8067)."""
 
-    plans: Mapping[int, Planned]
-    flops: Mapping[int, StepFlops | None]
+    plans: dict[int, Planned]
+    flops: dict[int, StepFlops | None]
     split: int
     sampled: SampledPasses
     key: tuple[int, ...]
@@ -635,6 +636,15 @@ class DrawingStep:
     pending: bool = False
     position: int | None = None
     """The global position of the next draw's first microbatch; None until a fit or the first call sets it."""
+    admit: Callable[[int], tuple[Planned, StepFlops | None]] | None = None
+    """A count's plan and FLOPs, admitted at the cap's plan (`StepCompiler.admitted_at`); none where every
+    count was admitted as the step was built (counts compiled ahead)."""
+    waited: Callable[[int], None] = lambda count: None
+    """Waits for a count's compile off the loop where one is running (`LaterCounts`), before it is admitted
+    on it."""
+    begin: Callable[[DrawingStep, int], None] | None = None
+    """Begins compiling, off the loop, the counts the draws from a global position will ask
+    (`dew.training.ahead.LaterCounts`), called once, at the first draw."""
 
     def drawn(self, interval: Interval, step: int) -> StepFlops | None:
         """The counts of the next call's microbatches at the run's dispatched microbatches
@@ -650,6 +660,7 @@ class DrawingStep:
         interval.microbatches += self.split
         self._draw()
         self.pending = True
+        self._admitted()
         total: StepFlops | None = None
         for count in self.counts:
             each = self.flops[count]
@@ -661,8 +672,26 @@ class DrawingStep:
     def _draw(self) -> None:
         """The next call's counts, drawn at `position`, which moves past them."""
         assert self.position is not None
+        if self.begin is not None:
+            begin, self.begin = self.begin, None
+            begin(self, self.position)
         self.counts = [self.sampled.count(self.key, self.position + part) for part in range(self.split)]
         self.position += self.split
+
+    def upcoming(self, position: int, draws: int) -> list[int]:
+        """The counts below the cap of the `draws` microbatches from global `position`, each once, in the
+        order they are first drawn, then every other count below the cap, least first: the order a compile
+        off the loop admits them in, so the next steps' counts are ready first."""
+        drawn = dict.fromkeys(count for at in range(draws)
+                              if (count := self.sampled.count(self.key, position + at)) < self.sampled.cap)
+        return [*drawn, *(count for count in range(1, self.sampled.cap) if count not in drawn)]
+
+    def _admitted(self) -> None:
+        """Each count of the call in hand admitted (`admit`) where none was."""
+        for count in dict.fromkeys(self.counts):
+            if count not in self.plans:
+                assert self.admit is not None, f"count {count} was admitted as the step was built"
+                self.plans[count], self.flops[count] = self.admit(count)
 
     def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False):
         assert self.run is not None
@@ -671,6 +700,7 @@ class DrawingStep:
             if self.position is None:
                 self.position = int(state.step) * self.split
             self._draw()
+            self._admitted()
         self.pending = False
         return self.run(state, batch, sampled)
 
@@ -1038,48 +1068,55 @@ class StepCompiler[L, E]:
         traced under its count's objective, `holder`'s and the compiler's (`PhasePasses.scoped`), by
         `stepping`. Its window pools each microbatch's statistics by their mean: one that replays them
         (`pooled_by_mean`) would replay each at the count closing its window, and is refused where it holds
-        several (row 7884)."""
+        several (row 7884). The counts compiled ahead are admitted as it is built; every other as a call
+        first draws it (`DrawingStep.admit`), on the loop, compiled first off it in one process where the
+        draws ask it (`dew.training.ahead.LaterCounts`), so the run's first step waits on its own counts
+        alone, not on every count below the cap (rows 7959, 8067: 336 s a count at 4B on a GH200)."""
         sampled, planned = self.phase_passes.sampled, cap.planned
         assert sampled is not None and planned is not None, "a sampled count's cap compiled on the devices"
         plans, flops = {sampled.cap: planned}, {sampled.cap: cap.step_flops}
-        for count, each in self.admitted_counts(holder, stepping, planned, state, batch):
+        self._refuse_sampled_window(planned)
+        ahead = self.counts_ahead is not None
+        for count, each in (self.admitted_counts(holder, stepping, planned, state, batch) if ahead else ()):
             plans[count], flops[count] = each.released(), self._flops(each)
         self.phase_passes.current = sampled.cap
         with self.phase_passes.scoped(holder, self):
             capped = stepping()
         words = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
         step = DrawingStep(plans, flops, planned.split, sampled, words)
+        if not ahead:
+            from dew.training._candidates import _shapes
+            from dew.training.ahead import LaterCounts
+
+            shapes = _shapes(fresh(state))
+
+            def admit(count: int) -> tuple[Planned, StepFlops | None]:
+                step.waited(count)
+                [(_, each)] = self.admitted_counts(holder, stepping, planned, shapes, batch, (count,))
+                return each.released(), self._flops(each)
+
+            step.admit = admit
+            step.begin = LaterCounts.begun(holder, planned, shapes, batch)
         step.run = self.runner(capped, planned, capped.settings.device_mesh,
                                parted=lambda: [plans[count] for count in step.counts])
         return step
 
     def admitted_counts(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Planned,
-                        state: TrainState, batch: Batch) -> Iterator[tuple[int, Planned]]:
+                        state: TrainState, batch: Batch,
+                        counts: Iterable[int] | None = None) -> Iterator[tuple[int, Planned]]:
         """Every count but the cap of a run that draws its pass count per microbatch (`PhasePasses.sampled`)
         admitted at the cap's plan `cap` (`admitted_at`), each traced under its count's objective, `holder`'s
         and the compiler's (`PhasePasses.scoped`), by `stepping`, and handed on as it is admitted, so its
         caller releases or keeps each before the next compiles; each taken from the counts' family of the
         step compiled ahead where the run was handed one (`counts_ahead`, `AheadOfTime.at_count`), which
         its first admission consumes as a step compiled ahead is (a later batch's shapes compile their
-        own), else compiled here, as the run says."""
+        own), else compiled here, as the run says; `counts` those asked, every one below the cap where
+        None."""
         sampled = self.phase_passes.sampled
         assert sampled is not None, "a run that draws its pass count per microbatch"
-        # Refused here, where a run and a build ahead (`compile_ahead`) both admit the counts: a window that
-        # pools its microbatches by their mean holds their gradient's sum and its mass
-        # (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that replays
-        # them holds their batches instead.
-        window = cap.candidate.prepared.window
-        if window is not None and window.mass is None:
-            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
-                             "its update replays each microbatch at the count that closes it: a pass count "
-                             "drawn per microbatch takes them one microbatch an update (split and "
-                             "accumulation 1), until replays run each at its own (row 7884)")
-        if window is not None and window.batch_statistics is not None and cap.split > 1 and sampled.cap > 1:
-            raise ValueError(f"{type(self.objective).__name__}'s statistics of a step's whole batch "
-                             "(`batch_statistics`) are computed at its first part, by that part's count, and "
-                             "read by every part: a pass count drawn per microbatch reads them one part a "
-                             "step (split 1), until each part's count computes its own (row 10770's audit)")
-        counts, family, self.counts_ahead = range(1, sampled.cap), self.counts_ahead, None
+        self._refuse_sampled_window(cap)
+        counts, family = range(1, sampled.cap) if counts is None else counts, self.counts_ahead
+        self.counts_ahead = None
         if family is None:
             _log.info("the run draws its pass count per microbatch: it compiles the steps of counts %s at "
                       "its cap's plan", list(counts))
@@ -1092,6 +1129,25 @@ class StepCompiler[L, E]:
                 yield count, planned
         finally:
             self.phase_passes.current = sampled.cap
+
+    def _refuse_sampled_window(self, cap: Planned) -> None:
+        """Refused where a run and a build ahead (`compile_ahead`) both admit a sampled run's counts, as the
+        step is built: a window that pools its microbatches by their mean holds their gradient's sum and its
+        mass (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that
+        replays them holds their batches instead."""
+        sampled = self.phase_passes.sampled
+        assert sampled is not None, "a run that draws its pass count per microbatch"
+        window = cap.candidate.prepared.window
+        if window is not None and window.mass is None:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
+                             "its update replays each microbatch at the count that closes it: a pass count "
+                             "drawn per microbatch takes them one microbatch an update (split and "
+                             "accumulation 1), until replays run each at its own (row 7884)")
+        if window is not None and window.batch_statistics is not None and cap.split > 1 and sampled.cap > 1:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics of a step's whole batch "
+                             "(`batch_statistics`) are computed at its first part, by that part's count, and "
+                             "read by every part: a pass count drawn per microbatch reads them one part a "
+                             "step (split 1), until each part's count computes its own (row 10770's audit)")
 
     def whole_program(self) -> OuterProgram:
         """The program a split step's whole runs on its microbatches' outputs (`whole_step_program`), each
