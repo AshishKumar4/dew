@@ -1,11 +1,11 @@
 """The Mosaic GPU toolkit's ring protocol model-checked (`ring_protocol`): the sm90 ring family's persistent
-walk (`mosaic.RingFamily.persist`: its producer's loads at a counter running across tiles, its drains, its
-consumers' walks with their slots acquired and released, a step's products in flight or not, a rotation
+walk (`ring_family.RingFamily.persist`: its producer's loads at a counter running across tiles, its drains,
+its consumers' walks with their slots acquired and released, a step's products in flight or not, a rotation
 unrolled or a step a trip) and the tcgen05 family's over a gathered ring (its load warps' gathers, its product
 warp's commits), traced as the toolkit builds it and explored over every interleaving, within the bounds
-below: no deadlock, no aliased parity, no early arrival, no read before its write lands, no overwrite
-before its read. And the checker catches each class it names: a flipped parity, a missing arrival, an early
-release, each a counterexample trace."""
+below: no deadlock, no aliased parity, no early arrival, no read before its write lands, no overwrite before
+its read. And the checker catches each class it names: a flipped parity, a missing arrival, an early release,
+each a counterexample trace."""
 
 import dataclasses
 import functools
