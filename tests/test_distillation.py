@@ -757,17 +757,20 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
 
 
 @pytest.mark.mesh(devices=4)
-def test_a_tiled_full_kl_over_a_batch_split_across_devices_gathers_no_states():
-    """The tiled full KL (`_tiled_divergence`) over final states whose rows are split across four devices
-    compiles with no all-gather of either model's states: each slice of positions keeps every row on its
-    own device (row 9067: a slice of the flattened token axis gathered `[B*S, D]` onto every device). The
+@pytest.mark.parametrize("axes", [{"data": 4}, {"data": 2, "sequence": 2}],
+                         ids=["rows", "rows-and-positions"])
+def test_a_tiled_full_kl_over_tokens_split_across_devices_gathers_no_states(axes):
+    """The tiled full KL (`_tiled_divergence`) over final states whose rows, or rows and positions, are split
+    across four devices compiles with no all-gather of either model's states: each device runs the slices
+    of its own tokens (row 9067: a slice of the flattened token axis gathered `[B*S, D]` onto every device,
+    and a slice of the positions gathered a device's `[B/dp, S, D]` where the positions were split). The
     KL's agreement with the whole logits' is the reference test's, tiled."""
     import math
 
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from sharded import collectives
 
     from dew.objectives.base import Prediction
+    from dew.training import MeshSpec
 
     arrays = fixture()
     objective, _ = fixture_objective(arrays)
@@ -776,8 +779,9 @@ def test_a_tiled_full_kl_over_a_batch_split_across_devices_gathers_no_states():
     keys = jax.random.split(jax.random.key(0), 4)
     student_table, teacher_table = (jax.random.normal(key, (width, vocab)) for key in keys[:2])
     states = [jax.random.normal(key, (rows, positions, width)) for key in keys[2:]]
-    mesh = Mesh(np.asarray(jax.devices()[:4]), ("data",))
-    split = NamedSharding(mesh, P("data"))
+    mesh = MeshSpec(**axes).build(jax.devices()[:4])
+    split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(
+        "data", "sequence" if "sequence" in axes else None))
 
     def divergence(student_states, teacher_states):
         student = Prediction(None, None, None, (), final=student_states, head=lambda h: h @ student_table)
@@ -785,6 +789,8 @@ def test_a_tiled_full_kl_over_a_batch_split_across_devices_gathers_no_states():
         finite = jnp.ones((rows, positions), bool)
         return objective._tiled_divergence(student, teacher, finite, jnp.asarray(2.0))
 
-    compiled = jax.jit(divergence, in_shardings=(split, split)).lower(*states).compile()
+    with jax.set_mesh(mesh):
+        compiled = jax.jit(divergence, in_shardings=(split, split)).lower(*states).compile()
     gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
-    assert not any(math.prod(shape) >= rows * positions * width for shape in gathered), gathered
+    local = rows * positions * width // 4
+    assert not any(math.prod(shape) > local for shape in gathered), gathered
