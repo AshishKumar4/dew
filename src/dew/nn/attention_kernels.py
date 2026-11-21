@@ -20,7 +20,7 @@ from .kernels import decode_attention, generation
 from .kernels.generation import INHERENT, Choice, bf16_dot_runs, capability, device_generation, gpu_placed
 from .kernels.selection import Kernel, Op, Requirement
 from .kernels.templates import attention_route
-from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
+from .kernels.templates.attention import DTYPES as TEMPLATE_DTYPES
 from .precision import wide_cpu_arithmetic
 
 SIXTEEN_BIT = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
