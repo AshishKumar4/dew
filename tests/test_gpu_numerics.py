@@ -18,6 +18,7 @@
 - A multiply-add marked to round alone rounds each step, as precision's unbarriered transforms take it
   (test_no_contract).
 - APG's projection at its range's edges is Diffusers' float64 projection's, as on a CPU (test_guidance).
+- A fusion reading a value directly and through a reversed view computes its exact sum (test_view_buffers).
 """
 
 import functools
@@ -34,6 +35,7 @@ import test_moe_precision as moe_precision
 import test_no_contract as no_contract
 import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
+import test_view_buffers as view_buffers
 from gpu_flow import Cell, covering, isolated, run_cells, when
 
 from dew.nn.kernels import grouped_matmul, grouped_triton, norm_swiglu
@@ -71,6 +73,11 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              guidance_tests.apg_holds_its_projection_at_its_ranges_edges, fault=OWN),
         Cell("a multiply-add marked to round alone rounds each step on a GPU",
              no_contract.a_marked_multiply_add_rounds_each_step, fault=OWN),
+        *(Cell(f"a value read through a reversed view is summed exactly on a GPU: {program}",
+               functools.partial(
+                   view_buffers.a_value_read_through_a_reversed_view_is_summed_exactly, program),
+               fault=OWN)
+          for program in view_buffers.PROGRAMS),
         *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",
                functools.partial(precision_policy.compensated_primitives_hold_under_jit, shape), fault=OWN)
           for shape in precision_policy.COMPENSATED_SHAPES),
