@@ -123,7 +123,7 @@ def _dq_step_of(walk: _Backward, operands: tuple, stats: tuple, coords_of, param
 
 
 def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, tile, index,
-             slots, rows, accumulators):
+             slots, rows, accumulators, *, masked: bool | None = None):
     """A dQ consumer's key tile `index`: its scores and score cotangents from the key and value slots
     (`slots`) and its queries and output cotangents (`operands`) under its rows' statistics (`stats`), the
     tile's coordinates (`coords_of(k_first)`), its hook parameters (`params_of(like, k_first=k_first,
@@ -149,7 +149,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         # where the mask is read (`gradient.pulled`).
         # Its places tiles: vector broadcasts took dQ 1.77 to 2.06 ms under sinks at width 64 (ET-HELD-h100,
         # the config unchanged), its registers no fewer.
-        coords = coords_of(k_first)
+        coords = coords_of(k_first, read=walk.places_read(masked=masked))
         scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen, masked=masked)
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = gradient.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
@@ -159,10 +159,13 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
                     terms.keyed_shift)
         return row_sums, parts, keyed
 
-    # One walk, its tiles' masks chosen a tile at a time: a walk of two loops into one warpgroup accumulator,
-    # the first empty, faults on an H100 under jax 0.11.2's Mosaic GPU lowering.
-    rows, scaled, keyed = lax.cond(whole(index), functools.partial(issued, masked=False),
-                                   functools.partial(issued, masked=True))
+    # One walk, its tiles' masks chosen a tile at a time on register-budgeted GPUs (a walk of two loops into
+    # one warpgroup accumulator, the first empty, faults on an H100 under jax 0.11.2); segmented on TPU mxu.
+    if masked is None:
+        rows, scaled, keyed = lax.cond(whole(index), functools.partial(issued, masked=False),
+                                       functools.partial(issued, masked=True))
+    else:
+        rows, scaled, keyed = issued(masked=masked)
     dq_acc, *keyed_accs = accumulators
     # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's
     # branches yield the scaled cotangents alone, not every part.
@@ -200,7 +203,8 @@ QUERIES_FIRST = (mosaic.Product("keys", placed.SCORES, "queries", transposed=Tru
 writes over the cotangents' turn (`_placed_dq_step`)."""
 
 
-def _placed_dq_step(walk: _Backward, stats: tuple, coords_of, tile, index, slots, rows, accumulators):
+def _placed_dq_step(walk: _Backward, stats: tuple, coords_of, tile, index, slots, rows, accumulators, *,
+                    masked: bool | None = None):
     """The compute warpgroup's key tile `index` of a walk whose family places its products on a role queries
     first (`placed.QUERIES`, `QUERIES_FIRST`): the tile's scores and their cotangents its issuer's
     (`awaited`, a query a thread's row in tensor memory's own layout), `PART` keys at a time under its rows'
@@ -215,12 +219,14 @@ def _placed_dq_step(walk: _Backward, stats: tuple, coords_of, tile, index, slots
     scores, cotangents = family.awaited(slots)
     pulled = family.turn_of(placed.COTANGENTS, slots.turn, narrowed=True)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
+    is_masked = True if masked is None else masked
+    read = walk.places_read(masked=is_masked)
     for first in range(0, tiles.block_k, PART):
         s = family.read(scores, first=first, columns=PART, layout=mosaic_sm100.TMEM)
         dp = family.read(cotangents, first=first, columns=PART, layout=mosaic_sm100.TMEM)
-        coords = coords_of(k_first + first, shape=(tiles.block_q, PART))
+        coords = coords_of(k_first + first, shape=(tiles.block_q, PART), read=read)
         exponentials, _, scored, slopes, seen = _scores(walk, coords, (), s, dp, peak, prior, anchor, delta,
-                                                        chosen, masked=True)
+                                                        chosen, masked=is_masked)
         sums = gradient.DqSums(empty, residual, mass, grads, weighed, empty, keyed_mass, keyed_shift)
         terms, part, _ = gradient.dq_issued(sums, exponentials, scored, slopes, seen, pulled.dtype, prior,
                                             scale=walk.grad_scale, kinds=walk.kinds, summed=walk.summed,
@@ -323,11 +329,14 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                                    draw=None if drop_of is None else drop_of.draw(row, head)))
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
                      nothing + gradient.NO_SHIFT)
+            run = (program.forward_whole_run(first, spans_of)
+                   if family.places_on_role or not family.budgets_registers else None)
             # The tiles its partner reads around its own (`Family.walk_own`).
             (residual, mass, grads, weighed, keyed_mass, keyed_shift), accumulated = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(
-                    streams, ((step, lo, hi),), start, ((block_q, share[1]),) * (2 if walk.accurate else 1),
+                    streams, program.segmented(step, run, lo, hi), start,
+                    ((block_q, share[1]),) * (2 if walk.accurate else 1),
                     walk.interpret, first=counted))
             dq, *keyed = accumulated
             rows = head_slice(family, row, head, pl.ds(first, block_q))
