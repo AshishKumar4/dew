@@ -940,7 +940,9 @@ def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
     (`RecordedLeaf.share`) that of the order it is, its values finite at both."""
     return [(one[0], one[1], float(np.fmax(one[2], other[2])), float(np.fmax(one[3], other[3])), one[4],
              one[5] and other[5], tuple(other[6][arm] if other[2 + arm] > one[2 + arm] else one[6][arm]
-                                        for arm in (0, 1)))
+                                        for arm in (0, 1)),
+             tuple(other[7][arm] if other[2 + arm] > one[2 + arm] else one[7][arm]
+                   for arm in (0, 1)))
             for one, other in zip(first, later, strict=True)]
 
 

@@ -251,6 +251,43 @@ def test_a_worst_row_one_element_of_dews_rules_defers_to_a_conditioned_sites_wei
         assert judged(20.0, spread, width, deferring=True)[0], width
 
 
+def test_a_worst_row_a_scalar_multiple_of_its_truth_defers_to_a_conditioned_sites_weighed_check():
+    """A wide leaf (`[192, 32]`, Gemma 3n's down projection) whose worst row's error is a scalar multiple of
+    its truth row, one degree of freedom no element rules (its largest element's share 0.11, its share
+    collinear with the truth 1), 4.8 times the reference's: at a site that declares its weighed check
+    (`_judgement`'s `deferring`) it is left unresolved for that check, nothing over (row 9780: a unit
+    `gaussian_topk` keeps active on one token 209 ulps over its cutoff scales its whole row with every ulp
+    upstream); at a site that declares none it fails by its width's factor; and a row of Dew's whose error is
+    spread across its truth's orthogonal complement fails at either."""
+    from dew.parity import _drawn_from, _evidence, _judgement, _prepared
+
+    def drawn(dew_rows, reference_rows, truth_rows, seeds=8):
+        # The first seed's rows as given, every other seed's a relative 1e-5 off its truth in both arms.
+        base = truth_rows * (1.0 + 1e-5)
+        first = _evidence(_prepared({"down_proj": dew_rows}, {"down_proj": truth_rows}),
+                          {"down_proj": reference_rows}, {"down_proj": truth_rows}, shared=True)
+        rest = _evidence(_prepared({"down_proj": base}, {"down_proj": truth_rows}),
+                         {"down_proj": base}, {"down_proj": truth_rows}, shared=True)
+        return _drawn_from(["down_proj"], (truth_rows.shape[-1],), [first, *([rest] * (seeds - 1))])
+
+    rng = np.random.default_rng(9780)
+    truth = rng.standard_normal((192, 32))
+    truth[50] *= 1e-4
+    dew, reference = truth * (1.0 + 1e-5), truth * (1.0 + 1e-5)
+    dew[50], reference[50] = truth[50] * (1.0 + 8.898e-3), truth[50] * (1.0 + 1.859e-3)
+    over, undecided = _judgement(drawn(dew, reference, truth), "gemma3n", deferring=True)
+    assert not over and any(finding.rule == "inconclusive" for finding in undecided), (over, undecided)
+    over, _ = _judgement(drawn(dew, reference, truth), "gemma3n", deferring=False)
+    assert any(finding.rule == "row" for finding in over), over
+    across = rng.standard_normal(32)
+    across -= across @ truth[50] / (truth[50] @ truth[50]) * truth[50]
+    across *= np.linalg.norm(truth[50]) / np.linalg.norm(across)
+    spread = truth * (1.0 + 1e-5)
+    spread[50] = truth[50] + 8.898e-3 * across
+    over, _ = _judgement(drawn(spread, reference, truth), "gemma3n", deferring=True)
+    assert any(finding.rule == "row" for finding in over), over
+
+
 def test_a_narrow_rows_factor_holds_through_check_one():
     """Through `assert_as_exact`: a first row of one value ten times the reference's relative error, too
     small a value for the pooled ratio to see, passes at one value a row and fails at eight."""

@@ -626,7 +626,8 @@ it fails at most 2 of 32,000 runs, where the width's factor alone failed up to 1
 width's factor alone failed 185, and 0 to 3 at 16 values. Dew's worst row must be ruled too, so a row of
 Dew's spread over its values (a row fault) keeps its width's factor beside a reference one value rules. At
 a site that declares its weighed check, a worst row one element of Dew's rules alone defers to it
-(`_judgement`'s `deferring`, row 10145). A
+(`_judgement`'s `deferring`, row 10145), as does one whose error lies along its truth row, one value it is
+all scaled by (row 9780). A
 Gaussian row of eight values or more is almost never ruled; rows of three or four values sometimes are,
 where a fault ruled alike is refused less often. A value's own error in a ruled row is check 2's to bound.
 A stacked-examples site's paired rows keep their width's factor (`_judgement`), and a recording's summary,
@@ -757,6 +758,9 @@ class RecordedLeaf:
     share: float | None = None
     """The share of its worst sized row's squared error the row's largest element carries (`_Draws.factor`),
     zero where no row is sized; None where the leaf was recorded as rows alone (`rows_summary`)."""
+    collinear: float | None = None
+    """The share of its worst sized row's squared error along its float64 truth row (`_collinear_share`), zero
+    where no row is sized; None where not recorded."""
     example_mse: np.ndarray | None = None
     example_worst: np.ndarray | None = None
     """At a site whose leaves stack independent examples, each example's evidence (`example_mse`,
@@ -887,8 +891,9 @@ def _error_rows(references, truths, *, xp):
         errors = values - truth
         width = _width(truth)
         rows = errors.reshape(-1, width) if width else xp.zeros((0, 1))
+        truth_rows = truth.reshape(-1, width) if width else xp.zeros((0, 1))
         found.append((log_mean_square(errors, xp), xp.isfinite(values).all(), _scaled_rms(rows, xp),
-                      _largest_share(rows, xp)))
+                      _largest_share(rows, xp), _collinear_share(rows, truth_rows, xp)))
     return found
 
 
@@ -916,6 +921,25 @@ def _largest_share(rows, xp=np):
     scaled = xp.square(xp.where(finite, rows, 0.0) / xp.where(finite & (largest > 0), largest, 1.0))
     total = xp.sum(scaled, axis=1)
     return xp.where(total > 0, 1.0 / xp.where(total > 0, total, 1.0), 0.0)
+
+
+def _collinear_share(rows, truth_rows, xp=np):
+    """Each row's share of its squared error along its truth row, `<e, t>^2 / (<e, e> <t, t>)`, each row read
+    over its largest magnitude first so no sum overflows or underflows: one for a row whose error is a scalar
+    multiple of its truth (one value its whole row is scaled by, row 9780), zero where either row is zero or
+    not finite."""
+    e = xp.asarray(rows)
+    t = xp.asarray(truth_rows)
+    e_max = xp.max(xp.abs(e), axis=1, keepdims=True) if e.shape[1] else xp.zeros((len(e), 1))
+    t_max = xp.max(xp.abs(t), axis=1, keepdims=True) if t.shape[1] else xp.zeros((len(t), 1))
+    ok = xp.isfinite(e_max) & xp.isfinite(t_max) & (e_max > 0) & (t_max > 0)
+    eu = xp.where(ok, e, 0.0) / xp.where(ok, e_max, 1.0)
+    tu = xp.where(ok, t, 0.0) / xp.where(ok, t_max, 1.0)
+    ee = xp.sum(xp.real(eu * xp.conj(eu)), axis=1)
+    tt = xp.sum(xp.real(tu * xp.conj(tu)), axis=1)
+    et = xp.sum(eu * xp.conj(tu), axis=1)
+    denom = ee * tt
+    return xp.where(denom > 0, xp.real(et * xp.conj(et)) / xp.where(denom > 0, denom, 1.0), 0.0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -979,8 +1003,9 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
                            [held.truths[at] for at in held.laid])
     log_mse = np.asarray([log_mse for log_mse, *_ in found], np.float64)
     finite = np.asarray([finite for _, finite, *_ in found], bool)
-    rows = np.concatenate([np.zeros(0), *(np.asarray(rows) for *_, rows, _ in found)])
-    shares = np.concatenate([np.zeros(0), *(np.asarray(shares) for *_, shares in found)])
+    rows = np.concatenate([np.zeros(0), *(np.asarray(rows) for _, _, rows, _, _ in found)])
+    shares = np.concatenate([np.zeros(0), *(np.asarray(shares) for _, _, _, shares, _ in found)])
+    collinears = np.concatenate([np.zeros(0), *(np.asarray(col) for _, _, _, _, col in found)])
     # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
     counts = held.counts
     starts = np.cumsum(counts) - counts
@@ -990,29 +1015,33 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     logs, over = log_over(rows[sized], held.sizes[sized]), _over(rows[sized], held.sizes[sized])
     # The worst sized row of each leaf that has one: the largest of its run of the sized rows.
     some = taken > 0
-    worst_log, worst, share = np.full(len(counts), LOG_ZERO), np.zeros(len(counts)), np.zeros(len(counts))
+    worst_log = np.full(len(counts), LOG_ZERO)
+    worst, share, collinear = np.zeros(len(counts)), np.zeros(len(counts)), np.zeros(len(counts))
     if some.any():
         firsts = (np.cumsum(taken) - taken)[some]
         worst_log[some] = np.maximum.reduceat(logs, firsts)
         worst[some] = np.maximum.reduceat(over, firsts)
-        # The worst row's largest element's share of its squared error, each leaf's worst sized row's.
-        sized_shares = shares[sized]
-        share[some] = [sized_shares[first + int(np.argmax(logs[first:first + count]))]
-                       for first, count in zip(firsts.tolist(), taken[some].tolist(), strict=True)]
+        # The worst row's largest element's share and truth-collinear share of its squared error.
+        sized_shares, sized_collinear = shares[sized], collinears[sized]
+        at_worst = [first + int(np.argmax(logs[first:first + count]))
+                    for first, count in zip(firsts.tolist(), taken[some].tolist(), strict=True)]
+        share[some] = [sized_shares[i] for i in at_worst]
+        collinear[some] = [sized_collinear[i] for i in at_worst]
     # The rows of float64 zero, each leaf's its span of them.
     unsized = np.flatnonzero(~sized)
     zero_rows = unsized - np.repeat(starts, counts - taken)
     zero_errors, zero_sizes = rows[unsized], held.own[unsized]
     ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
-    log_mse, worst, worst_log, share, finite = (log_mse.tolist(), worst.tolist(), worst_log.tolist(),
-                                                share.tolist(), (finite & held.finite).tolist())
+    log_mse, worst, worst_log, share, collinear, finite = (
+        log_mse.tolist(), worst.tolist(), worst_log.tolist(), share.tolist(), collinear.tolist(),
+        (finite & held.finite).tolist())
     for index, at in enumerate(held.laid):
         if read[index]:
             span = slice(ends[index], ends[index + 1])
             summaries[at] = RecordedLeaf(log_mse[index], worst[index], zero_rows[span], zero_errors[span],
                                          finite=finite[index], dtype=dtype(references[at]),
                                          zero_sizes=zero_sizes[span], worst_log=worst_log[index],
-                                         share=share[index])
+                                         share=share[index], collinear=collinear[index])
     return summaries
 
 
@@ -1043,6 +1072,9 @@ class _Draws:
     reference's (seed by leaf by arm, as `worst`), zero where no row is sized and NaN where it is unknown (a
     recording's summary keeps no row's elements, a row of float64 zero a live reference measured); None
     where none was kept (`held_shares`)."""
+    collinear: np.ndarray | None = None
+    """The share of each seed's worst row's squared error along its truth row (`_collinear_share`), Dew's and
+    the reference's (seed by leaf by arm, as `shares`), NaN where unknown."""
 
     def factor(self, index: int) -> float:
         """The worst-row rule's factor for leaf `index` (its maximum's, `_judgement`): its rows' width's
@@ -1058,27 +1090,35 @@ class _Draws:
         return row_factor(width)
 
     def ruled(self, index: int) -> bool:
-        """Whether one element carries past RULED_SHARE of Dew's worst row of leaf `index` over these draws
-        (`factor`'s first condition alone); a share unknown is not."""
+        """Whether one degree of freedom carries past RULED_SHARE of Dew's worst row of leaf `index` over
+        these draws: one element (`factor`'s first condition alone), or one value its whole row is scaled by,
+        its error along its truth row (row 9780); a share unknown is not. Read where a site declares its
+        weighed check alone (`_judgement`'s `deferring`); `factor` keeps the element's share."""
         mine = int(np.argmax(self.worst[:, index, 0]))
-        return bool(self.held_shares()[mine, index, 0] > RULED_SHARE)
+        return bool(self.held_shares()[mine, index, 0] > RULED_SHARE
+                    or self.held_collinear()[mine, index, 0] > RULED_SHARE)
 
     def held_shares(self) -> np.ndarray:
         """`shares`, every cell unknown (NaN) where none was kept, so draws join and pick per cell."""
         return np.full(self.worst.shape, np.nan) if self.shares is None else self.shares
+
+    def held_collinear(self) -> np.ndarray:
+        """`collinear`, every cell unknown (NaN) where none was kept, so draws join and pick per cell."""
+        return np.full(self.worst.shape, np.nan) if self.collinear is None else self.collinear
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
                                    if getattr(self, field) is not None and getattr(other, field) is not None
                                    else None) for field in ("examples", "example_rows"))
         shares = np.concatenate([self.held_shares(), other.held_shares()])
+        collinear = np.concatenate([self.held_collinear(), other.held_collinear()])
         return _Draws(self.names, np.concatenate([self.mine, other.mine]),
                       np.concatenate([self.theirs, other.theirs]), np.concatenate([self.worst, other.worst]),
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
-                      self.widths, examples, example_rows, shares)
+                      self.widths, examples, example_rows, shares, collinear)
 
     def __post_init__(self) -> None:
-        optional = (self.examples, self.example_rows, self.shares)
+        optional = (self.examples, self.example_rows, self.shares, self.collinear)
         held = {len(self.mine), len(self.theirs), len(self.worst), len(self.zero_rows), len(self.finite),
                 *(len(field) for field in optional if field is not None)}
         if len(held) > 1:
@@ -1094,7 +1134,8 @@ class _Draws:
                                   for field in ("examples", "example_rows"))
         return _Draws(self.names, self.mine[cut], self.theirs[cut], self.worst[cut], self.zero_rows[cut],
                       self.finite[cut], self.widths, examples, example_rows,
-                      None if self.shares is None else self.shares[cut])
+                      None if self.shares is None else self.shares[cut],
+                      None if self.collinear is None else self.collinear[cut])
 
     def of_examples(self, index: int) -> list[np.ndarray] | None:
         """Leaf `index`'s per-example log ratios a seed, or None where the site stacks none or a seed's
@@ -1144,6 +1185,8 @@ class _Draws:
         # A picked cell's worst row is the library arm's, and so is its share.
         shares = self.held_shares().copy()
         shares[..., 1] = np.where(pick, library.held_shares()[..., 1], shares[..., 1])
+        collinear = self.held_collinear().copy()
+        collinear[..., 1] = np.where(pick, library.held_collinear()[..., 1], collinear[..., 1])
 
         def uncovered(field: str):
             held = getattr(self, field)
@@ -1152,7 +1195,7 @@ class _Draws:
 
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
                       self.finite & (library.finite | ~covered), self.widths,
-                      uncovered("examples"), uncovered("example_rows"), shares)
+                      uncovered("examples"), uncovered("example_rows"), shares, collinear)
 
 
 def _shares(found: list[list], count: int) -> np.ndarray:
@@ -1307,7 +1350,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (path, kept, their.dtype)
-            row.append((-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0)))
+            row.append((-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0), (0.0, 0.0)))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (was and not own) or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
@@ -1350,7 +1393,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
         return (mine.log_mse, theirs.log_mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
-                mine.finite and theirs.finite, (mine.share, theirs.share))
+                mine.finite and theirs.finite, (mine.share, theirs.share), (mine.collinear, theirs.collinear))
     # Each of Dew's rows of float64 zero against the reference's same row, every row at once (up to 283k a
     # draw at 2469's chunk sites, which a loop of scalar logs held for a fifth of a GPU attention file's
     # time, row 5461): aligned in any order, a repeated row read at its last, as a mapping of rows reads it.
@@ -1376,8 +1419,10 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     # A measured row of float64 zero that became an arm's worst keeps no share of its own: unknown.
     shares = (mine.share if worst == mine.log_worst else None,
               theirs.share if their_worst == theirs.log_worst else None)
+    collinear = (mine.collinear if worst == mine.log_worst else None,
+                 theirs.collinear if their_worst == theirs.log_worst else None)
     return (mine.log_mse, theirs.log_mse, worst, their_worst, (rows, errors, their_errors),
-            mine.finite and theirs.finite, shares)
+            mine.finite and theirs.finite, shares, collinear)
 
 
 def _at_least(worst: float, logs: np.ndarray) -> float:
@@ -1466,7 +1511,8 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
     final verdict), a leaf its pooled ratio leaves inconclusive passed by its typical draw where that
     decides. Every factor is raised to `power`: WRITTEN against a reference as written, else one. With
     `deferring` (a site that declares its weighed check, `check1_judge.Verdict.defers_to`), a worst row past
-    its factor that one element of Dew's rules (`_Draws.ruled`) is left unresolved, for that check to judge
+    its factor that one degree of freedom of Dew's rules (`_Draws.ruled`: one element, or one value the row
+    is scaled by) is left unresolved, for that check to judge
     in units of the reference's rounding there: at an element its computation amplifies (a step's update of
     a gradient a few of its epsilons across), the two arms' errors are two values' alike, and the reference's
     worst row lies at another element wherever its own error there was the smaller, so RULED_SHARE's
@@ -1795,7 +1841,7 @@ def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[t
 
     worst = np.asarray([[(entry[2], entry[3]) for entry in row] for row in evidence]).reshape(count, -1, 2)
     return _Draws(names, np.asarray(each(0)), np.asarray(each(1)), worst, each(4), np.asarray(each(5)),
-                  widths, examples, example_rows, _shares(each(6), count))
+                  widths, examples, example_rows, _shares(each(6), count), _shares(each(7), count))
 
 
 
