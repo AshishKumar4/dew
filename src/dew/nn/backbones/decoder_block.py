@@ -24,7 +24,7 @@ from dew.nn.dropout import Dropout
 from ..activations import GatedActivation, gated_product
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..cross_attention import NAME as CROSS_ATTENTION, AttendsContext, LayerReads
-from ..cross_pass import CrossPass, CrossPassMerge
+from ..cross_pass import MERGE_PREFIX, CrossPass, CrossPassMerge
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -845,6 +845,26 @@ class DecoderBlock(nn.Module):
         return count
 
     @nn.nowrap
+    def message_flops(self, lengths, blocks: int, *, trained: bool) -> float:
+        """Its work in a looped pass that reads a bank of `blocks` summaries (`cross_pass`): a merge at each
+        of its mixer's input sites and its feed-forward's (`CrossPassMerge.merge_flops`), and its input
+        norm run again at each site past the first and at a shared parallel norm's feed-forward, each
+        normed apart (`trained` counting learned matrices' work alone)."""
+        spec = self.cross_pass
+        if spec is None:
+            return 0.0
+        mixer = self.mixer(parent=None)
+        sites = len(mixer.input_sites) if isinstance(mixer, InputSites) else 1
+        merges = sites + int(self.feedforward is not None)
+        merge = CrossPassMerge(spec, self.emb_features, self.norm_eps, parent=None)
+        count = merges * merge.merge_flops(lengths, blocks, trained=trained)
+        if NormSite.INPUT in self._built_norms():
+            reruns = sites - 1 + int(self.feedforward is not None and self.wiring.shared_parallel_norm)
+            count += reruns * gate_flops(self.norms, (NormSite.INPUT,), self.emb_features, lengths,
+                                         routed=self.routed)
+        return count
+
+    @nn.nowrap
     def _stream_sites(self, spec: HyperConnections):
         """The attention's and the MLP's sites over the streams, set up under `attn_hc` and `ffn_hc`:
         mHC's (`HyperConnection`), or Qwen4-Exp's gated ones (`GatedResidual`)."""
@@ -972,7 +992,8 @@ class DecoderBlock(nn.Module):
                     "residual is the depth mixture: no output norms, layer scalar, parallel "
                     "branch, altup, laurel, per-layer inputs, hyper-connections or residual multiplier")
             site = functools.partial(DepthAttention, emb_features=self.emb_features,
-                                     norm_eps=self._stated_eps('attention residuals'))
+                                     norm_eps=self._stated_eps('attention residuals'),
+                                     normalize_values=self.residual_site.normalize_values)
             self.attention_res = site(name='attention_res')
             if self.feedforward is not None:
                 self.mlp_res = site(name='mlp_res')
@@ -994,7 +1015,7 @@ class DecoderBlock(nn.Module):
             raise ValueError("a looped pass merges its message into a sublayer's input and leaves the one "
                              "residual stream as it is: no hyper-connections, AltUp or normed residual")
         eps = spec.norm_eps if spec.norm_eps is not None else self._stated_eps('cross-pass messages')
-        return {site: CrossPassMerge(spec, self.emb_features, eps, name=f'cross_pass_{site}')
+        return {site: CrossPassMerge(spec, self.emb_features, eps, name=f'{MERGE_PREFIX}{site}')
                 for site in (*self._mixer_sites(), *(('mlp',) if self.feedforward is not None else ()))}
 
     @nn.nowrap
@@ -1003,12 +1024,10 @@ class DecoderBlock(nn.Module):
         return self.self_attn.input_sites if isinstance(self.self_attn, InputSites) else ('mixer',)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
-        """The packed groups its mixer and its feed-forward declare (`ProjectionSites`): a mixer whose sites
-        read inputs of their own in a looped pass (`cross_pass`) packs none, its pass after the first
-        projecting each apart."""
-        sited = self.cross_pass is not None and len(self._mixer_sites()) > 1
-        return declared_groups(*(() if sited else (self.self_attn,)),
-                               *([self.mlp] if self.feedforward is not None else []))
+        """The packed groups its mixer and its feed-forward declare (`ProjectionSites`); a looped pass
+        whose sites read inputs of their own projects each through the packed group apart
+        (`ProjectionGroup.apart`)."""
+        return declared_groups(self.self_attn, *([self.mlp] if self.feedforward is not None else []))
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> CacheSpec:
@@ -1145,9 +1164,11 @@ class DecoderBlock(nn.Module):
                 if bank is not None:
                     # The feed-forward's site (and a parallel branch's, which reads it unnormed).
                     read = self.cross_pass_merges['mlp'](read, bank)
-                shared = normed if bank is None else self.input_layernorm(read)
-                mlp_input = (shared if self.wiring.shared_parallel_norm else
-                             self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
+                if self.wiring.shared_parallel_norm:
+                    # The attention's norm, of the feed-forward's own merged input where it has one.
+                    mlp_input = normed if bank is None else self._attention_input(read)
+                else:
+                    mlp_input = self.post_attention_layernorm(read) if self.wiring.pre_norms else read
                 if self.wiring.normed_residual:
                     state = state._replace(x=mlp_input)
             with projection_role("mlp"):  # The feed-forward's projections, as a recipe takes them by role.

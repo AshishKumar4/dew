@@ -38,9 +38,12 @@ from .precision import at_least_fp32, float32_einsum
 
 @dataclasses.dataclass(frozen=True)
 class AttentionResiduals:
-    """The block size the depth softmax groups layers by, `attn_res_block_size`."""
+    """The block size the depth softmax groups layers by, `attn_res_block_size`, and whether each depth
+    mixture sums its sources as its keys read them, each at unit RMS (`normalize_values`, Inkling 2
+    Mini's `attn_res_normalize_values`; Kimi K3's mix them as they are)."""
 
     block_size: int
+    normalize_values: bool = False
 
     def blocks(self, num_layers: int) -> int:
         """The finished blocks after `num_layers` layers: every layer opening one counts."""
@@ -48,7 +51,8 @@ class AttentionResiduals:
 
     def site(self, index: int) -> ResidualSite:
         """Layer `index`'s place in the blocks."""
-        return ResidualSite(finished=-(-index // self.block_size), opens=index % self.block_size == 0)
+        return ResidualSite(finished=-(-index // self.block_size), opens=index % self.block_size == 0,
+                            normalize_values=self.normalize_values)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,11 +61,13 @@ class ResidualSite:
 
     `finished` counts the blocks done before the layer runs, which its
     attention input mixes with the partial sum; `opens` makes the layer
-    close the partial it received into block `finished` and restart it.
+    close the partial it received into block `finished` and restart it;
+    `normalize_values` is its mixtures' (`AttentionResiduals.normalize_values`).
     """
 
     finished: int
     opens: bool
+    normalize_values: bool = False
 
 
 def sources(state, finished: int, partial):

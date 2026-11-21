@@ -10,12 +10,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..attention_residuals import DepthAttention
-from ..cross_pass import CrossPassMerge
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUpLayer
 from ..hyper_connections import stream_head
 from ..norms import NormSite
-from ..protocols import InputSites
 from .decoder_block import gate_flops
 from .layer_names import group_layers, layer_index
 
@@ -42,21 +40,16 @@ def trained_flops(decoder: CausalTransformer, lengths) -> float:
 
 
 def _message_flops(decoder: CausalTransformer, lengths, *, trained: bool) -> float:
-    """A loop's cross-pass merges' work (`Loop.messages`): each later pass's, one merge for each input site
-    of each layer of its block (its mixer's, `InputSites`, and its feed-forward's) over the bank's
-    blocks; the first pass reads no bank."""
+    """A loop's cross-pass messages' work (`Loop.messages`): each later pass's, each layer of its block
+    reading the bank of its blocks (`DecoderBlock.message_flops`); the first pass reads no bank."""
     loop = decoder.loop
     if loop is None or loop.messages is None:
         return 0.0
     first, end = loop.layers or (0, decoder.num_layers)
-    spec = loop.messages
-    merge = CrossPassMerge(spec, decoder.emb_features,
-                           decoder.norm_eps if spec.norm_eps is None else spec.norm_eps, parent=None)
+    banked = len(loop.messages.blocks(first, end))
     blocks = decoder.counted_blocks()
-    sites = sum((len(mixer.input_sites) if isinstance(mixer := decoder.mixer_of(index), InputSites) else 1)
-                + int(blocks[index].feedforward is not None) for index in range(first, end))
-    merged = merge.merge_flops(lengths, len(spec.blocks(first, end)), trained=trained)
-    return (loop.steps - 1) * sites * merged
+    return (loop.steps - 1) * sum(blocks[index].message_flops(lengths, banked, trained=trained)
+                                  for index in range(first, end))
 
 
 def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:

@@ -34,6 +34,19 @@ from .norms import unweighted_rmsnorm
 from .precision import at_least_fp32
 from .sharding import declared
 
+MERGE_PREFIX = "cross_pass_"
+"""The name of a block's merges, each `MERGE_PREFIX` and its site (`DecoderBlock.cross_pass`)."""
+
+MESSAGES_UNWRITTEN = ("the source's format holds no cross-pass messages, which this decoder has trained; a "
+                      "run's checkpoint or release keeps them")
+"""Why a decoder holding merges is written in no family's layout (`Pretrained.export`)."""
+
+
+def holds_merges(params) -> bool:
+    """Whether `params` holds a block's merges anywhere (`MERGE_PREFIX`)."""
+    paths = jax.tree_util.tree_flatten_with_path(params)[0]
+    return any(str(getattr(key, "key", "")).startswith(MERGE_PREFIX) for path, _ in paths for key in path)
+
 
 @dataclasses.dataclass(frozen=True)
 class CrossPass:

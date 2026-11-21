@@ -711,6 +711,20 @@ class Pretrained:
             dropped = sorted("/".join(path[1:]) for path in held - named)
             raise ValueError(f"this {type(model).__name__} reads none of the source's {dropped[:6]}: a "
                              "model in its place keeps every parameter it holds")
+        # A parameter drawn fresh beside the loaded weights (a loop's merges at one rank) is read again at
+        # the shape the new model declares, or refused: kept at another shape it would not apply.
+        def shapes(tree) -> dict[tuple, tuple[int, ...]]:
+            return {path: np.shape(getattr(leaf, "value", leaf))
+                    for path, leaf in flatten_dict(dict(tree.get("params", {}))).items()}
+
+        loaded, drawing = shapes(thaw(self.variables)), shapes(declared)
+        fresh = set(self.fresh)
+        reshaped = sorted("/".join(path) for path, shape in drawing.items()
+                          if path in loaded and "/".join(path) in fresh and loaded[path] != shape)
+        if reshaped:
+            raise ValueError(f"this {type(model).__name__} declares {reshaped[:6]}, drawn fresh beside the "
+                             "loaded weights, at shapes other than the source holds: draw it from the source "
+                             "without them")
         if not named - held:
             return replace(self, model=model)
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
@@ -804,6 +818,7 @@ class Pretrained:
         """
         from dew.batch import thaw
         from dew.nn.backbones.layer_names import stored_layers
+        from dew.nn.cross_pass import MESSAGES_UNWRITTEN, holds_merges
         from dew.nn.projections import unpacked
         from dew.nn.protocols import CrossAttending, Differential
 
@@ -817,6 +832,8 @@ class Pretrained:
         # A packed load's expert banks are written as the dense matrices they hold (`decoded_expert_banks`),
         # which the source's format encodes back.
         held = unboxed(decoded_expert_banks(self.variables if variables is None else variables))
+        if holds_merges(held):
+            raise ValueError(MESSAGES_UNWRITTEN)
         values = unpacked(self.model, stored_layers(self.model, held, banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)

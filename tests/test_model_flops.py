@@ -39,6 +39,7 @@ from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.jepa import FactorizedTokenStack, JepaEncoder, JepaPredictor, TokenStack
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
+from dew.nn.cross_pass import CrossPass
 from dew.nn.flops import (
     MissingFlopsCount,
     attention_flops,
@@ -788,16 +789,18 @@ GATED_NORM_SITES = (NormSite.EMBEDDING, NormSite.FINAL, NormSite.INPUT, NormSite
     {"loop": Loop(3, exit_gate=True)},
     {"loop": Loop(3, layers=(0, 2), exit_gate=True)},
     {"loop": Loop(3, exit_gate=True), "final_norm": False},
+    {"loop": Loop(3, step_norm=False, layers=(1, 2), messages=CrossPass(block_size=1, rank=2))},
 ], ids=["projected-lookup", "reinjecting-loop", "stepped-loop-unnormed-end", "gated-loop", "gated-loop-coda",
-        "gated-loop-unnormed-end"])
+        "gated-loop-unnormed-end", "messages"])
 def test_gated_norms_count_each_run_at_its_width(fields):
     """A norm gated by a low-rank map of its own output (`NormSpec.gate_rank`, A.X-K2's) counts its gate's
     two maps each time a call runs it, at its width: the embedding's at the lookup's where it norms the
     lookup before `project_in`, the final one's after the stack and before or between a loop's passes
     (seven runs of a reinjecting loop of three, two of a stepped one whose stack ends in no norm; under an
     exit gate each pass's exit read through it, which serves the step's norm where no coda runs between
-    them, and none where the stack ends in no norm), and a layer's before its sublayers: as many products
-    as the forward traces beside the ungated decoder's."""
+    them, and none where the stack ends in no norm), and a layer's before its sublayers, at each input site
+    of a later pass passing messages apart: as many products as the forward traces beside the ungated
+    decoder's."""
     lengths = np.array([4, 4], np.int64)
     operands = (jnp.ones((2, 4), jnp.int32),)
 
@@ -810,6 +813,28 @@ def test_gated_norms_count_each_run_at_its_width(fields):
     plain = counted_and_traced(decoder(**base))
     gated = counted_and_traced(decoder(**base, norms=dict.fromkeys(GATED_NORM_SITES, NormSpec(gate_rank=2))))
     assert gated[0] - plain[0] == gated[1] - plain[1] > 0
+
+
+@pytest.mark.parametrize("messages", [CrossPass(block_size=1, rank=2),
+                                      CrossPass(block_size=2, rank=3, additive=False)],
+                         ids=["a block a layer", "one block, gained alone"])
+def test_a_loop_passing_messages_counts_each_later_passs_merges(messages):
+    """A loop passing messages (`Loop.messages`) counts each later pass's merges beside the loop without
+    them, a merge at each of a layer's attention's input sites and its feed-forward's over the bank's
+    blocks: as many products as the forward traces beside the plain loop's (the first pass, which reads
+    no bank, merging none)."""
+    lengths = np.array([4, 4], np.int64)
+    operands = (jnp.ones((2, 4), jnp.int32),)
+
+    def counted_and_traced(model):
+        variables = model.init(jax.random.key(202), *operands)
+        return model.model_flops(lengths), forward_products(model.apply, variables, *operands)
+
+    base = {"causal": False, "attention_impl": "reference", "num_layers": 3}
+    plain = counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3))))
+    messaged = counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3),
+                                                            messages=messages)))
+    assert messaged[0] - plain[0] == messaged[1] - plain[1] > 0
 
 
 def test_a_norm_gated_on_the_routed_layers_counts_there_alone():

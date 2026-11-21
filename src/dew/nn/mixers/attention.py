@@ -755,19 +755,24 @@ class CausalSelfAttention(nn.Module):
                              "its provider's cache does not keep: the provider's kind reads them too")
         return stashed
 
-    def _projected_kv(self, x, whole: bool, projected=None):
+    def _projected_kv(self, x, whole: bool, projected=None,
+                      sites: Mapping[str, jax.Array] | None = None):
         """Project the keys and values, norm them, and split them into heads.
 
         `whole` norms the key projection before the head split, which is
         OLMo 3's scope. Otherwise the key norm runs per head, after it.
+        With `sites` (`MixerCall.site_inputs`) the keys project the 'k' site's input and the values the
+        'v' site's, where a looped pass merged its message into each apart.
         """
         batch, length, _ = x.shape
         if projected is None:
-            key = self.k_proj(x)
+            keys = x if sites is None else sites['k']
+            values = keys if sites is None else sites.get('v', keys)
+            key = self.k_proj(keys)
             # Gemma 4's global layers use the raw key projection as the
             # values before its norm (modeling_gemma4.py); MoVA's are routed experts'.
-            value = (key if self.ctx.k_eq_v else self.experts(x) if self.ctx.value_experts is not None
-                     else self.v_proj(x))
+            value = (key if self.ctx.k_eq_v else self.experts(values) if self.ctx.value_experts is not None
+                     else self.v_proj(values))
         else:
             key, value = projected
         if self.ctx.key_multiplier is not None:
@@ -996,7 +1001,7 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.kv_shared:
             key, value, positions, *held = self._shared_kv(kv_store, decode)
         else:
-            key, value = self._projected_kv(x, self._whole_norm, projected_kv)
+            key, value = self._projected_kv(x, self._whole_norm, projected_kv, call.site_inputs)
 
         kv_len = key.shape[-3]
         positions, append, prefix = self._step_positions(key, positions, segment_ids, attention_metadata,
@@ -1075,16 +1080,6 @@ class CausalSelfAttention(nn.Module):
             return ('q',)
         return ('q', 'k') if self.ctx.k_eq_v else ('q', 'k', 'v')
 
-    def _site_kv(self, sites: Mapping[str, jax.Array]):
-        """The keys and values projected from their own sites' inputs (`MixerCall.site_inputs`), each
-        projection reading its own."""
-        keys = sites['k']
-        values = sites.get('v', keys)
-        key = self.k_proj(keys)
-        value = (key if self.ctx.k_eq_v else self.experts(values) if self.ctx.value_experts is not None
-                 else self.v_proj(values))
-        return key, value
-
     def _query(self, x, keys: bool = True, sites: Mapping[str, jax.Array] | None = None):
         """The query heads of `x` `[B, S, E]`, `[B, S, heads, head_dim]`, normed as the layer norms
         them and column-parallel under a tensor axis (each shard a run of whole heads); the output gate
@@ -1094,7 +1089,7 @@ class CausalSelfAttention(nn.Module):
         them). The projections carry the names a remat policy saves or offloads
         (residuals.RESIDUALS). With `sites` (`MixerCall.site_inputs`) the keys and values read their own
         sites' inputs: a packed `qkv_proj` projects each input apart (`ProjectionGroup.apart`), and their
-        own projections read theirs (`_site_kv`)."""
+        own projections read theirs (`_projected_kv`)."""
         B, S, _ = x.shape
         projected_kv = None
         group = self._group()
@@ -1102,12 +1097,12 @@ class CausalSelfAttention(nn.Module):
             if sites is None:
                 projected, key, value = group.split(self.qkv_proj(x))
             else:
-                projected, key, value = group.apart(self.qkv_proj, (x, sites['k'], sites['v']))
+                # The query's input, then the keys' and values' sites in the group's member order.
+                projected, key, value = group.apart(self.qkv_proj, (x, *(sites[site] for site in ('k', 'v'))))
             projected_kv = (key, value)
         elif sites is not None:
+            # The keys and values project their own sites' inputs in `_projected_kv`.
             projected = self.q_proj(x)
-            if not self.ctx.kv_shared:
-                projected_kv = self._site_kv(sites)
         elif keys and group is not None and (
                 plan := side_by_side((self.q_proj, self.k_proj, self.v_proj), x)) is not None:
             projected, key, value = plan()

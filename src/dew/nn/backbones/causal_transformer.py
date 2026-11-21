@@ -822,6 +822,7 @@ class CausalTransformer(LinearProducts):
             self.hc_head = stream_head(hc, self.emb_features, self.norm_eps, name='hc_head')
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
+                                             normalize_values=self.attention_residuals.normalize_values,
                                              name='output_res')
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
@@ -1686,8 +1687,9 @@ class CausalTransformer(LinearProducts):
 
         A model with no loop gains one over `layers`, with no norm between its
         passes, so one pass computes the model as it was, and every count does
-        where it is implicit; None when it has no loop and the two do not both
-        say what to add."""
+        where it is implicit or passes messages; None when it has no loop and the
+        two do not both say what to add. Messages join only a loop of one pass
+        (refused otherwise), whose later passes they then define."""
         stated = {'backprop_steps': backprop_steps, 'remat': remat, 'implicit': implicit,
                   'exit_gate': exit_gate, 'exit_threshold': exit_threshold, 'exits': exits,
                   'theta_passes': theta_passes, 'messages': messages}
@@ -1696,8 +1698,15 @@ class CausalTransformer(LinearProducts):
             if steps is None or layers is None:
                 return None
             return self.clone(loop=Loop(steps, step_norm=False, layers=layers, **options))
+        if messages is not None and self.loop.messages is None and self.loop.steps > 1:
+            # Its later passes read the pass before's output; a loop passing messages reads the block's
+            # input, which would change what it computes at the merges' draw.
+            raise ValueError(f"this decoder already loops its block {self.loop.steps} times over the pass "
+                             "before's output, and a loop passing messages enters every pass at the block's "
+                             "input: add messages to a decoder that runs its block once")
         return self.clone(loop=dataclasses.replace(self.loop, steps=steps or self.loop.steps,
                                                    layers=layers or self.loop.layers, **options))
+
     @nn.nowrap
     def projected(self, params, *, updated: bool):
         """`ProjectsParameters`: before a training step's update, every AltUp layer's prediction

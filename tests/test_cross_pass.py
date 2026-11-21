@@ -37,17 +37,21 @@ MESSAGES = CrossPass(block_size=2, rank=4)
 
 def decoder(form: str, **loop) -> CausalTransformer:
     """A tiny decoder of four layers in `form`: attention alone ('attention'), a hybrid of gated delta nets
-    and attention ('hybrid'), or attention under Kimi K3's attention residuals in blocks of two ('depth');
-    its block [`first`, 4) looped as `loop` says where it says anything, passing `MESSAGES`."""
+    and attention ('hybrid'), attention under Kimi K3's attention residuals in blocks of two ('depth'), or
+    six attention layers scanned as one run (`scan_layers`, 'scanned'); its block [`first`, end) looped as
+    `loop` says where it says anything, passing `MESSAGES`."""
     fields = {"vocab_size": VOCAB, **TINY_DECODER, "num_layers": 4, "attention_impl": "reference",
               "tie_embeddings": False}
+    if form == "scanned":
+        fields |= {"num_layers": 6, "scan_layers": True}
     if form == "hybrid":
         fields |= {"layer_types": ("linear_attention", "full_attention") * 2, "kinds": DELTA_NETS}
     if form == "depth":
         fields |= {"attention_residuals": AttentionResiduals(block_size=2)}
     if loop:
-        loop = {"messages": MESSAGES, "step_norm": False, "layers": (2, 4) if form == "depth" else (1, 4),
-                **loop}
+        block = {"depth": (2, 4), "scanned": (1, 6)}.get(form, (1, 4))
+        messages = dataclasses.replace(MESSAGES, block_size=4) if form == "scanned" else MESSAGES
+        loop = {"messages": messages, "step_norm": False, "layers": block, **loop}
         fields["loop"] = Loop(**loop)
     return CausalTransformer(**fields)
 
@@ -80,15 +84,12 @@ def merged_by_hand(params, read, bank, spec: CrossPass, eps: float):
     """A merge's formula (the module doc of `dew.nn.cross_pass`) in float64, from its parameters."""
     wide = {name: jnp.asarray(value, jnp.float64) for name, value in params.items() if name != "depth"}
     read, bank = jnp.asarray(read, jnp.float64), jnp.asarray(bank, jnp.float64)
-
-    def rms(x):
-        return x / jnp.sqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
-
-    keys = rms(bank)
+    keys = bank * jax.lax.rsqrt(jnp.mean(bank * bank, axis=-1, keepdims=True) + eps)
     query = (jnp.asarray(params["depth"]["scale"], jnp.float64)
              * jnp.asarray(params["depth"]["kernel"], jnp.float64)[:, 0])
     weights = jax.nn.softmax(keys @ query, axis=-1)
-    message = rms(jnp.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank))
+    mixed = jnp.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank)
+    message = mixed * jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=-1, keepdims=True) + eps)
     sigma = jnp.sqrt(jnp.mean(read * read, axis=-1, keepdims=True) + eps)
     state = (read / sigma) @ wide["input_down"] + message @ wide["message_down"]
     sent = jnp.tanh(state @ wide["gain"]) * message
@@ -103,16 +104,18 @@ def merged_by_hand(params, read, bank, spec: CrossPass, eps: float):
                                                       normalize_values=False)],
                          ids=["additive", "gained alone", "unit scale, raw values"])
 def test_a_merge_is_its_formula(spec):
-    """A merge of a bank of three summaries into a sublayer input, its gates and its depth mixture's
-    kernel drawn off zero, computes its formula (`merged_by_hand` in float64; check 1), whether its
-    message adds a term of its own, joins at the input's RMS and mixes the summaries normed or raw."""
+    """A merge of a bank of three summaries into a sublayer input, every parameter drawn off its init,
+    computes its formula (`merged_by_hand` in float64; check 1), whether its message adds a term of its
+    own, joins at the input's RMS and mixes the summaries normed or raw."""
     merge = CrossPassMerge(spec, 16, 1e-6)
 
     def draw(seed):
         rng = np.random.default_rng([0xC405, seed])
         read = rng.normal(size=(2, 5, 16)).astype(np.float32)
         bank = rng.normal(size=(2, 5, 3, 16)).astype(np.float32)
-        params = gated(nn.unbox(merge.init(jax.random.key(seed), read, bank)), seed)
+        # Every parameter drawn off its init, its gates and its depth query among them.
+        params = jax.tree.map(lambda leaf: jnp.asarray(rng.normal(scale=0.3, size=leaf.shape), leaf.dtype),
+                              nn.unbox(merge.init(jax.random.key(seed), read, bank)))
         return params, read, bank
 
     def truth(params, read, bank):
@@ -203,8 +206,9 @@ def _without_merges(params):
 
 @pytest.mark.parametrize("case", [
     ("hybrid", {"steps": 2}), ("hybrid", {"steps": 4}), ("hybrid", {"steps": 3, "backprop_steps": 1}),
-    ("hybrid", {"steps": 3, "remat": True}), ("attention", {"steps": 3}), ("depth", {"steps": 3})],
-    ids=["two", "four", "the last trained", "recomputed", "attention", "depth residuals"])
+    ("hybrid", {"steps": 3, "remat": True}), ("attention", {"steps": 3}), ("depth", {"steps": 3}),
+    ("scanned", {"steps": 3})],
+    ids=["two", "four", "the last trained", "recomputed", "attention", "depth residuals", "scanned layers"])
 def test_a_loop_passing_messages_computes_its_passes_unrolled(case):
     """At gates drawn off zero, a loop passing messages computes its passes unrolled pass by pass from the
     stack's own spans (`_messages_by_hand`): its logits and every parameter's gradient, the prelude's and
@@ -250,6 +254,20 @@ def test_a_loop_passing_messages_decodes_as_it_prefills():
 
     assert_as_exact(decoded, passes(looped), draw, "decode", seeds=SEEDS["decode"],
                     truth_fn=passes(looped.clone(dtype=jnp.float64)))
+
+
+def test_a_shared_cache_prefills_as_a_cache_a_pass_does():
+    """A hybrid decoder passing messages over four passes, its gates drawn off zero, prefills with one
+    cache its passes share (`shared_cache`, each pass starting from the cache the step found) what it
+    prefills with a cache a pass, bit for bit: the bank crosses its scanned passes as it crosses them
+    apart."""
+    models = [decoder("hybrid", steps=4, shared_cache=shared) for shared in (True, False)]
+    variables, ids = gated_draw(models[0], salt=0xC407)(0)
+    prefilled = []
+    for model in models:
+        made, step = decode_steps(model)
+        prefilled.append(np.asarray(step(variables, made(variables, ids.shape[0]), ids)[0]))
+    np.testing.assert_array_equal(*prefilled)
 
 
 def test_a_packed_attention_projects_each_site_apart_as_its_own_projections_do():
@@ -304,14 +322,18 @@ def test_a_decoder_drawn_at_one_pass_holds_every_merge_a_later_pass_reads():
         2, step_norm=False, layers=(2, 4), messages=CrossPass(block_size=1))).init(
         jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
     lambda: dataclasses.replace(decoder("attention"), kv_shared_layers=(3,), loop=Loop(
-        2, step_norm=False, messages=MESSAGES)).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))],
+        2, step_norm=False, messages=MESSAGES)).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
+    lambda: decoder("attention", steps=2, messages=None).with_passes(3, messages=MESSAGES),
+    lambda: decoder("depth", steps=2, exit_gate=True).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))],
     ids=["a step norm", "implicit", "an empty block", "an empty message block", "depth blocks misaligned",
-         "a message block not the depth block", "shared keys"])
+         "a message block not the depth block", "shared keys", "messages joining a loop of passes",
+         "exits over depth residuals"])
 def test_a_loop_whose_messages_cannot_summarize_its_blocks_is_refused(refused):
     """A loop passing messages is refused where its passes would not each enter at the block's input (a
     step norm, the θ-method), where it banks nothing (an empty block or message block), where under
-    attention residuals a summary would not be a whole depth block's partial sum, and where a layer's
-    keys would cross a message block's end."""
+    attention residuals a summary would not be a whole depth block's partial sum or a pass would exit
+    through a depth state uncollapsed, where a layer's keys would cross a message block's end, and where
+    it would join a loop already of several passes, changing what it computes at the merges' draw."""
     with pytest.raises(ValueError):
         refused()
 
@@ -319,7 +341,8 @@ def test_a_loop_whose_messages_cannot_summarize_its_blocks_is_refused(refused):
 def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh():
     """A loaded decoder that gains a loop passing messages (`with_passes`, `Pretrained.with_model`) draws
     each merge fresh (`Pretrained.fresh`, the fresh group's alone) beside its loaded weights, which stay as
-    they were, and at the merges' draw computes what it computed (check 1 against it in float64)."""
+    they were, bit for bit, and at the merges' draw computes what the source computes (check 1 against it
+    in float64); it exports to the source's format no more, its merges the source's format cannot hold."""
     from test_decision_context import LLAMA
 
     from dew.interop import Pretrained
@@ -334,16 +357,22 @@ def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh
         (), looped.fresh).param_groups
     assert set(claimed[0].patterns) == set(looped.fresh)
 
+    kept = _without_merges(looped.variables["params"])
+    loaded = jax.tree_util.tree_leaves_with_path(source.variables["params"])
+    for (path, held), (_, was) in zip(jax.tree_util.tree_leaves_with_path(kept), loaded, strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(was), err_msg=jax.tree_util.keystr(path))
+
     def draw(seed):
         ids = jax.random.randint(jax.random.key(seed), (2, 8), 0, source.model.vocab_size)
         return looped.variables, ids
 
     def plain(dtype):
-        return jax.jit(lambda variables, ids: source.model.clone(dtype=dtype).apply(
-            {"params": _without_merges(variables["params"])}, ids))
+        return jax.jit(lambda _, ids: source.model.clone(dtype=dtype).apply(source.variables, ids))
 
     assert_as_exact(jax.jit(looped.model.apply), plain(jnp.float32), draw, "a loaded decoder retrofitted",
                     seeds=SEEDS["retrofitted"], truth_fn=plain(jnp.float64))
+    with pytest.raises(ValueError):
+        looped.export()
 
 
 def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies():
