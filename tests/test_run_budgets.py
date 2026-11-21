@@ -17,6 +17,7 @@ from data_support import Fanned, Questioned, Twice, jittered
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from test_barren_reads import Untouched
+from test_trainer import Targeted
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
@@ -1857,17 +1858,10 @@ def test_a_memory_read_packing_after_a_draw_declares_the_windows_its_shortest_re
     assert max(int(coordinates.segments.max()) for coordinates in laid) <= 2
 
 
-class TokenTargeted(Objective):
-    """A scalar `p` at 0 and the squared error of each row's `target`, the mean over its rows, each row one
-    valid target token."""
+class TokenTargeted(Targeted):
+    """`Targeted`, each row one valid target token."""
 
     counts_tokens = True
-
-    def fresh_variables(self, key, held):
-        return {"params": {"p": jnp.zeros(())}}
-
-    def loss(self, variables, batch, step):
-        return jnp.square(batch["target"] - variables["params"]["p"]).mean(), Aux({})
 
     def scored_tokens(self, batch):
         return jnp.ones(jnp.shape(batch["target"]), jnp.int32)

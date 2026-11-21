@@ -420,7 +420,7 @@ def test_a_cut_takes_the_longest_state_a_merge_lets_fit():
     assert tight.fits(row) and row.state_kept >= 1
 
 
-class Merging(ByteTokenizer):
+class MergingAcrossCuts(ByteTokenizer):
     """The byte vocabulary, but for "xyz", which encoding takes as one token (id 2): a row encoded whole
     can merge a state's last bytes with the text after it."""
 
@@ -451,7 +451,7 @@ def test_a_state_cut_in_a_row_encoded_whole_takes_a_longer_cut_whose_row_encodes
     def row(state: str, max_len: int):
         layout = SegmentLayout.state_first_row(max_len=max_len, labels=release().labels, unit="whole",
                                                segments=(Text("S:"), State(), Text("z\n"), *question))
-        [laid] = layout.rows(Merging(), SPECIALS, state, {"team": TEAM})
+        [laid] = layout.rows(MergingAcrossCuts(), SPECIALS, state, {"team": TEAM})
         return laid
 
     # The row of the cut "aaxy" kept whole, its "xyz" one token: the room the cut state is given.
