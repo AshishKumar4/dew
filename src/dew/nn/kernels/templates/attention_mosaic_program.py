@@ -1928,11 +1928,6 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
             step.append((block_k, value_width * family.rhs_copies, dtype))
     masks = _mask_places(family, block_q, block_k)
     step += masks
-    if not family.operands_in_registers and value_width > 128:
-        # Wide (>128) Wgmma accumulators hold extra descriptor/live-range pressure (236+ regs on cuda12
-        # ptxas at width 256, spilling 16-32 bytes at consumers=2's 232-reg cap; consumers=1's 255 fits
-        # spill-free at columns=None on both cuda12 and cuda13, row 5272).
-        step.append((block_q, 64, jnp.float32))
     # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
