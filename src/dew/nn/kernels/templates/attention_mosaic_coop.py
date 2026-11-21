@@ -100,9 +100,11 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     family.staged(narrowed, weights_ref.at[:, own])
     family.staged(part, cotangents_ref.at[:, own])
     exchange.publish()
+    dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size))
     dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
     dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
-    add_dq(q_first, family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size)))
+    add_dq(q_first, dq)
+    family.settled(0)
     exchange.release()
     return carry, (dk_acc, dv_acc)
 

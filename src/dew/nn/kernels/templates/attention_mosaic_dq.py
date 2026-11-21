@@ -137,8 +137,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     shape = (tiles.block_q, tiles.block_k)
     k_slot = slots["keys"]
     k_first = (index if tile is None else tile(index)) * tiles.block_k
-    s = family.product(q, k_slot.transpose((1, 0)), shape)
-    dp = family.product(do, slots["values"].transpose((1, 0)), shape)
+    s, dp = family.product_pair(q, k_slot.transpose((1, 0)), do, slots["values"].transpose((1, 0)), shape)
     slots.release("values")
     params = params_of(s, k_first=k_first, slots=slots)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
