@@ -29,7 +29,6 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.algebra import error
 from dew.nn import derivatives
 from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import (
@@ -111,11 +110,14 @@ def _upstream(dtype, ieee: bool) -> jax.lax.DotAlgorithmPreset:
             jnp.dtype(jnp.float16): jax.lax.DotAlgorithmPreset.F16_F16_F32}[dtype]
 
 
-@functools.cache
 def _precision(rows: int, depth: int, columns: int, dtype, ieee: bool) -> jax.lax.DotAlgorithmPreset:
     """The algorithm a port's `[rows, depth] @ [depth, columns]` product of `dtype` operands runs in: of
-    those Triton runs as named (`TRITON_ALGORITHMS`), the cheapest on the target at least as exact as
-    fla's own (`_upstream`; `dew.algebra.error.at_least`, `product_precision`, row 5473)."""
+    those Triton runs as named (`TRITON_ALGORITHMS`), the cheapest on the target it traces for at least as
+    exact as fla's own (`_upstream`; `dew.algebra.error.at_least`, `product_precision`, row 5473), chosen
+    as each product traces, so a process tracing for two GPUs takes each one's. The algebra is read here,
+    not as the port loads."""
+    from dew.algebra import error
+
     admits = error.at_least(_upstream(dtype, ieee), dtype)
     return error.product_precision(rows, depth, columns, dtype, admits=admits, stated=TRITON_ALGORITHMS)
 
@@ -874,8 +876,9 @@ def _summed_back(index, pairs, after, *, exact: bool):
 
 def _exactly(x, mask, exact: bool):
     """`x @ mask` fp32 for a mask of zeros and ones, each product exact: at least IEEE fp32's (`_dot`'s
-    `ieee`: bf16x6's three parts of an fp32 value its 24 bits, where one IEEE product compiles to FMA loops
-    on sm80, at the target's cost); interpreted, as `_dot` sums an fp32 contraction."""
+    `ieee`), whatever is cheapest on the target (by the cost model three bf16 parts' six products on sm80
+    and sm90, where one IEEE product compiles to FMA loops); interpreted, as `_dot` sums an fp32
+    contraction."""
     x = x.astype(jnp.float32)
     return _dot(x, mask, exact=True) if exact else _dot(x, mask, exact=False, ieee=True)
 
