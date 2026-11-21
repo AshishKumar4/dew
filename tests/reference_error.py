@@ -75,7 +75,15 @@ import arm_arithmetic
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED, Truth, rounds_nothing, summed_as_run, unrewritten, widened
+from arm_arithmetic import (
+    FORMATTED,
+    Truth,
+    drawn_on_the_host,
+    rounds_nothing,
+    summed_as_run,
+    unrewritten,
+    widened,
+)
 from arm_forms import (
     HELD,
     _arms,
@@ -100,7 +108,6 @@ from arm_forms import (
     as_recorded as as_recorded,
     dew_path as dew_path,
     dew_programs as dew_programs,
-    drawn_on_the_host,
     holding,
     over_windows as over_windows,
     refuse_rounded,

@@ -636,13 +636,3 @@ def _holds_program(fn) -> bool:
     while isinstance(fn, (_RunToRun, _Windowed)):
         fn = fn.fn
     return not (_given(fn) or getattr(fn, "dew_programs", False))
-
-
-def drawn_on_the_host(inputs_of: Callable, seed: int):
-    """`inputs_of(seed)` drawn on the host's CPU, as a recording's inputs were, whatever device the test runs
-    on: jax.random's draws are the same bits on every device but its normal's float transform is not (a
-    recorded site's seed drawn on an H100 had another digest than on the CPU, the recording's, in 157 of the
-    recurrence GPU flow's cells, draw-digest at 996fa29f1), so a draw on the test's device would not be the
-    recorded inputs. The arrays then go to the device where the run reads them."""
-    with jax.default_device(jax.devices("cpu")[0]):
-        return inputs_of(seed)

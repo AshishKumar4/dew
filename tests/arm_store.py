@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 
 import jax
 import numpy as np
-from arm_arithmetic import as_written, products_held, summed_as_run, unrewritten, widened
+from arm_arithmetic import as_written, drawn_on_the_host, products_held, summed_as_run, unrewritten, widened
 from arm_forms import (
     _compile_for,
     _declared,
@@ -24,7 +24,6 @@ from arm_forms import (
     _Windowed,
     _written_references,
     _written_role,
-    drawn_on_the_host,
 )
 from check1_wire import QUALIFY
 from float64_terms import POWER, evaluated, evaluated_on, static, traced

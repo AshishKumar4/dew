@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_arithmetic import drawn_on_the_host
 from interop_support import gemma_features
 from reference_error import ahead_arm, as_given, assert_as_exact
 from safetensors.numpy import load_file
@@ -52,13 +53,9 @@ def _audio(kind):
 
 
 def audio_on_host(kind):
-    """`_audio(kind)` built on the host's CPU, its variables NumPy's: a GPU tier part's prepare computes
-    nothing on its GPU, where loading the weights there went unprepared (row 8074), and a program closing
-    over them states them by their values alone, the prepare's and its run's alike."""
-    with jax.default_device(jax.devices("cpu")[0]):
-        path, config, variables, model, projector, projector_variables = _audio(kind)
-        return (path, config, jax.tree.map(np.asarray, variables), model, projector,
-                jax.tree.map(np.asarray, projector_variables))
+    """`_audio(kind)` built on the host's CPU (`drawn_on_the_host`): a GPU tier part's prepare computes
+    nothing on its GPU, where loading the weights there went unprepared (row 8074)."""
+    return drawn_on_the_host(_audio, kind)
 
 
 @pytest.fixture(params=("gemma3n", "gemma4"), scope="module")
