@@ -117,18 +117,18 @@
 "tests/test_attention_blackwell.py::test_the_blackwell_forward_keeps_finite_a_logit_its_scale_keeps_finite_interpreted"
 ],
 "tests/test_attention_decode_template.py": [
-"tests/test_attention_decode_template.py::test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_interpreted[near-bf16s-largest-paged]",
-"tests/test_attention_decode_template.py::test_a_decode_step_is_on_par_at_head_widths_interpreted[sm80-32]",
-"tests/test_attention_decode_template.py::test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted[sm90-16-float8_e4m3fn]",
-"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm80-bfloat16-mha-sinks]",
-"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm90-bfloat16-mha-sinks]",
-"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm90-float16-one-query-softcap]",
-"tests/test_attention_decode_template.py::test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk_interpreted[sinks]",
-"tests/test_attention_decode_template.py::test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_softmax_interpreted[4096-plain]",
-"tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[one-query-sm80-16]",
-"tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[one-query-sm90-1]",
+"tests/test_attention_decode_template.py::test_a_decode_step_launches_only_kernels_its_certification_held",
+"tests/test_attention_decode_template.py::test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted[sm90-dense-float8_e4m3fn]",
+"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm90-bfloat16-verify-four-plain]",
+"tests/test_attention_decode_template.py::test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_steps",
+"tests/test_attention_decode_template.py::test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100[1]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[verify-four-sm90-1]",
-"tests/test_attention_decode_template.py::test_a_verify_blocks_drafts_read_their_prefix_causally_interpreted[8]"
+"tests/test_attention_decode_template.py::test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted[pages]",
+"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm100-256]",
+"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm120-256]",
+"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm80-256]",
+"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm90-128]",
+"tests/test_attention_decode_template.py::test_every_output_a_decode_steps_launches_declare_is_written_interpreted[one-query-no-rewalk]"
 ],
 "tests/test_attention_derived.py": [
 "tests/test_attention_derived.py::test_the_derived_backward_is_on_par_in_every_cell[full-keys-first-normalized-weights]"
@@ -473,9 +473,6 @@
 "tests/test_attention_route.py::test_a_value_given_as_its_keys_leading_columns_reaches_the_mosaic_forward_on_an_h100",
 "tests/test_attention_route.py::test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expert_mesh",
 "tests/test_attention_route.py::test_the_accurate_form_is_one_option_away"
-],
-"tests/test_attention_splash.py": [
-"tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[sinks-window]"
 ],
 "tests/test_attention_stability.py": [
 "tests/test_attention_stability.py::test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form[a share in bf16's subnormal band, the denominator's rest in a later tile-normalized first]",
@@ -1657,6 +1654,9 @@
 "tests/test_imports.py::test_a_module_imports_its_own_domain_alone[dew.inputs.encoders]",
 "tests/test_imports.py::test_importing_the_data_layer_reads_no_configuration_and_its_workers_run[DEW_CONFIG_DIR]"
 ],
+"tests/test_in_backward.py": [
+"tests/test_in_backward.py::test_a_scanned_step_holds_no_more_than_a_layer_at_a_time[sm90-bfloat16-512]"
+],
 "tests/test_in_context_generation.py": [
 "tests/test_in_context_generation.py::test_a_decode_reads_the_logits_its_training_forward_gives[an adapter]"
 ],
@@ -1909,8 +1909,8 @@
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
 ],
-"tests/test_level_stacking.py": [
-"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
+"tests/test_lfm3.py": [
+"tests/test_lfm3.py::test_plain_and_looped_lfm3_train_through_a_decision_run[looped]"
 ],
 "tests/test_linear_attention.py": [
 "tests/test_linear_attention.py::test_a_cached_layer_traced_for_a_jvp_decodes_its_token[plain]",
@@ -2088,14 +2088,14 @@
 "tests/test_memory_composition.py::test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges[titans]"
 ],
 "tests/test_merged.py": [
-"tests/test_merged.py::test_a_long_splits_merge_compiles_as_one_launch[sm90-256]",
 "tests/test_merged.py::test_a_padded_merge_and_its_derivatives_are_on_par[fold-op by op]",
 "tests/test_merged.py::test_a_padded_merge_and_its_derivatives_are_on_par[natural-jitted]",
 "tests/test_merged.py::test_a_padded_merge_and_its_derivatives_are_on_par[natural-op by op]",
 "tests/test_merged.py::test_a_padded_merge_batched_is_each_batchs_own",
-"tests/test_merged.py::test_a_padded_merge_lowers_and_compiles_as_one_launch_at_any_value_width[sm100-80]",
+"tests/test_merged.py::test_a_padded_merge_compiles_as_one_launch[sm100]",
+"tests/test_merged.py::test_a_padded_merge_compiles_as_one_launch[sm90]",
 "tests/test_merged.py::test_a_padded_merge_of_states_varying_alone_carries_their_axes",
-"tests/test_merged.py::test_a_padded_merge_on_two_devices_is_each_rows_own"
+"tests/test_merged.py::test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span"
 ],
 "tests/test_mesh_axes.py": [
 "tests/test_mesh_axes.py::test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp[fsdp2_sequence2]",
@@ -2861,10 +2861,10 @@
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-tiny-saved]"
 ],
 "tests/test_ring_protocol.py": [
-"tests/test_ring_protocol.py::test_a_gathered_walk_over_the_load_warps_holds_every_property_in_every_interleaving[stages2-tiles1-0-2]",
 "tests/test_ring_protocol.py::test_a_gathered_walk_over_the_load_warps_holds_every_property_in_every_interleaving[stages2-tiles3]",
-"tests/test_ring_protocol.py::test_a_load_warp_reading_entries_no_fill_wrote_is_caught",
-"tests/test_ring_protocol.py::test_the_ring_familys_walk_holds_every_property_in_every_interleaving[stages1-consumers2-tiles(3,)-inflight0-stepped]"
+"tests/test_ring_protocol.py::test_a_load_warp_reading_its_entries_before_their_fills_land_is_caught[no-wait]",
+"tests/test_ring_protocol.py::test_a_load_warp_reading_its_entries_before_their_fills_land_is_caught[one-in-flight]",
+"tests/test_ring_protocol.py::test_the_ring_familys_walk_holds_every_property_in_every_interleaving[stages2-consumers3-tiles(1, 4)-inflight1-stepped]"
 ],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
@@ -3034,47 +3034,47 @@
 "tests/test_scenario_learning.py::test_a_released_decoder_learns_its_language[a mixture of experts]"
 ],
 "tests/test_scenario_runs.py": [
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Dense language-model pretraining-precision=32-true,rows=padded,memory=None,devices=2,read=memory]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Dense language-model pretraining-precision=32-true,rows=padded,memory=None,devices=1,read=memory]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Dense language-model pretraining-precision=32-true,rows=padded,memory=full,devices=1,read=streamed]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Dense language-model pretraining-precision=bf16-mixed,rows=padded,memory=None,devices=1,read=indexed]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion language models-precision=32-true,rows=packed,devices=2]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion language models-precision=bf16-mixed,rows=packed,devices=1]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion training-precision=32-true,quantization=None,memory=False,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion language models-objective=block,precision=32-true,rows=windows,devices=2]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion language models-objective=block,precision=bf16-mixed,rows=windows,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion language models-objective=masked,precision=32-true,rows=padded,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion language models-objective=masked,precision=bf16-mixed,rows=padded,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion training-precision=32-true,quantization=None,memory=full,devices=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion training-precision=32-true,quantization=qat,memory=False,devices=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion training-precision=32-true,quantization=qat,memory=full,devices=2]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion training-precision=bf16-mixed,quantization=None,memory=False,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Diffusion training-precision=bf16-mixed,quantization=qat,memory=full,devices=1]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Distributed training-model=dense,mesh=expert,precision=bf16-mixed]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Distributed training-model=dense,mesh=fsdp,precision=32-true]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Distributed training-model=moe,mesh=fsdp,precision=bf16-mixed]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=gated_delta_net,precision=32-true,rows=padded,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Generation and serving-serving=paged,precision=bf16-mixed,quantization=None,prompts=3]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Generation and serving-serving=speculative,precision=bf16-mixed,quantization=fp8,prompts=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=gated_delta_net,precision=bf16-mixed,rows=packed,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=kimi_delta_attention,precision=32-true,rows=padded,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=kimi_delta_attention,precision=bf16-mixed,rows=packed,devices=1]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=lightning_attention,precision=32-true,rows=packed,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=lightning_attention,precision=bf16-mixed,rows=padded,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=mamba,precision=32-true,rows=padded,devices=1]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=mamba,precision=bf16-mixed,rows=packed,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=mamba2,precision=32-true,rows=padded,devices=1]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=mamba2,precision=bf16-mixed,rows=packed,devices=2]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=mamba3,precision=32-true,rows=padded,devices=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=mamba3,precision=bf16-mixed,rows=packed,devices=2]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=memory,precision=32-true,rows=padded,devices=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=memory,precision=bf16-mixed,rows=packed,devices=2]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=short_conv,precision=32-true,rows=padded,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=short_conv,precision=bf16-mixed,rows=packed,devices=2]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Online post-training-method=flow_grpo,precision=bf16-mixed,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Online post-training-method=grpo,precision=32-true,devices=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Online post-training-method=grpo,precision=bf16-mixed,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Online post-training-method=rloo,precision=32-true,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Online post-training-method=rloo,precision=bf16-mixed,devices=1]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=32-true,adapter=full,quantization=None,devices=1]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=32-true,adapter=lora,quantization=ptq,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=32-true,adapter=full,quantization=None,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=32-true,adapter=lora,quantization=qat,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=bf16-mixed,adapter=full,quantization=ptq,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=bf16-mixed,adapter=full,quantization=qat,devices=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=bf16-mixed,adapter=lora,quantization=None,devices=1]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Published diffusion pipelines-family=safety,dtype=float32]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Published diffusion pipelines-family=wan,dtype=float32]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Quantized interchange-format=Q4_0,use=serve]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Published diffusion pipelines-family=sd,dtype=bfloat16]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Published diffusion pipelines-family=xl,dtype=float32]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Quantized interchange-format=Q4_0,use=train]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Quantized interchange-format=Q8_0,use=serve]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Quantized interchange-format=Q8_0,use=train]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Quantized interchange-format=modelopt/tiny,use=train]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Representation learning-precision=32-true,devices=1,read=memory]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Representation learning-precision=32-true,devices=1,read=streamed]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Representation learning-precision=32-true,devices=2,read=indexed]",
@@ -3083,7 +3083,7 @@
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Representation learning-precision=bf16-mixed,devices=2,read=streamed]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[dense-padded]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[dense-split]",
-"tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[distributed-padded]",
+"tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[distributed-packed]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[distributed-split]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-gated_delta_net-packed]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-gated_delta_net-padded]",
@@ -3100,27 +3100,27 @@
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-mamba3-padded]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-memory-packed]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-memory-padded]",
-"tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-short_conv-packed]",
+"tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-short_conv-padded]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[pretrained-packed]",
 "tests/test_scenario_runs.py::test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[pretrained-split]",
 "tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Dense language-model pretraining]",
-"tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Diffusion language models]",
+"tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Diffusion language models-objective=block]",
+"tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Diffusion language models-objective=masked]",
 "tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Diffusion training]",
 "tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Distributed training]",
 "tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Hybrid and state-space models]",
-"tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Online post-training]",
+"tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Online post-training-method=flow_grpo]",
+"tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Online post-training-method=grpo]",
+"tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Online post-training-method=rloo]",
 "tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Pretrained fine-tuning]",
 "tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Quantized interchange]",
 "tests/test_scenario_runs.py::test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs[Representation learning]",
-"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Dense language-model pretraining]",
-"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Diffusion language models]",
-"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Diffusion training]",
-"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Distributed training]",
-"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Generation and serving]",
-"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Hybrid and state-space models]",
-"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Pretrained fine-tuning]",
+"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Generation and serving-serving=batch]",
+"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Generation and serving-serving=paged]",
+"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Generation and serving-serving=speculative]",
 "tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Published diffusion pipelines]",
-"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Quantized interchange]"
+"tests/test_scenario_runs.py::test_a_scenarios_sampling_reruns_from_its_compiled_programs[Quantized interchange]",
+"tests/test_scenario_runs.py::test_the_recurrent_kinds_are_those_an_initialized_decoder_states"
 ],
 "tests/test_sd3_source.py": [
 "tests/test_sd3_source.py::test_native_flow_schedule_matches_the_source_grids_and_trajectory[flow.dynamic]",
@@ -3341,9 +3341,11 @@
 "tests/test_text_rollout_contract.py::test_right_padding_and_logical_positions_survive_cached_generation[attention]"
 ],
 "tests/test_tier2_parts.py": [
+"tests/test_tier2_parts.py::test_a_backward_its_forward_does_not_show_is_not_assembled[0]",
 "tests/test_tier2_parts.py::test_a_biased_ernie_moe_is_left_to_tier_3",
 "tests/test_tier2_parts.py::test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does",
 "tests/test_tier2_parts.py::test_a_built_in_type_loads_as_it_does_whether_remote_code_is_trusted",
+"tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[apertus]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[axk2-ungrouped]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[axk2]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[ernie4_5_moe]",
@@ -3351,6 +3353,7 @@
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[falcon_h1-norm-first]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[falcon_h1]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[glm4]",
+"tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[glm4_moe_lite]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[granite]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[hunyuan_v1_moe]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[hy_v3]",
@@ -3358,27 +3361,20 @@
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[laguna-per-channel]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[laguna]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[lfm2]",
+"tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[lfm2_moe]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[olmo2]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[olmoe]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[smollm3]",
+"tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[stablelm-parallel]",
 "tests/test_tier2_parts.py::test_a_built_in_type_of_known_parts_loads_natively[stablelm]",
 "tests/test_tier2_parts.py::test_a_conversion_that_renames_by_another_keys_presence_reads_the_checkpoints_inventory[False]",
 "tests/test_tier2_parts.py::test_a_conversion_that_renames_by_another_keys_presence_reads_the_checkpoints_inventory[True]",
-"tests/test_tier2_parts.py::test_a_learned_activation_and_a_fused_projection_save_as_stored[apertus]",
-"tests/test_tier2_parts.py::test_a_learned_activation_and_a_fused_projection_save_as_stored[falcon_h1-norm-first]",
-"tests/test_tier2_parts.py::test_a_learned_activation_and_a_fused_projection_save_as_stored[glm4]",
-"tests/test_tier2_parts.py::test_a_learned_activation_and_a_fused_projection_save_as_stored[jamba]",
-"tests/test_tier2_parts.py::test_a_learned_activation_and_a_fused_projection_save_as_stored[laguna]",
+"tests/test_tier2_parts.py::test_a_decoder_norming_its_rotated_heads_decodes_through_its_cache_as_transformers_generates",
+"tests/test_tier2_parts.py::test_a_helper_whose_default_differs_is_not_the_known_one",
 "tests/test_tier2_parts.py::test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads[latent]",
+"tests/test_tier2_parts.py::test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads[mixed]",
 "tests/test_tier2_parts.py::test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads[renamed-moe]",
-"tests/test_tier2_parts.py::test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads[latent]",
-"tests/test_tier2_parts.py::test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads[mixed]",
-"tests/test_tier2_parts.py::test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads[renamed-moe]",
-"tests/test_tier2_parts.py::test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads[renamed]",
-"tests/test_tier2_parts.py::test_a_model_of_known_parts_loads_natively_from_its_own_code[latent]",
-"tests/test_tier2_parts.py::test_a_model_of_known_parts_loads_natively_from_its_own_code[mixed]",
-"tests/test_tier2_parts.py::test_a_model_of_known_parts_loads_natively_from_its_own_code[renamed-moe]",
-"tests/test_tier2_parts.py::test_a_model_of_known_parts_loads_natively_from_its_own_code[renamed]",
+"tests/test_tier2_parts.py::test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads[renamed]",
 "tests/test_tier2_parts.py::test_a_part_whose_code_differs_is_not_assembled",
 "tests/test_tier2_parts.py::test_a_probe_builds_no_meta_model_twice",
 "tests/test_tier2_parts.py::test_a_released_config_of_a_new_hybrid_verifies_from_parts[axk2]",
@@ -3386,12 +3382,16 @@
 "tests/test_tier2_parts.py::test_a_released_config_of_a_new_hybrid_verifies_from_parts[jamba]",
 "tests/test_tier2_parts.py::test_a_released_config_of_a_new_hybrid_verifies_from_parts[laguna]",
 "tests/test_tier2_parts.py::test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_trunk",
+"tests/test_tier2_parts.py::test_a_remote_causal_lm_over_a_built_in_config_is_its_own",
 "tests/test_tier2_parts.py::test_a_remote_constructor_returning_transformers_classes_is_probed_at_its_depth",
 "tests/test_tier2_parts.py::test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code",
+"tests/test_tier2_parts.py::test_a_stored_name_reads_as_the_sources_load_reads_it",
 "tests/test_tier2_parts.py::test_a_verification_of_remote_code_is_recorded_under_its_commit",
 "tests/test_tier2_parts.py::test_an_embedding_dews_lookup_does_not_compute_is_refused_at_load",
 "tests/test_tier2_parts.py::test_each_code_folder_at_one_commit_is_verified_on_its_own",
-"tests/test_tier2_parts.py::test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_expert"
+"tests/test_tier2_parts.py::test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_expert",
+"tests/test_tier2_parts.py::test_one_load_of_local_remote_code_probes_it_once[alone]",
+"tests/test_tier2_parts.py::test_one_load_of_local_remote_code_probes_it_once[release]"
 ],
 "tests/test_tools.py": [
 "tests/test_tools.py::test_layout_parity_anchors_a_model_on_the_references_own_sample[dense_sft]",
