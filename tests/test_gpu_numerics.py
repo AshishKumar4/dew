@@ -51,6 +51,11 @@ OWN = "the GPU's own arithmetic, facts or placement, which a CPU does not have"
 
 PALLAS = "needs a GPU the Pallas kernels compile for"
 
+ON_THE_HOST = "its programs placed on the host's CPU, whose kernels a prepare would choose as on its GPU"
+"""Why a cell placed on a GPU host's CPU compiles at its run (`Cell.at_run`): a bitwise check, no check-1
+site, its programs the CPU's, which a GPU tier part's prepare, choosing every kernel as on its node's GPU
+(`truths_ahead.prepared`), lowered as Triton kernels on the CPU, where they raised (row 10764)."""
+
 
 def _flow_scaling():
     """`test_flow_grpo`'s flow-scaling cell, its module imported only where the cell runs (row 8971)."""
@@ -147,7 +152,7 @@ def projection_cells() -> list[Cell]:
     return [Cell(f"a projection on a GPU host's CPU runs without the Triton kernels: {implementation}",
                  when(triton_runs(), PALLAS, functools.partial(
                      moe_precision.a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels,
-                     implementation)), fault=OWN)
+                     implementation)), fault=OWN, at_run=ON_THE_HOST)
             for implementation in ("auto", "pallas")]
 
 
@@ -182,5 +187,5 @@ def seams_cells(without_deterministic_ops) -> list[Cell]:
     """The norm seams on a GPU host's CPU, each implementation a cell."""
     return [Cell(f"a GPU host's CPU runs the seams its placement chooses: {implementation}",
                  functools.partial(norm_swiglu_tests.a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses,
-                                   without_deterministic_ops, implementation))
+                                   without_deterministic_ops, implementation), at_run=ON_THE_HOST)
             for implementation in ("auto", "pallas")]
