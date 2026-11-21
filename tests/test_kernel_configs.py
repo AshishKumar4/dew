@@ -926,10 +926,17 @@ def _contract_cases(generation_name: str, form: str | None = None) -> list:
     is that bundle's, compiled at the gate's picks."""
     found: dict = {}
     contract = _family_forms(generation_name)
+    target_forms = ({form} & contract) if form is not None else contract
     for shape in GEMM_SHAPES:
         for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True, form=form):
             if case.form in contract:
                 found.setdefault((case.form, case.consumers), case)
+        if target_forms.issubset({key[0] for key in found}):
+            by_form = {name: pricing.family_of(case.tile, jnp.bfloat16) for (name, _), case in found.items()}
+            if all(all((name, count) in found
+                       for count in {1, min(by_form[name].consumers, mosaic_gpu.CONSUMERS)})
+                   for name in target_forms):
+                break
     return list(found.values())
 
 
@@ -1492,7 +1499,8 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     spilling fails."""
     from kernel_compile import inherited, mosaic_failures, reports
 
-    within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
+    within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0,
+              "cap": 168}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
@@ -1517,7 +1525,8 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
     assert set(c["unread"]) == {"shared bytes", "tensor memory columns", "binary", "registers", "spills"}
-    assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
+    # Each at the cap its compile states (`compile_mosaic_kernels`'), which these records skip.
+    assert len(mosaic_failures([{**record, "kernels": [{**each, "cap": 255} for each in (a, b, c)]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):
         reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=512)])

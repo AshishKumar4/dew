@@ -1472,13 +1472,11 @@ def routes(*, alone: bool = False) -> Iterator[list[Route]]:
 
 
 def reported(found: Sequence[Route]) -> None:
-    """Report `found`, routes a trace's dispatches reported, to every open `routes` block, as each of its
-    dispatches did (`route`): a trace held and reused (`dew.algebra.fusion`'s regions) reports the routes it
-    took where its program is written."""
-    from dew import _cache
-
-    for collected in _cache.KERNEL_ROUTES.value:
-        collected.found.extend(found)
+    """Report `found`, routes a trace's dispatches reported, again, each as its dispatch did (`published`): a
+    trace held and reused (`dew.algebra.fusion`'s regions, a decision cached by its key) reports the routes it
+    took where its program is written (train 1095's review F1: a second appender beside `published`)."""
+    for each in found:
+        published(each)
 
 
 def _site() -> str:

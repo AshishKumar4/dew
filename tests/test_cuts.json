@@ -21,10 +21,6 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
-"tests/test_algebra_laws.py": [
-"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[False-True-True]",
-"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-True-False]"
-],
 "tests/test_algebra_scaled.py": [
 "tests/test_algebra_scaled.py::test_a_merge_under_shard_map_and_under_a_sharded_jit_is_each_shards_own",
 "tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-a zero mass]",
@@ -142,8 +138,8 @@
 "tests/test_attention_derived.py::test_the_derived_backward_is_on_par_in_every_cell[causal-queries-first-normalized-weights]"
 ],
 "tests/test_attention_dropout.py": [
-"tests/test_attention_dropout.py::test_a_dropping_template_call_is_on_par_with_the_reference_path_forward_and_backward[packed-documents-float32]",
-"tests/test_attention_dropout.py::test_the_mosaic_walk_drops_a_slice_at_its_global_places[training-keys]"
+"tests/test_attention_dropout.py::test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term[training-mosaic]",
+"tests/test_attention_dropout.py::test_an_fp16_output_whose_fp32_quotient_is_its_overflow_midpoint_narrows_below_it[training-mosaic]"
 ],
 "tests/test_attention_metamorphic.py": [
 "tests/test_attention_metamorphic.py::test_a_causal_calls_first_queries_are_the_call_cut_to_them",
@@ -806,9 +802,9 @@
 "tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[packed-window]"
 ],
 "tests/test_attention_stability.py": [
-"tests/test_attention_stability.py::test_an_fp16_mean_of_values_at_fp16s_largest_is_finite[decode-inference-a sink]",
-"tests/test_attention_stability.py::test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a decode step's sink and one key-default]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a decode step's sink and one key-triton]",
+"tests/test_attention_stability.py::test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form[a share in bf16's subnormal band, the denominator's rest in a later tile-unnormalized]",
+"tests/test_attention_stability.py::test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient[float32]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a cotangent on a small column beside an overflowing one-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a product past fp32's largest before a small scale, float32-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a row of small values beside one that overflows in its tile, float32-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a sink and one key-portable]",
@@ -818,10 +814,10 @@
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys an ulp apart, bfloat16-portable]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[small values beside unseen ones near fp32's largest, bfloat16-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/2-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values near fp32's largest over 2 equal keys, bfloat16-portable]",
-"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a product past fp32's largest before a small scale, float32]",
-"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[keys an ulp apart, float32]",
-"tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[a share in bf16's subnormal band, the denominator's rest in a later tile]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values near fp32's largest over 256 equal keys-portable]",
+"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a sink and one key]",
+"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[ties at scale 1, cotangents near 2**125]",
+"tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[a small weight on a large value, bfloat16]",
 "tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[ties at scale 1/2, cotangents near 2**125]",
 "tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[a subnormal share beside 255 equal weights, bfloat16]",
 "tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[values at fp32's largest over 2 equal keys]",
@@ -1179,7 +1175,7 @@
 "tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[packed-near the largest-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[packed-normal-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_chunked_op_holds_every_order[normal]",
-"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_gdn-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_gdn-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_gdn-first orders]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_kda-first orders]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-gated_delta-grad of grad]",
@@ -1596,8 +1592,8 @@
 "tests/test_derived_plan.py::test_the_first_compile_is_at_the_fewest_microbatches_the_derivation_does_not_refuse"
 ],
 "tests/test_derived_stability.py": [
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge[an infinite hook where masked-bfloat16-fast]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge[values at the largest-float32-accurate]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge[a query no span reaches-float32-fast]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge[values at the largest-float32-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a cotangent on a small column beside an overflowing one-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a logit near fp32's largest-as drawn-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a resumed state of a denominator near fp32's largest beside an overflowing column-float16-accurate]",
@@ -2665,6 +2661,9 @@
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm86-int8-unscaled]"
 ],
+"tests/test_mtp.py": [
+"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
+],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[gemma3-inputs]",
@@ -2872,7 +2871,7 @@
 "tests/test_pass_weights.py::test_an_lm_validation_of_metrics_alone_reports_each_pass"
 ],
 "tests/test_per_shard.py": [
-"tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[dense bf16, a user's]",
+"tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[delta attention (KDA)]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[dense bf16, the lane's]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[dense fp32]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[gated delta net and its short conv]",

@@ -10,7 +10,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import bodies, fed, mosaic, resources
+from dew.nn.kernels.templates import bodies, fed, mosaic, resources, ring_family
 
 
 class WgmmaLayout:
@@ -184,9 +184,9 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
 
 
-class Wgmma(WgmmaIssuer, mosaic.RingFamily):
+class Wgmma(WgmmaIssuer, ring_family.RingFamily):
     """wgmma's bundle: its issuer and home (`WgmmaIssuer`) on TMA rings fed by a producer warpgroup
-    (`mosaic.RingFamily`), multicast across a pair of multiprocessors where a cluster shares a ring's
+    (`ring_family.RingFamily`), multicast across a pair of multiprocessors where a cluster shares a ring's
     blocks."""
 
     # Three consumers beside the producer, 504 of a lane's 512 registers raised (160 each, the producer's 24):

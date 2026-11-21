@@ -591,16 +591,19 @@ fresh state's own trace, lowering and compile, keeps it apart from them (6740: s
 compile in the planning, its whole gained work a step's compile did not, and dit and finetune read as
 regressed)."""
 SHOWN_PARTS = ("start", "algebra")
-"""The planning's other parts, each shown as a row beside the step's (`compile_rows`), none gated."""
+"""The planning's other parts, each a row of its own beside the step's (`compile_rows`), gated as it is."""
 
 
 def compile_rows(name: str) -> list[Row]:
-    """Compile row `name`'s rows (`compile_battery`): the step's own compile, gated (`STEP_PARTS`); the whole
-    planning and prepare under its own name, as every earlier gate recorded it, shown; and its other parts
-    (`SHOWN_PARTS`), shown."""
+    """Compile row `name`'s rows (`compile_battery`): the step's own compile (`STEP_PARTS`) and each of the
+    planning's other parts (`SHOWN_PARTS`), each gated, so a head that slows the initializer's compile or
+    the algebra's is no faster to its first step than it was (train 1104's review F3); and the whole
+    planning and prepare under its own name, as every earlier gate recorded it, shown, not gated, as a tree
+    that moved a compile into it reads more work there that no part of it took longer at (6740). A base
+    whose tree records no start apart compares none of the parts (`compile_samples`)."""
     return [Row(f"{name} step", "s", "", floor=COMPILE_FLOOR),
             Row(name, "s", "", gated=False, floor=COMPILE_FLOOR),
-            *(Row(f"{name} {part}", "s", "", gated=False, floor=COMPILE_FLOOR) for part in SHOWN_PARTS)]
+            *(Row(f"{name} {part}", "s", "", floor=COMPILE_FLOOR) for part in SHOWN_PARTS)]
 
 
 def compile_samples(name: str, seconds: float, parts: Mapping[str, float] | None) -> dict[str, object]:

@@ -270,6 +270,24 @@ def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tan
     return rule
 
 
+def custom_rule(value) -> tuple[str, dict] | None:
+    """`value`, a function with JAX's own custom derivative, as a trace of it reads it, by name: a custom
+    JVP's function, its rule (`defjvps`' a closure over each argument's), the arguments it does not
+    differentiate and its zeros' form; a custom VJP's function, its rules (None before `defvjp`, which a call
+    refuses) and the options a trace reads. None for any other value. This module names JAX's custom
+    derivatives (SLOP026), so the statement of a value (`dew._stated`) reads one of the user's here (row
+    10087: an arm holding a test's own rule had no statement and ran unprepared)."""
+    if isinstance(value, jax.custom_jvp):
+        return "custom jvp", {"function": value.fun, "jvp": value.jvp,
+                              "nondiff_argnums": value.nondiff_argnums,
+                              "symbolic_zeros": value.symbolic_zeros}
+    if isinstance(value, jax.custom_vjp):
+        return "custom vjp", {"function": value.fun, "fwd": value.fwd, "bwd": value.bwd,
+                              "nondiff_argnums": value.nondiff_argnums,
+                              "symbolic_zeros": value.symbolic_zeros, "optimize_remat": value.optimize_remat}
+    return None
+
+
 def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
                        static: Sequence[int] = ()) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked`) over its arrays, passed by position or by name: its

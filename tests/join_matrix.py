@@ -38,9 +38,9 @@ from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
 from reference_error import with_gradients
-from test_joined import assert_joined_as_exact, drawing
+from test_joined import assert_joined_as_exact, drawing, row_joins
 
-from dew.nn.kernels import generation, selection
+from dew.nn.kernels import generation, selection, tuning
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
@@ -158,7 +158,8 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The layer's training step of `case` on its GPU with its two projections joined on par with the
     projections apart (check 1): the output and the gradients of the input and every parameter, from the layer
     with them apart in float64. A gated MLP's biases are drawn too, which init leaves at zero. The routes it
-    records run its join `joined` and every other choice unfused (`CHOICES`, `UNFUSED`)."""
+    records run its join `joined` and every other choice unfused (`CHOICES`, `UNFUSED`); a joined attention
+    layer's step binds the side-by-side forward and the chained input gradient, apart neither."""
     combination = dict(zip(AXES["join"], case, strict=True))
     layer = _layer(combination)
     dtype = jnp.dtype(combination["dtype"])
@@ -176,6 +177,16 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     unnamed = sorted(pair for pair in recorded
                      if pair[0] not in CHOICES and pair[1] != unfused.get(pair[0], "xla"))
     assert (combination["join"], "joined") in recorded and not unnamed, (sorted(recorded), unnamed)
+    if combination["join"] == "qkv":
+        # Joined, its step binds the side-by-side forward and the chained input gradient; apart, neither
+        # (head review of 0099a4701 F4: the cell checked the route alone).
+        operands = drawing(params, (*ROWS, FEATURES), dtype)(0)
+        for joins, forms in ((True, {"beside", "chained"}), (False, set())):
+            with generation.chosen(**unfused), row_joins("qkv", joins=joins), tuning.seen() as launches:
+                jax.eval_shape(with_gradients(layer.apply), *operands)
+            bound = {form for _, each in launches.taken for form in ("beside", "chained")
+                     if each.arguments.get(form)}
+            assert bound == forms, (joins, bound)
 
 
 def per_shard(choice: str, kernel: str) -> dict:

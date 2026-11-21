@@ -145,14 +145,30 @@ def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
 def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
     """The block scale's declared decode (`bits.E4M3_SCALE`, a fixed layout), its checked-in form proven
     (`bits.proven`) and no dearer than the search's, restored by its one rule (`bits.scales_decoded`), is
-    the format's integer decode (`bits.decoded`) on every E4M3 code, bit for bit under a jit: subnormal
-    scales, both zeros and the NaN code (read as 480) among them."""
+    the format's integer decode (`bits.decoded`) on every finite E4M3 code, bit for bit under a jit: subnormal
+    scales and both zeros among them (its linear form reads the NaN code 0x7F as 480)."""
     bits.proven(bits.E4M3_SCALE, bits.E4M3_SCALE_FORM)
     assert bits.E4M3_SCALE_FORM.price <= bits.synthesized(bits.E4M3_SCALE).price
     codes = jnp.arange(256, dtype=jnp.uint32)
-    declared = jax.jit(bits.scales_decoded)(codes)
-    integer = jax.jit(lambda codes: bits.decoded(codes, bits.E4M3))(codes)
-    np.testing.assert_array_equal(np.asarray(declared).view(np.uint32), np.asarray(integer).view(np.uint32))
+    declared = np.asarray(jax.jit(bits.scales_decoded)(codes))
+    integer = np.asarray(jax.jit(lambda codes: bits.decoded(codes, bits.E4M3))(codes))
+    finite = (np.arange(256) & 0x7F) != 0x7F
+    np.testing.assert_array_equal(declared[finite].view(np.uint32), integer[finite].view(np.uint32))
+    assert float(declared[0x7F]) == 480.0
+
+
+@pytest.mark.parametrize(("dtype", "minifloat"), [(jnp.float8_e4m3fn, bits.E4M3),
+                                                  (jnp.float8_e5m2, bits.E5M2)],
+                         ids=["e4m3fn", "e5m2"])
+def test_decoded_matches_xla_on_every_fp8_code(dtype, minifloat):
+    """Row 8549: `bits.decoded` matches XLA's `astype(float32)` bitwise on all 256 codes of `e4m3fn` and
+    `e5m2` (including -0.0, subnormals, +-inf and NaN)."""
+    raw = jnp.arange(256, dtype=jnp.uint8)
+    ours = np.asarray(jax.jit(lambda c: bits.decoded(c.astype(jnp.uint32), minifloat))(raw))
+    xla = np.asarray(jax.jit(lambda c: jax.lax.bitcast_convert_type(c, dtype).astype(jnp.float32))(raw))
+    nans = np.isnan(xla)
+    np.testing.assert_array_equal(np.isnan(ours), nans)
+    np.testing.assert_array_equal(ours[~nans].view(np.uint32), xla[~nans].view(np.uint32))
 
 
 def test_a_forms_version_is_its_stored_layouts():
