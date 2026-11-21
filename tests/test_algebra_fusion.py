@@ -578,7 +578,8 @@ def test_a_region_whose_call_makes_other_types_is_reported_refused():
     """A region the compile point writes (a norm Dew's kernel takes on an H100, `recognize.recognized`) whose
     written call makes other types than the region's own (`jax_core.typematch`: here its outputs widened to
     float32) is not written, its equations kept as traced, and each route its call took is reported XLA's,
-    refused for it (`fusion.UNWRITTEN`), where it was dropped with no report (row 10719)."""
+    refused for it (`fusion.UNWRITTEN`), where it was dropped with no report (row 10719), at the site its
+    call took it from (row 10856: reported anew, it took the reporting frame's)."""
     from dew.algebra import fusion, recognize
 
     closed = jax.make_jaxpr(_norm_of)(jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
@@ -589,8 +590,11 @@ def test_a_region_whose_call_makes_other_types_is_reported_refused():
             lambda value: value.astype(jnp.float32), region.call(*values)), key=(region.key, "widened"))
         with generation.routes() as found:
             spliced = fusion._spliced(closed.jaxpr, [widened])
-    assert spliced is closed.jaxpr
-    assert any(route.refusal is not None and route.refusal.code == fusion.UNWRITTEN for route in found)
+    refused = [route for route in found
+               if route.refusal is not None and route.refusal.code == fusion.UNWRITTEN]
+    assert spliced is closed.jaxpr and refused
+    # Each reported as its call took it, its site the kernel's own dispatch's, not the report's (row 10856).
+    assert all(route.site.split(":")[0] != fusion.__name__ for route in refused)
 
 
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
