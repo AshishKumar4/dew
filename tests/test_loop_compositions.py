@@ -73,7 +73,7 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
     step is refused, naming why, where read whole it plans and steps (row 10770's composition audit)."""
     import optax
 
-    from dew.mesh import MeshSpec
+    from dew.distributed.placement import MeshSpec
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, Trainer

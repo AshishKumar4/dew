@@ -594,9 +594,9 @@ def _unlike(cap: Planned, other: Planned) -> list[str]:
         ours, theirs = leaves(held), leaves(given)
         unlike += [f"{name}{path}" for path in sorted(ours.keys() | theirs.keys())
                    if ours.get(path) != theirs.get(path)]
-        # The outputs' trees too, whose nodes' classes and static fields say what the leaves mean: a
-        # statistic pooled as one kind of mean by the cap and another by a count holds the same leaves.
-        if name == "outputs" and not unlike and jax.tree.structure(held) != jax.tree.structure(given):
+        # Their trees too, whose nodes' classes and static fields say what the leaves mean: a statistic
+        # pooled as one kind of mean by the cap and another by a count holds the same leaves.
+        if not unlike and jax.tree.structure(held) != jax.tree.structure(given):
             unlike.append(f"{name}'s tree: {jax.tree.structure(given)} where the cap's is "
                           f"{jax.tree.structure(held)}")
     return unlike
