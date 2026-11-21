@@ -58,6 +58,7 @@ from dew.objectives.base import (
     ProgramModule,
     Ratio,
     Step,
+    head_tile_of,
 )
 from dew.objectives.routing import RoutedStatistics
 
@@ -287,8 +288,7 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
 
     def _student_tile(self) -> tuple[int, int] | None:
         """The tile the student's trained head computes in, None where it keeps its whole logits."""
-        return next((entry.head_tile for entry in self.student.program_key()
-                     if entry.trained and entry.head_tile is not None), None)
+        return head_tile_of(self.student)
 
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""
@@ -359,9 +359,12 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         """Score the student in the step's mode and the frozen teacher in evaluation mode, each with its
         whole logits where the divergence reads every column (`full`), and none where it reads the
         sampled ids' likelihoods alone (`selected`), each loss scoring its head as it trains."""
-        # The full KL reads every column: the whole logits where the student's head keeps them, else a tile
-        # of rows at a time from the final states (`_tiled_divergence`).
-        whole = self.divergence == "full" and self._student_tile() is None
+        # The full KL reads every column: a tile of rows at a time from the final states where the student's
+        # head is tiled and both models state their head (`_tiled_divergence`), else the whole logits (an
+        # adapted model scores through more than its head, row 10983).
+        tiled = (self._student_tile() is not None and self.student.predicts_by_head
+                 and self.teacher.predicts_by_head)
+        whole = self.divergence == "full" and not tiled
         statistics, aux, student = self.student.predict(
             self.student_variables(params), batch, self._student_step(step), train=step.training,
             layers=tuple(student_layer for _, student_layer in self.features), logits=whole)
@@ -375,9 +378,6 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
                 f"teacher and the student share a tokenizer and a vocabulary; the "
                 f"student scores {student.logits.shape[-1]} ids and the teacher "
                 f"{teacher.logits.shape[-1]}")
-        if self.divergence == "full" and not whole and (student.head is None or teacher.head is None):
-            raise ValueError("a tiled head's full KL reads both models' final states through their heads, "
-                             "which these objectives state none of")
         return statistics, aux, student, teacher
 
     def _tiled_divergence(self, student: Prediction, teacher: Prediction, finite: jax.Array,

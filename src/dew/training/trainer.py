@@ -2136,7 +2136,6 @@ class Trainer(Generic[Loss, Effects]):
         ends on, ranked by them: a budget's last step, a stream's that ran out and a
         plateau's (`_between_steps`)."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
-        state = plan.closed_at_budget(state, run.clock.read)
         self._take(plan, run, interval, state, unlogged=True)
         self._read_taken(run)
         if run.notice is not None and run.cooling is None:
