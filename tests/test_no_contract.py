@@ -3,6 +3,7 @@ no-contract mark, in place of the optimization barrier (row 8378; `dew.nn.precis
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def float_arithmetic(lowered, *, paired: bool = False) -> list[str | None]:
@@ -39,15 +40,18 @@ def float_arithmetic(lowered, *, paired: bool = False) -> list[str | None]:
 def test_an_error_free_transform_marks_its_arithmetic_where_the_jaxlib_marks():
     """Where the jaxlib marks a float operation to round alone, `two_sum`, `two_product`, a compensated sum
     and a forward derivative of `two_sum` trace with every float add, subtract and multiply so marked (a
-    compensated sum's in its reduction of pairs); lowered for a CPU, whose compiler fences the mark
-    (`dew.nn.precision.MARKED_BACKENDS`), with no optimization barrier, which split the fusions around every
-    transform, and lowered from the same trace for CUDA, whose fusions contract a marked operation, with its
-    barrier (row 8378). On the barrier path (`dew._cache.BARRIERED`), and on a jaxlib that marks nothing,
-    they lower as before, their operands behind a barrier and nothing marked. The same jitted callables
-    lowered before, under and after the barrier path: a trace of one path is never run on the other."""
+    compensated sum's in its reduction of pairs); traced for a CPU and lowered for a CPU or for CUDA, whose
+    compilers round a marked operation alone (`dew.nn.precision.MARKED_BACKENDS`), with no optimization
+    barrier, which split the fusions around every transform; lowered from the same trace for a TPU, whose
+    compiler is no such one, with its barrier (row 8378). Traced for a GPU they are marked nowhere and keep
+    their barrier, as a raw Pallas body a GPU traces must (row 10138). On the barrier path
+    (`dew._cache.BARRIERED`), and on a jaxlib that marks nothing, they lower as before, their operands behind
+    a barrier and nothing marked. The same jitted callables lowered before, under and after the barrier
+    path: a trace of one path is never run on the other."""
     from jax.extend.backend import no_contract_attribute
 
     from dew import _cache
+    from dew.nn.kernels import generation
     from dew.nn.kernels.lowered import operations
     from dew.nn.precision import compensated_sum, two_product, two_sum
 
@@ -59,10 +63,10 @@ def test_an_error_free_transform_marks_its_arithmetic_where_the_jaxlib_marks():
                   (jax.jit(lambda x, y: compensated_sum(y, (0,))), True),
                   (jax.jit(lambda x, y: jax.jvp(two_sum, (x, y), (y, x))), False)]
 
-    def lowered(platform: str):
+    def lowered(platform: str, *, assumed: str | None = None):
         # Traced for a CPU (`jax.default_device`, the platform a call's code is chosen for), whatever the
-        # process's default, then lowered for `platform`.
-        with jax.default_device(cpu):
+        # process's default, or for a GPU of the `assumed` generation, then lowered for `platform`.
+        with jax.default_device(cpu), generation.assumed(assumed):
             return [(transform.trace(x, y).lower(lowering_platforms=(platform,)), paired)
                     for transform, paired in transforms]
 
@@ -77,6 +81,38 @@ def test_an_error_free_transform_marks_its_arithmetic_where_the_jaxlib_marks():
         return
     for _ in range(2):
         held(lowered("cpu"), barrier=False, marked=True)
-        held(lowered("cuda"), barrier=True, marked=True)
+        held(lowered("cuda"), barrier=False, marked=True)
+        held(lowered("cuda", assumed="sm90"), barrier=True, marked=False)
+        held(lowered("tpu"), barrier=True, marked=True)
         with _cache.BARRIERED(new_value=True):
             held(lowered("cpu"), barrier=True, marked=False)
+
+
+def a_marked_multiply_add_rounds_each_step():
+    """On a GPU, `a * b + c` with its add and multiply marked to round alone (the jaxlib's no-contract
+    attribute, `set_xla_metadata`, as `dew.nn.precision.rounding_alone` marks a transform a CPU traces for
+    CUDA) over 65536 normal draws is bitwise the product rounded and then the sum rounded (NumPy's float32
+    steps), and the draws tell that from a fused multiply-add's one rounding: should a later XLA:GPU contract
+    a marked operation, as precision's transforms lowered for CUDA without their barrier take it not to
+    (`dew.nn.precision.MARKED_BACKENDS`), this fails (row 10135: none contracted on an A100 or a GH200 at
+    post115). The GPU's own compiler's (test_gpu_numerics), its program compiled where the cell's arm runs
+    (`ahead_arm`); the marks a lowering for CUDA carries are `test_an_error_free_transform_marks_...`'s."""
+    from jax.experimental.xla_metadata import set_xla_metadata
+    from reference_error import ahead_arm
+
+    from dew.nn.precision import no_contract
+
+    name = no_contract()
+    assert name is not None, "this jaxlib marks no operation to round alone"
+    rng = np.random.default_rng(2026_1120)
+    a, b, c = (rng.standard_normal(65536).astype(np.float32) for _ in range(3))
+
+    def marked(a, b, c):
+        with set_xla_metadata(**{name: True}):
+            return a * b + c
+
+    found = np.asarray(ahead_arm(jax.jit(marked), "a marked multiply-add")(a, b, c))
+    stepped = a * b + c
+    fused = (a.astype(np.float64) * b + c).astype(np.float32)
+    assert np.any(fused != stepped), "no draw tells a fused multiply-add from its steps"
+    np.testing.assert_array_equal(found.view(np.uint32), stepped.view(np.uint32))

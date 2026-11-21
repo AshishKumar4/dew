@@ -1906,30 +1906,47 @@ def test_an_aligned_sums_shared_factors_gradient_holds_its_groups_scaled_until_t
     np.testing.assert_array_equal(np.asarray(pulled(jnp.ones_like(value))[0]), np.full((2, 3), 2.0 ** 126))
 
 
+def _plain_sum(terms, axis=None):
+    """`aligned_sum`'s value in plain float32 arithmetic: each term's product, reduced over `axis` where one
+    is given, the terms added."""
+    products = [functools.reduce(jnp.multiply, term) for term in terms]
+    return functools.reduce(jnp.add, [p if axis is None else jnp.sum(p, axis=axis) for p in products])
+
+
 @pytest.mark.parametrize("order", ["forward over reverse", "reverse over reverse"])
 def test_an_aligned_sums_second_order_keeps_its_losss_curvature(order):
-    """The Hessian along `[1, 0]` of `sum(aligned_sum([(a, a, c)])^2)` at `a` `[1, 2]` and `c` `[3, 4]`, its
-    loss nonlinear in the sum, `12 a^2 c^2` there, `[108, 0]`, and of a mixed-rank sum's
-    `sum(aligned_sum([(x, y), (y,)], axis=0)^2)` its `y`-gradient's gradient along `x`, `[8, 24]`: float64's,
-    by `jax.jvp` of the gradient and by the gradient of the gradient's product with the direction, where the
-    sum's tangent rule formed its value from bits, which carry no tangent, and both orders lost the loss's
-    curvature, `[36, 0]` and `[0, 0]` (base review d2d45bd6f F2)."""
-    a, c, direction = (jnp.asarray(v, jnp.float32) for v in ([1.0, 2.0], [3.0, 4.0], [1.0, 0.0]))
+    """The Hessian along `d` of `sum(aligned_sum([(a, a, c)])^2)`, its loss nonlinear in the sum (`12 a^2 c^2
+    d`), and of a mixed-rank sum's `sum(aligned_sum([(x, y), (y,)], axis=0)^2)` its cross curvature along
+    `d` in `x`, the `y`-gradient's (`4 y (x + 1) d`), each by `jax.jvp` of a gradient and by the gradient of
+    a gradient's product with the direction, on par with the same losses' in plain float32 arithmetic
+    against float64 (check 1), over normal draws, where the sum's tangent rule formed its value from bits,
+    which carry no tangent, and both orders lost the loss's curvature (at `a` `[1, 2]`, `c` `[3, 4]`, `d`
+    `[1, 0]`: `[36, 0]` and `[0, 0]` for `[108, 0]`; base review d2d45bd6f F2, row 8701)."""
+    def draw(seed):
+        rng = np.random.default_rng([2026_1120, seed])
+        return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
+                     for shape in ((4096,), (4096,), (4096,), (1, 4096)))
 
-    def loss(a):
-        return jnp.sum(aligned_sum([(a, a, c)]) ** 2)
+    def curvatures(summed):
+        def run(a, c, direction, y):
+            def loss(a):
+                return jnp.sum(summed([(a, a, c)]) ** 2)
 
-    if order == "forward over reverse":
-        found = jax.jvp(jax.grad(loss), (a,), (direction,))[1]
-    else:
-        found = jax.grad(lambda a: jnp.vdot(jax.grad(loss)(a), direction))(a)
-    np.testing.assert_array_equal(np.asarray(found), [108.0, 0.0])
-    y = jnp.asarray([[1.0, 2.0]], jnp.float32)
+            def mixed(x, y):
+                return jnp.sum(summed([(x, y), (y,)], axis=0) ** 2)
 
-    def mixed(x):
-        return jnp.sum(jax.grad(lambda y: jnp.sum(aligned_sum([(x, y), (y,)], axis=0) ** 2))(y))
+            if order == "forward over reverse":
+                curvature = jax.jvp(jax.grad(loss), (a,), (direction,))[1]
+                crossed = jax.jvp(lambda x: jax.grad(mixed, argnums=1)(x, y), (a,), (direction,))[1]
+            else:
+                curvature = jax.grad(lambda a: jnp.vdot(jax.grad(loss)(a), direction))(a)
+                crossed = jax.grad(lambda y: jnp.vdot(jax.grad(mixed)(a, y), direction))(y)
+            return {"curvature": curvature, "mixed": crossed}
 
-    np.testing.assert_array_equal(np.asarray(jax.grad(mixed)(a)), [8.0, 24.0])
+        return run
+
+    assert_as_exact(jax.jit(curvatures(aligned_sum)), jax.jit(curvatures(_plain_sum)), draw,
+                    f"an aligned sum's second order, {order}", seeds=8)
 
 
 def test_an_aligned_sum_over_an_axis_a_mesh_splits_sums_it_shard_by_shard():
