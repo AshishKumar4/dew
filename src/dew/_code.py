@@ -167,16 +167,23 @@ def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str] |
 
 def _held(value) -> Sequence[object]:
     """`value` and every value it holds: a dataclass's fields', a sequence's or a set's members, a mapping's
-    values."""
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        members = [getattr(value, field.name) for field in dataclasses.fields(value)]
-    elif isinstance(value, (tuple, list, frozenset, set)):
-        members = list(value)
-    elif isinstance(value, Mapping):
-        members = list(value.values())
-    else:
-        members = []
-    return [value, *(part for member in members for part in _held(member))]
+    values, each once however often it is held, so a graph that holds itself (a cyclic hook graph's) ends."""
+    found: list[object] = []
+    seen: set[int] = set()
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        if dataclasses.is_dataclass(current) and not isinstance(current, type):
+            pending.extend(getattr(current, field.name) for field in dataclasses.fields(current))
+        elif isinstance(current, (tuple, list, frozenset, set)):
+            pending.extend(current)
+        elif isinstance(current, Mapping):
+            pending.extend(current.values())
+    return found
 
 
 class _Changed(Exception):
