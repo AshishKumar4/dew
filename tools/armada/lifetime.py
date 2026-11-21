@@ -15,6 +15,7 @@ leaves the files it reached without a key. The standard library alone: it runs b
 on the path."""
 
 import atexit
+import contextlib
 import os
 import runpy
 import sys
@@ -22,7 +23,7 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import followed
-from followed import CLOSED, EVIDENCE, PEAK, READ, SHARED, STARTED, UNOPENED, VISIT
+from followed import CLOSED, EVIDENCE, PEAK, READ, SHARED, STARTED, UNOPENED, VISIT, WHY
 from session import CUTS, DURATIONS
 
 LOG = "DEW_EXECUTED_LOG"
@@ -110,6 +111,7 @@ def started(code, offset):
     backend; a multiprocessing child's start, whose child no event follows."""
     if code is CHILD_START:
         write(owner(), f"{STARTED}unfollowed")
+        noted(starting=True)
         return None
     if code.co_name == followed.OPENED[0] and code.co_filename.endswith(followed.OPENED[1]):
         # Registered after jax's own clean-up, so it reads the pool before the backend closes.
@@ -152,6 +154,19 @@ def audited(event, args):
             write(owner(), taken)
     elif event in followed.SPAWNS and (kind := followed.start(event, args, children)) is not None:
         write(owner(), f"{STARTED}{kind}")
+        if kind == "unfollowed":
+            noted(event=event, args=args)
+
+
+def noted(event: str | None = None, args: tuple = (), starting: bool = False) -> None:
+    """Why the start just counted unfollowed is (`followed.described`; where `starting`, the multiprocessing
+    start whose frame called `started`), its owner's evidence: nothing it does, a frame read or a line
+    written, fails the start, which its marker counted already."""
+    # A frame read the stack cannot give or an audit hook refuses, or a line the log cannot take, fails
+    # nothing.
+    with contextlib.suppress(OSError, ValueError, RuntimeError):
+        frame = sys._getframe(2) if starting else None
+        write(owner(), f"{WHY}{followed.described(root, event, args, frame)}")
 
 
 def peaked() -> None:

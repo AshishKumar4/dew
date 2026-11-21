@@ -135,6 +135,7 @@ from dew.data.pipeline import (
     Native,
     ObjectiveData,
     Pack,
+    PackedLayout,
     Phases,
     Pipeline,
     Prefetch,
@@ -1241,8 +1242,6 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     holds no more documents than tokens. A corpus that shows no packing
     while another packs into the same batches holds windows packed where
     none of this can see, so then each declares its window's length."""
-    from dew.data.packing import PackedSource
-
     fields: dict[str, tuple[str, ...]] = {}
     bounds: dict[str, int] = {}
     laid: dict[str, bool] = {}
@@ -1281,8 +1280,8 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
                 declare(stage, stage.segments if documents is None else documents, not itself)
                 packed = True
         *_, source = beneath(source, ("read", "materialized"))
-        if isinstance(source, PackedSource):
-            declare(source.plan.pack, source.plan.most_documents, not itself)
+        if isinstance(source, PackedLayout):
+            declare(*source.packed_layout(), not itself)
             packed = True
         unseen = unseen or not packed
 
@@ -2404,19 +2403,21 @@ def publish(
     by the shards its source states (`dew.data.sources.base.Source.manifest`)."""
     from dew.data.cache import Cache
     from dew.data.generation import Generation
-    from dew.data.packing import PackingPlan, plan_name
 
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
     if isinstance(pipeline.source, Combined):
         raise ValueError("publish each source prefix before mixing")
     planned = _at(pipeline.stages, Pack)
-    builder = None
+    builder, accepted = None, None
     if planned is not None:
+        # The packer imported where a pack is published: a prefix that packs nothing imports none.
+        from dew.data.packing import PackingPlan, plan_name
+
         packing = pipeline.stages[planned]
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
-        builder = PackingPlan(packing)
+        builder, accepted = PackingPlan(packing), plan_name(packing, "accepted")
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source
@@ -2426,8 +2427,7 @@ def publish(
 
     def published() -> Generation | None:
         generation = cache.generation(manifest)
-        held = generation is not None and (
-            builder is None or plan_name(builder.pack, "accepted") in generation.manifest["plan"])
+        held = generation is not None and (accepted is None or accepted in generation.manifest["plan"])
         return generation if held else None
 
     found = published()
