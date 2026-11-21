@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from low_precision_support import spread
 from map_judge import sharded
+from reference_error import ahead_arm, ran_here
 
 from dew.algebra import bits
 
@@ -69,10 +70,13 @@ def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order()
     codes = rng.integers(0, 16, size=(512, 8))
     codes[:16, :] = np.arange(16)[:, None]
     words = (codes.astype(np.uint64) << (4 * np.arange(8, dtype=np.uint64))).sum(axis=1)
-    natural = jnp.asarray(words.astype(np.uint32).reshape(64, 8))
-    stored = jax.jit(form.prepared)(natural)
+    def stored_and_decoded(natural):
+        stored = form.prepared(natural)
+        return stored, form.values(stored, jnp.bfloat16)
+
+    stored, decoded = ahead_arm(jax.jit(stored_and_decoded), "NVFP4 words stored and decoded")(
+        words.astype(np.uint32).reshape(64, 8))
     np.testing.assert_array_equal(np.asarray(stored).astype(np.uint64).ravel(), form.encoded(words))
-    decoded = jax.jit(lambda stored: form.values(stored, jnp.bfloat16))(stored)
     assert decoded.shape == (64, 64)
     expected = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
     got = np.asarray(decoded).astype(np.float64).reshape(512, 8) * 2.0 ** 126
@@ -83,10 +87,13 @@ def test_a_decoded_value_restored_narrow_is_its_float32_restoring_rounded_once()
     """`bits.restored` in float16 and bfloat16 is its float32 restoring rounded once to the format, at every
     16-bit pattern, a NaN as a NaN: formed in float32 and cast, where a fraction field cast to float16 first
     overflowed (the half code, `0x0040`, read as infinity, not 0.5: row 8660's head review)."""
-    patterns = jnp.arange(1 << 16, dtype=jnp.uint32)
-    narrow = np.asarray(jax.jit(bits.restored)(patterns))
-    for dtype in (jnp.float16, jnp.bfloat16):
-        made = np.asarray(jax.jit(lambda pattern, dtype=dtype: bits.restored(pattern, dtype))(patterns))
+    def restorings(patterns):
+        narrowed = (bits.restored(patterns, dtype) for dtype in (jnp.float16, jnp.bfloat16))
+        return bits.restored(patterns), *narrowed
+
+    narrow, *made_each = (np.asarray(x) for x in ahead_arm(jax.jit(restorings), "restorings narrowed")(
+        np.arange(1 << 16, dtype=np.uint32)))
+    for dtype, made in zip((jnp.float16, jnp.bfloat16), made_each, strict=True):
         numbers = ~np.isnan(narrow)
         np.testing.assert_array_equal(np.isnan(made.astype(np.float32)), ~numbers)
         np.testing.assert_array_equal(made[numbers].view(np.uint16),
@@ -97,10 +104,11 @@ def test_a_decoded_value_restored_wide_is_its_float32_restoring_widened():
     """`bits.restored` in float64, a float64 truth's, is its float32 restoring widened exactly (NumPy's
     widening on the host, a float32 subnormal kept), bit for bit, at every 16-bit pattern, a NaN as a NaN:
     one definition of the decoded value at every dtype (row 8661)."""
-    patterns = jnp.arange(1 << 16, dtype=jnp.uint32)
-    narrow = np.asarray(jax.jit(bits.restored)(patterns))
+    patterns = np.arange(1 << 16, dtype=np.uint32)
     with jax.enable_x64(new_val=True):
-        wide = np.asarray(jax.jit(lambda pattern: bits.restored(pattern, jnp.float64))(patterns))
+        narrow, wide = (np.asarray(x) for x in ahead_arm(jax.jit(
+            lambda pattern: (bits.restored(pattern), bits.restored(pattern, jnp.float64))),
+            "restorings widened")(patterns))
     assert wide.dtype == np.float64
     numbers = ~np.isnan(narrow)
     np.testing.assert_array_equal(np.isnan(wide), ~numbers)
@@ -111,10 +119,13 @@ def test_a_decoded_value_restored_wide_is_its_float32_restoring_widened():
 def test_a_decoded_value_restored_narrow_is_of_the_dtype_asked_for():
     """`bits.restored` in bfloat16 is bfloat16, its every pattern's float32 restoring cast: the dtype a caller
     asks for is the one returned (row 8661's review)."""
-    patterns = jnp.arange(1 << 16, dtype=jnp.uint32)
-    narrow = jax.jit(lambda pattern: bits.restored(pattern, jnp.bfloat16))(patterns)
+    def asked_and_cast(pattern):
+        return bits.restored(pattern, jnp.bfloat16), bits.restored(pattern).astype(jnp.bfloat16)
+
+    narrow, cast = ahead_arm(jax.jit(asked_and_cast), "a restoring asked narrow")(
+        np.arange(1 << 16, dtype=np.uint32))
     assert narrow.dtype == jnp.bfloat16
-    cast = np.asarray(jax.jit(bits.restored)(patterns).astype(jnp.bfloat16))
+    cast = np.asarray(cast)
     numbers = ~np.isnan(cast.astype(np.float32))
     np.testing.assert_array_equal(np.isnan(np.asarray(narrow, np.float32)), ~numbers)
     np.testing.assert_array_equal(np.asarray(narrow)[numbers].view(np.uint16), cast[numbers].view(np.uint16))
@@ -130,14 +141,14 @@ def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
     codes[:16, :16] = np.arange(16)[:, None]
     scale_bits = rng.integers(0, 0x7F, size=(depth // 16, columns), dtype=np.uint8)
     scale_bits[0, :3] = (0x01, 0x7E, 0x08)
-    scales = jnp.asarray(scale_bits).view(jnp.float8_e4m3fn)
+    scales = scale_bits.view(ml_dtypes.float8_e4m3fn)
     packed = codes.reshape(depth // 8, 8, columns).astype(np.uint64) << (
         4 * np.arange(8, dtype=np.uint64))[None, :, None]
-    natural = jnp.asarray(packed.sum(axis=1).astype(np.uint32))
-    stored = bits.NVFP4_BFLOAT16_FORM.prepared(natural)
-    decoded = jax.jit(bits.nvfp4_decoded)(stored, scales)
+    decoded = ahead_arm(jax.jit(lambda natural, scales: bits.nvfp4_decoded(
+        bits.NVFP4_BFLOAT16_FORM.prepared(natural), scales)), "an NVFP4 tile decoded")(
+        packed.sum(axis=1).astype(np.uint32), scales)
     values = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
-    block = np.repeat(np.asarray(scales.astype(jnp.float32), np.float64), 16, axis=0)
+    block = np.repeat(scales.astype(np.float64), 16, axis=0)
     np.testing.assert_array_equal(np.asarray(decoded.astype(jnp.float32), np.float64) * bits.NVFP4_OWED,
                                   values * block)
 
@@ -149,9 +160,9 @@ def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
     scales and both zeros among them (its linear form reads the NaN code 0x7F as 480)."""
     bits.proven(bits.E4M3_SCALE, bits.E4M3_SCALE_FORM)
     assert bits.E4M3_SCALE_FORM.price <= bits.synthesized(bits.E4M3_SCALE).price
-    codes = jnp.arange(256, dtype=jnp.uint32)
-    declared = np.asarray(jax.jit(bits.scales_decoded)(codes))
-    integer = np.asarray(jax.jit(lambda codes: bits.decoded(codes, bits.E4M3))(codes))
+    declared, integer = (np.asarray(x) for x in ahead_arm(jax.jit(lambda codes: (
+        bits.scales_decoded(codes), bits.decoded(codes, bits.E4M3))), "a block scale's decodes")(
+        np.arange(256, dtype=np.uint32)))
     finite = (np.arange(256) & 0x7F) != 0x7F
     np.testing.assert_array_equal(declared[finite].view(np.uint32), integer[finite].view(np.uint32))
     assert float(declared[0x7F]) == 480.0
@@ -163,9 +174,10 @@ def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
 def test_decoded_matches_xla_on_every_fp8_code(dtype, minifloat):
     """Row 8549: `bits.decoded` matches XLA's `astype(float32)` bitwise on all 256 codes of `e4m3fn` and
     `e5m2` (including -0.0, subnormals, +-inf and NaN)."""
-    raw = jnp.arange(256, dtype=jnp.uint8)
-    ours = np.asarray(jax.jit(lambda c: bits.decoded(c.astype(jnp.uint32), minifloat))(raw))
-    xla = np.asarray(jax.jit(lambda c: jax.lax.bitcast_convert_type(c, dtype).astype(jnp.float32))(raw))
+    ours, xla = (np.asarray(x) for x in ahead_arm(jax.jit(lambda c: (
+        bits.decoded(c.astype(jnp.uint32), minifloat),
+        jax.lax.bitcast_convert_type(c, dtype).astype(jnp.float32))), f"{minifloat} decoded beside XLA's")(
+        np.arange(256, dtype=np.uint8)))
     nans = np.isnan(xla)
     np.testing.assert_array_equal(np.isnan(ours), nans)
     np.testing.assert_array_equal(ours[~nans].view(np.uint32), xla[~nans].view(np.uint32))
@@ -328,7 +340,7 @@ def test_a_forms_traced_decode_is_its_decode(name):
     jit."""
     form = FORMS[name]()
     words = np.random.default_rng(3733).integers(0, 1 << 32, size=4096, dtype=np.uint64)
-    traced = jax.jit(form.traced)(jnp.asarray(words.astype(np.uint32)))
+    traced = ahead_arm(jax.jit(form.traced), f"{name}'s traced decode")(words.astype(np.uint32))
     for got, expected in zip(traced, form.decoded(words), strict=True):
         np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
 
@@ -444,12 +456,16 @@ def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values(e2m1
     its codes in their natural order, which the decode read as other values."""
     rng = np.random.default_rng(4050)
     x = rng.standard_normal((64, 8)).astype(np.float32) * 3
-    codes = bits.encoded(jnp.asarray(x).view(jnp.uint32), e2m1)
-    words = bits.packed(codes.T, e2m1).T
-    scales = jnp.full((4, 8), 2.0 ** 8, ml_dtypes.float8_e4m3fn)
-    decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32)
+
+    def decoded(x, scales):
+        codes = bits.encoded(x.view(jnp.uint32), e2m1)
+        return bits.nvfp4_decoded(bits.packed(codes.T, e2m1).T, scales)
+
+    scales = np.full((4, 8), 2.0 ** 8, ml_dtypes.float8_e4m3fn)
+    found = [run(x, scales) for run in ran_here(decoded, f"an NVFP4 tile packed from {e2m1}")]
     rounded = np.clip(x, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
-    np.testing.assert_array_equal(decoded, rounded)
+    for each in found:
+        np.testing.assert_array_equal(np.asarray(each, np.float32), rounded)
 
 
 def _spread_tile() -> np.ndarray:
@@ -465,9 +481,11 @@ def _quantized_values() -> np.ndarray:
     quotients on and beside e2m1's midpoints and e4m3's values, where an inexact division lands across (XLA's
     took 186 of its 1024 scales a step and 2760 of its codes across a midpoint)."""
     drawn = np.asarray(spread(0, (256, 64), 16), np.float32)
-    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(drawn))
+    words, scales, tensor = ahead_arm(jax.jit(bits.nvfp4_quantized), "an NVFP4 tile's values, quantized")(
+        drawn)
     owed = np.float32(bits.NVFP4_OWED) * np.asarray(tensor)
-    return np.asarray(bits.nvfp4_decoded(words, scales), np.float32) * owed
+    return np.asarray(ahead_arm(jax.jit(bits.nvfp4_decoded), "an NVFP4 tile's values, decoded")(
+        np.asarray(words), np.asarray(scales)), np.float32) * owed
 
 
 @pytest.mark.parametrize("tile", [_spread_tile, _quantized_values], ids=["spread", "quantized values"])
@@ -479,7 +497,20 @@ def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_it
     division's as NumPy divides (row 4050; row 5456: an NVFP4 tile's own values, whose quotients land on
     the formats' boundaries, took codes and scales across them by XLA's inexact division)."""
     x = tile()
-    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(x))
+
+    def quantized(x):
+        words, scales, tensor = bits.nvfp4_quantized(x)
+        return scales, tensor, bits.nvfp4_decoded(words, scales)
+
+    # Every way run before any is judged (`ran_here`).
+    found = [run(x) for run in ran_here(quantized, f"a tile quantized to NVFP4, {tile.__name__}")]
+    for scales, tensor, decoded in found:
+        _holds_its_least_scales_and_rounding(x, scales, tensor, decoded)
+
+
+def _holds_its_least_scales_and_rounding(x, scales, tensor, decoded):
+    """`x` quantized to NVFP4 (its block `scales`, its `tensor` scale and its `decoded` codes) as
+    test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_its_rounding states it."""
     largest = np.float32(np.abs(x).max())
     np.testing.assert_array_equal(np.asarray(tensor), largest / np.float32(6 * 448))
     table = np.arange(0x7F, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
@@ -491,7 +522,7 @@ def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_it
     each = np.repeat(least, 16, axis=0)
     quotient = np.where(each > 0, x / np.asarray(tensor) / np.where(each > 0, each, 1), 0).astype(np.float32)
     rounded = np.clip(quotient, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
-    decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32) * np.float32(bits.NVFP4_OWED)
+    decoded = np.asarray(decoded, np.float32) * np.float32(bits.NVFP4_OWED)
     np.testing.assert_array_equal(decoded, rounded * np.repeat(least, 16, axis=0))
 
 
@@ -502,10 +533,15 @@ def test_a_small_nonzero_tile_keeps_its_nvfp4_codes():
     underflow."""
     x = np.full((32, 8), np.float32(3e-36))
     x[::2] *= np.float32(-0.5)
-    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(x))
-    decoded = (np.asarray(bits.nvfp4_decoded(words, scales), np.float64) * bits.NVFP4_OWED
-               * np.float64(np.asarray(tensor)))
-    assert np.all(np.sign(decoded) == np.sign(x))
+
+    def decoded(x):
+        words, scales, tensor = bits.nvfp4_quantized(x)
+        return bits.nvfp4_decoded(words, scales), tensor
+
+    found = [run(x) for run in ran_here(decoded, "a small nonzero tile quantized to NVFP4")]
+    for codes, tensor in found:
+        values = np.asarray(codes, np.float64) * bits.NVFP4_OWED * np.float64(np.asarray(tensor))
+        assert np.all(np.sign(values) == np.sign(x))
 
 
 def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():

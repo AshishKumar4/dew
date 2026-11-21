@@ -156,15 +156,17 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
     assert not failures(found), "\n".join(failures(found))
 
 
+@pytest.mark.parametrize("case_index", [0, 1], ids=["kda", "kda-keys-256"])
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, case_index):
     """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
     compiled by XLA's CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py), within
-    the compile bound and the block's shared memory."""
-    found = compile_kernels(kda_training_cases(), target)
-    assert len(found) == 2
+    the compile bound and the block's shared memory (row 10557: each case its own pytest node)."""
+    cases = list(kda_training_cases())
+    assert len(cases) == 2
+    found = compile_kernels([cases[case_index]], target)
+    assert len(found) == 1
     assert not failures(found), "\n".join(failures(found))
-
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("target", gate_generations(scoped=True))
@@ -605,12 +607,16 @@ class GemmCase(NamedTuple):
     tile: Any
     consumers: int | None
     case: support.KernelCase
+    shape: str = ""
+    """Its projection (`GEMM_SHAPES`): two projections at one tile are two kernels, as a call leaving an axis
+    partial copies its blocks otherwise (`mosaic_gpu.partial_runs`) and one padded is compiled at its padded
+    extents."""
 
     @property
     def kernel(self) -> tuple:
-        """Its kernel's identity: its form and tile, the band its tiles are walked in apart
+        """Its kernel's identity: its form, tile and projection, the band its tiles are walked in apart
         (`Tiles.grid_block_n`), a contract case's count the tile's consumers stating it."""
-        return self.form, dataclasses.replace(self.tile, grid_block_n=0)
+        return self.form, dataclasses.replace(self.tile, grid_block_n=0), self.shape
 
 
 def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False,
@@ -662,7 +668,7 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                           launch.lowering(ba, config),
                                           {kernel: _model(launch, ba, config)},
                                           required=launch.legal(ba, config, target))
-                cases.append(GemmCase(name, config, consumers, case))
+                cases.append(GemmCase(name, config, consumers, case, shape))
     return cases
 
 
@@ -739,13 +745,9 @@ def _gate_forms(generation_name: str) -> set[str]:
 
 @functools.cache
 def _gate_cases(generation_name: str, form: str) -> list:
-    """A form's cases at every projection (`_gemm_mainloop_cases`), each distinct kernel once
-    (`GemmCase.kernel`)."""
-    found = {}
-    for shape in GEMM_SHAPES:
-        for case in _gemm_mainloop_cases(generation_name, shape, form=form):
-            found.setdefault(case.kernel, case)
-    return list(found.values())
+    """A form's cases at every projection (`_gemm_mainloop_cases`), each projection's call its own
+    (`GemmCase.shape`): two calls of one tile compile apart where one leaves an axis partial."""
+    return [case for shape in GEMM_SHAPES for case in _gemm_mainloop_cases(generation_name, shape, form=form)]
 
 
 def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> list:
@@ -983,15 +985,6 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
                 for count in {1, min(emitting.consumers, tiling.CONSUMERS)}}
     got = {(case.form, case.consumers) for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
-
-
-@pytest.fixture
-def libtpu_shared(monkeypatch):
-    """libtpu loaded in this process beside another's: its lock file holds one process's libtpu at a time,
-    so two test workers compiling for a TPU at once failed the second's load (ABORTED, /tmp/libtpu_lockfile).
-    A compile-only TPU needs no device a lock guards, so each loads with libtpu's own allowance and takes no
-    lock file."""
-    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
 
 
 @COMPILES_FOR_TPU

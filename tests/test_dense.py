@@ -21,6 +21,7 @@ from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral, _accumulated_dot_general
 from dew.nn.kernels import projections
 from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
+from dew.nn.programs import bodies, read_by
 from dew.quantization import Quantization, quantize_for_serving
 
 PARTITIONED = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None))
@@ -229,6 +230,124 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
 
     assert_as_exact(dew, reference, draw, f"{layer.__class__.__name__} bias gradient", seeds=BIAS_SEEDS,
                     truth_fn=as_given(lambda x, cotangent: {"bias": summed(cotangent, np.float64)}))
+
+
+@pytest.mark.parametrize("layer", [Dense(16), DenseGeneral((2, 8))], ids=["dense", "general"])
+def test_a_biased_layers_reverse_mode_holds_its_cotangent_once(layer):
+    """A biased projection's reverse mode returns its input's cotangent only with its kernel's and its bias's
+    gradients formed, the three through one exit barrier (`projections.dot_general`'s `bias`), where the
+    bias's own rule added its own, each a bound on XLA's fusions (row 6740); and reads its operands only
+    once its cotangent has arrived, the cotangent and every operand through one entry barrier
+    (`derivatives.with_cotangent_arrived`: read ahead of it, they raised a Muon LM's need past what parting
+    its stacks recovered, train 1113). A frozen bias's gradient is formed nowhere, the exit holding the
+    input's and the kernel's; with every parameter frozen, the entry alone holds."""
+    x = jnp.ones((4, 8), jnp.float32)
+    params = layer.init(jax.random.key(0), x)["params"]
+    out = jax.eval_shape(lambda x: layer.apply({"params": params}, x), x).size
+
+    def held(live):
+        def loss(trained, x):
+            return jnp.sum(layer.apply({"params": {**params, **trained}}, x) ** 2)
+
+        trained = {name: params[name] for name in live}
+        program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(trained, x).jaxpr
+        # Each barrier's operands by size (a bias's cotangent held shaped as the product broadcasts it), the
+        # entry's holding the cotangent (the output's size), each exit's results ones its program returns
+        # reads (`read_by`): the gradients leave through it.
+        entries, exits = [], []
+        for jaxpr in programs(program):
+            returned = read_by(jaxpr, jaxpr.outvars)
+            for eqn in jaxpr.eqns:
+                if eqn.primitive is jax.lax.optimization_barrier_p:
+                    sizes = sorted(var.aval.size for var in eqn.invars)
+                    if out in sizes:
+                        entries.append(sizes)
+                    else:
+                        assert all(var in returned for var in eqn.outvars)
+                        exits.append(sizes)
+        return entries, exits
+
+    kernel, bias = params["kernel"].size, params["bias"].size
+    entry = [sorted([out, x.size, kernel, bias])]
+    assert held(("kernel", "bias")) == (entry, [sorted([x.size, kernel, bias])])
+    assert held(("kernel",)) == (entry, [sorted([x.size, kernel])])
+    assert held(()) == (entry, [])
+
+
+def programs(jaxpr):
+    """`jaxpr` and every program within it (`bodies`), each whole, its equations in order."""
+    yield jaxpr
+    for eqn in jaxpr.eqns:
+        for body in bodies(eqn):
+            yield from programs(body)
+
+
+def test_a_bias_alone_moves_a_projection_whose_input_is_infinite_by_its_own_direction():
+    """A projection differentiated in its bias alone moves by the bias's direction, its input and its kernel
+    held, at the first order and at the second (the forward derivative of a forward derivative's value), and
+    the kernel's gradient, which reads no bias, does not move with it (forward over reverse): an infinite
+    input meets no zero direction of theirs (inf * 0, NaN), as the bias's own rule kept it apart from the
+    product (row 6740)."""
+    layer = Dense(1)
+    x = jnp.full((2, 1), jnp.inf, jnp.float32)
+    params = {"kernel": jnp.ones((1, 1), jnp.float32), "bias": jnp.zeros((1,), jnp.float32)}
+    direction = jnp.ones((1,), jnp.float32)
+
+    def moved(bias):
+        return jax.jvp(lambda bias: layer.apply({"params": {**params, "bias": bias}}, x), (bias,),
+                       (direction,))
+
+    np.testing.assert_array_equal(np.asarray(moved(params["bias"])[1]), np.ones((2, 1), np.float32))
+    _, again = jax.jvp(lambda bias: moved(bias)[0], (params["bias"],), (direction,))
+    np.testing.assert_array_equal(np.asarray(again), np.ones((2, 1), np.float32))
+
+    def kernel_gradient(bias):
+        return jax.grad(lambda kernel: jnp.sum(layer.apply({"params": {"kernel": kernel, "bias": bias}}, x)))(
+            params["kernel"])
+
+    # The kernel's gradient reads no bias: its forward derivative in the bias alone is zero.
+    _, turned = jax.jvp(kernel_gradient, (params["bias"],), (direction,))
+    np.testing.assert_array_equal(np.asarray(turned), np.zeros((1, 1), np.float32))
+
+
+BIAS_ORDER_SEEDS = 8
+"""The declared seeds of check 1 on a biased projection's gradient and curvature, sized by `seeds_for` on
+armada."""
+
+
+@pytest.mark.parametrize(("layer", "flaxs"), [
+    (Dense(16), nn.Dense(16)), (DenseGeneral((2, 8)), nn.DenseGeneral((2, 8))),
+    (DenseGeneral((2, 8), batch_dims=(0,)), nn.DenseGeneral((2, 8), batch_dims=(0,)))],
+    ids=["dense", "general", "batched"])
+def test_a_biased_layers_gradient_and_curvature_are_as_exact_as_flaxs(layer, flaxs):
+    """A biased projection's gradient and its curvature along a direction of its parameters (the gradient's
+    forward derivative: a Hessian's action, its kernel and bias terms mixed) under a loss nonlinear in its
+    output, on par with flax's own layer (check 1, its float64 run the truth): the bias's derivatives taken
+    inside the product's rule (`projections.dot_general`'s `bias`) are its own at every order, a batched
+    kernel's bias each member's own (row 6740)."""
+    x = jnp.zeros((4, 6, 12), jnp.float32)
+    shapes = jax.eval_shape(lambda: layer.init(jax.random.key(0), x)["params"])
+
+    def arm(module):
+        def run(params, x, direction):
+            def loss(params):
+                return jnp.sum(jnp.tanh(module.apply({"params": params}, x)) ** 2)
+
+            gradient, curvature = jax.jvp(jax.grad(loss), (params,), (direction,))
+            return {"gradient": gradient, "curvature": curvature}
+        return run
+
+    def draw(seed):
+        rng = np.random.default_rng([6740, seed])
+
+        def drawn():
+            return jax.tree.map(lambda leaf: rng.standard_normal(leaf.shape).astype(np.float32) * 0.3,
+                                shapes)
+
+        return drawn(), rng.standard_normal(x.shape).astype(np.float32), drawn()
+
+    assert_as_exact(jax.jit(arm(layer)), jax.jit(arm(flaxs)), draw, f"{layer.__class__.__name__} curvature",
+                    seeds=BIAS_ORDER_SEEDS)
 
 
 SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 256), "dense": (Dense(3), (8, 32, 32, 4), 256)}

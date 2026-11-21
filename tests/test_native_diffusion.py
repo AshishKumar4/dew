@@ -51,14 +51,25 @@ STREAMED = ("sd", "xl", "safety")
 (tests/test_pipeline_streaming.py) and hold it to the source beside the whole load."""
 
 
-@pytest.mark.parametrize("part", ["walk", "update"])
-@pytest.mark.parametrize(
-    "task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"]
-)
+BUNDLE_CHECKS = [*((task, None) for task in ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint",
+                                               "refiner")),
+                 ("safety", "walk"), ("safety", "update")]
+"""Each pipeline's check: both parts in one process over one load of each pipeline (None), but the safety
+pipeline's, whose parts together run past a group's 120 s, each part in its own. Measured on armada's large
+class (AMD EPYC, 8 CPUs), a task a pipeline, each running `.venv-3.12/bin/python -m pytest -q -p
+no:cacheprovider --durations=3` over the pipeline's nodes (both parts' at main 45131ca01, job
+20261120222129-ec6842f5; the one at 3e8cf35cb, job 20261120221427-f93ad5d3) and summing their call
+seconds: 852 s to 748 s over the eight, safety 137 s apart and 131 s together."""
+
+
+@pytest.mark.parametrize(("task", "part"), BUNDLE_CHECKS,
+                         ids=[task if part is None else f"{task}-{part}" for task, part in BUNDLE_CHECKS])
 def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task, part):
-    """A saved pipeline's walk held to the source's (`part` 'walk'), or its update, reload and export
-    ('update'), each in a process of its own (tools/check_native_diffusion.py)."""
-    run_check(saved_pipelines / task, "--part", part, *(["--streamed"] if task in STREAMED else []))
+    """A saved pipeline's walk held to the source's, and its update, reload and export
+    (tools/check_native_diffusion.py's `check_pipeline`): both in one process over one load of each
+    pipeline, or the `part` named (`BUNDLE_CHECKS`)."""
+    run_check(saved_pipelines / task, *(["--part", part] if part else []),
+              *(["--streamed"] if task in STREAMED else []))
 
 
 EVALUATION_SEEDS = 8

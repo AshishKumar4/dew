@@ -2414,6 +2414,21 @@ def _unit_turn_grad(q, k, v, do, state, *, turn=None):
                                 scale=1.0, group=1, pairs=1)
 
 
+def test_a_turned_gradients_overflowed_term_reaches_no_later_tokens_sum():
+    """Two tokens, no turn, decay or write, a memory entering of `(0, 2^126)` read by the first token's query
+    `(1, 0)` under its output's cotangent 4 alone: the first token's turn gradient overflows (`2^128`), and
+    the second's, which no term of the first reaches, is exactly zero, as the scan of its suffix keeps it
+    (`recurrence_algebra.suffix_sums(scanned=True)`), where a triangle's dot multiplied the first token's
+    infinity by zero, NaN (rows 7969 and 7975's head review)."""
+    q = jnp.zeros((1, 2, 1, 2), jnp.float32).at[0, 0, 0, 0].set(1.0)
+    k = jnp.zeros((1, 2, 1, 2), jnp.float32)
+    v = jnp.zeros((1, 2, 1, 1), jnp.float32)
+    do = jnp.zeros((1, 2, 1, 1), jnp.float32).at[0, 0, 0, 0].set(4.0)
+    state = jnp.zeros((1, 1, 2, 1), jnp.float32).at[0, 0, 1, 0].set(np.float32(2.0 ** 126))
+    gradient = np.asarray(_unit_turn_grad(q, k, v, do, state))
+    assert np.isinf(gradient[0, 0, 0, 0]) and gradient[0, 1, 0, 0] == 0.0
+
+
 def test_turned_gradient_p0_regressions_f1_f2_f3():
     """Regressions for turned-frame base-review P0s (d80c85a37 F1/F2/F3, 1cf389a60 F1, e488dc198 F1):
     carry zero-reset tangent (-1), deferred scale restoration across both own-chunk and cross-chunk cross

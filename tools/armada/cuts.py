@@ -89,28 +89,49 @@ def weighed(session, tests: list[float], seconds: float, target: float,
     return split(session, [each * seconds / total for each in tests] if total > 0 else tests, seconds, target)
 
 
-def ran(rows: Mapping[str, list[dict]]) -> dict[str, list[float]]:
-    """How main's CI ran each test file, from its rows by file (ci.py's `verdict_rows`): each group's seconds
-    in order (one, its whole row's, where it ran whole) where every row is green and every group of its count
-    is there; none where a row is red or a group is missing."""
-    runs: dict[str, list[float]] = {}
-    for name, held in rows.items():
-        if any(row["exitCode"] != 0 for row in held):
+def complete(rows: Mapping[str, list[dict]]) -> dict[str, list[dict]]:
+    """Each test file main's CI ran whole or as every group of one cut, from its rows by file (ci.py's
+    `verdict_rows`), every row green: its rows in group order (one, its whole row, where it ran whole)."""
+    found: dict[str, list[dict]] = {}
+    for name, held_ in rows.items():
+        if any(row["exitCode"] != 0 for row in held_):
             continue
-        groups = {row["name"].partition("#")[2]: row["seconds"] for row in held}
+        groups = {row["name"].partition("#")[2]: row for row in held_}
         if set(groups) == {""}:
-            runs[name] = [groups[""]]
+            found[name] = [groups[""]]
             continue
-        found = {CUT.fullmatch(group) for group in groups}
-        counts = {int(each[2]) for each in found if each}
-        if None not in found and len(counts) == 1 and len(groups) == (count := counts.pop()):
-            runs[name] = [groups[f"{group}/{count}"] for group in range(1, count + 1)]
-    return runs
+        matched = {CUT.fullmatch(group) for group in groups}
+        counts = {int(each[2]) for each in matched if each}
+        if None not in matched and len(counts) == 1 and len(groups) == (count := counts.pop()):
+            found[name] = [groups[f"{group}/{count}"] for group in range(1, count + 1)]
+    return found
+
+
+def ran(rows: Mapping[str, list[dict]]) -> dict[str, list[float]]:
+    """How main's CI ran each test file (`complete`): each group's seconds in order (one, its whole row's,
+    where it ran whole); none where a row is red or a group is missing."""
+    return {name: [row["seconds"] for row in held_] for name, held_ in complete(rows).items()}
+
+
+def held(rows: Mapping[str, list[dict]]) -> dict[str, list[set[str]]]:
+    """Each file `complete` reads, its groups' tests in their order, as their rows timed them."""
+    return {name: [set(row.get("tests", {})) for row in held_] for name, held_ in complete(rows).items()}
+
+
+def moved(session, bounds: list[str], groups: list[set[str]] | None, known: list[str]) -> bool:
+    """Whether a stored cut's `bounds` are not what ran as `groups` (`held`): a test of the record the cut was
+    made by (`known`) timed in another group than the cut puts it in (`session.cut_by`), whichever way a
+    boundary moved. A test timed in no group (skipped, or uncollected) proves nothing, so a cut is never
+    refused for what a run did not time, and recut every train."""
+    if groups is None:
+        return False
+    place = {node: index for index, group in enumerate(session.cut_by(known, bounds)) for node in group}
+    return any(place.get(node, index) != index for index, tests in enumerate(groups) for node in tests)
 
 
 def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[float]], target: float,
-             before: Mapping[str, dict[str, float]],
-             after: Mapping[str, dict[str, float]]) -> dict[str, list[str]]:
+             before: Mapping[str, dict[str, float]], after: Mapping[str, dict[str, float]],
+             ran_as: Mapping[str, list[set[str]]] | None = None) -> dict[str, list[str]]:
     """The stored cuts (session.CUTS) after main's CI ran each file as `runs` says (`ran`), every group within
     `KEPT` of `target`, setup and all: a file it ran as its stored cut keeps it; one it ran as another cut
     stores that cut, made from the record it was cut by (`before`: each file's own tests, node id to seconds).
@@ -118,11 +139,16 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
     (`rebalanced`); where none fit, or the file ran as another cut, the file is cut anew from the folded
     record (`after`), as `split` cuts a file it has no cut for. Each group's first test is its boundary; a
     file run whole within its bound, or cut into a group that holds none of its recorded tests, stores none; a
-    file it did not run keeps its own. The fold is the one place a cut changes (Main, 2026-11-13: a group's
-    name means the same tests from run to run, so its record is found again)."""
+    file it did not run keeps its own. A file whose run's groups (`ran_as`, `held`) show another cut of the
+    same count ran stores that one, never its stored cut it did not run, which a plan reweighed since would
+    take up again and rename every group of it (review, row 10776). The fold is the one place a cut changes
+    (Main, 2026-11-13: a group's name means the same tests from run to run, so its record is found again)."""
     kept = dict(stored)
     for name, seconds in runs.items():
         bounds = stored.get(name)
+        known = sorted(before.get(name, {}))
+        if bounds is not None and moved(session, bounds, (ran_as or {}).get(name), known):
+            bounds = None
         if max(seconds) <= session.KEPT * target:
             if bounds is not None and len(bounds) + 1 == len(seconds):
                 continue

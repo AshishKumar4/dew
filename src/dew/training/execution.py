@@ -616,7 +616,8 @@ def placed_host(objective, fresh: Callable[[], TrainState], state_mesh: Mesh, de
     one leaf, not the tree, and one JIT could not have returned to the two
     device sets anyway.
     """
-    from dew.distributed.host import evict, place_leaf, stream
+    from dew.distributed.host import place_leaf, stream
+    from dew.distributed.pages import evict
     held = objective.held_variables()
     with jax.default_device(state_mesh.local_devices[0]):
         state = fresh()

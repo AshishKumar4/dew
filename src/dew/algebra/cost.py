@@ -23,7 +23,7 @@ from dew.algebra.rules import CONTRACTED, shape
 from dew.algebra.terms import OPERATIONS, RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import cost as kernel_cost, emission
+from dew.nn.kernels.templates import cost as kernel_cost
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import eight, half
 from dew.nn.precision import asks_default_precision, effective_precision, precision_names
@@ -126,7 +126,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         return Work(conversions=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.unary)) is not None:
         elements = made(graph, args[:1], held)
-        special = text(args[1]) in _SPECIAL_FUNCTIONS
+        special = text(args[1]) in _special_functions()
         return Work(exponentials=elements) if special else Work(operations=elements)
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == RESCALE:
         # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an element.
@@ -143,10 +143,16 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     return Work()
 
 
-_SPECIAL_FUNCTIONS = frozenset(operation.symbol for primitive, operation in OPERATIONS.items()
-                               if primitive in emission.SPECIAL_FUNCTIONS)
-"""The symbols of the operations the special-function units evaluate, by the kernels' counter's one rule
-(`emission.SPECIAL_FUNCTIONS`)."""
+@functools.cache
+def _special_functions() -> frozenset[str]:
+    """The symbols of the operations the special-function units evaluate, by the kernels' counter's one rule
+    (`emission.SPECIAL_FUNCTIONS`), read where a price first asks: the emission's module loads the templates'
+    resources, which no process reading the algebra alone imports (the test cache keys a row on each module
+    it loads)."""
+    from dew.nn.kernels.templates import emission
+
+    return frozenset(operation.symbol for primitive, operation in OPERATIONS.items()
+                     if primitive in emission.SPECIAL_FUNCTIONS)
 
 LANE_BYTES = 4
 """The bytes a reduction's result element takes in what XLA's fusion keeps on chip (`work`): a vector lane's,

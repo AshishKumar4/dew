@@ -25,12 +25,14 @@ against 8.4).
 from __future__ import annotations
 
 import abc
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import importlib
 import importlib.util
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
@@ -1985,10 +1987,10 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class GroupedCase:
-    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its
-    target (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform
-    places), whether they see its operands whole (`whole`,
-    `dew.nn.sharding.seen_whole`), the `product` it declares, its `extents`, its launches bound to it
+    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its target
+    (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform places),
+    whether they see its operands whole (`whole`: no automatic mesh axis splits them,
+    `dew.nn.sharding.automatic_axes`), the `product` it declares, its `extents`, its launches bound to it
     (`call`) and the `kind` of call it is (`Kind`, as `gmm_call` and `tgmm_call` state it), which with the
     device's instruction family is its cell (`DECLARED`)."""
 
@@ -2334,9 +2336,60 @@ def launched(launches, arguments, options, *, product: Product, whole: bool,
     products, `gemm._one_launch`): taken and reported as it is, the call selected once (row 8735)."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
     route = selection.select(GROUPED, case) if selected is None else generation.published(selected)
+    if (collected := _WEIGHED.get()) is not None:
+        collected.append((case.call, route.kernel))
     if route.kernel in ('xla', APART.name):
         return None if route.kernel == 'xla' else APART
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
+
+
+_WEIGHED: contextvars.ContextVar[list | None] = contextvars.ContextVar('weighed', default=None)
+"""The calls `launched` selects for while `weighed` collects them."""
+
+
+@contextlib.contextmanager
+def weighed() -> Iterator[list[tuple[base.Call, str]]]:
+    """Each call traced in the block that `launched` selects for, in order, as its templates' bindings
+    (`base.Call`) and the launch it selected (a template's name, 'xla' or `APART`'s): what a pass weighing a
+    region reads of the launches it would make (`fused_gemm.analysis`), whether or not they are built."""
+    found: list[tuple[base.Call, str]] = []
+    token = _WEIGHED.set(found)
+    try:
+        yield found
+    finally:
+        _WEIGHED.reset(token)
+
+
+def resident(hooked: Sequence[tuple[base.Call, str]],
+             unhooked: Callable[[], Sequence[tuple[base.Call, str]]]) -> bool:
+    """Whether a product's Mosaic launch with its hooks keeps the residency the same launch takes without
+    them, each the last call `weighed` collected, `unhooked`'s weighed only where `hooked`'s is a Mosaic
+    launch (kernel-templates §4: a neighbour joins the kernel where the kernel with it still holds its
+    residency and stays spill-free; KERNEL-TEMPLATES-13, row 9032): the programs a multiprocessor of the
+    tile it derives (`Template.derived`, its plan's: the residency `mosaic.Family.kernel` launches at, its
+    registers within the family's budget) at least those of the tile it derives for the product unhooked,
+    whatever launch that call selects. A hooked launch that derives no tile holds none; any other launch,
+    or no product unhooked, is not judged. On an A100 an epilogue reading four float32 arrays of the
+    product's shape derived 64 x 64 at one program a multiprocessor, where the product alone takes two
+    (FS-HOOKED-RES)."""
+    if not hooked:
+        return True
+    call, kernel = hooked[-1]
+    if kernel not in call.bound:
+        return True
+    template, ba = call.bound[kernel]
+    if not isinstance(template, _Mosaic):
+        return True
+    target = generation.gpu_target()
+    config = template.derived(ba, target)
+    if config is None:
+        return False
+    bare = unhooked()
+    if not bare:
+        return True
+    plain_template, plain_ba = bare[-1][0].bound[kernel]
+    plain = plain_template.derived(plain_ba, target)
+    return plain is None or config.programs >= plain.programs
 
 
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),

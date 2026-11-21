@@ -2,6 +2,8 @@
 policy saves, offloads or recomputes by (`dew.nn.backbones.decoder_block.RematPolicy`): each declared
 once, here, and named by its member where it is marked."""
 
+import contextlib
+import contextvars
 import enum
 
 
@@ -65,3 +67,30 @@ ATTENTION_CONTEXT_RESIDUALS = (*ATTENTION_RESIDUALS, Residual.CONTEXT)
 DELTA_RULE_RESIDUALS = (Residual.CONTEXT, Residual.SCAN, Residual.CONV, *DELTA_RESIDUALS)
 """A delta-rule mixer's names: its scan's output as its context and as a scan, its convolution's output,
 the delta rule's three."""
+
+
+RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
+"""The residuals a decoder block's remat rung has the layers that compute them recompute, the block
+keeping every other (`dew.nn.backbones.decoder_block.RematPolicy.recompute`): a delta rule traced
+inside recomputes its memory in its backward where this names 'delta_memory'
+(`dew.nn.kernels.recurrence_chunk._blocked_rule`), and keeps it otherwise. A block sets it as it traces its
+layers (`recomputing`); held here, beside the names, so a block reads it without importing a recurrence's
+kernels."""
+
+
+def recomputed_memory() -> bool:
+    """Whether the layers traced here recompute the delta rule's memory in their backward (`RECOMPUTED`): the
+    template's call takes it as an argument (`template.mosaic_rule`'s `recomputed`), so the selectors' binds
+    (`port_kernel`, `scan_kernel`) and the run's (`template_rule`) read it alike, and a launch a compile
+    refused under the rung is the one the route judges (row 4133)."""
+    return Residual.DELTA_MEMORY in RECOMPUTED.get()
+
+
+@contextlib.contextmanager
+def recomputing(names: tuple[str, ...]):
+    """Trace the layers inside with `names` recomputed by the layers that compute them (`RECOMPUTED`)."""
+    token = RECOMPUTED.set(names)
+    try:
+        yield
+    finally:
+        RECOMPUTED.reset(token)

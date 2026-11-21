@@ -17,6 +17,8 @@
   (test_float64_terms).
 - A multiply-add marked to round alone rounds each step, as precision's unbarriered transforms take it
   (test_no_contract).
+- APG's projection at its range's edges is Diffusers' float64 projection's, as on a CPU (test_guidance).
+- A fusion reading a value directly and through a reversed view computes its exact sum (test_view_buffers).
 """
 
 import functools
@@ -27,11 +29,13 @@ import test_audio as audio
 import test_chunked_cross_entropy as chunked_cross_entropy
 import test_float64_terms as float64_terms_tests
 import test_fp8_base as fp8_base
+import test_guidance as guidance_tests
 import test_lowering as lowering
 import test_moe_precision as moe_precision
 import test_no_contract as no_contract
 import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
+import test_view_buffers as view_buffers
 from gpu_flow import Cell, covering, isolated, run_cells, when
 
 from dew.nn.kernels import grouped_matmul, grouped_triton, norm_swiglu
@@ -61,12 +65,20 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
         Cell("a correctly rounded division is IEEE division's at its edges on a GPU",
              precision_policy.divides_as_ieee_division_at_its_edges, fault=OWN),
         Cell("a correctly rounded division is IEEE division's on a GPU dividing approximately",
-             precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN),
+             precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN,
+             at_run="a fresh process of its own flags"),
         Cell("a power of two's scaling rounds a subnormal result once on a GPU",
              precision_policy.power2_rounds_a_subnormal_result_once, fault=OWN),
         Cell("a flow's scaling rounds a subnormal result once on a GPU", _flow_scaling, fault=OWN),
+        Cell("APG holds its projection at its range's edges on a GPU",
+             guidance_tests.apg_holds_its_projection_at_its_ranges_edges, fault=OWN),
         Cell("a multiply-add marked to round alone rounds each step on a GPU",
              no_contract.a_marked_multiply_add_rounds_each_step, fault=OWN),
+        *(Cell(f"a value read through a reversed view is summed exactly on a GPU: {program}",
+               functools.partial(
+                   view_buffers.a_value_read_through_a_reversed_view_is_summed_exactly, program),
+               fault=OWN)
+          for program in view_buffers.PROGRAMS),
         *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",
                functools.partial(precision_policy.compensated_primitives_hold_under_jit, shape), fault=OWN)
           for shape in precision_policy.COMPENSATED_SHAPES),
@@ -75,19 +87,21 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
                  fp8_base.a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower, "fp8")), fault=OWN),
         *(Cell(f"the {kind} audio encoder compiles with its mask built in the same jit",
                lambda kind=kind: audio.encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(
-                   audio._audio(kind)), native={"compile": f"the {kind} encoder's mask in its jit"})
+                   audio.audio_on_host(kind)), native={"compile": f"the {kind} encoder's mask in its jit"})
           for kind in ("gemma3n", "gemma4")),
         Cell("a GPU reports its block and multiprocessors whether or not a row names it",
-             lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it, fault=OWN),
+             lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it, fault=OWN,
+             at_run="its GPU's own facts, which a compile-only device does not report"),
         Cell("a GPU reports its clock and memory bandwidth from its driver",
-             lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver, fault=OWN),
+             lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver, fault=OWN,
+             at_run="its CUDA driver's facts, read on its GPU"),
         # A GPU process walks a truth's terms where its values lie, from either placement in either order
         # (`float64_terms.evaluated_on`: an unprepared site's, a steered walk's), each compiled evaluation
         # keyed by its platform (row 8531).
         Cell("a Dense layer's float64 terms are its placement's own on a GPU host",
              isolated(tmp_path_factory)(
                  float64_terms_tests.a_dense_layers_terms_are_its_placements_own_on_a_gpu_host, "placed"),
-             fault=OWN),
+             fault=OWN, at_run="fresh processes of each placement"),
     ]
 
 

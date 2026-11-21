@@ -1301,13 +1301,18 @@ def partial_runs(tiles: Tiles, dtype, interpret, *, transpose_rhs: bool, plain: 
     the fork from post84, row 5727); on a family whose products read the staged blocks by descriptor
     (`Issuer.operands_in_registers` False: wgmma's, tcgen05's), staged at the widest swizzle, a step's copy
     one tile along its depth, where a family reading them into registers is staged narrower by layout
-    inference (mma.sync.fed's 32-byte rows on an sm120: a 64-deep step four 16-element tiles). Elsewhere the
+    inference (mma.sync.fed's 32-byte rows on an sm120: a 64-deep step four 16-element tiles), and a partial
+    depth's rows no more than one copy moves along a dimension (`Family.copy_extent`). Elsewhere the
     launch's call is padded to whole tiles (`grouped_matmul._Mosaic. _aligned`), as it is where a stride is no
     whole 16 bytes, which no TMA copy takes."""
     family = family_of(tiles, dtype)
     bounded = family.bounded_loads and not family.operands_in_registers and not interpret and plain
     one = partial_step(dtype)
-    return (bounded and not gathered and tiles.block_k == one,
+    # A partial depth's untiled copy of the rows' block is a CTA's whole rows tall, one dimension of the
+    # copy's box, which TMA bounds (`Family.copy_extent`: an H100's 384 x 64 forward of a 200-deep call failed
+    # to lower); a partial width's copies are the matrix's one-tile blocks and each consumer's output share.
+    tall = family.copy_extent is not None and tiles.block_m > family.copy_extent
+    return (bounded and not gathered and tiles.block_k == one and not tall,
             bounded and not scattered and (transpose_rhs or tile_columns(tiles, family) == one))
 
 

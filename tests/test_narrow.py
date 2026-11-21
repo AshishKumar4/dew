@@ -623,8 +623,12 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     # with its copies in all, the step in what the pool can still take: a fresh GH200 4B run's (M-MC-3m).
     # The step is planned before the state is placed on the pool's bytes in all, not on its largest block,
     # which placing the state reshapes, and judged on the allocator once the state is on it: compiled once,
-    # beside the start, not again once the state is placed.
-    grown = {"bytes_limit": state + with_copies + state // 2, "bytes_in_use": 0, "pool_bytes": state,
+    # beside the start, not again once the state is placed. Its growth holds the step with its copies
+    # twice: a BFC pool whose largest block cannot take twice the bytes placed beside the temporaries
+    # gives half its growth as one block (`memory.placeable_beside`), which a GPU's step, its temporaries
+    # dwarfing its state, meets (row 5040: a GH200's step of 0.03 GiB of temporaries was refused on a
+    # growth that held them once).
+    grown = {"bytes_limit": state + 2 * with_copies + state // 2, "bytes_in_use": 0, "pool_bytes": state,
              "largest_free_block_bytes": state // 2}
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
     # A fresh run's process, holding no executable of the runs above.

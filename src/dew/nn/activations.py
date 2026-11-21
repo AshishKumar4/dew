@@ -35,7 +35,6 @@ from flax.typing import Dtype
 
 from . import derivatives
 from .derivatives import Protected, contracted, declared_tangent, marked
-from .kernels import norm_swiglu
 from .precision import at_least_fp32, capped_logits, divided, logistic_value, rounded_to, softplus
 
 
@@ -254,6 +253,8 @@ GatedActivation = str | Situ
 
 def _gate_function(activation: str, implementation: str) -> Callable[[jax.Array], jax.Array]:
     """The gate's activation `activation` names, refusing an unknown name or implementation."""
+    from .kernels import norm_swiglu
+
     if implementation not in norm_swiglu.IMPLEMENTATIONS:
         raise ValueError(f"implementation must be one of {norm_swiglu.IMPLEMENTATIONS}, "
                          f"got {implementation!r}")
@@ -343,7 +344,10 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
     round nowhere. A `Situ` computes its own product. SwiGLU's
     `implementation` defaults to the generation's measured kernel; off a GPU,
     'pallas' too runs XLA's product. GeGLU and SiTU remain XLA products. `axes`,
-    the operands' logical axes, place the kernel on a mesh."""
+    the operands' logical axes, place the kernel on a mesh. The kernels are imported where a product is
+    asked, not with this module, which every activation's user imports (row 6740's cache warmth)."""
+    from .kernels import norm_swiglu
+
     if isinstance(activation, Situ):
         return activation
     portable = _portable(_gate_function(activation, implementation), lambda gate, up: (gate, up))
@@ -359,6 +363,8 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     writes the packed layout (`norm_swiglu.packed_swiglu`), and XLA's product
     recomputes from the packed output itself, so neither copies a half out.
     `axes` are the product's logical axes, `[..., H]`'s."""
+    from .kernels import norm_swiglu
+
     portable = _portable(_gate_function(activation, implementation),
                          lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
     return _dispatched(activation, portable,

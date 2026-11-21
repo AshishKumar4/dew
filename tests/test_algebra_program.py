@@ -952,6 +952,21 @@ def test_xlas_schedule_on_a_tpu_prices_what_its_kernels_keep_in_vmem(target_name
     assert product.kept_bytes in kernel_cost.units(product, unmeasured)[1]
 
 
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_a_tpu_tile_walks_staged_bytes_are_priced_at_its_vmem_rate(target_name):
+    """A Pallas TPU template's staged bytes (`Work.shared_bytes`, its tiles copied into VMEM) are priced on
+    on-chip memory's unit at the chip's VMEM rate in a tile walk (`templates.cost.rates`, `device=False`: the
+    chip its one multiprocessor), where they were work no rate priced and a TPU template's forms were
+    compared without them (row 8729); a TPU no one measured leaves them unpriced."""
+    tpu, unmeasured = generation.TARGETS[target_name], generation.TARGETS["v4"]
+    staged = kernel_cost.Work(shared_bytes=4.0 * 512 * 1024)
+    on_chip = 3
+    priced, unpriced = kernel_cost.units(staged, kernel_cost.rates(tpu, device=False))
+    assert priced[on_chip] == staged.shared_bytes / tpu.vmem_rate
+    assert not any(unpriced)
+    assert staged.shared_bytes in kernel_cost.units(staged, kernel_cost.rates(unmeasured, device=False))[1]
+
+
 def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     """A scan's chunk form on a v5e (`linear_scan.derive` under XLA's schedule, as `scan` derives it) keeps
     its products' results and a token step's state on chip (`Work.kept_bytes`), which the TPU's VMEM rate
@@ -1776,3 +1791,67 @@ def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
     held = traced(made())
     gc.collect()
     assert held() is None
+
+
+def _mapped_over_rows(program, specs, devices: int = 2):
+    """`program` mapped per shard (`jax.shard_map`) over `devices` of this process's devices, its axis
+    `data`, its inputs split as `specs` (each a PartitionSpec's axes) and its output along its rows."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.asarray(jax.devices()[:devices]), ("data",))
+    return jax.shard_map(program, mesh=mesh, in_specs=tuple(PartitionSpec(*spec) for spec in specs),
+                         out_specs=PartitionSpec("data"))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_bodys_sums_take_their_cheaper_form_varying_as_the_values_they_replace():
+    """Two sums a manual mesh's body joins (`two_sums`, every input split along their rows): the cheaper
+    form, traced over the window's inputs as the body types them (their manual axes among them,
+    `fusion.typed`), varies as the values it replaces do, so it is spliced (row 6578's review, F5: traced
+    over unsplit types, its values varied over nothing and the output-type gate discarded it), and the
+    program computes what it computes (check 1)."""
+    mapped = _mapped_over_rows(two_sums, (("data",), ("data",), ("data",)))
+    assert cheaper_spliced(mapped, *rows(17, *SHAPES_MARKED))
+    assert_as_exact(jax.jit(algebra.rewritten(mapped)), jax.jit(mapped),
+                    lambda seed: rows(seed, *SHAPES_MARKED), "a mapped body's joined sums", seeds=8)
+
+
+def _span_of_a_constant_beside_joined_sums(x, y, a):
+    """An Algebra span closing over an array (`cumsum(sin(x * held))`, nothing the rules lower) beside two
+    sums the pass joins (`two_sums`): the constant-span witnesses' body."""
+    from dew.nn.derivatives import Algebra, marked
+
+    held = np.linspace(0.5, 1.5, x.shape[-1], dtype=np.float32)
+    kept = marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x * held), axis=-1))(x)
+    return kept, two_sums(x, y, a)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_body_whose_rewrite_holds_a_constant_binds_it_as_an_operand():
+    """A manual mesh's body holding an Algebra span that closes over an array (`cumsum(sin(x * held))`,
+    nothing the rules lower) beside two sums the pass joins (`two_sums`): the join is spliced and the span,
+    its array a constant of its own, is rewritten within its call, so no constant reaches the map's body,
+    which JAX's lowering binds none of (row 6578's review, F1: opened, its array was the body's and the
+    map's lowering refused it), and the program computes what it computes."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    split = PartitionSpec("data")
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    mapped = jax.shard_map(_span_of_a_constant_beside_joined_sums, mesh=mesh, in_specs=(split,) * 3,
+                           out_specs=(split, split))
+    assert cheaper_spliced(mapped, *rows(18, *SHAPES_MARKED))
+    assert_as_exact(jax.jit(algebra.rewritten(mapped)), jax.jit(mapped),
+                    lambda seed: rows(seed, *SHAPES_MARKED), "a mapped body's span beside joined sums",
+                    seeds=8)
+
+
+def test_a_checkpoints_body_holding_a_span_of_a_constant_lowers_as_written():
+    """A checkpoint (`jax.checkpoint`) whose body holds an Algebra span that closes over an array beside two
+    sums the pass joins: the join is spliced and the span, its array a constant of its own, is rewritten
+    within its call, so no constant reaches the checkpoint's body, which JAX stages and lowers with none
+    (row 6578's review: opened, its array was the body's and the checkpoint's lowering refused it), and the
+    program computes what it computes."""
+    both = jax.checkpoint(_span_of_a_constant_beside_joined_sums)
+    assert cheaper_spliced(both, *rows(20, *SHAPES_MARKED))
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a checkpoint's span of a constant beside joined sums", seeds=8)

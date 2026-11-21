@@ -8,9 +8,11 @@ long and fading memories, steep then mild decays), held as test_recurrence_stabi
 
 - finite wherever the recurrence a token at a time in float64 is;
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm in the call's 16-bit dtype, its
-  family's independent oracle (docs/design/testing.md): the fla port where it runs the form (the delta rule
-  with a decay), the recurrence a token at a time where the form's family has no release (a write gate
-  without the delta rule), its distance from the portable math reported beside the verdict. Mamba2's rated
+  family's independent oracle (docs/design/testing.md): recorded fla-core where it runs the form (the delta
+  rule with a decay; a write gate without it under a decay a head, fla's `chunk_simple_gla` on its keys
+  gated, whose chunked state gradient takes the chunk's `q^T do` in one product as the template's does, 1.57
+  times the token loop's distance, row 6755), the recurrence a token at a time where no fla release runs it,
+  its distance from the portable math reported beside the verdict. Mamba2's rated
   decay runs under both forms (`forms_of`): the accurate ones held to the portable math, the fast ones, its
   16-bit numbers mamba_ssm's (`chunk_forward.prepared`), to the port of mamba_ssm's kernels, as recorded
   mamba_ssm holds them at the same inputs (test_mamba_ssd).
@@ -121,9 +123,11 @@ def reference_arm(hooks, forms: str | None, **bound):
 
 
 def fla_recorded(hooks) -> bool:
-    """Whether a form's reference is recorded fla-core (`fla_sites`): the delta rule with a decay on its
-    operands as given, no gates formed in the rule."""
-    return hooks.delta and hooks.decay != 'none' and hooks.gates is None
+    """Whether a form's reference is recorded fla-core (`fla_sites`): the delta rule with a decay, or a write
+    gate without it under a decay a head (`chunk_simple_gla` on its keys gated), on its operands as given, no
+    gates formed in the rule."""
+    held = (hooks.delta and hooks.decay != 'none') or (hooks.write_gate and hooks.decay == 'scalar')
+    return held and hooks.gates is None and not hooks.rated
 
 
 @contextlib.contextmanager

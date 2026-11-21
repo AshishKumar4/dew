@@ -284,7 +284,7 @@ def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16,
 
 
 @pytest.mark.parametrize("layout", list(FORKED))
-@pytest.mark.check1_shards(seeds=8, per_task=4)
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_the_template_is_as_exact_over_a_forked_call_interpreted(layout):
     """`the_template_is_as_exact_over_a_forked_call` off a GPU, over one forward program's block of 128
     channels: its backward interprets a program a row's channel, and at the shape's 256 a draw took 621 s

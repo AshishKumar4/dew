@@ -10,14 +10,25 @@ datasets. The stage libraries (`images`, `video`, `audio`, `text`, `chat`,
 `Trainer.fit` reads a dataset as the run's mesh shares it.
 
 Each name below is imported from its own module when first read, so importing the package reads none of
-the stage libraries a run does not use. `dew.data.storage` alone loads with it: it registers the
-`dewcache::` protocol fsspec reads files through, before any store resolves.
+the stage libraries a run does not use. It registers the `dewcache::` protocol fsspec reads files through,
+before any store resolves, by its class's name: `dew.data.storage` loads where a URL first names it, so a
+test that reads no store imports none of it, nor is reached by its changes (the test cache's keys).
 """
 
 from typing import TYPE_CHECKING
 
+import fsspec
+
 from dew._exports import lookup as _lookup
-from dew.data import storage as storage
+
+if "dewcache" in fsspec.registry:
+    # A class another caller registered first, which fsspec's registry holds before any name: Dew's
+    # mirror takes its place, its byte limit and pins with it.
+    from dew.data.storage import BoundedFileCache
+
+    fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
+else:
+    fsspec.register_implementation("dewcache", "dew.data.storage.BoundedFileCache", clobber=True)
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.data import audio, chat, images, preferences, presets, prompts, text, video

@@ -8,13 +8,13 @@ import grain
 import jax
 import numpy as np
 import pytest
-from grain.experimental import FirstFitPackIterDataset
+from grain.experimental import ConcatThenSplitIterDataset, FirstFitPackIterDataset
 
 from dew.batch import VALID_ROWS, Coordinates
 from dew.data import Loading, Memory
 from dew.data.compile import compile, validation
 from dew.data.dataset import DataPartition
-from dew.data.packing import FirstFitPacked
+from dew.data.packing import ConcatPacked, FirstFitPacked
 from dew.data.pipeline import Pack, Pipeline
 from dew.data.plan import fingerprint
 from dew.data.text import Chunks
@@ -36,7 +36,7 @@ def _drawn(count: int) -> list[tuple[int, int, int | None]]:
 @pytest.mark.parametrize("window, bins, segments",
                          [(8, 1, None), (8, 3, None), (16, 4, 3), (5, 2, 2), *_drawn(16)])
 def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
-    """Dew plans first-fit windows by documents' lengths alone (`dew.data.tokens.first_fit`), a
+    """Dew plans first-fit windows by documents' lengths alone (`dew.data.placement.first_fit`), a
     placement Grain's packer reaches only by packing every token, so Grain's packer is its oracle,
     over packings drawn at random as over the edge cases. Documents from one token to well past the
     window, a few exactly the window, with ids and roles, cut by a chunk step before a first-fit pack:
@@ -285,26 +285,32 @@ def leaves(stream, batches):
             for batch in itertools.islice(stream, batches)]
 
 
+@pytest.mark.parametrize("segments", [None, 2])
 @pytest.mark.parametrize("overlap", [0, 1])
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_concatenating_pack_keeps_every_pair_where_its_cuts_overlap_and_resumes_anywhere(read, overlap):
+def test_a_concatenating_pack_keeps_every_pair_where_its_cuts_overlap_and_resumes_anywhere(read, overlap,
+                                                                                          segments):
     """A concatenating pack whose cuts overlap by a token (`Pack.overlap`) starts each window again
     at the last token a cut through a document left behind, in every field alike: a pass holds
-    every next-token pair of every document once, each field's its own documents'. With or without
-    the overlap, a run resumed after any step reads the windows the uninterrupted one reads: how
-    full the overlap left its window is saved with the position, and so is a window that closed
+    every next-token pair of every document once, each field's its own documents', and with a cap
+    (`Pack.segments`, row 9059) no window holds more documents or pieces of one than it. With or
+    without the overlap, a run resumed after any step reads the windows the uninterrupted one reads:
+    how full the overlap left its window is saved with the position, and so is a window that closed
     where a document ended, whose next document the packer holds whole."""
     lengths = (3, 7, 2, 5, 8, 4, 6, 2, 8, 3, 17)
     documents = [{"text": (np.arange(length) + 100 * index).astype(np.int32),
                   "text_roles": (np.arange(length) + 1000 * index).astype(np.int32)}
                  for index, length in enumerate(lengths)]
-    pipeline = Pipeline(Memory(documents)).pack(8, fields=FIELDS, policy="concat", overlap=overlap)
+    pipeline = Pipeline(Memory(documents)).pack(8, fields=FIELDS, policy="concat", overlap=overlap,
+                                                segments=segments)
+    reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
+    try:
+        held = list(reader)
+    finally:
+        reader.close()
+    most = max(int(np.asarray(batch["text_coordinates"].segments).max()) for batch in held)
+    assert most == (segments or most) and (segments is not None or most > 2), most
     if overlap:
-        reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
-        try:
-            held = list(reader)
-        finally:
-            reader.close()
         for field in FIELDS:
             drawn = [pair for document in documents for pair in itertools.pairwise(document[field].tolist())]
             assert sorted(pair for batch in held for pair in pairs(batch, field)) == sorted(drawn)
@@ -327,6 +333,44 @@ def test_a_concatenating_pack_keeps_every_pair_where_its_cuts_overlap_and_resume
             assert head + leaves(resumed, 8 - steps) == expected, steps
         finally:
             resumed.close()
+
+
+@pytest.mark.parametrize("window", [5, 8, 13])
+def test_a_stream_concatenates_as_grains_concatenating_packer_does_and_resumes_anywhere(window):
+    """Dew's concatenating packer (`ConcatPacked`) lays a stream's documents out as Grain's
+    `ConcatThenSplitIterDataset`, its oracle where Grain has the layout: no cap on a window's documents.
+    Documents of none to past two windows of tokens, ids and roles a token, beside an image of one to three
+    entries along an axis of its own, which Grain holds as a feature it never cuts (`meta_features`): field
+    for field, the ids' segments and positions, and each window's images, every piece holding its
+    document's whole, a window closing where the next one's no longer fit. A read stopped after any window
+    resumes on the windows after it."""
+    rng = np.random.default_rng(window)
+    documents = [{"text": (np.arange(length) + 1000 * index).astype(np.int32),
+                  "text_roles": np.full(length, index % 4, np.int32),
+                  "image": np.full(int(rng.integers(1, 4)), index, np.float32)}
+                 for index, length in enumerate(rng.integers(0, 2 * window + 2, 40).tolist())]
+
+    def stream():
+        return grain.MapDataset.source(documents).to_iter_dataset()
+
+    def but(windows, prefix):
+        return [dict(sorted((key, value) for key, value in packed.items() if not key.startswith(prefix)))
+                for packed in windows]
+
+    rooms = dict.fromkeys(FIELDS, window) | {"image": 4}
+    reference = list(ConcatThenSplitIterDataset(stream(), length_struct=rooms, meta_features=("image",)))
+    dews = ConcatPacked(stream(), Pack(window, fields=FIELDS, policy="concat", along=(("image", 4),)))
+    packed = list(dews)
+    # Grain pairs every field it cuts with segments and positions; Dew the ids alone, and each field along
+    # an axis of its own, which Grain pairs with none.
+    same(but(packed, "image_"), but(reference, "text_roles_"))
+    for stop in sorted({1, len(packed) // 2, len(packed) - 1}):
+        read = iter(dews)
+        for _ in range(stop):
+            next(read)
+        resumed = iter(dews)
+        resumed.set_state(read.get_state())
+        same(list(resumed), packed[stop:])
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])

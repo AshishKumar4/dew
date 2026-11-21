@@ -485,9 +485,10 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def read(self, acc: Accumulator, *, first: int = 0, columns: int | None = None, pending: int = 0,
              layout=STORED) -> jax.Array:
         # Its columns out of tensor memory in `layout` (an epilogue's, `STORED`, or tensor memory's own,
-        # `TMEM`), the load in flight until the value is read or `Signal.published`; zeros for a tile that
-        # multiplies nothing. Its products are awaited by a signal their commit arrives at (`signals`,
-        # `Tensor.ready`), not by `pending`.
+        # `TMEM`), the load in flight until `wait_load_tmem` (`write` before overwriting tensor memory,
+        # `Tensor.release` before releasing an accumulator); zeros for a tile that multiplies nothing. Its
+        # products are awaited by a signal their commit arrives at (`signals`, `Tensor.ready`), not by
+        # `pending`.
         del pending
         rows, width = acc.shape
         count = width - first if columns is None else columns
@@ -500,7 +501,9 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         column), from the layout it was read in, visible to a product once a signal publishes it
         (`Signal.published`):
         a softmax's narrowed weights for P·V, a keys-first backward's `Pᵀ` and `dSᵀ` for dV and dK, each the
-        left operand of its product (`products`' TS form), a state rescaled in place."""
+        left operand of its product (`products`' TS form), a state rescaled in place. Awaits any in-flight
+        `async_load_tmem` of this thread (`wait_load_tmem`) before overwriting tensor memory (row 8980)."""
+        plgpu.wait_load_tmem()
         plgpu.async_store_tmem(column_span(_tensor_memory(acc), first, value.shape[-1]),
                                value.astype(jnp.dtype(acc.dtype)))
 
@@ -1057,7 +1060,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
-                        together: tuple[int, ...] = ()) -> dict:
+                        together: tuple[int, ...] = (),
+                        tmem_limit: int | None = None) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
         # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
         # refused one, jsf-tmem4). A 16-column product is issued 32 wide, its right operand padded
@@ -1072,6 +1076,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # of that width in turn; a narrower group is summed in turn, in its width's one accumulator.
         # The padded tile only where a product is narrower than `PADDED` (a forward at width 256 over 64-key
         # tiles takes none: 8 KB its two consumers' training program needs for its split sums' stage).
+        del tmem_limit
         narrow = min((*widths, *ahead, *sums, *together), default=PADDED) < PADDED
         kept = all(self.keeps_sums(width) for width in sums)
         alone = tuple(width for width in together if width < PADDED)

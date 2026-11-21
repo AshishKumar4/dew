@@ -591,6 +591,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                 break
             held, last, batch = _covered(mesh, held, last, scored, objective.inputs)
             _admitted(objective, batch, seen)
+            if not scored:
+                _metrics_read(metrics, batch, split)
             # This rank's own real rows, counted on the host; the pool's count
             # is summed once after the split.
             records += int(np.sum(held[VALID_ROWS]))
@@ -679,13 +681,36 @@ def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> N
     agreed("validation input declaration", lambda: inputs.check(device, whole=False))
 
 
+def _named_fields(metrics: Sequence[Metric]) -> list[tuple[str, str]]:
+    """Each batch field a metric of `metrics` reads beside its artifact (`dew.eval.common.Mean.fields`),
+    by the metric's name."""
+    from dew.eval.common import Mean
+
+    return [(metric.name, field) for metric in metrics if isinstance(metric, Mean) for field in metric.fields]
+
+
+def _metrics_read(metrics: Sequence[Metric], batch: Batch, split: str) -> None:
+    """Refuse a split's first `batch` where it holds no field a metric scoring it names (`_named_fields`),
+    a host field among them (the captions a CLIP score compares), on every process at once (row 9063)."""
+    missing = [(name, field) for name, field in _named_fields(metrics) if field not in batch]
+
+    def refused() -> None:
+        if missing:
+            named = ", ".join(f"{name} reads {field!r}" for name, field in missing)
+            raise ValueError(f"the {split} split's batches hold no field its metrics read: {named}; keep it "
+                             "in the split's records (a caption, EncodeCaptions(keep=...))")
+
+    agreed(f"{split} metric fields", refused)
+
+
 def admit_split(objective: Objective[Loss, Effects], batches: Reader | Episodes, mesh: Mesh,
-                split: str) -> None:
+                split: str, metrics: Sequence[Metric] = ()) -> None:
     """Read a validation split's first batch and check it against what the objective declares
-    (`_admitted`), before a run that scores the split only past its first step trains on: a split of
-    undeclared inputs is refused before an update, not after training. Its later batches are checked
-    as they are scored. A split scored by its episodes (`Episodes`) reads none."""
-    if objective.inputs is None or episodic(batches):
+    (`_admitted`) and the fields its `metrics` read (`_metrics_read`), before a run that scores the split
+    only past its first step trains on: a split of undeclared inputs, or of no captions a metric compares,
+    is refused before an update, not after training. Its later batches are checked as they are scored. A
+    split scored by its episodes (`Episodes`) reads none."""
+    if episodic(batches) or (objective.inputs is None and not _named_fields(metrics)):
         return
     source = iterator = None
     try:
@@ -701,6 +726,7 @@ def admit_split(objective: Objective[Loss, Effects], batches: Reader | Episodes,
         if available:
             _, _, batch = _covered(mesh, held, None, 0, objective.inputs)
             _admitted(objective, batch, set())
+            _metrics_read(metrics, batch, split)
     finally:
         _close_source(iterator if iterator is not None else source)
 
@@ -1076,7 +1102,7 @@ class Evaluator[L, E]:
                 self.evaluation(plan, state, shardings, links, {}, warm=True)
         elif first:
             for split, suite in plan.suites.items():
-                admit_split(self.objective, suite.data, self.mesh, split)
+                admit_split(self.objective, suite.data, self.mesh, split, suite.metrics)
 
     def warmed_ahead(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
                      links: Mapping[str, Link]) -> None:

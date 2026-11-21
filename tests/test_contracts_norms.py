@@ -12,6 +12,7 @@ from contract_support import EDGES, OWN_FORWARD_ORDERS, REVERSE_ONLY, assert_con
 
 from dew.nn import activations, ngpt, precision
 from dew.nn.activations import exact_gelu, gated_product
+from dew.nn.aligned import aligned_sum
 
 
 def joined(seam):
@@ -62,7 +63,7 @@ def test_accurate_exp_holds_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_aligned_sum_holds_every_order(edge):
-    """`precision.aligned_sum` of three-factor terms summed along an axis (a forked call's entry write, its
+    """`aligned.aligned_sum` of three-factor terms summed along an axis (a forked call's entry write, its
     terms aligned to the largest before the sum, its tangent the terms' own): every order finite wherever
     float64 is a normal float32 and the plain sum of products is."""
     primals = normal_draw(7951, (2, 1, 1), (2, 6, 1), (2, 1, 5), scale=EDGES[edge])
@@ -70,7 +71,7 @@ def test_an_aligned_sum_holds_every_order(edge):
     (cotangent,) = normal_draw(7953, (1, 6, 5))
 
     def aligned(weight, value, key):
-        return precision.aligned_sum([(weight, value, key)], axis=0)
+        return aligned_sum([(weight, value, key)], axis=0)
 
     def plain(weight, value, key):
         return jnp.sum(weight * value * key, axis=0, keepdims=True)

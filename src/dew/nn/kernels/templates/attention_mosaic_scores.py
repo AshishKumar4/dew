@@ -24,6 +24,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Program,
     _streamed,
     _views_of,
+    head_slice,
     indexed_views,
     riding,
     score_stream,
@@ -140,33 +141,42 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
                         at=at)
                  for index, (ref, kind, kept) in enumerate(laid))
 
-def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords: algebra.Coords, whole,
+def _read(value):
+    """Resolve a deferred reader (`functools.partial`), or return an eager value unchanged."""
+    return value() if isinstance(value, functools.partial) else value
+def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
+                 coords: algebra.Coords | functools.partial[algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
                  ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
-    (`_fused_step`'s, `_coop_step`'s): its
-    logits from the query slot taken by its power in registers (`_Backward.scaled`) against the resident
-    keys (`resident`, `[bk, D]` and `[bk, Dv]` refs, a consumer's share of them where keys are shared), dP
-    from the output-cotangent slot against the values, then `_scores` under the tile's queries' statistics
-    `rows` (read before its products, which their loads run under: ET-A05AB5/6-h100, 2.05 against 2.32 ms
-    read past them at Qwen3-8B causal) and `coords`, masked where `masked`, or where it is None chosen at run
-    time, unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
+    (`_fused_step`'s, `_coop_step`'s): its logits from the query slot taken by its power in registers
+    (`_Backward.scaled`) against the resident keys (`resident`, `[bk, D]` and `[bk, Dv]` refs, a consumer's
+    share of them where keys are shared), dP from the output-cotangent slot against the values, then `_scores`
+    under the tile's queries' statistics `rows` and `coords` (read before products on shared-memory-operand
+    families so loads overlap wgmma, ET-A05AB5/6-h100, and after products on `operands_in_registers` families
+    so they do not spill at the S/dP peak), masked where `masked`, or where it is None chosen at run time,
+    unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
     (`algebra.value_weights`), a dropping call's dropped (`algebra.drawn`), and its score cotangents through
     the hook (`gradient.pulled`), one part in the operands' dtype (dK's and dQ's); with `whole_operands`
     (fp16's, `algebra.running_parts`), both fp32: the normalized weights, dropped, and the scaled
     cotangents."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
-    held = keys.transpose((1, 0))
-    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
-         if walk.scaled else family.product(q_slot, held, shape))
-    dp = family.product(do_slot, values.transpose((1, 0)), shape)
-
+    held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
+    if not family.operands_in_registers:
+        rows = tuple(_read(row) for row in rows)
+        coords = _read(coords)
+    if walk.scaled:
+        s = family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
+        dp = family.product(do_slot, values_t, shape)
+    else:
+        s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
+    tile_coords = _read(coords)
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
-        exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, (), s, dp, *rows,
+        exponentials, weights, cotangents, slopes, seen = _scores(walk, tile_coords, (), s, dp, *rows,
                                                                   masked=masked)
-        multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
+        multiplier = algebra.drawn(tile_coords, tile_coords.q_pos, tile_coords.k_pos)
         if multiplier is not None:
             exponentials, weights = exponentials * multiplier, weights * multiplier
         return exponentials, weights, gradient.pulled(cotangents, slopes, seen, ())[0]
@@ -198,21 +208,18 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     # Each query's statistics along a keys-first tile's query axis (`algebra.Coords.queries`); a queries-first
     # tile's the algebra broadcasts at each use, so no broadcast tile stays live across the step (a fused
     # launch at 128 x 64 and width 64 spilled 60 bytes holding them).
-    def read(x) -> jax.Array:
-        return x() if isinstance(x, functools.partial) else x
-
     def per_query(x):
-        return coords.queries(read(x), s) if coords.keys_first else read(x)
+        return coords.queries(_read(x), s) if coords.keys_first else _read(x)
 
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     # A dropping anchor's centre can survive where its tile's product rounds to zero before the
     # multiplier joins it. Take its self-difference as 0, as the accurate form does. The undropped
     # fast form keeps FlashAttention 3's math (the select took 10.8% of fused dK/dV's instructions).
     anchored = walk.accurate or multiplier is not None
-    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if anchored else None
+    at_anchor = coords.k_pos == coords.queries(_read(chosen), coords.k_pos) if anchored else None
     # The tile's weights and cotangents the derived forms' (`derived_cotangents`).
-    tiles = {"logits": logits, "products": dp, "peak": read(peak), "total": read(total),
-             "anchor": read(anchor), "delta": read(delta)}
+    tiles = {"logits": logits, "products": dp, "peak": _read(peak), "total": _read(total),
+             "anchor": _read(anchor), "delta": _read(delta)}
     if multiplier is not None:
         tiles["keep"] = multiplier
     if seen is not None:
@@ -259,7 +266,8 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
     dQ reduce runs off the consumers' path."""
     row, head = place
     rows = dq.shape[0]
-    view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
+    view = dq_ref.at[index if walk.interpret else 0,
+                     *head_slice(walk.program.family, row, head, pl.ds(q_first, rows))]
     if out_smem is None:
         walk.program.family.added(dq, view, walk.interpret, smem=None)
         return
@@ -280,7 +288,7 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     row, head = family.program_index("batch"), family.program_index("heads")
     pair = consumers * block_q
     refs, kinds = score
-    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+    views = _views_of(family, {"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
     if riding(family, kinds, "keys"):
         views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
     if spans is not None and spans.walk_count is not None:
@@ -299,6 +307,6 @@ def _query_tile_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: 
     """Consumer `index`'s query tile from `first` and its output cotangents, each `(ref, smem)` of `refs`
     and `smem` loaded whole against its `loaded` barrier at the program's batch row and head (`place`)."""
     row, head = place
-    rows = (row, pl.ds(first, smem[0].shape[1]), head)
+    rows = head_slice(family, row, head, pl.ds(first, smem[0].shape[1]))
     family.loaded(tuple((ref.at[rows], stage.at[index], barrier.at[index])
                         for ref, stage, barrier in zip(refs, smem, loaded, strict=True)))

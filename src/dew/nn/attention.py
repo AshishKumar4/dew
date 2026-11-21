@@ -71,7 +71,7 @@ from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
-from .kernels.templates import attention as template, attention_quantized, attention_route
+from .kernels.templates import attention as template
 from .precision import (
     asks_default_precision,
     at_least_fp32,
@@ -427,10 +427,13 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
         if quantized:
+            from .kernels.templates import attention_quantized
+
             # A quantized model's products, which the template forms as its rule does (row 4858).
             return attention_quantized.attend(query, key, value, spans, hooks)
-        return attention_route.attend(query, key, value, spans, hooks, in_key=in_key)
+        from .kernels.templates import attention_route
 
+        return attention_route.attend(query, key, value, spans, hooks, in_key=in_key)
     # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
     # rows and heads. A dropping call's draw takes each shard's global rows and heads from the query's own
     # split (`on_attention_shards`'s coordinates), so it does not depend on the mesh or on the rules of the
@@ -629,11 +632,29 @@ def _grouped_as_jax_nn(attend: Callable, query, key, value, mask, bias) -> jax.A
     return out.reshape(*rows, length, heads, value.shape[-1])
 
 
+@functools.cache
+def _default_16bit_preset(dtype_name: str, target_name: str | None) -> jax.lax.DotAlgorithmPreset:
+    """Cheapest single-pass fp32-accumulating dot preset for 16-bit `dtype_name` on `target_name`, derived
+    from `dew.algebra.error.product_precision` (row 5473)."""
+    del target_name
+    from dew.algebra.error import product_precision
+    from dew.nn import programs
+
+    dtype = jnp.dtype(dtype_name)
+
+    def admits(preset: jax.lax.DotAlgorithmPreset) -> bool:
+        arith = programs.dot_arithmetic(preset, dtype, dtype)
+        return (arith is not None and arith.accumulation_bits == 32
+                and not arith.imprecise and arith.operations == 1)
+
+    return product_precision(64, 64, 64, dtype, admits=admits)
+
+
 def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
     """The dot algorithm jax.nn's xla attention names for its logits' product
     (`_dot_product_attention_core`), which the reference's jax.nn form
     (`scale_logits`) declares as jax.nn does: a 16-bit operand's own product
-    with fp32 sums (bf16's `BF16_BF16_F32`, fp16's `F16_F16_F32`) where the
+    with fp32 sums derived from `dew.algebra.error.product_precision` where the
     call states no precision above the default and the platform it is placed
     on lowers it (`placed_platform`: bf16's everywhere but a GPU before
     `BF16_GPU`, `bf16_dot_runs`; fp16's on a GPU alone, where a CPU's dot and
@@ -642,11 +663,10 @@ def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
     if not asks_default_precision(precision):
         return None
     if dtype == jnp.bfloat16 and bf16_dot_runs():
-        return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+        return _default_16bit_preset("bfloat16", generation.gpu_target().generation)
     if dtype == jnp.float16 and generation.placed_platform() == 'gpu':
-        return jax.lax.DotAlgorithmPreset.F16_F16_F32
+        return _default_16bit_preset("float16", generation.gpu_target().generation)
     return None
-
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation: AttentionImpl = 'auto',
@@ -1270,11 +1290,12 @@ def quantized_rule(sinks: bool, dropout: bool = False) -> str | None:
     """`AttentionCase.quantized`'s kernel for a call with `sinks` or `dropout`: the template's quantized
     attention where a quantized model's rule owning its products takes it, the reference path where it does
     not; None where no rule owns them or it quantizes no activation."""
+    from .kernels.templates import attention_quantized
+
     rule = attention_quantized.quantizing()
     if rule is None:
         return None
     return 'template' if attention_quantized.takes(rule) and not (sinks or dropout) else 'reference'
-
 
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,

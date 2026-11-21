@@ -22,10 +22,13 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    head_layout,
+    head_slice,
     launch_scope,
     modelled,
     reducing,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -119,8 +122,9 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     stage = family.staged_memory((consumers, max(block_q, block_k), width), jnp.float32)
     held = family.adds_through_shared
-    scoped = [family.staged_memory((consumers, block_k, width), dtype),
-              family.staged_memory((consumers, block_k, width), dtype),
+    kv_swizzles = transposed_swizzles(config, "keys", "values")
+    scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("keys")),
+              family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("values")),
               family.staged_memory((consumers, 2 * staged_parts(dtype), block_q, block_k), dtype),
               *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
@@ -148,22 +152,25 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    coords = coords_of(q_first, read=walk.places_read(masked=masked))
+    coords = functools.partial(coords_of, q_first, read=walk.places_read(masked=masked))
     if q_slot.dtype == jnp.float16:
         return _sixteen_step(walk, k_smem, staged, add_dq, slots, carry, accumulators, q_first, _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
             masked=masked, whole_operands=True))
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
                                   whole(index), shape, masked=masked)
-    family.staged(narrowed, staged.at[0])
-    dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     cotangents_staged = staged.at[1]
+    # Stage P and dS before dV/dK so narrowed and part free before products; on shared-memory-operand
+    # families (wgmma), issue dQ before dV/dK so add_dq overlaps with async dV/dK wgmma (row 5272).
+    family.staged(narrowed, staged.at[0])
     family.staged(part, cotangents_staged)
+    dq = (None if family.operands_in_registers
+          else family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
+    dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
-    # The tile's dQ, its staged cotangents times the resident keys (`algebra.cotangent_product`'s `a @ b`),
-    # added into dQ: the query tile's other key blocks add theirs.
-    add_dq(q_first, family.looped_product(cotangents_staged, k_smem,
-                                         (tiles.block_q, k_smem.shape[-1])))
+    if dq is None:
+        dq = family.looped_product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]))
+    add_dq(q_first, dq)
     return carry, (dk_acc, dv_acc)
 
 def _sixteen_step(walk: _Backward, k_smem, staged, add_dq, slots, carry, accumulators, q_first,
@@ -215,10 +222,11 @@ def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, s
              for name, ref in zip(names[:streamed], refs, strict=False)}
 
     def rows_of(slots, first):
-        return tuple(family.rows_of(slots[name]) if index < streamed
-                     else _rows(family, ref, row, head, first, block_q)
+        def read(index, name, ref):
+            return (family.rows_of(slots[name]) if index < streamed
+                    else _rows(family, ref, row, head, first, block_q))
+        return tuple(functools.partial(read, index, name, ref)
                      for index, (name, ref) in enumerate(zip(names, refs, strict=True)))
-
     return views, rows_of
 
 
@@ -246,10 +254,10 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     q_steps = queries // block_q
     grouped, group = heads != kv_heads, heads // kv_heads
     leaves, treedef = jax.tree.flatten((spans, drop))
-    # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
-    shapes = [(batch, keys_padded, kv_heads, width)] * 2
+    kv_shape = ((batch, kv_heads, keys_padded, width) if family.copies_tiled_rows
+                else (batch, keys_padded, kv_heads, width))
+    shapes = [kv_shape] * 2
     groups = stacked.groups(shapes)
-
     def body(*refs, streams, after=None):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         (spans_of, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
@@ -264,7 +272,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, group)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
-        views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head), **statistics}
+        views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         pair_first = family.program_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
@@ -272,7 +280,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
         def consumer(index):
             k_first = pair_first + index * block_k
-            keys_view = (row, pl.ds(k_first, block_k), key_head)
+            keys_view = head_slice(family, row, key_head, pl.ds(k_first, block_k))
             family.loaded(((k_ref.at[keys_view], k_smem.at[index], k_loaded.at[index]),
                            (v_ref.at[keys_view], v_smem.at[index], v_loaded.at[index])))
             lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
@@ -318,8 +326,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
 
     # dK and dV as their own arrays' axes (`outputs.Output`).
+    axis_order = (0, 2, 1) if family.copies_tiled_rows else (0, 1, 2)
     gradients = tuple(outputs.output(array.dtype if typed else jnp.float32,
-                                     *(outputs.axis(array, index) for index in range(3)), width)
+                                     *(outputs.axis(array, index) for index in axis_order), width)
                       for array in (key, value))
     launch = family.kernel(
         entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
@@ -333,10 +342,11 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
+    query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    return _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
-                         grouped=grouped)
-
+    dq, dk, dv = _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
+                               grouped=grouped)
+    return head_layout(family, dq), head_layout(family, dk), head_layout(family, dv)
 
 def _fused_called(launch: Callable, operands: tuple, grads: tuple, *, copies: int, grouped: bool
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:

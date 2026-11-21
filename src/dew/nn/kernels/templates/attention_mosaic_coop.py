@@ -100,9 +100,11 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     family.staged(narrowed, weights_ref.at[:, own])
     family.staged(part, cotangents_ref.at[:, own])
     exchange.publish()
+    dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size))
     dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
     dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
-    add_dq(q_first, family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size)))
+    add_dq(q_first, dq)
+    family.settled(0)
     exchange.release()
     return carry, (dk_acc, dv_acc)
 
@@ -176,7 +178,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, heads // kv_heads)
-        views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
+        views = _views_of(family, {"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
         k_first = family.program_index("k_tiles") * block_k
         lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)

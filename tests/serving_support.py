@@ -2,6 +2,7 @@
 
 import dataclasses
 import functools
+import hashlib
 import itertools
 from collections.abc import Callable, Mapping, Sequence
 
@@ -12,6 +13,7 @@ import numpy as np
 from flax import linen as nn
 from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
+from dew._hashing import array_fingerprint
 from dew.batch import Variables
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
@@ -139,18 +141,33 @@ def full_forward_scores(task: TextGeneration, requests: Sequence[Served], model:
     @as_given
     def scored(row, drawn, _served=None):
         weights = widened(variables) if wide else variables
-        scores = []
+        # A request whose prompt, draws, fields and conditioning are another's of this call, bit for bit,
+        # scores as it does: computed once, each request's scores its own entry still.
+        scores, made = [], {}
         for request, tokens in zip(requests, drawn, strict=True):
             inputs = served_inputs(np.asarray(row), request, vocab)
             prompt, tokens = np.asarray(inputs.tokens), np.asarray(tokens)
             carried = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
             held = with_served_blocks(carried, np.ones(prompt.shape, bool), task.prefix)
             given = request.conditioned(np.asarray(row))
-            reading = functools.partial(forward, conditioning=widened(given) if wide else given)
-            scores.append(drawn_scores(reading, weights, prompt, tokens, held, per_step=not wide,
-                                       policy=task.sampling))
+            key = fingerprint((prompt, tokens, held, given))
+            if key not in made:
+                reading = functools.partial(forward, conditioning=widened(given) if wide else given)
+                made[key] = drawn_scores(reading, weights, prompt, tokens, held, per_step=not wide,
+                                         policy=task.sampling)
+            scores.append(made[key])
         return tuple(itertools.chain.from_iterable(zip(*scores, strict=True)))
     return scored
+
+
+def fingerprint(tree) -> tuple:
+    """`tree`'s identity bit for bit: its structure and a digest of its leaves, each fingerprinted as Dew
+    fingerprints an array (`dew._hashing.array_fingerprint`: its dtype, shape and bytes)."""
+    leaves, structure = jax.tree.flatten(tree)
+    hasher = hashlib.sha256()
+    for leaf in leaves:
+        array_fingerprint(hasher, np.asarray(leaf))
+    return structure, hasher.digest()
 
 
 def served_row(seed: int, vocab: int, width: int) -> np.ndarray:

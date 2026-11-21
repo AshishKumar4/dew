@@ -205,7 +205,6 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     ring_slots = STAGES
 
     copies_tiled_rows = True
-
     def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
                   joined: tuple = ()) -> int:
         raise NotImplementedError("a TPU core budgets no registers: its values spill to VMEM")
@@ -274,12 +273,15 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 return named(*given, *made[:len(outputs)])
 
             spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(values))]
+            # Programs with no in-place aliased refs (`places`) have independent grid outputs (`parallel`);
+            # launches with `added` refs stay `arbitrary` so read-modify-writes never race.
+            semantics = ("arbitrary" if places else "parallel",) * len(grid)
             written = launches.pallas_call(
                 program, name=name or self.name, out_shape=(*outputs, *aliased), grid=grid,
                 in_specs=[pl.BlockSpec(memory_space=space) for space in spaces],
                 out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (len(outputs) + len(aliased)),
                 input_output_aliases={at: len(outputs) + k for k, at in enumerate(places)},
-                compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",) * len(grid)),
+                compiler_params=pltpu.CompilerParams(dimension_semantics=semantics),
                 interpret=pltpu.InterpretParams() if interpret else False,
                 cost_estimate=emission.built_with(cost))(*values)
             for at, added in zip(places, written[len(outputs):], strict=True):
@@ -338,15 +340,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # A core's scalar is its own: no lanes to read alike.
         return value
 
-    def decided_scratch(self, consumers: int) -> dict:
-        # One core a program, its walk its one role: it decides a second walk alone (`after_walk.Decided`).
-        del consumers
-        return {}
-
     def stream(self, streams, views, lo, hi, *, again=None) -> None:
-        # No producer role: the walk issues its own copies, a decided walk's second pass's too.
+        # No producer role: the walk issues its own copies.
         del streams, views, lo, hi, again
-
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,

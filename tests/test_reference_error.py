@@ -654,6 +654,24 @@ def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm
     assert options.compiler_options() == {}
 
 
+def test_a_sizing_tells_each_count_it_draws_for_before_drawing_it():
+    """A sizing given its `progress` (`seeds_for`'s, `parity.Sized`) is told each count it draws for, in
+    order, each the one before it doubled from the start, with its place among them and their most (its
+    doublings from the start to the cap), its last the count it declares: a long recording (a GPU's,
+    chunked, cut short by its time) shows how far its sizing went, where it printed nothing until the end."""
+    from reference_error import seeds_for
+
+    from dew.parity import FEWEST_SEEDS, MOST_SEEDS
+
+    told = []
+    count = seeds_for(_product, _draw, "product", progress=lambda *each: told.append(each))
+    doublings = len(told)
+    assert [each for each, _, _ in told] == [FEWEST_SEEDS * 2 ** place for place in range(doublings)]
+    assert [place for _, place, _ in told] == list(range(1, doublings + 1))
+    assert {most for _, _, most in told} == {(MOST_SEEDS // FEWEST_SEEDS).bit_length()}
+    assert told[-1][0] == count
+
+
 def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
     """`seeds_resolving` over the reference's errors measured apart (a recording's merged shards) gives
     `seeds_for`'s count for the reference compared with itself on the same draws, and refuses a
