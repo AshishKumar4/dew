@@ -378,7 +378,8 @@ def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
         return res.acc, res.m, res.total
 
     traced = jax.make_jaxpr(run)(padded, stacked, init_m, init_t, init_acc)
-    merge_eqns = [e for e in traced.jaxpr.eqns if e.primitive is merged.merged_padded_p]
+    from dew.nn import programs
+    merge_eqns = [e for e in programs.equations(traced.jaxpr) if e.primitive is merged.merged_padded_p]
     assert len(merge_eqns) == 1 and len(merge_eqns[0].invars) == 5
 
     got = run(padded, stacked, init_m, init_t, init_acc)
