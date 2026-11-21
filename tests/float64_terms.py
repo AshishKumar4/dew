@@ -16,7 +16,7 @@ import numpy as np
 from arm_arithmetic import on_float64_device, on_float64_host, unrewritten
 from jax.extend.core import primitives
 from jax.interpreters import partial_eval as pe
-from truths_ahead import AT_RUN, COMPILED as STORE, running
+from store_wire import COMPILED as STORE, running
 
 from dew.nn import programs
 from dew.nn.precision import correctly_rounded_divide_p
@@ -175,7 +175,7 @@ def _termed(fn, args, *, power: int):
     steered = None if ran is None else ran[0].walked(ran[1], f"terms {power}", args)
     if ran is not None and steered is None:
         # A run reading programs compiled ahead (`truths_ahead`): the truth's compiled run and the walk's,
-        # its terms alone, in turn (`reference_error._held_walk`); a walk its values steer runs as it is
+        # its terms alone, in turn (`arm_store._held_walk`); a walk its values steer runs as it is
         # walked, on the GPU, named.
         store, label = ran
         values = jax.tree.leaves(store.called(label, "truth", args))
@@ -187,6 +187,8 @@ def _termed(fn, args, *, power: int):
     if ran is not None:
         # In a part's run, a walk its values steer (its prepare held none) compiles its spans on the GPU as
         # it walks, its float64 on the GPU's FP64 units (bible §8), named as its prepare declared it.
+        from truths_ahead import AT_RUN
+
         ran[0].unprepared(f"{ran[1]}: its terms walk: {steered}", AT_RUN)
     token = POWER.set(power)
     try:
@@ -738,7 +740,7 @@ def _stacked(*steps):
 def _traced_values(values) -> bool:
     """Whether any of `values` is a tracer: a walk inside a trace (a compiled span, a jit of the walk), a
     program calling `float64_terms` traced whole (a site's terms program its prepare compiles,
-    `reference_error._held_program`)."""
+    `arm_store._held_program`)."""
     return any(isinstance(value, jax.core.Tracer) for value in values)
 
 

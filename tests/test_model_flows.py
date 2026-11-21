@@ -906,14 +906,14 @@ def test_a_site_whose_prepare_ended_before_its_arms_runs_them_unprepared(tmp_pat
     deferred, `gpu_flow.run_cells`, its store still serving the run) runs its arms unprepared in its run,
     recorded, judging the site as one computing its own does, where its run found no program
     (`MissingTruth`, the review)."""
-    import reference_error
+    import arm_store
 
     dew, reference, draw = _site()
     with compiled_truths(tmp_path, prepare=True, stamp="a"), monkeypatch.context() as failing:
         def ended(*arguments, **options):
             raise RuntimeError("the prepare ended before the site's arms")
 
-        failing.setattr(reference_error, "_compile_arms", ended)
+        failing.setattr(arm_store, "_compile_arms", ended)
         with pytest.raises(RuntimeError):
             assert_as_exact(dew, reference, draw, "a product whose arms went unprepared", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
@@ -938,7 +938,7 @@ def test_a_tests_unprepared_record_names_every_reason(tmp_path):
 def test_a_walk_its_values_steer_runs_on_the_runs_device_named_at_run(tmp_path, monkeypatch):
     """A site sized by its truth's terms (`terms=True`) whose float64 truth takes a branch its values pick
     (`lax.cond` on its operands), its terms' walk held by its prepare as one its run walks
-    (`reference_error._held_walk`), walks it in its run on the run's own device, a GPU's FP64 units, each
+    (`arm_store._held_walk`), walks it in its run on the run's own device, a GPU's FP64 units, each
     output's terms completed there (`float64_terms._or_size`), and the run names the walk as compiled at run
     (`truths_ahead.AT_RUN`), nothing unprepared: a float64 truth's terms walked on the host's CPU in the run
     was dense float64 on the node's CPU (testing.md, bible section 8; row 8576)."""

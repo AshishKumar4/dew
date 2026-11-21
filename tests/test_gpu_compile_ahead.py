@@ -551,7 +551,8 @@ def test_a_program_compiled_ahead_for_compile_only_gpus_of_no_stated_memory_comp
 
     import test_recurrence_stability as stability
     from arm_arithmetic import summed_as_run
-    from reference_error import _arm_program, with_gradients
+    from arm_store import _arm_program
+    from reference_error import with_gradients
     from truths_ahead import named
 
     from dew.nn.kernels import generation
