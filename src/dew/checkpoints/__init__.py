@@ -133,6 +133,7 @@ from dew.checkpoints.averaging import (
     averaged as averaged,
     averaged_pinned as averaged_pinned,
 )
+from dew.checkpoints.submesh import SubmeshArrays
 from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
@@ -201,7 +202,7 @@ def _types() -> ocp.type_handlers.TypeHandlerRegistry:
     slice below `REPLICA_SLICE_BYTES`. Built through Orbax's public API, that handler keeps no array
     metadata store, by which alone Orbax types a key it reads, so a step records each key's
     implementation itself (`key_record`), which a restore types the key's data by (`_keyed`)."""
-    arrays = ocp.type_handlers.ArrayHandler(min_slice_bytes_for_replica_parallel=REPLICA_SLICE_BYTES)
+    arrays = SubmeshArrays(min_slice_bytes_for_replica_parallel=REPLICA_SLICE_BYTES)
     return ocp.type_handlers.create_type_handler_registry(*(
         (kind, arrays if kind is jax.Array else ocp.type_handlers.get_type_handler(kind))
         for kind in ocp.type_handlers.supported_types()))
@@ -458,7 +459,8 @@ def _read(want, dtype) -> ocp.ArrayRestoreArgs:
         return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None))
     if want is None or jax.dtypes.canonicalize_dtype(dtype) != np.dtype(dtype):
         return ocp.ArrayRestoreArgs(restore_type=np.ndarray)
-    return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None), dtype=dtype)
+    return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None), dtype=dtype,
+                                global_shape=getattr(want, 'shape', None))
 
 
 def _keyed(leaf, want, keys: Mapping[str, str]):
@@ -1284,8 +1286,7 @@ class Checkpoints:
             multiprocessing = MultiprocessingOptions(primary_host=me, active_processes={me},
                                                      barrier_sync_key_prefix=f'local{me}')
             registry = ocp.type_handlers.create_type_handler_registry(
-                (jax.Array, ocp.type_handlers.ArrayHandler(
-                    primary_host=None, replica_id=None, use_replica_parallel=False)))
+                (jax.Array, SubmeshArrays(primary_host=None, replica_id=None, use_replica_parallel=False)))
             # orbax creates no directory for a manager over a subset of the pool.
             epath.Path(self.local_path).mkdir(parents=True, exist_ok=True)
             options = ocp.CheckpointManagerOptions(

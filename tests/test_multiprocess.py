@@ -766,12 +766,21 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
 @pytest.mark.distributed
 def test_a_pipeline_whose_stages_are_each_one_processs_checkpoints_and_resumes(tmp_path):
     """A two-stage pipeline over two processes, each stage one process's devices alone: every process reads
-    the finite check over leaves each placed on one process's devices alone, alike, and the run checkpoints
-    its step and resumes from it one step further (row 10780: each rank read each stage's finite flag,
-    those outside a stage holding none of it, and the save crashed)."""
-    pool = run_pool("stage_save", tmp_path / "pool", 2, devices=2, steps=1, run_dir=tmp_path / "run")
+    the finite check over leaves each placed on one process's devices alone, alike; the run checkpoints on
+    its local tier and resumes from it, then from its persistent tier, each stage writing its own rows; and
+    the persistent checkpoint, the plain per-layer one, resumes in this one process on one stage (row
+    10780: each rank read each stage's finite flag, and Orbax refused each stage's rows as host-local)."""
+    from test_stage_local import ADAM, decoder, stream, trainer
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import MeshSpec
+
+    pool = run_pool("stage_save", tmp_path / "pool", 2, devices=2, run_dir=tmp_path / "run",
+                    local_dir=tmp_path / "local")
     assert [report["finite"] for report in pool] == [[True, False]] * 2, pool
-    assert [report["resumed"] for report in pool] == [2, 2], pool
+    assert [report["steps"] for report in pool] == [[1, 2, 3]] * 2, pool
+    alone = trainer(decoder(), ADAM, MeshSpec(fsdp=2), 2, checkpoints=Checkpoints(str(tmp_path / "run")))
+    assert int(alone.fit(stream(), steps=4, log_every=1).step) == 4
 
 
 # --------------------------------------------------------------------------

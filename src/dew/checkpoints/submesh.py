@@ -1,0 +1,101 @@
+"""Orbax's array handler for a pool whose arrays live on part of it: a pipeline stage's rows, each on its own
+stage's devices (`dew.training.stages.StageLocal.saved`), which a stage of one process's devices holds whole.
+
+Orbax 0.12.7 refuses such an array as a `pmap`'s host-local one (`ArrayHandler.serialize`), takes its first
+addressable shard where a process holds none (`replica_slices.get_replica_slices`), and makes it on restore
+without the dtype a process that holds none of it must state (`serialization._read_and_create_array`). Here
+each array on a strict part of the pool (`apart`) is written by the processes that hold its shards, its
+metadata by the first of them, the others writing nothing of it, and read back by them, the others making it
+with no shard; every other array is Orbax's own. The files are Orbax's: each such row its own array, read by
+any topology as the stages wrote it (docs/design/training.md, checkpoints). A host-local array of a `pmap`,
+on each process's own devices under one name, is still refused, every process agreeing the devices an
+array is on first."""
+
+from __future__ import annotations
+
+import jax
+import orbax.checkpoint as ocp
+from orbax.checkpoint._src.futures import future
+from orbax.checkpoint._src.serialization import jax_array_handlers as handlers
+
+from dew._coordination import from_every_process
+
+
+def apart(value) -> bool:
+    """Whether `value` is an array on a strict part of a pool of processes' devices."""
+    return (isinstance(value, jax.Array) and jax.process_count() > 1
+            and not set(jax.devices()) <= value.sharding.device_set)
+
+
+def _owner(sharding: jax.sharding.Sharding) -> int:
+    """The process that writes the metadata of an array placed by `sharding`: the first that holds it."""
+    return min(device.process_index for device in sharding.device_set)
+
+
+class SubmeshArrays(ocp.type_handlers.ArrayHandler):
+    """Orbax's `ArrayHandler`, which also writes and reads an array on a strict part of the pool (module
+    docstring): the processes that hold it write its shards and the first of them its metadata, and read it
+    back, and a process that holds none of it makes it with no shard."""
+
+    async def serialize(self, values, infos, args=None):
+        args = list(args or [ocp.SaveArgs()] * len(values))
+        parted = [index for index, value in enumerate(values) if apart(value)]
+        whole = [index for index in range(len(values)) if index not in set(parted)]
+        futures = [] if not whole else list(await super().serialize(
+            [values[index] for index in whole], [infos[index] for index in whole],
+            [args[index] for index in whole]))
+        if not parted:
+            return futures
+        # Every process places each array alike: a pmap's array, on each process's own devices, is not.
+        placed = [[infos[index].name, sorted(device.id for device in values[index].sharding.device_set)]
+                  for index in parted]
+        if any(other != placed for other in from_every_process(placed)):
+            raise ValueError("an array on each process's own devices is a pmap's host-local array, which a "
+                             "checkpoint does not hold: make it one global array first")
+        if any(jax.dtypes.issubdtype(values[index].dtype, jax.dtypes.prng_key) for index in parted):
+            raise ValueError("a PRNG key on part of the pool is not written: place it on every process")
+        if self._enable_write_sharding_file:
+            futures.append(future.CommitFutureAwaitingContractedSignals(
+                handlers._async_serialize_shardings(
+                    shardings=[values[index].sharding for index in parted],
+                    infos=[infos[index] for index in parted], primary_host=self._primary_host),
+                name="serialize_submesh_shardings"))
+        by_owner: dict[int, list[int]] = {}
+        for index in parted:
+            if values[index].addressable_shards:
+                by_owner.setdefault(_owner(values[index].sharding), []).append(index)
+        for owner, members in sorted(by_owner.items()):
+            futures.append(handlers._serialize_arrays(
+                arrays=[values[index] for index in members], infos=[infos[index] for index in members],
+                args=[args[index] for index in members], dispatcher=None,
+                # A local tier's every process writes its own metadata, into its own directory.
+                primary_host=None if self._primary_host is None else owner,
+                replica_id=self._replica_id, use_replica_parallel=self._use_replica_parallel,
+                min_slice_bytes_for_replica_parallel=self._min_slice_bytes_for_replica_parallel,
+                max_replicas_for_replica_parallel=self._max_replicas_for_replica_parallel,
+                enable_replica_parallel_separate_folder=self._enable_replica_parallel_separate_folder,
+                metadata_key=self._metadata_key, ext_metadata={}, array_metadata_store=None,
+                callback=self._callback))
+        return futures
+
+    async def deserialize(self, infos, args=None):
+        if args is None:
+            return await super().deserialize(infos, args)
+        none = [index for index, arg in enumerate(args)
+                if isinstance(getattr(arg, "sharding", None), jax.sharding.Sharding)
+                and not arg.sharding.addressable_devices]
+        held = [index for index in range(len(infos)) if index not in set(none)]
+        read = [] if not held else list(await super().deserialize([infos[index] for index in held],
+                                                                   [args[index] for index in held]))
+        # Its shape and dtype as the restore states them, else as the step's files do (a local tier's
+        # process wrote none of an array it held none of).
+        unstated = [index for index in none if args[index].global_shape is None or args[index].dtype is None]
+        stated = dict(zip(unstated, await self.metadata([infos[index] for index in unstated]) if unstated
+                          else [], strict=True))
+        made = [jax.make_array_from_single_device_arrays(
+            tuple(args[index].global_shape or stated[index].shape), args[index].sharding, [],
+            dtype=args[index].dtype or stated[index].dtype) for index in none]
+        results: list = [None] * len(infos)
+        for index, value in [*zip(held, read, strict=True), *zip(none, made, strict=True)]:
+            results[index] = value
+        return results

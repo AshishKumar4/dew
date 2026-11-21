@@ -1072,9 +1072,10 @@ def mode_pipeline(args) -> dict:
 def mode_stage_save(args) -> dict:
     """A two-stage pipeline whose stages are each one process's devices alone (its devices interleaved
     so the stage axis, the mesh's last, pairs one of each process's): its finite check over leaves placed
-    on each stage alone, then `--steps` steps that checkpoint every step into `--run-dir`, and a run that
-    resumes from them one step further (row 10780: each rank read each stage's finite flag, those outside
-    a stage holding none of it, and the save crashed)."""
+    on each stage alone; a step checkpointed on the local tier (`--local-dir`) alone, resumed from it to a
+    step the persistent tier (`--run-dir`) holds too, and resumed from that one step further (row 10780:
+    each rank read each stage's finite flag, those outside a stage holding none of it, and Orbax refused
+    each stage's rows as host-local arrays)."""
     import jax
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -1101,14 +1102,17 @@ def mode_stage_save(args) -> dict:
               for device in pair]
     mesh = MeshSpec(fsdp=2, stage=2)
 
-    def run(steps: int) -> int:
-        staged = trainer(decoder(), ADAM, mesh, len(paired), checkpoints=Checkpoints(str(args.run_dir)))
+    def run(steps: int, *, local: bool = True) -> int:
+        kept = (Checkpoints(str(args.run_dir), local_directory=str(args.local_dir), local_every=1) if local
+                else Checkpoints(str(args.run_dir)))
+        staged = trainer(decoder(), ADAM, mesh, len(paired), checkpoints=kept)
         staged.device_mesh = mesh.build(paired)
-        return int(staged.fit(stream(), steps=steps, checkpoint_every=1, log_every=1).step)
+        return int(staged.fit(stream(), steps=steps, checkpoint_every=2, log_every=1).step)
 
-    run(args.steps)
-    resumed = run(args.steps + 1)
-    return {"process_index": jax.process_index(), "finite": read, "resumed": resumed}
+    # Step 1 on the local tier alone, resumed from it to step 2, which the persistent tier holds too; then
+    # resumed from the persistent tier alone to step 3.
+    steps = [run(1), run(2), run(3, local=False)]
+    return {"process_index": jax.process_index(), "finite": read, "steps": steps}
 
 
 class InjectedValueError(ValueError):
