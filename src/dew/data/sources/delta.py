@@ -36,9 +36,9 @@ class Delta(Files):
         return path
 
     def _read_files(self) -> tuple[str, ...]:
-        """The files of the table's version as its log names them (its add actions' paths), its dataset
-        unbuilt, which a resume's shards name alike wherever the table is mounted."""
-        return tuple(self.table.get_add_actions(flatten=True).column("path").to_pylist())
+        """The files of the table's version as its log names them, its dataset's fragments' paths: Delta's
+        dataset is read off its log, no file's footer opened, and names them as a resume's shards did."""
+        return tuple(fragment.path for fragment in self.arrow.get_fragments())
 
     @cached_property
     def paths(self) -> tuple[str, ...]:
