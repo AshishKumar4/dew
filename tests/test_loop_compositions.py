@@ -50,10 +50,13 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
             if isinstance(step, DrawingStep):
                 step.drawn(interval, index)
                 counts.extend(step.counts)
-            given = (jax.device_get(state), jax.tree.map(lambda leaf: leaf.sharding, state))
+            oracle = drawn and implicit and copies and gated
+            # The state before the step donates it, read where the fixed-count program steps it too.
+            given = None if not oracle else (jax.device_get(state),
+                                             jax.tree.map(lambda leaf: leaf.sharding, state))
             state, loss, *_ = step(state, batch)
             assert np.isfinite(float(loss)), (index, counts)
-            if drawn and implicit and copies and gated:
+            if oracle:
                 (count,) = step.counts
                 if count not in fixed:
                     alone = phased_trainer(model.with_passes(count), 0, None, accumulation=2)
@@ -102,10 +105,15 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
     with pytest.raises(ValueError):
         stepped(trainer_of(2))
     # A build ahead admits the counts as the run does, and refuses alike.
-    built = trainer_of(2)
-    built.device_mesh = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2 ** 30))
+    def built(law=TRAINED):
+        trainer = trainer_of(2, law)
+        trainer.device_mesh = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2 ** 30))
+        return compile_ahead(trainer, batch)
+
     with pytest.raises(ValueError):
-        compile_ahead(built, batch)
+        built()
+    # The same build of a one-count law, which reads no other count's statistics, is made.
+    assert built(dataclasses.replace(TRAINED, cap=1)) is not None
     assert np.isfinite(stepped(trainer_of(1)))
     # A law of one count compiles its cap's step alone, whose parts read the statistics of their own model.
     assert np.isfinite(stepped(trainer_of(2, dataclasses.replace(TRAINED, cap=1))))
