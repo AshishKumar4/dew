@@ -503,8 +503,7 @@ def serving_task(cell: Mapping) -> tuple[TextGeneration, nn.Module]:
     """The cell's served task and the canonical float model it serves: a decoder computing in the cell's
     dtype (`model_support.decoder`, its weights drawn), with a prediction depth its task drafts speculative
     blocks of three by where the cell speculates, quantized after training (PTQ, weight-only) where the cell
-    serves so, traced for it over a prompt of two tokens as its prompts are (a prediction depth reads a
-    sequence longer than itself, row 9669)."""
+    serves so, traced at the task's default example, a row as long as a prediction depth reads (row 9669)."""
     from model_support import decoder
 
     from dew.quantization import Quantization
@@ -516,7 +515,7 @@ def serving_task(cell: Mapping) -> tuple[TextGeneration, nn.Module]:
     task = TextGeneration(canonical, variables, sampling=Sampling(temperature=0),
                           **({"strategy": Speculative(block=3)} if speculative else {}))
     if cell["quantization"] is not None:
-        task = task.quantized(Quantization(dtype=cell["quantization"], weight_only=True), example=[[3, 4]])
+        task = task.quantized(Quantization(dtype=cell["quantization"], weight_only=True))
     return task, canonical
 
 

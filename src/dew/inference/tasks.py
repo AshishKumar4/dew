@@ -80,6 +80,7 @@ from dew.sampling.text import (
     Transforms,
     decoded_rows,
     generate,
+    prediction_depths,
     refuse_redrawn,
     row_texts,
     with_ids_of,
@@ -1383,12 +1384,14 @@ class TextGeneration(_NativeTextTask):
         criteria = (tuple(given) if isinstance(given, Sequence) else (given,)) + stops
         return replace(policy, stop=(), pad_token_id=policy.pad), chain, criteria
 
-    def quantized(self, spec: Quantization, example: Rows = ((0,),)) -> TextGeneration:
+    def quantized(self, spec: Quantization, example: Rows | None = None) -> TextGeneration:
         """Return the task with the weights matched by `spec` stored as int8 or fp8 through Qwix.
 
         Requires `dewml[quantization]`. `example` is one prepared model
         input, token rows or `ModelInputs`, for Qwix's abstract trace; for a
-        multimodal model it must include the media fields too. The processor
+        multimodal model it must include the media fields too. By default one
+        row of one token more than the model's prediction depths, the
+        shortest a model with depths takes (`prediction_depths`). The processor
         and decoding controls stay unchanged. Weights held as host NumPy
         arrays are quantized one kernel at a time on the default device and
         then return to host storage. If one kernel will not fit on that
@@ -1396,6 +1399,8 @@ class TextGeneration(_NativeTextTask):
         """
         from dew.quantization import quantize_for_serving
 
+        if example is None:
+            example = ((0,) * (prediction_depths(self.model) + 1),)
         inputs = prepared_inputs(None, example, images=None)
         model, variables = quantize_for_serving(self.model, self.variables, spec,
                                                 inputs.tokens, **inputs.kwargs())
