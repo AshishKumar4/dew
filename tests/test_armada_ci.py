@@ -1225,11 +1225,15 @@ def test_a_stored_cut_another_cut_of_its_count_ran_in_place_of_is_stored_as_ran(
     folded = ci.cuts.refolded(ci.session, stored, {name: ran}, 120.0, {name: own}, {name: own},
                               {name: as_ran})
     assert ci.session.cut_by(nodes, folded[name]) == [nodes[:2], nodes[2:]]
-    # A boundary moved earlier ([a, b] | [c, d] stored; [a] | [b, c, d] ran) is found too.
-    earlier = {name: [nodes[2]]}
-    folded = ci.cuts.refolded(ci.session, earlier, {name: ran}, 120.0, {name: own}, {name: own},
-                              {name: [set(nodes[:1]), set(nodes[1:])]})
-    assert ci.session.cut_by(nodes, folded[name]) == [nodes[:2], nodes[2:]]
+    # A boundary moved earlier ([a, b] | [c, d] stored; [a] | [b, c, d] ran, as the record it was cut by
+    # weighs it) is found too: the fold stores b, and the next plan runs [a] | [b, c, d], where a stored cut
+    # kept unrun would have stood at c.
+    before = dict(zip(nodes, [180.0, 40.0, 50.0, 50.0], strict=True))
+    after = dict(zip(nodes, [100.0, 40.0, 50.0, 50.0], strict=True))
+    folded = ci.cuts.refolded(ci.session, {name: [nodes[2]]}, {name: [100.0, 140.0]}, 120.0, {name: before},
+                              {name: after}, {name: [set(nodes[:1]), set(nodes[1:])]})
+    assert folded[name] == [nodes[1]]
+    assert ci.session.planned(name, nodes, list(after.values()), 2, folded) == [nodes[:1], nodes[1:]]
     # Its bound untimed (skipped): the stored cut stays.
     untimed = [set(nodes[:1]), set(nodes[2:])]
     assert ci.cuts.refolded(ci.session, stored, {name: ran}, 120.0, {name: own}, {name: own},
