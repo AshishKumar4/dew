@@ -22,7 +22,6 @@ import jax.numpy as jnp
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection
-from dew.nn.kernels.templates import attention_decode, attention_mosaic, attention_portable, attention_triton
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
@@ -39,9 +38,21 @@ from dew.nn.kernels.templates.attention import (
     takes_output_residuals,
 )
 
-PLAIN = attention_portable.Tiles(attention_triton.BLOCK, attention_triton.BLOCK, attention_triton.BLOCK)
-"""The plain-JAX mainloop's config: the query and key blocks a call walks, and the padding it takes to whole
-blocks, each the Triton mainloop's largest tile (`attention_triton.BLOCK`)."""
+_PLAIN_BLOCK = 128
+"""The plain-JAX mainloop's block size: the Triton mainloop's largest tile (`attention_triton.BLOCK`)."""
+
+
+def _plain():
+    """The plain-JAX mainloop's config (`attention_portable.Tiles`) and module, imported only when the
+    portable fallback runs."""
+    from dew.nn.kernels.templates import attention_portable
+
+    return attention_portable, attention_portable.Tiles(_PLAIN_BLOCK, _PLAIN_BLOCK, _PLAIN_BLOCK)
+
+
+def _unfitted_none(**_kw) -> None:
+    return None
+
 
 Residuals = tuple[jax.Array, jax.Array, jax.Array, Split]
 """A training forward's residuals, which both backwards read: each query's running maximum and denominator
@@ -214,7 +225,12 @@ def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks,
     config of which is refused is declined for its registers, reported so, and the next mainloop takes it, a
     call another mainloop takes compiling none of the refused mainloop's kernels."""
     on_gpu = _on_gpu() or interpret
-    triton = (attention_triton.refused(spans, hooks) or unfitted()) if on_gpu else None
+    if on_gpu:
+        from dew.nn.kernels.templates import attention_triton
+
+        triton = attention_triton.refused(spans, hooks) or unfitted()
+    else:
+        triton = None
     case = _Pass(on_gpu, _on_mosaic() or interpret, declined, triton)
     if uncertified is not None and declined is None and selection.selected(MAINLOOP, case).name == 'mosaic':
         case = dataclasses.replace(case, mosaic=uncertified())
@@ -239,17 +255,31 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         kept = Kept.OUTPUT
     else:
         kept = Kept.SPLIT
-    declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
-                                                 in_key=config.in_key, **form) if _on_mosaic() else None
-    # A decode step's work list certifies the launches its plan derives (`attention_decode.plan`).
-    decodes = kept is Kept.NONE and attention_decode.serves(query, key, hooks, natural=config.natural,
-                                                            target=generation.gpu_target())
-    mainloop = _mainloop(declined, spans, hooks, functools.partial(
-        attention_triton.unfitted, query, key, value, spans, hooks, residuals=kept, **form),
-        uncertified=None if decodes else functools.partial(
+    on_mosaic = _on_mosaic()
+    if on_mosaic:
+        from dew.nn.kernels.templates import attention_decode, attention_mosaic
+
+        declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
+                                                     in_key=config.in_key, **form)
+        # A decode step's work list certifies the launches its plan derives (`attention_decode.plan`).
+        decodes = kept is Kept.NONE and attention_decode.serves(query, key, hooks, natural=config.natural,
+                                                                target=generation.gpu_target())
+        uncertified = None if decodes else functools.partial(
             attention_mosaic.forward_declined, query, key, value, spans, hooks, residuals=kept,
-            in_key=config.in_key, certified=True, **form))
+            in_key=config.in_key, certified=True, **form)
+    else:
+        declined, decodes, uncertified = None, False, None
+    if _on_gpu():
+        from dew.nn.kernels.templates import attention_triton
+
+        unfitted = functools.partial(attention_triton.unfitted, query, key, value, spans, hooks,
+                                     residuals=kept, **form)
+    else:
+        unfitted = _unfitted_none
+    mainloop = _mainloop(declined, spans, hooks, unfitted, uncertified=uncertified)
     if mainloop == 'mosaic':
+        from dew.nn.kernels.templates import attention_decode, attention_mosaic
+
         if decodes:
             # A memory-bound inference call (a decode step's, a verify block's) as the decode's work list.
             return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale,
@@ -257,10 +287,12 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, in_key=config.in_key,
                                         **form)
     if mainloop == 'triton':
+        from dew.nn.kernels.templates import attention_triton
+
         return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=kept,
                                         **form)
-    return attention_portable.xla_mainloop(PLAIN, query, key, value, spans, hooks, residuals=residuals,
-                                           **form)
+    portable, plain = _plain()
+    return portable.xla_mainloop(plain, query, key, value, spans, hooks, residuals=residuals, **form)
 
 
 def rounded(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks) -> jax.Array:
@@ -329,23 +361,37 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     device in effect's (`generation.assumed`'s `interpreted`), where an interpreted call is chosen for."""
     call = (query, key, value, spans, hooks, dout)
     form = {"scale": scale, "natural": natural, "accurate": accurate}
-    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, rounded=rounded, **form)
-                if _on_mosaic() or interpret else None)
-    mainloop = _mainloop(declined, spans, hooks, functools.partial(
-        attention_triton.backward_unfitted, *call, residuals=residuals, **form), interpret=interpret,
-        uncertified=functools.partial(attention_mosaic.backward_declined, *call, residuals=residuals,
-                                      rounded=rounded, certified=True, **form))
+    on_mosaic = _on_mosaic() or interpret
+    if on_mosaic:
+        from dew.nn.kernels.templates import attention_mosaic
+
+        declined = attention_mosaic.backward_declined(*call, residuals=residuals, rounded=rounded, **form)
+        uncertified = functools.partial(attention_mosaic.backward_declined, *call, residuals=residuals,
+                                        rounded=rounded, certified=True, **form)
+    else:
+        declined, uncertified = None, None
+    if _on_gpu() or interpret:
+        from dew.nn.kernels.templates import attention_triton
+
+        unfitted = functools.partial(attention_triton.backward_unfitted, *call, residuals=residuals, **form)
+    else:
+        unfitted = _unfitted_none
+    mainloop = _mainloop(declined, spans, hooks, unfitted, interpret=interpret, uncertified=uncertified)
     if mainloop == 'mosaic':
+        from dew.nn.kernels.templates import attention_mosaic
+
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, interpret=interpret,
                                          **form)
     if mainloop == 'triton':
+        from dew.nn.kernels.templates import attention_triton
+
         grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
                                           residuals=residuals, rounded=rounded, interpret=interpret, **form)
         return dataclasses.replace(grads, score_params=tuple(
             shared_sum(grad, param) if param.kind in SPREAD else grad
             for grad, param in zip(grads.score_params, hooks.score_params, strict=True)))
-    return attention_portable.backward(PLAIN, *call, residuals=residuals, rounded=rounded, **form)
-
+    portable, plain = _plain()
+    return portable.backward(plain, *call, residuals=residuals, rounded=rounded, **form)
 
 SPREAD = (Kind.QUERY, Kind.KEY, Kind.TILE)
 """The parameter kinds `[B or 1, H or 1, ...]` the Pallas-Triton mainloop reads a batch row and head of

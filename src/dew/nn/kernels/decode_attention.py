@@ -56,13 +56,14 @@ from dew.nn.precision import FP32_PRODUCTS, precision_names
 from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
-from .templates import attention_algebra as algebra
 from .templates.attention import Capped, kernel_dot, prescaled
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
     from dew.nn.attention_kernels import AttentionCase
     from dew.nn.kv_cache import PagedCase
+
+    from .templates import attention_algebra as algebra
 
 BLOCK = 32
 """The keys a cache holds whole blocks of, and a page at most (`SUPPORTS`, `PAGED_GEOMETRY`): the least a step
@@ -86,6 +87,8 @@ def step_keys(dtype, width: int, keys: int | None = None) -> int:
     `algebra.compensates`), whose step then sums its product whole, where a step of `BLOCK` keys would split
     its value tile in registers, a layout change through shared memory (116736 bytes at 256-wide fp32 heads,
     past an sm120 block's 101376)."""
+    from .templates import attention_algebra as algebra
+
     if algebra.compensates(dtype):
         return algebra.CHUNK
     most = max(BLOCK, KEY_STEP_BYTES // (width * jnp.dtype(dtype).itemsize))
@@ -167,7 +170,7 @@ run's declared products (`PRODUCTS`)."""
 
 
 def _spec(scale: float, power: float, softcap: float | None, natural: bool | None, dtype, sinks: bool,
-          stored) -> algebra.Forward:
+          stored) -> "algebra.Forward":
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`; None:
     natural for fp32 operands, whose edge logit's base-2 conversion rounded before exp2 moves its normal
@@ -178,6 +181,8 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
     past its reach, row 1955, on a walk the memory bounds). A decode block's rows are a key head's query
     heads and positions (`grouped_query`), so the hook takes no query positions. Its output stored in
     `stored`, the query's dtype, which its narrowing settles for (`algebra.Forward.narrowed`)."""
+    from .templates import attention_algebra as algebra
+
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else Capped(softcap),
                            natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
@@ -186,13 +191,15 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
                            largest=dtype, narrowed=algebra.narrowed_of(stored))
 
 
-def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
-            interpret: bool, sink: jax.Array | None = None) -> algebra.Partial:
+def _attend(query: jax.Array, span: tuple, read, block: int, spec: "algebra.Forward", steps,
+            interpret: bool, sink: jax.Array | None = None) -> "algebra.Partial":
     """The decode mainloop: `query` `[QUERIES, D]` over the keys of `steps`, a range of the loop's steps
     of `block` keys, those of the row's `span` (its first key and its length) alone, `read(step)` giving
     a step's keys and values `[block, D]`, as a softmax state (`algebra.Partial`). A `sink` `[QUERIES]`
     (each query row's value-free logit, -inf for a slice that does not carry it) starts the softmax as
     its first term."""
+    from .templates import attention_algebra as algebra
+
     first_key, length = span
     rows = jnp.arange(QUERIES)
     spans = ((jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)),)
@@ -227,9 +234,11 @@ def _slice(span: tuple, block: int, split, splits: int) -> tuple:
     return begin, jnp.minimum(begin + per, last)
 
 
-def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
+def _write(out_refs, spec: "algebra.Forward", state: "algebra.Partial"):
     """The row's output normalized where one slice reads it all, else the slice's state, which
     `_combined` merges."""
+    from .templates import attention_algebra as algebra
+
     if len(out_refs) == 1:
         out = algebra.finish(spec, state, initial=True)[0]
         out_refs[0][...] = out.astype(out_refs[0].dtype)
@@ -248,7 +257,7 @@ def _first_slice_sink(sinks_ref) -> jax.Array | None:
     return jnp.where(pl.program_id(2) == 0, sinks_ref[...], -jnp.inf)
 
 
-def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: algebra.Forward, splits: int,
+def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: "algebra.Forward", splits: int,
             interpret: bool, sinks: bool):
     sinks_ref, out_refs = (refs[0], refs[1:]) if sinks else (None, refs)
     block = step_keys(value_ref.dtype, key_ref.shape[-1], key_ref.shape[0])
@@ -264,7 +273,7 @@ def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: algebra.Forwa
 
 
 def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pages: int,
-                  spec: algebra.Forward, splits: int, interpret: bool, sinks: bool):
+                  spec: "algebra.Forward", splits: int, interpret: bool, sinks: bool):
     sinks_ref, out_refs = (refs[0], refs[1:]) if sinks else (None, refs)
     page_size, width = key_ref.shape[-2:]
 
@@ -279,10 +288,12 @@ def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pa
                                    _first_slice_sink(sinks_ref)))
 
 
-def _combined(spec: algebra.Forward, *parts, axis: int):
+def _combined(spec: "algebra.Forward", *parts, axis: int):
     """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima and totals, and
     their rows' scale on the scaled walk, `algebra.exported`) merged at once (`algebra.merged`), as the
     normalized output in fp32: an empty slice's state (a maximum of -inf) merges as nothing."""
+    from .templates import attention_algebra as algebra
+
     return algebra.finish(spec, algebra.merged(spec, algebra.imported(parts), axis), initial=True)[0]
 
 
@@ -293,6 +304,8 @@ def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, 
     if splits == 1:
         return jax.ShapeDtypeStruct(shape, dtype), spec
     split = (*shape[:at], splits, *shape[at:])
+    from .templates import attention_algebra as algebra
+
     sums, rows = jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32)
     count = algebra.exported_rows(scaled)
     return [sums, *[rows] * count], [summed, *[reduced] * count]
@@ -370,7 +383,7 @@ class DecodeAttention(tuning.KernelOp):
         summed = pl.BlockSpec((None, None, QUERIES, None, width),
                               lambda row, head, split: (row, split, 0, head, 0))
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
-        def launch(spec: algebra.Forward, spans: jax.Array, splits: int = splits) -> jax.Array:
+        def launch(spec: "algebra.Forward", spans: jax.Array, splits: int = splits) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
                                             scaled=spec.headroom)
             out = launches.pallas_call(
@@ -441,7 +454,7 @@ class PagedDecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
 
-        def launch(spec: algebra.Forward, spans: jax.Array, splits: int = splits) -> jax.Array:
+        def launch(spec: "algebra.Forward", spans: jax.Array, splits: int = splits) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
                                             scaled=spec.headroom)
             out = launches.pallas_call(
