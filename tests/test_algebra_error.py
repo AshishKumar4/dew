@@ -152,8 +152,10 @@ def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
     whose gate is check 1 itself: an algorithm is admitted where this backend runs the product in it and
     the product is as exact as the IEEE fp32 one from the float64 truth. The choice is an algorithm that
     gate admits, and the product computed in it holds the accuracy asked; a gate that admits none is
-    refused, never answered with a cheaper algorithm; and FP8 operands, whose algorithms name no operand
-    types of their own, are given one JAX lowers for them."""
+    refused, never answered with a cheaper algorithm; FP8 operands, whose algorithms name no operand
+    types of their own, are given one JAX lowers for them; and an algorithm converting its operands is
+    never given, whatever a backend states it runs and its gate admits: an fp16 product of fp32 operands
+    past fp16's range, its digits TF32's, is infinite."""
     shape = (64, 32, 16)
     draw = functools.partial(_factors, shape)
 
@@ -174,6 +176,11 @@ def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
                     "the product in the algorithm chosen", seeds=8)
     with pytest.raises(ValueError):
         product_precision(*shape, jnp.float32, admits=lambda preset: False)
+    stated = (jax.lax.DotAlgorithmPreset.F16_F16_F16, jax.lax.DotAlgorithmPreset.F32_F32_F32)
+    wide = product_precision(*shape, jnp.float32, admits=lambda preset: True, stated=stated)
+    assert_as_exact(_product(wide), _product(jax.lax.DotAlgorithmPreset.F32_F32_F32),
+                    lambda seed: tuple(1e6 * factor for factor in draw(seed)), "a product past fp16's range",
+                    seeds=8)
     eight = product_precision(*shape, jnp.float8_e4m3fn, admits=lambda preset: True)
     assert programs.dot_arithmetic(eight, jnp.float8_e4m3fn, jnp.float8_e4m3fn).operand_bits == (8, 8)
 

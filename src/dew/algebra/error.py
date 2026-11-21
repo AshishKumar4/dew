@@ -153,17 +153,19 @@ def product_precision(rows: int, depth: int, columns: int, dtype, *,
                       stated: Iterable[jax.lax.DotAlgorithmPreset] | None = None,
                       ) -> jax.lax.DotAlgorithmPreset:
     """The dot algorithm a `[rows, depth] @ [depth, columns]` product of `dtype` operands runs in for the
-    accuracy its site asks: of the algorithms its backend runs as named (`stated`; by default those JAX runs
-    operands of that dtype in as they are stored, `dew.nn.programs.dot_algorithms`, JAX's own conversion; no
-    list of them here), the cheapest on the process's target (`cost.product_work` under XLA's schedule: a
-    preset's mode and passes as JAX lowers it) that `admits` holds: the site's gate run on its own family at
-    that algorithm (as exact as the accuracy asked, from the float64 truth), or `at_least` the algorithm
-    its upstream runs. So a site states an accuracy and takes whatever product meets it at the best rate:
-    three TF32 passes where one is not enough and IEEE fp32 costs more, one where it is (row 5473;
-    docs/design/algebra.md §1.5). None admitted is refused: the site asked more than any stated algorithm
-    gives, and no cheaper one is taken in its place."""
+    accuracy its site asks: of the algorithms JAX runs operands of that dtype in as they are stored
+    (`dew.nn.programs.dot_algorithms`, JAX's own conversion; no list of them here), those its backend runs
+    as named (`stated`, every one where not given: one converting its operands is none of them, an fp16
+    product of fp32 operands its digits of TF32's and its range fp16's), the cheapest on the process's
+    target (`cost.product_work` under XLA's schedule: a preset's mode and passes as JAX lowers it) that
+    `admits` holds: the site's gate run on its own family at that algorithm (as exact as the accuracy asked,
+    from the float64 truth), or `at_least` the algorithm its upstream runs. So a site states an accuracy and
+    takes whatever product meets it at the best rate: three TF32 passes where one is not enough and IEEE
+    fp32 costs more, one where it is (row 5473; docs/design/algebra.md §1.5). None admitted is refused: the
+    site asked more than any stated algorithm gives, and no cheaper one is taken in its place."""
     operand = jax.numpy.dtype(dtype)
-    stated = programs.dot_algorithms(operand) if stated is None else tuple(stated)
+    found = programs.dot_algorithms(operand)
+    stated = found if stated is None else tuple(preset for preset in found if preset in set(stated))
     schedule = cost.fused(cost.target())
 
     def seconds(preset: jax.lax.DotAlgorithmPreset) -> tuple[float, float]:
