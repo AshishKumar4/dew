@@ -754,7 +754,7 @@ IN_CONTEXT = "in_context"
 the model's own."""
 
 
-class InContextDecoder(DecoderHooks, nn.Module):
+class InContextDecoder(DecoderHooks):
     """`model` decoding with its continuum level stepped in context as its training forward steps it
     (`adapted_scores` under `adaptation`): the model a language model that adapts in context generates
     with (row 9066).

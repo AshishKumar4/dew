@@ -247,14 +247,12 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
 
 
 def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
-    """The digits `_nearest` walks: a kernel's every one, and every one where a limb is split across devices
-    (its type's sharding names a mesh axis: the extrema of independent sums' limbs would be a collective
-    across their shards, row 8841), else the nonzero limbs' and a carry's room."""
+    """The digits `_nearest` walks: a kernel's every one, and every one where a limb may lie across devices
+    (`_may_split`: the extrema of independent sums' limbs would be a collective across their shards, row
+    8841), else the nonzero limbs' and a carry's room."""
     from dew.nn.kernels.launches import interpreting
 
-    split = any(entry is not None for product, _, _ in parts for limb in product.limbs
-                for entry in jax.typeof(limb).sharding.spec)
-    if interpreting() is not None or split:
+    if interpreting() is not None or _may_split(limb for product, _, _ in parts for limb in product.limbs):
         return 0, levels
     ints = jnp.dtype(f"int{limits.bits}")
     width = 2 * split_bits(limits.dtype)[2]
@@ -268,6 +266,16 @@ def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
     first = jnp.clip((least - lowest) // digit, 0, levels)
     last = jnp.clip((most + count.bit_length() + 2 - lowest) // digit + 2, 0, levels)
     return first, jnp.maximum(first, last)
+
+
+def _may_split(limbs) -> bool:
+    """Whether a limb may lie across devices: its type's sharding names a mesh axis (an Explicit one), or
+    the trace's mesh has an Auto axis of more than one device, which the compiler may split it over and its
+    type does not state."""
+    mesh = jax.sharding.get_abstract_mesh()
+    auto = any(kind == jax.sharding.AxisType.Auto and size > 1
+               for kind, size in zip(mesh.axis_types, mesh.axis_sizes, strict=True))
+    return auto or any(entry is not None for limb in limbs for entry in jax.typeof(limb).sharding.spec)
 
 
 def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> jax.Array:

@@ -663,16 +663,15 @@ def _folded(operation: Callable, values: list):
 
 def _joined(a, b):
     """Two double floats at powers of two (`_streamed`'s bands) summed, `(high, low, exponent)`: each moved to
-    the
-    larger's power (exact, or beneath the larger's `u^2`), their high parts' sum exact (`two_sum`), its error
-    carried in the low part; a zero sum where both are."""
+    the larger's power (exact, or beneath the larger's `u^2`), one compensated step of the two
+    (`scaled.compensated_pair`: their high parts' sum exact, its error carried with their low parts), then
+    renormalized (`two_sum`); a zero sum where both are."""
     a, b = _normal(*a), _normal(*b)
     exponents = [jnp.where(high != 0, exponent, _NONE) for high, _, exponent in (a, b)]
     top = jnp.maximum(*exponents)
     moved = [(power2(high, exponent - top, reach=_REACH), power2(low, exponent - top, reach=_REACH))
              for (high, low, _), exponent in zip((a, b), exponents, strict=True)]
-    high, error = two_sum(moved[0][0], moved[1][0])
-    high, low = two_sum(high, error + moved[0][1] + moved[1][1])
+    high, low = two_sum(*scaled.compensated_pair(*moved[0], *moved[1]))
     return high, low, jnp.where(top == _NONE, 0, top)
 
 

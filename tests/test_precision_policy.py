@@ -2,7 +2,6 @@
 
 import contextlib
 import functools
-import re
 from fractions import Fraction
 from types import SimpleNamespace
 
@@ -1973,22 +1972,28 @@ def test_an_aligned_sum_over_an_axis_a_mesh_splits_sums_it_shard_by_shard():
     assert beside.sharding.is_equivalent_to(whole, beside.ndim)
 
 
-def test_an_elementwise_aligned_sum_split_over_a_mesh_is_computed_shard_by_shard():
-    """`aligned_sum([(x, y), (z,)])` elementwise of `[8, 4]` operands split over an Explicit two-device data
-    axis is each element's exact sum (`[[3 + 2^-30]]` rounded, 3, everywhere) and its compiled program holds
-    no collective: each shard's sums are its own, where the digits' walk bounded itself by the extrema of
-    every limb across the shards, an all-reduce of independent sums (row 8841)."""
-    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis_type", [jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Auto])
+def test_an_elementwise_aligned_sum_split_over_a_mesh_is_computed_shard_by_shard(axis_type):
+    """`aligned_sum([(x, y), (z,)])` elementwise of `[8, 4]` operands split over a two-device data axis,
+    Explicit or Auto, is each element's exact sum (`3 + 2^-30` rounded, 3, everywhere) and its compiled
+    program holds no collective (`dew.telemetry.trace.collective`): each shard's sums are its own, where the
+    digits' walk bounded itself by the extrema of every limb across the shards, an all-reduce of independent
+    sums (row 8841)."""
+    from dew.telemetry.trace import collective
+
+    mesh = jax.make_mesh((2,), ("data",), (axis_type,), devices=jax.devices()[:2])
     with jax.set_mesh(mesh):
         rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
         x, y, z = (jax.device_put(jnp.full((8, 4), value, jnp.float32), rows)
                    for value in (2.0 ** -15, 2.0 ** -15, 3.0))
-        summed = jax.jit(lambda x, y, z: aligned_sum([(x, y), (z,)]))
-        text = summed.lower(x, y, z).compile().as_text()
-        value = summed(x, y, z)
+        compiled = jax.jit(lambda x, y, z: aligned_sum([(x, y), (z,)])).lower(x, y, z).compile()
+        value = compiled(x, y, z)
+    instructions = hlo_instructions(compiled).values()
+    assert instructions
+    assert not [each.op for each in instructions if collective(each.op) is not None]
     np.testing.assert_array_equal(np.asarray(value), np.full((8, 4), 3.0, np.float32))
     assert value.sharding.is_equivalent_to(rows, value.ndim)
-    assert not re.search(r"all-reduce|all-gather|collective-permute|reduce-scatter", text), "a collective"
 
 
 def test_an_aligned_sum_over_an_empty_axis_is_zero():
