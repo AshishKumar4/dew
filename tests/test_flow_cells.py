@@ -385,6 +385,23 @@ def test_a_parts_prepare_prepares_its_child_processs_arms(tmp_path, monkeypatch)
     assert CompiledTruths(tmp_path / "store", prepare=False, stamp="a").holds(armed(edges))
 
 
+def test_a_parts_prepare_draws_an_nvfp4_tiles_values_on_the_host(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), the NVFP4 tile of quantized values
+    (`test_algebra_bits._quantized_values`) is drawn and its arms prepared, nothing computed on the
+    compile-only GPU its default device is: its draw ran eagerly there and raised "'Executable' object has no
+    attribute 'local_devices'", naming its test unprepared (row 8617)."""
+    import model_flows
+    import test_algebra_bits
+    import tier_wire
+    from generation_support import node_target
+    from truths_ahead import prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        assert test_algebra_bits._quantized_values().shape == (256, 64)
+
+
 def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, monkeypatch):
     """In a GPU tier part's prepare (its node an H100), the numerics flows' cells placed on the host's CPU, a
     projection and the norm seams, are passed by, none recorded deferred: the prepare chooses every kernel as
