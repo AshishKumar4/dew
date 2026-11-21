@@ -186,10 +186,11 @@ def forward_products(family: mosaic.Family, tiles: Tiles, value_width: int, dtyp
     if not (training or family.rescales_kept):
         return (tiles.consumers, (*logits, value_width), lefts, ahead_logits)
     fresh = (value_width,) if scaled or jnp.dtype(dtype) == jnp.dtype(jnp.float16) else ()
-    base = (tiles.consumers, (*logits, *fresh), lefts, ahead_logits, (value_width,))
+    tail = ((), tmem_columns) if family.places_on_role else ()
+    base = (tiles.consumers, (*logits, *fresh), lefts, ahead_logits, (value_width,), *tail)
     if family.places_on_role and query_width is not None and parts == 1:
         with_query = (tiles.consumers, (*logits, *fresh), (*lefts, (query_width, dtype)),
-                      ahead_logits, (value_width,))
+                      ahead_logits, (value_width,), *tail)
         if family.product_columns(with_query) <= (tmem_columns or 0):
             return with_query
     return base

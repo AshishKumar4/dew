@@ -99,6 +99,53 @@ def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving
     assert explore(threads, arrivals) > 0
 
 
+@pytest.mark.parametrize(("mutation", "expected"), [
+    ("left out", "unwritten"),
+    ("published early", "unwritten"),
+    ("reused turn left out", "unwritten"),
+    ("load wait left out", "unordered"),
+    ("late wait", "unordered"),
+])
+def test_a_rows_forwards_tmem_store_and_load_wait_mutations_are_caught(mutation, expected):
+    """The forward's launch on a B200's tcgen05 rows at one consumer (`ROWS_TILES`) over 256 queries and keys
+    (four 64-key tiles: turns 0, 1, 0, 1): its consumer loads each step's logits (`async_load_tmem` +
+    `wait_load_tmem`), writes its weights over the same aliased tensor-memory allocation (`async_store_tmem`),
+    and publishes them to the issuer by a commit, then an arrival (`Tcgen05Issuer.published`). Dropping the
+    first weights store, moving its commit past the arrival, dropping the third weights store (reused turn 0,
+    after the third logits MMA overwrote the aliased ref), dropping `wait_load_tmem`, or moving
+    `wait_load_tmem` past `tmem_store` is each caught by the explorer (row 8980)."""
+    from ring_protocol import Violation, explore, programs
+
+    query, key = jnp.ones((1, 256, 1, 128), jnp.bfloat16), jnp.ones((1, 256, 1, 128), jnp.bfloat16)
+    spans = template.spans(256, 256, 1)
+    threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key,
+                                 threads=ROWS_TILES.consumers + 1)
+    assert explore(threads, arrivals) > 0
+    (consumer,) = [index for index, program in enumerate(threads)
+                   if any(event.kind == "tmem_store" for event in program)]
+    program = list(threads[consumer])
+    stores = [position for position, event in enumerate(program) if event.kind == "tmem_store"]
+    if mutation == "left out":
+        del program[stores[0]]
+    elif mutation == "published early":
+        commit = next(position for position in range(stores[0], len(program))
+                      if program[position].kind == "tmem_commit")
+        arrival = next(position for position in range(commit, len(program))
+                       if program[position].kind == "arrive")
+        program.insert(arrival, program.pop(commit))
+    elif mutation == "reused turn left out":
+        del program[stores[2]]
+    elif mutation == "load wait left out":
+        wait = next(position for position, event in enumerate(program) if event.kind == "tmem_load_wait")
+        del program[wait]
+    else:
+        wait = next(position for position, event in enumerate(program) if event.kind == "tmem_load_wait")
+        program.insert(stores[0], program.pop(wait))
+    with pytest.raises(Violation) as found:
+        explore([*threads[:consumer], program, *threads[consumer + 1:]], arrivals)
+    assert found.value.kind == expected
+
+
 def _tmem_q_copies(issuer) -> list[tuple[int, object, object]]:
     """Each `(position, tmem_dst, smem_src)` pair emitted by `async_copy_smem_to_tmem` in `issuer`."""
     copies = []
@@ -142,12 +189,12 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     query = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     key = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
-    products = forward_mod.forward_products(placed.ROWS, tiles, width, jnp.bfloat16, ahead=True,
-                                            query_width=width, tmem_columns=tmem)
-    tmem_used = placed.ROWS.product_columns(products)
+    launch_products = forward_mod.forward_products(placed.ROWS, tiles, width, jnp.bfloat16, ahead=True,
+                                                   query_width=width, tmem_columns=tmem)
+    launch_tmem = placed.ROWS.product_columns(launch_products)
     threads, arrivals = programs(
         _placed_forward(tiles, spans), query, key,
-        threads=tiles.consumers + 1 + len(placed.correction_roles(placed.ROWS, tiles.consumers, tmem_used,
+        threads=tiles.consumers + 1 + len(placed.correction_roles(placed.ROWS, tiles.consumers, launch_tmem,
                                                                   tmem)),
         rare=False)
     (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
