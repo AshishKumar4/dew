@@ -837,9 +837,11 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> 
     scaled = reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn
 
     def scale_of(inputs, seed):
-        if scale is not None:
-            return scale(inputs, seed)
+        # A site's own scale too, in the arithmetic its arms run in (a Gemma 3n site's, stated without it,
+        # weighed float64 CPU sums its arms never run: row 9780's debugger).
         with summed_as_run():
+            if scale is not None:
+                return scale(inputs, seed)
             if not isinstance(reference_fn, _Windowed):
                 return rounding_scale(scaled, *inputs, seed=seed)[1]
             each = [rounding_scale(scaled, *jax.tree.map(lambda leaf, at=at: leaf[at], inputs), seed=seed)[1]

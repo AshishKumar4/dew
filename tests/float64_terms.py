@@ -630,7 +630,10 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     walked = wanted or rule is not None
     if walked and body is not None:
         return evaluated(*body, inputs, given, compiling, rule, used)
-    if rule is not None and programs.control_flow(primitive) and _traced_values(inputs):
+    # A branch picks by its selector alone: one known (a platform's, `_platform`) walks its branch beside
+    # traced operands, never every dead one (a platform's other branches, primitives no rule evaluates).
+    picking = inputs[:1] if primitive is jax.lax.cond_p else inputs
+    if rule is not None and programs.control_flow(primitive) and _traced_values(picking):
         # Traced, its values pick no branch and bound no Python loop: the primitive itself over walked bodies.
         outputs = _bound_walk(equation, inputs, rule, used)
         return outputs, [None] * len(outputs)

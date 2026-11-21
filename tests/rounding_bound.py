@@ -30,7 +30,7 @@ import weakref
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import on_float64_device, on_float64_host, rounds_nothing, unrewritten
+from arm_arithmetic import FORMATTED, on_float64_device, on_float64_host, rounds_nothing, unrewritten
 from float64_terms import SUMS, _target, evaluated_on, static, walked
 from jax.extend.core import primitives
 
@@ -109,9 +109,19 @@ class TapRule:
             # An explicit algorithm fixes its products' and sums' format: the replay's are float64's.
             params["precision"] = jax.lax.DotAlgorithmPreset.F64_F64_F64
         operands = [_widened(value) for value in inputs]
-        # A reduce_precision's float64 evaluation keeps its value, the rounding it is weighed.
+        # A reduce_precision's float64 evaluation keeps its value, the rounding it is weighed; any other
+        # operation whose meaning is its format's (`FORMATTED`: a bit cast, a step to a neighbour) runs at the
+        # dtypes it was traced at, its parameters its own, as the float64 replay runs it, its float results
+        # widened after (bound on float64, a float32 read as uint32 was two words an element).
         rounded_to = primitive is jax.lax.reduce_precision_p
-        outputs = list(operands) if rounded_to else _bound(equation, params, operands)
+        if rounded_to:
+            outputs = list(operands)
+        elif primitive in FORMATTED:
+            outputs = [_widened(value) for value in _bound(equation, equation.params, [
+                jnp.asarray(value).astype(variable.aval.dtype)
+                for value, variable in zip(operands, equation.invars, strict=True)])]
+        else:
+            outputs = _bound(equation, params, operands)
         if rounds_nothing(primitive):
             return outputs
         tapped = []
