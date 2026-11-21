@@ -36,9 +36,9 @@ class Delta(Files):
         return path
 
     def _read_files(self) -> tuple[str, ...]:
-        """The files of the table's version as its log names them (`DeltaTable.files`), its dataset
+        """The files of the table's version as its log names them (its add actions' paths), its dataset
         unbuilt, which a resume's shards name alike wherever the table is mounted."""
-        return tuple(self.table.files())
+        return tuple(self.table.get_add_actions(flatten=True).column("path").to_pylist())
 
     @cached_property
     def paths(self) -> tuple[str, ...]:

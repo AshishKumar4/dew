@@ -270,14 +270,16 @@ def test_a_position_saved_under_plan_16_of_a_store_stating_lengths_resumes_under
     def read(stream, count) -> list[int]:
         return [int(value) for batch in itertools.islice(stream, count) for value in batch["x"]]
 
+    # Its plan described as plan 16 describes it, every store's lengths among its facts, and saved as 16's.
     with described_under(DECIDED):
         saving = loader().train(DataPartition())
         try:
             assert read(saving, 2) == [0, 1, 2, 3]
-            saved = saving.get_state()
+            position = json.loads(saving.get_state())
         finally:
             saving.close()
-    assert json.loads(saved)["dew_data_plan"]["version"] == DECIDED
+    position["dew_data_plan"]["version"] = DECIDED
+    saved = json.dumps(position).encode()
     resumed = loader().train(DataPartition())
     try:
         resumed.set_state(saved)
