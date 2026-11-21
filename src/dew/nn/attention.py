@@ -632,11 +632,29 @@ def _grouped_as_jax_nn(attend: Callable, query, key, value, mask, bias) -> jax.A
     return out.reshape(*rows, length, heads, value.shape[-1])
 
 
+@functools.cache
+def _default_16bit_preset(dtype_name: str, target_name: str | None) -> jax.lax.DotAlgorithmPreset:
+    """Cheapest single-pass fp32-accumulating dot preset for 16-bit `dtype_name` on `target_name`, derived
+    from `dew.algebra.error.product_precision` (row 5473)."""
+    del target_name
+    from dew.algebra.error import product_precision
+    from dew.nn import programs
+
+    dtype = jnp.dtype(dtype_name)
+
+    def admits(preset: jax.lax.DotAlgorithmPreset) -> bool:
+        arith = programs.dot_arithmetic(preset, dtype, dtype)
+        return (arith is not None and arith.accumulation_bits == 32
+                and not arith.imprecise and arith.operations == 1)
+
+    return product_precision(64, 64, 64, dtype, admits=admits)
+
+
 def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
     """The dot algorithm jax.nn's xla attention names for its logits' product
     (`_dot_product_attention_core`), which the reference's jax.nn form
     (`scale_logits`) declares as jax.nn does: a 16-bit operand's own product
-    with fp32 sums (bf16's `BF16_BF16_F32`, fp16's `F16_F16_F32`) where the
+    with fp32 sums derived from `dew.algebra.error.product_precision` where the
     call states no precision above the default and the platform it is placed
     on lowers it (`placed_platform`: bf16's everywhere but a GPU before
     `BF16_GPU`, `bf16_dot_runs`; fp16's on a GPU alone, where a CPU's dot and
@@ -645,11 +663,10 @@ def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
     if not asks_default_precision(precision):
         return None
     if dtype == jnp.bfloat16 and bf16_dot_runs():
-        return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+        return _default_16bit_preset("bfloat16", generation.gpu_target().generation)
     if dtype == jnp.float16 and generation.placed_platform() == 'gpu':
-        return jax.lax.DotAlgorithmPreset.F16_F16_F32
+        return _default_16bit_preset("float16", generation.gpu_target().generation)
     return None
-
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation: AttentionImpl = 'auto',

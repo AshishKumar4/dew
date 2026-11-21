@@ -142,6 +142,6 @@ M_EM_52 = ("M-EM-52-gh200 (a GH200 under its power cap, base/kernels 3bea6245b56
            "in the same process, 24,576 tokens)")
 EM35D = ("em35d (a B200, base/kernels ce6eff7f0be, CUPTI medians of 5 rounds, cuBLASLt autotuned at run, "
          "24,576 tokens)")
-B200_GRID = ("lab-b200-20261113-grid (a B200, base/kernels 5ac163abbec, medians of 5 rounds' same-round "
+B200_GRID = ("the B200 grid (base/kernels 5ac163abbec, medians of 5 rounds' same-round "
              "ratios, cuBLASLt autotuned at run, 24,576 tokens; its down kernel gradient the template's, "
              "0.833x)")

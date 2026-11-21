@@ -98,7 +98,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
         # collectives then start, their rendezvous block every worker of the pool, and the device the
         # first one waits for never runs (row 5397: a plain JAX program of three such loops on a 2x2 mesh
         # hangs 11 of 12 processes, none with the communicator made a completion dependency; armada job
-        # 20261110120401-1a75cf8e; the program is dew-ops upstream/xla_cpu_collective_order_repro.py).
+        # 20261110120401-1a75cf8e).
         # The memory-optimized schedule reuses buffers between the loops, whose dependencies keep them
         # apart: tests/test_run_option_matrix.py's staged lm run aborted 3 of 30 runs under the default
         # schedule and 0 of 60 under this one. XLA's CPU backend ships in jaxlib, which Dew takes as

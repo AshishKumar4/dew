@@ -92,10 +92,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
-- Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
-- Tools/layout_parity.py:816-839 keeps a second accuracy policy. [793]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - Released checkpoints judged on GPUs. [1703]
 - Reference comparisons held by derived bounds. [1719, 2094]

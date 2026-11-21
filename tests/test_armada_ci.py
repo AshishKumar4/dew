@@ -1210,6 +1210,47 @@ def test_a_group_past_its_bound_is_cut_again_with_its_nearest_groups_alone_and_t
     assert ci.cuts.rebalanced(ci.session, dict.fromkeys(nodes, 100.0), bounds, [210.0] * 6, 180.0) is None
 
 
+def test_a_stored_cut_another_cut_of_its_count_ran_in_place_of_is_stored_as_ran(ci, tmp_path):
+    """A stored cut main's CI ran no group of as stored (a bound timed in another group than the one it
+    starts: a reweighed plan cut the file afresh at the same count) stores the cut that ran, never its own,
+    which a plan would take up again and rename every group of (review, row 10776); a bound timed in no
+    group (skipped) proves nothing and keeps the stored cut, so none is recut every train."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 120, "environment": {}}))
+    name = "tests/test_steady.py"
+    nodes = [f"{name}::test_{index}" for index in range(4)]
+    own = dict.fromkeys(nodes, 50.0)
+    ran = [100.0, 100.0]
+    as_ran = [set(nodes[:2]), set(nodes[2:])]
+    # Stored [test_0], [test_1..3]; ran [test_0, test_1], [test_2, test_3]: the cut that ran is stored.
+    stored = {name: [nodes[1]]}
+    folded = ci.cuts.refolded(ci.session, stored, {name: ran}, 120.0, {name: own}, {name: own},
+                              {name: as_ran})
+    assert ci.session.cut_by(nodes, folded[name]) == [nodes[:2], nodes[2:]]
+    # A boundary moved earlier ([a, b] | [c, d] stored; [a] | [b, c, d] ran, as the record it was cut by
+    # weighs it) is found too: the fold stores b, and the next plan runs [a] | [b, c, d], where a stored cut
+    # kept unrun would have stood at c.
+    before = dict(zip(nodes, [180.0, 40.0, 50.0, 50.0], strict=True))
+    after = dict(zip(nodes, [100.0, 40.0, 50.0, 50.0], strict=True))
+    folded = ci.cuts.refolded(ci.session, {name: [nodes[2]]}, {name: [100.0, 140.0]}, 120.0, {name: before},
+                              {name: after}, {name: [set(nodes[:1]), set(nodes[1:])]})
+    assert folded[name] == [nodes[1]]
+    assert ci.session.planned(name, nodes, list(after.values()), 2, folded) == [nodes[:1], nodes[1:]]
+    # Its bound untimed (skipped): the stored cut stays.
+    untimed = [set(nodes[:1]), set(nodes[2:])]
+    assert ci.cuts.refolded(ci.session, stored, {name: ran}, 120.0, {name: own}, {name: own},
+                            {name: untimed}) == stored
+    # The same rows read back: each group's timed tests, in order.
+    rows = {name: [{"name": f"3.12:{name}#2/2", "exitCode": 0, "seconds": 100.0,
+                    "tests": dict.fromkeys(nodes[2:])},
+                   {"name": f"3.12:{name}#1/2", "exitCode": 0, "seconds": 100.0,
+                    "tests": dict.fromkeys(nodes[:2])}]}
+    assert ci.cuts.held(rows) == {name: as_ran}
+    # A one-group split (`--split=1/1`) reads as its one group.
+    whole = {name: [{"name": f"3.12:{name}#1/1", "exitCode": 0, "seconds": 200.0,
+                     "tests": dict.fromkeys(nodes)}]}
+    assert ci.cuts.held(whole) == {name: [set(nodes)]} and ci.cuts.ran(whole) == {name: [200.0]}
+
+
 def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
         ci, tmp_path, monkeypatch, cache_worker):
     """Tests marked shared_setup with one name, on their own decorators, run in one group of their
