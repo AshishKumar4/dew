@@ -28,6 +28,7 @@ import dataclasses
 import functools
 import inspect
 import json
+import logging
 from collections.abc import Callable, Collection, Hashable, Sequence
 
 import jax
@@ -39,6 +40,8 @@ from jax.extend import core as jax_core
 from jax.extend.core import create_call_primitive
 
 from dew.nn import programs
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "Algebra",
@@ -467,7 +470,8 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
 
     try:
         statement = json.dumps(stated(function, f"a marked span of {kind!r}"), sort_keys=True)
-    except Unestablished:
+    except Unestablished as unstated:
+        _log.debug("a marked span no statement holds is traced at each call: %s", unstated)
         return None
     return (kind, structure, statement, tuple(jax.typeof(leaf) for leaf in flat), options.trace_context(),
             tuple(sorted(np.geterr().items())))

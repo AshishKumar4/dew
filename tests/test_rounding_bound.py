@@ -65,46 +65,12 @@ def test_a_program_traced_under_one_context_is_not_served_under_another():
     np.testing.assert_array_equal(after, 2.0 * before)
 
 
-def test_a_program_of_more_steps_than_a_span_is_scaled_as_compiled_whole(monkeypatch):
-    """A static program of more steps than a compiled span holds (`float64_terms.SPAN_STEPS`) is walked a
-    span at a time (row 9780: a Gemma 3n site compiled whole peaked at 9.1 GiB), its values and its rounding
-    scale each element's as the program compiled whole gives them: each rounding's sign keyed by its place
-    in the program, not by the span it falls in. Here spans of 8 steps over a program of 40."""
+def _held_whole_in_spans(monkeypatch, program) -> None:
+    """`program`'s values and rounding scale at three values walked in spans of 8 steps
+    (`float64_terms.SPAN_STEPS`) as compiled whole: each rounding's sign keyed by its place in the program,
+    not by the span it falls in."""
     import float64_terms
     import rounding_bound
-
-    def chained(x):
-        for step in range(20):
-            x = x * np.float32(1.0 + 1e-3 * (step % 7)) + np.float32(0.25)
-        return x
-
-    x = jnp.asarray([1.0, -2.0, 3.5], jnp.float32)
-    whole = rounding_scale(chained, x)
-    rounding_bound.released_scales()
-    monkeypatch.setattr(float64_terms, "SPAN_STEPS", 8)
-    monkeypatch.setattr(rounding_bound, "SPAN_STEPS", 8)
-    spanned = rounding_scale(chained, x)
-    rounding_bound.released_scales()
-    np.testing.assert_array_equal(spanned[0], whole[0])
-    np.testing.assert_array_equal(spanned[1], whole[1])
-
-
-def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypatch):
-    """A call whose body holds more steps than a compiled span (`float64_terms.SPAN_STEPS`; a jit-wrapped
-    reference, the gate's common arm, is one such step) is walked as its body's spans, its values and its
-    rounding scale each element's as the program compiled whole gives them (row 10950: counted as one step,
-    it was compiled whole however large its body; row 10971: its spans checked by their bounds alone)."""
-    import float64_terms
-    import rounding_bound
-
-    @jax.jit
-    def body(x):
-        for _ in range(10):
-            x = x * np.float32(1.5) + np.float32(0.25)
-        return x
-
-    def program(x):
-        return body(x + np.float32(1.0)) * np.float32(2.0)
 
     x = jnp.asarray([1.0, -2.0, 3.5], jnp.float32)
     whole = rounding_scale(program, x)
@@ -115,3 +81,33 @@ def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypat
     rounding_bound.released_scales()
     np.testing.assert_array_equal(spanned[0], whole[0])
     np.testing.assert_array_equal(spanned[1], whole[1])
+
+
+def test_a_program_of_more_steps_than_a_span_is_scaled_as_compiled_whole(monkeypatch):
+    """A static program of more steps than a compiled span holds (`float64_terms.SPAN_STEPS`) is walked a
+    span at a time (row 9780: a Gemma 3n site compiled whole peaked at 9.1 GiB), its values and its rounding
+    scale each element's as the program compiled whole gives them: each rounding's sign keyed by its place
+    in the program, not by the span it falls in. Here spans of 8 steps over a program of 40."""
+    def chained(x):
+        for step in range(20):
+            x = x * np.float32(1.0 + 1e-3 * (step % 7)) + np.float32(0.25)
+        return x
+
+    _held_whole_in_spans(monkeypatch, chained)
+
+
+def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypatch):
+    """A call whose body holds more steps than a compiled span (`float64_terms.SPAN_STEPS`; a jit-wrapped
+    reference, the gate's common arm, is one such step) is walked as its body's spans, its values and its
+    rounding scale each element's as the program compiled whole gives them (row 10950: counted as one step,
+    it was compiled whole however large its body; row 10971: its spans checked by their bounds alone)."""
+    @jax.jit
+    def body(x):
+        for _ in range(10):
+            x = x * np.float32(1.5) + np.float32(0.25)
+        return x
+
+    def program(x):
+        return body(x + np.float32(1.0)) * np.float32(2.0)
+
+    _held_whole_in_spans(monkeypatch, program)
