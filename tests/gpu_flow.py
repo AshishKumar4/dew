@@ -27,7 +27,10 @@ class Cell:
     Mosaic GPU's where `mosaic` (run only where the device runs them as the generation lowers them,
     `generation_support.lowers_as`); `native` its values of the axes a GPU runs natively, which a class's
     covering reads (`covering`), and `fault` the GPU-only fault or red it is kept for by name, None where the
-    covering decides."""
+    covering decides. `at_run`, a cell with no check-1 site whose programs its run compiles as it reaches
+    them (its GPU's driver facts read, a fresh process's, a bitwise check), says why: its GPU tier part's
+    prepare has nothing of it to compile ahead and passes it by (`run_cells`), as the `compiles_at_run`
+    marker passes a test by (tests/conftest.py), where it was deferred and named unprepared (row 8074)."""
 
     label: str
     run: Callable[[], None]
@@ -35,6 +38,7 @@ class Cell:
     mosaic: bool = False
     native: Mapping[str, str] = dataclasses.field(default_factory=dict)
     fault: str | None = None
+    at_run: str | None = None
 
 
 def held(combination: Mapping[str, str], *, values: bool = True) -> set:
@@ -181,6 +185,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     # Read when the flow runs: generation_support reads, in a prepare, model_flows' node target, whose
     # module imports this one, so importing it here made a flow module imported first refuse to import in
     # every GPU tier part's prepare (a circular import: its sites went unprepared).
+    import tier_wire
     from generation_support import lowers_as, runnable
 
     global _depth
@@ -188,10 +193,16 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     failed: list[tuple[str, str, list[tuple[str, int]]]] = []
     skipped: list[str] = []
     passed = deferred = 0
+    preparing = tier_wire.preparing()
     try:
         for cell in cells:
             if cell.generation is not None and not (lowers_as if cell.mosaic else runnable)(cell.generation):
                 skipped.append(cell.label)
+                continue
+            if preparing and cell.at_run is not None:
+                # Nothing of it to compile ahead (`Cell.at_run`): its run runs it, as a deferred cell's.
+                print(f"cell compiles at its run: {cell.label}: {cell.at_run}", flush=True)
+                deferred += 1
                 continue
             print(f"cell: {cell.label}", flush=True)
             tried_before = _tried()
