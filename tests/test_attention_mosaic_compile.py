@@ -949,48 +949,54 @@ def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_t
             == sorted((op, sorted(modules.items())) for op, _, modules in cold))
 
 
+CERTIFIED_PROGRAM = """
+import json
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels import generation
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.templates import report
+
+tokens, heads, kv_heads, width = 1600, 4, 2, 128
+device = compile_only_gpus("sm90")[0]
+placed = NamedSharding(Mesh([device], ("x",)), PartitionSpec())
+query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16, sharding=placed)
+key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16, sharding=placed)
+
+def loss(query, key, value):
+    attended = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
+    return jnp.sum(attended.astype(jnp.float32))
+
+with generation.assumed("sm90"), report.certifying(device), report.refusals():
+    owned_program(jax.grad(loss, argnums=(0, 1, 2))).compiled(query, key, key)
+print(json.dumps([[found.op, found.stored, bool(found.refused),
+                   {name: module for name, (module, _) in found.kernels.items()}]
+                  for found in report.certifications()]))
+"""
+"""A training step compiled through Dew's compile point (`OuterProgram.compiled`) in a process of its own,
+each attention launch certified on a compile-only H100."""
+
+
 @COMPILES_ON_CPU
-def test_a_programs_launches_compile_beside_its_trace():
+def test_a_programs_launches_compile_beside_its_trace(tmp_path):
     """A training step compiled through Dew's compile point (`OuterProgram.compiled`) certifies its
-    attention launches beside its trace (`report.certifying_aside`): each launch's compile runs on a thread
-    of its own while the trace goes on, as JAX's compile events say of the thread that ran them, the
-    program's own compile on the caller's; its launches certified, none refused."""
-    import threading
+    attention launches beside its trace (`report.certifying_aside`) on a cold isolated store and reads
+    stored verdicts on a warm repeat without refusing any launch (row 10802)."""
+    from process_support import fresh, keeping_picks
 
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+    def certified(found: list) -> list:
+        return sorted((op, sorted(modules.items())) for op, _, _, modules in found)
 
-    from dew.nn.kernels.generation import compile_only_gpus
-    from dew.nn.kernels.options import owned_program
-
-    compiled_on: list[str] = []
-
-    def heard(event: str, seconds: float, **_) -> None:
-        if event == "/jax/core/compile/backend_compile_duration":
-            compiled_on.append(threading.current_thread().name)
-
-    tokens, heads, kv_heads, width = 1600, 4, 2, 128
-    device = compile_only_gpus("sm90")[0]
-    placed = NamedSharding(Mesh([device], ("x",)), PartitionSpec())
-    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16, sharding=placed)
-    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16, sharding=placed)
-
-    def loss(query, key, value):
-        attended = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
-        return jnp.sum(attended.astype(jnp.float32))
-
-    before = len(report.certifications())
-    jax.monitoring.register_event_duration_secs_listener(heard)
-    try:
-        with generation.assumed("sm90"), report.certifying(device), report.refusals():
-            owned_program(jax.grad(loss, argnums=(0, 1, 2))).compiled(query, key, key)
-    finally:
-        jax.monitoring.unregister_event_duration_listener(heard)
-    certified = report.certifications()[before:]
-    assert certified and not any(certification.refused for certification in certified), certified
-    aside = [name for name in compiled_on if name.startswith("dew-certify")]
-    compiled_here = [certification for certification in certified if not certification.stored]
-    assert len(aside) == len(compiled_here) > 0, compiled_on
-    assert compiled_on.count(threading.current_thread().name) == 1, compiled_on
+    cold = fresh(CERTIFIED_PROGRAM, cache_dir=tmp_path, flags=keeping_picks())
+    warm = fresh(CERTIFIED_PROGRAM, cache_dir=tmp_path, flags=keeping_picks())
+    assert cold and not any(refused for _, _, refused, _ in cold), cold
+    assert not any(stored for _, stored, _, _ in cold), cold
+    assert warm and all(stored for _, stored, _, _ in warm), warm
+    assert not any(refused for _, _, refused, _ in warm), warm
+    assert certified(warm) == certified(cold)
 
 
 @COMPILES_ON_CPU
