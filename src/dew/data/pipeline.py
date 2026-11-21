@@ -29,7 +29,7 @@ import numpy as np
 from dew._records import ADDED, JSON, integer, json_value, record, text
 from dew.batch import Batch
 from dew.data.concurrent import PoolKind
-from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
+from dew.data.dataset import WORKER_BUFFER, Closeable, Records, phase_ends
 
 if TYPE_CHECKING:
     import jax
@@ -1538,8 +1538,14 @@ class Dataset:
         drawn = {"seed": seed} if draws(chain) else {}
 
         def rows() -> Iterator[Batch]:
-            # The pass opened once `export` has checked where and how it writes, as it opens a chain.
-            yield from passed(chain, seed)
+            # The pass opened once `export` has checked where and how it writes, as it opens a chain, and
+            # closed however it ends, a row that fails to read among them.
+            opened = passed(chain, seed)
+            try:
+                yield from opened
+            finally:
+                if isinstance(opened, Closeable):
+                    opened.close()
 
         if deduplicate is None:
             return export(rows(), url, format=format, rows_per_shard=rows_per_shard, metadata=drawn or None)
