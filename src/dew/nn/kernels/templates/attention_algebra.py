@@ -555,7 +555,7 @@ the plain launch's outputs, which it writes its rows `live` into in place (`walk
 
 
 def finished_form(spec: Forward) -> Forward:
-    """The form a walk's finished states merge in (`slice_state`, `finished_merged`, `merged_slices`): its
+    """The form a walk's finished states merge in (`slice_state`, `finished_merged`, `merged_state`): its
     own where `finish` leaves its maxima in its units (natural, or a raw fold's products), else its fold's
     natural form (`unfolded`), whose units a folded walk's finished maxima are in (`finished_rows`)."""
     return spec if spec.natural or spec.raw else unfolded(spec)
@@ -587,13 +587,6 @@ def initial_state(spec: Forward, initial: Partial) -> Partial:
     out = jnp.where(held[..., None], means.finished(initial.acc, initial.total), 0.0)
     maximum = raw_maximum(initial.m, spec.scale) if spec.raw else initial.m
     return slice_state(spec, out, maximum, initial.total)
-
-
-def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
-                  initial: Initial | None = None) -> jax.Array:
-    """A split walk's slices merged (`merged_state`, then `finish`): the rows' output `[B, Q, KV, Dv]` fp32, a
-    row of no mass zero, as the reference's."""
-    return finish(spec, merged_state(spec, out, maximum, total, initial), initial=True, normalized=True)[0]
 
 
 def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array, total: jax.Array,
@@ -1336,11 +1329,10 @@ def rescaled(state: Partial, factor: jax.Array, weighed: Callable[[], jax.Array]
     # fp32's largest takes its exponent still (values of 2^126 at a reach of 2^66 overflowed it and took none,
     # the range audit of row 8652, #3); held at fp32's largest past it, as finite as a bound need be.
     binades = math.log2(drop.reach)
-    # Scalar power of two via `scalar_power2`: `power2` bitcasts a rank-0 scalar, which Mosaic GPU refuses
-    # (`Scalars must be represented by non-vector types, got: vector<f32>`, row 9810).
-    shift = jnp.asarray(binades, jnp.float32)
-    held = scalar_power2(factor * before.bound, -shift) + term
-    bound = jnp.minimum(scalar_power2(held, shift), np.float32(np.finfo(np.float32).max))
+    # Static power-of-two host constants via `taken_back` (row 10161): exact on every backend (no `exp2`
+    # approximation) and builds no rank-0 scalar bitcast in Mosaic GPU (row 9810).
+    held = taken_back(factor * before.bound, -binades) + term
+    bound = jnp.minimum(taken_back(held, binades), np.float32(np.finfo(np.float32).max))
     return Scale(jnp.maximum(before.exponent, exponent_of(held, binades)), bound)
 
 
@@ -1400,11 +1392,19 @@ def small_parts(small: jax.Array, dtype) -> tuple[product.Scaled, ...]:
 
 def taken_back(value: jax.Array, exponent: jax.Array | float) -> jax.Array:
     """A scaled part's product, or a sum of its weights, `value` taken back by its power of two
-    (`product.Scaled`): a static one's (`small_parts`) as one exact multiply by its constant, no power built
-    in the kernel (Mosaic GPU's lowering holds no scalar a constant's arithmetic makes); a traced one's by
-    `power2`."""
+    (`product.Scaled`): a static one's (`small_parts`, `rescaled`) as exact multiplies by normal float32
+    host constants (split past fp32's normal range `[-126, 127]`), no power built in the kernel (Mosaic
+    GPU's lowering holds no scalar a constant's arithmetic makes); a traced one's by `power2`."""
     if isinstance(exponent, int | float):
-        return value * np.float32(2.0 ** exponent)
+        remaining = float(exponent)
+        out = value
+        while remaining > 127.0:
+            out = out * np.float32(2.0 ** 126)
+            remaining -= 126.0
+        while remaining < -126.0:
+            out = out * np.float32(2.0 ** -126)
+            remaining += 126.0
+        return out * np.float32(2.0 ** remaining)
     return power2(value, exponent)
 
 

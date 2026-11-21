@@ -123,7 +123,7 @@ def _decode_spans(lengths):
 def _slices_merged(query, key, value, spans, *, slices: int = 8, subtracted: bool = False):
     """A folded decode step (`natural=False`) cut into `slices` slices a row at the decode plan's config
     (the fold's raw products where `subtracted`, as `attention_decode.attend` walks them), merged after the
-    launch (`algebra.merged_slices`), interpreted."""
+    launch (`algebra.merged_state`), interpreted."""
     with generation.assumed("sm90"):
         rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
         config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,

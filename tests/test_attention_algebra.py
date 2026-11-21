@@ -1707,8 +1707,8 @@ def _slice_and_initial_near_fp32s_largest(seed):
 
 
 def test_a_decode_merge_from_an_initial_state_near_fp32s_largest_is_on_par():
-    """A split decode step's slice merged with the call's initial state (`algebra.merged_slices`, as
-    attention_decode merges them), both of masses from 2^126 to 2^127: on par with their outputs' convex
+    """A split decode step's slice merged with the call's initial state (`algebra.merged_state` + `finish`,
+    as attention_decode merges them), both of masses from 2^126 to 2^127: on par with their outputs' convex
     combination over the masses' power of two, the initial state's output its sums over its total, against
     float64 (check 1)."""
 
@@ -1716,8 +1716,9 @@ def test_a_decode_merge_from_an_initial_state_near_fp32s_largest_is_on_par():
         spec = algebra.Forward("spans", 1, ids=False, scale=1.0, natural=True, initial=True)
         initial = template.Initial(jnp.zeros((1, 1, 1)), totals[1].reshape(1, 1, 1),
                                    sums.reshape(1, 1, 1, 1))
-        return algebra.merged_slices(spec, outputs[0].reshape(1, 1, 1, 1, 1), jnp.zeros((1, 1, 1, 1)),
+        state = algebra.merged_state(spec, outputs[0].reshape(1, 1, 1, 1, 1), jnp.zeros((1, 1, 1, 1)),
                                      totals[0].reshape(1, 1, 1, 1), initial)
+        return algebra.finish(spec, state, initial=True, normalized=True)[0]
 
     def plain(outputs, totals, sums):
         shares, = _scaled_masses(totals)
@@ -1748,3 +1749,20 @@ def test_a_padded_query_walks_nothing_again_where_a_real_row_past_fp32_does(form
     later = jnp.asarray([0.0, 3.0, 1.0, 0.5, 2.0, 1e6, -jnp.inf, -jnp.inf], jnp.float32)
     sliced, _ = algebra.rewalks(spec, jnp.stack([maxima, later]))
     np.testing.assert_array_equal(np.asarray(sliced), [expected, [False] * 5 + [True, False, False]])
+
+
+def test_rescaled_uses_exact_power_of_two_constants_for_dropout_reach():
+    """`algebra.rescaled` scales a dropping call's bound by exact host power-of-two constants (row 10161),
+    never `jnp.exp2`, so the scaled bound is bitwise exact on XLA:CPU for both normal and wide reaches."""
+    for binades in (10, 140):
+        drop = template.Draw(rate=1.0 - 2.0 ** -binades, seed=0)
+        assert math.log2(drop.reach) == binades
+        prior = jnp.array([1.5], jnp.float32)
+        state = algebra.Partial(jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32),
+                                jnp.ones((1,), jnp.float32),
+                                algebra.Scale(jnp.zeros((1,), jnp.float32), prior))
+        scale = jax.jit(lambda s: algebra.rescaled(s, jnp.ones((1,), jnp.float32),
+                                                   lambda: jnp.zeros((1,), jnp.float32), drop))(state)
+        assert scale is not None
+        expected = np.float32(1.5) if binades <= 126 else np.float32(0.0)
+        np.testing.assert_array_equal(np.asarray(scale.bound), np.array([expected], np.float32))

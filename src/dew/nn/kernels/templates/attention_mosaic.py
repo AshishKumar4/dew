@@ -648,10 +648,8 @@ class MosaicForward(_Mainloop[Tiles]):
         # A family that places its products on a role issues its logits ahead (`_ahead`: tcgen05's rows,
         # whose issuer warp is a step ahead of its consumer), which past its tensor memory it does not: its
         # products' scratch then none it takes (`Issuer.product_scratch`).
-        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and (
-                not self._ahead(ba, config, target)
-                or scaled_drop(ba.arguments["query"].dtype, ba.arguments.get("drop"),
-                               ba.arguments.get("initial"))):
+        if (bundle_of(config, ba.arguments["query"].dtype).places_on_role
+                and not self._ahead(ba, config, target)):
             return False
         if not super().legal(ba, config, target):
             return False
