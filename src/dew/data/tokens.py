@@ -202,11 +202,16 @@ class BestFit(FirstFit):
                              f"{list(self.rooms)} it packs into; cut it first")
         chosen, fullest = None, -1
         for window, free in enumerate(self.free):
-            if free >= size and (cap is None or held[window] < cap) and (not rest or all(
-                    other <= room for other, room in zip(rest, self.others[window], strict=True))):
+            # Each field's tokens held with the document's, against its room; a window at its documents' cap
+            # takes one only where every field then holds none, as grain adds its capacity to such a window's
+            # (`max_sequences_per_bin`): an empty document beside empty ones.
+            held_after = [self.rooms[0] - free + size, *(room - left + other for room, left, other in zip(
+                self.rooms[1:], self.others[window], rest, strict=True))]
+            capped = cap is not None and held[window] >= cap
+            if all(after <= (0 if capped else room)
+                   for after, room in zip(held_after, self.rooms, strict=True)):
                 # What its fields already hold, summed: grain's score, its first maximum chosen.
-                used = self.rooms[0] - free + sum(room - left for room, left in zip(
-                    self.rooms[1:], self.others[window], strict=True))
+                used = sum(held_after) - sum(sizes)
                 if used > fullest:
                     chosen, fullest = window, used
         if chosen is None:

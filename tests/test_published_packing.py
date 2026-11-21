@@ -20,8 +20,16 @@ SIZES = (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)
 """Documents of these many characters, three longer than a 9-token window."""
 
 
-@pytest.mark.parametrize("bins, segments", [(3, None), (2, 2), (4, 3)])
-def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_packs(tmp_path, bins, segments):
+SIZES_BEST_FIT = (3, 7, 6, 2, 4, 5, 7, 1, 5, 6, 7, 2, 3, 8, 1, 4)
+"""Documents a best-fit pack places, each its own letter."""
+
+
+@pytest.mark.parametrize("bins, segments, sizes", [
+    (3, None, SIZES_BEST_FIT), (2, 2, SIZES_BEST_FIT), (4, 3, SIZES_BEST_FIT),
+    # Empty documents fill a window's documents to its cap, which grain still gives an empty one.
+    (2, 2, (0, 0, 0, 3, 3, 3, 3))])
+def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_packs(tmp_path, bins, segments,
+                                                                                  sizes):
     """A best-fit pack of whole documents is published (row 9053: refused before) with the plan grain's
     best-fit packer places them by (`tokens.BestFit`): read back by index, it holds window for window, in
     order, the documents grain's `BestFitPackIterDataset` packs from them with its bins emitted in order, as a
@@ -31,7 +39,6 @@ def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_pack
 
     # Each document its own letter, so a window's byte ids name the documents it holds; tokenized, the
     # documents' lengths are certified (`Tokenize`), as a published plan needs.
-    sizes = (3, 7, 6, 2, 4, 5, 7, 1, 5, 6, 7, 2, 3, 8, 1, 4)
     texts = tuple(chr(ord("a") + index) * size for index, size in enumerate(sizes))
     prefix = Pipeline(Memory(tuple({"text": text} for text in texts))).map(Tokenize())
     packed = prefix.pack(9, bins=bins, segments=segments, policy="best-fit")
@@ -41,6 +48,11 @@ def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_pack
     def held(tokens) -> list[int]:
         """The documents a window's tokens are of, in their order: each its letter's byte id."""
         return list(dict.fromkeys(int(token) for token in np.ravel(tokens) if token))
+
+    def tokened(windows: list[list[int]]) -> list[list[int]]:
+        """The windows that hold a token, which every read keeps (one of empty documents alone it leaves
+        out, having no target)."""
+        return [window for window in windows if window]
 
     def windows(chain, read) -> list[list[int]]:
         # One pass, in order (a validation read's).
@@ -56,8 +68,8 @@ def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_pack
         num_packing_bins=bins, shuffle_bins=False, max_sequences_per_bin=segments)]
     published = windows(prefix.cache(generation).pack(
         9, bins=bins, segments=segments, policy="best-fit"), "indexed")
-    assert published == grains, (published, grains)
-    assert windows(packed, "memory") == grains
+    assert tokened(published) == tokened(grains), (published, grains)
+    assert tokened(windows(packed, "memory")) == tokened(grains)
 
 
 def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tmp_path):
