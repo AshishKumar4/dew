@@ -17,7 +17,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Performance measurements. [569, 285, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - Inference through the templates. [3424, 3602]
-- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900]
+- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900, 10742]
 - Convolution repairs above their owner. [5665]
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
