@@ -830,7 +830,7 @@ def test_a_loop_passing_messages_counts_each_later_passs_merges(messages):
         variables = model.init(jax.random.key(202), *operands)
         return model.model_flops(lengths), forward_products(model.apply, variables, *operands)
 
-    base = {"causal": False, "attention_impl": "reference", "num_layers": 3}
+    base = {"causal": False, "attention_impl": "reference"}
     plain = counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3))))
     messaged = counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3),
                                                             messages=messages)))

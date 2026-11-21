@@ -713,18 +713,14 @@ class Pretrained:
                              "model in its place keeps every parameter it holds")
         # A parameter drawn fresh beside the loaded weights (a loop's merges at one rank) is read again at
         # the shape the new model declares, or refused: kept at another shape it would not apply.
-        def shapes(tree) -> dict[tuple, tuple[int, ...]]:
-            return {path: np.shape(getattr(leaf, "value", leaf))
-                    for path, leaf in flatten_dict(dict(tree.get("params", {}))).items()}
-
-        loaded, drawing = shapes(thaw(self.variables)), shapes(declared)
-        fresh = set(self.fresh)
-        reshaped = sorted("/".join(path) for path, shape in drawing.items()
-                          if path in loaded and "/".join(path) in fresh and loaded[path] != shape)
+        loaded = flatten_dict(dict(unboxed(thaw(self.variables)).get("params", {})))
+        drawing = flatten_dict(dict(unboxed(declared).get("params", {})))
+        reshaped = sorted(name for path, leaf in drawing.items()
+                          if (name := "/".join(path)) in self.fresh and path in loaded
+                          and np.shape(loaded[path]) != leaf.shape)
         if reshaped:
             raise ValueError(f"this {type(model).__name__} declares {reshaped[:6]}, drawn fresh beside the "
-                             "loaded weights, at shapes other than the source holds: draw it from the source "
-                             "without them")
+                             "loaded weights, at shapes other than the source holds: draw it without them")
         if not named - held:
             return replace(self, model=model)
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))

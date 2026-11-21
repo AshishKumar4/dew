@@ -10,8 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from arm_forms import ROUNDED
 from flax import linen as nn
+from map_judge import marked_seeds
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
@@ -28,8 +28,14 @@ DELTA_NETS = {'linear_attention': {'mixer': {'class': 'gated_delta_net', 'fields
     'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}}
 """Gated delta nets, a hybrid's recurrent layers, whose one input site their mixer reads."""
 
-SEEDS = {"merge": 64, "zero gates": 8, "unrolled": 8, "decode": 8, "packed": 16, "retrofitted": 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
+SEEDS = {"merge": 8, "zero gates": 32, "decode": 32, "packed": 8, "retrofitted": 8}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada (XP-SIZE, the most
+any of a site's cases asked)."""
+
+UNROLLED_SEEDS = {"two": 8, "four": 512, "the last trained": 8, "recomputed": 512, "attention": 512,
+                  "depth residuals": 8, "scanned layers": 128}
+"""Check 1's declared seeds for each unrolled case, sized by `seeds_for` on armada (XP-SIZE); those of 512
+drawn 128 a map task (`check1_shards`)."""
 
 MESSAGES = CrossPass(block_size=2, rank=4)
 """Messages over blocks of two layers through a controller of rank 4."""
@@ -80,23 +86,25 @@ def gated_draw(model, shape=(2, 12), salt=0):
     return drawn
 
 
-def merged_by_hand(params, read, bank, spec: CrossPass, eps: float):
-    """A merge's formula (the module doc of `dew.nn.cross_pass`) in float64, from its parameters."""
-    wide = {name: jnp.asarray(value, jnp.float64) for name, value in params.items() if name != "depth"}
-    read, bank = jnp.asarray(read, jnp.float64), jnp.asarray(bank, jnp.float64)
-    keys = bank * jax.lax.rsqrt(jnp.mean(bank * bank, axis=-1, keepdims=True) + eps)
-    query = (jnp.asarray(params["depth"]["scale"], jnp.float64)
-             * jnp.asarray(params["depth"]["kernel"], jnp.float64)[:, 0])
-    weights = jax.nn.softmax(keys @ query, axis=-1)
-    mixed = jnp.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank)
-    message = mixed * jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=-1, keepdims=True) + eps)
-    sigma = jnp.sqrt(jnp.mean(read * read, axis=-1, keepdims=True) + eps)
-    state = (read / sigma) @ wide["input_down"] + message @ wide["message_down"]
-    sent = jnp.tanh(state @ wide["gain"]) * message
-    if spec.additive:
-        sent = sent + jnp.tanh(state @ wide["added"])
-    kept = (1 - jnp.tanh(state @ wide["forget"])) * read
-    return kept + (sigma * sent if spec.scale_by_input_rms else sent)
+def merged_by_hand(params, read, bank, spec: CrossPass, eps: float, dtype=jnp.float64):
+    """A merge's formula (the module doc of `dew.nn.cross_pass`) in `dtype`, from its parameters: in
+    float32 the controller as Inkling 2 Mini's reference writes it, in float64 its truth."""
+    with jax.default_matmul_precision("highest"):
+        wide = {name: jnp.asarray(value, dtype) for name, value in params.items() if name != "depth"}
+        read, bank = jnp.asarray(read, dtype), jnp.asarray(bank, dtype)
+        keys = bank * jax.lax.rsqrt(jnp.mean(bank * bank, axis=-1, keepdims=True) + eps)
+        depth = {name: jnp.asarray(value, dtype) for name, value in params["depth"].items()}
+        query = depth["scale"] * depth["kernel"][:, 0]
+        weights = jax.nn.softmax(keys @ query, axis=-1)
+        mixed = jnp.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank)
+        message = mixed * jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=-1, keepdims=True) + eps)
+        sigma = jnp.sqrt(jnp.mean(read * read, axis=-1, keepdims=True) + eps)
+        state = (read / sigma) @ wide["input_down"] + message @ wide["message_down"]
+        sent = jnp.tanh(state @ wide["gain"]) * message
+        if spec.additive:
+            sent = sent + jnp.tanh(state @ wide["added"])
+        kept = (1 - jnp.tanh(state @ wide["forget"])) * read
+        return kept + (sigma * sent if spec.scale_by_input_rms else sent)
 
 
 @pytest.mark.parametrize("spec", [MESSAGES, dataclasses.replace(MESSAGES, additive=False),
@@ -105,8 +113,9 @@ def merged_by_hand(params, read, bank, spec: CrossPass, eps: float):
                          ids=["additive", "gained alone", "unit scale, raw values"])
 def test_a_merge_is_its_formula(spec):
     """A merge of a bank of three summaries into a sublayer input, every parameter drawn off its init,
-    computes its formula (`merged_by_hand` in float64; check 1), whether its message adds a term of its
-    own, joins at the input's RMS and mixes the summaries normed or raw."""
+    computes its formula (`merged_by_hand`) on par with the formula written in float32 (check 1 against
+    it in float64), whether its message adds a term of its own, joins at the input's RMS and mixes the
+    summaries normed or raw."""
     merge = CrossPassMerge(spec, 16, 1e-6)
 
     def draw(seed):
@@ -118,10 +127,13 @@ def test_a_merge_is_its_formula(spec):
                               nn.unbox(merge.init(jax.random.key(seed), read, bank)))
         return params, read, bank
 
-    def truth(params, read, bank):
-        return merged_by_hand(params["params"], read, bank, spec, 1e-6)
+    def by_hand(dtype):
+        def formula(params, read, bank):
+            return merged_by_hand(params["params"], read, bank, spec, 1e-6, dtype)
+        return jax.jit(formula)
 
-    assert_as_exact(jax.jit(merge.apply), ROUNDED, draw, "a merge", seeds=SEEDS["merge"], truth_fn=truth)
+    assert_as_exact(jax.jit(merge.apply), by_hand(jnp.float32), draw, "a merge", seeds=SEEDS["merge"],
+                    truth_fn=by_hand(jnp.float64))
 
 
 def _messages_by_hand(module, ids):
@@ -204,12 +216,19 @@ def _without_merges(params):
     return kept(dict(params))
 
 
-@pytest.mark.parametrize("case", [
-    ("hybrid", {"steps": 2}), ("hybrid", {"steps": 4}), ("hybrid", {"steps": 3, "backprop_steps": 1}),
-    ("hybrid", {"steps": 3, "remat": True}), ("attention", {"steps": 3}), ("depth", {"steps": 3}),
-    ("scanned", {"steps": 3})],
-    ids=["two", "four", "the last trained", "recomputed", "attention", "depth residuals", "scanned layers"])
-def test_a_loop_passing_messages_computes_its_passes_unrolled(case):
+@pytest.mark.parametrize("case, seeds", [
+    pytest.param(("hybrid", {"steps": 2}), UNROLLED_SEEDS["two"], id="two"),
+    pytest.param(("hybrid", {"steps": 4}), UNROLLED_SEEDS["four"], id="four",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+    pytest.param(("hybrid", {"steps": 3, "backprop_steps": 1}), UNROLLED_SEEDS["the last trained"],
+                 id="the last trained"),
+    pytest.param(("hybrid", {"steps": 3, "remat": True}), UNROLLED_SEEDS["recomputed"], id="recomputed",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+    pytest.param(("attention", {"steps": 3}), UNROLLED_SEEDS["attention"], id="attention",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+    pytest.param(("depth", {"steps": 3}), UNROLLED_SEEDS["depth residuals"], id="depth residuals"),
+    pytest.param(("scanned", {"steps": 3}), UNROLLED_SEEDS["scanned layers"], id="scanned layers")])
+def test_a_loop_passing_messages_computes_its_passes_unrolled(case, seeds, request):
     """At gates drawn off zero, a loop passing messages computes its passes unrolled pass by pass from the
     stack's own spans (`_messages_by_hand`): its logits and every parameter's gradient, the prelude's and
     the merges' among them, on par in float64 (check 1), its later passes traced alone (two), scanned
@@ -224,8 +243,9 @@ def test_a_loop_passing_messages_computes_its_passes_unrolled(case):
             variables, ids, method=_messages_by_hand))
 
     name = f"{form}, {loop}"
-    assert_as_exact(_results(looped.apply), by_hand(jnp.float32), draw, name, seeds=SEEDS["unrolled"],
-                    truth_fn=by_hand(jnp.float64))
+    marked = request.node.get_closest_marker("check1_shards")
+    assert_as_exact(_results(looped.apply), by_hand(jnp.float32), draw, name,
+                    seeds=marked_seeds(request) if marked else seeds, truth_fn=by_hand(jnp.float64))
     if loop.get("backprop_steps"):
         variables, ids, cotangent = draw(0)
         gradients = _results(looped.apply)(variables, ids, cotangent)["gradients"]["params"]
