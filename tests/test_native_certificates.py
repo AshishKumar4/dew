@@ -705,12 +705,13 @@ def the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively
         rw.assert_key_backward_witnessed(mosaic_lane(), heads=2)
 
 
-def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_name):
+def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_name, width):
     """The native step witness under a decay a key dimension
     (`recurrence_witness.assert_key_decays_witnessed`): a native bf16 call of two value heads, every record
-    inside its step's enclosure, and a kernel reading each token's mean decay for all its keys refused."""
+    inside its step's enclosure, and a kernel reading each token's mean decay for all its keys refused, at
+    `width` keys (128 its prefix a running sum down each column, 64 the doubling scan)."""
     with generation.assumed(generation_name):
-        rw.assert_key_decays_witnessed(mosaic_lane(), heads=2)
+        rw.assert_key_decays_witnessed(mosaic_lane(), heads=2, width=width)
 
 
 def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_name, mask):
@@ -777,7 +778,8 @@ def test_the_native_kernels_certify_on_this_gpu():
           for g in GENERATIONS),
         *(cell(the_recurrence_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary, g)
           for g in GENERATIONS),
-        *(cell(the_recurrence_witness_holds_a_decay_a_key_dimension_natively, g) for g in GENERATIONS),
+        *(cell(the_recurrence_witness_holds_a_decay_a_key_dimension_natively, g, w) for g in GENERATIONS
+          for w in (64, 128)),
         *(cell(the_recurrence_witness_holds_a_write_gate_on_the_keys_side_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_values_passed_in_parts_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_the_delta_rules_fast_backward_natively, g) for g in GENERATIONS),

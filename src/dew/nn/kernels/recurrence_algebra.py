@@ -133,6 +133,15 @@ def prefix(g):
                                  padding)
 
 
+def prefix_terms(g) -> tuple:
+    """Each token's term of `prefix`'s pair, `g log2(e)` as a Dekker product and its residual plus `g` times
+    the constant's own rounding, an fp32 pair `(hi, lo)` `g`'s shape: the factor split where it is known
+    (`two_product` of a constant), `g` by its bits in the launch."""
+    scale = np.float32(LOG2_E)
+    scaled, error = two_product(g, scale, bit_split=True)
+    return scaled, error + g * float(np.float32(LOG2_E - float(scale)))
+
+
 def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk: int) -> tuple:
     """`prefix`'s pair of a chunk's decay tile `g` `[C, BK]` (natural log) within a launch, its compensated
     sums taken by doubling (Hillis-Steele's scan: `log2(C)` steps, each row's running pair added to the one
@@ -146,10 +155,7 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
     product into the sum (`fma(g, log2(e), shifted)`), its rounding counted twice beside the Dekker residual
     that keeps it: the native prefix lay 1.9e-6 from exact where the interpreted one lay 1e-12 (M-MC-9), a
     key's gated write one bf16 step from the witness's at a tie (M-MC-8)."""
-    # The factor split where it is known (`two_product` of a constant), `g` by its bits in the launch.
-    scale = np.float32(LOG2_E)
-    scaled, error = two_product(g, scale, bit_split=True)
-    pair = scaled, error + g * float(np.float32(LOG2_E - float(scale)))
+    pair = prefix_terms(g)
     shift = 1
     while shift < chunk:
         staged = stage(pair)
@@ -696,48 +702,34 @@ def gated_up(prefix: tuple, reference: tuple, index: jax.Array, place) -> jax.Ar
 
 
 def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, prefix: tuple,
-                    at: Callable[[int], tuple], staged: Callable[[jax.Array, int, int | None], Tile], *,
-                    chunk: int, scales: Sequence[float], sub: int = SUB) -> list[Callable[[], list[tuple]]]:
-    """A chunk's pairs under a decay a key dimension, one key block's, as the products whose sum they are, a
-    sub-chunk at a time: for each sub-chunk past the first a callable forming its products, one `(name, lhs,
-    rhs)` ('pairs') for each of `rows` (each forming its row when called: the queries, the write-gated keys;
-    fp32), summed into one accumulator a row set, its `[C, C]` pairs against the same `keys` (fp32), `sum_k
-    r_ik k_jk exp2(g_ik - g_jk)` for row `i` in sub-chunk `s` and key `j` in an earlier sub-chunk `t < s`,
-    zero for `t >= s` (a sub-chunk's own pairs are `key_diagonal_bands`', each its own decay, as fla's
-    token-parallel diagonal). `prefix` is the block's separated prefix (`separated`) and `at(token)` it at the
-    chunk's `token`, a column's vectors; each row set's gated rows are scaled by its of `scales` (the scores'
-    the attention scale), so the sums a mainloop holds are its pairs scaled. Each pair's decay splits at `s`'s
-    first token `G_s`, as fla_kda's inter-sub-chunk products split it: `exp2(g_i - G_s) exp2(G_s - g_j)`, each
-    exponent at most zero (`decay`). For each sub-chunk `s` past the first, one product a row set: the rows of
-    `s` gated down to `G_s`, zero on every other row, against every key before `s` gated up to `G_s`
-    (`gated_up`), zero from `s` on, a whole chunk of rows against a whole chunk of keys (read transposed),
-    each operand staged once where `staged(value, s, r)` puts it (the keys' `r` None, every row set's products
-    reading them). A row set's products sum into one accumulator, which a mainloop may hold across its key
-    blocks, read once; formed a sub-chunk at a time, a caller issues each sub-chunk's products once its
-    operands are staged, their MMAs running under the next sub-chunk's forming, where every operand staged
-    before any product was issued, a B200's intra walk's compute warps waited on their products' commit at its
-    end (11% of their stalls, an emulated B200 at b1a0fe4b98b). Factored instead at `t`'s last token, its
-    middle factor laid over the rows of `s` a product a key sub-chunk, each product awaited and read into a
-    tile, the sums added up in shared memory every key block, a B200's Kimi Linear intra walk spent 23% of its
-    cycles waiting on its products' commits and 20% staging (an emulated B200's line map at 37ef70629d7), and
-    its intra launches took 880 us on a GH200 and 1,858 on an A100 against fla's inter-sub-chunk launch's 159
-    and 355 (M-JS-24). A sub-chunk's own pairs factored too, the queries and keys decay-scaled around its
-    first token and taken on the tensor cores, put a packed document's first token's output, a row of 2.5e-5
-    where `q . k` cancels, at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay
-    (row 5194, M-JS-48w)."""
+                    at: Callable[[int], tuple], *, chunk: int, scales: Sequence[float],
+                    sub: int = SUB) -> tuple[list[jax.Array], Callable[[int], jax.Array]]:
+    """A chunk's pairs under a decay a key dimension, one key block's, as the operands of the products
+    whose sum they are: `(gated, raised)`, each of `rows`' gated rows `[C, BK]` (each forming its row when
+    called: the queries, the write-gated keys; fp32), and `raised(s)` sub-chunk `s`'s keys gated up `[C,
+    BK]`. A caller stages each row set's gated rows once and each later sub-chunk's keys in turn, and
+    issues for each sub-chunk `s` past the first one product a row set (`(name, lhs, rhs)`, 'pairs'): the
+    `sub` rows of `s` of the staged rows (a `Staged` tile's `rows`) against the staged keys read
+    transposed, `[sub, C]` a row set and sub-chunk, `sum_k r_ik k_jk exp2(g_ik - g_jk)` for row `i` in `s`
+    and key `j` in an earlier sub-chunk, zero for keys from `s` on (a sub-chunk's own pairs are
+    `key_diagonal_bands`', each its own decay, as fla's token-parallel diagonal). Each pair's decay splits
+    at `s`'s first token `G_s`, as fla_kda's inter-sub-chunk products split it
+    (chunk_kda_fwd_kernel_inter_solve_fused): `exp2(g_i - G_s) exp2(G_s - g_j)`, each exponent at most zero
+    (`decay`), the rows gated down to `G_s` and every key gated up to it (`gated_up`). `prefix` is the
+    block's separated prefix (`separated`) and `at(token)` it at the chunk's `token`, a column's vectors;
+    each row set's gated rows are scaled by its of `scales` (the scores' the attention scale), so the sums
+    a mainloop holds are its pairs scaled. A row set's products sum into one accumulator a sub-chunk, which
+    a mainloop may hold across its key blocks, read once. The products take a sub-chunk's rows (mma.sync's,
+    `intra.sub_chunked`): a whole chunk's rows masked to a sub-chunk's took 4.2 times fla's inter-sub-chunk
+    launch on an A100 (1508 us against 356, M-JS-144-a100). A sub-chunk's own pairs factored too, taken on
+    the tensor cores, put a packed document's first token's output, a row of 2.5e-5 where `q . k` cancels,
+    at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay (row 5194, M-JS-48w)."""
     index, _ = _grid(prefix[0].shape)
-    blocks = chunk // sub
     # Every row gated down to its own sub-chunk's first token.
     down = decay(prefix, _laid_references(lambda s: at(s * sub), index, chunk, sub))
     # Scaled once gated down, so a large row its decay attenuates stays finite.
     gated = [row() * down * scale for row, scale in zip(rows, scales, strict=True)]
-
-    def formed(s: int) -> list[tuple]:
-        raised = staged(keys * gated_up(prefix, at(s * sub), index, s * sub), s, None).T
-        mine = (index >= s * sub) & (index < (s + 1) * sub)
-        return [("pairs", staged(jnp.where(mine, value, 0.0), s, r), raised) for r, value in enumerate(gated)]
-
-    return [functools.partial(formed, s) for s in range(1, blocks)]
+    return gated, lambda s: keys * gated_up(prefix, at(s * sub), index, s * sub)
 
 
 
@@ -752,9 +744,11 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     is the product of its tokens' own, formed across the offsets as the token recurrence forms it (`pair_e =
     pair_(e - 1) a_(i - e + 1)`, at most `sub - 1` roundings, every factor at most one), each term the row
     times the key, then times the decay, in a rolled loop over the offsets, each offset's keys and decays read
-    once for every product; a row before its offset is selected out of its band's column once its terms are
-    summed, not term by term (its sum any value, a select's, never a product's: selected on every term, the
-    mask was a quarter of a B200's own pairs' issues, an emulated B200 at b6a888850b2). Each term's decay
+    once for every product; each offset's sums selected into its band's column, written once, and a row before
+    its offset selected out of every column once, at the end, not term by term nor offset by offset (its sum
+    any value, a select's, never a product's: selected on every term, the mask was a quarter of a B200's own
+    pairs' issues, an emulated B200 at b6a888850b2; an offset's two-part mask and the band's add on every
+    offset were 12% of an emulated GH200's intra_own issues, M-JS-145h). Each term's decay
     from the separated prefix instead (`decay`: two differences, a
     clip, a power of two and an exp2), a B200's Kimi Linear training spent 0.96 ms of an emulated 2.86 in this
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
@@ -772,8 +766,8 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     def offset(e, carried):
         bands, pair, following = carried
         keys, decays = shifted(e)
-        pair, column = pair * following, (lane == e) & (token % sub >= e)
-        return (tuple(band + jnp.where(column, jnp.sum(row * keys * pair, axis=1)[:, None], 0.0)
+        pair = pair * following
+        return (tuple(jnp.where(lane == e, jnp.sum(row * keys * pair, axis=1)[:, None], band)
                       for band, row in zip(bands, rows, strict=True)), pair, decays)
 
     def folded(e, carried):
@@ -781,14 +775,17 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         # most one in size (`unit_keys`) make what the decayed row loses below normal in the exact term too.
         bands, decayed, following = carried
         keys, decays = shifted(e)
-        decayed, column = tuple(row * following for row in decayed), (lane == e) & (token % sub >= e)
-        return (tuple(band + jnp.where(column, jnp.sum(row * keys, axis=1)[:, None], 0.0)
+        decayed = tuple(row * following for row in decayed)
+        return (tuple(jnp.where(lane == e, jnp.sum(row * keys, axis=1)[:, None], band)
                       for band, row in zip(bands, decayed, strict=True)), decayed, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
     if unit_keys:
-        return list(jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0])
-    return list(jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0])
+        bands = jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0]
+    else:
+        bands = jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0]
+    # Each column written once, by its offset's select; a row before its offset selected out once, at the end.
+    return [jnp.where(token % sub >= lane, band, 0.0) for band in bands]
 
 
 def token_decays(prefix: tuple, earlier: tuple, *, sub: int = SUB) -> jax.Array:
@@ -838,10 +835,12 @@ def write_gated(tile: jax.Array, strengths: jax.Array) -> jax.Array:
     return tile * strengths[:, None]
 
 
-def strictly_lower(found: jax.Array) -> jax.Array:
-    """A system's pairs `found` `[C, C]` below their diagonal, zero on and above it (`key_block_pairs`' are
-    zero there as formed, but for a row whose write gate overflows, a NaN where it meets a zero factor)."""
-    return jnp.where(_lags(found.shape) > 0, found, 0.0)
+def columns_before(found: jax.Array, start: int) -> jax.Array:
+    """A sub-chunk's row block of a system's pairs `found` `[SUB, C]` (`key_block_pairs`', rows from `start`
+    on) strictly below the chunk's diagonal across sub-chunks: its columns before `start`, zero from it on.
+    `key_block_pairs`' are zero there as formed, but for a row whose write gate overflows, a NaN where it
+    meets a zero factor."""
+    return jnp.where(_grid(found.shape)[1] < start, found, 0.0)
 
 
 def band_masked(band: jax.Array, *, strict: bool, scale: float) -> jax.Array:
