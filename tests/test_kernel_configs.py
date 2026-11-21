@@ -596,6 +596,8 @@ class GemmCase(NamedTuple):
     tile: Any
     consumers: int | None
     case: support.KernelCase
+    launch: Any = None
+    bound: Any = None
 
     @property
     def kernel(self) -> tuple:
@@ -605,12 +607,10 @@ class GemmCase(NamedTuple):
 
 
 def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False,
-                         form: str | None = None, settled: bool = False) -> list[GemmCase]:
+                         form: str | None = None) -> list[GemmCase]:
     """Each GEMM Mosaic launch form a `generation_name` GPU runs at the projection `shape`
     (`GEMM_SHAPES`, `_gemm_forms`), at the one tile its launch derives from the generation's facts
-    (`Template.derived`), or with `settled` the one it settles on (`KernelOp.taken`: certification refusing a
-    derived tile whose kernels spill and the derivation stepping down, as a run's compile does; none, the
-    call off the template, where every tile spills); each a family's mainloop only where it takes the call
+    (`Template.derived`); each a family's mainloop only where it takes the call
     (`Template.eligible`). With `every_consumer_count`, each form at one consumer and at the family's most
     (`Family.consumers`) where that tile is legal instead, each case named with its count (`x1`, `x2`).
     With `form`, that form's alone. Each a record (`GemmCase`)."""
@@ -622,14 +622,7 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             ba = launch.bind(*args, **options)
             if not launch.eligible(ba, target):
                 continue
-            if settled:
-                # Certified for the generation's compile-only GPU, as a run's own certifies it.
-                with report.certifying(generation.compile_only_gpus(generation_name)[0]):
-                    config = launch.taken(ba)
-            else:
-                config = launch.derived(ba, target)
-            if config is None:
-                continue
+            config = launch.derived(ba, target)
             configs = {(f"{name} {config}", None): config}
             if every_consumer_count:
                 family = pricing.family_of(config, jnp.bfloat16)
@@ -656,14 +649,41 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                 None)
                     if tile is not None:
                         configs[(f"{name} x{consumers} {tile}", consumers)] = tile
-            kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for (label, consumers), config in configs.items():
-                case = support.KernelCase(label, lambda launch=launch, ba=ba, config=config:
-                                          launch.lowering(ba, config),
-                                          {kernel: _model(launch, ba, config)},
-                                          required=launch.legal(ba, config, target))
-                cases.append(GemmCase(name, config, consumers, case))
+                case = _kernel_case(label, launch, ba, config, target)
+                cases.append(GemmCase(name, config, consumers, case, launch, ba))
     return cases
+
+
+def _kernel_case(label: str, launch, ba, config, target) -> support.KernelCase:
+    """The compile case of `launch`'s call `ba` at `config` on `target` (`GemmCase.case`): required where the
+    tile is legal there."""
+    kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
+    return support.KernelCase(label, lambda: launch.lowering(ba, config),
+                              {kernel: _model(launch, ba, config)}, required=launch.legal(ba, config, target))
+
+
+def _settled(generation_name: str, gemm: GemmCase, record: dict) -> tuple[GemmCase, dict | None]:
+    """A gate case at the tile its launch settles on, and its compile's record: where a required case's
+    kernels spill, its launch refused at that tile (`report.refuse_launch`, as a run's compile refuses it)
+    and the call derived again (`Template.remaining`, its refusals read), compiled at the next, until one
+    spills nothing; no record where every tile spills (the call leaves the template, as a run's)."""
+    from kernel_compile import compile_mosaic_kernels
+
+    while gemm.case.required:
+        spilling = {kernel["kernel"] for kernel in record.get("kernels", ()) if kernel.get("spilled")}
+        if not spilling:
+            break
+        with generation.assumed(generation_name):
+            report.refuse_launch(gemm.launch, gemm.bound, gemm.tile, spilling)
+            tile = gemm.launch.remaining(gemm.bound)
+            if tile is None:
+                return gemm, None
+            target = generation.gpu_target()
+            case = _kernel_case(f"{gemm.form} {tile}", gemm.launch, gemm.bound, tile, target)
+        gemm = gemm._replace(tile=tile, case=case)
+        [record] = compile_mosaic_kernels([case], generation_name)
+    return gemm, record
 
 
 def _replaced(config, **changes):
@@ -739,11 +759,11 @@ def _gate_forms(generation_name: str) -> set[str]:
 
 @functools.cache
 def _gate_cases(generation_name: str, form: str) -> list:
-    """A form's cases at every projection, each at the tile its launch settles on
-    (`_gemm_mainloop_cases`' `settled`), each distinct kernel once (`GemmCase.kernel`)."""
+    """A form's cases at every projection (`_gemm_mainloop_cases`), each distinct kernel once
+    (`GemmCase.kernel`)."""
     found = {}
     for shape in GEMM_SHAPES:
-        for case in _gemm_mainloop_cases(generation_name, shape, form=form, settled=True):
+        for case in _gemm_mainloop_cases(generation_name, shape, form=form):
             found.setdefault(case.kernel, case)
     return list(found.values())
 
@@ -761,22 +781,26 @@ def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> lis
 @pytest.mark.parametrize(("generation_name", "form"), _by_form(gate_generations(stated=True), _gate_forms))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, form):
     """Every distinct GEMM Mosaic GPU kernel of a form a generation runs at a real projection (`_gate_cases`),
-    a test each form, at the tile its launch settles on from the generation's facts (certification refusing
-    a derived tile whose kernels spill, as a run's compile does), compiled by Mosaic for a
-    compile-only device of the generation on
+    a test each form, at the tile its launch settles on from the generation's facts (`_settled`: a derived
+    tile whose kernels spill refused and the next derived, as a run's compile steps it down; the owner's
+    11-14 ruling, certification judges a launch and no register model is held to ptxas), compiled by Mosaic
+    for a compile-only device of the generation on
     this CPU through ptxas, with the JAX this checkout pins. Required launches must spill nothing; compiler
     errors and missing reports fail any. Beside them, each launch of the
     form's family contract (`_family_cases`: each consumer count) the gate does not hold lowers, within the
     block, spilling nothing, before any consumer adopts a Family head; no version guard skips it."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    cases = [each.case for each in _gate_cases(generation_name, form)]
+    gate = _gate_cases(generation_name, form)
     contract = ([each.case for each in _family_cases(generation_name, form)]
                 if form in _family_forms(generation_name) else [])
-    assert cases
-    found = compile_mosaic_kernels(cases + contract, generation_name)
-    failed = failures(found) + mosaic_failures(found[len(cases):])
-    required = [record for case, record in zip(cases, found[:len(cases)], strict=True) if case.required]
+    assert gate
+    compiled = compile_mosaic_kernels([each.case for each in gate] + contract, generation_name)
+    settled = [_settled(generation_name, gemm, record)
+               for gemm, record in zip(gate, compiled[:len(gate)], strict=True)]
+    found = [record for _, record in settled if record is not None] + compiled[len(gate):]
+    failed = failures(found) + mosaic_failures(compiled[len(gate):])
+    required = [record for gemm, record in settled if gemm.case.required and record is not None]
     failed += mosaic_failures(required)
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
