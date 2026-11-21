@@ -1644,6 +1644,29 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
             cases.append(KernelCase(label, lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)))
         found = compile_mosaic_kernels(cases, "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+def test_sm90_and_sm100_forward_scale_prescaled_query_in_smem_without_spills():
+    """Row 5272: sm90 wgmma and sm100 tcgen05.chunks forwards with a power-of-two query prescale (e.g.
+    the natural rewalk launch) scale `q_smem` in place via `across.scale_smem` instead of emitting a
+    host-wide XLA `by_power` multiply pass, and compile without spills."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    spans = template.spans(512, 512, 1, causal=True)
+    q = jnp.zeros((2, 512, 8, 128), jnp.bfloat16)
+    k = jnp.zeros((2, 512, 2, 128), jnp.bfloat16)
+    for gen in ("sm90", "sm100"):
+        with generation.assumed(gen):
+            target = generation.gpu_target()
+            op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+            ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+            cfg = op.derived(ba, target)
+            assert cfg is not None
+            found = compile_mosaic_kernels([
+                KernelCase(f"{gen}-d128-in-kernel-prescale",
+                           lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)),
+            ], gen)
+            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 def test_forward_pricing_aligns_with_m_fs_15_sm90_and_sm80_receipts():
     """Wave-quantized residency pricing (`_launch_seconds` + `_derived`'s residency-step rung, row 6216)
     ranks M-FS-15's faster sm90 2-consumer config ahead of 3-consumer on T=512 split forward (0.0508 vs
