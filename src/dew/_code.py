@@ -167,8 +167,16 @@ def _listed() -> dict[str, tuple[str, str]]:
         for path in sorted((SOURCE / package).rglob("*.py")):
             relative = path.relative_to(SOURCE)
             name = ".".join(relative.with_suffix("").parts).removesuffix(".__init__")
-            files[name] = (relative.as_posix(), hashlib.sha256(path.read_bytes()).hexdigest())
+            if (contents := _hashed(path)) is not None:
+                files[name] = (relative.as_posix(), contents)
     return files
+
+
+def _hashed(path: Path) -> str | None:
+    """The digest of `path`'s contents; None for a file removed since it was listed, which is absent."""
+    with contextlib.suppress(FileNotFoundError):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    return None
 
 
 @functools.cache
