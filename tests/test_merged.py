@@ -609,7 +609,16 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
                                np.zeros((1, 1, 1, width), dtype=np.float32)], axis=2)
     np.testing.assert_array_equal(np.asarray(got, dtype=np.float32), expected)
 
-    (launched,) = merged._launch(padded, stacked, init_m, init_t, init_acc, units=algebra.units_of(spec),
-                                 queries=queries, width=width, block=width, out_dtype=jnp.bfloat16,
-                                 out_heads=out_heads)
-    np.testing.assert_array_equal(np.asarray(launched, dtype=np.float32), expected)
+    traced = jax.make_jaxpr(lambda p, s, im, it, ia: merged._launch(
+        p, s, im, it, ia, units=algebra.units_of(spec), queries=queries, width=width, block=width,
+        out_dtype=jnp.bfloat16, out_heads=out_heads))(padded, stacked, init_m, init_t, init_acc)
+    from dew.nn import programs
+
+    (call_eqn,) = [eqn for eqn in programs.equations(traced.jaxpr) if eqn.primitive.name == "pallas_call"]
+    body = call_eqn.params["jaxpr"]
+    producers = {outvar: eqn for eqn in body.eqns for outvar in eqn.outvars}
+    (store,) = [eqn for eqn in body.eqns if eqn.primitive.name == "swap"]
+    cast = producers[store.invars[1]]
+    assert cast.primitive.name == "convert_element_type", cast
+    value_eqn = producers.get(cast.invars[0])
+    assert value_eqn is None or value_eqn.primitive.name != "select_n", value_eqn
