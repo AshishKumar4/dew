@@ -25,12 +25,14 @@ against 8.4).
 from __future__ import annotations
 
 import abc
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import importlib
 import importlib.util
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
@@ -2272,7 +2274,49 @@ def launched(launches, arguments, options, *, product: Product, whole: bool,
     route = selection.select(GROUPED, case) if selected is None else generation.published(selected)
     if route.kernel in ('xla', APART.name):
         return None if route.kernel == 'xla' else APART
+    if (collected := _WEIGHED.get()) is not None:
+        collected.append(case.call.bound[route.kernel])
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
+
+
+_WEIGHED: contextvars.ContextVar[list | None] = contextvars.ContextVar('weighed', default=None)
+"""The calls `launched` selects a template's launch for while `weighed` collects them."""
+
+
+@contextlib.contextmanager
+def weighed() -> Iterator[list[tuple]]:
+    """Each call traced in the block that `launched` selects a template's launch for, in order, as the
+    template and the arguments it bound: what a pass weighing a region reads of the launches it would make
+    (`fused_gemm.analysis`), whether or not they are built."""
+    found: list = []
+    token = _WEIGHED.set(found)
+    try:
+        yield found
+    finally:
+        _WEIGHED.reset(token)
+
+
+def resident(hooked: Sequence[tuple], bare: Sequence[tuple]) -> bool:
+    """Whether a product's launch with its hooks keeps the residency its launch takes without them, each the
+    last call `weighed` collected (kernel-templates §4: a neighbour joins the kernel where the kernel with it
+    still holds its residency and stays spill-free; KERNEL-TEMPLATES-13, row 9032): the programs a
+    multiprocessor of the tile the hooked call derives (`Template.derived`, its plan's: the residency
+    `mosaic.Family.kernel` launches at, its registers within the family's budget) at least those of the
+    product's own. A hooked launch that derives no tile holds none; a product either side of which no template
+    launch takes, or whose configs are no Mosaic tiles, is not judged. On an A100 an epilogue reading four
+    float32 arrays of the product's shape derived 64 x 64 at one program a multiprocessor, where the product
+    alone takes two (FS-HOOKED-RES)."""
+    if not hooked or not bare:
+        return True
+    target = generation.gpu_target()
+    (template, ba), (plain_template, plain_ba) = hooked[-1], bare[-1]
+    config = template.derived(ba, target)
+    if config is None:
+        return False
+    plain = plain_template.derived(plain_ba, target)
+    if not isinstance(config, tiling.Tiles) or not isinstance(plain, tiling.Tiles):
+        return True
+    return config.programs >= plain.programs
 
 
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
