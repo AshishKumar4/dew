@@ -1357,11 +1357,13 @@ def test_the_recurrence_step_witness_holds_a_packed_call(begins):
 
 
 @INTERPRETS
-def test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_one_a_head():
+@pytest.mark.parametrize("width", [64, 128], ids=["doubling prefix", "running prefix"])
+def test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_one_a_head(width):
     """The step witness (row 2084 (e)) under a decay a key dimension (`rw.assert_key_decays_witnessed`):
     every record of a bf16 call of three chunks inside its step's enclosure, and a kernel reading each
-    token's mean decay for all its keys refused."""
-    rw.assert_key_decays_witnessed(rw.interpreted_lane())
+    token's mean decay for all its keys refused, at 64 keys (its prefix the doubling scan) and 128 (a
+    running sum down each column, `intra._running`)."""
+    rw.assert_key_decays_witnessed(rw.interpreted_lane(), width=width)
 
 
 @INTERPRETS

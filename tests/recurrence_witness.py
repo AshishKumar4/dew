@@ -1058,11 +1058,12 @@ KEY_DECAY_SHARES = {"leaving": 0.5}
 mean is refused."""
 
 
-def assert_key_decays_witnessed(lane: Lane, heads: int = 1) -> None:
+def assert_key_decays_witnessed(lane: Lane, heads: int = 1, width: int = 64) -> None:
     """The step witness under a decay a key dimension (Kimi delta attention's, `key_enclosures`' pairs): a
     bf16 call of three chunks, every record inside its step's enclosure, and a kernel reading each token's
-    mean decay for all its keys refused (`shared_decay_refusals`, `KEY_DECAY_SHARES`)."""
-    operands = draw(0, "mild", heads=heads, per_key=True)
+    mean decay for all its keys refused (`shared_decay_refusals`, `KEY_DECAY_SHARES`). At `width` 128 its
+    prefix a running sum down each column (`intra._running`), at 64 the doubling scan."""
+    operands = draw(0, "mild", heads=heads, per_key=True, width=width)
     held, shared = witness(recorded(*operands), lane), shared_decay_refusals(operands, lane)
     for name in RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
