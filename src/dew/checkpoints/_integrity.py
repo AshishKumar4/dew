@@ -81,7 +81,7 @@ def _held_marks(leaves: list[jax.Array], pinned: bool) -> np.ndarray:
     if pinned:
         (leaf,) = leaves
         leaves = [jax.device_put(leaf, leaf.sharding.with_memory_kind("device"))]
-    return np.asarray(_marks(leaves).addressable_data(0))
+    return np.asarray(jax.device_get(_marks(leaves).addressable_data(0)))
 
 
 def _digest(tree) -> str:

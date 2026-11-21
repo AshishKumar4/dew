@@ -720,7 +720,7 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
 
 def _held_flag(finite: jax.Array) -> bool:
     """A verdict replicated over its placement's devices, read from one this process holds."""
-    return bool(np.asarray(finite.addressable_data(0)))
+    return bool(jax.device_get(finite.addressable_data(0)))
 
 
 def compact_qk(tree, calls: bool = False):

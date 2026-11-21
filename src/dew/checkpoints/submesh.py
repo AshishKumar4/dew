@@ -108,7 +108,7 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
             return await super().deserialize(infos, args)
         # Each array's placement as Orbax resolves it, the step's own sharding file read where a restore
         # states none, so a row another stage holds is known before Orbax reads it.
-        await asyncio.gather(*[info.await_path_creation() for info in infos])
+        await asyncio.gather(*[param.await_path_creation() for param in infos])
         recorded = await async_path.exists(infos[0].parent_dir / handlers._SHARDING_FILE_NAME)
         placed = await handlers._deserialize_shardings(infos, args, recorded)
         args = [dataclasses.replace(arg, sharding=sharding, mesh=None, mesh_axes=None)
@@ -136,8 +136,10 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
             given = getattr(unheld[index], "global_shape" if field == "shape" else field)
             return getattr(stated[index], field) if given is None else given
 
+        placements = {index: arg.sharding for index, arg in unheld.items()
+                      if isinstance(arg.sharding, jax.sharding.Sharding)}
         made = [jax.make_array_from_single_device_arrays(
-            tuple(known(index, "shape")), unheld[index].sharding, [], dtype=known(index, "dtype"))
+            tuple(known(index, "shape")), placements[index], [], dtype=known(index, "dtype"))
             for index in none]
         restored: list = [None] * len(infos)
         for index, value in [*zip(held, read, strict=True), *zip(none, made, strict=True)]:
