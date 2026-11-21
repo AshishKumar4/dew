@@ -1604,6 +1604,16 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
             def store_chunks(stage):
                 width = state.acc.shape[-1]
+                if not family.operands_in_registers and stage is not None and stage.shape[-1] == width:
+                    for col in range(0, width, 128):
+                        chunk = state._replace(acc=state.acc[:, col:col + 128])
+                        out_chunk = algebra.finish(spec, chunk, initial=hooked.initial is not None,
+                                                   held=program.parts > 1)[0]
+                        stage[:, pl.ds(col, 128)] = out_chunk.astype(stage.dtype)
+                    plgpu.commit_smem()
+                    plgpu.copy_smem_to_gmem(stage, out_view)
+                    plgpu.wait_smem_to_gmem(0)
+                    return
                 for col in range(0, width, 128):
                     chunk = state._replace(acc=state.acc[:, col:col + 128])
                     out_chunk = algebra.finish(spec, chunk, initial=hooked.initial is not None,
