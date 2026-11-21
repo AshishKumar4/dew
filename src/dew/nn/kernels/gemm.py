@@ -45,9 +45,8 @@ from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
-from dew import _cache
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
-from dew.nn.kernels import generation, grouped_matmul, selection, tuning, xla_products
+from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic_sm100
 from dew.nn.kernels.templates.axes import GROUPS
@@ -86,7 +85,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
          precision: PrecisionLike = None, interpret_on_cpu: bool = False, prologue_jvp=None, compute=None,
          layer: jax.Array | None = None, paired: jax.Array | None = None, gather: jax.Array | None = None,
          scatter: jax.Array | None = None, applied: jax.Array | None = None, named: tuple = (),
-         beside: tuple = ()):
+         beside: tuple = (), selected: "generation.Route | None" = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default (explicitly or
     through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in the kernels: the
@@ -119,22 +118,23 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     to `lhs`'s dtype, which its producer wrote (a paired product's epilogue, beside `lhs` and the sides it
     read): the product multiplies it in place of forming each tile, and every derivative is the prologue's
     (`portable`'s, which forms it), so `applied` takes no cotangent, and reverse mode forms the prologue's
-    VJP in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of
-    banks at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output
-    (an epilogue's output that is its accumulator rounded to its dtype, a gate's projection before its
-    SwiGLU, `fused_gemm` lifting the program's name onto it): each named output is a residual of the
-    call's derivative under its name (`checkpoint_name`), so a policy keeping the name keeps it, and the
-    reverse pass reads the accumulator from it where the epilogue reads its accumulator through that
-    rounding alone, recomputing no product (row 7131). `beside`, matrices of `rhs`'s groups and depth each of
-    its own width: an output each (a tuple), one launch over their columns side by side where one takes them
-    (`mosaic_gpu.gmm`'s), the input gradient chained in one accumulator, each kernel gradient its own; no
-    kernels joined, no output split (row 6794, M-EM-59i); with no other part (`_gemm_refused`)."""
+    VJP in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of banks
+    at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output (an
+    epilogue's output that is its accumulator rounded to its dtype, a gate's projection before its SwiGLU,
+    `fused_gemm` lifting the program's name onto it): each named output is a residual of the call's derivative
+    under its name (`checkpoint_name`), so a policy keeping the name keeps it, and the reverse pass reads the
+    accumulator from it where the epilogue reads its accumulator through that rounding alone, recomputing no
+    product (row 7131). `beside`, matrices of `rhs`'s groups and depth each of its own width: an output each
+    (a tuple), one launch over their columns side by side where one takes them (`mosaic_gpu.gmm`'s), the input
+    gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
+    6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
+    (`side_by_side`'s), runs as found."""
     if isinstance(rhs, NvFp4):
         return _nvfp4_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
                            out_dtype=out_dtype, layer=layer, gather=gather, scatter=scatter,
                            interpret_on_cpu=interpret_on_cpu,
                            refused=(transpose_rhs, prologue, prologue_operands, paired, prologue_jvp,
-                                    out_dtypes, applied, beside))
+                                    out_dtypes, applied, beside, selected))
     _gemm_refused(group_sizes, gather=gather, scatter=scatter, compute=compute, applied=applied,
                   prologue=prologue, lhs=lhs,
                   beside=beside and (prologue, epilogue, paired, gather, scatter, applied, compute, layer,
@@ -164,7 +164,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
                          dtypes, several=several, paired=paired, first=first, scatter=scatter, **plain)
         return _gemm(lhs.astype(compute), rhs, group_sizes, prologue, prologue_arrays, prologue_axes,
                      epilogue, epilogue_arrays, epilogue_axes, dtypes, several=several, paired=paired,
-                     first=first, gather=gather, scatter=scatter, beside=beside, **plain)
+                     first=first, gather=gather, scatter=scatter, beside=beside, selected=selected, **plain)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
                  applied, beside):
@@ -179,13 +179,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
 
     def forward(*operands):
         out = value(*operands)
-        if not any(named):
-            return out, ()
-        # Each named output a residual under its name, the one array the output and the residual are.
-        outs = [checkpoint_name(each, name) if name is not None else each
-                for each, name in zip(out if several else (out,), named, strict=True)]
-        kept = tuple(each for each, name in zip(outs, named, strict=True) if name is not None)
-        return (tuple(outs) if several else outs[0]), kept
+        return _named_residuals(out, named, several) if any(named) else (out, ())
 
     call = _Call(prologue, prologue_axes, epilogue, epilogue_axes, dtypes, several, compute, plain,
                  tuple(at for at, name in enumerate(named) if name is not None))
@@ -200,6 +194,15 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
                                    kind=KernelGlue(), nested=not any(named)))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
                           scatter, None if applied is None else jax.lax.stop_gradient(applied), beside)
+
+
+def _named_residuals(out, named: tuple, several: bool) -> tuple:
+    """`gemm`'s forward's outputs `out` (several, or one) and what it saves: each output `named` names a
+    residual under its name (`checkpoint_name`), the one array the output and the residual are."""
+    outs = [checkpoint_name(each, name) if name is not None else each
+            for each, name in zip(out if several else (out,), named, strict=True)]
+    kept = tuple(each for each, name in zip(outs, named, strict=True) if name is not None)
+    return (tuple(outs) if several else outs[0]), kept
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1252,15 +1255,19 @@ def _added(acc, prior):
     return acc + prior
 
 
-def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *, whole: bool) -> bool:
-    """Whether a launch takes `rows` (`[rows, depth]`) by `matrices` side by side (`gemm`'s `beside`, each
-    `[depth, width]`, one output each in `out_dtype`) as `gemm` binds them: their forward, or their input
-    gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's launch read unreported: the
-    forward and the input gradient independent choices, but a forward that would not run (a named kernel's
-    or a pin's refusal of it) a no. The operands abstract (`jax.ShapeDtypeStruct`) or arrays, `whole`
-    whether a launch sees them whole (`seen_whole`; a device's own rows where the caller maps them per
-    shard): a layer's choice of the side-by-side product over its projections apart
-    (`dew.nn.joined.side_by_side`)."""
+def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *,
+                 whole: bool) -> "generation.Route | None":
+    """The forward's route where a launch takes `rows` (`[rows, depth]`) by `matrices` side by side (`gemm`'s
+    `beside`, each `[depth, width]`, one output each in `out_dtype`) as `gemm` binds them, else None: their
+    forward, or their input gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's
+    launch read unreported: the forward and the input gradient independent choices, but a forward that would
+    not run (a pin's refusal of it) none, a named kernel's refusal raised (`selection.KernelRefused`, as
+    `gemm` would raise it). The route, decided unreported
+    (`selection.decided`), is the one the call runs and reports where its caller hands it on (`gemm`'s
+    `selected`), the call selected once (base review b68fc2382 F5). The operands abstract
+    (`jax.ShapeDtypeStruct`) or arrays, `whole` whether a launch sees them whole (`seen_whole`; a device's
+    own rows where the caller maps them per shard): a layer's choice of the side-by-side product over its
+    projections apart (`dew.nn.joined.side_by_side`)."""
     sizes = jnp.full((1,), rows.shape[0], jnp.int32)
     grouped = tuple(jax.ShapeDtypeStruct((1, *matrix.shape), matrix.dtype) for matrix in matrices)
     dtypes = (jnp.dtype(out_dtype),) * len(matrices)
@@ -1269,20 +1276,16 @@ def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *, 
                                paired=None, first=None, gather=None, scatter=None, summed_as=(),
                                beside=grouped[1:])
     case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
-    try:
-        forward = selection.decided(grouped_matmul.GROUPED, case)
-    except selection.KernelRefused:
-        # A named kernel refusing the forward side by side: `gemm` would raise it, so they run apart.
-        return False
+    forward = selection.decided(grouped_matmul.GROUPED, case)
     if forward.kernel == grouped_matmul.MosaicGmm.name:
         # Its forward a launch's, which runs where its pin does (head review of 4d6c7a69c F5: a forward the
         # pin refused raised where its input gradient alone was asked).
-        return not _pin_refuses(call)
+        return None if _pin_refuses(call) else forward
     reached = [(jax.ShapeDtypeStruct((rows.shape[0], matrix.shape[-1]), out_dtype), matrix)
                for matrix in grouped]
     options = {'interpret_on_cpu': False, 'precision': precision, 'transpose_rhs': True, 'dense': True,
                'first': None, 'gather': None}
-    return _one_launch(reached, None, rows.dtype, None, options, whole=whole) is not None
+    return None if _one_launch(reached, None, rows.dtype, None, options, whole=whole) is None else forward
 
 
 def _one_launch(reached: list, group_sizes, dtype, prologue, options: dict, *, whole: bool) -> tuple | None:
@@ -1333,7 +1336,7 @@ def _mosaic_route(call: tuple, product, whole: bool) -> "generation.Route | Lite
     in one launch, `side_by_side`'s and `_one_launch`'s) of `product` by, its operands seen `whole`, decided
     and reported nowhere (`selection.decided`: the dispatch that runs it publishes it), else False: another
     kernel's, a refusal of a named kernel, or a pin the launch's own resolution refuses for the call
-    (`tuning.KernelOp.taken`'s `Unpinnable`: base review 2e4651b2e F1, a chain narrowed a 64-column pin to
+    (`tuning.KernelOp.pin_refuses`: base review 2e4651b2e F1, a chain narrowed a 64-column pin to
     16). Each is the products' decision to run apart, as before."""
     case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
     try:
@@ -1349,16 +1352,10 @@ def _mosaic_route(call: tuple, product, whole: bool) -> "generation.Route | Lite
 
 def _pin_refuses(call: tuple) -> bool:
     """Whether a pin of Mosaic GPU's launch refuses `call` (`_gemm_call`'s) as the launch resolves it
-    (`tuning.KernelOp.taken`'s `Unpinnable`): products one launch would take whole an optional form, whose
-    refusal runs them apart (base review 156a4595a F5); none where no pin is held."""
-    if grouped_matmul.MosaicGmm not in dict(_cache.KERNEL_PINS.value):
-        return False
+    (`tuning.KernelOp.pin_refuses`): products one launch would take whole an optional form, whose refusal
+    runs them apart (base review 156a4595a F5); none where no pin is held."""
     launch = grouped_matmul.MosaicGmm()
-    try:
-        launch.taken(launch.bind(*call[1], **call[2]))
-    except tuning.Unpinnable:
-        return True
-    return False
+    return launch.pin_refuses(launch.bind(*call[1], **call[2]))
 
 
 def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed_as: tuple,

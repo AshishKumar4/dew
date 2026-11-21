@@ -374,9 +374,12 @@ def dot_general(xla, path: tuple | None = None):
             # grouped GEMM where a launch takes any of its products, as a dense one's (DeepSeek V4's
             # `o_a_proj`, a `DenseGeneral` over its groups; spec alignment SA20261119pm F36).
             rows, matrices, count, shape = grouped_rows(lhs, rhs, dimension_numbers)
-            sizes = jnp.full((matrices.shape[0],), count, jnp.int32)
-            if launched(rows, matrices, out_dtype, precision):
-                return gemm(rows, matrices, sizes, out_dtype=out_dtype, precision=precision).reshape(shape)
+            # One member is the dense product it is, probed and run as one: the dense product's cells, not
+            # one group's (head review of 0099a4701 F3).
+            matrix, sizes = ((matrices[0], None) if matrices.shape[0] == 1
+                             else (matrices, jnp.full((matrices.shape[0],), count, jnp.int32)))
+            if launched(rows, matrix, out_dtype, precision):
+                return gemm(rows, matrix, sizes, out_dtype=out_dtype, precision=precision).reshape(shape)
         taken = _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs)
         return taken(lhs, rhs)
 
@@ -528,9 +531,7 @@ def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole, generation.gpu_target(),
                             _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value)
-    for route in found:
-        generation.route(route.choice, kernel=route.kernel, preferred=route.preferred, refusal=route.refusal,
-                         forced=route.forced)
+    generation.reported(found)
     return taken
 
 
@@ -553,8 +554,10 @@ def _launched_once(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out
     """`launched`'s decision, its routes reported."""
     width = matrix.shape[-1]
     abstract = functools.partial(jax.ShapeDtypeStruct, dtype=rows.dtype)
+    # Dense as `gemm` runs it: a `[depth, width]` matrix, never a stack of one group (row 9707).
+    dense = matrix.ndim == 2
     matrices = abstract(matrix.shape if matrix.ndim == 3 else (1, *matrix.shape))
-    sizes, dense = jax.ShapeDtypeStruct((matrices.shape[0],), jnp.int32), matrices.shape[0] == 1
+    sizes = jax.ShapeDtypeStruct((matrices.shape[0],), jnp.int32)
     calls = (grouped_matmul.gmm_call(rows, matrices, sizes, out_dtype=out_dtype, trans_rhs=False,
                                      interpret=False, promoted=product.promoted, dense=dense),
              grouped_matmul.gmm_call(abstract((rows.shape[0], width)), matrices, sizes, out_dtype=rows.dtype,

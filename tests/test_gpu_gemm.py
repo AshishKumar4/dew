@@ -35,7 +35,9 @@ one process (`gpu_flow`), each cell its own file's property:
 - The NVFP4, blockwise FP8 and adapted products' check-1 matrices (tests/kernel_matrix.py), each at the cases
   a red found on a GPU (`kernel_matrix.seeded_cells`), and the MX products' over a covering of their block
   formats and output dtypes on a Blackwell, whose block-scaled MMA no interpreter runs; every other pair is
-  the CPU's, interpreted, as the joined projections' matrix is.
+  the CPU's, interpreted.
+- The joined projections' check-1 matrix (tests/join_matrix.py), each cell on a GPU of its generation: an
+  attention layer's query, key and value side by side on a Hopper's warpgroup MMA among them.
 """
 
 import functools
@@ -304,6 +306,14 @@ def test_the_mx_matrix_holds_on_this_gpu():
     run_cells(covering(cells_of(
         kernel_matrix.check("mxfp8"),
         native=lambda case: dict(zip(("format", "out_dtype"), (case[1], case[4]), strict=True)))))
+
+
+def test_the_join_matrix_holds_on_this_gpu():
+    """The joined projections' check-1 matrix (tests/join_matrix.py): a layer's training step with two of its
+    projections joined, or an attention layer's query, key and value side by side, on par with them apart,
+    each cell on a GPU of its generation (its pin): Hopper's side-by-side forward and chained input gradient
+    on the warpgroup MMA, which the CPU only interprets (head review of 0099a4701 F6)."""
+    run_cells(cells_of(kernel_matrix.check("join")))
 
 
 def test_the_blockwise_matrix_holds_on_this_gpu():
