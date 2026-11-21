@@ -63,7 +63,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556]
+- Time to first step: the compile path's re-derivations. [5556, 10762]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
@@ -101,7 +101,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1903]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
-- Check 2's ratio contract reads the law's bound looser than its spec states. [7980]
 
 ## Tutorials and docs
 
