@@ -389,11 +389,11 @@ class StageLocal:
                     [shard.data for shard in leaf.addressable_shards if shard.device in held],
                     dtype=leaf.dtype)
                 row = _sharded(sharding, devices, sharding.spec[len(shape):])
-                rows.extend(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
-                    math.prod(shape) // self.stages))(piece, stacked=len(shape)))
+                # Each row a checkpoint holds on its own stage's devices, on part of a pool (`held_apart`).
+                rows.extend(held_apart(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
+                    math.prod(shape) // self.stages))(piece, stacked=len(shape))))
             return rows
-        # Each row a checkpoint holds on its own stage's devices, on part of a pool (`held_apart`).
-        return held_apart(self.state(state, lambda tree: self.layered(tree, cut)))
+        return self.state(state, lambda tree: self.layered(tree, cut))
 
     def restored(self, tree):
         """`saved`'s inverse of one of a state's trees, read onto `checkpointed`'s placement: each
