@@ -11,13 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import (
-    attention_algebra as algebra,
-    mosaic,
-    outputs,
-    resources,
-    stacked,
-)
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
