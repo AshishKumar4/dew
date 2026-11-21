@@ -50,7 +50,6 @@ def _tops(artifact: Artifact) -> tuple[np.ndarray, np.ndarray]:
 @dataclass(frozen=True)
 class Accuracy:
     """The share of answered questions whose most likely option is the right one."""
-    fields = ()
 
     name = "accuracy"
     reads = Decisions

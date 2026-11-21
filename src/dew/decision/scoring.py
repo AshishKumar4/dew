@@ -32,7 +32,6 @@ from dew.objectives.base import Metric, Shown, mean_of_totals, merge_totals
 
 class ScoringRule(ABC):
     """A proper scoring rule, lower is better."""
-    fields = ()
 
     name: str
     reads = Decisions
