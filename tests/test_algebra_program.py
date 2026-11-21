@@ -1115,6 +1115,50 @@ def test_a_products_mode_prices_it():
     assert product(eight, jnp.float8_e4m3fn).fp8_flops == flops
 
 
+def _priced(fn, *shapes, schedule=None):
+    """`fn`'s program over fp32 ones of `shapes`, its price (`cost.model`, under XLA's schedule on an H100
+    where none is given) and its traced program."""
+    traced = jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.float32) for shape in shapes))
+    region = terms.region(traced)
+    graph, bundle, _ = program.graphed(region)
+    _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag", cost_model=cost.model(
+        region, schedule or cost.fused(generation.TARGETS["sm90"])))
+    return price, traced
+
+
+@pytest.mark.parametrize("name", ["power", "clamp", "exponential", "selection", "conversion", "reduction"])
+def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(name):
+    """A term's arithmetic (`cost.work`) is what the kernels' counter prices its equation at in a kernel's
+    body (`emission.operation_work`, the one rule): a power an exponential an element, a clamp a maximum and
+    a minimum, an exponential, a comparison and a selection, a conversion and a reduction theirs, where the
+    algebra's own table priced a power as an operation and the counter a clamp as one (row 5901)."""
+    from dew.nn.kernels.templates import emission
+
+    fn = {"power": jax.lax.pow,
+          "clamp": lambda x, y: jax.lax.clamp(np.float32(-0.5), x, np.float32(0.5)) + y,
+          "exponential": lambda x, y: jax.lax.exp(x) * y,
+          "selection": lambda x, y: jax.lax.select(x < y, x, y),
+          "conversion": lambda x, y: jax.lax.convert_element_type(x, jnp.bfloat16) * y.astype(jnp.bfloat16),
+          "reduction": lambda x, y: jnp.sum(x * y, axis=-1)}[name]
+    price, traced = _priced(fn, (64, 128), (64, 128))
+    counted = emission.emitted(traced.jaxpr, 1, None).fixed
+    fields = ("operations", "exponentials", "conversions")
+    assert [getattr(price.work, field) for field in fields] == [getattr(counted, field) for field in fields]
+
+
+def test_an_operation_no_rule_prices_makes_no_form_cheaper_for_taking_more_of_it():
+    """An operation no rule prices (an atan2: no kernel's body holds one and no probe has measured it) is
+    work at no rate (`Work.unpriced_operations`), so a form taking more of it is never cheaper
+    (`cost.cheaper`), whatever its priced work's seconds: priced as one operation an element, two atan2s
+    compared cheaper than one beside a product."""
+    one, _ = _priced(lambda x, y, w: jax.lax.atan2(x, y) + jnp.sum(jnp.dot(w, w)), (64, 128), (64, 128),
+                     (512, 512))
+    two, _ = _priced(lambda x, y, w: jax.lax.atan2(x, y) + jax.lax.atan2(y, x) + jnp.sum(w), (64, 128),
+                     (64, 128), (512, 512))
+    assert two.value < one.value and not cost.cheaper(two, one)
+    assert (one.work.unpriced_operations, two.work.unpriced_operations) == (64 * 128, 2 * 64 * 128)
+
+
 def test_a_rewrites_persisted_record_names_the_limits_its_saturation_had():
     """A rewrite's record as a fit search persists it (`planning.rewrite_record`, `FitSearch.kernels`): the
     node and iteration limits its saturation had beside whether one stopped it (docs/design/algebra.md
