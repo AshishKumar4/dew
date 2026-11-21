@@ -2219,65 +2219,42 @@ the fused backward launch streams the hottest rows before `anchor` and `chosen`.
 
 @functools.cache
 def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool) -> int:
-    """Peak live 2D score-tile arrays in the traced attention algebra step (`jax.make_jaxpr`), counted by
-    last-use liveness so TPU VMEM pricing derives from the step's actual arithmetic (row 10965)."""
+    """Peak live 2D score-tile arrays in the traced attention algebra step (`jax.make_jaxpr`, row 10965)."""
     from dew.nn.kernels.templates import attention_backward_algebra as bwd_algebra
 
     tile = (8, 8)
-    s_in = jax.ShapeDtypeStruct(tile, jnp.float32)
-    row = jax.ShapeDtypeStruct((tile[0],), jnp.float32)
+    s_in, row = jax.ShapeDtypeStruct(tile, jnp.float32), jax.ShapeDtypeStruct((tile[0],), jnp.float32)
     q_pos = jax.ShapeDtypeStruct((tile[0], 1), jnp.int32)
     k_pos = jax.ShapeDtypeStruct((1, tile[1]), jnp.int32)
-    spec = algebra.Forward("causal", 64, False, 1.0 / 8.0, natural=natural_form, headroom=scaled)
-
+    spec = algebra.Forward("causal", 64, ids=False, scale=1.0 / 8.0, natural=natural_form, headroom=scaled)
     if backward:
-        def step(s, dp, peak, total, anchor, delta, q, k):
-            coords = algebra.Coords(q, k)
-            seen = algebra.seen(spec, coords, s)
-            exps, weights, ds = bwd_algebra.softmax_cotangents(
-                s, dp, peak, total, anchor, delta, seen=seen)
+        def backward_step(s, dp, peak, total, anchor, delta, q, k):
+            seen = algebra.seen(spec, algebra.Coords(q, k), s)
+            exps, weights, ds = bwd_algebra.softmax_cotangents(s, dp, peak, total, anchor, delta, seen=seen)
             return algebra.value_weights(exps, weights, jnp.bfloat16), ds.astype(jnp.bfloat16)
-
-        jaxpr = jax.make_jaxpr(step)(s_in, s_in, row, row, row, row, q_pos, k_pos).jaxpr
+        jaxpr = jax.make_jaxpr(backward_step)(s_in, s_in, row, row, row, row, q_pos, k_pos).jaxpr
     else:
-        def step(s, m, l_val, q, k):
-            coords = algebra.Coords(q, k)
-            mod = algebra.modify(spec, s, coords, (), masked=True)
+        def forward_step(s, m, l_val, q, k):
+            mod = algebra.modify(spec, s, algebra.Coords(q, k), (), masked=True)
             new_m, alpha = algebra.peak(spec, m, mod)
             w = algebra.weights(spec, mod, new_m)
             if scaled:
                 exp = jnp.ones((tile[0],), jnp.int32)
                 held = algebra.Scaled(exp, exp, lambda shift: algebra.weights(spec, mod, new_m - shift))
-                high, low = algebra.at_scale(w, held)
-                return high, low, new_m, alpha
+                return (*algebra.at_scale(w, held), new_m, alpha)
             return w.astype(jnp.bfloat16), algebra.total(l_val, alpha, w), new_m
-
-        jaxpr = jax.make_jaxpr(step)(s_in, row, row, q_pos, k_pos).jaxpr
-
-    def is_tile(var) -> bool:
-        return (not isinstance(var, jax_core.Literal)
-                and isinstance(var.aval, ShapedArray)
-                and var.aval.shape == tile)
-
-    last_use: dict[object, int] = {}
-    for idx, eqn in enumerate(jaxpr.eqns):
-        for var in eqn.invars:
-            if is_tile(var):
-                last_use[var] = idx
-    for var in jaxpr.outvars:
-        if is_tile(var):
-            last_use[var] = len(jaxpr.eqns)
-    live = {var for var in jaxpr.invars if is_tile(var)}
+        jaxpr = jax.make_jaxpr(forward_step)(s_in, row, row, q_pos, k_pos).jaxpr
+    def is_tile(v):
+        return not isinstance(v, jax_core.Literal) and getattr(v.aval, "shape", None) == tile
+    last_use = {v: pos for pos, eqn in enumerate(jaxpr.eqns) for v in eqn.invars if is_tile(v)}
+    last_use.update({v: len(jaxpr.eqns) for v in jaxpr.outvars if is_tile(v)})
+    live = {v for v in jaxpr.invars if is_tile(v)}
     peak = len(live)
-    for idx, eqn in enumerate(jaxpr.eqns):
-        for var in eqn.outvars:
-            if is_tile(var):
-                live.add(var)
+    for pos, eqn in enumerate(jaxpr.eqns):
+        live.update(v for v in eqn.outvars if is_tile(v))
         peak = max(peak, len(live))
-        live = {var for var in live if last_use.get(var, -1) > idx}
+        live = {v for v in live if last_use.get(v, -1) > pos}
     return peak
-
-
 def step_live_tiles(block_q: int, block_k: int, *, backward: bool = False, natural_form: bool = False,
                     scaled: bool = False) -> tuple:
     """Live `(block_q, block_k)` fp32 score tiles in TPU VMEM derived from the traced step (row 10965)."""

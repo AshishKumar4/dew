@@ -989,7 +989,7 @@ def _realize_output(operands: tuple, spec):
             else kernel_outputs.axis(operands[dim[0]], dim[1]) // dim[2]
             for dim in spec.dims)
         return kernel_outputs.output(spec.dtype, *dims)
-    return tuple(_realize_output(operands, item) for item in spec)
+    return tuple(_realize_output(operands, part) for part in spec)
 
 def _typed(backward, parameters: int = 0):
     """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type and
@@ -1080,7 +1080,7 @@ class RmsForward(tuning.KernelOp):
             x, branch, scale, gate, kernel=_rms_forward, name="rms_norm_forward",
             outputs=(_Out(jnp.dtype(dtype), ((0, 0), (0, 1))),
                      None if branch is None else _Out(x.dtype, ((0, 0), (0, 1))),
-                     _Out(jnp.float32, ((0, 0),))),
+                     _Out(jnp.dtype(jnp.float32), ((0, 0),))),
             grid=(pl.cdiv(rows, config.rows),),
             warps=config.warps, interpret=interpret, arithmetic=(
                 ('row_block', config.rows), ('epsilon', epsilon), ('offset', offset),
@@ -1119,7 +1119,7 @@ class RmsBackward(tuning.KernelOp):
              weight_first: bool = False, epilogue=None, return_residuals: bool = False):
         rows = x.shape[0]
         groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
-        partial = None if scale is None else _Out(jnp.float32, (groups, (0, 1)))
+        partial = None if scale is None else _Out(jnp.dtype(jnp.float32), (groups, (0, 1)))
         return _launched(
             x, scale, gate, mean_square, dy, ds, kernel=_rms_backward, name="rms_norm_backward",
             outputs=(_Out(x.dtype, ((0, 0), (0, 1))),
