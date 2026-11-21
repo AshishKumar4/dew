@@ -442,7 +442,7 @@ def _running_prefix(call: Call, rows, decays: jax.Array, keys: int) -> tuple:
     mosaic.synced(call.interpret)
 
     def added(t, running):
-        found = compensated_add(running, tuple(plgpu.load(rows.at[half, t], (), layout=layout)
+        found = compensated_add(running, tuple(plgpu.load(rows.at[half, t], layout=layout, optimized=False)
                                                for half in (0, 1)))
         for half, value in enumerate(found):
             plgpu.store(rows.at[half, t], value)
