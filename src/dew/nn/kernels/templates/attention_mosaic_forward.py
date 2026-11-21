@@ -87,6 +87,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     forward_reduces,
     head_slice,
     held_params,
+    hook_reduces,
     indexed_views,
     issued_into,
     issued_pairs,

@@ -40,6 +40,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     column_share,
     head_slice,
     held_params,
+    holders,
     issued_into,
     modelled,
     param_types,
