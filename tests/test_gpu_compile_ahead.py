@@ -590,11 +590,11 @@ import json
 import sys
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels.options import owned_program
+from dew.telemetry.compiles import Compiles
 from dew.training.ahead import kept, keeping
 
 # The persistent cache's reads: each program served from it, and each it had none of.
@@ -610,24 +610,28 @@ def doubled(x):
     return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
 
 
-x = jnp.arange(128 * 128, dtype=jnp.float32).reshape(128, 128)
+# Drawn on the host, so the only program a process needs is `doubled`'s.
+x = np.arange(128 * 128, dtype=np.float32).reshape(128, 128)
 mode, path = sys.argv[1], sys.argv[2]
-if mode == "cache":
-    out = owned_program(doubled)(x)
-elif mode == "keep":
-    with keeping() as programs:
+with Compiles(None) as compiles:
+    if mode == "cache":
         out = owned_program(doubled)(x)
-    programs.save(path)
-else:
-    with kept(path):
-        out = owned_program(doubled)(x)
-print(json.dumps({"ok": bool(np.array_equal(np.asarray(out), np.asarray(x) * 2 + 1)),
+    elif mode == "keep":
+        with keeping() as programs:
+            out = owned_program(doubled)(x)
+        programs.save(path)
+    else:
+        with kept(path):
+            out = owned_program(doubled)(x)
+print(json.dumps({"ok": bool(np.array_equal(np.asarray(out), x * 2 + 1)),
                   "hits": sum(event == "/jax/compilation_cache/cache_hits" for event in events),
-                  "misses": sum(event == "/jax/compilation_cache/cache_misses" for event in events)}))
+                  "misses": sum(event == "/jax/compilation_cache/cache_misses" for event in events),
+                  "compiled": len(compiles.seconds)}))
 """
 """A Pallas program on this GPU, in a process of its own sharing one cache: compiled into the persistent cache
 (`cache`), kept by `keeping` and saved to `path` (`keep`), or run from the file (`run`); whether it answered
-exactly, and how many programs its cache served and had none of."""
+exactly, how many programs its cache served and had none of, and how many it compiled (`Compiles`, which
+hears a compile whether or not the cache keeps it)."""
 
 
 def test_a_gpu_process_keeps_a_program_its_cache_serves_and_another_runs_it_compiling_nothing(tmp_path):
@@ -642,5 +646,5 @@ def test_a_gpu_process_keeps_a_program_its_cache_serves_and_another_runs_it_comp
     keep = fresh(SERVED_KEPT, "keep", path, cache_dir=tmp_path / "cache")
     run = fresh(SERVED_KEPT, "run", path, cache_dir=tmp_path / "other")
     assert keep["ok"] and keep["hits"] and not keep["misses"], keep
-    assert run["ok"] and not run["hits"] and not run["misses"], run
+    assert run["ok"] and not run["hits"] and not run["misses"] and not run["compiled"], run
 

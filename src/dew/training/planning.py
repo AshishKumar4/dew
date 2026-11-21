@@ -831,6 +831,9 @@ class FitSearch[LossT, EffectsT]:
     is the one at the rung `searched` settles on (`found`)."""
     sampled: SampledStep | None = None
     """The last measured candidate's sampled step (`measured`), which summarizes what the run inspects."""
+    taken_ahead: dict[str, jax.stages.Compiled] = dataclasses.field(default_factory=dict)
+    """The step taken ahead (`ahead`), by its compiled key, where its whole candidate fitted: a later measure
+    of the same program in this search takes it again (row 7988)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
@@ -1010,6 +1013,10 @@ class FitSearch[LossT, EffectsT]:
             began = time.perf_counter()
             early, firsts, relowered = None, [], None
             kept = held(self.compiled_key(candidate.lowered, options))
+            if kept is None:
+                # The step this search took ahead, which a later measure of the same program takes again
+                # rather than compiling it afresh (row 7988: measured ahead, then compiled again).
+                kept = self.taken_ahead.get(self.compiled_key(candidate.lowered, options))
             if ahead is not None:
                 executable, self.ahead = ahead.taken(candidate.lowered), None
             elif candidate.sampled is None and kept is not None:
@@ -1026,16 +1033,14 @@ class FitSearch[LossT, EffectsT]:
                 candidate = relowered.candidate(candidate)
             fit, headroom = self.fitting(executable, candidate)
             key = self.compiled_key(candidate.lowered, options)
-            if (relowered is not None or ahead is not None) and executable is not None and (
-                    fit or self.provisional):
+            if relowered is not None and executable is not None and (fit or self.provisional):
                 # Under the program it compiled: the relowered one past a spill, which a plan after it lowers
-                # directly, the spill's refusal held for the process; or the one taken ahead, which a later
-                # measure of the same program takes again rather than compiling afresh (row 7988: measured
-                # ahead, then compiled again). One that misses on the devices the step runs on is no step's,
-                # its device code held for nothing.
+                # directly, the spill's refusal held for the process. One that misses on the devices the
+                # step runs on is no step's, its device code held for nothing.
                 hold(key, executable)
             elif kept is not None and executable is kept and not fit and not self.provisional:
                 unhold(key)
+                self.taken_ahead.pop(key, None)
             self.sampled = None
             if fit and candidate.sampled is not None:
                 if ahead is not None and ahead.sampled is not None:
@@ -1065,6 +1070,10 @@ class FitSearch[LossT, EffectsT]:
                 # admitted by the same memory plan).
                 fit, headroom = self.fitting(None if self.sampled is None else self.sampled.executable,
                                              candidate)
+        if ahead is not None and executable is not None and fit:
+            # The step taken ahead, kept for this search alone, where the whole candidate fits: the file's
+            # executable, compiled under the options its build stated, is no other trainer's to take.
+            self.taken_ahead[key] = executable
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable, self.held(candidate))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, spent=spent)

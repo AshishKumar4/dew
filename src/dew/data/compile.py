@@ -59,6 +59,7 @@ from dew.data.analysis import (
     _until,
     _volatile,
     _written,
+    draws,
     reach,
     written,
 )
@@ -1992,8 +1993,8 @@ def iterate(
     through, holds no draw."""
     loading = loading.unsized()
     pipeline = _in_process(pipeline)
-    refused = (BatchStage, MapBatch, Repeat) + (() if seed is not None else (RandomMap,))
-    if any(isinstance(stage, refused) for stage in _steps(pipeline)):
+    if (seed is None and draws(pipeline)) or any(isinstance(stage, (BatchStage, MapBatch, Repeat))
+                                                 for stage in _steps(pipeline)):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat; a snapshot "
                          "seals a random step's draws (`snapshot(url, seed=...)`)")
     (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),

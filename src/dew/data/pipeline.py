@@ -1530,14 +1530,19 @@ class Dataset:
         near-duplicates in that one pass is sealed as one record, and the
         manifest's metadata records the rule, DataTrove's release and the
         records removed. Returns the manifest."""
+        from dew.data.analysis import draws
         from dew.data.sinks import export, passed
 
         chain = self._chain()
-        # The seed is the sealed rows' fact only where a step drew under it.
-        drawn = {"seed": seed} if any(isinstance(stage, RandomMap) for stage in chain.stages) else {}
+        # The seed is the sealed rows' fact only where a step drew under it, anywhere in the chain's tree.
+        drawn = {"seed": seed} if draws(chain) else {}
+
+        def rows() -> Iterator[Batch]:
+            # The pass opened once `export` has checked where and how it writes, as it opens a chain.
+            yield from passed(chain, seed)
+
         if deduplicate is None:
-            return export(passed(chain, seed), url, format=format, rows_per_shard=rows_per_shard,
-                          metadata=drawn or None)
+            return export(rows(), url, format=format, rows_per_shard=rows_per_shard, metadata=drawn or None)
         import tempfile
         from importlib.metadata import version
 
@@ -1548,9 +1553,7 @@ class Dataset:
         # whatever a fetch makes of them the next time.
         with tempfile.TemporaryDirectory(prefix="dew-deduplicate-") as sealed:
             # A pass that kept no record seals none, and has none to deduplicate.
-            sealed_rows = export(passed(chain, seed), sealed, format="array_record",
-                                 rows_per_shard=rows_per_shard)["rows"]
-            if sealed_rows:
+            if export(rows(), sealed, format="array_record", rows_per_shard=rows_per_shard)["rows"]:
                 kept, removed = near_duplicates_removed(lambda: passed(Files(sealed)), deduplicate)
             else:
                 kept, removed = iter(()), 0
