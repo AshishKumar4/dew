@@ -507,13 +507,17 @@ def test_a_forward_alones_kernels_are_refused_at_its_own_tiles():
     operands, skip = resource_operands(name, dtype, 1, 4096), _skipped(name)['skip']
     options = dict(max_segments=None, bound=None, **_form(name, dtype))
     facts = generation.gpu_target('sm90')
+    before = set(report._LAUNCHES)
     with generation.assumed(facts):
         bound = template.MOSAIC.bind(*operands, None, skip=skip, **options)
         tiles = template.MOSAIC.derived(bound, facts)
         # Lowered, as a compile names its kernels (`report.named`).
         call = jax.jit(lambda *x: template.MOSAIC(*x[:-1], None, skip=x[-1], **options))
         call.trace(*operands, skip).lower(lowering_platforms=("cuda",))
-    identity = report._identity(template.MOSAIC, bound)
-    ran = {kernel for launch in report._LAUNCHES.values()
-           if launch.identity == identity and launch.config == tiles.forward for kernel in launch.kernels}
-    assert tiles.forward is not None and {'recurrence_states', 'recurrence_output'} <= ran, (tiles, ran)
+    ran = {}
+    for digest in set(report._LAUNCHES) - before:
+        launch = report._LAUNCHES[digest]
+        ran.setdefault(launch.config, set()).update(launch.kernels)
+    assert tiles.forward is not None and {'recurrence_states', 'recurrence_output'} <= ran.get(tiles.forward,
+                                                                                            set()), (tiles, ran)
+    assert not ran.get(tiles, set()) & {'recurrence_states', 'recurrence_output'}, (tiles, ran)
