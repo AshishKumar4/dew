@@ -93,7 +93,7 @@ def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 
     return draw
 
 
-def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> template.Hooks:
+def hooks_for(names: tuple[str, ...], queries: int, value_width: int, gate=None) -> template.Hooks:
     """The hooks `names` asks for: a softcap and ALiBi as one score_mod, sinks as the initial state, an
     output gate."""
     slopes = jnp.asarray(alibi_slopes(4), jnp.float32)
@@ -118,9 +118,9 @@ def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> te
         (template.Param(jnp.asarray(gate), template.Kind.OUTPUT),) if "gate" in names else ())
 
 
-HOOKS = {"none": frozenset(), "softcap": frozenset({"softcap"}), "sinks": frozenset({"sinks"}),
-         "alibi": frozenset({"alibi"}), "gate": frozenset({"gate"}),
-         "all": frozenset({"softcap", "sinks", "alibi", "gate"})}
+HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",),
+         "alibi": ("alibi",), "gate": ("gate",),
+         "all": ("alibi", "gate", "sinks", "softcap")}
 
 FORMS = ("full", "causal", "causal-window", "two-sided-window", "causal-chunk", "documents",
          "causal-documents-window", "cross-causal", "cross-causal-lengths-starts", "lengths-starts")
@@ -130,13 +130,14 @@ def gate_of(queries: int, value_width: int) -> np.ndarray:
     return np.random.default_rng(99).standard_normal((ROWS, queries, 4, value_width)).astype(np.float32)
 
 
-def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, **options):
+def check(case: dict, names: tuple[str, ...], dtype, config: attention_triton.Tiles, **options):
     """`check_each` at the one `config`."""
     check_each(case, names, dtype, (config,), **options)
 
 
-def check_each(case: dict, names: frozenset, dtype, configs, *, residuals: bool = False, width: int = 32,
-               value_width: int = 32, natural: bool = template.NATURAL, mainloop: str = "triton"):
+def check_each(case: dict, names: tuple[str, ...], dtype, configs, *, residuals: bool = False,
+               width: int = 32, value_width: int = 32, natural: bool = template.NATURAL,
+               mainloop: str = "triton"):
     """`attention_triton.forward` pinned at each of `configs` (or with `mainloop` "portable" the plain-JAX
     mainloop's `attend` at their tiles) on par with `template.reference` over `case`'s keys and the hooks
     `names`, at the site's declared seeds, its exponent `natural` or the fold: one check of every config,
@@ -943,9 +944,10 @@ def _trained(spans: template.KeySpans):
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128, 256])
 @pytest.mark.parametrize("phase", ["forward", "backward"])
 @pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
-def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, phase):
+def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, phase, width):
     """The forward and a training step's backward (its forward kept) at the tiles they derive on a GPU of a
     99 KB block (an RTX PRO 6000's, an A10's), causal, bf16, widths 64, 128 and 256, compiled by XLA's CUDA
     backend for a compile-only device of it on this CPU (tests/kernel_compile.py): every Triton launch within
@@ -954,19 +956,15 @@ def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, phas
     from kernel_compile import compile_kernels, failures
 
     spans = template.spans(512, 512, 1, causal=True)
+    shape = jax.ShapeDtypeStruct((1, 512, 2, width), jnp.bfloat16)
 
-    def _case(width: int):
-        shape = jax.ShapeDtypeStruct((1, 512, 2, width), jnp.bfloat16)
+    def forward(query, key, value):
+        return attention_triton.forward(query, key, value, spans, None, natural=True)
 
-        def forward(query, key, value):
-            return attention_triton.forward(query, key, value, spans, None, natural=True)
-
-        return (KernelCase(f"forward-{width}", lambda: (forward, (shape,) * 3)) if phase == "forward"
-                else KernelCase(f"backward-{width}", lambda: (_trained(spans), (shape,) * 4)))
-
-    cases = [_case(width) for width in (64, 128, 256)]
-    found = compile_kernels(cases, generation_name)
-    assert len(found) == len(cases)
+    case = (KernelCase(f"forward-{width}", lambda: (forward, (shape,) * 3)) if phase == "forward"
+            else KernelCase(f"backward-{width}", lambda: (_trained(spans), (shape,) * 4)))
+    found = compile_kernels([case], generation_name)
+    assert len(found) == 1
     assert not failures(found), "\n".join(failures(found))
 
 
@@ -1264,7 +1262,9 @@ def test_a_triton_forward_every_config_of_which_spills_hands_its_call_to_the_nex
 
 
 @COMPILES_ON_CPU
-def test_a_forward_at_its_own_config_compiles_within_an_a100s_block():
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT],
+                         ids=lambda k: k.name)
+def test_a_forward_at_its_own_config_compiles_within_an_a100s_block(kept):
     """A bf16 call's forward 128 wide, its plain walk, the training walk that keeps its output for D and the
     one of split sums (whose anchor value row holds 128 more registers a thread), each at the config the
     launch derives itself (no pin), compiled by XLA's CUDA backend for a compile-only A100 on this CPU
@@ -1276,13 +1276,11 @@ def test_a_forward_at_its_own_config_compiles_within_an_a100s_block():
     query = jax.ShapeDtypeStruct((1, 1024, 4, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.bfloat16)
 
-    def _case(kept):
-        def forward(query, key, value):
-            return attention_triton.forward(query, key, value, spans, residuals=kept)
-        return KernelCase(f"forward-{kept.name}", lambda: (forward, (query, key, key)))
+    def forward(query, key, value):
+        return attention_triton.forward(query, key, value, spans, residuals=kept)
 
-    cases = [_case(kept) for kept in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)]
-    found = compile_kernels(cases, "sm80")
+    found = compile_kernels([KernelCase(f"forward-{kept.name}", lambda: (forward, (query, key, key)))],
+                            "sm80")
     assert not failures(found), "\n".join(failures(found))
 
 
