@@ -773,17 +773,26 @@ def _drops(stage: Stage) -> bool:
 
 def groups_held(after: Sequence[Stage], size: int, threads: int) -> int:
     """The groups of `size` a same-rows batched step's read holds at once (`dew.data.lowering._GroupedRows`):
-    a window shuffle's after it and the read's threads'; a global shuffle refused, naming its reads (row
-    9784)."""
+    a window shuffle's after it and the read's threads'. A global shuffle after it the analysis refused
+    (`_regrouped`)."""
     threaded = 2 * max(1, threads)
-    shuffled = next((stage for stage in after if isinstance(stage, Shuffle)), None)
-    if shuffled is None:
-        return threaded
-    if shuffled.window is None:
-        raise ValueError("a global shuffle after a batched map reads each row's group anew on an indexed "
-                         "read: read it in memory (read='memory'), shuffle within a window (window=), or "
-                         "shuffle before the map")
-    return -(-shuffled.window // size) + 1 + threaded
+    windows = [stage.window for stage in after if isinstance(stage, Shuffle) and stage.window is not None]
+    return threaded if not windows else -(-windows[0] // size) + 1 + threaded
+
+
+def _regrouped(pipeline: Pipeline, read: Read, eager: int) -> None:
+    """Refuse a global shuffle after a same-rows batched step a reader runs over its order's rows, not one a
+    memory read's eager pass ran (before `eager`): it would draw each row's group anew, a group a draw
+    (`dew.data.lowering._GroupedRows`), naming the remedies its read has (row 9784). Refused as `compile`
+    analyzes the chain, where a reader lowering its stages refused it."""
+    grouped = False
+    for index, stage in enumerate(pipeline.stages):
+        grouped = grouped or (index >= eager and isinstance(stage, Batched) and stage.same_rows)
+        if grouped and isinstance(stage, Shuffle) and stage.window is None:
+            remedies = (*(("read it in memory (read='memory')",) if read != "memory" else ()),
+                        "shuffle within a window (window=)", "shuffle before the map")
+            raise ValueError(f"the global shuffle in {_name(pipeline)} after a batched map would read each "
+                             f"row's group anew: {', or '.join(remedies)}")
 
 
 def rejects(stage: Stage) -> bool:
@@ -969,6 +978,8 @@ def _analyzed(
             break
         eager += held
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
+    if read != "streamed":
+        _regrouped(pipeline, read, eager)
     if isinstance(source, Mixture) and source.tokens is not None:
         per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in lowered)

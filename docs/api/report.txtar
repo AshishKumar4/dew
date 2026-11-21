@@ -129,7 +129,7 @@ class MLflowTracker(experiment: str, name: str | None = None, *, uri: str | None
   .close(self) -> None
   .log(self, scalars: Mapping[str, float], step: int) -> None
   .run: property -> tuple[MlflowClient, str]
-class Mean(fn: collections.abc.Callable[[Scored, Batch], jax.Array | numpy.ndarray | numpy.bool | numpy.number | bool | int | float | complex | tuple[float, float]], name: str, better: Literal['higher', 'lower'], reads: type[Scored]) -> None  [dew.eval.common]
+class Mean(fn: collections.abc.Callable[[Scored, Batch], jax.Array | numpy.ndarray | numpy.bool | numpy.number | bool | int | float | complex | tuple[float, float]], name: str, better: Literal['higher', 'lower'], reads: type[Scored], fields: tuple[str, ...] = ()) -> None  [dew.eval.common]
   .finalize(self, accumulated: tuple[float, float]) -> float
   .merge(accumulated: tuple[float, float], contribution: tuple[float, float]) -> tuple[float, float]  [staticmethod]
   .shown: property -> dew.objectives.base.Shown
@@ -622,7 +622,6 @@ dew.config.trainer.TrainerConfig
   mesh: MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
   layout: Annotated[Layout, tyro.conf.subcommand('layout')] | None = None
-  layout_unsettable: Annotated[bool, tyro.conf.Suppress] = True
   profile: ProfileWindow | None = None
   run_profile: RunProfile | None = dew.training.profiling.RunProfile()
   compilation_cache_dir: str | None = None

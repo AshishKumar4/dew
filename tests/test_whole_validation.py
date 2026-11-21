@@ -106,13 +106,12 @@ EVALUATED = sorted(set(objectives) - ROLLOUT)
 """Every registered objective with an evaluation loss."""
 
 POOLED = (("block_diffusion", "distillation", "lm", "mean_flow", "masked_diffusion", "supervised"),
-          ("guidance_distillation",), ("ladd",), ("decision", "shortcut"), ("jepa", "dpo"),
-          ("diffusion", "rcm"))
+          ("guidance_distillation",), ("ladd", "decision", "shortcut"), ("jepa", "dpo", "diffusion", "rcm"))
 """`EVALUATED` in the parts `tests/test_multiprocess.py` runs its passes on a pool in, so no part passes
 CI's group target on a pool's own seconds, which its two processes' start and compiles dominate. With each
-case's init and loss statistics compiled whole (`evaluated`), the parts took 49, 58, 35, 30, 26 and 40 s on
-armada (11-06), guidance distillation's Flux alone the second. The first, the lightest, also scores
-`Perplexity`."""
+case's init and loss statistics compiled whole (`evaluated`), six parts took 49, 58, 35, 30, 26 and 40 s on
+armada (11-06), guidance distillation's Flux alone the second, each paying its pool's start: the last
+four are two pools now (armada cut, 11-20). The first, the lightest, also scores `Perplexity`."""
 
 
 def evaluated(name: str, windows, tmp_path) -> dict:
