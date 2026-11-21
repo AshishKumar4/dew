@@ -1304,8 +1304,36 @@ def _prepared(dew, truth, terms=None) -> _Prepared:
     return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held), term_leaves)
 
 
+class Paired(NamedTuple):
+    """One seed's evidence of a leaf for check 1 (`_paired`), read by name (`_drawn_from`): its arms' log
+    mean squared errors, their worst sized rows, the rows of float64 zero with both arms' errors on them
+    (`ZeroRows`), whether every value was finite, and the shares of each arm's worst row's squared error,
+    one array `[kind, arm]` (`SHARE_KINDS`), NaN where unknown (row 10786: a share added as one more
+    positional field broke every reader unpacking the entry)."""
+
+    mse: float
+    their_mse: float
+    worst: float
+    their_worst: float
+    zero_rows: ZeroRows
+    finite: bool
+    shares: np.ndarray
+
+
+SHARE_KINDS = ("element", "collinear")
+"""The kinds of a worst row's share of its squared error `Paired.shares` holds, in its order: its largest
+element's (`RecordedLeaf.share`) and its share along its truth row (`RecordedLeaf.collinear`, row 9780)."""
+
+
+def _shares_of(mine: RecordedLeaf | None, theirs: RecordedLeaf | None) -> np.ndarray:
+    """`Paired.shares` from each arm's summary (`SHARE_KINDS` of it), NaN for an arm passed as None or a
+    share it does not know."""
+    return np.asarray([[np.nan if leaf is None or getattr(leaf, kind) is None else getattr(leaf, kind)
+                        for leaf in (mine, theirs)] for kind in ("share", "collinear")], np.float64)
+
+
 def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, their_terms=None,
-              own: bool = False) -> list[tuple]:
+              own: bool = False) -> list[Paired]:
     """One draw's `_paired` evidence of every leaf of Dew (`prepared`, read once a draw) and `reference`
     against their truths: the reference's leaves (a recorded one's `RecordedLeaf`) and its truth held to
     Dew's truth's leaves, paths and shapes, so no leaf is paired with another's truth or compared through
@@ -1365,34 +1393,6 @@ def _one_row(recorded: RecordedLeaf, truth, terms=None) -> RecordedLeaf:
     row = rows_summary(np.exp([recorded.log_mse / 2]), truth, finite=recorded.finite, dtype=recorded.dtype,
                        log_mse=recorded.log_mse, terms=terms)
     return dataclasses.replace(row, example_mse=recorded.example_mse, example_worst=recorded.example_worst)
-
-
-class Paired(NamedTuple):
-    """One seed's evidence of a leaf for check 1 (`_paired`), read by name (`_drawn_from`): its arms' log
-    mean squared errors, their worst sized rows, the rows of float64 zero with both arms' errors on them
-    (`ZeroRows`), whether every value was finite, and the shares of each arm's worst row's squared error,
-    one array `[kind, arm]` (`SHARE_KINDS`), NaN where unknown (row 10786: a share added as one more
-    positional field broke every reader unpacking the entry)."""
-
-    mse: float
-    their_mse: float
-    worst: float
-    their_worst: float
-    zero_rows: ZeroRows
-    finite: bool
-    shares: np.ndarray
-
-
-SHARE_KINDS = ("element", "collinear")
-"""The kinds of a worst row's share of its squared error `Paired.shares` holds, in its order: its largest
-element's (`RecordedLeaf.share`) and its share along its truth row (`RecordedLeaf.collinear`, row 9780)."""
-
-
-def _shares_of(mine: RecordedLeaf | None, theirs: RecordedLeaf | None) -> np.ndarray:
-    """`Paired.shares` from each arm's summary (`SHARE_KINDS` of it), NaN for an arm passed as None or a
-    share it does not know."""
-    return np.asarray([[np.nan if leaf is None or getattr(leaf, kind) is None else getattr(leaf, kind)
-                        for leaf in (mine, theirs)] for kind in ("share", "collinear")], np.float64)
 
 
 def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> Paired:
@@ -1850,7 +1850,7 @@ def _judged_leaves(dew, weighing) -> tuple[list[str], tuple[int, ...]]:
             tuple(int(_width(leaf)) for leaf in jax.tree.leaves(judged)))
 
 
-def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[tuple]], examples=None,
+def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[Paired]], examples=None,
                example_rows=None) -> _Draws:
     """A site's draws (`_Draws`) from each seed's evidence (`_evidence`, one entry a leaf), the leaves'
     `names` and row `widths` (`_judged_leaves`), and where its leaves stack examples, each seed's
