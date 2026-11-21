@@ -534,15 +534,15 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         if not candidate(ran, tile, target):
             return False
         family = pricing.family_of(tile, ran.arguments['tokens'].dtype)
-        launch = dataclasses.replace(self._launch(ran, tile, merges=self._merges(ba, config)),
+        launch = dataclasses.replace(self._launch(ran, tile, registers=self.registers(ba, config)),
                                      floor=tile.stages, most=tile.stages)
         return resources.plan([launch], family, target, programs=tile.programs) is not None
 
     def _stated(self, ba, config: tiling.Tiles) -> dict:
         """The register model a launch at `config` states its mainloop: `registers`, `shared` bytes staged,
         and whether its last wave is `balanced`."""
-        registers, balanced = self._tail(ba, config)
-        return {'registers': registers, 'balanced': balanced,
+        registers = self.registers(ba, config)
+        return {'registers': registers, 'balanced': self.balanced(ba, config),
                 'shared': registers and self.staged_bytes(ba, config, generation.gpu_target())}
 
     def launch_of(self, ba, config: tiling.Tiles) -> resources.Launch:
@@ -551,18 +551,16 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         the stages its program's share of the GPU's block (`generation.shared_budget`) holds of a step's
         two operand blocks at an element a byte and its contraction has steps, at least two: the call's a
         launch at `config` runs (`_ran`)."""
-        # Its schedule read on the call and tile as given (`_merges`: a split's runs merge no last wave).
-        return self._launch(*self._ran(ba, config), merges=self._merges(ba, config))
+        return self._launch(*self._ran(ba, config), registers=self.registers(ba, config))
 
-    def _launch(self, ba, config: tiling.Tiles, *, merges: bool) -> resources.Launch:
-        """`launch_of`'s launch for the call `ba` as a launch at `config` runs it (`_ran`), whose last wave
-        `merges` as the call given decided (`_merges`)."""
+    def _launch(self, ba, config: tiling.Tiles, *, registers: int | None) -> resources.Launch:
+        """`launch_of`'s launch for the call `ba` as a launch at `config` runs it (`_ran`), a consumer thread
+        at `registers`, the register model's for the call as given (`registers`)."""
         from .templates import resources
         from .templates.gemm import pricing
 
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         steps = self._steps(ba, config)
-        registers = self._ran_tail(ba, config, merges=merges)[0]
         scope = self._scope(ba, config, family, steps)
         shared = resources.program_shared(generation.shared_budget(generation.gpu_target()), config.programs)
         most = shared // ((config.block_m + config.block_n) * config.block_k)

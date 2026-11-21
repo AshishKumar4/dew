@@ -329,10 +329,10 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     `registers` and `shared` state its launch's register model (`mosaic.Family.kernel`'s;
     `grouped_matmul._Mosaic`'s prices), and `balanced` whether its registers hold a balanced last wave's
     merge (`grouped_matmul._Mosaic.balanced`), its tail unbalanced where they do not. With `beside`, further
-    matrices whose products the launch takes
-    with `rhs`'s side by side, each its own output (`Beside`: q, k and v's projections, row 6794). With
-    `chained`, `(rows, matrix)` products summed with `lhs @ rhs` over their depths end to end, in order
-    (`Chained`: a multi-matrix input gradient, row 8282; its overflowing tiles again, `guarded_walk`)."""
+    matrices whose products the launch takes with `rhs`'s side by side, each its own output (`Beside`: q, k
+    and v's projections, row 6794). With `chained`, `(rows, matrix)` products summed with `lhs @ rhs` over
+    their depths end to end, in order (`Chained`: a multi-matrix input gradient, row 8282; its overflowing
+    tiles again, `guarded_walk`)."""
     dtype = _products_dtype(lhs, {'matrix': rhs}, packed_rows)
     block_n = tile_columns(tiles, family_of(tiles, dtype))
     if transpose_lhs and (not dense or prologue is not None):
@@ -393,12 +393,17 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     if linked is not None:
         outs = guarded_walk(walk, outs, tiles, len(linked.depths),
                             launched(family_of(tiles, dtype), multiprocessors, walked * linked.narrowed))
-    if tiles.splits > 1:
-        # Each run's fp32 partial, summed in its order (the same sums every call) and rounded once.
+    outs = _gmm_outputs(outs, dtypes, rows, tiles.splits)
+    return outs if out_dtypes or beside else outs[0]
+
+
+def _gmm_outputs(outs: tuple, dtypes: tuple, rows: int, splits: int) -> tuple:
+    """`gmm`'s outputs from its walk's, each its first `rows`: a split's runs' fp32 partials summed in their
+    order (the same sums every call) and rounded once to each of `dtypes`."""
+    if splits > 1:
         total = functools.reduce(jnp.add, tuple(outs[0]))
         outs = tuple(total.astype(dtype) for dtype in dtypes)
-    outs = tuple(out[:rows] for out in outs)
-    return outs if out_dtypes or beside else outs[0]
+    return tuple(out[:rows] for out in outs)
 
 
 def _joined(joined, lhs, paired, epilogue: tuple, *, parts: tuple, transpose_lhs: bool,
