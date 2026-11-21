@@ -57,9 +57,7 @@ def _value(padded, stacked, *extra, units: windows.Units, queries: int, width: i
     if out_dtype is None:
         return tuple(state[:3])
     assert out_heads is not None
-    finished = jnp.where(algebra.expand(state.total > 0, state.acc), state.acc, 0.0)
-    return (ungrouped_rows(finished, out_heads).astype(out_dtype),)
-
+    return (ungrouped_rows(state.acc, out_heads).astype(out_dtype),)
 def merged_split(spec: algebra.Forward, padded, stacked, *, queries: int, width: int,
                  initial: Initial | None = None) -> algebra.Partial:
     """A split walk's padded slices merged (`_trimmed`'s layout) with the call's `initial` state where it has
@@ -221,8 +219,7 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
     if len(role.walks) == 3:
         joining_walk, mean_walk, _ = role.walks
     else:
-        joining_walk = cost.Work()
-        mean_walk, _ = role.walks
+        joining_walk, mean_walk = cost.Work(), role.walks[0]
     walk_work = emission.repeated(joining_walk, chunks - 1) + emission.repeated(mean_walk, 2 * chunks)
     passes = 3 * chunks
     padded_item, stacked_item = padded.dtype.itemsize, stacked.dtype.itemsize
@@ -350,8 +347,7 @@ def _launch(padded, stacked, *extra, units: windows.Units, queries: int, width: 
         state = algebra.finished_merged_chunked(units, *_chunks(total_slices, read))
         if out_dtype is not None:
             (merged_ref,) = out_refs
-            finished = jnp.where(algebra.expand(state.total > 0, state.acc), state.acc, 0.0)
-            merged_ref[...] = finished.astype(out_dtype)
+            merged_ref[...] = state.acc.astype(out_dtype)
         else:
             merged_ref, maximum_ref, total_ref = out_refs
             merged_ref[...] = state.acc
