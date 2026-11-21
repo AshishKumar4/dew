@@ -1533,7 +1533,7 @@ class _Build:
         # that left is dropped while the others resume (`Plan.check`); a mix of stated counts weighs each
         # member's targets as it accepts them, as `TokenDeficit` does as it draws (row 10784).
         stated = self.lowering.order.get("shares") == STATED_SHARES
-        weighed = {"tokens": source.tokens} if source.tokens is not None and stated else {}
+        weighed: _Counter = {"tokens": source.tokens} if source.tokens is not None and stated else {}
         streams = [build.accepted(_as_iter(parent, build.loading), _name(child), _label(child), **weighed)
                    for parent, build, child in zip(parents, builds, source.pipelines, strict=True)]
         if tagged:
