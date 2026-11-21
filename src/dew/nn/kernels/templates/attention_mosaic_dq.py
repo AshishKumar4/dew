@@ -203,8 +203,7 @@ QUERIES_FIRST = (mosaic.Product("keys", placed.SCORES, "queries", transposed=Tru
 writes over the cotangents' turn (`_placed_dq_step`)."""
 
 
-def _placed_dq_step(walk: _Backward, stats: tuple, coords_of, tile, index, slots, rows, accumulators, *,
-                    masked: bool | None = None):
+def _placed_dq_step(walk: _Backward, stats: tuple, coords_of, tile, index, slots, rows, accumulators):
     """The compute warpgroup's key tile `index` of a walk whose family places its products on a role queries
     first (`placed.QUERIES`, `QUERIES_FIRST`): the tile's scores and their cotangents its issuer's
     (`awaited`, a query a thread's row in tensor memory's own layout), `PART` keys at a time under its rows'
@@ -219,14 +218,12 @@ def _placed_dq_step(walk: _Backward, stats: tuple, coords_of, tile, index, slots
     scores, cotangents = family.awaited(slots)
     pulled = family.turn_of(placed.COTANGENTS, slots.turn, narrowed=True)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
-    is_masked = True if masked is None else masked
-    read = walk.places_read(masked=is_masked)
     for first in range(0, tiles.block_k, PART):
         s = family.read(scores, first=first, columns=PART, layout=mosaic_sm100.TMEM)
         dp = family.read(cotangents, first=first, columns=PART, layout=mosaic_sm100.TMEM)
-        coords = coords_of(k_first + first, shape=(tiles.block_q, PART), read=read)
+        coords = coords_of(k_first + first, shape=(tiles.block_q, PART))
         exponentials, _, scored, slopes, seen = _scores(walk, coords, (), s, dp, peak, prior, anchor, delta,
-                                                        chosen, masked=is_masked)
+                                                        chosen, masked=True)
         sums = gradient.DqSums(empty, residual, mass, grads, weighed, empty, keyed_mass, keyed_shift)
         terms, part, _ = gradient.dq_issued(sums, exponentials, scored, slopes, seen, pulled.dtype, prior,
                                             scale=walk.grad_scale, kinds=walk.kinds, summed=walk.summed,
@@ -329,8 +326,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                                    draw=None if drop_of is None else drop_of.draw(row, head)))
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
                      nothing + gradient.NO_SHIFT)
-            run = (program.forward_whole_run(first, spans_of)
-                   if family.places_on_role or not family.budgets_registers else None)
+            run = program.forward_whole_run(first, spans_of) if not family.budgets_registers else None
             # The tiles its partner reads around its own (`Family.walk_own`).
             (residual, mass, grads, weighed, keyed_mass, keyed_shift), accumulated = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
