@@ -101,3 +101,19 @@ def test_a_snapshot_draws_after_a_filter_and_a_shuffle_as_its_rows_stand(tmp_pat
     drawn = sealed("first")
     assert sorted(row for row, _ in drawn) == [row for row in range(24) if row % 3]
     assert sealed("again") == drawn
+
+
+def test_a_snapshot_of_a_finite_mix_ends_where_its_streamed_mix_ends(tmp_path):
+    """A snapshot of an equal-weight mix of two JSON-lines stores, five records and two, seals what the
+    finite mix reads, one of each in turn until the shorter ends: four records, whether or not its pass draws
+    (a sealing pass is the scored pass it was, its mix's members ending as theirs do; row 10567's review)."""
+    from dew.data.pipeline import Pipeline, mix
+
+    stores = []
+    for name, ids in (("five", range(5)), ("two", range(100, 102))):
+        path = tmp_path / f"{name}.jsonl"
+        path.write_text("".join(f'{{"id": {value}}}\n' for value in ids))
+        stores.append(Pipeline(Files(str(path), format="jsonl")))
+    mix(stores).snapshot(str(tmp_path / "sealed"))
+    stored = Files(str(tmp_path / "sealed")).records("indexed")
+    assert [int(stored[at]["id"]) for at in range(len(stored))] == [0, 100, 1, 101]
