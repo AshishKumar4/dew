@@ -15,7 +15,14 @@ from collections.abc import Mapping
 from importlib.metadata import version
 from pathlib import Path
 
-from pins import pinned
+
+def pinned(requirements: list[str], name: str) -> str | None:
+    """The release `requirements` pin `name` at: its first `name==release` requirement, an extra in brackets
+    or an environment marker beside it; None where none pins it."""
+    for requirement in requirements:
+        if found := re.match(rf"{re.escape(name)}(?:\[[^]]*\])?==([^;\s]+)", requirement):
+            return found[1]
+    return None
 
 
 def tested(distribution: str) -> str:

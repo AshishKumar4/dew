@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tools" / "armada"))
 sys.path.insert(0, str(REPO / "tools"))
 from ci import PYTHONS  # the tested Pythons, pyproject.toml's classifiers'
-from pins import pinned  # the one reader of a pyproject pin
+from reference_releases import pinned  # the one reader of a pyproject pin
 
 SHELL = ("# BEGIN install facts (site/scripts/gen_install.py)", "# END install facts")
 TABLE = ("<!-- BEGIN CUDA builds (site/scripts/gen_install.py) -->", "<!-- END CUDA builds -->")
@@ -59,9 +59,9 @@ def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str,
 
 
 def agreed(requirements: list[str], names: tuple[str, ...]) -> str:
-    """The one release `requirements` pin every one of `names` at (`pins.pinned`), refused where one is
-    unpinned or two differ: the page states one release for them all (train 1140's review: it read the
-    CUDA 12 plugin's pin alone while stating every plugin's and PJRT's)."""
+    """The one release `requirements` pin every one of `names` at (`reference_releases.pinned`), refused
+    where one is unpinned or two differ: the page states one release for them all (train 1140's review: it
+    read the CUDA 12 plugin's pin alone while stating every plugin's and PJRT's)."""
     found = {name: pinned(requirements, name) for name in names}
     if None in found.values() or len(set(found.values())) != 1:
         raise SystemExit(f"pyproject.toml's pins of {', '.join(names)} are not one release: {found}")
