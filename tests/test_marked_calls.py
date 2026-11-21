@@ -282,3 +282,48 @@ def test_a_declared_derivatives_nondifferentiable_array_is_bound_not_traced():
 
     for run in (lambda f: f, jax.jit):
         np.testing.assert_array_equal(np.asarray(gradient(declared, run)), np.asarray(gradient(bare, run)))
+
+
+def test_a_marked_span_called_again_in_one_state_is_traced_once(monkeypatch):
+    """A marked span called again in the same state, its function's reads, its arguments' types and the
+    context a trace reads alike, is the program its first call traced (`derivatives._SPANS`), never traced
+    again: precision's error-free transforms were traced afresh at every call, 7.5 percent of a padded
+    merge's grad of grad (row 10762). Each trace of a span counted as JAX makes it."""
+    traced = []
+    making = jax.make_jaxpr
+
+    def counted(fn, *args, **kwargs):
+        # A marked call's own trace of its span, among whatever else the trace makes.
+        traced.append(getattr(fn, "__name__", None))
+        return making(fn, *args, **kwargs)
+
+    span = marked(Protected(), body)
+    x, y = jnp.ones(3), jnp.full(3, 2.0)
+    monkeypatch.setattr(jax, "make_jaxpr", counted)
+    first = jax.jit(lambda x, y: span(x, y)).trace(x, y)
+    second = jax.jit(lambda x, y: span(x, y) + 0.0).trace(x, y)
+    assert traced.count("span") == 1
+    assert kinds_of(first.jaxpr) == kinds_of(second.jaxpr) == [Protected()]
+
+
+SCALE = 2.0
+"""A module global a marked span reads (`test_a_marked_span_reads_the_state_its_function_reads_now`)."""
+
+
+def test_a_marked_span_reads_the_state_its_function_reads_now(monkeypatch):
+    """A marked span's program is its function's in the state it reads now: a module global rebound, a
+    closure's dict changed, between two calls, the second computes with the new values, never a program
+    the first traced (row 10762's reviews: a key that missed a function's reads served the old one)."""
+    held = {"shift": 1.0}
+
+    def scaled(x):
+        return x * SCALE + held["shift"]
+
+    span = marked(Protected(), scaled)
+    x = jnp.ones(3)
+    first = jax.jit(lambda x: span(x))(x)
+    monkeypatch.setattr(__import__(__name__), "SCALE", 3.0)
+    held["shift"] = 5.0
+    second = jax.jit(lambda x: span(x) + 0.0)(x)
+    np.testing.assert_array_equal(np.asarray(first), np.full(3, 3.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(second), np.full(3, 8.0, np.float32))
