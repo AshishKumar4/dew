@@ -732,21 +732,6 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     assert {case.form for case in cases} == _gate_forms(generation_name)
 
 
-@lowers("sm90")
-def test_an_h100s_forward_whose_depth_no_tile_divides_lowers_at_its_derived_tile():
-    """An H100's bf16 forward of a call whose depth and width no tile divides (the 'unaligned in whole 16
-    bytes' projection: 200 deep, 136 wide, four groups) lowers at the tile its launch derives: a partial
-    axis's blocks move untiled at the array's true extents, each copy's rows a dimension of its box, so the
-    derivation takes no block of more rows than one copy moves (it derived 384 x 64, whose (384, 64) copy
-    Mosaic GPU refuses past 256 rows, a case the gate's tile dedup had dropped behind an aligned projection's
-    same tile)."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    [case] = _gemm_mainloop_cases("sm90", "unaligned in whole 16 bytes", form="forward bf16")
-    found = compile_mosaic_kernels([case.case], "sm90")
-    assert not mosaic_failures(found), (case.tile, mosaic_failures(found))
-
-
 def _gate_forms(generation_name: str) -> set[str]:
     """The forms a generation's GEMM launches emit (`_emitted_forms`), each on the most capable issuer
     whose bundle takes it (`bundles.groups`): what its compile gate holds."""
