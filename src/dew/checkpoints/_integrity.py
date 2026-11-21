@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew._coordination import from_every_process
 from dew._hashing import fmix32
 from dew.nn.kernels.options import program
 
@@ -86,8 +87,19 @@ def _digest(tree) -> str:
     for index, (_, leaf) in enumerate(flat):
         if isinstance(leaf, jax.Array) and leaf.sharding.memory_kind in (None, "device"):
             on_device.setdefault(frozenset(leaf.sharding.device_set), []).append(index)
-    marks = {index: mark for indices in on_device.values() for index, mark in zip(
-        indices, np.asarray(jax.device_get(_marks([flat[index][1] for index in indices]))), strict=True)}
+    # Each set's marks where they are held, every process taking those it holds none of from one that holds
+    # them, in one round where some set spans fewer than every process (a stage of one process's devices,
+    # `dew.training.stages`): every process digests the tree alike.
+    held = [np.asarray(_marks([flat[index][1] for index in indices]).addressable_data(0)).tolist()
+            if flat[indices[0]][1].sharding.addressable_devices else None for indices in on_device.values()]
+    if any({device.process_index for device in devices} != set(range(jax.process_count()))
+           for devices in on_device):
+        every = from_every_process(held)
+        held = [next(read for read in (rank[at] for rank in every) if read is not None)
+                for at in range(len(held))]
+    marks = {index: np.asarray(mark, np.uint32)
+             for indices, read in zip(on_device.values(), held, strict=True)
+             for index, mark in zip(indices, read, strict=True)}
     digest = hashlib.sha256()
     for index, (path, leaf) in enumerate(flat):
         if index not in marks:

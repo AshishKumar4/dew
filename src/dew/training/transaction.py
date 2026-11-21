@@ -691,11 +691,11 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
     for index, leaf in enumerate(leaves):
         sharding = leaf.sharding
         groups.setdefault((frozenset(sharding.device_set), sharding.memory_kind), []).append(index)
-    mine = set(jax.local_devices())
-    # Each placement's flags as this process read them, None where it holds none of its devices.
+    # Each placement's flags as this process read them, None where it holds none of its devices (on any
+    # backend: a CPU-owned state's companion mesh is no default backend's).
     read: list[list[bool] | None] = []
-    for (devices, memory), members in groups.items():
-        if not devices & mine:
+    for (_, memory), members in groups.items():
+        if not leaves[members[0]].sharding.addressable_devices:
             read.append(None)
         elif memory not in (None, "device"):
             read.append([_held_flag(program(leaf_finite)(fetched(leaves[index], leaves[index].sharding)))

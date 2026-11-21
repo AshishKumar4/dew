@@ -1678,7 +1678,8 @@ class Checkpoints:
         template's placement and dtype or as host arrays, refusing one whose
         content no longer has the digest the step recorded."""
         values = {}
-        with ocp.PyTreeCheckpointer() as checkpointer:
+        # The store read as it was written (`_handler`): a stage's rows of a collection on its own devices.
+        with ocp.Checkpointer(_handler()) as checkpointer:
             for name, digest in digests.items():
                 path = epath.Path(self.directory) / FROZEN_STORE / digest
                 if not path.exists():

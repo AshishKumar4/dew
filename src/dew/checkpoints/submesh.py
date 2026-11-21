@@ -7,24 +7,29 @@ without the dtype a process that holds none of it must state (`serialization._re
 each array on a strict part of the pool (`apart`) is written by the processes that hold its shards, its
 metadata by the first of them, the others writing nothing of it, and read back by them, the others making it
 with no shard; every other array is Orbax's own. The files are Orbax's: each such row its own array, read by
-any topology as the stages wrote it (docs/design/training.md, checkpoints). A host-local array of a `pmap`,
-on each process's own devices under one name, is still refused, every process agreeing the devices an
-array is on first."""
+any topology as the stages wrote it (docs/design/training.md, checkpoints). Only an array a mesh places
+(`NamedSharding`) is written so: a `pmap`'s host-local array, or one put on a single device, on each
+process's own devices under one name, is still refused, as Orbax refuses it, with no round between the
+processes (a local tier's saves are each process's own)."""
 
 from __future__ import annotations
+
+import asyncio
+import dataclasses
 
 import jax
 import orbax.checkpoint as ocp
 from orbax.checkpoint._src.futures import future
+from orbax.checkpoint._src.path import async_path
 from orbax.checkpoint._src.serialization import jax_array_handlers as handlers, replica_slices
-
-from dew._coordination import from_every_process
 
 
 def apart(value) -> bool:
-    """Whether `value` is an array on a strict part of a pool of processes' devices."""
+    """Whether `value` is an array whose devices are some processes' of a pool and not every one's, on any
+    backend (a CPU-owned state's companion mesh spans every process, as its accelerator's does)."""
     return (isinstance(value, jax.Array) and jax.process_count() > 1
-            and not set(jax.devices()) <= value.sharding.device_set)
+            and {device.process_index for device in value.sharding.device_set} != set(range(
+                jax.process_count())))
 
 
 def _owner(sharding: jax.sharding.Sharding) -> int:
@@ -39,19 +44,17 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
 
     async def serialize(self, values, infos, args=None):
         args = list(args or [ocp.SaveArgs()] * len(values))
-        parted = [index for index, value in enumerate(values) if apart(value)]
-        whole = [index for index in range(len(values)) if index not in set(parted)]
+        parted: list[int] = []
+        whole: list[int] = []
+        for index, value in enumerate(values):
+            # A mesh's array alone: a pmap's or a single device's, Orbax's own refusal (module docstring).
+            (parted if apart(value) and isinstance(value.sharding, jax.sharding.NamedSharding)
+             else whole).append(index)
         futures = [] if not whole else list(await super().serialize(
             [values[index] for index in whole], [infos[index] for index in whole],
             [args[index] for index in whole]))
         if not parted:
             return futures
-        # Every process places each array alike: a pmap's array, on each process's own devices, is not.
-        placed = [[infos[index].name, sorted(device.id for device in values[index].sharding.device_set)]
-                  for index in parted]
-        if any(other != placed for other in from_every_process(placed)):
-            raise ValueError("an array on each process's own devices is a pmap's host-local array, which a "
-                             "checkpoint does not hold: make it one global array first")
         if any(jax.dtypes.issubdtype(values[index].dtype, jax.dtypes.prng_key) for index in parted):
             raise ValueError("a PRNG key on part of the pool is not written: place it on every process")
         if self._enable_write_sharding_file:
@@ -92,12 +95,22 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
         return futures
 
     async def deserialize(self, infos, args=None):
-        if args is None:
+        if args is None or not infos:
             return await super().deserialize(infos, args)
-        none = [index for index, arg in enumerate(args)
-                if isinstance(getattr(arg, "sharding", None), jax.sharding.Sharding)
-                and not arg.sharding.addressable_devices]
-        held = [index for index in range(len(infos)) if index not in set(none)]
+        # Each array's placement as Orbax resolves it, the step's own sharding file read where a restore
+        # states none, so a row another stage holds is known before Orbax reads it.
+        await asyncio.gather(*[info.await_path_creation() for info in infos])
+        recorded = await async_path.exists(infos[0].parent_dir / handlers._SHARDING_FILE_NAME)
+        placed = await handlers._deserialize_shardings(infos, args, recorded)
+        args = [dataclasses.replace(arg, sharding=sharding, mesh=None, mesh_axes=None)
+                if isinstance(arg, ocp.ArrayRestoreArgs) and isinstance(sharding, jax.sharding.Sharding)
+                else arg for arg, sharding in zip(args, placed, strict=True)]
+        none: list[int] = []
+        held: list[int] = []
+        for index, arg in enumerate(args):
+            sharding = getattr(arg, "sharding", None)
+            (none if isinstance(sharding, jax.sharding.Sharding) and not sharding.addressable_devices
+             else held).append(index)
         read = [] if not held else list(await super().deserialize([infos[index] for index in held],
                                                                    [args[index] for index in held]))
         # Its shape and dtype as the restore states them, else as the step's files do (a local tier's
@@ -105,9 +118,14 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
         unstated = [index for index in none if args[index].global_shape is None or args[index].dtype is None]
         stated = dict(zip(unstated, await self.metadata([infos[index] for index in unstated]) if unstated
                           else [], strict=True))
+
+        def known(index: int, field: str):
+            given = getattr(args[index], "global_shape" if field == "shape" else field)
+            return getattr(stated[index], field) if given is None else given
+
         made = [jax.make_array_from_single_device_arrays(
-            tuple(args[index].global_shape or stated[index].shape), args[index].sharding, [],
-            dtype=args[index].dtype or stated[index].dtype) for index in none]
+            tuple(known(index, "shape")), args[index].sharding, [], dtype=known(index, "dtype"))
+            for index in none]
         results: list = [None] * len(infos)
         for index, value in [*zip(held, read, strict=True), *zip(none, made, strict=True)]:
             results[index] = value

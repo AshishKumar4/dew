@@ -1101,17 +1101,21 @@ def mode_stage_save(args) -> dict:
                                                for rank in range(jax.process_count())), strict=True)
               for device in pair]
     mesh = MeshSpec(fsdp=2, stage=2)
+    persistent = Checkpoints(str(args.run_dir))
 
-    def run(steps: int, *, local: bool = True) -> int:
+    def run(steps: int, *, local: bool = True, resume: str = "require") -> tuple[int, int | None]:
         kept = (Checkpoints(str(args.run_dir), local_directory=str(args.local_dir), local_every=1) if local
                 else Checkpoints(str(args.run_dir)))
-        staged = trainer(decoder(), ADAM, mesh, len(paired), checkpoints=kept)
+        # A frozen scalar a layer, which the store holds, each stage's rows on its own devices.
+        staged = trainer(decoder(layer_scalar="frozen"), ADAM, mesh, len(paired), checkpoints=kept)
         staged.device_mesh = mesh.build(paired)
-        return int(staged.fit(stream(), steps=steps, checkpoint_every=2, log_every=1).step)
+        stepped = int(staged.fit(stream(), steps=steps, checkpoint_every=2, log_every=1, resume=resume,
+                                 checkpoint_final=False).step)
+        return stepped, persistent.latest()
 
-    # Step 1 on the local tier alone, resumed from it to step 2, which the persistent tier holds too; then
-    # resumed from the persistent tier alone to step 3.
-    steps = [run(1), run(2), run(3, local=False)]
+    # Step 1 on the local tier alone (the persistent tier holds none), resumed from it to step 2, which the
+    # persistent tier holds; then that resumed from the persistent tier alone to step 3, which it does not.
+    steps = [run(1, resume="never"), run(2), run(3, local=False)]
     return {"process_index": jax.process_index(), "finite": read, "steps": steps}
 
 
