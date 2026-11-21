@@ -13,17 +13,30 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import launches, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stacked, stores, swizzling
-from dew.nn.kernels.templates.attention_mosaic_fused import staged_parts, walked_sums
+from dew.nn.kernels import generation, launches, tuning
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    mosaic,
+    resources,
+    stacked,
+    stores,
+    swizzling,
+)
+from dew.nn.kernels.templates.attention_mosaic_fused import (
+    _STREAM_ORDER,
+    _statistics,
+    staged_parts,
+    walked_sums,
+)
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    STATISTICS,
     BackwardTiles,
     TileWalk,
     _coords,
-    _rows,
     _Spans,
     _streamed,
     _views_of,
+    launch_scope,
     modelled,
     reducing,
     stated,
@@ -36,8 +49,23 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
 )
 
 
-def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
-                      ) -> tuple[list, dict]:
+def coop_streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
+                             reduced: int) -> int:
+    """How many of its query tiles' statistics (`_STREAM_ORDER`, `peak`/`total`/`delta` first) the
+    shared-keys launch at `config` streams beside them within `shared_limit` (row 5272)."""
+    if not family.copies_vectors:
+        return 0
+    limit = generation.gpu_target().shared_limit
+    for count in range(len(_STREAM_ORDER), 0, -1):
+        allocations = _coop_allocations(family, config, width, dtype, stages, streamed=count, reduced=reduced)
+        if limit is None or resources.shared_bytes(
+                family, launch_scope(family, allocations, reduced, reduces=False)) <= limit:
+            return count
+    return 0
+
+
+def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
+                      reduced: int = 0, streamed: int | None = None) -> tuple[list, dict]:
     """The shared-keys launch's allocations as `Family.scoped` takes them, in `_coop_launch`'s order: the
     program's resident keys and values; a tile's weights and score cotangents, every consumer's share of
     the keys whole rows of their swizzle, the widest whose row divides it and the products' contractions
@@ -45,8 +73,8 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     each (`staged_parts`); each consumer's fp32 stage of its adds a chunk of its columns at a time
     (`stores.staged_columns`: width 256's two stages of its 64 x 256 slots fit beside it); the two loads'
     barriers and the exchange's (`Family.exchange`); fp16's shares' exponents, a row each of the weights'
-    and of the cotangents' (`_sixteen_step`); and its query and output-cotangent streams in `stages` slots
-    (`Family.streams`)."""
+    and of the cotangents' (`_sixteen_step`); and its query, output-cotangent, and streamed-statistics
+    streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     chunk = stores.staged_columns(width // consumers, (jnp.float32,))
     swizzle = swizzling.swizzle_for(dtype, block_k // consumers, block_q, block_k)
@@ -57,7 +85,10 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
               family.load_barriers(2), *family.exchange(consumers)]
     if parts > 1:
         scoped.append(family.staged_memory((2, consumers, block_q), jnp.float32))
-    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
+    if streamed is None:
+        streamed = coop_streamed_statistics(family, config, width, dtype, stages, reduced=reduced)
+    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
+              **{name: ((block_q,), STATISTICS[name]) for name in _STREAM_ORDER[:streamed]}}
     return scoped, family.streams(blocks, stages, consumers)
 
 
@@ -73,7 +104,7 @@ def _share_scores(walk: _Backward, share: int, resident: tuple, rows_of, coords_
     own = pl.ds(share * keys, keys)
     coords = coords_of(q_first, read=walk.places_read(masked=masked))
     scores = _tile_scores(walk, (slots["queries"], slots["douts"]), (k_smem.at[own], v_smem.at[own]),
-                          rows_of(q_first), coords, whole(index), (tiles.block_q, keys), masked=masked,
+                          rows_of(slots, q_first), coords, whole(index), (tiles.block_q, keys), masked=masked,
                           whole_operands=whole_operands)
     return scores, own, pl.ds(share * columns, columns), q_first
 
@@ -97,12 +128,21 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
                                                          index, slots, masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
     exchange.claim()
-    family.staged(narrowed, weights_ref.at[:, own])
-    family.staged(part, cotangents_ref.at[:, own])
+    with family.staged_together():
+        family.staged(narrowed, weights_ref.at[:, own])
+        family.staged(part, cotangents_ref.at[:, own])
     exchange.publish()
-    dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size))
-    dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
-    dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
+    if family.products_overlap and not family.operands_in_registers and not walk.interpret:
+        def issue_dkv():
+            family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
+            family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
+
+        dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size),
+                            then=issue_dkv, pending=2)
+    else:
+        dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size))
+        dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
+        dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
     add_dq(q_first, dq)
     family.settled(0)
     exchange.release()
@@ -178,16 +218,13 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, heads // kv_heads)
-        views = _views_of(family, {"queries": q_ref, "douts": do_ref}, row, head)
+        statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
+        views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         k_first = family.program_index("k_tiles") * block_k
         lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
         streamed = _streamed([(lo, hi)] * consumers)
         run = program.whole_run(k_first, q_steps, spans_of)
-
-        def rows_of(q_first):
-            return tuple(_rows(family, ref, row, head, q_first, block_q) for ref in stat_refs)
-
         def cooperate(share: int, index):
             # Each consumer's columns its own, so each slices its tiles at offsets it holds statically.
             keys_view = (row, pl.ds(k_first, block_k), key_head)
@@ -227,8 +264,12 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
 
         family.scheduled(consumers, consumer, producer)
 
-    scoped, rings = _coop_allocations(family, program.tiles, width, query.dtype,
-                                      min(program.tiles.stages, q_steps))
+    stages = min(program.tiles.stages, q_steps)
+    reduced = reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1)
+    stats_streamed = coop_streamed_statistics(family, program.tiles, width, query.dtype, stages,
+                                              reduced=reduced)
+    scoped, rings = _coop_allocations(family, program.tiles, width, query.dtype, stages,
+                                      reduced=reduced, streamed=stats_streamed)
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
@@ -239,7 +280,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         approx_math=walk.approx_math, name="attention_dkv_shared",
         registers=walk.registers(dq=False),
         # A score hook's warpgroups reserve their reduction scratch, and fp16's running scale's (`reducing`).
-        reducing_warpgroups=reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1),
+        reducing_warpgroups=reduced,
         # Its walk's statement, its work its emission's (`stated`); the model's products it owns
         # (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads, query, key, value, dout,

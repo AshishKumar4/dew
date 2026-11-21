@@ -11,7 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked, stores
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
@@ -39,19 +39,22 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
 )
 
 
+_STREAM_ORDER: tuple[str, ...] = ("peak", "total", "delta", "anchor", "chosen")
+"""Priority order for TMA-streaming query statistics beside query tiles: `peak`, `total`, and `delta` are
+read on every fast-form step, while `anchor` and `chosen` are unused in plain bf16 backward (row 5272)."""
+
+
 def streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
                         reduced: int) -> int:
-    """How many of its query tiles' statistics (`STATISTICS`, in order) the fused launch at `config` streams
-    beside them: where its copies move a vector (`Transport.copies_vectors`), the most whose rings its block
-    holds beside its own allocations (the GPU's `shared_limit`, `launch_scope`); a step reads the rest from
-    global memory (`_rows`). FlashAttention 3's 64 x 64 launch on two consumers at width 128 holds two of
-    the five on an H100 (a ring 1,056 bytes, 2,976 free; all five put it past the block and the derivation on
-    one consumer, et-bwdderive, et-fusedbytes). `reduced` the launch's warpgroups reserving reduction scratch
-    (`reducing`: a score hook's)."""
+    """How many of its query tiles' statistics (`_STREAM_ORDER`, `peak`/`total`/`delta` first) the fused
+    launch at `config` streams beside them: where its copies move a vector (`Transport.copies_vectors`), the
+    most whose rings its block holds beside its own allocations (the GPU's `shared_limit`, `launch_scope`);
+    a step reads the rest from global memory (`_rows`). `reduced` the launch's warpgroups reserving reduction
+    scratch (`reducing`: a score hook's)."""
     if not family.copies_vectors:
         return 0
     limit = generation.gpu_target().shared_limit
-    for count in range(len(STATISTICS), 0, -1):
+    for count in range(len(_STREAM_ORDER), 0, -1):
         allocations = _fused_allocations(family, config, width, dtype, stages, streamed=count,
                                          reduced=reduced)
         if limit is None or resources.shared_bytes(
@@ -120,8 +123,11 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     229,424 bytes held whole against its 166,912); where dK and dV leave `typed` (`stores_typed`), in `dtype`
     through a stage of their own after the walks, rounded once there."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
-    stage = family.staged_memory((consumers, max(block_q, block_k), width), jnp.float32)
     held = family.adds_through_shared
+    # Chunk held fp32 add stages (`stores.staged_columns`: 64 cols = 32 KB at d128 vs 64 KB whole-width) so
+    # sm90 64x64 d128 frees 32 KB SMEM for streaming `delta`, `stores_typed`, and extra pipeline stages.
+    stage_width = stores.staged_columns(width, (jnp.float32,)) if held else width
+    stage = family.staged_memory((consumers, max(block_q, block_k), stage_width), jnp.float32)
     kv_swizzles = transposed_swizzles(config, "keys", "values")
     scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("keys")),
               family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("values")),
@@ -131,7 +137,7 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     if streamed is None:
         streamed = streamed_statistics(family, config, width, dtype, stages, reduced=reduced)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
-              **{name: ((block_q,), kind) for name, kind in list(STATISTICS.items())[:streamed]}}
+              **{name: ((block_q,), STATISTICS[name]) for name in _STREAM_ORDER[:streamed]}}
     out = family.staged_memory((consumers, block_k, width), dtype) if typed else stage
     return scoped, family.streams(blocks, stages, consumers), [] if held and not typed else [out]
 
@@ -213,20 +219,21 @@ def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: in
 
 def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, streamed: int
                 ) -> tuple[dict, Callable]:
-    """A fused program's query tiles' statistics (`STATISTICS`, their `refs` at its batch `row` and `head`):
-    the views of the first `streamed`, streamed beside each tile (`streamed_statistics`), and
-    `rows_of(slots, first query)`, a tile's rows, those from its slots, the rest from global memory
-    (`_rows`)."""
-    names = list(STATISTICS)
-    views = {name: (ref.at[row, head], lambda j: (j,))
-             for name, ref in zip(names[:streamed], refs, strict=False)}
+    """A program's query tiles' statistics (`STATISTICS`, their `refs` at its batch `row` and `head`):
+    the views of the first `streamed` of `_STREAM_ORDER`, streamed beside each tile (`streamed_statistics`),
+    and `rows_of(slots, first query)`, a tile's rows in `STATISTICS` order, streamed ones from their slots
+    and the rest from global memory (`_rows`)."""
+    by_name = dict(zip(STATISTICS, refs, strict=True))
+    chosen = _STREAM_ORDER[:streamed]
+    views = {name: (by_name[name].at[row, head], lambda j: (j,)) for name in chosen}
+    streamed_names = frozenset(chosen)
 
     def rows_of(slots, first):
-        def read(index, name, ref):
-            return (family.rows_of(slots[name]) if index < streamed
+        def read(name, ref):
+            return (family.rows_of(slots[name]) if name in streamed_names
                     else _rows(family, ref, row, head, first, block_q))
-        return tuple(functools.partial(read, index, name, ref)
-                     for index, (name, ref) in enumerate(zip(names, refs, strict=True)))
+        return tuple(functools.partial(read, name, ref)
+                     for name, ref in zip(STATISTICS, refs, strict=True))
     return views, rows_of
 
 
