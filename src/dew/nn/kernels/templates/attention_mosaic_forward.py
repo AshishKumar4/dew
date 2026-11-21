@@ -1345,7 +1345,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
                 whole_end = (jnp.minimum(jnp.maximum(jnp.where(program.padded(first), 0,
                                                                program.whole(first, hi)), lo), hi)
                              if (spans is None and program.causal and not program.ahead
-                                 and certified is None) else None)
+                                 and certified is None and not family.budgets_registers) else None)
                 return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret,
                                           products=program.products, whole_end=whole_end))
             assert anchors is not None
