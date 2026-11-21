@@ -295,27 +295,29 @@ def _launch(padded, stacked, *extra, units: means.Units, queries: int, width: in
     channels = 1 << (width - 1).bit_length()
 
     def merge(out_ref, maxima_ref, totals_ref, *rest):
-        init_refs = rest[:3] if has_initial else ()
-        merged_ref, maximum_ref, total_ref = rest[3:] if has_initial else rest
         if has_initial:
-            init_m_ref, init_t_ref, init_acc_ref = init_refs
+            init_m_ref, init_t_ref, init_acc_ref, merged_ref, maximum_ref, total_ref = rest
             raw_t = init_t_ref[...].reshape(1, 1)
             raw_m = init_m_ref[...].reshape(1, 1)
             raw_acc = init_acc_ref[...].reshape(1, 1, block)
             held = means.holding(raw_t)
             init_out = jnp.where(held[..., None], means.finished(raw_acc, raw_t), 0.0)
             init_m = algebra.raw_maximum(raw_m, raw_scale) if raw_scale is not None else raw_m
-            init_m = jnp.where(jnp.isfinite(init_m), init_m, algebra.LEAST)
-            init_t = jnp.where(raw_t >= 0, raw_t, 0.0)
+            init_state: tuple | None = (init_out, jnp.where(jnp.isfinite(init_m), init_m, algebra.LEAST),
+                                        jnp.where(raw_t >= 0, raw_t, 0.0))
+        else:
+            merged_ref, maximum_ref, total_ref = rest
+            init_state = None
 
         def read(start):
             at = pl.ds(start, chunk)
             out = out_ref[at]
             maximum = maxima_ref[0, at].reshape(chunk, 1)
             total = totals_ref[0, at].reshape(chunk, 1)
-            if has_initial:
-                idx = start + jax.lax.broadcasted_iota(jnp.int32, (chunk, 1), 0)
-                is_init = idx == slices
+            if init_state is not None:
+                init_out, init_m, init_t = init_state
+                slice_pos = start + jax.lax.broadcasted_iota(jnp.int32, (chunk, 1), 0)
+                is_init = slice_pos == slices
                 out = jnp.where(is_init[..., None], init_out, out)
                 maximum = jnp.where(is_init, init_m, maximum)
                 total = jnp.where(is_init, init_t, total)

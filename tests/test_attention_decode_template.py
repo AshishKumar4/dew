@@ -121,7 +121,7 @@ def test_a_decode_step_over_a_value_it_reads_not_a_number_is_the_references_inte
     never made finite; the second row, its values ordinary, bit for bit its own without the NaN beside it."""
     positions, heads, kv_heads = CALLS["one-query"]
     spans = _spans(positions)
-    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    query, _, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
     poisoned = value.at[0, 5, 0, 3].set(jnp.nan)
     ours = np.asarray(_assumed_attend(device, query, key, poisoned, spans), np.float32)
     theirs = np.asarray(template.reference(query, key, poisoned, spans), np.float32)
