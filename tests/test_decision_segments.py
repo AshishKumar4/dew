@@ -389,14 +389,15 @@ class Merging(ByteTokenizer):
 
 
 def test_a_cut_state_takes_a_longer_cut_whose_row_encodes_shorter_past_one_that_overflows():
-    """A row whose room holds the state "abxyz" whole only as its encoding merges "xyz": the cut its share
-    counted ("abx", three tokens) grows past "abxy", which overflows at four, to the whole state, three
-    tokens again (row 9060: the growth stopped at the first longer cut that overflowed)."""
-    tokenizer, state = Merging(), "abxyz"
-    segments = (Text("S:"), State(), Schema())
+    """A row whose room holds the state "aaxy" whole only as its encoding merges the state's "xy" with the
+    text after it ("z"): the cut its share counted ("a", the room left by the text after it) grows past
+    "aa" and "aax", which overflow, to the whole state, whose row is as short as the first cut's (row 9060:
+    the growth stopped at the first longer cut that overflowed)."""
+    tokenizer, state = Merging(), "aaxy"
+    segments = (Text("S:"), State(), Text("z"), Schema())
     [whole] = SegmentLayout.joint_row(max_len=1 << 20, segments=segments).rows(tokenizer, SPECIALS, state,
                                                                                 QUESTIONS)
     [row] = SegmentLayout.joint_row(max_len=len(whole.tokens), segments=segments).rows(
         tokenizer, SPECIALS, state, QUESTIONS)
-    # The whole state, its "xyz" merged: the row the room past all lays out.
+    # The whole state, its "xy" merged with the "z" after it: the row the room past all lays out.
     assert list(row.tokens) == list(whole.tokens) and 1 in list(row.tokens)
