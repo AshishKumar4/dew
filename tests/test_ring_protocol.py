@@ -734,24 +734,106 @@ def test_a_gathered_load_warp_skipping_its_slots_release_wait_is_caught():
         explore(mutated, arrivals)
 
 
-def test_a_gathered_index_ends_a_locations_known_prefix():
-    """The checker's locator (`ring_protocol._located`) over a ref's indexer as a kernel's trace states it,
-    a buffer laid `[role, slot, column]`: a role's slot, `[0, 1]`, located at both indices, its columns
-    whole; the role's slots gathered by an array of indices, `[0, [0, 2]]`, at the role alone, the prefix it
-    knows (the base review of 56a716c95, F6: a gathered index of several entries raised)."""
+def test_a_gathered_indexs_location_shares_memory_with_what_it_reads_alone():
+    """The checker's locator (`ring_protocol._located`) over a ref's indexers as a kernel's trace states
+    them, a buffer laid `[role, slot, column]`: a role's slot, `[0, 1]`, located at both indices, its columns
+    whole; the role's slots gathered by an array of indices, `[0, [0, 2]]` (JAX broadcasts the role's index
+    beside them, one value), sharing memory with those slots alone; a `(2, 2)` ref's rows gathered by a
+    repeated index, `[[0, 0]]`, then the view's second row, `[1]`, the ref's row 0 again, with that row
+    alone (the base review of 56a716c95, F6: a gathered index raised; of d8f8ab837, F1: a repeated one read
+    as one value, which lost the alias, row 8978)."""
     from jax._src.state.indexing import NDIndexer
 
     ref, shape = ring_protocol.Ref("ring", barrier=False, num_arrivals=0), (2, 4, 8)
     assert ring_protocol._located(ref, [NDIndexer.from_indices_shape((0, 1), shape)]) == ("ring", 0, 1)
-    gathered = NDIndexer.from_indices_shape((0, np.asarray([0, 2], np.int32)), shape)
-    assert ring_protocol._located(ref, [gathered]) == ("ring", 0)
-    # Row 8978: a constant advanced index `ref.at[[0, 0]].at[1]` on (2, 2) reads base row 0, so it must stop
-    # at `("ring", 0)` and overlap `("ring", 0, 0)` rather than mislabeling as `("ring", 0, 1)`.
+    gathered = ring_protocol._located(ref, [NDIndexer.from_indices_shape((0, np.asarray([0, 2], np.int32)),
+                                                                         shape)])
+    assert [ring_protocol._overlaps(gathered, ("ring", 0, slot)) for slot in range(4)] == [True, False, True,
+                                                                                          False]
+    assert not ring_protocol._overlaps(gathered, ("ring", 1))
     repeated = [NDIndexer.from_indices_shape((np.asarray([0, 0], np.int32),), (2, 2)),
                 NDIndexer.from_indices_shape((1,), (2, 2))]
-    located = ring_protocol._located(ref, repeated)
-    assert located == ("ring", 0)
-    assert ring_protocol._overlaps(located, ("ring", 0, 0))
+    assert ring_protocol._overlaps(ring_protocol._located(ref, repeated), ("ring", 0, 1))
+    assert not ring_protocol._overlaps(ring_protocol._located(ref, repeated), ("ring", 1))
+
+
+GATHERS = {
+    "a row apart": ((2, 2), (([1],),), ("ring", 0), False),
+    "its row": ((2, 2), (([1],),), ("ring", 1), True),
+    "a cell apart": ((2, 2), ((0, [1]),), ("ring", 0, 0), False),
+    "its cell": ((2, 2), ((0, [1]),), ("ring", 0, 1), True),
+    "a picked cell apart": ((2, 2), (([1],), (0, 0)), ("ring", 1, 1), False),
+    "its picked cell": ((2, 2), (([1],), (0, 0)), ("ring", 1, 0), True),
+    "a rank-two pick apart": ((4,), (([[0, 1], [2, 3]],), (1, 0)), ("ring", 1), False),
+    "its rank-two pick": ((4,), (([[0, 1], [2, 3]],), (1, 0)), ("ring", 2), True),
+    "an empty gather": ((2, 2), (([],),), ("ring", 0), False),
+    "an empty pick": ((2, 2), (([1],), ([],)), ("ring", 1), False),
+}
+"""Each gather cell's ref shape, its indexers in turn (a list an array of indices), the location the other
+warpgroup writes, and whether that write shares memory with the gather's read."""
+
+
+@pytest.mark.parametrize(("shape", "indexers", "written", "races"), GATHERS.values(), ids=GATHERS.keys())
+def test_a_gather_races_only_what_it_reads(shape, indexers, written, races):
+    """Two warpgroups, one reading a ref through a gather (`ref.at[[1]]`, its row 1; `ref.at[0, [1]]`, its
+    cell `(0, 1)`; `ref.at[[1]].at[0, 0]`, the cell `(1, 0)` its view's entry picks; a `(4,)` ref's
+    `ref.at[[[0, 1], [2, 3]]].at[1, 0]`, its element 2; `ref.at[[]]` and `ref.at[[1]].at[[]]`, nothing; its
+    location `_located`'s) and the other writing `written` with no barrier between them: the explorer
+    takes a write apart from what the gather reads as apart, and catches one of it unordered with the read
+    (the base reviews of 71686face, F2: the row gather taken as the ref whole raced the other row; of
+    8c1c9efca, F2: the cell gather taken as its row raced the other cell; of 31b5fe85b, F1: the picked cell
+    taken as its row raced the other cell of it; of 8a5405c55, F1: the rank-two gather flattened missed its
+    element, F2: an empty one raised)."""
+    from jax._src.state.indexing import NDIndexer
+
+    ref, transforms = ring_protocol.Ref("ring", barrier=False, num_arrivals=0), []
+    for indexer in indexers:
+        indices = tuple(np.asarray(index, np.int32) if isinstance(index, list) else index
+                        for index in indexer)
+        transforms.append(NDIndexer.from_indices_shape(indices, shape))
+        shape = transforms[-1].get_indexer_shape()
+    read = ring_protocol._located(ref, transforms)
+    reader, writer = [Event("read", read)], [Event("write", written)]
+    if not races:
+        assert explore([reader, writer], {}) > 0
+    else:
+        with pytest.raises(Violation) as found:
+            explore([reader, writer], {})
+        assert found.value.kind == "unordered"
+
+
+def test_a_kernels_gathered_reads_touch_what_they_read():
+    """A kernel's reads of its shared tiles through gathers, as the checker's interpreter takes them
+    (`_access`, `_located`), at a row the checker does not evaluate (one read from global memory, None to
+    it): an empty gather of a `(3, 2)` tile, one of a `(0, 2)` tile and the `(3, 2)` tile's rows 0 and 2
+    gathered then picked at that row and no column emit no read, touching no memory (the base reviews of
+    8a5405c55, 839bb19de and 369d0ad7b, F2: one raised, the others read their tile whole); its rows 0 and 2
+    gathered then picked at that row, or a one-row slice from it, and the first column read where the
+    gather's rows are, either one's first cell, for the pick could be either, and never row 1, which the
+    gather does not reach (of 839bb19de and 369d0ad7b, F1: each raised; of b0f3db894, F6: the tile whole
+    passed)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def body(rows_gmem, out_gmem, tile, empty):
+        del out_gmem
+        row = rows_gmem[0]
+        rows = tile.at[2 * jnp.arange(2, dtype=jnp.int32)]
+        tile.at[jnp.zeros((0,), jnp.int32)][...]
+        empty.at[jnp.zeros((0,), jnp.int32)][...]
+        rows.at[row, :0][...]
+        rows.at[row, 0][...]
+        rows.at[pl.ds(row, 1), 0][...]
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32),
+                          scratch_types=[plgpu.SMEM((3, 2), jnp.float32), plgpu.SMEM((0, 2), jnp.float32)])
+    (events,), _ = programs(kernel, jnp.zeros((1,), jnp.int32), threads=1)
+    (gmem, *picks) = [event.at for event in events if event.kind == "read"]
+    assert len(picks) == 2
+    for picked in picks:
+        (name,) = {block[0] for block in ring_protocol._each(picked)}
+        assert gmem[0] != name
+        assert [ring_protocol._overlaps(picked, (name, row, 0)) for row in range(3)] == [True, False, True]
 
 
 @pytest.mark.parametrize("waits", [True, False], ids=["ordered", "unordered"])

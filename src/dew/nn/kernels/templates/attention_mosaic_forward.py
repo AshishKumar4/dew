@@ -2116,7 +2116,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
-                                in_key=value_columns is not None)
+                                in_key=value_columns is not None, splits=splits)
     grid = (heads, queries // pair * splits, batch)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
@@ -2237,7 +2237,7 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, group: 
 
 def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
                   value_width: int, tiles: Tiles, *, peaks: bool, training: bool, counted: bool,
-                  shared_by: int, in_key: bool) -> tuple:
+                  shared_by: int, in_key: bool, splits: int = 1) -> tuple:
     """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): its walk's
     statement, its work its emission's (`stated`), and the model's products it owns (`modelled`): the
     forward's two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of
@@ -2253,7 +2253,7 @@ def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, valu
     streamed = (query, key) if in_key else (query, key, value)
     cost = (stated(spec, batch, heads, *streamed,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
-                                      common=family.feeds_itself)) if counted
+                                      common=family.feeds_itself, splits=splits)) if counted
             else estimate(0))
     query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
     value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)
