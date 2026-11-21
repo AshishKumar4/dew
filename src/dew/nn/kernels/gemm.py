@@ -57,7 +57,7 @@ from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import called, read_by
-from dew.nn.sharding import seen_whole
+from dew.nn.sharding import automatic_axes
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 """The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
@@ -460,7 +460,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                                          sides, tables if tabled else None, out_dtype=jnp.float32,
                                          hooks=hooked, interpret=interpret, promoted=parted.promoted,
                                          dense=dense),
-                parted, whole=seen_whole(lhs) and seen_whole(rhs))):
+                parted, whole=not automatic_axes())):
             def part(left, right, finite, epilogue, prior, axes, dtypes):
                 # A kernel gradient takes no epilogue: the earlier parts' sum is added after. The rows' finite
                 # values are read after their prologue, which rewrites them.
@@ -485,7 +485,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                                         tables if tabled else None, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
-        launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
+        launch = grouped_matmul.launched(*call, product=product, whole=not automatic_axes())
         # A kernel gradient is one product: no launch takes it apart.
         if callable(launch) and not _UNBUILT.get():
             return launch()
@@ -992,7 +992,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         # theirs rounded to it, as the product multiplies them.
         holds = jnp.promote_types(rhs.dtype, lhs.dtype) == jnp.dtype(lhs.dtype)
         counts = _part_counts(lhs.dtype, rhs.dtype if holds else lhs.dtype, precision)
-        whole = seen_whole(lhs) and all(map(seen_whole, (rhs, *beside)))
+        whole = not automatic_axes()
         if (counts is not None and prologue is None and paired is None and scatter is None and not several
                 and not chained and _parts_launched(*_gemm_call(
                     lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), group_sizes, None, (), (), epilogue,
@@ -1164,7 +1164,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                if d is not None]
     entrywise = _entrywise(lhs, prologue, prologue_arrays, prologue_axes, plain)
     wide, d_operand = at_least_fp32(lhs.dtype), None
-    whole = all(seen_whole(each) for pair in reached for each in pair)
+    whole = not automatic_axes()
     taken = (None if entrywise
              else _one_launch(reached, group_sizes, lhs.dtype, prologue, options, whole=whole))
     if taken is not None:
@@ -1263,15 +1263,14 @@ def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *,
                  whole: bool) -> generation.Route | None:
     """The forward's route where a launch takes `rows` (`[rows, depth]`) by `matrices` side by side (`gemm`'s
     `beside`, each `[depth, width]`, one output each in `out_dtype`) as `gemm` binds them, else None: their
-    forward, or their input gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's
-    launch read unreported: the forward and the input gradient independent choices, but a forward that would
-    not run (a pin's refusal of it) none, a named kernel's refusal raised (`selection.KernelRefused`, as
-    `gemm` would raise it). The route, decided unreported
-    (`selection.decided`), is the one the call runs and reports where its caller hands it on (`gemm`'s
-    `selected`), the call selected once (base review b68fc2382 F5). The operands abstract
-    (`jax.ShapeDtypeStruct`) or arrays, `whole` whether a launch sees them whole (`seen_whole`; a device's
-    own rows where the caller maps them per shard): a layer's choice of the side-by-side product over its
-    projections apart (`dew.nn.joined.side_by_side`)."""
+    forward, or their input gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's launch
+    read unreported: the forward and the input gradient independent choices, but a forward that would not run
+    (a pin's refusal of it) none, a named kernel's refusal raised (`selection.KernelRefused`, as `gemm` would
+    raise it). The route, decided unreported (`selection.decided`), is the one the call runs and reports where
+    its caller hands it on (`gemm`'s `selected`), the call selected once (base review b68fc2382 F5). The
+    operands abstract (`jax.ShapeDtypeStruct`) or arrays, `whole` whether a launch sees them whole (no
+    automatic mesh axis splits them; a device's own rows where the caller maps them per shard): a layer's
+    choice of the side-by-side product over its projections apart (`dew.nn.joined.side_by_side`)."""
     sizes = jnp.full((1,), rows.shape[0], jnp.int32)
     grouped = tuple(jax.ShapeDtypeStruct((1, *matrix.shape), matrix.dtype) for matrix in matrices)
     dtypes = (jnp.dtype(out_dtype),) * len(matrices)
@@ -1303,7 +1302,7 @@ def _one_launch(reached: list, group_sizes, dtype, prologue, options: dict, *, w
     transpose order (`chained`: projections side by side of their own widths, `beside`, row 8282), its
     derivation refusing depths of no whole steps (`mosaic_gpu.chained_refusal`). Cotangents of one dtype and
     no gathered rows; elsewhere each product runs as before, the next adding it in its epilogue. `whole`,
-    whether a launch sees the operands whole (`seen_whole`)."""
+    whether a launch sees the operands whole (no automatic mesh axis splits them)."""
     if options['gather'] is not None or len({d.dtype for d, _ in reached}) > 1:
         return None
     forms = []
@@ -1384,7 +1383,7 @@ def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed
                                    precision=options['precision'], dense=options['dense'], paired=None,
                                    first=options['first'], gather=options['gather'], scatter=None,
                                    summed_as=summed_as)
-        case = grouped_matmul.grouped_case(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
+        case = grouped_matmul.grouped_case(*call, product=product, whole=not automatic_axes())
         try:
             kernels.append(selection.selected(grouped_matmul.GROUPED, case).name)
         except selection.KernelRefused:
@@ -1444,7 +1443,7 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
         call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), sizes, after, None, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
-        case = grouped_matmul.grouped_case(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
+        case = grouped_matmul.grouped_case(*call, product=product, whole=not automatic_axes())
         try:
             kernels.append(selection.selected(grouped_matmul.GROUPED, case).name)
         except selection.KernelRefused:

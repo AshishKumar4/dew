@@ -1923,10 +1923,10 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class GroupedCase:
-    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its
-    target (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform
-    places), whether they see its operands whole (`whole`,
-    `dew.nn.sharding.seen_whole`), the `product` it declares, its `extents`, its launches bound to it
+    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its target
+    (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform places),
+    whether they see its operands whole (`whole`: no automatic mesh axis splits them,
+    `dew.nn.sharding.automatic_axes`), the `product` it declares, its `extents`, its launches bound to it
     (`call`) and the `kind` of call it is (`Kind`, as `gmm_call` and `tgmm_call` state it), which with the
     device's instruction family is its cell (`DECLARED`)."""
 

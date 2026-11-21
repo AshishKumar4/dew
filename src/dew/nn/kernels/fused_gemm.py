@@ -44,6 +44,8 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
+from jax._src import config as jax_config
+from jax._src.core import pvary_p, reduced_vary_cast_p
 from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
@@ -54,13 +56,17 @@ from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost, program as algebra_program
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import gemm, generation, grouped_matmul, launches, tuning
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
+from dew.nn.sharding import computed_from
 
 FUSION_ROW = 'ledger 1295'
 """The fusion analysis's limits."""
+
+_MANUAL_CASTS = frozenset({pvary_p, reduced_vary_cast_p})
+"""Casts of a value's type along manual mesh axes, which change no value (`_evaluated`)."""
 
 
 AXES = ('rows', 'columns')
@@ -295,7 +301,10 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     rhs, *rest = (fusion() for fusion in rest_fusions)
     group_sizes = None if dense else rest[0]
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
-    acc = jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype)
+    # Typed as the launch's result is (`dew.nn.sharding.computed_from`, row 9808): a consumer reading it
+    # beside a value each device holds its own of is traced as the program wrote it.
+    acc = computed_from(jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype), lhs, rhs, group_sizes,
+                        [side for side, _ in prologue.get('prologue_operands', ())])
     operand_bytes = float(sum(operand.size * operand.dtype.itemsize for operand in (lhs, rhs)))
     collected = _PRICED.get()
 
@@ -614,6 +623,10 @@ def _evaluated(program, consts, args):
         invals = [read(var) for var in eqn.invars]
         if body is not None:
             outvals = _evaluated(body, body.consts, invals)
+        elif eqn.primitive in _MANUAL_CASTS and not jax_config._check_vma.value:
+            # A recorded cast of a value's type along manual axes, where nothing checks them (a kernel's
+            # tile, `_tiled`, which carries no mesh's types and binds no manual axis): the value as it is.
+            outvals = invals
         else:
             outvals = eqn.primitive.bind(*invals, **eqn.params)
             outvals = outvals if eqn.primitive.multiple_results else [outvals]
@@ -632,8 +645,9 @@ def _dtype(var):
 
 
 def _staged(closed, *arrays):
-    """The producer's kernel stage evaluated on whole arrays or on tiles (under `pull_block_spec`)."""
-    return jax_core.jaxpr_as_fun(closed)(*arrays)[0]
+    """The producer's kernel stage evaluated on whole arrays or on tiles (under `pull_block_spec`), a
+    recorded cast along manual axes the value as it is on tiles (`_evaluated`)."""
+    return _evaluated(closed.jaxpr, closed.consts, arrays)[0]
 
 
 VIEWS = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.convert_element_type_p)
@@ -715,7 +729,9 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | Refusal:
     blocks = [jax.ShapeDtypeStruct(block.block_shape, array.dtype)
               for block, array in zip(specs, arrays, strict=True)]
     ids = (jnp.int32(0), jnp.int32(0))
-    closed = jax.make_jaxpr(lambda ids, *blocks: tiled(ids, (), *blocks))(ids, *blocks)
+    # Read on tiles, which carry no mesh's types (`_on_tiles`).
+    with _unchecked(on_tiles=True):
+        closed = jax.make_jaxpr(lambda ids, *blocks: tiled(ids, (), *blocks))(ids, *blocks)
     if any(var in programs.read_by(closed.jaxpr, closed.jaxpr.outvars) for var in closed.jaxpr.invars[:2]):
         return Refusal('reads_position', "the producer reads its tile's position")
     return tuple(axes)
@@ -725,14 +741,16 @@ def _prologue_tile(whole, types: tuple, axes: tuple, tile, *side_tiles):
     """The producer's kernel stage on one loaded tile of its base and its side arrays' tiles beside it,
     each side tile given back the dimensions of one the template squeezed (`_split`), by a broadcast:
     Mosaic GPU's layout inference finds a layout for a broadcast's dimension of one, and none for a
-    reshape's (FUSEDNORM-h100)."""
+    reshape's (FUSEDNORM-h100). Its block spec pulled at the tile, read as `_on_tiles` reads it."""
     shaped = [jax.lax.broadcast_in_dim(
         side, tuple(1 if axis is None else tile.shape[PROLOGUE_AXES.index(axis)] for axis in side_axes),
         tuple(index for index, axis in enumerate(side_axes) if axis is not None))
         for side, side_axes in zip(side_tiles, axes, strict=True)]
-    tiled, _, _ = fuser.pull_block_spec(whole, pl.BlockSpec(tile.shape, lambda row, depth: (row, depth)),
-                                        grid_len=2)(*types)
-    return tiled((jnp.int32(0), jnp.int32(0)), (), tile, *shaped)
+    on_tiles = _on_tiles()
+    with _unchecked(on_tiles):
+        tiled, _, _ = fuser.pull_block_spec(whole, pl.BlockSpec(tile.shape, lambda row, depth: (row, depth)),
+                                            grid_len=2)(*(_shaped(each, on_tiles) for each in types))
+        return tiled((jnp.int32(0), jnp.int32(0)), (), tile, *shaped)
 
 
 def _axes(consumer, values, acc) -> tuple | Refusal:
@@ -829,8 +847,10 @@ def _reads_position(tiled, value_specs, values, probe, dtype) -> bool:
     tiles = jax.tree.map(lambda leaf, leaf_spec: jax.ShapeDtypeStruct(leaf_spec.block_shape, leaf.dtype),
                          values, value_specs, is_leaf=_is_spec)
     tile = jax.ShapeDtypeStruct(probe, dtype)
-    closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
-        (jnp.int32(0), jnp.int32(0)), tiles, tile)
+    # Read on tiles, which carry no mesh's types (`_on_tiles`).
+    with _unchecked(on_tiles=True):
+        closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
+            (jnp.int32(0), jnp.int32(0)), tiles, tile)
     needed = programs.read_by(closed.jaxpr, closed.jaxpr.outvars)
     return any(var in needed for var in closed.jaxpr.invars[:2])
 
@@ -839,10 +859,32 @@ def _tiled(consumer, treedef, value_types: tuple, out_treedef, whole: jax.ShapeD
     """The consumer on one fp32 accumulator tile of `acc.shape`, rounded first to the product's declared
     dtype (`whole`'s, the product it was traced at), and the captured arrays' tiles beside it: its block
     spec pulled at that block of `whole`, so the same function serves every kernel tile and XLA's whole
-    array."""
-    values = jax.tree.unflatten(treedef, [jax.ShapeDtypeStruct(t.shape, t.dtype) for t in value_types])
-    tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, whole, acc.shape),
-                                        grid_len=2)(values, whole)
-    outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)),
-                 acc.astype(whole.dtype))
+    array, each read as `_on_tiles` reads it."""
+    on_tiles = _on_tiles()
+    values = jax.tree.unflatten(treedef, [_shaped(t, on_tiles) for t in value_types])
+    product = _shaped(whole, on_tiles)
+    with _unchecked(on_tiles):
+        tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, product, acc.shape),
+                                            grid_len=2)(values, product)
+        outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)),
+                     acc.astype(whole.dtype))
     return tuple(jax.tree.leaves(outs)) if out_treedef.num_leaves > 1 else jax.tree.leaves(outs)[0]
+
+
+def _on_tiles() -> bool:
+    """Whether a stage runs on a kernel's tiles, in a launch's body (`launches.interpreting`), which carry
+    no mesh's types: its program pulled and run there with the check of manual axes off (`_unchecked`), a
+    recorded cast along them the value as it is (`_evaluated`). Elsewhere it runs on XLA's whole arrays,
+    typed as the program made them (a checked manual mesh's, row 9808), each cast bound."""
+    return launches.interpreting() is not None
+
+
+def _shaped(aval, on_tiles: bool):
+    """`aval` (a value's type: an aval, or a struct stating its manual axes' type) as a stage is pulled at
+    it: its shape and dtype alone on a kernel's tiles (`_on_tiles`), as it is on whole arrays."""
+    return jax.ShapeDtypeStruct(aval.shape, aval.dtype) if on_tiles else aval
+
+
+def _unchecked(on_tiles: bool):
+    """No check of manual axes on a kernel's tiles (`_on_tiles`); the context's on whole arrays."""
+    return jax_config._check_vma(new_val=False) if on_tiles else contextlib.nullcontext()
