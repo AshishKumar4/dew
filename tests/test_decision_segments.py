@@ -398,5 +398,5 @@ def test_a_cut_state_takes_a_longer_cut_whose_row_encodes_shorter_past_one_that_
                                                                                 QUESTIONS)
     [row] = SegmentLayout.joint_row(max_len=len(whole.tokens), segments=segments).rows(
         tokenizer, SPECIALS, state, QUESTIONS)
-    assert len(row.tokens) <= len(whole.tokens)
-    assert (row.state_tokens, row.state_kept) == (len(state), len(state))
+    # The whole state, its "xyz" merged: the row the room past all lays out.
+    assert list(row.tokens) == list(whole.tokens) and 1 in list(row.tokens)
