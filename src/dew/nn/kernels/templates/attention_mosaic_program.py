@@ -586,7 +586,7 @@ def column_share(array: jax.Array, count: int) -> outputs.Dim:
     return columns if count == width else columns // (width // count)
 
 
-def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
+def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles", *, parts: int = 1) -> bool:
     """Whether a program of `family` takes `tiles`: its query tiles positive whole multiples of the rows a
     role's products cover (`Family.rows`), its key tiles of the rows a walked tile comes in
     (`Family.walked_rows`), and one to its launch's count of consumers (`most_consumers`), whose turns its
@@ -594,8 +594,10 @@ def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
     rows, a row a consumer thread: a keys-first walk's its key block (`placed.KEYS`)."""
     held, walked = held_walked(family, tiles)
     rows = held == family.rows if family.places_on_role else held % family.rows == 0
+    walked_unit = (min(family.walked_rows, 32) if parts > 1 and not family.places_on_role
+                   else family.walked_rows)
     return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
-            and rows and walked % family.walked_rows == 0)
+            and rows and walked % walked_unit == 0)
 
 
 ROUNDED = Refusal('rounds', "a quantized model's weights round at their row's maximum in the anchored "
@@ -1406,7 +1408,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
         return index ^ (count - 1) if count & (count - 1) == 0 else count - 1 - index
 
     def __post_init__(self):
-        if not whole_tiles(self.family, self.tiles):
+        if not whole_tiles(self.family, self.tiles, parts=self.parts):
             raise ValueError(f"{self.tiles}: query and key tiles of whole {self.family.rows} and "
                              f"{self.family.walked_rows} rows and {most_consumers(self.family, self.tiles)} "
                              f"consumers at most ({self.family.name})")

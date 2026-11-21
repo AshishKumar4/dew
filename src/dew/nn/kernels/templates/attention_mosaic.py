@@ -293,6 +293,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     UNBUNDLED: ClassVar[str] = "the Mosaic mainloop has no bundle for {name} yet"
     """Why a launch runs on no device of a family it has no bundle of (`declined`)."""
 
+    @property
+    def _tile_parts(self) -> int:
+        return 1
     @staticmethod
     def _bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
         """The bundle the launch runs on (`bundle`)."""
@@ -376,8 +379,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # Blackwell's, an unseen NVIDIA GPU's: `bundles.of`, row 4727).
         alone = family is not None and isinstance(config, Tiles) and config.consumers == 1
         return (family is not None and (walks_whole or alone or not split_queries(family))
-                and whole_tiles(family, config) and self.refusal(ba, family) is None
-                and super().legal(ba, config, target))
+                and whole_tiles(family, config, parts=self._tile_parts)
+                and self.refusal(ba, family) is None and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
@@ -481,6 +484,10 @@ class MosaicForward(_Mainloop[Tiles]):
     """The bf16 parts each of an fp32 call's operands enters as (`product.EXACT_PARTS`, `product.formed`),
     stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
     each 16-bit (attention.md 4b). One for a 16-bit call."""
+
+    @property
+    def _tile_parts(self) -> int:
+        return self.parts
     rounds: float | None = None
     """A quantized model's weights' bound (`Hooks.rounds`), which the anchored training walk rounds them to
     at each row's maximum: a call that keeps its split residuals' alone. None where its weights stay whole."""
