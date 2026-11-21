@@ -722,9 +722,10 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
     from `s` on, a whole chunk of keys (read transposed). A whole chunk of rows masked to a sub-chunk's took
     3.7 times fla's inter-sub-chunk launch on an A100's mma.sync (1508 us against
     chunk_kda_fwd_kernel_inter_solve_fused's 356, M-JS-144-a100). A row set's products sum into one
-    accumulator a sub-chunk, which a mainloop may hold across its key blocks, read once; formed a sub-chunk at a time, a caller issues each sub-chunk's products once its
-    operands are staged, their MMAs running under the next sub-chunk's forming, where every operand staged
-    before any product was issued, a B200's intra walk's compute warps waited on their products' commit at its
+    accumulator a sub-chunk, which a mainloop may hold across its key blocks, read once; formed a sub-chunk at
+    a time, a caller issues each sub-chunk's products once its operands are staged, their MMAs running under
+    the next sub-chunk's forming, where every operand staged before any product was issued, a B200's intra
+    walk's compute warps waited on their products' commit at its
     end (11% of their stalls, an emulated B200 at b1a0fe4b98b). Factored instead at `t`'s last token, its
     middle factor laid over the rows of `s` a product a key sub-chunk, each product awaited and read into a
     tile, the sums added up in shared memory every key block, a B200's Kimi Linear intra walk spent 23% of its
@@ -754,9 +755,11 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     is the product of its tokens' own, formed across the offsets as the token recurrence forms it (`pair_e =
     pair_(e - 1) a_(i - e + 1)`, at most `sub - 1` roundings, every factor at most one), each term the row
     times the key, then times the decay, in a rolled loop over the offsets, each offset's keys and decays read
-    once for every product; a row before its offset is selected out of its band's column once its terms are
-    summed, not term by term (its sum any value, a select's, never a product's: selected on every term, the
-    mask was a quarter of a B200's own pairs' issues, an emulated B200 at b6a888850b2). Each term's decay
+    once for every product; each offset's sums selected into its band's column, written once, and a row before
+    its offset selected out of every column once, at the end, not term by term nor offset by offset (its sum
+    any value, a select's, never a product's: selected on every term, the mask was a quarter of a B200's own
+    pairs' issues, an emulated B200 at b6a888850b2; an offset's two-part mask and the band's add on every
+    offset were 12% of an emulated GH200's intra_own issues, M-JS-145h). Each term's decay
     from the separated prefix instead (`decay`: two differences, a
     clip, a power of two and an exp2), a B200's Kimi Linear training spent 0.96 ms of an emulated 2.86 in this
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
@@ -774,8 +777,8 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     def offset(e, carried):
         bands, pair, following = carried
         keys, decays = shifted(e)
-        pair, column = pair * following, (lane == e) & (token % sub >= e)
-        return (tuple(band + jnp.where(column, jnp.sum(row * keys * pair, axis=1)[:, None], 0.0)
+        pair = pair * following
+        return (tuple(jnp.where(lane == e, jnp.sum(row * keys * pair, axis=1)[:, None], band)
                       for band, row in zip(bands, rows, strict=True)), pair, decays)
 
     def folded(e, carried):
@@ -783,14 +786,17 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         # most one in size (`unit_keys`) make what the decayed row loses below normal in the exact term too.
         bands, decayed, following = carried
         keys, decays = shifted(e)
-        decayed, column = tuple(row * following for row in decayed), (lane == e) & (token % sub >= e)
-        return (tuple(band + jnp.where(column, jnp.sum(row * keys, axis=1)[:, None], 0.0)
+        decayed = tuple(row * following for row in decayed)
+        return (tuple(jnp.where(lane == e, jnp.sum(row * keys, axis=1)[:, None], band)
                       for band, row in zip(bands, decayed, strict=True)), decayed, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
     if unit_keys:
-        return list(jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0])
-    return list(jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0])
+        bands = jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0]
+    else:
+        bands = jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0]
+    # Each column written once, by its offset's select; a row before its offset selected out once, at the end.
+    return [jnp.where(token % sub >= lane, band, 0.0) for band in bands]
 
 
 def token_decays(prefix: tuple, earlier: tuple, *, sub: int = SUB) -> jax.Array:
