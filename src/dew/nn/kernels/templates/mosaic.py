@@ -845,9 +845,10 @@ class Issuer[Accumulator](abc.ABC):
         bounds them (`resources.held_area`: a TPU core's VMEM); None where registers do."""
         return None
 
-    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
+    def value_scratch(self, blocks: dict, outputs: tuple, *, step: tuple = ()) -> tuple:
         """The `(shape, dtype)` stand-ins of the values it keeps in scratch memory beside a program's
         allocations (`gemm.mosaic_gpu.Allocations.scope`): none where they live in registers."""
+        del blocks, outputs, step
         return ()
 
     issues_in_consumers: bool = True

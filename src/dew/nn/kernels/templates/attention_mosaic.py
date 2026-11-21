@@ -117,8 +117,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     split_queries,
     stagings,
     streams_operands,
-    tpu_backward_score_tiles,
-    tpu_forward_score_tiles,
+    tpu_backward_step_tiles,
+    tpu_forward_step_tiles,
     value_columns,
     varying_slopes,
     walked_extents,
@@ -1150,12 +1150,12 @@ class MosaicForward(_Mainloop[Tiles]):
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
-        score_pairs = tpu_forward_score_tiles(natural_form=config.natural_form,
-                                              scaled=self.scales_in_kernel(ba))
         tpu_values = ({"keys": ((config.block_k, width), query.dtype),
                        "values": ((config.block_k, value_width), query.dtype)},
-                      (((config.block_q, value_width), jnp.float32),
-                       *(((config.block_q, config.block_k), jnp.float32),) * score_pairs))
+                      (((config.block_q, value_width), jnp.float32),),
+                      tpu_forward_step_tiles(config.block_q, config.block_k,
+                                             natural_form=config.natural_form,
+                                             scaled=self.scales_in_kernel(ba)))
         return resources.shared_bytes(
             family, launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
                                  products=products, over_rings=True, values=tpu_values))
@@ -2101,8 +2101,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 {"queries": ((tiles.block_q, width), dtype), "keys": ((tiles.block_k, width), dtype),
                  "values": ((tiles.block_k, value_width), dtype)},
                 (((tiles.block_k, width), jnp.float32), ((tiles.block_k, value_width), jnp.float32),
-                 ((tiles.block_q, width), jnp.float32),
-                 *(((tiles.block_q, tiles.block_k), jnp.float32),) * tpu_backward_score_tiles()))))
+                 ((tiles.block_q, width), jnp.float32)),
+                tpu_backward_step_tiles(tiles.block_q, tiles.block_k))))
             for layout, tiles, allocations, reduces in launches)
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
         # None on a family that budgets none (`Family.budgets_registers`), which holds every config.

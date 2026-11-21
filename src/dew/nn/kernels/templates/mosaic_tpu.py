@@ -99,15 +99,17 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         _one(consumers)
         return generation.shared_budget(generation.gpu_target()) // (VALUES * 4)
 
-    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
-        # Mosaic TPU holds a step's operand blocks as values and the fp32 accumulator and product tile
-        # beside them in VMEM (`VALUES`): a v5e refused 20.33 and 20.95 MiB at a 1024 x 512 x 2048 product
-        # and kernel gradient, 16.12 at a 256 x 512 x 4096 gradient, whose buffers alone counted 16.00, 16.00
-        # and 13.0 (the compile gate's libtpu runs of the launch this one replaced).
+    def value_scratch(self, blocks: dict, outputs: tuple, *, step: tuple = ()) -> tuple:
+        """VMEM scratch stand-ins for operand `blocks`, fp32 `outputs` accumulators (`VALUES` copies
+        each), and a walk step's live intermediate tiles `step` (billed once each): GEMM passes `step=()`
+        (keeping its v5e bill unchanged: 20.33/20.95 MiB at 1024x512x2048, 16.12 at 256x512x4096);
+        attention derives `step` from its phases (forward 6+6 live score-tile pairs, backward 10 pairs
+        beside 3 fp32 accumulators; v5e 22 MiB, row 10771)."""
         operands = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in blocks.values())
         values = tuple(jax.ShapeDtypeStruct(shape, jnp.float32)
                        for shape, _ in outputs for _ in range(VALUES))
-        return operands + values
+        live = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in step)
+        return operands + values + live
 
     # A tile, a row and a column are values: the members the GPU's issuers lay out are plain reads.
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:

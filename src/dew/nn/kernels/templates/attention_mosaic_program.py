@@ -496,7 +496,7 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
 
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
                  products: tuple | None = None, over_rings: bool = False,
-                 values: tuple[dict, tuple] | None = None) -> resources.Scope:
+                 values: tuple[dict, tuple] | tuple[dict, tuple, tuple] | None = None) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
     walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
     where its `products` take one (`Family.product_held`, its tensor memory's addresses
@@ -506,7 +506,12 @@ def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups:
     `reducing_warpgroups`' scratch (`resources.Scope`)."""
     scoped, streams, *after = allocations
     after_walks = tuple(after[0]) if after else ()
-    scratch = () if values is None else family.value_scratch(*values)
+    if values is None:
+        scratch = ()
+    elif len(values) == 3:
+        scratch = family.value_scratch(values[0], values[1], step=values[2])
+    else:
+        scratch = family.value_scratch(values[0], values[1])
     if after_walk.uses_over_rings(family, after_walks, over_rings=over_rings):
         added, rest, _ = after_walk.over_rings_plan(streams, after_walks)
         held, walks = family.lifetimes(rest)
@@ -2215,21 +2220,23 @@ launch over a shared dQ streams each beside its queries, and the fused launch th
 STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total", "delta", *STATISTICS)))
 """Stream priority for per-query statistics (`STATISTICS`): `peak`, `total`, and `delta` first so
 the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
-def tpu_forward_score_tiles(*, natural_form: bool, scaled: bool) -> int:
-    """Live `(block_q, block_k)` fp32 intermediate tiles held in TPU VMEM during a forward step:
-    base softmax fold (logits, mask/coords, shifted, exp, weights, rescaled) plus the extra
-    natural-form/scaled-walk intermediates when active (`MosaicForward._staged_bytes`, row 10771)."""
+
+def tpu_forward_step_tiles(block_q: int, block_k: int, *, natural_form: bool, scaled: bool) -> tuple:
+    """Live `(block_q, block_k)` fp32 score-tile stand-ins held in TPU VMEM during a forward step
+    (`MxuIssuer.value_scratch(step=...)`, billed once each; 6+6 live pairs matching v5e 22 MiB, row 10771)."""
     base = ("logits", "coords", "shifted", "exponentials", "weights", "rescaled")
     extra = ("scaled_logits", "small_weights", "small_exp", "guard_mask", "scaled_sum", "restored")
-    return len(base) + (len(extra) if natural_form or scaled else 0)
+    count = 2 * (len(base) + (len(extra) if natural_form or scaled else 0))
+    return (((block_q, block_k), jnp.float32),) * count
 
 
-def tpu_backward_score_tiles() -> int:
-    """Live `(block_q, block_k)` fp32 intermediate tiles held in TPU VMEM during a backward step:
-    scores, score cotangents, coords/mask, shifted logits, exponentials, weights, dP, dS, and the
-    two product-operand casts (`MosaicBackward.staged_bytes`, row 10771)."""
-    return len(("logits", "dp", "coords", "mask", "shifted", "exponentials", "weights", "ds",
-                "weights_cast", "ds_cast"))
+def tpu_backward_step_tiles(block_q: int, block_k: int) -> tuple:
+    """Live `(block_q, block_k)` fp32 score-tile stand-ins held in TPU VMEM during a backward step
+    (`MxuIssuer.value_scratch(step=...)`, billed once each; 10 live pairs beside 3 fp32 accumulators,
+    v5e 22 MiB, row 10771)."""
+    names = ("logits", "dp", "coords", "mask", "shifted", "exponentials", "weights", "ds",
+             "weights_cast", "ds_cast")
+    return (((block_q, block_k), jnp.float32),) * (2 * len(names))
 
 
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
