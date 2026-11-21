@@ -40,6 +40,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
+from jax._src.pallas.triton import lowering as triton_lowering
+from jax.experimental.pallas import triton as pltriton
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
@@ -1695,6 +1697,19 @@ correctly_rounded_divide_p.def_impl(_correctly_rounded_divide)
 correctly_rounded_divide_p.def_effectful_abstract_eval(jax.lax.div_p.abstract_eval)
 mlir.register_lowering(correctly_rounded_divide_p,
                        mlir.lower_fun(_correctly_rounded_divide, multiple_results=False))
+
+
+def _triton_divide(numerator, denominator):
+    """A correctly rounded fp32 quotient (`correctly_rounded_divide`'s) in a Triton kernel."""
+    numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
+    [quotient] = pltriton.elementwise_inline_asm(
+        "div.rn.f32 $0, $1, $2;", args=[numerator, denominator], constraints="=r,r,r", pack=1,
+        result_shape_dtypes=[jax.ShapeDtypeStruct(numerator.shape, numerator.dtype)])
+    return quotient
+
+
+triton_lowering.register_lowering(correctly_rounded_divide_p)(
+    triton_lowering.lower_fun(_triton_divide, multiple_results=False))
 batching.defbroadcasting(correctly_rounded_divide_p)
 correctly_rounded_divide_p.elementwise = True
 # It rounds the quotient to float32 whatever its operands' dtype: at a wider width it is the quotient.

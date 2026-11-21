@@ -30,6 +30,7 @@ from collections.abc import Callable, Collection, Sequence
 
 import jax
 import jax.numpy as jnp
+from jax._src.pallas.triton import lowering as triton_lowering
 from jax.core import Tracer, eval_context
 from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
@@ -402,6 +403,8 @@ marked_call_p = create_call_primitive("marked_call")
 transpose, batching, partial evaluation and checkpointing are JAX's call primitive's, each a marked call of
 the same kind; lowered by inlining its body, so it costs nothing compiled, inside a Pallas kernel's body too
 (Dew's JAX build lowers a call primitive there as its body)."""
+triton_lowering.register_lowering(marked_call_p)(triton_lowering.lower_fun(
+    lambda *args, call_jaxpr, **_: jax_core.eval_jaxpr(call_jaxpr, (), *args), multiple_results=True))
 
 
 def _evaluating() -> bool:

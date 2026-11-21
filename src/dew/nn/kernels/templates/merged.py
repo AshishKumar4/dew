@@ -23,17 +23,15 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-from jax._src import api_util, core as jax_core, dispatch
+from jax._src import api_util, dispatch
 from jax._src.interpreters import partial_eval as pe
-from jax._src.pallas.triton import lowering as triton_lowering
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import triton as pltriton
 from jax.extend import core as jcore
 from jax.interpreters import batching, mlir
 
-from dew.algebra import means, scaled
-from dew.nn import derivatives, precision, programs
+from dew.algebra import means
+from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import attention_algebra as algebra, cost, emission, mosaic
@@ -291,24 +289,3 @@ def _on_cuda(padded, stacked, *, spec: algebra.Forward, queries: int, width: int
 
 
 mlir.register_lowering(merged_padded_p, mlir.lower_fun(_on_cuda, multiple_results=True), platform="cuda")
-
-
-def _divided(numerator, denominator):
-    """A correctly rounded fp32 quotient (`precision.correctly_rounded_divide`'s) in a Triton kernel."""
-    numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
-    [quotient] = pltriton.elementwise_inline_asm(
-        "div.rn.f32 $0, $1, $2;", args=[numerator, denominator], constraints="=r,r,r", pack=1,
-        result_shape_dtypes=[jax.ShapeDtypeStruct(numerator.shape, numerator.dtype)])
-    return quotient
-
-
-# The law's primitives in a Triton kernel as their own values (the kernel runs the law's functions; every
-# one the law makes, `scaled.MADE`), Dew's marked calls as their bodies, and its correctly rounded division
-# as PTX's.
-for _primitive, (_value_of, _several) in scaled.MADE.items():
-    triton_lowering.register_lowering(_primitive)(triton_lowering.lower_fun(_value_of,
-                                                                            multiple_results=_several))
-triton_lowering.register_lowering(derivatives.marked_call_p)(triton_lowering.lower_fun(
-    lambda *args, call_jaxpr, **_: jax_core.eval_jaxpr(call_jaxpr, (), *args), multiple_results=True))
-triton_lowering.register_lowering(precision.correctly_rounded_divide_p)(
-    triton_lowering.lower_fun(_divided, multiple_results=False))

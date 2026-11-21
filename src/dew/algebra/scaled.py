@@ -35,6 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax._src import dispatch
+from jax._src.pallas.triton import lowering as triton_lowering
 from jax.extend import core
 from jax.interpreters import batching, mlir
 
@@ -213,6 +214,7 @@ def primitive(name: str, value: Callable, typed: Callable, batched: Callable | N
     made.def_impl(partial(dispatch.apply_primitive, made))
     made.def_abstract_eval(typed)
     mlir.register_lowering(made, mlir.lower_fun(_alike(value), multiple_results=several))
+    triton_lowering.register_lowering(made)(triton_lowering.lower_fun(value, multiple_results=several))
     if batched is None:
         batching.defbroadcasting(made)
         made.elementwise = True
