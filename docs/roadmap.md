@@ -69,7 +69,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- The saved data plan as recorded rules, one last version, and the resume modes. [10569, 10814]
+- The saved data plan as recorded rules, one last version, and the resume modes. [10569, 10814, 10816]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 

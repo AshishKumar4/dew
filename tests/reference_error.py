@@ -146,6 +146,7 @@ from dew.parity import (
     Finding,
     GateFailure as GateFailure,
     Inconclusive,
+    Paired,
     RecordedLeaf,
     _drawn_from,
     _Draws,
@@ -934,14 +935,17 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
                       f"model; a stated rounding, a cast, is kept)")
 
 
-def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
+def _over_orders(first: list[Paired], later: list[Paired]) -> list[Paired]:
     """An arm's evidence on a draw (`_evidence`) over two of its orders: each leaf's errors and rows of
-    float64 zero the first order's, its worst rows the worse of the two, each worst row's share
-    (`RecordedLeaf.share`) that of the order it is, its values finite at both."""
-    return [(one[0], one[1], float(np.fmax(one[2], other[2])), float(np.fmax(one[3], other[3])), one[4],
-             one[5] and other[5], tuple(other[6][arm] if other[2 + arm] > one[2 + arm] else one[6][arm]
-                                        for arm in (0, 1)))
-            for one, other in zip(first, later, strict=True)]
+    float64 zero the first order's, its worst rows the worse of the two, each worst row's shares
+    (`Paired.shares`) those of the order it is, its values finite at both."""
+    def over(one: Paired, other: Paired) -> Paired:
+        later_worse = np.asarray([other.worst > one.worst, other.their_worst > one.their_worst])
+        return one._replace(worst=float(np.fmax(one.worst, other.worst)),
+                            their_worst=float(np.fmax(one.their_worst, other.their_worst)),
+                            finite=one.finite and other.finite,
+                            shares=np.where(later_worse, other.shares, one.shares))
+    return [over(one, other) for one, other in zip(first, later, strict=True)]
 
 
 def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> Conditioning:

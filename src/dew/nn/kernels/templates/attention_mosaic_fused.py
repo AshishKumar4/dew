@@ -160,16 +160,26 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
                                   whole(index), shape, masked=masked)
     cotangents_staged = staged.at[1]
-    # Stage P and dS before dV/dK so narrowed and part free before products; on shared-memory-operand
-    # families (wgmma), issue dQ before dV/dK so add_dq overlaps with async dV/dK wgmma (row 5272).
-    family.staged(narrowed, staged.at[0])
-    family.staged(part, cotangents_staged)
-    dq = (None if family.operands_in_registers
-          else family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
-    dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
-    dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
-    if dq is None:
-        dq = family.looped_product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]))
+    # Stage P and dS under one proxy fence so narrowed and part free before products; on overlapping
+    # shared-memory issuers (wgmma), issue dV and dK inside dQ's product scope and read dQ with
+    # `pending=2` so dQ/dV/dK issue back-to-back with no wait bubble and `add_dq` overlaps dV/dK (row 5272).
+    with family.staged_together():
+        family.staged(narrowed, staged.at[0])
+        family.staged(part, cotangents_staged)
+    if family.products_overlap and not family.operands_in_registers and not walk.interpret:
+        def issue_dkv():
+            family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
+            family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
+
+        dq = family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]),
+                            then=issue_dkv, pending=2)
+    else:
+        dq = (None if family.operands_in_registers
+              else family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
+        dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
+        dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
+        if dq is None:
+            dq = family.looped_product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]))
     add_dq(q_first, dq)
     return carry, (dk_acc, dv_acc)
 

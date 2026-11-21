@@ -407,7 +407,9 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         their elements themselves."""
         return self.dtype.itemsize <= 2
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+        if pending:
+            raise ValueError(f"{type(self).__name__}.product is synchronous (pending={pending})")
         out = self.products(self.zeros(shape), lhs, rhs)
         if then is not None:
             then()

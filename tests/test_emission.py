@@ -353,16 +353,23 @@ def test_a_launchs_cost_counts_a_scalar_predicate_as_the_gpu_computes_it(predica
     at the output dtype it names, base review f9953e23a F1; int4's wrap, 0f72bd41c F1), and both branches of
     each warpgroup where the predicate is a float's, which the fold computes none of. Each kernel lowered for
     a GPU: a uint64's wrap (edd99fc1d F1) is no cell, as Mosaic GPU lowers no uint64 arithmetic of a
-    warpgroup's index (std::bad_cast, Lane's and Warpgroup's alike)."""
+    warpgroup's index (std::bad_cast, Lane's and Warpgroup's alike). Its cost, JAX's in-memory caches
+    cleared before it, compiles no program (`Compiles`: no backend compile within its trace; row 8707, the
+    fold proved through the launch that consumes it, not its helper alone)."""
+    from dew.telemetry.compiles import Compiles
+
     def body(x_ref, o_ref, row):
         wg = lax.axis_index("wg").astype(jnp.int32)
         row[...] = lax.cond(predicate(wg), jnp.exp, lambda value: value, row[...])
 
     launch = _kernel(body, predicate)
     lowered_for(launch, (_ROW,), "sm90")
-    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
+    jax.clear_caches()
+    with Compiles(None) as compiles:
+        traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
     assert [equation.params["cost_estimate"].transcendentals for equation in programs.equations(traced.jaxpr)
             if "cost_estimate" in equation.params] == [exponentials]
+    assert compiles.count == 0, compiles.programs
 
 
 def test_a_launchs_cost_folds_a_bodys_64_bit_arithmetic_at_its_width():
