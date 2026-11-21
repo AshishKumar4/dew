@@ -787,8 +787,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   least fla's own (`fla_gdn._precision` over `TRITON_ALGORITHMS`), and the TPU SSD's Mosaic kernel
   (`ssd._exact`, its precisions named back). A product XLA compiles states a `Precision` instead
   (`recurrence_algebra.STATE_PRECISION`'s HIGHEST): XLA routes a dot to an emitter by its shape, and its
-  CPU's elemental emitter took no named algorithm at a `[1, 1]` dot (F64 and BF16x6 alike, row 5473's
-  measurement), where HIGHEST is one every routing takes.
+  CPU's elemental emitter took no named algorithm at a `[1, 1]` dot (F64 and BF16x6 alike, M-JS-159), where
+  HIGHEST is one every routing takes.
 - Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
   exact counterpart (`extract.extracted`) is the oracle (exact as a mixed integer program is: solved to a
   relative gap of zero within the solver's feasibility tolerance, each price level held at its least within
