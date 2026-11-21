@@ -38,6 +38,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew import _cache
+from dew.algebra import bits
 from dew.nn import derivatives
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
@@ -54,7 +55,7 @@ from dew.nn.kernels.templates import (
 )
 from dew.nn.kernels.templates.cost import Stated, Work
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Turn, besides, drain, loaded_once
-from dew.nn.kernels.templates.stores import column_chunks, written
+from dew.nn.kernels.templates.stores import column_chunks, column_spans, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 Operand = Ref | jax.Array
@@ -428,13 +429,24 @@ MAGIC_INT, MAGIC_FLOAT = 0x4B400000, 12582912.0
 the second it is (2**23 + 2**22's exponent and mantissa: Family.converted's integer codes)."""
 
 
+def _decoded_codes(loaded: jax.Array, dtype) -> jax.Array:
+    """Decode quantized `loaded` codes of `dtype` to fp32: int8 via magic-number bias (avoids sm_90
+    sub.bf16x2, dd-q8), FP8 via hardware cvt on sm_89+ or `bits.decoded` on sm_80/sm_86 (rows 8549,
+    10143)."""
+    if jnp.issubdtype(dtype, jnp.integer):
+        biased = loaded.astype(jnp.int32) + jnp.int32(MAGIC_INT)
+        return lax.bitcast_convert_type(biased, jnp.float32) - jnp.float32(MAGIC_FLOAT)
+    if generation.fp8_tensor_cores(generation.gpu_target().generation):
+        return loaded.astype(jnp.float32)
+    fmt = bits.E4M3 if jnp.dtype(dtype) == jnp.dtype(jnp.float8_e4m3fn) else bits.E5M2
+    return bits.decoded(lax.bitcast_convert_type(loaded, jnp.uint8).astype(jnp.uint32), fmt)
+
+
 def converts(dtype) -> bool:
-    """Whether the current device converts quantized codes of `dtype` to 16 bits in registers
-    (`Family.converted`): integer codes on any, FP8 codes where its tensor instructions multiply FP8
-    (`generation.fp8_tensor_cores`, sm_89 on), as PTX's e4m3x2 and e5m2x2 conversions require (an A100's
-    ptxas refused them, dd-quant4's q3)."""
+    """Whether the current device converts quantized `dtype` codes in registers (`Family.converted`): int8
+    and FP8 on any GPU, hardware cvt on sm_89+ and `bits.decoded` on sm_80/sm_86 (row 8549)."""
     return (jnp.issubdtype(dtype, jnp.integer)
-            or generation.fp8_tensor_cores(generation.gpu_target().generation))
+            or jnp.dtype(dtype) in (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2)))
 
 
 step_index = derivatives.marked(derivatives.WalkStep(), lambda index: index)
@@ -2005,27 +2017,22 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             raise ValueError(f"this device converts no {jnp.dtype(codes.dtype).name} codes in registers "
                              "(`converts`)")
         if interpret:
-            value = codes[...].astype(jnp.float32)
+            value = _decoded_codes(codes[...], codes.dtype)
             if row_scale is not None:
                 value = value * row_scale[:, None]
-        else:
-            # Read in the accumulator's layout, whose rows a row vector broadcasts along (`as_row`); an 8-bit
-            # stage takes no ldmatrix. Integer codes to fp32 by the exponent's magic number in integer
-            # arithmetic (exact below 2**22), no integer-to-float conversion: an int-to-fp32 cast and the
-            # cast to 16 bits after it folded into Mosaic's packed int8-to-bf16 conversion, sm_90's
-            # sub.bf16x2, which an A100's ptxas refused (dd-q8).
-            loaded = plgpu.load(codes, layout=self.layout, optimized=False)
-            if jnp.issubdtype(codes.dtype, jnp.integer):
-                biased = loaded.astype(jnp.int32) + jnp.int32(MAGIC_INT)
-                value = lax.bitcast_convert_type(biased, jnp.float32) - jnp.float32(MAGIC_FLOAT)
-            else:
-                value = loaded.astype(jnp.float32)
-            if row_scale is not None:
-                value = value * self.as_row(row_scale)[:, None]
-        if interpret:
             into[...] = value.astype(into.dtype)
             return into
-        plgpu.store(into, value.astype(into.dtype), optimized=False)
+        # Accumulator layout (`as_row`, no 8-bit ldmatrix). Chunk by the 8-bit swizzle width via
+        # `column_spans` so staged widths past 256 (e.g. 320, 448) never overrun `pl.ds` (rows 5449, 10140).
+        chunk = swizzling.swizzle_columns(codes.dtype, swizzling.SWIZZLE_BYTES)
+        scale = None if row_scale is None else self.as_row(row_scale)[:, None]
+        for first, count in column_spans(codes.shape[1], chunk):
+            span = pl.ds(first, count)
+            loaded = plgpu.load(codes.at[:, span], layout=self.layout, optimized=False)
+            value = _decoded_codes(loaded, codes.dtype)
+            if scale is not None:
+                value = value * scale
+            plgpu.store(into.at[:, span], value.astype(into.dtype), optimized=False)
         self.published()
         return into
 
