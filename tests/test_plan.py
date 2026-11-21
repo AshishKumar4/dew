@@ -1329,6 +1329,16 @@ H100 = 2 ** 40
 """The allocator limit of the compile-only H100 a census shape's need at each rung is read on: past any."""
 
 
+class LazyFit:
+    """A place's fit, compiled where it is first read as a truth value (`climbed`)."""
+
+    def __init__(self, fits, moves: int):
+        self.fits, self.moves = fits, moves
+
+    def __bool__(self) -> bool:
+        return self.fits(self.moves)
+
+
 def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, request
             ) -> tuple[list, int, tuple, tuple] | None:
     """A census shape's step at four microbatches on `target` ('cpu', its devices' memory stated through
@@ -1398,15 +1408,20 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
             return refused.probes[0].fits
 
     if request.node.get_closest_marker("shards") is None:
-        lightest = next((place for moves, place in enumerate(places) if fits(moves)), None)
+        # Each place's fit compiled where it is read, once (no later place is compiled for the lightest).
+        fitted = functools.cache(fits)
+        found = [LazyFit(fitted, moves) for moves in range(len(places))]
     else:
         walked = sharded(f"{request.node.name} walk", lambda start, stop: [fits(moves) for moves in
                                                                             range(start, stop)], len(places))
         if walked is None:
             return None
         found = [fit for part in walked for fit in part]
-        lightest = next((place for place, fit in zip(places, found, strict=True) if fit), None)
-    return places, room, placed(planned(0, room)), lightest
+    lightest = next((place for place, fit in zip(places, found, strict=True) if fit), None)
+    # The first remat rung past the start's, at the run's own head, that fits: what a tight start asks next.
+    recomputing = next((place for place, fit in zip(places[1:], found[1:], strict=True)
+                        if place[0] is None and place[2] != places[0][2] and fit), None)
+    return places, room, placed(planned(0, room)), lightest, recomputing
 
 
 CENSUS = {
@@ -1428,12 +1443,11 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request):
-    """A start whose step does not fit at its own rung climbs the ladder in its order, each rung asked, and
-    settles the first that fits: no later than the first place of the ladder an exhaustive walk compiles
-    under the step's own options and finds fits in the same room, and that place where the plan is no rung
-    of XLA's default options, which the walk does not compile (a GPU's step under them can fit a place
-    earlier: its Triton GEMM fusions hold fewer temporaries), the decoder on the CPU and for a compile-only
-    H100, the scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
+    """A start whose step does not fit at its own rung asks the remat rungs at its own head first and
+    settles the first of them that fits (row 6740: a tight cold start's second compile), where an
+    exhaustive walk compiling each place of the ladder in the same room finds one fits, and the lightest
+    place it finds fits where none of them does, the decoder on the CPU and for a compile-only H100, the
+    scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
     in 418 s of a train's call time past the train's bound (row 7414), and the CPU's walk is the decoder's.
     What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder needed more recomputing
     its scans and convolutions too than not), so a search that passed over a rung for one seen to miss
@@ -1445,10 +1459,11 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
         climb = climbed(monkeypatch, target, fields, batch, room_of, request)
     if climb is None:
         return
-    ladder, room, plan, lightest = climb
-    places = [place[:3] for place in ladder]
-    assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (ladder, room, plan)
-    assert plan[3] or plan == lightest, (ladder, room, plan, lightest)
+    ladder, room, plan, lightest, recomputing = climb
+    # A tight start asks the remat rungs at its own head first (row 6740): it settles the first of them that
+    # fits, where one does, else the lightest place of the ladder.
+    expected = recomputing if recomputing is not None else lightest
+    assert expected is not None and plan[:3] == expected[:3], (ladder, room, plan, lightest, recomputing)
 
 
 def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss(

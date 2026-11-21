@@ -514,14 +514,14 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     assert copies > 0 and held[0] - held[1] == copies
 
 
-def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_that_frees_bytes(monkeypatch):
-    """The narrow copies are the fit ladder's first rung. In the geometry of row 1661's run, a window of
-    two steps, a step that does not fit with its copies drops them before it recomputes more, and keeps
-    them dropped where the step without them falls less short; where it falls no less short, the copies
-    come back, their 1-2% of a step kept, and the ladder recomputes with them. The plan says which
-    (`narrow`). On a CPU the drop frees bytes, the step's casts fused into their uses; on a GPU the step
-    casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them, rows
-    5041, train 857 F2). The devices hold the step fully recomputed without its copies."""
+def test_a_step_that_fits_no_recomputation_with_its_copies_drops_them_where_that_frees_bytes(monkeypatch):
+    """A tight start asks each remat rung with its copies first (`FitSearch.recomputing`, row 6740), then,
+    where none fits, drops the copies at its own rung and keeps them dropped where the step without them falls
+    less short; where it falls no less short, the copies come back, their 1-2% of a step kept, and the ladder
+    climbs with them. The plan says which (`narrow`). In the geometry of row 1661's run, a window of two
+    steps, the devices hold the step fully recomputed without its copies and not with them. On a CPU the drop
+    frees bytes, the step's casts fused into their uses; on a GPU the step casts its weights whole either way
+    (a GH200: 68.352 MB without its copies, 68.344 MB with them, rows 5041, train 857 F2)."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -533,8 +533,11 @@ def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_th
     free -= recomputed.plan["probes"][0]["headroom"]
     state, _, trainer = trained(copies=True, remat=None)
     probes = trainer.plan["probes"]
-    first, second = probes[0], probes[1]
-    assert (first["narrow"], first["fits"], second["narrow"]) == (True, False, False)
+    dropped = next(index for index, probe in enumerate(probes) if not probe["narrow"])
+    first, second = probes[0], probes[dropped]
+    # Every remat rung asked with the copies, and missed, before they are dropped at the start's rung.
+    assert all(probe["narrow"] and not probe["fits"] for probe in probes[:dropped]), probes
+    assert len({probe["remat"] for probe in probes[:dropped]}) > 1, probes
     assert second["remat"] == first["remat"] and probes[-1]["fits"] is True
     # On a CPU the step without them falls less short, and they stay dropped; on a GPU it falls no less
     # short, and they come back.
