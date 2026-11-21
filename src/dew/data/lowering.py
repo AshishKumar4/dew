@@ -755,6 +755,19 @@ class _GroupedRows(_WrappingDataset):
         self._made: collections.OrderedDict[int, concurrent.futures.Future] = collections.OrderedDict()
         self._lock = threading.Lock()
 
+    def __getstate__(self) -> dict:
+        # Its grouping alone travels to a worker (Grain's `mp_prefetch` pickles the dataset graph): the
+        # groups it made and the lock over them are this process's, each worker making and holding its own
+        # (row 10781: a lock and cached futures failed cloudpickle before the first batch).
+        state = dict(self.__dict__)
+        del state["_lock"], state["_made"]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._made = collections.OrderedDict()
+        self._lock = threading.Lock()
+
     def __len__(self) -> int:
         return len(self._parent)
 
