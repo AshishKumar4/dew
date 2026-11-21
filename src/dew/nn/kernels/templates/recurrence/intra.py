@@ -16,7 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
+from dew.nn.kernels.templates import bundles, mosaic, operands, product, resources, swizzling
 from dew.nn.kernels.templates.operands import Issuer
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
@@ -29,6 +29,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _merging,
     _resident,
     building,
+    bundle_dtype,
     chunk_liveness,
     f32,
     held_tile,
@@ -60,8 +61,10 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     recurrence-unused-grid-proof)."""
     chunk = call.chunk
     pairing = _pairing_operand(call)
-    paired = product_fragments(call, (pairing, chunk, block), (pairing, block, chunk), rhs_transposed=True)
-    carried = [] if call.family.keeps_sums(chunk) else [f32(chunk, chunk)] * outputs
+    # A sliced walk's products a sub-chunk's rows each (`_sliced`), its sums a row set and sub-chunk's.
+    rows, sums = (algebra.SUB, outputs * _later(call)) if _sliced(call) else (chunk, outputs)
+    paired = product_fragments(call, (pairing, rows, block), (pairing, block, chunk), rhs_transposed=True)
+    carried = [] if call.family.keeps_sums(chunk) else [f32(rows, chunk)] * sums
     return Held(carried=carried, phases=(
         [f32(chunk, block)] * 5,
         [f32(chunk, block)] * 9 + masks(chunk, block) + held_tile(pairing, chunk, block) + paired))
@@ -120,6 +123,7 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     own pairs zero (a launch of their own, `own_pairs.intra_own`); the
     scores and the system share every factor in one walk (`_intra_walk`), their sums held across it, where
     `_intra_merges` (wgmma's, tcgen05's); else each output walks a launch of its own."""
+    call = sub_chunked(call)
     products = ("scores", "system") if solves else ("scores",)
     if solves and not _intra_merges(call):
         scores, hi, lo = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("scores",))
@@ -128,6 +132,29 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     else:
         *walked, hi, lo = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=products)
     return (*walked, hi, lo)
+
+
+def sub_chunked(call: Call) -> Call:
+    """`call` on the bundle whose products take a sub-chunk's rows (`bundles.layouts` at `algebra.SUB`
+    rows: mma.sync's on every target, an H100's and a B200's among them, as a decode step's 8 rows take it),
+    the intra walk's (`_sliced`): a sub-chunk's row of pairs a product, fla_kda's inter-sub-chunk blocks
+    (chunk_kda_fwd_kernel_inter_solve_fused). On warpgroup MMA's 64 rows each sub-chunk's product took a
+    whole chunk's rows masked to its own, 2.3 times fla's inter-sub-chunk launch on a GH200 and 13 times
+    Dew's port of it on a B200 (M-JS-144-gh200: 330 + 87 us against 142 with the solve; js106c: 712 + 664
+    against 102)."""
+    family = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), algebra.SUB,
+                             scoped=True)[0]
+    return call if family == call.family else dataclasses.replace(call, family=family)
+
+
+def _sliced(call: Call) -> bool:
+    """Whether `call`'s products take a sub-chunk's rows (`algebra.key_block_pairs`' `sliced`)."""
+    return call.family.rows <= algebra.SUB
+
+
+def _later(call: Call) -> int:
+    """The sub-chunks past a chunk's first, each a row of pairs (`algebra.key_block_pairs`' products)."""
+    return call.chunk // algebra.SUB - 1
 
 
 def _named(launch: str, products: tuple[str, ...]) -> str:
@@ -215,6 +242,21 @@ def intra_sums_stored(call: Call, products: tuple[str, ...], totals: tuple, sums
         form.store(ref, total, row, chunk, head * chunk, chunk, family=call.family, smem=smem)
 
 
+def intra_block_stored(call: Call, name: str, block, ref, landing: dict, *, row, head) -> None:
+    """A sliced intra walk's sub-chunk row block `[SUB, C]` of output `name` at `row`, as
+    `intra_sums_stored` stores a whole chunk's."""
+    chunk = call.chunk
+    form, smem = ((dataclasses.replace(call.held, rows=call.rows), landing["square"]) if name == "scores"
+                  else (systems(call), landing["system"]))
+    form.store(ref, block, row, algebra.SUB, head * chunk, chunk, family=call.family, smem=smem)
+
+
+def _sum_index(call: Call, output: int, later: int) -> int:
+    """The walk's sum of output `output`'s and the `later`-th sub-chunk past the first's (a sliced walk's,
+    `_sliced`), else of the output's."""
+    return output * _later(call) + later if _sliced(call) else output
+
+
 def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tuple[str, ...]):
     """The intra launch's walk of each chunk's key blocks (`key_block`, the block a multiprocessor holds most
     programs of): each step the block's prefix halves from its decay (`algebra.scanned_prefix`, staged in a
@@ -227,7 +269,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     H100; the scores and the system a launch each, each scanned the prefix and gated its keys again, 0.42
     and 0.40 ms of its 1.45 (kda-batch-h100-7e3a5fb48)."""
     chunk = call.chunk
-    width, gates, family = call.width, call.gates, call.family
+    width, gates, family, sliced = call.width, call.gates, call.family, _sliced(call)
     # The scores' launch stores the prefix halves; a launch of the system alone reads no queries.
     scored = "scores" in products
     outputs = len(products)
@@ -282,40 +324,58 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
 
             def staged(value, s, r):
                 """A sub-chunk's operand staged in its own tiles (`_intra_staged`): its keys gated up, or row
-                set `r`'s rows gated down."""
-                return operands.staged(family, value, raised[s - 1] if r is None else lefts[r][s - 1])
+                set `r`'s rows gated down (a sliced walk's every sub-chunk's at once, `s` None)."""
+                return operands.staged(family, value, raised[s - 1] if r is None
+                                       else lefts[r][0 if s is None else s - 1])
 
             issuer = Issuer(call)
-            for formed in algebra.key_block_pairs([functools.partial(rows, name) for name in products],
-                                                  operand("keys"), whole, at_token, staged, chunk=chunk,
-                                                  scales=[shrinking if name == "scores" else 1.0
-                                                          for name in products]):
+            summed = list(accumulators)
+            for j, formed in enumerate(algebra.key_block_pairs(
+                    [functools.partial(rows, name) for name in products], operand("keys"), whole, at_token,
+                    staged, chunk=chunk, scales=[shrinking if name == "scores" else 1.0 for name in products],
+                    sliced=sliced)):
                 # A sub-chunk's operands staged and published once (`Family.staged_together`), its products
                 # issued then, running under the next sub-chunk's forming.
                 with family.staged_together():
                     found = formed()
-                accumulators = tuple(issuer.summed([product], into=acc)
-                                     for product, acc in zip(found, accumulators, strict=True))
-            return carry, accumulators
+                # A sliced walk's sums a row set and sub-chunk's (`_sum_index`), else a row set's.
+                for r, pair in enumerate(found):
+                    at = _sum_index(call, r, j)
+                    summed[at] = issuer.summed([pair], into=summed[at])
+            return carry, tuple(summed)
 
         def read(carry, totals):
             """The sums once the walk is done, the system masked once (a row whose write gate overflows
-            times a zero factor is a NaN there, which its strict mask clears), and stored."""
+            times a zero factor is a NaN there, which its strict mask clears), and stored: a sliced walk's a
+            sub-chunk's rows at a time, its first sub-chunk's zero (no keys before it)."""
             del carry
-            masked = tuple(algebra.strictly_lower(total) if name == "system" else total * growing
-                           for name, total in zip(products, totals, strict=True))
-            intra_sums_stored(call, products, masked, sums, landing, row=row, head=h)
+            if not sliced:
+                masked = tuple(algebra.strictly_lower(total) if name == "system" else total * growing
+                               for name, total in zip(products, totals, strict=True))
+                intra_sums_stored(call, products, masked, sums, landing, row=row, head=h)
+                return
+            for r, name in enumerate(products):
+                blocks = [family.zeros((algebra.SUB, chunk))]
+                for j in range(_later(call)):
+                    total = totals[_sum_index(call, r, j)]
+                    blocks.append(algebra.columns_before(total, (j + 1) * algebra.SUB) if name == "system"
+                                  else total * growing)
+                for j, block in enumerate(blocks):
+                    intra_block_stored(call, name, block, sums[r], landing, row=row + j * algebra.SUB, head=h)
 
+        held_sums = (((algebra.SUB, chunk),) * (outputs * _later(call)) if sliced
+                     else ((chunk, chunk),) * outputs)
         return mosaic.Walk(views, step, steps=steps, prologue=lambda: _scan_zeroed(call, scanned, keys),
-                           sums=((chunk, chunk),) * outputs, read=read)
+                           sums=held_sums, read=read)
 
     blocks = _intra_streamed(call, keys, queries=scored)
     formed = [dataclasses.replace(call.held, rows=call.rows) if name == "scores" else systems(call)
               for name in products]
     out_type = (*(form.shape(call.heads * chunk) for form in formed),
                 *((gates.shape(call.heads * width),) * 2 if scored else ()))
-    # Each output's products a whole chunk of rows against a whole chunk of keys, the model's own pairs'.
-    model = outputs * 2 * chunk * chunk * width
+    # Each output's products a whole chunk of rows against a whole chunk of keys, the model's own pairs' (a
+    # sliced walk's a sub-chunk's rows a later sub-chunk).
+    model = outputs * 2 * (_later(call) * algebra.SUB if sliced else chunk) * chunk * width
     staging, landing = _intra_staged(call, keys, products=products)
     # Its rings as deep as its residency holds them (`resources.plan`): one deep, a B200's Kimi Linear walk
     # waited on each key block's loads at two programs a multiprocessor, 24.5% of its warps active and
@@ -325,7 +385,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                          live=chunk_liveness(4), steps=steps, model=model,
                          held=_intra_held(call, keys, outputs), staging=staging, landing=landing,
                          name=_named("recurrence_intra", products),
-                         sums=(chunk,) * outputs,
+                         sums=(chunk,) * (outputs * (_later(call) if sliced else 1)),
                          # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
                          swizzles={name: resources.widest_swizzle(dtype, keys)
                                    for name, (_, dtype) in blocks.items()})(q, k, g, beta, taken)
@@ -354,13 +414,16 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     many zero rows (`algebra.scanned_prefix`'s shifts); and the stores' landings: the scores' square and a
     block of each prefix half where it forms the scores (`walk_stores`), the system's where it forms the
     system."""
-    chunk = call.chunk
-    landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(chunk, chunk),
+    chunk, later = call.chunk, _later(call)
+    # A sliced walk's stores a sub-chunk's rows at a time (`intra_block_stored`).
+    stored = algebra.SUB if _sliced(call) else chunk
+    landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(stored, chunk),
                    **{f"prefix{i}": call.gates.landing(chunk, keys) for i in (0, 1)}}
                   if "scores" in products else {}),
-               **({"system": systems(call).landing(chunk, chunk)} if "system" in products else {})}
-    later = chunk // algebra.SUB - 1
-    lefts = tuple(staging_tiles(_pairing_operand(call), *((chunk, keys),) * later) for _ in products)
+               **({"system": systems(call).landing(stored, chunk)} if "system" in products else {})}
+    # A sliced walk's rows staged once for every sub-chunk (`algebra.key_block_pairs`' `sliced`).
+    lefts = tuple(staging_tiles(_pairing_operand(call), *((chunk, keys),) * (1 if _sliced(call) else later))
+                  for _ in products)
     raised = staging_tiles(_pairing_operand(call), *((chunk, keys),) * later)
     # Read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain.
     # Unpadded: a tile read in the accumulator's layout takes a row stride a whole number of its tiling's

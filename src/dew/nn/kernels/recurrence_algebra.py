@@ -382,6 +382,8 @@ class Tile(Protocol):
 
     def value(self) -> jax.Array: ...
 
+    def rows(self, start, count: int) -> "Tile": ...
+
 
 Load = Callable[..., jax.Array] | Callable[..., Tile]
 """A tile read where it is used: `load(i, c)` sub-chunk `i`'s column block `c`, or `load(c)` a chunk's; the
@@ -672,8 +674,9 @@ def gated_up(prefix: tuple, reference: tuple, index: jax.Array, place) -> jax.Ar
 
 
 def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, prefix: tuple,
-                    at: Callable[[int], tuple], staged: Callable[[jax.Array, int, int | None], Tile], *,
-                    chunk: int, scales: Sequence[float], sub: int = SUB) -> list[Callable[[], list[tuple]]]:
+                    at: Callable[[int], tuple], staged: Callable[[jax.Array, int | None, int | None], Tile],
+                    *, chunk: int, scales: Sequence[float], sub: int = SUB,
+                    sliced: bool = False) -> list[Callable[[], list[tuple]]]:
     """A chunk's pairs under a decay a key dimension, one key block's, as the products whose sum they are, a
     sub-chunk at a time: for each sub-chunk past the first a callable forming its products, one `(name, lhs,
     rhs)` ('pairs') for each of `rows` (each forming its row when called: the queries, the write-gated keys;
@@ -700,16 +703,28 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
     and 355 (M-JS-24). A sub-chunk's own pairs factored too, the queries and keys decay-scaled around its
     first token and taken on the tensor cores, put a packed document's first token's output, a row of 2.5e-5
     where `q . k` cancels, at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay
-    (row 5194, M-JS-48w)."""
+    (row 5194, M-JS-48w).
+
+    `sliced`, an issuer whose products take `sub` rows (mma.sync's): each row set's gated rows staged once
+    (`staged(value, None, r)`) and each sub-chunk's product its `sub` rows of them alone against the same
+    keys, `[sub, C]` a row set and sub-chunk, its rows of the chunk's pairs (fla_kda's inter-sub-chunk blocks,
+    a sub-chunk's row of them a product): a quarter of the rows' products and staging, where a whole chunk of
+    rows masked to a sub-chunk's took 3.7 times fla's inter-sub-chunk launch on an A100's mma.sync (1508 us
+    against chunk_kda_fwd_kernel_inter_solve_fused's 356, M-JS-144-a100)."""
     index, _ = _grid(prefix[0].shape)
     blocks = chunk // sub
     # Every row gated down to its own sub-chunk's first token.
     down = decay(prefix, _laid_references(lambda s: at(s * sub), index, chunk, sub))
     # Scaled once gated down, so a large row its decay attenuates stays finite.
     gated = [row() * down * scale for row, scale in zip(rows, scales, strict=True)]
+    whole: list[Tile] = []
 
     def formed(s: int) -> list[tuple]:
         raised = staged(keys * gated_up(prefix, at(s * sub), index, s * sub), s, None).T
+        if sliced:
+            # The gated rows staged with the first sub-chunk's keys, read a sub-chunk's rows at a time.
+            whole.extend(staged(value, None, r) for r, value in enumerate(gated) if s == 1)
+            return [("pairs", tile.rows(s * sub, sub), raised) for tile in whole]
         mine = (index >= s * sub) & (index < (s + 1) * sub)
         return [("pairs", staged(jnp.where(mine, value, 0.0), s, r), raised) for r, value in enumerate(gated)]
 
@@ -812,6 +827,13 @@ def write_gated(tile: jax.Array, strengths: jax.Array) -> jax.Array:
     its `k k^T`, `v * beta` before its `A v`), gated on the operand, which scaling after the product is not
     at finite precision (kernel-templates.md §3)."""
     return tile * strengths[:, None]
+
+
+def columns_before(found: jax.Array, start: int) -> jax.Array:
+    """A sub-chunk's row block of a system's pairs `found` `[SUB, C]` (`key_block_pairs`' `sliced`, rows
+    from `start` on) below the chunk's diagonal: its columns before `start`, zero from it on, as
+    `strictly_lower` keeps them."""
+    return jnp.where(_grid(found.shape)[1] < start, found, 0.0)
 
 
 def strictly_lower(found: jax.Array) -> jax.Array:
