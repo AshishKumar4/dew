@@ -823,6 +823,7 @@ def _powered_in_kernel(family: mosaic.Family, dtype, hooks: Hooks, *, parts: int
     return (jnp.dtype(dtype).itemsize == 2 and family.fixes_up
             and not family.places_on_role and query_swizzle(family) is not None)
 
+
 def folded_form(form: str, keys: int, *, ids: bool, dtype, width: int, scale: float | None, natural: bool,
                 score_mod, subtracted: bool, **fields) -> tuple[algebra.Forward, float]:
     """A forward's form (`algebra.Forward`, `fields` its others) at the scale its launch takes, and the power

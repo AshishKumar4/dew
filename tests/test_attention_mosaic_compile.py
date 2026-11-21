@@ -1674,6 +1674,7 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
         found = compile_mosaic_kernels(cases, "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
+
 @COMPILES_ON_CPU
 def test_sm90_d256_forward_fits_single_launch_without_spills():
     """Row 5272: chunking wide (>128) register epilogues lets d256 bf16 causal forward (inference and
