@@ -110,7 +110,8 @@ def _intra_solve(system, taken, call: Call):
         system, taken)
 
 
-@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_intra_system"))
+@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_intra_system",
+                          "recurrence_prefix_halves"))
 def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     """`(Aqk [R, HV * C], A [R, HV * C] where the call `solves`, hi, lo [R, HV * Dk])` of each chunk and value
     head under a decay a key dimension, one launch (`_intra_walk`): the scores as `call.held`, the keys'
