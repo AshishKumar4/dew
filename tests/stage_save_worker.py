@@ -39,6 +39,7 @@ def mode_stage_save(args) -> dict:
                                                for rank in range(jax.process_count())), strict=True)
               for device in pair]
     mesh = MeshSpec(fsdp=2, stage=2)
+    staged_values, refused = _handled(mesh.build(paired), args.run_dir)
     persistent = Checkpoints(str(args.run_dir))
 
     def run(steps: int, *, local: bool = True, resume: str = "require") -> tuple[int, int | None]:
@@ -54,7 +55,44 @@ def mode_stage_save(args) -> dict:
     # Step 1 on the local tier alone (the persistent tier holds none), resumed from it to step 2, which the
     # persistent tier holds; then that resumed from the persistent tier alone to step 3, which it does not.
     steps = [run(1, resume="never"), run(2), run(3, local=False)]
-    return {"process_index": jax.process_index(), "finite": read, "steps": steps}
+    return {"process_index": jax.process_index(), "finite": read, "steps": steps, "handled": staged_values,
+            "refused": refused}
+
+
+def _handled(mesh, directory) -> tuple[dict, bool]:
+    """A scalar on one stage's devices and a vector on the other's, written by Dew's handler on the
+    persistent tier and read back: each process's view of what it holds of them, which a process outside
+    a stage holds nothing of; and whether a pmap's output, on each process's own devices under one name,
+    is refused (row 10780)."""
+    import jax
+    import numpy as np
+    import orbax.checkpoint as ocp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.checkpoints import _handler
+    from dew.training.stages import stage_mesh
+
+    placed = {"scalar": NamedSharding(stage_mesh(mesh, 1), P()),
+              "vector": NamedSharding(stage_mesh(mesh, 0), P())}
+    values = {"scalar": np.float32(3.5), "vector": np.arange(4, dtype=np.float32)}
+    arrays = {name: jax.make_array_from_callback(np.shape(values[name]), placed[name],
+                                                 lambda index, name=name: np.asarray(values[name])[index])
+              for name in values}
+    with ocp.Checkpointer(_handler()) as checkpointer:
+        checkpointer.save(f"{directory}/handled", arrays)
+        restored = checkpointer.restore(f"{directory}/handled", restore_args={
+            "scalar": ocp.ArrayRestoreArgs(sharding=placed["scalar"], dtype=np.float32, global_shape=()),
+            "vector": ocp.ArrayRestoreArgs(sharding=placed["vector"])})
+    held = {name: [np.asarray(shard.data).tolist() for shard in restored[name].addressable_shards][:1]
+            for name in restored}
+    local = jax.pmap(lambda x: x * (jax.process_index() + 1))(np.ones((jax.local_device_count(), 2)))
+    try:
+        with ocp.Checkpointer(_handler()) as checkpointer:
+            checkpointer.save(f"{directory}/pmapped", {"local": local})
+        refused = False
+    except ValueError:
+        refused = True
+    return {name: {"shape": list(restored[name].shape), "held": held[name]} for name in held}, refused
 
 
 MODES = {"stage_save": mode_stage_save}

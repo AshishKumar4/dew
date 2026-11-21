@@ -239,3 +239,15 @@ def batch_axes(mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh) -> tuple[str
 __all__ = ["BATCH_AXES", "DATA_AXIS", "DEFAULT_RULES", "DILOCO_AXIS", "EXPERT_AXIS", "FSDP_AXIS", "MESH_AXES",
            "SEQUENCE_AXIS", "STAGE_AXIS", "TENSOR_AXIS", "LayoutRefused", "LogicalAxes", "LogicalAxisRules",
            "MeshAxes", "axis_rules", "batch_axes", "logical_spec", "mesh_axes", "row_axes"]
+
+
+HELD_APART: set[jax.sharding.Mesh] = set()
+"""The meshes whose arrays a checkpoint holds on part of a pool (`held_apart`, `dew.checkpoints.submesh`)."""
+
+
+def held_apart(mesh: jax.sharding.Mesh) -> jax.sharding.Mesh:
+    """`mesh`, a pipeline stage's (`dew.training.stages.stage_mesh`), named one whose arrays a checkpoint
+    holds on part of the pool, as every process names it; any other array on part of a pool is refused as
+    Orbax refuses a `pmap`'s host-local one."""
+    HELD_APART.add(mesh)
+    return mesh

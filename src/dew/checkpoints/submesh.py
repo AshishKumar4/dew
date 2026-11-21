@@ -7,10 +7,11 @@ without the dtype a process that holds none of it must state (`serialization._re
 each array on a strict part of the pool (`apart`) is written by the processes that hold its shards, its
 metadata by the first of them, the others writing nothing of it, and read back by them, the others making it
 with no shard; every other array is Orbax's own. The files are Orbax's: each such row its own array, read by
-any topology as the stages wrote it (docs/design/training.md, checkpoints). Only an array a mesh places
-(`NamedSharding`) is written so: a `pmap`'s host-local array, or one put on a single device, on each
-process's own devices under one name, is still refused, as Orbax refuses it, with no round between the
-processes (a local tier's saves are each process's own)."""
+any topology as the stages wrote it (docs/design/training.md, checkpoints). Only an array on a stage's mesh
+(`dew.mesh.held_apart`, which `dew.training.stages.stage_mesh` names of every mesh it makes, alike on every
+process) is written so; any other array on part of the pool, a `pmap`'s host-local output on each
+process's own devices under one name above all, is still refused as Orbax refuses it, with no round
+between the processes (a local tier's saves are each process's own)."""
 
 from __future__ import annotations
 
@@ -22,6 +23,8 @@ import orbax.checkpoint as ocp
 from orbax.checkpoint._src.futures import future
 from orbax.checkpoint._src.path import async_path
 from orbax.checkpoint._src.serialization import jax_array_handlers as handlers, replica_slices
+
+from dew.mesh import HELD_APART
 
 
 def apart(value) -> bool:
@@ -47,9 +50,9 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
         parted: list[int] = []
         whole: list[int] = []
         for index, value in enumerate(values):
-            # A mesh's array alone: a pmap's or a single device's, Orbax's own refusal (module docstring).
+            # A stage's array alone: any other's on part of the pool, Orbax's own refusal (module docstring).
             (parted if apart(value) and isinstance(value.sharding, jax.sharding.NamedSharding)
-             else whole).append(index)
+             and value.sharding.mesh in HELD_APART else whole).append(index)
         futures = [] if not whole else list(await super().serialize(
             [values[index] for index in whole], [infos[index] for index in whole],
             [args[index] for index in whole]))

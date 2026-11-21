@@ -56,7 +56,7 @@ import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.algebra.terms import parameter_key, parameters_key
-from dew.mesh import STAGE_AXIS, LayoutRefused
+from dew.mesh import STAGE_AXIS, LayoutRefused, held_apart
 from dew.nn import programs
 from dew.nn.kernels.options import owned_program, program
 from dew.nn.kernels.templates.layout import entrywise
@@ -106,8 +106,9 @@ def stage_mesh(mesh: Mesh, stage: int) -> Mesh:
     one stage's, whole."""
     if STAGE_AXIS not in mesh.axis_names:
         return mesh
-    return Mesh(np.take(mesh.devices, [stage], axis=mesh.axis_names.index(STAGE_AXIS)), mesh.axis_names,
-                axis_types=mesh.axis_types)
+    # A checkpoint holds a stage's rows on its own devices, on part of a pool (`held_apart`).
+    return held_apart(Mesh(np.take(mesh.devices, [stage], axis=mesh.axis_names.index(STAGE_AXIS)),
+                           mesh.axis_names, axis_types=mesh.axis_types))
 
 
 def _layer_rows(path, leaf: jax.Array, shape: tuple[int, ...]) -> list[jax.Array]:
