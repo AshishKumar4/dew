@@ -149,9 +149,11 @@ def _launch_programs(kernel) -> int:
     return math.prod(kernel.params["grid_mapping"].grid)
 
 
-def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget) -> float:
-    """A launch's seconds on `target`: the longer of one program on a multiprocessor (`cost.walked`, plus
-    launch latency) and the whole launch across the device (`cost.seconds`), no constant (row 6710)."""
+def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget, *,
+                    resident: int = 1) -> float:
+    """A launch's seconds on `target`: the longer of its quantized waves (`ceil(programs / (SMs * resident))`
+    times one program's `cost.walked`, plus launch latency) and the whole launch across the device
+    (`cost.seconds`), no constant (rows 6216, 6710)."""
     count = max(programs, 1)
     per_program = dataclasses.replace(
         work,
@@ -165,9 +167,10 @@ def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget
         fp8_flops=work.fp8_flops / count,
         kernels=0,
     )
-    return max(cost.walked(per_program, target) + (target.launch_seconds or 0.0),
+    processors = target.multiprocessors or 1
+    waves = math.ceil(count / (processors * max(resident, 1)))
+    return max(waves * cost.walked(per_program, target) + (target.launch_seconds or 0.0),
                cost.seconds(work, target))
-
 
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
@@ -867,13 +870,13 @@ class MosaicForward(_Mainloop[Tiles]):
         if not kernels:
             return None
         total = 0.0
+        resident = self.resident(ba, config, target)
         for kernel in kernels:
             work = emission.work_of(kernel)
             if work is None:
                 return None
-            total += _launch_seconds(work, _launch_programs(kernel), target)
+            total += _launch_seconds(work, _launch_programs(kernel), target, resident=resident)
         return total
-
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget) -> Tiles:
         """Pick the fastest consumer count among `candidates` from `emission.work_of` and `cost.walked` /
@@ -1528,10 +1531,9 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     if hooks.score_mod is None and hooks.score_params:
         hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
-    parts = product.EXACT_PARTS if fp32 else 1
+    parts = algebra.bf16_part_count(accurate=True) if fp32 else 1
     if hooks.query_mod is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
-        # its parts, and a padded width's rows hold zeros past it (a norm over them is another norm); XLA's
         # program before the launch takes it.
         query = prologued(query, hooks.query_mod, hooks.query_params)
         hooks = dataclasses.replace(hooks, query_mod=None, query_params=())

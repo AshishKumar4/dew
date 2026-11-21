@@ -582,3 +582,43 @@ def test_a_finished_split_merge_ungroups_and_casts_in_one_launch():
         work_fin = merged.launch_work(spec, p_s, s_s, queries, width, target,
                                       out_dtype=jnp.bfloat16, out_heads=out_heads)
     assert work_fin.kernels == 1 and work_fin.device_bytes < work_plain.device_bytes
+
+
+def test_a_finished_split_merge_preserves_subnormal_initial_mass():
+    """When key slices are empty and `initial` carries subnormal mass (`2^-127`, row 10778), both
+    `merged.merged_finished` (`_value`) and the Pallas merge kernel (`_launch`) preserve the merge law's
+    normalized output `1.0` instead of flushing `state.total > 0` to `0.0`, while truly empty rows stay
+    `0.0`."""
+    batch, slices, rows, kv_heads, width, queries, out_heads = 1, 2, 4, 1, 16, 2, 2
+    spec = algebra.finished_form(algebra.Forward(form="full", ids=False, keys=16, scale=1.0))
+    padded = jnp.zeros((batch, slices, rows, kv_heads, width), jnp.float32)
+    maxima = jnp.full((batch, kv_heads, slices, rows), -jnp.inf, jnp.float32)
+    totals = jnp.zeros((batch, kv_heads, slices, rows), jnp.float32)
+    stacked = jnp.stack([maxima, totals])
+    sub = jnp.float32(2.0 ** -127)
+    init_m = jnp.zeros((batch, kv_heads, queries), jnp.float32)
+    init_t = jnp.array([[[sub, 0.0]]], jnp.float32)
+    init_acc = jnp.stack([jnp.full((batch, kv_heads, width), sub, jnp.float32),
+                          jnp.zeros((batch, kv_heads, width), jnp.float32)], axis=2)
+    initial = template.Initial(init_m, init_t, init_acc)
+
+    got = jax.jit(lambda p, s, i: merged.merged_finished(
+        spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+        initial=i))(padded, stacked, initial)
+    expected = np.concatenate([np.ones((1, 1, 1, width), dtype=np.float32),
+                               np.zeros((1, 1, 1, width), dtype=np.float32)], axis=2)
+    np.testing.assert_array_equal(np.asarray(got, dtype=np.float32), expected)
+
+    traced = jax.make_jaxpr(lambda p, s, im, it, ia: merged._launch(
+        p, s, im, it, ia, units=algebra.units_of(spec), queries=queries, width=width, block=width,
+        out_dtype=jnp.bfloat16, out_heads=out_heads))(padded, stacked, init_m, init_t, init_acc)
+    from dew.nn import programs
+
+    (call_eqn,) = [eqn for eqn in programs.equations(traced.jaxpr) if eqn.primitive.name == "pallas_call"]
+    body = call_eqn.params["jaxpr"]
+    producers = {outvar: eqn for eqn in body.eqns for outvar in eqn.outvars}
+    (store,) = [eqn for eqn in body.eqns if eqn.primitive.name == "swap"]
+    cast = producers[store.invars[1]]
+    assert cast.primitive.name == "convert_element_type", cast
+    value_eqn = producers.get(cast.invars[0])
+    assert value_eqn is None or value_eqn.primitive.name != "select_n", value_eqn

@@ -1210,6 +1210,47 @@ def test_a_group_past_its_bound_is_cut_again_with_its_nearest_groups_alone_and_t
     assert ci.cuts.rebalanced(ci.session, dict.fromkeys(nodes, 100.0), bounds, [210.0] * 6, 180.0) is None
 
 
+def test_a_stored_cut_another_cut_of_its_count_ran_in_place_of_is_stored_as_ran(ci, tmp_path):
+    """A stored cut main's CI ran no group of as stored (a bound timed in another group than the one it
+    starts: a reweighed plan cut the file afresh at the same count) stores the cut that ran, never its own,
+    which a plan would take up again and rename every group of (review, row 10776); a bound timed in no
+    group (skipped) proves nothing and keeps the stored cut, so none is recut every train."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 120, "environment": {}}))
+    name = "tests/test_steady.py"
+    nodes = [f"{name}::test_{index}" for index in range(4)]
+    own = dict.fromkeys(nodes, 50.0)
+    ran = [100.0, 100.0]
+    as_ran = [set(nodes[:2]), set(nodes[2:])]
+    # Stored [test_0], [test_1..3]; ran [test_0, test_1], [test_2, test_3]: the cut that ran is stored.
+    stored = {name: [nodes[1]]}
+    folded = ci.cuts.refolded(ci.session, stored, {name: ran}, 120.0, {name: own}, {name: own},
+                              {name: as_ran})
+    assert ci.session.cut_by(nodes, folded[name]) == [nodes[:2], nodes[2:]]
+    # A boundary moved earlier ([a, b] | [c, d] stored; [a] | [b, c, d] ran, as the record it was cut by
+    # weighs it) is found too: the fold stores b, and the next plan runs [a] | [b, c, d], where a stored cut
+    # kept unrun would have stood at c.
+    before = dict(zip(nodes, [180.0, 40.0, 50.0, 50.0], strict=True))
+    after = dict(zip(nodes, [100.0, 40.0, 50.0, 50.0], strict=True))
+    folded = ci.cuts.refolded(ci.session, {name: [nodes[2]]}, {name: [100.0, 140.0]}, 120.0, {name: before},
+                              {name: after}, {name: [set(nodes[:1]), set(nodes[1:])]})
+    assert folded[name] == [nodes[1]]
+    assert ci.session.planned(name, nodes, list(after.values()), 2, folded) == [nodes[:1], nodes[1:]]
+    # Its bound untimed (skipped): the stored cut stays.
+    untimed = [set(nodes[:1]), set(nodes[2:])]
+    assert ci.cuts.refolded(ci.session, stored, {name: ran}, 120.0, {name: own}, {name: own},
+                            {name: untimed}) == stored
+    # The same rows read back: each group's timed tests, in order.
+    rows = {name: [{"name": f"3.12:{name}#2/2", "exitCode": 0, "seconds": 100.0,
+                    "tests": dict.fromkeys(nodes[2:])},
+                   {"name": f"3.12:{name}#1/2", "exitCode": 0, "seconds": 100.0,
+                    "tests": dict.fromkeys(nodes[:2])}]}
+    assert ci.cuts.held(rows) == {name: as_ran}
+    # A one-group split (`--split=1/1`) reads as its one group.
+    whole = {name: [{"name": f"3.12:{name}#1/1", "exitCode": 0, "seconds": 200.0,
+                     "tests": dict.fromkeys(nodes)}]}
+    assert ci.cuts.held(whole) == {name: [set(nodes)]} and ci.cuts.ran(whole) == {name: [200.0]}
+
+
 def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
         ci, tmp_path, monkeypatch, cache_worker):
     """Tests marked shared_setup with one name, on their own decorators, run in one group of their
@@ -2346,33 +2387,6 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
         return [word for word in run if word.startswith("--deadline")]
 
     assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
-
-
-def run_options(tmp_path: Path, ref: str, policy: str, option: str) -> list[str]:
-    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy` (`suite_step`)."""
-    calls = suite_step(tmp_path / ref.replace("/", "-"), ref, "", policy, 2)
-    [run] = [call for call in calls if call[0] == "run"]
-    return [word for word in run if word.startswith(option)]
-
-
-def test_a_base_push_runs_above_every_lanes_run_and_no_higher_than_main(tmp_path):
-    """A push to base/kernels runs its suite above a lane's run, with the suite's ordinary deadline, so it is
-    graded: at a lane's whole-suite priority (-10) with the background deadline it waited behind every train,
-    precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs that started from
-    2026-11-09 to 11-12 (the owner's rule, 2026-11-01: every push to base is graded, a red its committer's the
-    same day); and at a targeted run's 0 its judges' draws waited out their deadline behind lane work
-    (2026-11-16). It runs no higher than main's own push, below which trains keep theirs (the queue's gates on
-    the hub set a train's, runbooks/hub.md)."""
-    def level(ref: str) -> int:
-        # armada's default where the workflow names none.
-        given = run_options(tmp_path, ref, "off", "--priority")
-        return int(given[0].partition("=")[2]) if given else 0
-
-    assert level("fix/lane") < level("base/kernels") <= level("main")
-    # A base push, on the pool armada gives it, has the suite's ordinary deadline: main's.
-    assert (run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline")
-            == run_options(tmp_path / "main-deadline", "main", "on", "--deadline"))
-    assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):

@@ -1574,3 +1574,29 @@ def test_an_a100_d128_and_d256_forward_use_whole_row_warps_and_high_residency():
             KernelCase("sm80-d256-64x64-c128", lambda: op256.lowering(ba256, cfg256)),
         ], "sm80")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_launch_seconds_prices_wave_quantization_and_residency():
+    """`_launch_seconds` prices quantized waves (`ceil(programs / (SMs * resident))`) so a config spilling
+    into a second sparse wave on Hopper (176 programs at 1 resident on 132 SMs) is priced slower than a
+    single full wave at 2 resident (256 programs on 132*2=264 slots, row 6216)."""
+    from dew.nn.kernels.templates import cost
+
+    target = generation.gpu_target("sm90")
+    work = cost.Work(flops=1e11, operations=1e9, exponentials=1e8, device_bytes=1e7, shared_bytes=1e7)
+    two_waves = attention_mosaic._launch_seconds(work, 176, target, resident=1)
+    one_wave = attention_mosaic._launch_seconds(work, 256, target, resident=2)
+    assert one_wave < two_waves, (one_wave, two_waves)
+
+
+def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
+    """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) and default 16-bit dot preset
+    (`_jax_nn_algorithm`) through `dew.algebra.error.product_precision` (row 5473)."""
+    from dew.nn import attention
+    from dew.nn.kernels.templates import attention_algebra as algebra
+
+    with generation.assumed("sm90"):
+        assert algebra.bf16_part_count(accurate=True) == 3
+        assert algebra.bf16_part_count(accurate=False) == 1
+        assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+        assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32

@@ -172,10 +172,10 @@ seams: "grouped-cells": {
 		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560)))": "the template's kernel gradient of the 4B's 9216 x 2560 on a GH200 (M-EM-36-gh200, 0.975x)"
 		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024)))": "the template's kernel gradient of the 4B's 2560 x 1024 on a GH200 (M-EM-36-gh200, 0.973x)"
 		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64)))": "the template's kernel gradient of the 4B's 2560 x 64 on a GH200 (M-EM-36-gh200, 0.376x)"
-		"(tcgen05, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64)))": "XLA's forward of the 4B's 2560 x 64 on a B200 (lab-b200-20261113-grid, 1.216x)"
+		"(tcgen05, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64)))": "XLA's forward of the 4B's 2560 x 64 on a B200 (the B200 grid, 1.216x)"
 		"(tcgen05, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216)))": "XLA's input gradient of the 4B's 2560 x 9216 on a B200 (em35d, 1.009x)"
-		"(tcgen05, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216)))": "XLA's kernel gradient of the 4B's 2560 x 9216 on a B200 (lab-b200-20261113-grid, 1.355x)"
-		"(tcgen05, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024)))": "XLA's kernel gradient of the 4B's 2560 x 1024 on a B200 (lab-b200-20261113-grid, 1.148x)"
+		"(tcgen05, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216)))": "XLA's kernel gradient of the 4B's 2560 x 9216 on a B200 (the B200 grid, 1.355x)"
+		"(tcgen05, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024)))": "XLA's kernel gradient of the 4B's 2560 x 1024 on a B200 (the B200 grid, 1.148x)"
 	}
 }
 

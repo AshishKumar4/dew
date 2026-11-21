@@ -180,8 +180,7 @@ class _Locality(Protocol):
 
 def _dropping(pipeline: Pipeline, lowering: _Lowering) -> bool:
     """Whether a read can drop records before its batch: a step that drops or expands records, a
-    Grain step of the caller's, or a cache read as each input's outputs, in it or in a corpus it
-    mixes."""
+    Grain step of the caller's, or a cache read as each input's outputs, in it or in a corpus it mixes."""
     if lowering.cache is not None and not lowering.one_to_one and not _transparent(pipeline, lowering.cache):
         # A transparent cache drops what the steps it stands for drop, which the stages below count.
         return True
@@ -209,8 +208,7 @@ def _streamed_take(pipeline: Pipeline, read: str) -> bool:
 
 def _shared_pool(pool: int, members: int, index: int) -> int:
     """The loading workers the `index`th of `members` corpora reads in, of a mixture's `pool`: an
-    equal share, the first ones taking what is left over; one given none reads in the reading
-    process."""
+    equal share, the first ones taking what is left over; one given none reads in the reading process."""
     return pool // members + int(index < pool % members)
 
 
@@ -640,8 +638,7 @@ class _Prefix:
 class _ShardSteps:
     """A shard reader that runs the record steps written before an interleave
     inside each shard, after flattening a cache's outputs, so the interleave
-    flattens the shards where it stands. Rejected rows stay marked for the
-    accepting reader after it."""
+    flattens the shards where it stands. Rejected rows stay marked for the accepting reader after it."""
 
     reader: ShardOpener
     stages: tuple[Map | MapWithIndex | Filter | FlatMap, ...]
@@ -754,6 +751,13 @@ class _GroupedRows(_WrappingDataset):
         self._groups, self._size, self._held = groups, size, max(2, held)
         self._made: collections.OrderedDict[int, concurrent.futures.Future] = collections.OrderedDict()
         self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict:
+        # Its grouping alone pickles to a worker (`mp_prefetch`), each making its groups and lock (row 10781).
+        return {name: value for name, value in self.__dict__.items() if name not in ("_made", "_lock")}
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state, _made=collections.OrderedDict(), _lock=threading.Lock())
 
     def __len__(self) -> int:
         return len(self._parent)
@@ -1596,8 +1600,7 @@ class _Build:
         Without a cache the root is dense: an order batched by index needs a
         record at every position. A source held in memory may hold missing
         records (None), so its root is the records it holds, each keeping its
-        source position (`_Present`); a cache rejects a missing record as it
-        reads it (`_CachedOutputs`)."""
+        source position (`_Present`); a cache rejects a missing record as it reads it (`_CachedOutputs`)."""
         records = source.records(self.read)
         stored = pygrain.MapDataset.source(records)
         cache = self.lowering.cache
@@ -1988,8 +1991,7 @@ class _Build:
         it goes by in the mixture that reads it (`corpus`'s last), or, read outside any, its name's where it
         was given one (`named`), so corpora of one length shuffled by one seed read in orders of their own,
         and a named corpus reads one order whichever others a mixture holds, however deep, and alone, as a
-        later phase continues it (row 3840); an unnamed chain read outside any mixture, by its seed
-        alone."""
+        later phase continues it (row 3840); an unnamed chain read outside any mixture, by its seed alone."""
         key = self.corpus[-1] if self.corpus else self.named
         if key is None:
             return stage

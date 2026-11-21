@@ -4,7 +4,6 @@ forward's statistics (`_scores`)."""
 
 import dataclasses
 import functools
-from collections.abc import Callable
 
 import jax
 from jax import lax
@@ -142,18 +141,21 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
                         at=at)
                  for index, (ref, kind, kept) in enumerate(laid))
 
+def _read(value):
+    """Resolve a deferred reader (`functools.partial`), or return an eager value unchanged."""
+    return value() if isinstance(value, functools.partial) else value
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
-                 coords: algebra.Coords | Callable[[], algebra.Coords], whole,
+                 coords: algebra.Coords | functools.partial[algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
                  ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
-    (`_fused_step`'s, `_coop_step`'s): its
-    logits from the query slot taken by its power in registers (`_Backward.scaled`) against the resident
-    keys (`resident`, `[bk, D]` and `[bk, Dv]` refs, a consumer's share of them where keys are shared), dP
-    from the output-cotangent slot against the values, then `_scores` under the tile's queries' statistics
-    `rows` (read before its products, which their loads run under: ET-A05AB5/6-h100, 2.05 against 2.32 ms
-    read past them at Qwen3-8B causal) and `coords`, masked where `masked`, or where it is None chosen at run
-    time, unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
+    (`_fused_step`'s, `_coop_step`'s): its logits from the query slot taken by its power in registers
+    (`_Backward.scaled`) against the resident keys (`resident`, `[bk, D]` and `[bk, Dv]` refs, a consumer's
+    share of them where keys are shared), dP from the output-cotangent slot against the values, then `_scores`
+    under the tile's queries' statistics `rows` and `coords` (read before products on shared-memory-operand
+    families so loads overlap wgmma, ET-A05AB5/6-h100, and after products on `operands_in_registers` families
+    so they do not spill at the S/dP peak), masked where `masked`, or where it is None chosen at run time,
+    unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
     (`algebra.value_weights`), a dropping call's dropped (`algebra.drawn`), and its score cotangents through
     the hook (`gradient.pulled`), one part in the operands' dtype (dK's and dQ's); with `whole_operands`
     (fp16's, `algebra.running_parts`), both fp32: the normalized weights, dropped, and the scaled
@@ -161,12 +163,15 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
+    if not family.operands_in_registers:
+        rows = tuple(_read(row) for row in rows)
+        coords = _read(coords)
     if walk.scaled:
         s = family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
         dp = family.product(do_slot, values_t, shape)
     else:
         s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
-    tile_coords = coords() if callable(coords) else coords
+    tile_coords = _read(coords)
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
         exponentials, weights, cotangents, slopes, seen = _scores(walk, tile_coords, (), s, dp, *rows,
@@ -203,21 +208,18 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     # Each query's statistics along a keys-first tile's query axis (`algebra.Coords.queries`); a queries-first
     # tile's the algebra broadcasts at each use, so no broadcast tile stays live across the step (a fused
     # launch at 128 x 64 and width 64 spilled 60 bytes holding them).
-    def read(x) -> jax.Array:
-        return x() if isinstance(x, functools.partial) else x
-
     def per_query(x):
-        return coords.queries(read(x), s) if coords.keys_first else read(x)
+        return coords.queries(_read(x), s) if coords.keys_first else _read(x)
 
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     # A dropping anchor's centre can survive where its tile's product rounds to zero before the
     # multiplier joins it. Take its self-difference as 0, as the accurate form does. The undropped
     # fast form keeps FlashAttention 3's math (the select took 10.8% of fused dK/dV's instructions).
     anchored = walk.accurate or multiplier is not None
-    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if anchored else None
+    at_anchor = coords.k_pos == coords.queries(_read(chosen), coords.k_pos) if anchored else None
     # The tile's weights and cotangents the derived forms' (`derived_cotangents`).
-    tiles = {"logits": logits, "products": dp, "peak": read(peak), "total": read(total),
-             "anchor": read(anchor), "delta": read(delta)}
+    tiles = {"logits": logits, "products": dp, "peak": _read(peak), "total": _read(total),
+             "anchor": _read(anchor), "delta": _read(delta)}
     if multiplier is not None:
         tiles["keep"] = multiplier
     if seen is not None:

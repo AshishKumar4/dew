@@ -598,12 +598,16 @@ class GemmCase(NamedTuple):
     tile: Any
     consumers: int | None
     case: support.KernelCase
+    shape: str = ""
+    """Its projection (`GEMM_SHAPES`): two projections at one tile are two kernels, as a call leaving an axis
+    partial copies its blocks otherwise (`mosaic_gpu.partial_runs`) and one padded is compiled at its padded
+    extents."""
 
     @property
     def kernel(self) -> tuple:
-        """Its kernel's identity: its form and tile, the band its tiles are walked in apart
+        """Its kernel's identity: its form, tile and projection, the band its tiles are walked in apart
         (`Tiles.grid_block_n`), a contract case's count the tile's consumers stating it."""
-        return self.form, dataclasses.replace(self.tile, grid_block_n=0)
+        return self.form, dataclasses.replace(self.tile, grid_block_n=0), self.shape
 
 
 def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False,
@@ -655,7 +659,7 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                           launch.lowering(ba, config),
                                           {kernel: _model(launch, ba, config)},
                                           required=launch.legal(ba, config, target))
-                cases.append(GemmCase(name, config, consumers, case))
+                cases.append(GemmCase(name, config, consumers, case, shape))
     return cases
 
 
@@ -732,13 +736,9 @@ def _gate_forms(generation_name: str) -> set[str]:
 
 @functools.cache
 def _gate_cases(generation_name: str, form: str) -> list:
-    """A form's cases at every projection (`_gemm_mainloop_cases`), each distinct kernel once
-    (`GemmCase.kernel`)."""
-    found = {}
-    for shape in GEMM_SHAPES:
-        for case in _gemm_mainloop_cases(generation_name, shape, form=form):
-            found.setdefault(case.kernel, case)
-    return list(found.values())
+    """A form's cases at every projection (`_gemm_mainloop_cases`), each projection's call its own
+    (`GemmCase.shape`): two calls of one tile compile apart where one leaves an axis partial."""
+    return [case for shape in GEMM_SHAPES for case in _gemm_mainloop_cases(generation_name, shape, form=form)]
 
 
 def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> list:
