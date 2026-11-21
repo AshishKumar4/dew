@@ -185,13 +185,13 @@ ORDER_SETS = {"first orders": ("primal", "jvp", "vjp"), "jvp of grad": ("jvp of 
               "second jvp": ("second jvp",), "grad of grad": ("grad of grad",),
               "second orders, staged": ("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit"),
               "jvp of grad, scanned": ("jvp of grad, scanned",)}
-"""The contract's orders (`orders`) a case takes at once, the chunked delta rule's, a padded merge's and the
-convex mean's (tests/test_contracts_algebra.py): all ten in one case took 127 to 156 s near float32's largest,
-each order's program compiled for itself (row 4433); the three second orders in one case 172 s over packed
-documents there (row 5348), so each is a case of its own, the scanned one apart from the staged ones (an
-interpreted selective scan's 170 s alone). The derived delta rule's and a turned template call's every order
-in one case, their rule and references dispatched op by op, took 178 to 193 s and 132 s at unit operands (row
-9512): each a case an order set, its rule and references staged (`jax.jit`)."""
+"""The contract's orders (`orders`) a case takes at once, the chunked delta rule's and a padded merge's: all
+ten in one case took 127 to 156 s near float32's largest, each order's program compiled for itself (row
+4433); the three second orders in one case 172 s over packed documents there (row 5348), so each is a case
+of its own, the scanned one apart from the staged ones (an interpreted selective scan's 170 s alone). The
+derived delta rule's and a turned template call's every order in one case, their rule and references
+dispatched op by op, took 178 to 193 s and 132 s at unit operands (row 9512): each a case an order set, its
+rule and references staged (`jax.jit`)."""
 
 
 def orders(fn, primals, direction, cotangent):
