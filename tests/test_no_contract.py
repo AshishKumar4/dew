@@ -96,7 +96,7 @@ def a_marked_multiply_add_rounds_each_step():
     a marked operation, as precision's transforms lowered for CUDA without their barrier take it not to
     (`dew.nn.precision.MARKED_BACKENDS`), this fails (row 10135: none contracted on an A100 or a GH200 at
     post115). The GPU's own compiler's (test_gpu_numerics), its program compiled where the cell's arm runs
-    (`ahead_arm`)."""
+    (`ahead_arm`); the marks a lowering for CUDA carries are `test_an_error_free_transform_marks_...`'s."""
     from jax.experimental.xla_metadata import set_xla_metadata
     from reference_error import ahead_arm
 
@@ -111,8 +111,6 @@ def a_marked_multiply_add_rounds_each_step():
         with set_xla_metadata(**{name: True}):
             return a * b + c
 
-    marks = float_arithmetic(jax.jit(marked).trace(a, b, c).lower())
-    assert marks and all(mark == "true" for mark in marks), marks
     found = np.asarray(ahead_arm(jax.jit(marked), "a marked multiply-add")(a, b, c))
     stepped = a * b + c
     fused = (a.astype(np.float64) * b + c).astype(np.float32)
