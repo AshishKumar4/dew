@@ -1434,13 +1434,17 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
     # The remat rungs past the start's at the run's own head, in order: what a tight start asks next.
     preferred = [moves for moves, place in enumerate(places)
                  if moves and place[0] is None and place[2] != places[0][2]]
-    recomputing = next((places[moves] for moves in preferred if fitted(moves)), None)
+    settled = next((at for at, moves in enumerate(preferred) if fitted(moves)), None)
+    recomputing = None if settled is None else places[preferred[settled]]
+    # What a tight start asks, a probe a place at its fixed split: its own rung, then each remat rung at its
+    # own head and options up to the first that fits.
+    asks = None if settled is None else [places[0], *(places[moves] for moves in preferred[:settled + 1])]
     lightest = None if recomputing is not None else next(
         (place for moves, place in enumerate(places) if fitted(moves)), None)
     trainer = planned(0, room)
     probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
               for probe in trainer.plan["probes"]]
-    return places, room, placed(trainer), lightest, recomputing, probes
+    return places, room, placed(trainer), lightest, asks, probes
 
 
 CENSUS = {
@@ -1478,13 +1482,12 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
         climb = climbed(monkeypatch, target, fields, batch, room_of, request)
     if climb is None:
         return
-    ladder, room, plan, lightest, recomputing, probes = climb
-    if recomputing is not None:
+    ladder, room, plan, lightest, asks, probes = climb
+    if asks is not None:
         # A tight start asks its own rung, then the remat rungs at its own head and options in order, and
         # settles the first of them that fits: no head or options rung compiled on the way (row 6740).
-        asked = list(dict.fromkeys(probes))
-        assert all(place[0] is None and not place[3] for place in asked), (asked, recomputing)
-        assert plan == (*recomputing[:3], False) and asked[-1] == plan, (asked, plan, recomputing)
+        assert probes == [(*place[:3], False) for place in asks], (probes, asks)
+        assert plan == probes[-1], (plan, probes)
     else:
         # Where no remat rung at its own head fits, the whole ladder: no later than the lightest place the
         # walk (under the step's own options alone) finds fits, a rung of XLA's defaults maybe earlier.
