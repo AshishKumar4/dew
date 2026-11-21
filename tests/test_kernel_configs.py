@@ -24,7 +24,16 @@ from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, generations, l
 from jax.sharding import PartitionSpec
 from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
-from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
+from dew.nn.kernels import (
+    chunked_launch,
+    fla_gdn,
+    fla_kda,
+    gemm,
+    generation,
+    grouped_matmul,
+    recurrence,
+    tuning,
+)
 from dew.nn.kernels.templates import bundles, report, resources, swizzling
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
@@ -1110,6 +1119,33 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     assert copies, modules
     bounded = [line.strip() for line in copies if re.search(r"\],\s*\d+,\s*%r", line)]
     assert not bounded, bounded[:4]
+
+
+@COMPILES_ON_CPU
+@lowers("sm80")
+def test_an_amperes_dense_product_derives_a_square_tile_it_compiles_within_its_registers():
+    """Llama-3-8B's down projection forward on a compile-only A100, 8192 tokens, the template named: its
+    launch derives a tile reading its operands at most once in 64 of a FLOP's rows and columns (1/rows +
+    1/columns, a 128 x 128 tile's; cuBLAS's 256 x 128 reads 1/85), and compiles by Mosaic and ptxas within
+    the registers its model prices, spilling nothing (`mosaic_failures`). Its tile was 192 x 64, 1/48, at
+    1.32x cuBLAS's time where 128 x 128 ran 1.07x (M-FS-36, row 5271): 128 x 128 was refused for the
+    registers its last wave's balanced merge holds beside its accumulator, 280 a thread past the 255."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    rows, weights = bf16((8192, 14336)), bf16((14336, 4096))
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as launches:
+        jax.eval_shape(lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16), rows, weights)
+    [(tile, ba)] = launches.taken
+    assert 1 / tile.block_m + 1 / tile.block_n <= 1 / 64, tile
+    with generation.assumed("sm80"):
+        model = _model(ba.op, ba, tile)
+    case = support.KernelCase(f"llama-3-8b down forward {tile}", lambda: ba.op.lowering(ba, tile),
+                              {"dew_gmm": model})
+    found = compile_mosaic_kernels([case], "sm80")
+    assert found and all(record.get("kernels") for record in found), found
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
 
 
 @COMPILES_ON_CPU
