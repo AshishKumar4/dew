@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import weakref
+from collections.abc import Hashable
 
 import jax
 import jax.numpy as jnp
@@ -36,7 +37,6 @@ from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
-from dew.nn.kernels.generation import device_generation
 from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
@@ -71,14 +71,13 @@ def compensating() -> frozenset:
 
 
 SCALES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-"""Each function's compiled rounding scale (`rounding_scale`) of a static program, by its arguments' tree,
-shapes, dtypes and weak types and the matmul precision it traced under (`_signature`), held while the
-function lives."""
+"""Each function's compiled rounding scale (`rounding_scale`) of a static program, by its trace's key
+(`_key`) and the device it evaluates on, held while the function lives."""
 
 TRACED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-"""Each function's program as `rounding_scale` traces it (`_traced`), by the same signature, held while the
-function lives: a weighed site's recording asks its reference's scale at thousands of draws of one program,
-and tracing it again at each took 6.8 of a recording's 25 s (row 5864)."""
+"""Each function's program as `rounding_scale` traces it (`_traced`), by its trace's key (`_key`), held
+while the function lives: a weighed site's recording asks its reference's scale at many draws of one
+program, which traced it again at each (tests/test_weighed_recording.py 77.3 s, 70.8 s held; row 5864)."""
 
 
 @jax.tree_util.register_dataclass
@@ -184,8 +183,8 @@ def rounding_scale(fn, *args, seed: int = 0):
     weighs alike for every arm. The program is traced at `args` as given, its roundings those formats', and
     evaluated in float64; a non-floating output's scale is None. A static program (no branch or loop its
     values pick) evaluates compiled, once a signature and matmul precision; any other walks eagerly."""
-    signature = _signature(args)
-    closed, tree = _traced(fn, args, signature)
+    key = _key(args)
+    closed, tree = _traced(fn, args, key)
     moved = on_float64_host(jax.tree.leaves(args))
     with on_float64_device(), evaluated_on(moved), jax.enable_x64(new_val=True), \
             jax.default_matmul_precision("highest"):
@@ -195,7 +194,7 @@ def rounding_scale(fn, *args, seed: int = 0):
         if static(closed.jaxpr):
             held = SCALES.setdefault(fn, {})
             # Compiled for the device it evaluates on (`float64_terms.evaluated_on`), which its trace is not.
-            compiled = (signature, _target())
+            compiled = (key, _target())
             if compiled not in held:
                 jaxpr = closed.jaxpr
                 # One tapped evaluation compiled, which every draw runs with its own key: a program of
@@ -211,28 +210,27 @@ def rounding_scale(fn, *args, seed: int = 0):
             tree.unflatten([None if scale is None else np.asarray(scale) for scale in scales]))
 
 
-def _signature(args) -> tuple:
-    """What a program `rounding_scale` traces at `args` is keyed by (`TRACED`; `SCALES` beside the device it
-    evaluates on): the arguments' tree, shapes, dtypes and weak types, and the context a trace reads beside
-    them: the matmul precision it is traced under (the caller's arithmetic, which its replay in float64 does
-    not keep), whether x64 is on (its constants' widths), the abstract mesh (its values' shardings) and the
-    generation its kernels are chosen for (`generation.device_generation`)."""
-    return (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
-                                             getattr(jax.typeof(leaf), "weak_type", False))
-                                            for leaf in jax.tree.leaves(args)),
-            str(jax.config.jax_default_matmul_precision), bool(jax.config.jax_enable_x64),
-            jax.sharding.get_abstract_mesh(), device_generation())
+def _key(args) -> Hashable:
+    """What a program `rounding_scale` traces at `args` is held by (`TRACED`; `SCALES` beside the device it
+    evaluates on): the arguments as a lowering reads them (`options.abstract_signature`) and the context a
+    trace reads beside them (`options.trace_context`: JAX's traced configuration, the caller's matmul
+    precision and x64 among it, its meshes, Dew's contexts, the logical axis rules and Dew's environment),
+    the one key a held trace is kept by (row 10878: a second, hand-picked here, missed Dew's kernel
+    choices)."""
+    from dew.nn.kernels import options
+
+    return options.abstract_signature(args), options.trace_context()
 
 
-def _traced(fn, args, signature: tuple) -> tuple:
+def _traced(fn, args, key: Hashable) -> tuple:
     """`fn`'s program as written at `args`, traced with the algebra pass off, a reference's
-    (`arm_arithmetic.unrewritten`), and its outputs' tree from the same trace, once a signature
-    (`TRACED`): a function is its program, as `SCALES` holds it."""
+    (`arm_arithmetic.unrewritten`), and its outputs' tree from the same trace, once a key (`_key`,
+    `TRACED`): a function is its program, as `SCALES` holds it."""
     held = TRACED.setdefault(fn, {})
-    if signature not in held:
+    if key not in held:
         closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
-        held[signature] = (closed, jax.tree.structure(shapes))
-    return held[signature]
+        held[key] = (closed, jax.tree.structure(shapes))
+    return held[key]
 
 
 def _scaled(jaxpr, tapped, keys):
