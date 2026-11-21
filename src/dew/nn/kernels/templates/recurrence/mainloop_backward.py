@@ -104,7 +104,8 @@ class Kept(NamedTuple):
     dh0: jax.Array
     """`_reverse`'s gradient of the initial memory."""
     ds: jax.Array
-    """`_scores_back`'s scores' gradient."""
+    """The scores' gradient in `_score_grads`' form: `_scores_back`'s, a key head's group summed after it
+    (`_grouped_scores`)."""
     decay_pairs: jax.Array
     """`_scores_back`'s decay pair terms."""
     dq: jax.Array
@@ -767,7 +768,7 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
     the group's `i`-th value head's values, output gradient and corrected values' gradient (`served`) at
     its columns, its entered memory and leaving memory's gradient (`memory`) a head's rows apart, and its
     scores' gradient (`scores`: the ref and the key head; without the delta rule each step the key head's,
-    summed over its value heads, `_scores_back`); of each value head's columns the `split`-th `vq` (all of
+    summed over its value heads, `_grouped_scores`); of each value head's columns the `split`-th `vq` (all of
     them where None, `_query_key_split`)."""
     width, value_width, group = call.width, call.value_width, call.group
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
@@ -930,7 +931,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     weights), after, leaving [blocks, HV, R], memory
     [blocks, HV, chunks * block] fp32)`: each chunk's and key block's queries', keys' and weights' gradients
     (fla's dqkwg's memory products, `algebra.memory_gradients`, given the scores' gradient `ds` in
-    `_score_grads`' form, `_scores_back`'s: `[R, HV * C]` with the delta rule, each step's value head's
+    `_score_grads`' form, `_grouped_scores`': `[R, HV * C]` with the delta rule, each step's value head's
     product; without it `[R, H * C]`, the key head's, its products the first step's alone), a program a key
     head's and a step each value head it serves,
     the queries' and keys' summed over them in fp32 where they leave (each program's own tiles: a register
@@ -1191,9 +1192,12 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
         if streamed:
             views |= vector_views(n, h, **vectors)
 
+        read = prefix_reader(family, streamed, vectors, h, span)
+
         def step(index, slots, carry, accumulators, loaded=None):
             del index
-            found = prefix_reader(family, streamed, vectors, h, span)(slots) if loaded is None else loaded
+            found = read(slots) if streamed else loaded
+            assert found is not None, "a family that streams no vectors loads them in the prologue"
             (gate, low), laid = found
 
             column = functools.partial(column_tile, call, slots)
@@ -1213,7 +1217,6 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
             grads.store(ds_ref, ds, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
             return carry, accumulators
 
-        read = prefix_reader(family, streamed, vectors, h, span)
         return mosaic.Walk(views, step, steps=1, prologue=None if streamed else lambda: read(None))
 
     tiles = stream_blocks(queries=((chunk, width), given), keys=((chunk, width), given),
