@@ -21,12 +21,13 @@ parses an op's 153 files in about a second."""
 
 import ast
 import contextlib
+import dataclasses
 import functools
 import hashlib
 import json
 import logging
 import sys
-from collections.abc import Collection, Iterator, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from pathlib import Path
 
 from dew._builds import dew_cache_dir
@@ -68,6 +69,12 @@ REVIEWED = {
     "dew.registry:import_trusted:package": "a package the run trusts, as `dew.registry:imported:module`",
     "dew.registry:import_trusted:module": "a trusted package's module a record names, as its package",
     "dew.registry:module_from_file:<loader>": "a user's file a run names, the user's code",
+    **dict.fromkeys((
+        "dew.registry:_importable:sys.modules", "dew.registry:declared_type:sys.modules",
+        "dew.registry:imported:sys.modules", "dew.registry:module_from_file:sys.modules",
+        "dew.registry:parameter_type:sys.modules"),
+        "a module already imported, by its name or a record-named class's: whether it is, or its namespace, "
+        "which a class's annotations are evaluated among, as `dew.registry:imported:module`"),
     **dict.fromkeys((
         "dew._cache:unintercepted:sys.modules", "dew._devices:_seen:sys.modules",
         "dew._devices:backend_open:sys.modules", "dew._devices:flags_hold:sys.modules",
@@ -144,15 +151,41 @@ def _current() -> bool:
         return False
 
 
-def defining_modules(values: Sequence[object]) -> frozenset[str]:
-    """The modules of Dew's that define `values`' code: a class's own module, any other value's class's;
-    none for a library's value or the user's own, whose release or source states it."""
-    found = set()
-    for value in values:
-        module = (value if isinstance(value, type) else type(value)).__module__
-        if isinstance(module, str) and _path(module) is not None:
-            found.add(module)
-    return frozenset(found)
+def provenance(values: Sequence[object]) -> frozenset[str] | None:
+    """The modules of Dew's defining `values` and every value they hold (a dataclass's fields', a
+    collection's members): a class's own module, any other value's class's, none for a library's or the
+    user's own, whose release or source states it. None, the whole package, where any is a function (a
+    hook, a prepared one): a kernel's identity traces a hook at one tile alone
+    (`attention.hook_program`), and no value names the code a wrapper calls (row 10743)."""
+    held = [part for value in values for part in _held(value)]
+    if any(callable(part) and not isinstance(part, type) for part in held):
+        return None
+    modules = {(part if isinstance(part, type) else type(part)).__module__ for part in held}
+    return frozenset(module for module in modules if _path(module) is not None)
+
+
+def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str] | None:
+    """The digests (`code_digest`) of the code a record of `root`'s, of values whose `provenance` it names,
+    keys on: `root`'s and each module's of `provenance`, or the whole package's (`whole_digest`) where it
+    is None; None where Dew's source changed while this process ran, which keeps no record."""
+    found = [whole_digest()] if provenance is None else [code_digest(module)
+                                                          for module in (root, *sorted(provenance))]
+    digests = [digest for digest in found if digest is not None]
+    return digests if len(digests) == len(found) else None
+
+
+def _held(value: object) -> Sequence[object]:
+    """`value` and every value it holds: a dataclass's fields', a sequence's or a set's members, a mapping's
+    values."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        members = [getattr(value, field.name) for field in dataclasses.fields(value)]
+    elif isinstance(value, (tuple, list, frozenset, set)):
+        members = list(value)
+    elif isinstance(value, Mapping):
+        members = list(value.values())
+    else:
+        members = []
+    return [value, *(part for member in members for part in _held(member))]
 
 
 class _Changed(Exception):
@@ -198,7 +231,7 @@ def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ..
     kept = Path(dew_cache_dir()) / "code" / f"{tree}-{python}-{named}.json"
     with contextlib.suppress(FileNotFoundError, ValueError):
         found = json.loads(kept.read_text())
-        if _sound(found, roots):
+        if isinstance(found, dict) and _sound(found, roots):
             return frozenset(found["modules"]), tuple(found["sites"])
     modules, sites = closure(*roots)
     kept.parent.mkdir(parents=True, exist_ok=True)
@@ -207,13 +240,12 @@ def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ..
     return modules, sites
 
 
-def _sound(found: JSON, roots: tuple[str, ...]) -> bool:
+def _sound(found: dict[str, JSON], roots: tuple[str, ...]) -> bool:
     """Whether `found` is a closure of `roots` as `_kept_closure` keeps one."""
-    if not isinstance(found, dict) or found.get("roots") != list(roots):
-        return False
     modules, sites = found.get("modules"), found.get("sites")
-    return (isinstance(modules, list) and isinstance(sites, list)
-            and all(isinstance(module, str) and _path(module) is not None for module in modules)
+    if found.get("roots") != list(roots) or not isinstance(modules, list) or not isinstance(sites, list):
+        return False
+    return (all(isinstance(module, str) and _path(module) is not None for module in modules)
             and set(roots) <= set(modules) and all(isinstance(site, str) for site in sites))
 
 
@@ -341,9 +373,9 @@ def _literal(node: ast.expr) -> dict[str, str] | list[str] | str | None:
             node.args) == 1 and not node.keywords:
         return _literal(node.args[0])
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        items = [_literal(each) for each in node.elts]
-        strings = [item for item in items if isinstance(item, str)]
-        return strings if len(strings) == len(items) else None
+        members = [_literal(each) for each in node.elts]
+        strings = [member for member in members if isinstance(member, str)]
+        return strings if len(strings) == len(members) else None
     if not isinstance(node, ast.Dict):
         return None
     held: dict[str, str] = {}

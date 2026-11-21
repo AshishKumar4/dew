@@ -136,8 +136,7 @@ class Launch:
     """Whether it traced as reverse mode runs it (`pulled`), the form its certification compiles
     (`certified`): a kernel's own entry (`named`) its trace's, the launch's its first trace's."""
     provenance: frozenset[str] | None = dataclasses.field(default=None, compare=False)
-    """The modules of Dew's whose code its records key on beside the certification's (`_provenance`), None
-    for the whole package's."""
+    """The modules of Dew's whose code its records key on (`_provenance`), None for the whole package's."""
 
 
 @dataclasses.dataclass
@@ -338,51 +337,21 @@ def _identity(op, arguments: tokamax.BoundArguments) -> str:
 
 
 def _provenance(op, arguments: tokamax.BoundArguments) -> frozenset[str] | None:
-    """The modules of Dew's whose code a launch's records are a function of beside the certification's own
-    (`launch_code`): those defining its op's class and each value its fields hold, nested ones among them (a
-    family's, a config's: `dew._code.defining_modules`). None, the whole package, where the op or its
-    arguments hold a function (a hook, a prepared one, a group's): a launch's identity traces a hook at one
-    tile alone (`attention.hook_program`), and no value names the code a wrapper calls."""
-    from dew._code import defining_modules
+    """A launch's provenance (`dew._code.provenance`): of its op's class, its fields' values and its hooks."""
+    from dew._code import provenance
 
-    fields = ([getattr(op, field.name) for field in dataclasses.fields(op)]
-              if dataclasses.is_dataclass(op) else [])
-    hooks = [value for name, value in arguments.arguments.items() if name in op.HOOKS]
-    values = [part for value in (*fields, *hooks) for part in _parts(value)]
-    if any(callable(value) and not isinstance(value, type) for value in values):
-        return None
-    return defining_modules([type(op), *values])
-
-
-def _parts(value) -> Iterator[object]:
-    """`value` and every value it holds: a dataclass's fields', a sequence's items, a mapping's values."""
-    yield value
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        held = [getattr(value, field.name) for field in dataclasses.fields(value)]
-    elif isinstance(value, (tuple, list, frozenset, set)):
-        held = list(value)
-    elif isinstance(value, Mapping):
-        held = list(value.values())
-    else:
-        held = []
-    for each in held:
-        yield from _parts(each)
+    fields = ([getattr(op, field.name) for field in dataclasses.fields(type(op))]
+              if dataclasses.is_dataclass(type(op)) else [])
+    return provenance([type(op), *fields, *(value for name, value in arguments.arguments.items()
+                                             if name in op.HOOKS)])
 
 
 def launch_code(provenance: frozenset[str] | None) -> list[str] | None:
-    """The digests of the code a launch's stored verdict and choice are a function of
-    (`dew._code.code_digest`): the certification's own and every module its code imports (each GPU
-    family's template, `mosaic_sm80`, `mosaic_sm90`, ..., among them), and those of the modules of Dew's
-    its `provenance` names (`_provenance`): an op's lowering, a value it holds. An edit of Dew's code
-    elsewhere (a trainer's, another op's) keeps them (row 10743). The whole package's where `provenance`
-    is None. None where Dew's source changed while this process ran (`code_digest`): it keeps no record."""
-    from dew._code import code_digest, whole_digest
+    """The code a launch's stored verdict and choice key on (`dew._code.provenance_code`): the
+    certification's, each GPU family's template (`mosaic_sm90`, ...) among it, and its `provenance`'s."""
+    from dew._code import provenance_code
 
-    if provenance is None:
-        whole = whole_digest()
-        return None if whole is None else [whole]
-    found = [code_digest(module) for module in (__name__, *sorted(provenance))]
-    return None if None in found else [digest for digest in found if digest is not None]
+    return provenance_code(__name__, provenance)
 
 
 def _digest(text: str) -> str:

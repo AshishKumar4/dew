@@ -2195,10 +2195,8 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     found = report._misses_of([dataclasses.replace(binary, frame=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
-    stored = [tuning.stored_verdict(report.verdict_target(device),
-                                    report._verdict_key(identity, rung, refused.reverse,
-                                                        refused.provenance))
-              is not None for rung in rungs]
+    keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance) for rung in rungs]
+    stored = [tuning.stored_verdict(report.verdict_target(device), key) is not None for key in keys]
 print(json.dumps({"stored": stored}))
 """
 """Two rungs of one launch's producer ladder lowered for a compile-only H100 with certification on, the
