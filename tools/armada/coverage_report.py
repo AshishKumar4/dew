@@ -12,6 +12,9 @@ from pathlib import Path
 DEADLINE = 5400.0
 """A coverage task's deadline. Branch tracing slows a task several times over, and a task cut short leaves
 its files' coverage partial, which `report` refuses."""
+SHORT = ("deadline", "whole", "stale")
+"""The kinds of a red row whose task's run did not finish its file (grading.py's `red_as`): cut at its
+deadline, its process failed, or a kept row it never ran; its coverage is partial, which `report` refuses."""
 SCENARIO_SUITE = ("tests/test_scenario_runs.py", "tests/test_decision_workflow.py")
 """The scenario suite's files, as docs/design/testing.md names them: a short run a cell of each scenario its
 `SCENARIOS` registry holds, and the decision workflow's cells; `coverage items --scenarios` measures their
@@ -46,11 +49,14 @@ def report(directory: Path) -> int:
     if not parts:
         print(f"no coverage data under {directory}", file=sys.stderr)
         return 1
-    # A task that wrote no rows or was interrupted left the coverage of its files' later tests out.
+    # A task that wrote no rows or no coverage data, or a row of which its run did not finish, left the
+    # coverage of its files' later tests out: cut at its deadline, its process crashed (`whole`), or never
+    # started (`stale`, a kept row it did not run; row 10801).
     def ran_short(task: Path) -> bool:
         verdict = task / "rows.json"
-        return not verdict.exists() or any(found["exitCode"] and found["kind"] == "deadline"
-                                           for found in json.loads(verdict.read_text())["rows"])
+        return (not verdict.exists() or not any(task.glob(".coverage.*"))
+                or any(found["exitCode"] and found.get("kind") in SHORT
+                       for found in json.loads(verdict.read_text())["rows"]))
 
     # armada keeps each task's artifacts in a directory named by its index.
     short = [task.name for task in sorted(directory.iterdir())

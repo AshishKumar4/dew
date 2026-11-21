@@ -781,12 +781,19 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   ordered by their seconds, where every rate of a GPU target is stated (`cost.cheaper`'s rule for work no
   rate prices is the compile-time splice's). No module calls `choose` yet (the generator is parked, §6.11).
 - One choice of this kind is built: a product's dot algorithm for the accuracy its site asks
-  (`dew.algebra.error.product_precision`, row 5473; today its test calls it and no site does). Its candidates are the algorithms JAX itself states for
-  the operands' dtype (`dew.nn.programs.dot_algorithms`, by JAX's own conversion of each preset), priced by `cost.product_work` in the mode
-  and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
+  (`dew.algebra.error.product_precision`, row 5473). Its candidates are the algorithms JAX itself states for
+  the operands' dtype (`dew.nn.programs.dot_algorithms`, by JAX's own conversion of each preset), of them
+  those the site's kernel runs as named where it states them (`stated`), priced by `cost.product_work` in the
+  mode and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
   three-pass TF32 product where one pass misses the accuracy and IEEE fp32 costs more); none admitted is
-  refused. A site is to read it in place of a hand-picked preset: the recurrence ports, the template's accurate
-  parts and the GEMM's low-precision forms (their lanes' rows).
+  refused. A gate stated as an algorithm (`error.at_least`) admits one at least as exact: as many significand
+  digits of each operand (`DotArithmetic.digits`, its parts times the narrower side's) and as wide an
+  accumulation. It serves the sites whose kernel lowers the algorithm itself: the Triton ports, each at
+  least fla's own (`fla_gdn._precision` over `TRITON_ALGORITHMS`), and the TPU SSD's Mosaic kernel
+  (`ssd._exact`, its precisions named back). A product XLA compiles states a `Precision` instead
+  (`recurrence_algebra.STATE_PRECISION`'s HIGHEST): XLA routes a dot to an emitter by its shape, and its
+  CPU's elemental emitter took no named algorithm at a `[1, 1]` dot (F64 and BF16x6 alike, M-JS-159), where
+  HIGHEST is one every routing takes.
 - Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
   exact counterpart (`extract.extracted`) is the oracle (exact as a mixed integer program is: solved to a
   relative gap of zero within the solver's feasibility tolerance, each price level held at its least within

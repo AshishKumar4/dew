@@ -1625,8 +1625,12 @@ def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> b
             if declares_fp32_products((lhs, rhs)):
                 return True
         if "algorithm" in attributes:
+            # The names that are a preset's, the ones stating an algorithm to compare ('HIGHEST' names a
+            # `Precision`, which JAX's conversion reads by no such name).
             stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
-            return any(stated == dot_arithmetic(name, jnp.float32, jnp.float32) for name in FP32_PRODUCTS)
+            presets = jax.lax.DotAlgorithmPreset.__members__
+            return any(stated == dot_arithmetic(presets[name], jnp.float32, jnp.float32)
+                       for name in FP32_PRODUCTS if name in presets)
         return False
 
     return any_op(lowered, wrong)

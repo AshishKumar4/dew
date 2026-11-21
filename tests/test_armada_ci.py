@@ -677,6 +677,19 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     # Its stall's record among this task's own artifacts (`stalls.kept`), never an enclosing task's.
     [kept] = interrupted["artifacts"]
     assert (tmp_path / "artifacts" / kept).is_file()
+    # So is a pass a task of which crashed, never started its file, or left no coverage data (row 10801).
+    shutil.rmtree(tmp_path / "runs/2")
+    complete = json.loads((tmp_path / "runs/0/rows.json").read_text())
+    for kind in ("whole", "stale", None):
+        shutil.copytree(tmp_path / "runs/0", tmp_path / "runs/2")
+        rows = ([{**row, "exitCode": 1, "kind": kind} for row in complete["rows"]] if kind
+                else complete["rows"])
+        (tmp_path / "runs/2/rows.json").write_text(json.dumps({**complete, "rows": rows}))
+        if kind is None:
+            for part in (tmp_path / "runs/2").glob(".coverage.*"):
+                part.unlink()
+        assert ci.coverage_report.report(tmp_path / "runs") == 1, kind
+        shutil.rmtree(tmp_path / "runs/2")
 
 
 def test_the_scenario_suites_coverage_items_are_its_tasks_alone(ci, tmp_path):
@@ -1460,9 +1473,11 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     """A run that reads a checkout file and writes it keeps no key, however it writes it: Python's write, one
     handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, through
     an alias of what it read, under a nested hidden directory, a copy that puts the file's time back, or a
-    native writer (sqlite's); nor does one that found a file absent and made it: its key would hash the
-    checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its review).
-    A file a run only writes, as each run here appends to `runs`, is no input and leaves its key."""
+    native writer (sqlite's); nor does one that found a file absent and made it, a package beside a module
+    it imported among them, which only its key's import lookups cover (`ci.inputs`; row 10800): its key would
+    hash the checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its
+    review), its record saying so (row 10775). A file a run only writes, as each run here appends to `runs`,
+    is no input and leaves its key."""
     import sqlite3
 
     counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
@@ -1479,6 +1494,9 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     (tmp_path / "docs/.data").mkdir()
     (tmp_path / "docs/.data/input.txt").write_text("input\n")
     (tmp_path / "docs/same.txt").write_text("PAGE\n")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src/held.py").write_text("VALUE = 1\n")
+    (tmp_path / "docs/gone.txt").write_text("gone\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     for test, body in (
             ("plain", "    assert True\n"),
@@ -1501,18 +1519,41 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
                      "        made.write_text('made\\n')\n"),
             ("native", "    with sqlite3.connect('tests/fixtures/rows.db') as database:\n"
                        "        database.execute('insert into t values (1)')\n"
-                       "    database.close()\n")):
+                       "    database.close()\n"),
+            ("emptied", "    gone = Path('docs/gone.txt')\n    if gone.is_file():\n"
+                        "        assert gone.read_text()\n        gone.unlink()\n        gone.mkdir()\n"),
+            ("shadowed", "    import sys\n    sys.path.insert(0, 'src')\n    import held\n    assert held\n"
+                         "    made = Path('src/held')\n    if not made.exists():\n        made.mkdir()\n"
+                         "        (made / '__init__.py').write_text('')\n")):
         written(tmp_path, {"test_a.py": "import mmap\nimport os\nimport shutil\nimport sqlite3\n"
                                         "from pathlib import Path\n\n\ndef test_a():\n" + counted + body})
         (tmp_path / "runs").unlink(missing_ok=True)
         commit(tmp_path, test)
-        assert [run(), run()] == ([1, 1] if test == "plain" else [1, 2]), test
+        first = run()
+        if test == "shadowed":
+            # Its first run's record, before the second (which finds the package made) records its own.
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            kept = json.loads(cache_worker[1][place])
+            assert kept["key"] is None and "its task wrote its input src/held" in kept["why"], kept["why"]
+        assert [first, run()] == ([1, 1] if test == "plain" else [1, 2]), test
         # Its record keeps what it read all the same, which a change's reach reads (`reached`).
         if test == "python":
             place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
             kept = json.loads(cache_worker[1][place])
             assert kept["key"] is None and kept["depends"] is None
             assert any(path.partition(ci.followed.CODE)[0].endswith("docs/page.txt") for path in kept["read"])
+
+
+
+def test_a_lookups_entries_are_its_names_alone(ci):
+    """A write counts against an import lookup (`ci.looked_entry`) only where it is an entry the lookup
+    lists: its name, a module or package of any suffix beside it, a package's own __init__; none of another
+    name, a deeper file, or one under a namesake package (review: `held/__init__report.json`)."""
+    entry = ci.looked_entry
+    assert all(entry(path, "src/held") for path in ("src/held", "src/held.py", "src/held.cpython-312.so",
+                                                    "src/held/__init__.py", "src/held/__init__.pyc"))
+    assert not any(entry(path, "src/held") for path in ("src/held/__init__report.json", "src/held/mod.py",
+                                                        "src/helder.py", "src/other/held.py"))
 
 
 def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(ci, tmp_path, monkeypatch,

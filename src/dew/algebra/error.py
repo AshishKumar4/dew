@@ -9,7 +9,7 @@ differ in error, which depends on every operand form a candidate reads."""
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Sequence
 
 import jax
 from egglog import DagCostModel, Vec
@@ -127,21 +127,46 @@ def compensated(candidate: Candidate, operands: Sequence[jax.ShapeDtypeStruct], 
                      form=candidate.function)
 
 
+def at_least(asked: jax.lax.DotAlgorithmPreset, dtype) -> Callable[[jax.lax.DotAlgorithmPreset], bool]:
+    """A site's gate for `product_precision` stated as an algorithm: it admits a product of `dtype` operands
+    in a preset at least as exact as `asked` in them, by what each states of its arithmetic
+    (`dew.nn.programs.dot_arithmetic`): as many significand digits of each operand
+    (`DotArithmetic.digits`), as wide an accumulation, and an imprecise one only where `asked`'s is. So a
+    port states the algorithm its upstream runs and takes the cheapest its backend runs that keeps as much,
+    not a precision picked by hand (row 5473). `asked` names an algorithm: the default preset, which names
+    none, is refused."""
+    operand = jax.numpy.dtype(dtype)
+    floor = programs.dot_arithmetic(asked, operand, operand)
+    if floor is None:
+        raise ValueError(f"{asked} names no dot algorithm for a product to be at least as exact as")
+
+    def admits(preset: jax.lax.DotAlgorithmPreset) -> bool:
+        arithmetic = programs.dot_arithmetic(preset, operand, operand)
+        return (arithmetic is not None and arithmetic.digits >= floor.digits
+                and arithmetic.accumulation_bits >= floor.accumulation_bits
+                and (floor.imprecise or not arithmetic.imprecise))
+    return admits
+
+
 def product_precision(rows: int, depth: int, columns: int, dtype, *,
-                      admits: Callable[[jax.lax.DotAlgorithmPreset], bool]) -> jax.lax.DotAlgorithmPreset:
+                      admits: Callable[[jax.lax.DotAlgorithmPreset], bool],
+                      stated: Iterable[jax.lax.DotAlgorithmPreset] | None = None,
+                      ) -> jax.lax.DotAlgorithmPreset:
     """The dot algorithm a `[rows, depth] @ [depth, columns]` product of `dtype` operands runs in for the
     accuracy its site asks: of the algorithms JAX runs operands of that dtype in as they are stored
-    (`dew.nn.programs.dot_algorithms`, JAX's own conversion; no list of them here), the cheapest on the
-    process's target
-    (`cost.product_work` under XLA's schedule: a preset's mode and passes as JAX lowers it, one with work at
-    a rate the target states none of after every one without, row 10845) that `admits`
-    holds, the site's gate run on its own family at that algorithm (as exact as the accuracy asked, from
-    the float64 truth). So a site states an accuracy and takes whatever product meets it at the best rate:
-    three TF32 passes where one is not enough and IEEE fp32 costs more, one where it is (row 5473;
-    docs/design/algebra.md §1.5). None admitted is refused: the site asked more than any stated algorithm
-    gives, and no cheaper one is taken in its place."""
+    (`dew.nn.programs.dot_algorithms`, JAX's own conversion; no list of them here), those its backend runs
+    as named (`stated`, every one where not given: one converting its operands is none of them, an fp16
+    product of fp32 operands its digits of TF32's and its range fp16's), the cheapest on the process's
+    target (`cost.product_work` under XLA's schedule: a preset's mode and passes as JAX lowers it, one with
+    work at a rate the target states none of after every one without, row 10845) that `admits` holds: the
+    site's gate run on its own family at that algorithm (as exact as the accuracy asked, from the float64
+    truth), or `at_least` the algorithm its upstream runs. So a site states an accuracy and takes whatever
+    product meets it at the best rate: three TF32 passes where one is not enough and IEEE fp32 costs more,
+    one where it is (row 5473; docs/design/algebra.md §1.5). None admitted is refused: the site asked more
+    than any stated algorithm gives, and no cheaper one is taken in its place."""
     operand = jax.numpy.dtype(dtype)
-    stated = programs.dot_algorithms(operand)
+    found = programs.dot_algorithms(operand)
+    stated = found if stated is None else tuple(preset for preset in found if preset in set(stated))
     schedule = cost.fused(cost.target())
 
     def seconds(preset: jax.lax.DotAlgorithmPreset) -> tuple[float, ...]:

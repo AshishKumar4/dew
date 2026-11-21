@@ -3,6 +3,8 @@ e-graph proposes, each admitted by the accuracy gate (check 1, `assert_as_exact`
 policy), and the cheapest admitted chosen: the log-sum-exp fold, `log1p` and `expm1` where the form as
 written loses digits."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,7 +12,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra.error import choose, product_precision
+from dew.algebra.error import at_least, choose, product_precision
 from dew.nn import programs
 from dew.parity import GateFailure
 
@@ -133,43 +135,92 @@ def test_a_form_an_equation_outside_the_language_reads_is_the_one_its_candidate_
 
 
 
+def _factors(shape: tuple[int, int, int], seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """A seed's fp32 factors of a `[rows, depth] @ [depth, columns]` product, standard normal."""
+    rng = np.random.default_rng(seed)
+    return (rng.standard_normal(shape[:2]).astype(np.float32),
+            rng.standard_normal(shape[1:]).astype(np.float32))
+
+
+def _product(preset: jax.lax.DotAlgorithmPreset):
+    """A product of two factors in the dot algorithm `preset`, compiled."""
+    return jax.jit(lambda x, y: jnp.dot(x, y, precision=preset))
+
+
 def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
     """A product's dot algorithm chosen for an accuracy asked (`product_precision`, row 5473), by a site
     whose gate is check 1 itself: an algorithm is admitted where this backend runs the product in it and
     the product is as exact as the IEEE fp32 one from the float64 truth. The choice is an algorithm that
     gate admits, and the product computed in it holds the accuracy asked; a gate that admits none is
-    refused, never answered with a cheaper algorithm; and FP8 operands, whose algorithms name no operand
-    types of their own, are given one JAX lowers for them."""
+    refused, never answered with a cheaper algorithm; FP8 operands, whose algorithms name no operand
+    types of their own, are given one JAX lowers for them; and an algorithm converting its operands is
+    never given, whatever a backend states it runs and its gate admits: an fp16 product of fp32 operands
+    past fp16's range, its digits TF32's, is infinite."""
     shape = (64, 32, 16)
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (rng.standard_normal(shape[:2]).astype(np.float32),
-                rng.standard_normal(shape[1:]).astype(np.float32))
-
-    def product(preset):
-        return jax.jit(lambda x, y: jnp.dot(x, y, precision=preset))
+    draw = functools.partial(_factors, shape)
 
     def admits(preset):
         try:
-            product(preset)(*draw(0))
-        except ValueError:  # this backend's dot_general refuses the algorithm
+            _product(preset)(*draw(0))
+        except (ValueError, jax.errors.JaxRuntimeError):  # JAX's check refuses it, or a GPU's compile
             return False
         try:
-            assert_as_exact(product(preset), product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
+            assert_as_exact(_product(preset), _product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
                             f"a product in {preset.name}", seeds=8)
         except GateFailure:
             return False
         return True
 
     chosen = product_precision(*shape, jnp.float32, admits=admits)
-    assert_as_exact(product(chosen), product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
+    assert_as_exact(_product(chosen), _product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
                     "the product in the algorithm chosen", seeds=8)
     with pytest.raises(ValueError):
         product_precision(*shape, jnp.float32, admits=lambda preset: False)
+    stated = (jax.lax.DotAlgorithmPreset.F16_F16_F16, jax.lax.DotAlgorithmPreset.F32_F32_F32)
+    wide = product_precision(*shape, jnp.float32, admits=lambda preset: True, stated=stated)
+    assert_as_exact(_product(wide), _product(jax.lax.DotAlgorithmPreset.F32_F32_F32),
+                    lambda seed: tuple(1e6 * factor for factor in draw(seed)), "a product past fp16's range",
+                    seeds=8)
     eight = product_precision(*shape, jnp.float8_e4m3fn, admits=lambda preset: True)
     assert programs.dot_arithmetic(eight, jnp.float8_e4m3fn, jnp.float8_e4m3fn).operand_bits == (8, 8)
 
+
+def test_an_algorithm_at_least_another_is_as_exact_as_it():
+    """A site's gate stated as an algorithm (`at_least`, row 5473) admits, of the algorithms this backend
+    runs fp32 operands in, only ones whose product is as exact as the algorithm asked's from the float64
+    truth (check 1 between them, over every pair), by what each states of its arithmetic alone: its
+    operands' significand digits, its parts and its accumulation. Every algorithm is at least itself, so a
+    site asking its upstream's algorithm can always take it."""
+    draw = functools.partial(_factors, (64, 128, 32))
+    runs = []
+    for preset in jax.lax.DotAlgorithmPreset:
+        try:
+            _product(preset)(*draw(0))
+        except (ValueError, jax.errors.JaxRuntimeError):  # JAX's check refuses it, or a GPU's compile
+            continue
+        if programs.dot_arithmetic(preset, jnp.float32, jnp.float32) is not None:
+            runs.append(preset)
+    for asked in runs:
+        admits = at_least(asked, jnp.float32)
+        assert admits(asked)
+        for chosen in filter(admits, runs):
+            assert_as_exact(_product(chosen), _product(asked), draw, f"{chosen.name}, at least {asked.name}",
+                            seeds=8, truth_fn=_product(jax.lax.DotAlgorithmPreset.F64_F64_F64))
+
+
+def test_a_program_naming_a_dot_algorithm_compiles_for_a_gpu():
+    """A program whose product names a dot algorithm compiles through Dew's compile point for a GPU on this
+    CPU, as a prepare compiles it (`generation.assumed`, a compile-only device): the compile's own checks
+    read the algorithm's arithmetic (`report.triton_wrong`, `programs.algorithm_arithmetic`) outside any MLIR
+    context of theirs, its precision types' digits read in the attribute's own (row 5473)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.options import owned_program
+
+    gpu = generation.compile_only_gpus("sm90", 1)[0]
+    operand = jax.ShapeDtypeStruct((256, 256), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(gpu))
+    split = functools.partial(jnp.dot, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6)
+    with generation.assumed("sm90"):
+        owned_program(split).compiled(operand, operand)
 
 
 @pytest.mark.parametrize("target_name", ["v5e", "v6e"])
