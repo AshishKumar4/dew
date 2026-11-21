@@ -76,7 +76,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [5292]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353]
 - A device-plan search whose devices hold no plan walks the whole remat/head ladder before refusing. [8541]
-- The saved data plan as recorded rules, one last version, and the resume modes. [10814]
 - The BFC bound places a step's non-aliased outputs beside its temporaries at XLA's raw sizes (memory.placed_beside: stats.output - stats.alias), where each…. [8792]
 
 ## RL and serving

@@ -29,7 +29,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew._coordination import from_every_process
+from dew._coordination import read_by_holders
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
@@ -704,15 +704,9 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
             held = [leaves[index] for index in members]
             read.append([True] * len(members) if _held_flag(program(all_finite)(held)) else
                         [_held_flag(finite) for finite in program(_finite_each)(held)])
-    # The round decided alike on every process, by which processes each placement spans.
-    if any({device.process_index for device in devices} != set(range(jax.process_count()))
-           for devices, _ in groups):
-        every = from_every_process(read)
-        read = [next(flags for flags in (rank[at] for rank in every) if flags is not None)
-                for at in range(len(read))]
     flags: list[bool] = [True] * len(leaves)
-    for members, held in zip(groups.values(), read, strict=True):
-        assert held is not None, "a placement no process holds a device of"
+    for members, held in zip(groups.values(), read_by_holders(read, [devices for devices, _ in groups]),
+                             strict=True):
         for index, finite in zip(members, held, strict=True):
             flags[index] = bool(finite)
     return flags

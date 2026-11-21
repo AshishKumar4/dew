@@ -46,9 +46,6 @@ from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
 from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p
 
-__accuracy_gate__ = True
-"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
-
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
              primitives.reduce_scatter_p: "axis_name"}
 """The collectives that sum over devices, by the parameter naming their axes: sums of terms, one a device of

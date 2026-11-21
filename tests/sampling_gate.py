@@ -24,9 +24,6 @@ import math
 
 import numpy as np
 
-__accuracy_gate__ = True
-"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
-
 FALSE_RED = 1e-4
 """The chance a sampler that draws exactly its declared chances fails the gate: one verdict in ten
 thousand, so a suite of a hundred such sites goes red on a fair sampler once in a hundred runs."""

@@ -1220,10 +1220,10 @@ def test_a_rows_length_and_the_context_it_derives_are_no_computation_a_resume_ho
     rows resume (row 9535: the derived context was recorded and refused)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.training.startup import computation_differs
+    from dew.training.startup import differing_records
 
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=4)
     short, long = LMObjective(model, seq_len=4), LMObjective(model, seq_len=8)
     assert short.context != long.context
-    assert computation_differs(None, None, short.training_record(), long.training_record()) == []
+    assert differing_records(None, None, short.training_record(), long.training_record()) == []

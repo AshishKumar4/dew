@@ -13,7 +13,7 @@ from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS, ContextReader
 from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
-from dew.inputs.spec import Condition, encode_conditions
+from dew.inputs.spec import Condition, encode_conditions, token_widths
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts
@@ -131,7 +131,8 @@ class DecisionModel(HeadedModel):
                 # document alone.
                 segments, documents = context_documents(inputs.context, inputs.context_lengths,
                                                         inputs.context_segments, inputs.max_segments)
-                states = _apart(encoded, inputs.context, segments, documents, encoded_tokens(encoder))
+                states = _apart(encoded, inputs.context, segments, documents,
+                                token_widths(encoder)["input_ids"][0])
                 return {CONTEXT: states, CONTEXT_LENGTHS: inputs.context_lengths,
                         **({} if inputs.context_segments is None else {CONTEXT_SEGMENTS: segments})}
 
@@ -479,12 +480,6 @@ def context_documents(tokens: jax.Array, lengths: jax.Array, segments: jax.Array
 def document_lengths(segments: jax.Array, documents: int) -> jax.Array:
     """Each row's documents' token counts `[B, documents]`, by `segments` (`context_documents`)."""
     return jnp.sum(segments[:, :, None] == jnp.arange(1, documents + 1), axis=1)
-
-
-def encoded_tokens(encoder: ConditionEncoder) -> int:
-    """The tokens a configured context encoder reads a text at, its own tokenization's width, which a
-    document of a row's context is encoded at (`_apart`)."""
-    return len(encoder.tokenize([""])["input_ids"][0])
 
 
 def state_width(encoder: ConditionEncoder) -> int:

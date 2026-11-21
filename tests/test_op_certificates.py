@@ -10,9 +10,6 @@ import numpy as np
 import op_certificates as oc
 import pytest
 
-__accuracy_gate__ = True
-"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
-
 FORMATS = [oc.FLOAT32, oc.BFLOAT16]
 Fraction = fractions.Fraction
 

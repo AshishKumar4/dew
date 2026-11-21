@@ -134,13 +134,16 @@ def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_train
     assert stepped.values == []
 
 
+@pytest.mark.parametrize("metric", ["mean", "own"])
 @pytest.mark.parametrize("eval_every", [None, 2], ids=["at-the-end", "midway"])
-def test_a_validation_split_holding_no_field_its_metric_reads_is_refused_before_the_run_trains(eval_every):
+def test_a_validation_split_holding_no_field_its_metric_reads_is_refused_before_the_run_trains(eval_every,
+                                                                                                metric):
     """A metric that reads a field beside its scores (`Mean.fields`, as a CLIP score reads the captions it
-    compares) over a validation split whose records hold none: the split's first batch is read before the
-    run updates, whether it is scored every two steps or only at the end, and the run is refused there, on
-    every process at once, before it completes a step. Before, an end-only split met the missing field at
-    its first scoring, after training (row 9063)."""
+    compares, or a metric of a user's own that states it, as FID states its images) over a validation split
+    whose records hold none: the split's first batch is read before the run updates, whether it is scored
+    every two steps or only at the end, and the run is refused there, on every process at once, before it
+    completes a step. Before, an end-only split met the missing field at its first scoring, after training
+    (row 9063), and a metric no `Mean` was never asked (row 10561)."""
     from dew.artifacts import TokenScores
     from dew.eval.common import Mean
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -150,8 +153,24 @@ def test_a_validation_split_holding_no_field_its_metric_reads_is_refused_before_
     rows = Memory({"text": tokens}).read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
     model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
                               max_seq_len=4, attention_impl="reference")
-    captioned = Mean(lambda scores, batch: [len(caption) for caption in batch["caption"]], name="captioned",
-                     better="higher", reads=TokenScores, fields=("caption",))
+    class Captions:
+        """A metric of a user's own, no `Mean`, that reads the captions beside its scores (`Metric`'s
+        `fields`), as FID reads its reference images: the captions it was handed, counted."""
+
+        name, reads, fields = "captions", TokenScores, ("caption",)
+
+        def __call__(self, scores, batch) -> int:
+            return len(batch["caption"])
+
+        def merge(self, accumulated: int, contribution: int) -> int:
+            return accumulated + contribution
+
+        def finalize(self, accumulated: int) -> float:
+            return float(accumulated)
+
+    captioned = Captions() if metric == "own" else Mean(
+        lambda scores, batch: [len(caption) for caption in batch["caption"]], name="captioned",
+        better="higher", reads=TokenScores, fields=("caption",))
     stepped = Observe(1, lambda state: int(state.step))
     with pytest.raises(ValueError):
         Trainer(LMObjective(model, seq_len=4, ema_decay=None), optax.adam(.05), key=0).fit(
