@@ -1840,6 +1840,7 @@ def test_sm90_fed_fused_backward_deepens_to_3_stages_and_compiles_spill_free():
         k = jax.ShapeDtypeStruct((2, 4096, 8, 64), jnp.bfloat16)
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
         op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, residuals=shapes,
+                                                   scale=None, natural=attention_mosaic.NATURAL,
                                                    accurate=False)
         ba = op.bind(*args, interpret=False)
         cfg = op.derived(ba, target)
