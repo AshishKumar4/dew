@@ -2306,7 +2306,8 @@ def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int,
             resources.Product(block_q, value_width, block_k, beside=[logits] * 2, transposed=True),
             resources.Product(block_k, block_q, value_width, beside=[logits]),
             resources.Product(block_k, block_q, width, beside=[logits]),
-            resources.Product(block_q, block_k, width, beside=dq_tile))
+            resources.Product(block_q, block_k, width, beside=dq_tile),
+            narrow=config.narrow)
         if not family.operands_in_registers:
             # A family reading its operands from shared memory holds the weights narrowed for dV's product
             # beside the pullback until they are staged: wgmma's at 64 x 64, width 128, under a softcap held
