@@ -165,19 +165,25 @@ class FirstFit:
         """The window a document of `sizes` entries in each field goes to, which takes them, or None
         where no open window has room for it. One longer than a window is refused, as grain refuses
         it: no window ever has room for it."""
-        size, rest, cap, held = sizes[0], sizes[1:], self.segments, self.held
-        if size > self.rooms[0] or (rest and any(
-                other > room for other, room in zip(rest, self.rooms[1:], strict=True))):
+        if sizes[0] > self.rooms[0] or any(
+                other > room for other, room in zip(sizes[1:], self.rooms[1:], strict=True)):
             raise ValueError(f"a document of {list(sizes)} entries is longer than the windows of "
                              f"{list(self.rooms)} it packs into; cut it first")
+        window = self._chosen(sizes)
+        if window is not None:
+            self.free[window] -= sizes[0]
+            if len(sizes) > 1:
+                self.others[window] = [room - other for other, room in zip(sizes[1:], self.others[window],
+                                                                           strict=True)]
+            self.held[window] += 1
+        return window
+
+    def _chosen(self, sizes: Sequence[int]) -> int | None:
+        """The first window with room for every field of the document and fewer than `segments`."""
+        size, rest, cap, held = sizes[0], sizes[1:], self.segments, self.held
         for window, free in enumerate(self.free):
             if free >= size and (cap is None or held[window] < cap) and (not rest or all(
                     other <= room for other, room in zip(rest, self.others[window], strict=True))):
-                self.free[window] = free - size
-                if rest:
-                    self.others[window] = [room - other for other, room in zip(rest, self.others[window],
-                                                                               strict=True)]
-                held[window] += 1
                 return window
         return None
 
@@ -188,39 +194,26 @@ class FirstFit:
 
 
 class BestFit(FirstFit):
-    """Grain's best-fit placement (`BestFitPackedBatch.try_add_to_batch`, grain 0.2.18): a document goes to
-    the open window with room for it (and fewer than `segments` documents) that its fields fill most, the
-    first such where they tie; where none has room, the packer emits every window that holds a document and
+    """Grain's best-fit placement over one field's lengths (`BestFitPackedBatch.try_add_to_batch`, grain
+    0.2.18), which a published best-fit plan follows: a document goes to the open window it fills most, the
+    first where they tie; where none has room, the packer emits every window that holds a document and
     starts afresh, as first-fit's does. A window takes a document only once every window before it has, so
     the windows holding one are the first ones (`holding`)."""
 
-    def place(self, sizes: Sequence[int]) -> int | None:
-        size, rest, cap, held = sizes[0], sizes[1:], self.segments, self.held
-        if size > self.rooms[0] or (rest and any(
-                other > room for other, room in zip(rest, self.rooms[1:], strict=True))):
-            raise ValueError(f"a document of {list(sizes)} entries is longer than the windows of "
-                             f"{list(self.rooms)} it packs into; cut it first")
+    def __init__(self, room: int, bins: int, segments: int | None = None):
+        super().__init__((room,), bins, segments)
+
+    def _chosen(self, sizes: Sequence[int]) -> int | None:
+        (size,), room, cap = sizes, self.rooms[0], self.segments
         chosen, fullest = None, -1
         for window, free in enumerate(self.free):
-            # Each field's tokens held with the document's, against its room; a window at its documents' cap
-            # takes one only where every field then holds none, as grain adds its capacity to such a window's
-            # (`max_sequences_per_bin`): an empty document beside empty ones.
-            held_after = [self.rooms[0] - free + size, *(room - left + other for room, left, other in zip(
-                self.rooms[1:], self.others[window], rest, strict=True))]
-            capped = cap is not None and held[window] >= cap
-            if all(after <= (0 if capped else room)
-                   for after, room in zip(held_after, self.rooms, strict=True)):
-                # What its fields already hold, summed: grain's score, its first maximum chosen.
-                used = sum(held_after) - sum(sizes)
-                if used > fullest:
-                    chosen, fullest = window, used
-        if chosen is None:
-            return None
-        self.free[chosen] -= size
-        if rest:
-            self.others[chosen] = [room - other for other, room in zip(rest, self.others[chosen],
-                                                                       strict=True)]
-        held[chosen] += 1
+            used = room - free
+            # A window at its documents' cap takes one only where it then holds no token, as grain adds
+            # its capacity to such a window's (`max_sequences_per_bin`): an empty document beside empty
+            # ones.
+            capped = cap is not None and self.held[window] >= cap
+            if used + size <= (0 if capped else room) and used > fullest:
+                chosen, fullest = window, used
         return chosen
 
 
@@ -246,7 +239,8 @@ def first_fit(sizes: np.ndarray, window: int, bins: int,
     goes to the first window with room and an empty window has room for
     anything.
     """
-    placement = (BestFit if policy == "best-fit" else FirstFit)((window,), bins, segments)
+    placement = (BestFit(window, bins, segments) if policy == "best-fit"
+                 else FirstFit((window,), bins, segments))
     plan = np.empty(len(sizes), np.int64)
     closed = 0
     for index, size in enumerate(sizes.tolist()):

@@ -31,45 +31,47 @@ SIZES_BEST_FIT = (3, 7, 6, 2, 4, 5, 7, 1, 5, 6, 7, 2, 3, 8, 1, 4)
 def test_a_published_best_fit_pack_reads_the_windows_grains_best_fit_packer_packs(tmp_path, bins, segments,
                                                                                   sizes):
     """A best-fit pack of whole documents is published (row 9053: refused before) with the plan grain's
-    best-fit packer places them by (`tokens.BestFit`): read back by index, it holds window for window, in
-    order, the documents grain's `BestFitPackIterDataset` packs from them with its bins emitted in order, as a
-    memory read of the pack does."""
+    best-fit packer places them by (`tokens.BestFit`): read back by index, it is window for window, in
+    order, the tokens, segments and positions grain's `BestFitPackIterDataset` packs from them with its bins
+    emitted in order, less the windows that hold no target, as a memory read of the pack is. A chunk step
+    written after the generation, which drops an empty document the plan places, reads as written: the chain
+    chunked after the cache packs as the chain chunked before the publication."""
     import grain
     from grain.experimental import BestFitPackIterDataset
 
-    # Each document its own letter, so a window's byte ids name the documents it holds; tokenized, the
-    # documents' lengths are certified (`Tokenize`), as a published plan needs.
+    # Each document its own letter; tokenized, the documents' lengths are certified (`Tokenize`), as a
+    # published plan needs.
     texts = tuple(chr(ord("a") + index) * size for index, size in enumerate(sizes))
     prefix = Pipeline(Memory(tuple({"text": text} for text in texts))).map(Tokenize())
     packed = prefix.pack(9, bins=bins, segments=segments, policy="best-fit")
     generation = publish(packed, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
                                        shard_bytes=256 * 1024), read="indexed", loading=READ)
 
-    def held(tokens) -> list[int]:
-        """The documents a window's tokens are of, in their order: each its letter's byte id."""
-        return list(dict.fromkeys(int(token) for token in np.ravel(tokens) if token))
-
-    def tokened(windows: list[list[int]]) -> list[list[int]]:
-        """The windows that hold a token, which every read keeps (one of empty documents alone it leaves
-        out, having no target)."""
-        return [window for window in windows if window]
-
-    def windows(chain, read) -> list[list[int]]:
-        # One pass, in order (a validation read's).
+    def windows(chain, read) -> list[tuple[list[int], list[int], list[int]]]:
+        # One pass, in order (a validation read's): each window's tokens, segments and positions.
         reader = validation(chain, batch=1, read=read, loading=READ)(DataPartition())
         try:
-            return [held(batch["text"]) for batch in reader]
+            return [(np.asarray(batch["text"])[0].tolist(), batch["text_coordinates"].segments[0].tolist(),
+                     batch["text_coordinates"].positions[0].tolist()) for batch in reader]
         finally:
             reader.close()
 
-    grains = [held(window["text"]) for window in BestFitPackIterDataset(
+    reference = BestFitPackIterDataset(
         grain.MapDataset.source([{"text": np.frombuffer(text.encode(), np.uint8).astype(np.int32)}
                                  for text in texts]).to_iter_dataset(), length_struct={"text": 9},
-        num_packing_bins=bins, shuffle_bins=False, max_sequences_per_bin=segments)]
-    published = windows(prefix.cache(generation).pack(
-        9, bins=bins, segments=segments, policy="best-fit"), "indexed")
-    assert tokened(published) == tokened(grains), (published, grains)
-    assert tokened(windows(packed, "memory")) == tokened(grains)
+        num_packing_bins=bins, shuffle_bins=False, max_sequences_per_bin=segments)
+    # The windows that hold a target, a token after another of its document (`_dew_valid_targets`).
+    grains = [(window["text"].tolist(), window["text_segment_ids"].tolist(),
+               window["text_positions"].tolist()) for window in reference
+              if np.any((window["text_segment_ids"][1:] == window["text_segment_ids"][:-1])
+                        & (window["text_segment_ids"][1:] != 0))]
+    published = windows(prefix.cache(generation).pack(9, bins=bins, segments=segments, policy="best-fit"),
+                        "indexed")
+    assert published == grains
+    assert windows(packed, "memory") == grains
+    chunked = prefix.flat_map(Chunks(9)).pack(9, bins=bins, segments=segments, policy="best-fit")
+    assert windows(prefix.cache(generation).flat_map(Chunks(9)).pack(
+        9, bins=bins, segments=segments, policy="best-fit"), "indexed") == windows(chunked, "memory")
 
 
 def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tmp_path):
