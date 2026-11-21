@@ -407,9 +407,12 @@ def on_a_tpu(fn):
 
 def normal_draw(seed, *shapes, scale: float = 1.0, dtype=jnp.float32) -> tuple:
     """Standard normal arrays of `shapes` at `scale` in `dtype`, from `seed` (a seed, or a site's salt and
-    a seed: NumPy's `SeedSequence` entropy)."""
+    a seed: NumPy's `SeedSequence` entropy), made on the host's CPU and committed to no device, so a program
+    places them where it runs: a GPU tier part's prepare made them on its compile-only GPU, which computes
+    nothing, and the draw's cell went unprepared (row 10552)."""
     rng = np.random.default_rng(seed)
-    return tuple(jnp.asarray(rng.standard_normal(shape) * scale, dtype) for shape in shapes)
+    with jax.default_device(jax.devices("cpu")[0]):
+        return tuple(jnp.asarray(rng.standard_normal(shape) * scale, dtype) for shape in shapes)
 
 
 def normal_drawn(salt: int, *shapes, dtype=jnp.float32):

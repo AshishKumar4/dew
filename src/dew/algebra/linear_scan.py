@@ -960,12 +960,15 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
             return Work(operations=12.0 * c * width, kernels=1.0, kept_bytes=kept(c * width))
         if (args := get_callable_args(node, decay)) is not None:
             # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass; a decay a
-            # value takes alone two a span (`scan._Split`: its factors each normal).
+            # value takes alone three a span (`scan._Split`: its factors each normal).
             part = terms.text(args[0])
             elements = {"entering": c * width, "to_last": c * width, "whole": width, "between": c * c * width,
                         "entering_before": c * width, "between_before": c * c * width}
-            # A span's two factors (`scan._Split`), a pair's one.
-            factors = elements[part] * (1 if part.startswith("between") else 2)
+            # A span's factors (`scan._Split`'s, read where a price is asked: scan reads this module), a
+            # pair's one.
+            from dew.algebra.scan import _Split
+
+            factors = elements[part] * (1 if part.startswith("between") else len(_Split._fields))
             if part.endswith("_before"):
                 # A token back: a shift of the decay it reads (`shifted_back`, priced once beside it), each
                 # factor selected at a document's start and kept (`scan._back`).

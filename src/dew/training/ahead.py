@@ -21,7 +21,8 @@ A configured run does both ends: `--trainer.compile-ahead.generation sm90 --trai
 (`AheadTarget`), and `--trainer.ahead step.dew-aot` on a host of that topology runs it in place of
 compiling its first step, where it is the very program the run compiles first (`AheadOfTime.taken`).
 
-A run's plan is the fewest microbatches at the least recomputation that fit, which memory decides; which
+A run's plan is the fewest microbatches that fit at the first rung its search admits (the remat rungs at
+its own head first, a tight cold start's second compile: docs/design/training.md), which memory decides; which
 plan steps fastest, a rung that recomputes more at fewer microbatches or the plan's own, the GPUs alone
 tell. `--trainer.compile-ahead.frontier`, with each GPU's memory stated, lists past the plan each rung
 above it that fits at fewer microbatches than every plan before it, at the fewest that fit there, and,

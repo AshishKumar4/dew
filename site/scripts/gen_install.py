@@ -27,6 +27,7 @@ CONSTRAINT = ("# BEGIN package index (site/scripts/gen_install.py)", "# END pack
 COLAB = ("// BEGIN package index (site/scripts/gen_install.py)", "// END package index")
 PIP = ("<!-- BEGIN pip (site/scripts/gen_install.py) -->", "<!-- END pip -->")
 JAX = ("<!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->", "<!-- END JAX requirement -->")
+BUILDS = ("<!-- BEGIN Dew's JAX builds (site/scripts/gen_install.py) -->", "<!-- END Dew's JAX builds -->")
 COMMANDS = ("<!-- BEGIN install commands (site/scripts/gen_install.py) -->", "<!-- END install commands -->")
 UV = ("# BEGIN uv bootstrap (site/scripts/gen_install.py)", "# END uv bootstrap")
 EXTRAS = ("<!-- BEGIN extras (site/scripts/gen_install.py checks them against pyproject.toml) -->",
@@ -53,6 +54,29 @@ def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str,
         raise SystemExit(f"gen_install reads a requires-python of the form >=X.Y, not {required!r}")
     tensor_memory = (literal("TENSOR_MEMORY_SMS"), literal("LEAST_CUBLAS_BESIDE_TENSOR_MEMORY")[0])
     return builds, index, least[1], tensor_memory
+
+
+def pinned(requirements: list[str], name: str) -> str:
+    """The version `requirements` pin `name` at (its first `==` requirement, an extra or a marker beside)."""
+    return next(found[1] for requirement in requirements
+                if (found := re.match(rf"{re.escape(name)}(?:\[[^]]*\])?==([^;\s]+)", requirement)))
+
+
+def builds_sentence(project: dict) -> list[str]:
+    """Which of Dew's builds of JAX's native packages each install takes, as pyproject.toml pins them: the
+    CUDA and PJRT plugins of the `cuda12` and `cuda13` extras and of `kernel-compile`, and jaxlib, Dew's on
+    Linux x86_64 and aarch64, the release's elsewhere (train 1111's review: the page named post114's and
+    post111's while the pins were post117's)."""
+    optional, dependencies = project["optional-dependencies"], project["dependencies"]
+    plugins, compiling = (pinned(optional[extra], "jax-cuda12-plugin").rpartition(".")[2]
+                          for extra in ("cuda12", "kernel-compile"))
+    dews = pinned([each for each in dependencies if "sys_platform == 'linux'" in each], "jaxlib")
+    stock = pinned([each for each in dependencies if "sys_platform != 'linux'" in each], "jaxlib")
+    return [f"Dew's CUDA and PJRT plugins are {plugins}'s on x86_64 and aarch64 (a GH200's Grace) alike, "
+            f"and the `kernel-compile` extra's (x86_64 only) are {compiling}'s. On Linux x86_64 and aarch64 "
+            f"jaxlib is Dew's build too, `jaxlib=={dews}`, whose client of a plugin reads that metadata, and "
+            f"libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock "
+            f"`jaxlib=={stock}`."]
 
 
 def documented_extras(text: str) -> set[str]:
@@ -156,6 +180,7 @@ def main() -> None:
                          (REPO / "site/package.json", ()),
                          (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least), (PIP, advice),
                                                            (JAX, [f"Dew requires `{jax}`."]),
+                                                           (BUILDS, builds_sentence(project)),
                                                            (COMMANDS, commands(builds, index)))),
                          (REPO / "README.md", ((LEAST, least), (PIP, advice),
                                                (COMMANDS, commands(builds, index))))):

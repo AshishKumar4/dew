@@ -8,11 +8,8 @@ on:
   push:
     # A train's CI is the land queue's (dew-ops queue/gates.py, from the same tools/ci scripts), on the hub (dew-ops
     # runbooks/hub.md). Main's push, the hub's mirror of it, finds the queue's proof of a tip it published; a direct
-    # push to main is its tip's only test. base/kernels runs on every push: its template lanes push there with no
-    # tests first, and this run, every lint gate among it, is their check (owner, 2026-11-02: base gathered 85
-    # pyright errors while its per-push run was off); a red one is paged to the lanes whose files the push changed
-    # (the land queue's base-ci).
-    branches: [ "main", "base/kernels" ]
+    # push to main is its tip's only test. base/kernels is retired: the hub refuses its pushes (row 10798).
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
   # A dispatch runs its ref as a push would. No run is the whole suite's: trains are the only check (owner,
@@ -25,13 +22,10 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref makes the older run's verdict moot, but on base/kernels, whose lanes push more
-# often than a run takes (about 47 minutes), a running run finishes: GitHub keeps the newest push pending behind it,
-# cancelling an older pending one, so each run that finishes grades the newest tip it could and its reds page
-# (2026-11-02: seven base runs in a row cancelled by the next push, 2 to 26 minutes in, none finished).
+# A newer push to the same ref makes the older run's verdict moot.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/base/kernels' }}
+  cancel-in-progress: true
 
 env:
   # The armada runner every armada job uses: one that waits out a redeploy's refusal of a new job (armada 1626e08),
@@ -123,7 +117,7 @@ jobs:
       run: |
         base=$(git merge-base HEAD origin/main)
         # A push to main's gates start after a train's (the land queue's, at 10), as its suite does.
-        case "$GITHUB_REF_NAME" in main|base/kernels) priority=--priority=5 ;; *) priority= ;; esac
+        case "$GITHUB_REF_NAME" in main) priority=--priority=5 ;; *) priority= ;; esac
         # Any CPU the region gives: the suite's pin and AMD's 25/1, as a gate reads text and types and its verdict is
         # one on any host (2026-11-13: small lint maps pinned alone ran out 8 minutes on 25/1 placements).
         cpus=$(jq -r '[.task.cpu // empty] | flatten | map("\(.vendor)/\(.family)/\(.model)") + ["AuthenticAMD/25/1"] | unique | join(",")' .armada.json)
@@ -158,20 +152,13 @@ jobs:
         name: dist
         path: dist/
 
-  # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its armada
-  # group depends on it: a run reruns what its change reaches, and the whole suite where it cannot place it: from
-  # main, and for a push to
-  # base/kernels from the last push whose run finished, green or red (the tip it moved from before any did; main
-  # where it is new).
+  # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its timeout
+  # depends on it: a run reruns what its change reaches from main, and the whole suite where it cannot place it.
   scope:
     # A pull request's CI is its lint and package, on hosted runners: a fork's holds no armada credentials, and its
     # suite runs when a lane's head of it reaches the land queue.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    # Reads the last run on base/kernels that finished, green or red, which its pushes are scoped from.
-    permissions:
-      actions: read
-      contents: read
     outputs:
       policy: ${{ steps.policy.outputs.policy }}
     steps:
@@ -185,23 +172,8 @@ jobs:
     # tools/armada/ci.py runs itself under the one Python every key is computed by (HASHED_BY), through uv.
     - uses: astral-sh/setup-uv@v6
     - id: policy
-      env:
-        BEFORE: ${{ github.event.before }}
-        GH_TOKEN: ${{ github.token }}
       run: |
-        case "$GITHUB_REF_NAME" in
-          # From the last push whose run finished, green or red, whose rows its run recorded: a newer push cancels
-          # a pending run (the group's), and only the newest tip of a branch fixed forward needs a run, which covers
-          # what the cancelled ones changed. Never the last green one alone: a base red for days made every run's
-          # policy span every lock and harness change since, and every run cold (2026-11-07: 90 minutes a run).
-          base/kernels)
-            ran="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=base/kernels&status=completed"
-            from=$(gh api "$ran&per_page=100" -q '[.workflow_runs[] | select(.conclusion == "success" or
-              .conclusion == "failure")][0].head_sha // empty')
-            git cat-file -e "${from:-$BEFORE}^{commit}" 2>/dev/null && from=${from:-$BEFORE} || from=origin/main ;;
-          *) from=origin/main ;;
-        esac
-        DEW_TEST_CACHE=$(python3 tools/armada/ci.py policy "$from")
+        DEW_TEST_CACHE=$(python3 tools/armada/ci.py policy origin/main)
         echo "the test cache's policy: $DEW_TEST_CACHE"
         echo "policy=$DEW_TEST_CACHE" >> "$GITHUB_OUTPUT"
 
@@ -234,18 +206,14 @@ jobs:
     # MODELS, so every case runs in one. A commit proven on another push is not run
     # again. armada's priorities share the fleet with the land queue's trains, and
     # its one line of waiting holders gives a gang's ranks their containers in turn
-    # (armada#49). A push to base/kernels takes a group of its own, whether it reruns what its change reaches or
-    # the whole suite: it runs no gangs, which every train runs.
+    # (armada#49).
     concurrency:
-      group: >-
-        ${{ (github.ref_name == 'base/kernels' && 'armada-base')
-        || (github.ref_name == 'main' && 'armada-main')
-        || 'armada' }}
+      group: ${{ (github.ref_name == 'main' && 'armada-main') || 'armada' }}
       cancel-in-progress: false
       queue: max
     # A suite runs its deadline and then its judges up to a task's 1,800 s and 600 s more (armada's later waves):
     # a cold one's 5,400 s, 140 minutes; a warm one's 2,700 s, 90.
-    timeout-minutes: ${{ ((github.ref_name == 'base/kernels' || needs.scope.outputs.policy != 'on') && 140) || 90 }}
+    timeout-minutes: ${{ (needs.scope.outputs.policy != 'on' && 140) || 90 }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -272,20 +240,13 @@ jobs:
         DEW_XLA_CACHE_READ_TOKEN: ${{ secrets.DEW_XLA_CACHE_READ_TOKEN }}
         DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
         PROVEN: ${{ needs.proven.outputs.run }}
-      # tools/ci/suite.sh, which this step reads from the ref, holds what the run takes. A push to base/kernels
-      # runs no gangs: main's trains run them. It runs at the staged rung (5), as the promotion path,
-      # above every lane's run and below a train (Main, 2026-11-16: at 0 its judges' draws waited out their
-      # deadline behind lane work), on the pool armada gives it, one run at a time and the newest tip pending
-      # behind it (the concurrency groups above): at a lane's whole-suite priority (-10) it waited behind
-      # every other run and
-      # ran out its deadline ungraded, each of the eleven runs that started from 2026-11-09 to 11-12, though
-      # reuse left each about 115 tasks (the owner, 2026-11-01: every push to base is graded). A push to main the queue did not grade (a direct push) is its tip's only test, at 5, in
-      # a concurrency group of its own (the maintainer, 2026-10-29, 2026-10-31), its gangs and its suite at one
-      # priority, so the suite never recalls its own gangs' containers.
+      # tools/ci/suite.sh, which this step reads from the ref, holds what the run takes. A push to main the queue
+      # did not grade (a direct push) is its tip's only test, at the staged rung (5), above every lane's run and
+      # below a train, in a concurrency group of its own (the maintainer, 2026-10-29, 2026-10-31), its gangs and
+      # its suite at one priority, so the suite never recalls its own gangs' containers.
       run: |
-        case "$GITHUB_REF_NAME" in base/kernels) gangless=1 ;; *) gangless= ;; esac
-        case "$GITHUB_REF_NAME" in main|base/kernels) priority=5 ;; *) priority= ;; esac
-        ARMADA=armada LABEL="$GITHUB_REF_NAME" PRIORITY="$priority" GANGLESS="$gangless" \
+        case "$GITHUB_REF_NAME" in main) priority=5 ;; *) priority= ;; esac
+        ARMADA=armada LABEL="$GITHUB_REF_NAME" PRIORITY="$priority" \
           OUT="$RUNNER_TEMP/ci" bash tools/ci/suite.sh ${{ github.sha }}
     - name: Cancel the armada jobs of a cancelled run
       # A client killed before it cancelled leaves its job running to its deadline, on the fleet the

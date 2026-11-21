@@ -88,8 +88,7 @@ A GPU-touching change is qualified by its row; where it lands and when each run 
 
 | Destination | Change | Qualification |
 |---|---|---|
-| `base/kernels` | Kernel and template pieces | Hardware-free, on each push: interpret-mode check 1 for every mainloop, stability, deviceless compilation and the resource checks, which qualify without hardware; what certifies a launch's own compile is kernel-templates.md §7's. |
-| `main`, from `base/kernels` | Composed kernel base | The GPU tier and the no-regression window on every gating type. |
+| `main` | Kernel and template pieces | Hardware-free, in each train: interpret-mode check 1 for every mainloop, stability, deviceless compilation and the resource checks, which qualify without hardware; what certifies a launch's own compile is kernel-templates.md §7's. Then the GPU tier and the no-regression window on every gating type. |
 | `main` | Hopper-only path | The native H100 run. |
 | `main` | Other changes reaching GPU-specific behavior | The native tier on the affected target types. |
 
@@ -206,4 +205,4 @@ Branch coverage directs scenario settings. Uncovered code that a real use case r
 
 ## What the suite costs
 
-`tests/test_durations.json` is the CPU plan's weights and nothing else: each test's seconds as the CPU suite's last green rows observed it, by which the plan cuts a file into tasks (`tools/armada/ci.py durations` folds it from main's CI). A test the CPU suite skips, one marked for a GPU, weighs its skip there, a thousandth of a second for a flow that trains for minutes on its device; a check-1 site's entry is its judge's pooling, not its draws. So the file is no ledger of cost. What the CPU suite costs is read from a run: its rows' seconds and its sites' map tasks, which armada times. What a GPU test costs is read from its tier's receipts, each row's own tests' seconds on its device.
+`tests/test_durations.json` is the CPU plan's weights and nothing else: each test's warm seconds and, once a run compiled its programs cold, its cold ones, as `tools/armada/ci.py durations` folds them from main's CI (a warm time lowered where a green run takes well under it, a cold time the newest green cold run's), by which the plan cuts a file into tasks at the greater of the two. A test the CPU suite skips, one marked for a GPU, weighs its skip there, a thousandth of a second for a flow that trains for minutes on its device; a check-1 site's entry is its judge's pooling, not its draws. So the file is no ledger of cost. What the CPU suite costs is read from a run: its rows' seconds and its sites' map tasks, which armada times. What a GPU test costs is read from its tier's receipts, each row's own tests' seconds on its device.

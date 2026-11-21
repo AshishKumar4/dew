@@ -513,16 +513,17 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 @pytest.mark.parametrize("generation_name", FP32_GATED)
 def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name):
     """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
-    of a causal call 64 and 128 wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
-    launch within its shared memory, spilling nothing."""
+    of a causal call 64, 128 (and 256 on Hopper, row 6508) wide, lowered and compiled by ptxas for
+    `generation_name` on this CPU: every launch within its shared memory, spilling nothing."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
+    widths = (64, 128, 256) if generation_name == "sm90" else (64, 128)
     cases = []
     with generation.assumed(generation_name):
-        for width in (64, 128):
+        for width in widths:
             query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.float32)
             key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.float32)
             zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
@@ -539,34 +540,6 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
 
             cases.append(KernelCase(f"fp32-forward-{width}", _make))
         found = compile_mosaic_kernels(cases, generation_name)
-    failed = mosaic_failures(found)
-    assert not failed, "\n".join(failed)
-
-
-@COMPILES_ON_CPU
-def test_an_fp32_forward_at_width_256_compiles_spill_free_on_hopper():
-    """An fp32 call's inference forward (`MosaicForward.parts = 3`) at width 256 derives a 32-key tile on
-    Hopper (`sm90`) within its 232,448-byte shared memory and compiles spill-free (row 6508)."""
-    from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    queries = 512
-    spans = template.spans(queries, queries, 1, causal=True)
-    query = jax.ShapeDtypeStruct((1, queries, 4, 256), jnp.float32)
-    key = jax.ShapeDtypeStruct((1, queries, 2, 256), jnp.float32)
-    with generation.assumed("sm90"):
-        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
-        op, args = attention_mosaic._forward_call(*zeros, spans, None, scale=None,
-                                                  natural=attention_mosaic.NATURAL)
-        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
-        config = op.derived(ba, generation.gpu_target())
-        assert config is not None, "the Mosaic forward derives no fp32 config 256 wide on sm90"
-
-        def forward(query, key, value):
-            return attention_mosaic.forward(query, key, value, spans, None)
-
-        found = compile_mosaic_kernels(
-            [KernelCase("fp32-forward-256", lambda: (forward, (query, key, key)))], "sm90")
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
@@ -1601,3 +1574,29 @@ def test_an_a100_d128_and_d256_forward_use_whole_row_warps_and_high_residency():
             KernelCase("sm80-d256-64x64-c128", lambda: op256.lowering(ba256, cfg256)),
         ], "sm80")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_launch_seconds_prices_wave_quantization_and_residency():
+    """`_launch_seconds` prices quantized waves (`ceil(programs / (SMs * resident))`) so a config spilling
+    into a second sparse wave on Hopper (176 programs at 1 resident on 132 SMs) is priced slower than a
+    single full wave at 2 resident (256 programs on 132*2=264 slots, row 6216)."""
+    from dew.nn.kernels.templates import cost
+
+    target = generation.gpu_target("sm90")
+    work = cost.Work(flops=1e11, operations=1e9, exponentials=1e8, device_bytes=1e7, shared_bytes=1e7)
+    two_waves = attention_mosaic._launch_seconds(work, 176, target, resident=1)
+    one_wave = attention_mosaic._launch_seconds(work, 256, target, resident=2)
+    assert one_wave < two_waves, (one_wave, two_waves)
+
+
+def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
+    """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) and default 16-bit dot preset
+    (`_jax_nn_algorithm`) through `dew.algebra.error.product_precision` (row 5473)."""
+    from dew.nn import attention
+    from dew.nn.kernels.templates import attention_algebra as algebra
+
+    with generation.assumed("sm90"):
+        assert algebra.bf16_part_count(accurate=True) == 3
+        assert algebra.bf16_part_count(accurate=False) == 1
+        assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+        assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32

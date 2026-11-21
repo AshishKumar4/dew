@@ -188,6 +188,7 @@ progress = _loaded(HERE / "progress.py")
 natives, digests, grading = (_loaded(HERE / f"{name}.py") for name in ("natives", "digests", "grading"))
 host, stalls, temp_roots = (_loaded(HERE / f"{name}.py") for name in ("host", "stalls", "temp_roots"))
 costs, cuts, partition = (_loaded(HERE / f"{name}.py") for name in ("costs", "cuts", "partition"))
+fold = _loaded(HERE / "fold.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
@@ -779,12 +780,12 @@ def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
     """Each file's seconds on armada under `python`: its median, which armada sums over a split file's groups
     (`task`), or its tests' sum in tests/test_durations.json where that is more: each test's record is its
-    least time (`durations`), so a sum past the median may mean the measured runs predate the file's current
-    tests, and the sum is a floor on what it takes. base/kernels' route census, 1,576 tests recorded at 2,654
-    s in a file main ran in 6 s, was packed by that median with six other files into one task, which ran past
-    its deadline (train 18). Else the recorded sum, scaled by how much slower armada ran the files measured
-    both ways, and never below it, a floor as a measured file's is (a test's cold time outweighs a warm run's
-    measure); else None, for a file nothing has timed."""
+    recorded time (`durations`), so a sum past the median may mean the measured runs predate the file's
+    current tests, and the sum is a floor on what it takes. base/kernels' route census, 1,576 tests recorded
+    at 2,654 s in a file main ran in 6 s, was packed by that median with six other files into one task, which
+    ran past its deadline (train 18). Else the recorded sum, scaled by how much slower armada ran the files
+    measured both ways, and never below it, a floor as a measured file's is (a test's cold time outweighs a
+    warm run's measure); else None, for a file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     # A file armada holds no timing of weighs its rows' sum at the cut they name (`measured_cut`), which is
     # what its timing would say: armada keeps a plan's rows from run to run, and drops the file timings a run
@@ -1284,8 +1285,8 @@ def stale_row(python: str, name: str, group: str, why: str) -> dict:
 def stale_cost(name: str, group: str, reading: Reading) -> float:
     """What a kept row of test file `name` (in `group`'s group) costs a task that runs it, its record not
     found: its tests' recorded seconds, its check-1 sites' aside, which run apart (`own_tests`; a group's,
-    `members`), each its least time, and what a run cold adds to them (`COLD_SECONDS`), as the plan weighs a
-    cold row; a file the record does not name, that alone."""
+    `members`), each its recorded cost, and what a run cold adds to them (`COLD_SECONDS`), as the plan weighs
+    a cold row; a file the record does not name, that alone."""
     reading.cut(name, 1)
     own = own_tests(name, (reading.durations or {}).get(name, {}))
     nodes = members(name, cut, reading) if (cut := cut_of(group)) else list(own)
@@ -1832,7 +1833,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             current = None
         elif current is None:
             current = begun(python, row_["name"], held, common, token, fresh_only=True)
-        body = json.dumps({"key": key,
+        body = json.dumps({"key": key, "why": ran.get("why"),
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            **({"read": read} if ran["depends"] is None and read is not None else {}),
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
@@ -2194,85 +2195,38 @@ def verdict_rows(verdict: dict) -> dict[str, list[dict]]:
     return rows
 
 
-def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str, float]:
-    """What a file's red, cut-off or incomplete rows `held` time of its tests, as `folded` takes it: each
-    test a row timed past its record raises it, and a test a row its task's deadline cut off finished (all
-    but its last, which the deadline stopped, timed only as far as it ran) is taken where the record lacks
-    it; the run counts as no green one, so nothing it timed lowers an entry or drops one. A test that grew
-    past its record and makes its group outrun its deadline is timed so, or its group is cut by the old
-    time every run and dies at it again (Main, 2026-11-17: base/kernels' test_attention_mosaic_compile
-    groups, recorded at about 100 s, ran 12 to 25 min). A site's entries stay as they are
-    (`site_entries`). The trade-off, Main's: a time a bad red run inflated (a hang) comes down only when a
-    green run finds the file stale (`stale`), so until then its test is packed further apart than it needs,
-    which costs packing, never coverage or a verdict; a green run lowering entries would change the green
-    path's keeping of them byte for byte."""
-    taken: dict[str, float] = {}
-    for row_ in held:
-        timed = list(row_.get("tests", {}).items())
-        stopped = row_.get("kind") == "deadline"
-        finished = {node for node, _ in (timed[:-1] if stopped else timed)}
-        for node, seconds in timed:
-            if session.site_name(node, marked) in marked:
-                continue
-            grew = node in record and seconds > record[node]
-            if grew or (node not in record and stopped and node in finished):
-                taken[node] = round(seconds, 3)
-    return taken
+def folded_entries(record: dict[str, "Entry"], verdict: dict, target: float,
+                   rows: dict[str, list[dict]]) -> dict:
+    """The durations `record`'s entries with main's CI `verdict` folded in, its `rows` (`verdict_rows`): each
+    file whole (`folded`), each cold-timed test seen at its warm record where it has one, a cold run moving
+    no warm time (a test no warm run has timed takes its cold time as its warm one, which a warm run lowers),
+    each test's warm time lowered first to what its green runs take (fold.py's `lowered`, so the same verdict
+    folded again moves nothing), then its cold time and peak (fold.py's `entries`); each file's sites read
+    once for both."""
+    marks = {name: sites(name) for name in rows}
+    warm = fold.lowered(session, {node: session.warm_cold(held)[0] for node, held in record.items()}, rows,
+                        marks, target)
+    # A green row that is no planning evidence (fold.py's `evidence`: reused, or run alone after a failure
+    # beside other tasks) and each test a row timed cold keep its record's time: they count for whether a
+    # file is whole, never as its time; a red row's raises, isolated or not, as `raised` takes them (review).
+    calm = {name: [{**row_, "tests": {node: warm[node] if node in warm and (
+        node in row_.get("cold", ()) or (row_["exitCode"] == 0 and not fold.evidence(row_))) else seconds
+        for node, seconds in row_.get("tests", {}).items()}} for row_ in held] for name, held in rows.items()}
+    return fold.entries(session, record, folded(warm, verdict, target, calm, marks), rows, grading.owning)
 
 
-def folded_entries(record: dict[str, "Entry"], verdict: dict, target: float) -> dict:
-    """The durations `record`'s entries with main's CI `verdict` folded in (`session.entry`): each test's
-    warm time as `folded` keeps the record, a run in which it compiled a program the shared cache lacked
-    (a row's `cold`) timing it no warm time; its cold time the least of the green runs so, raised by a
-    red or cut-off row's past it, as `raised` raises an entry; its peak the newest of its rows' (`peak`).
-    A test the warm record drops loses its cold time and peak with it: one record, so no test is timed
-    cold or sized that the record no longer holds (Main, 2026-11-18, rows 7939 and 6003)."""
-    warm = {node: session.warm_cold(held)[0] for node, held in record.items()}
-    cold = {node: found for node, held in record.items()
-            if (found := session.warm_cold(held)[1]) is not None}
-    peaks = {node: found for node, held in record.items() if (found := session.peak(held)) is not None}
-    # The warm fold sees each cold-timed test at its warm record, where it has one: a cold run moves no warm
-    # time. A test no warm run has timed takes its cold time as its warm one, which a warm run lowers.
-    calm = {**verdict, "rows": [
-        {**row_, "tests": {node: warm[node] if node in row_.get("cold", ()) and node in warm else seconds
-                           for node, seconds in row_.get("tests", {}).items()}}
-        for row_ in verdict["rows"]]}
-    kept = folded(warm, calm, target)
-    for held in verdict_rows(verdict).values():
-        for row_ in held:
-            green = row_["exitCode"] == 0
-            for node in row_.get("cold", ()):
-                if node in kept and (seconds := row_.get("tests", {}).get(node)) is not None:
-                    before = cold.get(node)
-                    cold[node] = (seconds if before is None else min(before, seconds) if green
-                                  else max(before, seconds))
-            # Each test's peak, the newest task's that ran it, red or green: a bound that follows its test as
-            # it grows, never the least of runs it has outgrown (`task_peak`).
-            if (measured := row_.get("peak")) is not None:
-                for node in row_.get("tests", {}):
-                    if node in kept:
-                        peaks[node] = session.moved_peak(peaks.get(node), int(measured))
-                # A task killed before it reported a case (its pytest OOM-killed) still bounds its file's
-                # tests: their peaks raised to it, never lowered by a run that timed none of them (review).
-                if not row_.get("tests"):
-                    file = row_["name"].split(":", 1)[1].split("#", 1)[0]
-                    for node in kept:
-                        if grading.owning(node) == file:
-                            peaks[node] = max(peaks.get(node, 0), int(measured))
-    return {node: session.entry(seconds, cold.get(node), peaks.get(node)) for node, seconds in kept.items()}
-
-
-def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
+def folded(record: dict[str, float], verdict: dict, target: float, rows: dict[str, list[dict]] | None = None,
+           marks: dict[str, dict] | None = None) -> dict[str, float]:
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
     complete (its whole row, or every group of its cut) takes the times they observed where its record is
     stale (`stale`, its total drifted among it). A group's key holds its tests, not their seconds
     (`cache_key`), and its cut stays as stored while its groups hold (`session.stored_bounds`), so a refreshed
     file reruns only the groups whose tests move, and every group of it where its group count changes. A file
-    with a red or missing row keeps its entries, but for what its rows timed past them (`raised`), as does a
-    file the verdict did not run, and one the checkout has changed since the verdict's commit, whose rows
-    observed tests it may no longer hold (2026-10-31: train 370's fold replaced a head's 66 renamed test ids
-    with main's old ones); a file the checkout no longer has loses them. A file a task's deadline cut off
+    with a red or missing row keeps its entries, but for what its rows timed past them (fold.py's `raised`),
+    as does a file the verdict did not run, and one the checkout has changed since the verdict's commit, whose
+    rows observed tests it may no longer hold (2026-10-31: train 370's fold replaced a head's 66 renamed test
+    ids with main's old ones); a file the checkout no longer has loses them. A file a task's deadline cut off
     takes the times its rows observed of the tests it finished (all but the last, which the deadline stopped)
     where its record lacks them: no green run would ever time it, and the plan cuts it by them, a test it
     never reached weighing their mean (2026-11-02: base/kernels' test_algebra_laws, recorded nowhere, ran 46
@@ -2280,17 +2234,18 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     that recorded it. Each train folds main's CI so (the land queue), and nothing else writes the record. A
     site its file's marks shard (`sites`) keeps its entries: its judge's row times its pooling, no measure of
     its draws, so its map tasks are weighed by armada's measures of them, never by the record
-    (`site_entries`), and a judge armada did not run is a row of its task's name."""
-    rows = verdict_rows(verdict)
+    (`site_entries`), and a judge armada did not run is a row of its task's name. Its `rows` and each file's
+    sites (`marks`) are read where not handed in."""
+    rows = verdict_rows(verdict) if rows is None else rows
     kept = {node: seconds for node, seconds in record.items() if Path(grading.owning(node)).is_file()}
     for name, held in rows.items():
         splits = {parsed_row(row_["name"])[2] for row_ in held}
         counts = {int(split_.split("/")[1]) for split_ in splits if split_}
         complete = splits == {""} or (len(counts) == 1 and splits == {f"{group}/{count}" for count in counts
                                                                       for group in range(1, count + 1)})
-        marked = sites(name)
+        marked = marks[name] if marks is not None else sites(name)
         if not complete or any(row_["exitCode"] != 0 or "tests" not in row_ for row_ in held):
-            kept.update(raised(kept, held, marked))
+            kept.update(fold.raised(session, kept, held, marked))
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
         own = {node: seconds for node, seconds in kept.items() if grading.owning(node) == name
@@ -2429,12 +2384,14 @@ def main() -> int:
         before, verdict = session.entries(), json.loads(args.verdict.read_text())
         # The record main's CI cut its files by, read before its times change it (`cuts.refolded`).
         cut_by = {name: own_tests(name, tests) for name, tests in parted_record().items()}
-        recorded = folded_entries(before, verdict, target)
+        rows_of = verdict_rows(verdict)
+        recorded = folded_entries(before, verdict, target, rows_of)
         if recorded != before:
             session.DURATIONS.write_text(json.dumps(recorded, indent=0) + "\n")
         after = {name: own_tests(name, tests) for name, tests in parted_record().items()}
-        runs = cuts.ran(verdict_rows(verdict))
-        stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after)
+        runs = cuts.ran(rows_of)
+        stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after,
+                               cuts.held(rows_of))
         if stored != session.stored_cuts():
             session.CUTS.write_text(json.dumps(stored, indent=0, sort_keys=True) + "\n")
         changed = sorted({grading.owning(node) for node in before.keys() ^ recorded.keys()}

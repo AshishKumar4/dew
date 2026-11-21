@@ -154,6 +154,20 @@ def cast_paths(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] = ()
     return paths
 
 
+def read_paths(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] = ()
+               ) -> frozenset[tuple[str, ...]]:
+    """The paths of `tree`'s leaves under `within` (relative to it) that `closed`, a program whose first
+    inputs are `tree`'s leaves, reads in its live equations (`cast_paths`' count): a leaf it reads nowhere
+    is none, its value no part of what the program computes."""
+    leaves = jax.tree_util.tree_flatten_with_path(tree)[0]
+    live, _ = partial_eval.dce_jaxpr(closed.jaxpr, used_outputs=[True] * len(closed.jaxpr.outvars),
+                                     instantiate=True)
+    return frozenset(tuple(key.key for key in path)[len(within):]
+                     for (path, _), var in zip(leaves, live.invars[:len(leaves)], strict=True)
+                     if tuple(key.key for key in path)[:len(within)] == within
+                     and (var in live.outvars or _uses(var, live)))
+
+
 def narrowed(variables: Variables, paths: dict[tuple[str, ...], jnp.dtype]) -> Variables:
     """The `params` leaves at `paths` cast to their dtypes, nested as in
     `variables` (`compute`'s tree)."""

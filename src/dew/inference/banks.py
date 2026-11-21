@@ -480,7 +480,7 @@ class SafetensorsBanks(LayerBanks):
             raise RuntimeError("the safetensors bank source is closed")
 
     def _read(self, key: tuple[tuple[str, ...], int]) -> Variables:
-        from dew.distributed.host import evict
+        from dew.distributed.pages import evict
         from dew.interop.streaming import SourceLeaf
 
         with self._lock:

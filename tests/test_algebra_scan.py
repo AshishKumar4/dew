@@ -1807,51 +1807,63 @@ def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are
     assert float(outputs[reader, 0]) == 2.0 ** 126
 
 
-def isolated_draw(seed: int, side: str, merged: bool = False):
-    """Two-sided GLA's operands of one write of about 2^100 (its key's where `side` is "keys", its value's
-    where "values") and three gates of -39 to -41 on that side after it, every other write none and every
-    other decay at most 1e-2 a token: the write decayed to about `e^-51`, normal, as the token scan keeps it,
-    where each gate's span past the write alone is past fp32's least normal (row 9660). The gated side's
-    exponents multiples of 2^-10, so every span's sum is exact in fp32 and the decays' own rounding (an
-    exponent of -120 rounded, `|x|` ulps of its decay) is no part of the witness. The write in chunk 1 and its
-    readers in the chunks after it, or where `merged`, the write the first half's last token and its gates
-    the second half's first tokens."""
+DEPTHS = {"past the least normal": (2.0 ** 100, None), "past two normal factors": (2.0 ** 127, -58.375)}
+"""The isolated write's size and its three gates (`isolated_draw`): about 2^100 through gates of -39 to -41
+(`e^-120`, past fp32's least normal, row 9660), or about 2^127 through three of -58.375 (`e^-175.125`, past
+two normal factors' reach of 2^-252, the decayed write about 1.5e-38, normal)."""
+
+
+def isolated_draw(seed: int, side: str, merged: bool = False, depth: str = "past the least normal"):
+    """Two-sided GLA's operands of one write (its key's where `side` is "keys", its value's where "values")
+    and three gates on that side after it (`DEPTHS`' `depth`), every other write none and every other decay
+    at most 1e-2 a token: the write decayed to a normal value, as the token scan keeps it, where each gate's
+    span past the write alone is past fp32's least normal (row 9660), or past two normal factors' reach. The
+    gated side's exponents multiples of 2^-10, so every span's sum is exact in fp32 and the decays' own
+    rounding (an exponent of -120 rounded, `|x|` ulps of its decay) is no part of the witness. The write in
+    chunk 1 and its readers in the chunks after it, or where `merged`, the write the first half's last token
+    and its gates the second half's first tokens."""
     rng = np.random.default_rng([9660, seed])
     write = TOKENS // 2 - 1 if merged else CHUNK + int(rng.integers(0, CHUNK - 4))
-    large, unit = 2.0 ** 100 * rng.uniform(1, 2), rng.uniform(1, 2)
+    size, gate = DEPTHS[depth]
+    # At 2^127 the write and the unit it multiplies stay below fp32's largest (1.5 times 1.3).
+    large, unit = (size * rng.uniform(1, 2), rng.uniform(1, 2)) if gate is None else (
+        size * rng.uniform(1, 1.5), rng.uniform(1, 1.3))
     k, v = np.zeros((TOKENS, KEY)), np.zeros((TOKENS, VALUE))
     k[write, 0], v[write, 0] = (large, unit) if side == "keys" else (unit, large)
     g, e = -rng.uniform(0, 1e-2, (TOKENS, KEY)), -rng.uniform(0, 1e-2, (TOKENS, VALUE))
     gated = g if side == "keys" else e
     gated[:] = np.round(gated * 1024) / 1024
-    gated[write + 1:write + 4] = -rng.integers(39, 42, (3, gated.shape[1]))
+    gated[write + 1:write + 4] = -rng.integers(39, 42, (3, gated.shape[1])) if gate is None else gate
     q = rng.standard_normal((TOKENS, KEY))
     q[:(write // CHUNK + 1) * CHUNK] = 0.0
     drawn = (q, k, v, g, e, np.ones(TOKENS), np.zeros((KEY, VALUE)))
     return tuple(jnp.asarray(x, jnp.float32) for x in drawn)
 
 
+@pytest.mark.parametrize("depth", DEPTHS)
 @pytest.mark.parametrize("target", list(ALGORITHMS))
 @pytest.mark.parametrize("side", ["keys", "values"])
-def test_a_large_write_through_gates_past_the_least_normal_is_kept(target, side):
-    """Two-sided GLA's forms (`ALGORITHMS`) over one write of 2^100 decayed by three gates of -40 on its key's
-    or its value's side (`isolated_draw`): outputs of its readers in later chunks and the final state on par
-    with the token scan's from float64 (check 1), each decay a value takes alone applied as two normal
-    factors in turn (`scan._Split`), where its span's decay alone (`e^-120`) underflowed to zero (row
-    9660)."""
+def test_a_large_write_through_gates_past_the_least_normal_is_kept(target, side, depth):
+    """Two-sided GLA's forms (`ALGORITHMS`) over one large write decayed by three gates on its key's or its
+    value's side (`isolated_draw`, `DEPTHS`): outputs of its readers in later chunks and the final state on
+    par with the token scan's from float64 (check 1), each decay a value takes alone applied as normal
+    factors in turn (`scan._Split`), where its span's decay alone (`e^-120`) underflowed to zero (row 9660),
+    and two factors' second past their reach (`e^-175.125`) was subnormal and flushed to zero."""
     with generation.assumed(target):
         forms = two_sided_forms(target)
         assert_as_exact(jax.jit(functools.partial(two_sided_walked, forms)), jax.jit(two_sided_tokenwise),
-                        functools.partial(isolated_draw, side=side), f"a large write's {side} on {target}",
-                        seeds=16)
+                        functools.partial(isolated_draw, side=side, depth=depth),
+                        f"a large write's {side} {depth} on {target}", seeds=16)
 
 
+@pytest.mark.parametrize("depth", DEPTHS)
 @pytest.mark.parametrize("side", ["keys", "values"])
-def test_a_large_write_through_a_later_walks_gates_is_kept_by_the_merge(side):
-    """Two-sided GLA's tokens walked in two halves, a write of 2^100 the first's last token and three gates
-    of -40 on its key's or its value's side the second's first (`isolated_draw`), merged: the final state on
-    par with the token scan's from float64 (check 1), the later walk's decay of `e^-120` applied as two
-    normal factors in turn, where a floor at the vanished exponent (-105) zeroed it (row 9660)."""
+def test_a_large_write_through_a_later_walks_gates_is_kept_by_the_merge(side, depth):
+    """Two-sided GLA's tokens walked in two halves, a large write the first's last token and three gates on
+    its key's or its value's side the second's first (`isolated_draw`, `DEPTHS`), merged: the final state on
+    par with the token scan's from float64 (check 1), the later walk's decay applied as normal factors in
+    turn (`scan._scaled_exp`), where a floor at the vanished exponent (-105) zeroed `e^-120` (row 9660) and
+    two factors' second past their reach (`e^-175.125`) was subnormal and flushed to zero."""
     forms = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
     half = TOKENS // CHUNK // 2
 
@@ -1863,8 +1875,8 @@ def test_a_large_write_through_a_later_walks_gates_is_kept_by_the_merge(side):
         return forms.finish(forms.merge(a, b, values), values)
 
     assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: two_sided_tokenwise(*xs)[1]),
-                    functools.partial(isolated_draw, side=side, merged=True),
-                    f"a large write's {side} merged", seeds=16)
+                    functools.partial(isolated_draw, side=side, merged=True, depth=depth),
+                    f"a large write's {side} {depth} merged", seeds=16)
 
 
 def scalar_gla(h, q, k, v, g, beta):

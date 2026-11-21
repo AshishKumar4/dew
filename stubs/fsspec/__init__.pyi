@@ -5,8 +5,13 @@ overloads describe its documented rb/wb and text modes separately.
 """
 
 from . import core as core
+from collections.abc import Mapping
+
 from .spec import AbstractFileSystem
+
+registry: Mapping[str, type[AbstractFileSystem]]
 
 def filesystem(protocol: str, **storage_options: object) -> AbstractFileSystem: ...
 def get_filesystem_class(protocol: str) -> type[AbstractFileSystem]: ...
-def register_implementation(name: str, cls: type[AbstractFileSystem], clobber: bool = ..., errtxt: str | None = ...) -> None: ...
+# `cls` a class, or the dotted path of one, imported where a URL first names the protocol (fsspec's own docs).
+def register_implementation(name: str, cls: type[AbstractFileSystem] | str, clobber: bool = ..., errtxt: str | None = ...) -> None: ...

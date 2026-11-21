@@ -1484,11 +1484,17 @@ class Transport[Allocated, Opened](abc.ABC):
     instead."""
 
     adds_through_shared: bool = True
-    stages_vectors: bool = True
-    """Whether 1D per-row vectors (attention statistics, status) stage through shared memory on store."""
     """Whether `added` reads its value through its `smem` (TMA's reduction from a staged tile), which is then
     live wherever a walk adds; an atomic add from registers (cp.async's `red.global`) reads none, so a tile
     staged for the program's stores alone may be scoped after its walks (`scoped`'s `after_walks`)."""
+
+    stages_vectors: bool = True
+    """Whether 1D per-row vectors (attention statistics, status, anchor keys, key sums) stage through shared
+    memory on store (`vector_stage`)."""
+
+    def vector_stage(self, shape: tuple[int, ...], dtype) -> list:
+        """A 1D vector staging allocation of `shape` and `dtype` where `stages_vectors`, else empty."""
+        return [self.staged_memory(shape, dtype)] if self.stages_vectors else []
 
     cluster: int = 1
     """The programs a cluster of the family's launch takes where they share a block or a product (`kernel`'s

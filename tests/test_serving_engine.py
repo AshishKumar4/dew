@@ -8,7 +8,9 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from dew.inference import Engine, ScoringRequest, ScoringServer
@@ -70,6 +72,29 @@ def test_a_request_admitted_before_a_reload_is_scored_by_the_task_that_laid_it_o
     after = server.submit("y")
     server.run()
     assert before.result() == ("a", "a", "x", 1.0)
+    assert after.result() == ("b", "b", "y", 2.0)
+
+
+def test_a_reload_of_host_weights_places_them_once_on_the_served_placement():
+    """A reload of NumPy weights (a checkpoint's host leaves) places each leaf once, on the served
+    placement: checking them against the served tree (`engine.normalized`) transfers nothing, where it
+    placed each on the default device before the reload copied it again (row 10799), and the new pair
+    scores what is submitted after, its weights a buffer of its own, the caller's array changed after the
+    reload changing none of them."""
+    from dew.inference.engine import normalized
+
+    server = ScoringServer.from_task(Named("a"), weights(1.0))
+    # The served dtype's own, so no cast copies it before its placement (a CPU's may alias it).
+    host = {"w": np.full((), 2.0, np.float32)}
+    source = jax.tree_util.tree_flatten_with_path(
+        jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), weights(1.0)))[0]
+    with jax.transfer_guard("disallow_explicit"):
+        checked = normalized(host, source)
+    assert isinstance(checked["w"], np.ndarray) and checked["w"].dtype == np.float32
+    server.reload(Named("b"), host)
+    host["w"][...] = 3.0
+    after = server.submit("y")
+    server.run()
     assert after.result() == ("b", "b", "y", 2.0)
 
 

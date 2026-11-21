@@ -311,3 +311,44 @@ def test_a_flow_module_importing_gpu_flow_first_imports_in_a_parts_prepare():
                           check=False)
     assert done.returncode == 0, done.stderr[-2000:]
 
+
+
+def test_a_cell_compiling_at_its_run_is_passed_by_in_a_parts_prepare(tmp_path, monkeypatch):
+    """A cell with no check-1 site that declares its programs compiled at its run (`Cell.at_run`: its GPU's
+    driver facts, a fresh process) is passed by in a GPU tier part's prepare, neither run nor recorded
+    deferred, and its flow passes its prepare; outside a prepare it runs, its failure its flow's (rows 8074,
+    8635: every such cell was deferred and its test named unprepared)."""
+    import tier_wire
+    from truths_ahead import DEFERRED, compiled_truths
+
+    ran = []
+
+    def facts():
+        ran.append("facts")
+        raise AssertionError("no driver facts here")
+
+    flow = [Cell("driver facts", facts, at_run="its GPU's driver facts")]
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells(flow)
+    assert ran == [] and not (tmp_path / DEFERRED).exists()
+    monkeypatch.delenv(tier_wire.PREPARE)
+    with pytest.raises(CellsFailed) as raised:
+        run_cells(flow)
+    assert ran == ["facts"] and raised.value.labels == ["driver facts"]
+
+
+def test_a_parts_prepare_chooses_kernels_as_its_nodes_gpu(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (`truths_ahead.prepared`, its node an H100), a call reads the node's
+    generation and facts, as its run on that GPU does, where its compile-only device, placed off the CPU
+    backend, read the bare platform 'gpu' and every kernel that GPU takes refused (rows 8076, 10088)."""
+    import model_flows
+    from generation_support import node_target
+    from truths_ahead import prepared
+
+    from dew.nn.kernels.generation import device_generation, gpu_target
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        target = gpu_target()
+        assert (device_generation(), target.generation, target.multiprocessors) == ("sm90", "sm90", 132)

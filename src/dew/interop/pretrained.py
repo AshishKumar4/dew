@@ -202,7 +202,7 @@ def on_default_device(variables: Variables, *, cast: Callable[[KeyPath, Leaf], L
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
     jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
     completes before the next starts, and its host copy is released (a memory-mapped one's pages
-    evicted, `dew.distributed.host.evict`) once its device copy is written back in its place. A leaf is
+    evicted, `dew.distributed.pages.evict`) once its device copy is written back in its place. A leaf is
     as `cast(path, leaf)` makes it where given, cast as it is placed."""
     from dew.distributed.host import placed_leaves
 
