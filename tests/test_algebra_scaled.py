@@ -717,7 +717,7 @@ def test_the_primitives_result_types_keep_weak_types():
     exponent = jnp.asarray(2, jnp.int32)
 
     def product(x, significand):
-        return scaled.applied_p.bind(x, significand, exponent, reach=0)
+        return scaled.applied_p.bind(x, significand, exponent)
 
     assert jax.eval_shape(product, weak, jnp.asarray(1.5)).weak_type
     assert not jax.eval_shape(product, weak, strong).weak_type

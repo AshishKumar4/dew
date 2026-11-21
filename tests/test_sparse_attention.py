@@ -346,3 +346,36 @@ def test_a_querys_empty_selection_slots_leave_the_next_querys_keys_alone():
     expected = np.asarray([[1, 0, 0, 0], [0, 1, 0, 0], [0, 1, 1, 0], [0, 1, 1, 0]], bool)
     np.testing.assert_array_equal(np.asarray(jax.jit(selection_mask, static_argnums=1)(indices, 4))[0],
                                   expected)
+
+
+def test_the_sparse_latent_template_shards_over_batch_and_heads():
+    """`_template_forward` maps over the active mesh's batch, length and head axes (`_template_specs`,
+    rows 10528, 10530): each shard builds its own local latent pool and local table offsets and launches
+    `attention_decode.attend` on its local query rows and local heads instead of replicating the global
+    batch."""
+    from jax.sharding import AbstractMesh, AxisType, PartitionSpec as P
+
+    from dew.mesh import DATA_AXIS, TENSOR_AXIS
+    from dew.nn.sparse_selection import _template_forward
+
+    mesh = AbstractMesh((2, 2), (DATA_AXIS, TENSOR_AXIS), axis_types=(AxisType.Auto, AxisType.Auto))
+    batch, length, heads, rank, rope, keys, top_k = 4, 8, 4, 16, 16, 16, 4
+    absorbed = jax.ShapeDtypeStruct((batch, length, heads, rank), jnp.bfloat16)
+    query_rot = jax.ShapeDtypeStruct((batch, length, heads, rope), jnp.bfloat16)
+    latent = jax.ShapeDtypeStruct((batch, keys, rank), jnp.bfloat16)
+    rot = jax.ShapeDtypeStruct((batch, keys, rope), jnp.bfloat16)
+    indices = jax.ShapeDtypeStruct((batch, length, top_k), jnp.int32)
+    with jax.set_mesh(mesh), generation.assumed("sm90"):
+        traced = jax.make_jaxpr(lambda *args: _template_forward(*args, scale=1.0)[0])(
+            absorbed, query_rot, latent, rot, indices)
+    (mapped,) = [eq for eq in traced.jaxpr.eqns if eq.primitive.name == "shard_map"]
+    assert mapped.params["in_specs"] == (
+        P(DATA_AXIS, None, TENSOR_AXIS, None), P(DATA_AXIS, None, TENSOR_AXIS, None),
+        P(DATA_AXIS), P(DATA_AXIS), P(DATA_AXIS, None))
+    assert mapped.params["out_specs"] == P(DATA_AXIS, None, TENSOR_AXIS, None)
+    inner_shapes = produced_shapes(mapped.params["jaxpr"])
+    # Local batch is 2 (not 4), local heads is 2 (not 4): local pool has 2 * 16 = 32 keys, not 64.
+    assert (1, 2 * keys, 1, rank + rope) in inner_shapes
+    assert (1, batch * keys, 1, rank + rope) not in inner_shapes
+    assert (2 * length, 1, 2, rank + rope) in inner_shapes
+    assert (batch * length, 1, heads, rank + rope) not in inner_shapes

@@ -2,6 +2,7 @@
 derivatives the law's path's (`merged._value`), which its JVP rule takes; it and its state on par with the
 plain merge from float64, here and on a GPU's one launch (tests/test_gpu_attention.py)."""
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +13,8 @@ from generation_support import COMPILES_ON_CPU
 from kernel_compile import compile_kernels
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
 
+from dew.algebra import means
+from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, merged
 
@@ -317,35 +320,98 @@ def test_a_padded_merge_compiles_as_one_launch(name):
         assert sorted(record["thunks"]) == expected, record
 
 
+def _emitted_device_bytes(body, *, rows: int, blocks: int) -> float:
+    """Device bytes transferred on the common one-window path of a traced Pallas `merged_padded` body,
+    counted independently from its emitted `get` and `swap` equations (`body` is `kernel.params['jaxpr']`)."""
+    def has_load(jaxpr) -> bool:
+        for eq in jaxpr.eqns:
+            if eq.primitive.name == "get":
+                return True
+            if eq.primitive.name == "scan" and has_load(eq.params["jaxpr"].jaxpr):
+                return True
+            if eq.primitive.name == "while" and has_load(eq.params["body_jaxpr"].jaxpr):
+                return True
+            if eq.primitive.name == "cond" and any(has_load(b.jaxpr) for b in eq.params["branches"]):
+                return True
+        return False
+
+    def walk(jaxpr) -> float:
+        total = 0.0
+        for eq in jaxpr.eqns:
+            name = eq.primitive.name
+            if name == "get":
+                aval = eq.outvars[0].aval
+                total += math.prod(aval.shape) * aval.dtype.itemsize
+            elif name == "swap":
+                aval = eq.invars[1].aval
+                total += math.prod(aval.shape) * aval.dtype.itemsize
+            elif name == "scan":
+                total += eq.params["length"] * walk(eq.params["jaxpr"].jaxpr)
+            elif name == "while":
+                # One window on the common path.
+                total += walk(eq.params["body_jaxpr"].jaxpr)
+            elif name == "cond":
+                b0, b1 = (walk(b.jaxpr) for b in eq.params["branches"])
+                if b0 == 0.0 and b1 > 0.0 and not has_load(eq.params["branches"][1].jaxpr):
+                    # `pl.when(program_id(3) == 0)`: row-stat stores execute on 1 of `blocks` programs.
+                    total += b1 / blocks
+                else:
+                    # Rare re-landing `lax.cond`: common path takes the branch with no extra loads.
+                    total += min(b0, b1)
+        return total
+
+    return walk(body) * rows * blocks
+
+
+def _traced_merge_bytes(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                        queries: int, width: int, block: int) -> float:
+    """Independent device-byte count for `merged._launch` at `block` from its emitted Pallas body."""
+    batch, _, _, heads, _ = padded.shape
+    channels = 1 << (width - 1).bit_length()
+    launch = functools.partial(merged._launch, units=algebra.units_of(spec), queries=queries, width=width,
+                               block=block)
+    (kernel,) = (eq for eq in jax.make_jaxpr(launch)(padded, stacked).jaxpr.eqns if programs.opaque(eq))
+    return _emitted_device_bytes(kernel.params["jaxpr"], rows=batch * queries * heads,
+                                 blocks=channels // block)
+
+
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
-    """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (row 8845):
-    one kernel, span `3 * chunks` (1 joining pass + 2 `_windows` passes), valid unmasked device bytes
-    excluding masked tail slices and tail channels, and row-stat stores charged once per row even when a row
-    splits across multiple channel blocks."""
+    """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (rows 8845,
+    10533): one kernel, span `3 * chunks`, exact agreement with the emitted Pallas `get`/`swap` byte count on
+    unmasked shapes (including multi-block row-stat stores charged once per row), and strictly less traffic
+    than padded loads on irregular masked tails."""
     target = generation.gpu_target("sm90")
     spec = SPECS["fold"]
 
-    def expected_bytes(batch: int, slices: int, queries: int, heads: int, width: int, block: int) -> float:
-        channels = 1 << (width - 1).bit_length()
-        blocks = channels // block
-        rows = batch * queries * heads
-        return float(rows * ((3 * slices + 1) * width * 4 + (blocks * 3 * slices + 1) * 8))
-
-    # 1-chunk (slices=8), 4-chunk (slices=32), irregular tail (slices=9, width=96), and multi-block (1 row).
-    cases = [
+    # Unmasked shapes (slices a multiple of chunk_width, power-of-two width): 1-chunk, 4-chunk, multi-block.
+    unmasked = [
         (2, 8, 16, 8, 4, 128, 1),
         (2, 32, 16, 8, 4, 128, 4),
-        (2, 9, 16, 8, 4, 96, 2),
         (1, 8, 8, 1, 1, 128, 1),
     ]
-    for batch, slices, padded_q, heads, queries, width, chunks in cases:
+    for batch, slices, padded_q, heads, queries, width, chunks in unmasked:
         padded = jax.ShapeDtypeStruct((batch, slices, padded_q, heads, width), jnp.float32)
         stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, padded_q), jnp.float32)
         block = merged._channel_block(spec, padded, stacked, queries, width, target)
         work = merged.launch_work(spec, padded, stacked, queries, width, target)
         assert work.kernels == 1.0
         assert work.span == float(3 * chunks)
-        assert work.device_bytes == expected_bytes(batch, slices, queries, heads, width, block)
+        assert work.device_bytes == _traced_merge_bytes(spec, padded, stacked, queries, width, block)
+
+    # Irregular masked tail (slices=9, width=96, chunks=2): valid traffic stays strictly below the unmasked
+    # emitted loads/stores of its padded tile (16 slices x 128 channels) and above an 8-slice 64-wide launch.
+    tail_p = jax.ShapeDtypeStruct((2, 9, 16, 8, 96), jnp.float32)
+    tail_s = jax.ShapeDtypeStruct((2, 2, 8, 9, 16), jnp.float32)
+    tail_block = merged._channel_block(spec, tail_p, tail_s, 4, 96, target)
+    tail_work = merged.launch_work(spec, tail_p, tail_s, 4, 96, target)
+    assert tail_work.kernels == 1.0
+    assert tail_work.span == float(3 * -(-9 // means.chunk_width(9)))
+    assert tail_work.device_bytes < _traced_merge_bytes(spec, tail_p, tail_s, 4, 96, tail_block)
+    small_tail_p = jax.ShapeDtypeStruct((2, 8, 16, 8, 64), jnp.float32)
+    small_tail_s = jax.ShapeDtypeStruct((2, 2, 8, 8, 16), jnp.float32)
+    small_tail_block = merged._channel_block(spec, small_tail_p, small_tail_s, 4, 64, target)
+    assert tail_work.device_bytes > _traced_merge_bytes(spec, small_tail_p, small_tail_s, 4, 64,
+                                                        small_tail_block)
     # The 1-row 128-wide case splits across multiple channel blocks on an H100 (row 8439), exercising the
     # single-stat-store-per-row accounting directly.
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
