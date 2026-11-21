@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from arm_arithmetic import float64_held, summed_as_run, unrewritten
+from arm_arithmetic import float64_held, unrewritten
 from flax import linen as nn
 from model_support import flat_tree, largest_difference, stepped_decode, steps_from
 from reference_error import (
@@ -309,10 +309,8 @@ class ScanCase:
         written = unrewritten(lambda ids, cotangent: site_of(run(ids, cotangent), site))
 
         def scale(inputs, seed):
-            # Summed as the arms run it (`summed_as_run`, as `assert_as_exact` holds them): the walk weighs
-            # the float32 sums the plain loop computes, not the float64 ones a wide CPU run would trace.
-            with summed_as_run():
-                return rounding_scale(written, *inputs, seed=seed)[1]
+            # Summed as the arms run it: the check's conditioning holds it under `summed_as_run`.
+            return rounding_scale(written, *inputs, seed=seed)[1]
         return scale
 
     def arms(self):
@@ -340,17 +338,23 @@ def site_of(outputs, site: str):
 
 
 def _held(arm):
-    """`arm`, a host arm run on a draw's concrete inputs, run once a draw: the sites judged apart, each over
-    every draw before the next site, read one run of it a draw (`site_of`), every draw's kept (a task's
-    draws of the tiny stack's outputs)."""
+    """`arm`, a host arm run on a draw's concrete inputs, run once a draw across the sites judged apart,
+    each over every draw before the next site, which read one run of it a draw (`site_of`), every draw's
+    kept (a task's draws of the tiny stack's outputs): a site's run (`at_site()`) that asks a draw it asked
+    already runs the arm again, as a check that repeats a draw to see it repeat asks (`_of_its_inputs`)."""
     runs: dict = {}
 
-    def run(ids, cotangent):
-        key = (np.asarray(ids).tobytes(), float(cotangent))
-        if key not in runs:
-            runs[key] = arm(ids, cotangent)
-        return runs[key]
-    return run
+    def at_site():
+        seen: set = set()
+
+        def run(ids, cotangent):
+            key = (np.asarray(ids).tobytes(), float(cotangent))
+            if key in seen or key not in runs:
+                runs[key] = arm(ids, cotangent)
+            seen.add(key)
+            return runs[key]
+        return run
+    return at_site
 
 
 def scans_as_the_loop(shape: str) -> None:
@@ -374,7 +378,7 @@ def scans_as_the_loop(shape: str) -> None:
     for site in case.sites():
         scanned_site, plain_site, truth_site = (
             as_given(lambda ids, cotangent, run=run, site=site: site_of(run(ids, cotangent), site))
-            for run in held)
+            for run in (at_site() for at_site in held))
         assert_as_exact(scanned_site, plain_site, case.draw, f"{shape} scanned stack, {site}",
                         seeds=SCAN_SEEDS[shape], truth_fn=truth_site, conditioning=conditioning,
                         conditioning_scale=case.weighed(site))
