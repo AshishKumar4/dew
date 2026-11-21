@@ -402,23 +402,24 @@ def _prefix_halves(g, taken, call: Call):
         def step(index, slots, carry, accumulators):
             del index
             slots.acquire_all()
-            decays = stream_tile(slots, "decays", gates).value()
+            tile = stream_tile(slots, "decays", gates)
+            decays = tile.value()
             if running:
                 prefix = _running_prefix(call, rows, decays, keys)
             else:
                 _scan_zeroed(call, rows, keys)
                 prefix = _intra_prefix(call, rows, decays, keys)
-            # The running sum's halves through one landing in turn (each store waited), the doubling's their
-            # own.
+            # The running sum's halves through its decays' slot in turn, read and staged before (each store
+            # waited; the operand's form and tile, a landing's own), the doubling's through their landings.
             for i, (half, ref) in enumerate(zip(prefix, (hi_ref, lo_ref), strict=True)):
                 gates.store(ref, half, row, chunk, column, keys, family=family,
-                            smem=landing["prefix0" if running else f"prefix{i}"])
+                            smem=tile.refs[0] if running else landing[f"prefix{i}"])
             return carry, accumulators
 
         return mosaic.Walk(views, step)
 
     blocks = stream_blocks(decays=((chunk, keys), gates))
-    landing = {f"prefix{i}": gates.landing(chunk, keys) for i in ((0,) if running else (0, 1))}
+    landing = {} if running else {f"prefix{i}": gates.landing(chunk, keys) for i in (0, 1)}
     # The running sum's tiles: its decays, then a sub-chunk's rows of them and their terms; the doubling's
     # five.
     held = (Held(phases=([f32(chunk, keys)], [f32(algebra.SUB, keys)] * 3)) if running
@@ -433,10 +434,11 @@ def _prefix_halves(g, taken, call: Call):
 
 def _running(call: Call) -> bool:
     """Whether `_prefix_halves` sums a key block a column a thread (`_running_prefix`): where the width takes
-    the warpgroup's threads' worth of keys and the program's four `[C, keys]` fp32 tiles (its decays' ring
-    slot, the two halves' rows and a landing) fit the target's shared memory, else the doubling scan at two
-    sub-chunks' worth of keys: an sm120's 99 KB holds no 128 KB program, and the call derived no tiles."""
-    tiles = 4 * call.chunk * scan.THREADS * jnp.dtype(jnp.float32).itemsize
+    the warpgroup's threads' worth of keys and the program's three `[C, keys]` fp32 tiles (its decays' ring
+    slot, which its stores land through, and the two halves' rows) fit the target's shared memory, else the
+    doubling scan at two sub-chunks' worth of keys: an sm120's 99 KB holds no 128 KB program, and the call
+    derived no tiles."""
+    tiles = 3 * call.chunk * scan.THREADS * jnp.dtype(jnp.float32).itemsize
     return call.width % scan.THREADS == 0 and tiles <= generation.shared_budget(call.target)
 
 
@@ -463,15 +465,18 @@ def _running_prefix(call: Call, rows, decays: jax.Array, keys: int) -> tuple:
     mosaic.synced(call.interpret)
     layout = scan.striped(keys)
 
-    def added(t, running):
-        found = compensated_add(running, tuple(plgpu.load(rows.at[half, t], layout=layout, optimized=False)
-                                               for half in (0, 1)))
-        for half, value in enumerate(found):
-            plgpu.store(rows.at[half, t], value, optimized=False)
-        return found
+    def row(t) -> tuple:
+        return tuple(plgpu.load(rows.at[half, t], layout=layout, optimized=False) for half in (0, 1))
 
+    # Unrolled, each row's load issued a row ahead of its add: one program a multiprocessor (its shared
+    # memory's) waited on every row's load in turn, 58% of its stalls (M-JS-145e, an emulated GH200).
     zero = plgpu.layout_cast(jnp.zeros((keys,), jnp.float32), layout)
-    jax.lax.fori_loop(0, chunk, added, (zero, zero))
+    running, ahead = (zero, zero), row(0)
+    for t in range(chunk):
+        terms, ahead = ahead, row(t + 1) if t + 1 < chunk else None
+        running = compensated_add(running, terms)
+        for half, value in enumerate(running):
+            plgpu.store(rows.at[half, t], value, optimized=False)
     mosaic.synced(call.interpret)
     return tuple(call.family.tile_of(rows.at[half]) for half in (0, 1))
 
