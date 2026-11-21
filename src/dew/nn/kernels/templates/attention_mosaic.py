@@ -1508,7 +1508,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     if hooks.score_mod is None and hooks.score_params:
         hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
-    parts = algebra.bf16_part_count(accurate=True) if fp32 else 1
+    parts = product.EXACT_PARTS if fp32 else 1
     if hooks.query_mod is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
         # program before the launch takes it.

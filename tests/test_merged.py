@@ -626,7 +626,7 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
     state_total = jnp.array([[[sub], [0.0]]], jnp.float32)
     state = algebra.Partial(state_acc, state_m, state_total)
 
-    low_m = jnp.full((batch, kv_heads, slices, rows), -140.0, jnp.float32)
+    low_m = jnp.full((batch, kv_heads, slices, rows), -160.0, jnp.float32)
     low_t = jnp.ones((batch, kv_heads, slices, rows), jnp.float32)
     low_stacked = jnp.stack([low_m, low_t])
 
@@ -640,6 +640,5 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
 
     resumed_m, got = jax.jit(step)(padded, state, low_stacked)
     assert float(resumed_m[0, 0, 0]) == 0.0, resumed_m
-    np.testing.assert_allclose(np.asarray(got[0, 0, 0]), np.full(width, float(scale), dtype=np.float32),
-                               rtol=1e-3)
+    np.testing.assert_array_equal(np.asarray(got[0, 0, 0]), np.full(width, float(scale), dtype=np.float32))
     np.testing.assert_array_equal(np.asarray(got[0, 0, 1]), np.zeros(width, dtype=np.float32))
