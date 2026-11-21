@@ -79,7 +79,7 @@ from dew.nn.kernels.templates.gemm import (
     sides_padded,
 )
 from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, flags_declared, guarded_walk
-from dew.nn.kernels.templates.gemm.pricing import balanced_tail, family_of, fixes_up, tile_columns, tile_rows
+from dew.nn.kernels.templates.gemm.pricing import balanced_tail, family_of, merges, tile_columns, tile_rows
 from dew.nn.kernels.templates.gemm.row_tiles import TMA_ROWS
 from dew.nn.kernels.templates.gemm.tiling import GMM, GUARDED_GMM, TGMM, Tiles
 from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
@@ -286,8 +286,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         transpose_lhs: bool = False, first: jax.Array | None = None,
         scales: jax.Array | None = None, step_scales: tuple | None = None, mx_scales: tuple | None = None,
         gather: jax.Array | None = None, scatter: jax.Array | None = None, packed_rows: bool = False,
-        registers: int | None = None, shared: int | None = None, beside: tuple = (), chained: tuple = ()
-        ) -> jax.Array | tuple[jax.Array, ...]:
+        registers: int | None = None, shared: int | None = None, balanced: bool = True, beside: tuple = (),
+        chained: tuple = ()) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or with
     `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the routed ones
     zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`. With `dense`, the one
@@ -327,10 +327,12 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     multiprocessors (`mosaic.Transport.pairs_product`, tcgen05's pair), a tile is the pair's: twice
     `tiles.block_m` rows by twice `tiles.block_n` columns, each multiprocessor storing its own rows.
     `registers` and `shared` state its launch's register model (`mosaic.Family.kernel`'s;
-    `grouped_matmul._Mosaic`'s prices). With `beside`, further matrices whose products the launch takes
-    with `rhs`'s side by side, each its own output (`Beside`: q, k and v's projections, row 6794). With
-    `chained`, `(rows, matrix)` products summed with `lhs @ rhs` over their depths end to end, in order
-    (`Chained`: a multi-matrix input gradient, row 8282; its overflowing tiles again, `guarded_walk`)."""
+    `grouped_matmul._Mosaic`'s prices), and `balanced` whether its registers hold a balanced last wave's
+    merge (`grouped_matmul._Mosaic.balanced`), its tail unbalanced where they do not. With `beside`, further
+    matrices whose products the launch takes with `rhs`'s side by side, each its own output (`Beside`: q, k
+    and v's projections, row 6794). With `chained`, `(rows, matrix)` products summed with `lhs @ rhs` over
+    their depths end to end, in order (`Chained`: a multi-matrix input gradient, row 8282; its overflowing
+    tiles again, `guarded_walk`)."""
     dtype = _products_dtype(lhs, {'matrix': rhs}, packed_rows)
     block_n = tile_columns(tiles, family_of(tiles, dtype))
     if transpose_lhs and (not dense or prologue is not None):
@@ -375,7 +377,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     prologue_operands = sides_extended(prologue_operands, prologue_axes, extent)
     epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, extent)
     tail = _dense_tail(tiles, dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
-                       balanced=dense and paired is None and not beside)
+                       balanced=balanced and dense and paired is None and not beside)
     walked = (-(-m // row_tile) + (0 if dense else g)) * -(-n // block_n) * tiles.cluster * tiles.splits
     programs = launched(family_of(tiles, dtype), multiprocessors, walked, tail)
     walk = functools.partial(
@@ -391,12 +393,17 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     if linked is not None:
         outs = guarded_walk(walk, outs, tiles, len(linked.depths),
                             launched(family_of(tiles, dtype), multiprocessors, walked * linked.narrowed))
-    if tiles.splits > 1:
-        # Each run's fp32 partial, summed in its order (the same sums every call) and rounded once.
+    outs = _gmm_outputs(outs, dtypes, rows, tiles.splits)
+    return outs if out_dtypes or beside else outs[0]
+
+
+def _gmm_outputs(outs: tuple, dtypes: tuple, rows: int, splits: int) -> tuple:
+    """`gmm`'s outputs from its walk's, each its first `rows`: a split's runs' fp32 partials summed in their
+    order (the same sums every call) and rounded once to each of `dtypes`."""
+    if splits > 1:
         total = functools.reduce(jnp.add, tuple(outs[0]))
         outs = tuple(total.astype(dtype) for dtype in dtypes)
-    outs = tuple(out[:rows] for out in outs)
-    return outs if out_dtypes or beside else outs[0]
+    return tuple(out[:rows] for out in outs)
 
 
 def _joined(joined, lhs, paired, epilogue: tuple, *, parts: tuple, transpose_lhs: bool,
@@ -442,7 +449,7 @@ def _dense_tail(tiles: Tiles, dtype, extents: tuple, itemsizes: tuple, multiproc
     adds; none for a depth split, which already shares its depth over the wave, its runs a schedule of their
     own (`_gmm_scheduled`), each into its own slice of the outputs, which no tail shares."""
     m, n, k = extents
-    if not (balanced and tiles.cluster == 1 and tiles.splits == 1 and fixes_up(tiles, dtype)):
+    if not merges(tiles, dtype, dense=balanced):
         return None
     columns = tile_columns(tiles, family_of(tiles, dtype))
     return balanced_tail(tiles, (-(-m // tiles.block_m), -(-n // columns)), -(-k // tiles.block_k), itemsizes,
@@ -1796,7 +1803,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
          prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False,
          dense: bool = False, k_major: bool = False, step_scales: tuple | None = None,
          gather: tuple | None = None, whole_steps: bool = False, registers: int | None = None,
-         shared: int | None = None) -> jax.Array:
+         shared: int | None = None, balanced: bool = True) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
     `tiles.block_m` and the width by `tiles.block_n`, and the tile takes one multiprocessor;
@@ -1819,8 +1826,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     4518). `gather`, a table for either operand (`(lhs_table, rhs_table)`, int32 `[rows]` or None), makes
     the rows that operand's rows at the table's entries, read where they lie (`gmm`'s `gather`: a mixture of
     experts' tokens, and a scattered product's cotangent at its slots, row 1376), on a ring family's
-    producer, with no prologue, rows-contiguous layout, step scales or dense call. `registers` and `shared` as
-    `gmm`'s, its split's runs at the tile unsplit, as the launch prices them."""
+    producer, with no prologue, rows-contiguous layout, step scales or dense call. `registers`, `shared` and
+    `balanced` as `gmm`'s, its split's runs at the tile unsplit, as the launch prices them."""
     block_m, block_k = tiles.block_m, tiles.block_k
     if k_major and (prologue is not None or tiles.splits > 1 or (step_scales is not None and (
             not exact_sums or block_k != SCALE_DEPTH))):
@@ -1882,7 +1889,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     order = jnp.argsort(-group_num_blocks).astype(jnp.int32)
     # A tile summed across programs adds their exact partials by IEEE adds (`Family.fixed_up`), as a split's.
     tail = _dense_tail(tiles, lhs.dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
-                       balanced=dense)
+                       balanced=balanced and dense)
     walked = g * -(-m // tile_rows(tiles, family)) * (n // tile_columns(tiles, family))
     programs = launched(family, multiprocessors, walked, tail)
     return _tgmm_streamed(
