@@ -797,14 +797,16 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
                               for name, ref in zip(("entered", "leaving"), memory, strict=True)})}
 
 
-def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequence, sums: dict, first,
-                     landing: dict, split: bool = False) -> None:
+def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequence, first, landing: dict,
+                     split: bool = False) -> None:
     """`algebra.memory_gradients`' emit in `_query_key`: the weights' gradient (`kind` 'dw') in the
     operands' dtype to `weights` (its parts' views) as it is final, as fla's dqkwg writes it; the queries'
-    and keys' ('dq', 'dk') to `sums[kind]` summed over the key head's value heads in fp32, stored at the
-    first (`first`) and added at the rest (`Family.added`: a TMA reduction, or whole rows through
-    registers), each through its launch's landing tiles. A value split's (`split`) weights' gradient is its
-    split's own part of it, fp32, which XLA adds, through its own landing tile."""
+    and keys' ('dq', 'dk') summed over the key head's value heads in fp32 in their shared tiles
+    (`landing[kind]`), the first value head's (`first`) taken as it is and the rest added, in the order the
+    steps take them, which the step stores once at the last: added into the output at each value head an
+    A100's element-wise global atomics (`Family.added`, no TMA reduction before Hopper) held query_key at 26%
+    of its stall samples, its tensor pipe under 10% busy (M-JS-183). A value split's (`split`) weights'
+    gradient is its split's own part of it, fp32, which XLA adds, through its own landing tile."""
     del block
     family = call.family
     if kind == "dw":
@@ -817,11 +819,31 @@ def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequen
 
     @pl.when(first)
     def _():
-        family.stored([grad], [sums[kind]], smem=landing["sums"])
+        plgpu.store(landing[kind], grad, optimized=False)
 
     @pl.when(jnp.logical_not(first))
     def _():
-        family.added(grad, sums[kind], call.interpret, smem=landing["sums"])
+        _summed_into(call, landing[kind], grad)
+
+
+def _sums_stored(call: Call, landing: dict, sums: dict, last) -> None:
+    """The key head's queries' and keys' sums (`_gradient_stored`'s shared tiles) stored to `sums` once, at
+    its last value head's step (`last`), and waited on by design: Mosaic GPU waits on no copy at a kernel's
+    exit (numerics review 10-26, P3-4)."""
+    family = call.family
+
+    @pl.when(last)
+    def _():
+        for kind in ("dq", "dk"):
+            family.stored([family.tile_of(landing[kind])], [sums[kind]], smem=landing[kind])
+
+    family.store_wait(0)
+
+
+def _summed_into(call: Call, tile, value: jax.Array) -> None:
+    """`value` added into the fp32 shared `tile` in the family's accumulator layout, which each thread reads
+    and writes its own words of (`Family.tile_of`): no thread reads another's, so none waits on them."""
+    plgpu.store(tile, call.family.tile_of(tile) + value, optimized=False)
 
 
 def _memory_sum(call: Call, issue: Issuer, entered: Parts, leaving: Parts) -> jax.Array:
@@ -897,11 +919,13 @@ def _query_key_held(call: Call, vq: int) -> Held:
 
 def _query_key_landing(call: Call, splits: int) -> dict:
     """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule
-    (fp32 where there are two splits or more) and the queries' and keys' sums."""
+    (fp32 where there are two splits or more) and the queries' and keys' sums, each its own, held across the
+    key head's steps (`_gradient_stored`)."""
     chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
     weights = held.landing(chunk, call.block) if splits == 1 else ((chunk, call.block), jnp.float32)
-    return {**({"weights": weights} if call.delta else {}), "sums": ((chunk, call.block), jnp.float32)}
+    sums = ((chunk, call.block), jnp.float32)
+    return {**({"weights": weights} if call.delta else {}), "dq": sums, "dk": sums}
 
 
 def _query_key_launched(call: Call, vq: int) -> tuple[dict, tuple]:
@@ -983,7 +1007,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
             weights = (() if not weights_ref else
                        held.views(weights_ref[0], row, chunk, weights_at, call.block) if splits == 1 else
                        [weights_ref[0].at[span, pl.ds(split * call.heads * width + weights_at, call.block)]])
-            stored = functools.partial(_gradient_stored, call, weights=weights, sums=sums, first=first_head,
+            stored = functools.partial(_gradient_stored, call, weights=weights, first=first_head,
                                        landing=landing, split=splits > 1)
 
             issue = Issuer(call)
@@ -1002,9 +1026,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                 def _():
                     keys, queries = whole("keys", given, 0), whole("queries", given, 0)
                     for kind, lhs, rhs in (("dq", ds, keys), ("dk", ds.T, queries)):
-                        family.store_wait(0)
-                        family.added(issue("scores_dq", lhs, rhs), sums[kind], call.interpret,
-                                     smem=landing["sums"])
+                        _summed_into(call, landing[kind], issue("scores_dq", lhs, rhs))
             after_ref.at[split * key_blocks + c, h, span][...] = after
             leaving_ref.at[split * key_blocks + c, h, span][...] = leaving
             # `sum(S dS)` over the block's rows, read here rather than both memories again: where products
@@ -1016,9 +1038,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                 _memory_sum(call, issue, column("entered", memories, j), column("leaving", memories, j))
                 for j in range(blocks)))
             memory_ref.at[split * key_blocks + c, h, pl.ds(n * call.block, call.block)][...] = traced
-            # The step's reduce-adds ('dq', 'dk', `Family.added`) waited on by design, not by 'dw''s store
-            # after them: Mosaic GPU waits on no copy at a kernel's exit (numerics review 10-26, P3-4).
-            family.store_wait(0)
+
+            _sums_stored(call, landing, sums, index == group - 1)
             return carry, accumulators
 
         # Without the delta rule the scores' products the first step's alone.
