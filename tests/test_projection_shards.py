@@ -295,6 +295,22 @@ def test_a_projection_no_launch_takes_runs_as_it_ran_before():
     assert lowered(placing(LAYOUT)) == lowered()
 
 
+def test_a_one_member_batched_projection_runs_as_the_dense_product_it_is():
+    """A bf16 `DenseGeneral` batched over one member (`[1, 32, 64]` rows, a `[1, 64, 48]` kernel) on an
+    assumed B200, nothing named: its launch is the dense product's (`dense` bound), the one its probe asked
+    about, where the probe asked the dense product's cells and the call ran one group's grouped launch (head
+    review of 0099a4701 F3)."""
+    from dew.nn.dense import DenseGeneral
+    from dew.nn.kernels import tuning
+
+    layer = DenseGeneral(48, batch_dims=(0,), axis=-1, use_bias=False, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((1, 32, 64), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+    with generation.assumed("sm100"), tuning.seen() as launches:
+        jax.eval_shape(layer.apply, params, x)
+    assert launches.taken and all(bound.arguments["dense"] for _, bound in launches.taken), launches.taken
+
+
 def test_a_batched_projection_runs_its_members_as_one_grouped_gemm():
     """A bf16 `DenseGeneral` batched over 4 groups (DeepSeek V4's grouped `o_a_proj`: `[4, 32, 64]` rows, a
     `[4, 64, 48]` kernel) on an assumed H100, the GEMM template named and interpreted: its members run as one
