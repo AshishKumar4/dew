@@ -1644,7 +1644,6 @@ def test_sm90_fused_and_coop_backward_stream_delta_and_compile_spill_free():
     spans = template.spans(queries, queries, 1, causal=True)
     cases = []
     with generation.assumed("sm90"):
-        target = generation.gpu_target()
         for label, width in (("sm90-fused-d64", 64), ("sm90-fused-d128", 128), ("sm90-coop-d256", 256)):
             q = jax.ShapeDtypeStruct((1, queries, 8, width), jnp.bfloat16)
             k = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
