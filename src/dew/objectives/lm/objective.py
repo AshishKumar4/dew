@@ -1899,6 +1899,7 @@ class Perplexity:
     padded pass whose batches differ in size is scored per token, and a batch with
     no counted target contributes nothing.
     """
+    fields = ()
 
     name = "perplexity"
     reads = TokenScores

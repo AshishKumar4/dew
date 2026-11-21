@@ -579,6 +579,7 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
             return Representations(features=batch["x"], labels=jnp.zeros((8,), jnp.int32))
 
     class InvalidMetric:
+        fields = ()
         name, reads = "invalid", Representations
 
         def __call__(self, artifact, batch):
