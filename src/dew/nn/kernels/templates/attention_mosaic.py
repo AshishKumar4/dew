@@ -153,16 +153,16 @@ def _launch_programs(kernel) -> int:
     return math.prod(kernel.params["grid_mapping"].grid)
 
 def _planned_stages(family: mosaic.Family, scope_of: Callable[[int], resources.Scope],
-                    target: generation.GpuTarget, *, consumers: int, floor: int, most: int,
-                    resident: int) -> int:
+                    target: generation.GpuTarget, *, consumers: int, registers: int | None,
+                    floor: int, most: int, resident: int) -> int:
     """Deepest ring in `[floor, most]` whose `scope_of(stages)` fits `target`'s share at `resident`
-    programs per SM via `resources.plan` (rows 10948, 10962)."""
+    programs per SM via `resources.plan` (rows 10948, 10962, 10993)."""
     if most <= floor or not family.budgets_registers:
         return floor
-    launch = resources.Launch(scope=scope_of, consumers=consumers, registers=None, floor=floor, most=most)
+    launch = resources.Launch(scope=scope_of, consumers=consumers, registers=registers,
+                              floor=floor, most=most)
     planned = resources.plan((launch,), family, target, programs=resident)
     return floor if planned is None else planned[0].stages
-
 
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
@@ -852,17 +852,17 @@ class MosaicForward(_Mainloop[Tiles]):
             return config
         base_resident = self.resident(ba, config, target)
         products = self._products(ba, config, target)
-        stages = _planned_stages(
+        planned = _planned_stages(
             family, lambda s: self._scope(ba, dataclasses.replace(config, stages=s), target,
                                           products=products),
-            target, consumers=config.consumers, floor=config.stages, most=want, resident=base_resident)
-        if stages > config.stages:
+            target, consumers=config.consumers, registers=self.registers(ba, config),
+            floor=config.stages, most=want, resident=base_resident)
+        for stages in range(planned, config.stages, -1):
             candidate = self._launchable(ba, dataclasses.replace(config, stages=stages), target)
             if (candidate is not None and candidate not in refused
                     and self.resident(ba, candidate, target) == base_resident):
                 return candidate
         return config
-
     def _price_config(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
                       ) -> float | None:
         """Price `config`'s main launch on `target` (`cost.launch_seconds` over `emission.work_of`), traced
@@ -1960,12 +1960,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                                            allocations_of=allocator) < min(3, base_stats)):
                 want -= 1
         base_scopes = self._scopes(ba, config, target)
-        stages = min(
+        dq_regs, dkv_regs = self._launch_registers(ba, config)
+        launch_regs = (dkv_regs,) if config.fused else (dkv_regs, dq_regs)
+        planned = min(
             _planned_stages(layout, lambda s, i=i: self._scopes(
                 ba, dataclasses.replace(config, stages=s), target)[i][2],
-                target, consumers=consumers, floor=config.stages, most=want, resident=base_resident)
-            for i, (layout, consumers, _) in enumerate(base_scopes))
-        if stages > config.stages:
+                target, consumers=consumers, registers=regs, floor=config.stages, most=want,
+                resident=base_resident)
+            for i, ((layout, consumers, _), regs) in enumerate(zip(base_scopes, launch_regs, strict=True)))
+        for stages in range(planned, config.stages, -1):
             candidate = dataclasses.replace(config, stages=stages)
             if self.takes(ba, candidate, target) and self.resident(ba, candidate, target) == base_resident:
                 return candidate
@@ -1974,10 +1977,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def _one_launch(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, family: mosaic.Family,
                     fed: list, dkv: dict) -> BackwardTiles | None:
         """`derived`'s one launch: on the fed layout with its consumers (FlashAttention 3's CTA), keys first
-        on the dQ launch's layout, or a key block its consumers share; None where none holds or the family
-        lacks hardware atomics (`Transport.adds_atomically`, TPU VMEM)."""
-        if not family.adds_atomically:
-            return None
+        on the dQ launch's layout, or a key block its consumers share; None where none holds."""
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:

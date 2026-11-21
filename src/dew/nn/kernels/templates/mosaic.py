@@ -1496,11 +1496,6 @@ class Transport[Allocated, Opened](abc.ABC):
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
     of 128', R9-gpu-a100): a step reads a side vector it does not copy from global memory instead."""
 
-    adds_atomically: bool = True
-    """Whether `added` updates global memory with hardware atomics (`tma.reduce_add` or `atomicAdd`);
-    False on a TPU (`VmemRings`), where `added` emulates accumulation via blocking HBM read-modify-write
-    under arbitrary grid semantics."""
-
     adds_vectors: bool = True
     """Whether `added` takes a vector of fewer entries than a warpgroup's threads (TMA's reduction from shared
     memory), where Mosaic GPU refuses atomic stores from a layout that replicates its entries across
