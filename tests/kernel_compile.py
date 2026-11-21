@@ -955,11 +955,12 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             found_kernel = _report(kernel)
             if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
-            # Its model as its launch stated it tracing (a case settled as a call takes its tile states none
-            # of its own), else as its case states it.
+            # Its model as its case states it, else as its launch stated it tracing (a case settled as a call
+            # takes its tile states none of its own).
             cased = record.get("models", {}).get(found_kernel.kernel)
             stated = (None if found_kernel.kind == "triton"
-                      else record.get("stated_models", {}).get(found_kernel.traced, cased))
+                      else cased if cased is not None
+                      else record.get("stated_models", {}).get(found_kernel.traced))
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")

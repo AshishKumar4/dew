@@ -43,11 +43,12 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
     template's. Up to two consumers a program, the derivations choosing among them: two warpgroups each at
     the most registers a thread takes fill a multiprocessor's register file (`resources.entry_registers`,
     2 x 128 x 255 of 64K), and neither its issuer nor its rings bound them, the first consumer issuing
-    every load (`fed.Feed`). cp.async's one (`mosaic_sm80.Mma`, whose pipeline hung at two) held an RTX
-    PRO 6000's dense products to one consumer's 128 x 64 tiles, its consumers stalled on their full
-    barriers (wait 30.9% and sleeping 19.1% of samples, HMMA 12.4%, EM-THEME-G4-NCU; the wait's suspend
-    no part of it, M-EM-33) at 1.79-2.25x cuBLASLt's time (row 5634); its two consumers ran 21-39% faster
-    there (M-EM-70c-g4), a config whose kernels spill refused by certification (`report.certified`)."""
+    every load (`fed.Feed`). At one consumer an RTX PRO 6000's dense products took one consumer's 128 x 64
+    tiles at 1.79-2.25x cuBLASLt's time (row 5634), their consumers stalled on their full barriers (wait
+    30.9% and sleeping 19.1% of samples, HMMA 12.4%, EM-THEME-G4-NCU; the wait's suspend no part of it,
+    M-EM-33); the head that took two (f4711191814, its operands' lookahead count and other GEMM changes
+    beside this cap) ran them 21-39% faster than its parent 519133451d1 (M-EM-70c-g4). A config whose kernels
+    spill is refused by certification (`report.certified`)."""
 
     name = "mma.sync.fed"
     consumers = 2
@@ -67,7 +68,7 @@ class MmaProduced(mosaic_sm80.MmaIssuer, ring_family.RingFamily):
     and no template's: the layout a launch that streams through a producer takes on a device whose mma.sync
     has no other (an attention backward's dQ launch, `attention_mosaic_program.runs_backward`, on consumer
     Blackwell, whose cp.async Mosaic lowers no wait for and whose fed layout holds no backward of Qwen3-8B's
-    widths). One consumer a program, as `MmaFed`'s; after it among mma.sync's compositions, so a launch that
+    widths). One consumer a program; after it among mma.sync's compositions, so a launch that
     derives on the fed layout keeps it, and taken by a launch that states it streams through a producer
     (`Launch.produced`) alone: a decode step, whose rows prefer mma.sync's 16 (`layouts`), would otherwise
     leave its own issuer's walk for this one on a Hopper or a B200 unmeasured, its fp32 parts past its model
