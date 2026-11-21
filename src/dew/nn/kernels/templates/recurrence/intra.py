@@ -123,13 +123,13 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     own pairs zero (a launch of their own, `own_pairs.intra_own`); the
     scores and the system share every factor in one walk (`_intra_walk`), their sums held across it, where
     `_intra_merges` (wgmma's, tcgen05's); else each output walks a launch of its own."""
-    call = sub_chunked(call)
+    sub = sub_chunked(call)
     products = ("scores", "system") if solves else ("scores",)
-    if _sliced(call):
-        # The decay's prefix halves a launch of their own (fla_kda's chunk_local_cumsum), the walk of the
-        # pairs reading them, no scan of its own (`_sub_chunk_walk`).
+    if _sliced(sub):
+        # The decay's prefix halves a launch of their own on the call's bundle (fla_kda's chunk_local_cumsum),
+        # the walk of the pairs reading them on the sub-chunk's, no scan of its own (`_sub_chunk_walk`).
         hi, lo = _prefix_halves(g, taken, call)
-        return (*_sub_chunk_walk(q, k, hi, lo, beta, taken, call, scale=scale, products=products), hi, lo)
+        return (*_sub_chunk_walk(q, k, hi, lo, beta, taken, sub, scale=scale, products=products), hi, lo)
     if solves and not _intra_merges(call):
         scores, hi, lo = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("scores",))
         (system,) = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("system",))
