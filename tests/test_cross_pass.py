@@ -322,19 +322,22 @@ def test_a_shared_cache_prefills_as_a_cache_a_pass_does(form):
 
 def test_a_packed_attention_projects_each_site_apart_as_its_own_projections_do():
     """A decoder passing messages packs none of its block's attention projections anew (`pending`: a later
-    pass would run the packed product once a site), the prelude's alone; a tree a server packed as the
-    decoder without the loop packs (`qkv_proj`) runs each site's input apart through the packed product
-    (`ProjectionGroup.apart`), computing what its own three projections compute at drawn gates (check 1
-    against them in float64), and unpacks back to them (`unpacked`)."""
+    pass would run the packed product once a site), the prelude's alone, its feed-forwards' as any; a
+    tree a server packed as the decoder without the loop packs (`qkv_proj`) runs each site's input apart
+    through the packed product (`ProjectionGroup.apart`), computing what its own three projections compute
+    at drawn gates (check 1 against them in float64), and unpacks back to them (`unpacked`)."""
     from dew.nn.projections import pack_projections, pending, unpacked
 
     looped = decoder("attention", steps=3)
     draw = gated_draw(looped, salt=0xC406)
     variables, _ = draw(0)
-    assert {group.path[0] for group in pending(looped, variables)} == {"layers_0"}
+    def attending(groups):
+        return {group.path[0] for group in groups if group.packed == "qkv_proj"}
+
+    assert attending(pending(looped, variables)) == {"layers_0"}
     plain = decoder("attention")
     groups = pending(plain, {"params": _without_merges(variables["params"])})
-    assert {group.path[0] for group in groups} == {f"layers_{index}" for index in range(4)}
+    assert attending(groups) == {f"layers_{index}" for index in range(4)}
     packed_tree = pack_projections(variables, groups)
     for one, other in zip(jax.tree.leaves(unpacked(looped, packed_tree)), jax.tree.leaves(variables),
                           strict=True):

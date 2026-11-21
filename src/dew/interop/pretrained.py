@@ -439,11 +439,10 @@ class Pretrained:
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
                           else None)
             from dew.interop.layouts import source_layout
-            from dew.nn.protocols import CrossAttending
 
             kind = MultimodalTransformer if isinstance(model, MediaWrapper) else CausalTransformer
             laid = from_record(kind, model)
-            crossing = isinstance(laid, CrossAttending) and laid.cross_attention is not None
+            crossing = laid.cross_attention is not None
             stated = source_layout(laid.with_cross_attention(None) if crossing else laid)
             if isinstance(stated, Unwritable):
                 # No family's layout writes it (a wrapper's or a decoder's alike): the run's own model,
