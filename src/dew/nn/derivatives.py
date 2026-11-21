@@ -411,7 +411,7 @@ def triton_lowerings() -> None:
     from jax._src.pallas.triton import lowering as triton_lowering
 
     triton_lowering.register_lowering(marked_call_p)(triton_lowering.lower_fun(
-        lambda *args, call_jaxpr, **_: jax_core.eval_jaxpr(call_jaxpr, (), *args), multiple_results=True))
+        lambda *args, call_jaxpr, **_: jax.core.eval_jaxpr(call_jaxpr, (), *args), multiple_results=True))
 
 
 def _evaluating() -> bool:
