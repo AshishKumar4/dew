@@ -471,6 +471,9 @@
 "tests/test_attention_route.py::test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expert_mesh",
 "tests/test_attention_route.py::test_the_accurate_form_is_one_option_away"
 ],
+"tests/test_attention_splash.py": [
+"tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[sinks-window]"
+],
 "tests/test_attention_stability.py": [
 "tests/test_attention_stability.py::test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form[a share in bf16's subnormal band, the denominator's rest in a later tile-normalized first]",
 "tests/test_attention_stability.py::test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient[float32]",
@@ -1928,9 +1931,6 @@
 "tests/test_linear_attention.py::test_the_masked_conv_matches_the_token_scan[False-a paused row beside a full one]",
 "tests/test_linear_attention.py::test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound"
 ],
-"tests/test_live_bridge.py": [
-"tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
-],
 "tests/test_lm_objective.py": [
 "tests/test_lm_objective.py::test_evaluation_correctness_is_the_same_full_forward_argmax",
 "tests/test_lm_objective.py::test_scoring_with_samples_configured_does_not_decode",
@@ -2156,9 +2156,6 @@
 "tests/test_mla.py::test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole",
 "tests/test_mla.py::test_decode_matches_prefill[mla_v32]",
 "tests/test_mla.py::test_the_deepseek_stack_fits_on_the_mesh[2-1]"
-],
-"tests/test_model_flops.py": [
-"tests/test_model_flops.py::test_analytical_count_equals_every_forward_dot_and_convolution[jepa]"
 ],
 "tests/test_model_flops_families.py": [
 "tests/test_model_flops_families.py::test_conditional_unet_counts_odd_resizing_pooled_time_ids_and_cross_only_attention[False]",
