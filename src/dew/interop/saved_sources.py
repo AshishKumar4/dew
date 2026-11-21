@@ -18,7 +18,6 @@ import hashlib
 import json
 import os
 import tempfile
-import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -152,15 +151,16 @@ def step_records(artifact: dict[str, JSON] | list[JSON] | str | int | float | bo
     return (*task.step_records(directory, step), *held)
 
 
-def _fingerprint(run: SavedRun, ema: bool | None) -> str:
+def _fingerprint(run: SavedRun, ema: bool | None) -> str | None:
     """What an export of `run`'s pinned step with `ema` is a function of: the run's location, its step,
-    the EMA choice, the code that writes it (`dew._code.whole_digest`, ledger 2775; a process whose source
-    changed while it ran keys an export of its own, which no other reads), the contents of the run's
+    the EMA choice, the code that writes it (`dew._code.whole_digest`, ledger 2775; None, no kept export,
+    where the process's source changed while it ran), the contents of the run's
     own records beside its checkpoints (its run record and a task's assets, a decision task's
     calibration among them) and those its task keeps by the step (`SavedRunTask.step_records`), and the
     step's metadata files, by size and write time, which a new save of the step rewrites."""
     root = epath.Path(run.directory)
-    code = whole_digest() or f"changed source, process {os.getpid()} at {time.time_ns()}"
+    if (code := whole_digest()) is None:
+        return None
     digest = hashlib.sha256(json.dumps([str(root), run.step, ema, code]).encode())
     for path in sorted((path for path in root.iterdir() if path.is_file()), key=str):
         digest.update(f"{path.name}\0".encode() + path.read_bytes())
@@ -316,7 +316,11 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     if samples_images(run):
         raise ValueError(f"{name_or_dir} is a diffusion run, which Dew writes no release of: a diffusion run "
                          "starts from it (load_diffusion_source), and TextToImage.from_run serves it")
-    release = Path(dew_cache_dir()) / RELEASES / _fingerprint(run, ema)
+    # A process whose source changed while it ran exports outside the kept releases, which no other reads
+    # (train 1154's review F5: keyed on its process and time, each load left a whole release in the cache).
+    key = _fingerprint(run, ema)
+    release = (Path(dew_cache_dir()) / RELEASES / key if key is not None
+               else Path(tempfile.mkdtemp(prefix="dew-release-")) / "release")
     lacking = any(from_every_process(not release.is_dir()))
     if not lacking:
         if not (release / HELD_FILE).is_file():
