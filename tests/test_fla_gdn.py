@@ -840,7 +840,7 @@ three."""
 def test_a_remat_policy_changes_no_gradient(policy):
     """A block's remat policy over the port's named residuals (`residuals.RESIDUALS`): none,
     'all_but_delta_memory', which the block applies by tracing its layers recomputing that name
-    (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, and a policy saving the output,
+    (`residuals.recomputing`) rather than by a checkpoint policy, and a policy saving the output,
     decay and inverse. Each computes the gradients the layer computes without remat, on
     par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
     (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient. A GPU compiles

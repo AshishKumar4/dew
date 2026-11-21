@@ -56,7 +56,7 @@ from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
-from dew.nn.residuals import recomputed_memory
+from dew.nn.residuals import recomputed_memory, recomputing
 from tools import benchmark_recurrence
 
 pytestmark = pytest.mark.kernel
@@ -1180,7 +1180,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
 
     # The run's rounded products are its declaration's at the default precision (`rounds_products`; the
     # suite's lanes configure 'highest').
-    with (report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)),
+    with (report.refusals(), generation.assumed('sm90'), recomputing(('delta_memory',)),
           generation.chosen(gated_delta_rule='mosaic_gpu'), jax.default_matmul_precision('default')):
         target = template.Mosaic.launched()
         named()
