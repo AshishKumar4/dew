@@ -1159,12 +1159,11 @@ def test_a_launch_spilling_at_every_rung_refuses_the_tiles_that_plan_it_alike():
 
 
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
-    """Under the remat rung recomputing the delta rule's memory (`residuals.recomputing`), a refusal of
-    every tile of the run's training call's launch (its identity as its lowering for an H100 names it,
-    `report.traced`) reaches the route: a call naming the template is refused first for its launch (code
-    'launch'; its backward with it) where it was taken before. The route's bind is the run's launch, the
-    rung's flag resolved alike (`residuals.recomputed_memory`); bound as kept, it judged another
-    launch than the run's (row 4133)."""
+    """Under the remat rung recomputing the delta rule's memory (`residuals.recomputing`), a refusal of every
+    tile of the run's training call's launch (its identity as an H100's lowering names it, `report.traced`)
+    reaches the route: a call naming the template is refused first for its launch (code 'launch'; its
+    backward with it) where it was taken before. The route binds the run's launch, the rung's flag resolved
+    alike (`residuals.recomputed_memory`); bound as kept, it judged another launch (row 4133)."""
     from dew.nn.kernels import recurrence_chunk
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.selection import KernelRefused
