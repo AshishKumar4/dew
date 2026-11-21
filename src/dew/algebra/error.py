@@ -133,7 +133,8 @@ def product_precision(rows: int, depth: int, columns: int, dtype, *,
     accuracy its site asks: of the algorithms JAX runs operands of that dtype in as they are stored
     (`dew.nn.programs.dot_algorithms`, JAX's own conversion; no list of them here), the cheapest on the
     process's target
-    (`cost.product_work` under XLA's schedule: a preset's mode and passes as JAX lowers it) that `admits`
+    (`cost.product_work` under XLA's schedule: a preset's mode and passes as JAX lowers it, one with work at
+    a rate the target states none of after every one without, row 10845) that `admits`
     holds, the site's gate run on its own family at that algorithm (as exact as the accuracy asked, from
     the float64 truth). So a site states an accuracy and takes whatever product meets it at the best rate:
     three TF32 passes where one is not enough and IEEE fp32 costs more, one where it is (row 5473;
@@ -143,9 +144,11 @@ def product_precision(rows: int, depth: int, columns: int, dtype, *,
     stated = programs.dot_algorithms(operand)
     schedule = cost.fused(cost.target())
 
-    def seconds(preset: jax.lax.DotAlgorithmPreset) -> tuple[float, float]:
+    def seconds(preset: jax.lax.DotAlgorithmPreset) -> tuple[float, ...]:
+        # Work at no rate first (an algorithm the target does not run, `product.TPU_ALGORITHMS`), as
+        # `cost.cheaper` weighs it: no seconds price it, so none makes its algorithm cheaper.
         work = cost.product_work(rows, depth, columns, dtype=operand, precision=preset)
-        return cost.Seconds(work, schedule).key
+        return sum(schedule.unpriced(work)), *cost.Seconds(work, schedule).key
 
     for preset in sorted(stated, key=seconds):
         if admits(preset):
