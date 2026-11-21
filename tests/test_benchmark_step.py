@@ -414,7 +414,6 @@ def test_a_benchmarks_rows_reach_a_tracker_after_its_cases_one_step_a_case(tmp_p
              "fixed_batch": False},
             {"architecture": "unet", "ms_per_step": 30.0, "mfu": None, "devices": 1}]
     step.tracked(rows, LocalTracker(tmp_path))
-    logged = [json.loads(line) for line in (tmp_path / "scalars.jsonl").read_text().splitlines()]
-    assert [(entry["step"], entry["scalars"]) for entry in logged] == [
+    assert LocalTracker(tmp_path).scalars() == [
         (0, {"simple_dit/ms_per_step": 12.5, "simple_dit/mfu": 0.31}),
         (1, {"unet/ms_per_step": 30.0, "unet/devices": 1.0})]

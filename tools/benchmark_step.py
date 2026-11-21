@@ -864,13 +864,14 @@ def main(config: BenchmarkConfig) -> list[Row]:
         print(f"Devices: {rows[0]['devices']} x {rows[0]['device_kind']}, {rows[0]['processes']} process(es)")
     print()
     print(format_table(rows))
-    if config.tracked:
-        tracked(rows, WandbTracker(config.tracked, name=f"benchmark_step {config.preset}"))
     if config.json_out:
         print(f"\nWrote {config.json_out}")
     else:
         print()
         print(json.dumps(rows, indent=2))
+    # Last, the rows written first: a tracker that fails loses none of them (train 1150's review F4).
+    if config.tracked:
+        tracked(rows, WandbTracker(config.tracked, name=f"benchmark_step {config.preset}"))
     return rows
 
 

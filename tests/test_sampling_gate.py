@@ -16,9 +16,6 @@ from sampling_gate import (
 )
 from scipy import stats
 
-__accuracy_gate__ = True
-"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
-
 SHARES = (0.85, 0.05, 0.1)
 
 

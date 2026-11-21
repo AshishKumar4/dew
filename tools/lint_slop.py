@@ -1983,21 +1983,22 @@ def owned_constructs(module: Module) -> Iterator[Finding]:
                               finding.format(named=named))
 
 
-GATE_MARK = "__accuracy_gate__"
-"""The name a module of the accuracy gate binds at its top level (`_gated`), its modules and the tests of
-the gate itself, the one place a float is compared within a bound: every other comparison goes through
-its assertion; the sampling gate (tests/sampling_gate.py) compares a statistic's rarity with its level, and
-the learning gate (tests/learning_gate.py) a claim's t over its runs with its threshold, each its verdict.
-The selection margins (tests/selection_margins.py) are the gate's preconditions for check 1 on a model that
-selects: their bounds hold a draw's discrete choices to float64's, and live with it. Each module states it
-itself, so a new one is the gate's as it is written (row 5377: a hand-kept list linted a new gate test as
-a product test until its name was added)."""
-
-
-def _gated(module: Module) -> bool:
-    """Whether `module` is the accuracy gate's: its top level binds `GATE_MARK`."""
-    return any(isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == GATE_MARK
-                                                    for target in node.targets) for node in module.tree.body)
+GATE = frozenset({"tests/reference_error.py", "src/dew/parity.py", "tests/op_certificates.py",
+                  "tests/certified.py",
+                  "tests/residual_orders.py",
+                  "tests/selection_margins.py", "tests/test_selection_margins.py",
+                  "tests/test_reference_error.py", "tests/test_op_certificates.py",
+                  "tests/test_reference_orders.py", "tests/test_float64_terms.py",
+                  "tests/sampling_gate.py", "tests/test_sampling_gate.py",
+                  "tests/learning_gate.py", "tests/test_learning_gate.py", "tests/one_draw.py",
+                  "tests/float64_terms.py",
+                  "tests/rounding_bound.py", "tests/test_weighed_check.py", "tests/arm_arithmetic.py"})
+"""The gate's modules and the tests of the gate itself, the one place a float is compared within a
+bound: every other comparison goes through its assertion; the sampling gate (tests/sampling_gate.py)
+compares a statistic's rarity with its level, and the learning gate (tests/learning_gate.py) a claim's t
+over its runs with its threshold, each its verdict. The selection margins
+(tests/selection_margins.py) are the gate's preconditions for check 1 on a model that selects: their
+bounds hold a draw's discrete choices to float64's, and live with it."""
 INVENTORY = "tools/tolerance_inventory.json"
 RULE = "tools/lint_tolerances.py"
 """SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""
@@ -2241,11 +2242,11 @@ def _checkout(module: Module) -> Path:
 
 
 def tolerances(module: Module) -> Iterator[Finding]:
-    """SLOP020: a float compared within a tolerance outside the gate (`_gated`, `_tolerance_comparisons`).
+    """SLOP020: a float compared within a tolerance outside the gate (`GATE`, `_tolerance_comparisons`).
     A file the inventory holds may keep its count; above it, every comparison is reported; below it,
     the inventory is told to come down, so the count it keeps is the file's and it only shrinks
     (`ratchet` holds every commit's inventory to its parents')."""
-    if not module.relative.startswith(("tests/", "tools/")) or _gated(module):
+    if not module.relative.startswith(("tests/", "tools/")) or module.relative in GATE:
         return
     found = sorted(_tolerance_comparisons(module),
                    key=lambda pair: (pair[0].lineno, pair[0].col_offset))
