@@ -212,7 +212,7 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
     exported = packed.export()
     for name in PACKED_MLP:
         stem = f"model.layers.0.mlp.{name}.weight"
-        for part in (stem, stem + "_scale", stem + "_scale_2"):
-            np.testing.assert_array_equal(np.asarray(exported[part]).view(np.uint8),
-                                          np.asarray(stored[part]).view(np.uint8), err_msg=part)
+        parts = (stem, stem + "_scale", stem + "_scale_2")
+        assert_same_stored_tensors({part: np.asarray(exported[part]) for part in parts},
+                                   {part: stored[part] for part in parts})
 
