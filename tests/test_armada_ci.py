@@ -1460,9 +1460,11 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     """A run that reads a checkout file and writes it keeps no key, however it writes it: Python's write, one
     handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, through
     an alias of what it read, under a nested hidden directory, a copy that puts the file's time back, or a
-    native writer (sqlite's); nor does one that found a file absent and made it: its key would hash the
-    checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its review).
-    A file a run only writes, as each run here appends to `runs`, is no input and leaves its key."""
+    native writer (sqlite's); nor does one that found a file absent and made it, a package beside a module
+    it imported among them, which only its key's import lookups cover (`ci.inputs`; row 10800): its key would
+    hash the checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its
+    review), its record saying so (row 10775). A file a run only writes, as each run here appends to `runs`,
+    is no input and leaves its key."""
     import sqlite3
 
     counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
@@ -1479,6 +1481,8 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     (tmp_path / "docs/.data").mkdir()
     (tmp_path / "docs/.data/input.txt").write_text("input\n")
     (tmp_path / "docs/same.txt").write_text("PAGE\n")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src/held.py").write_text("VALUE = 1\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     for test, body in (
             ("plain", "    assert True\n"),
@@ -1501,7 +1505,10 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
                      "        made.write_text('made\\n')\n"),
             ("native", "    with sqlite3.connect('tests/fixtures/rows.db') as database:\n"
                        "        database.execute('insert into t values (1)')\n"
-                       "    database.close()\n")):
+                       "    database.close()\n"),
+            ("shadowed", "    import sys\n    sys.path.insert(0, 'src')\n    import held\n    assert held\n"
+                         "    made = Path('src/held')\n    if not made.exists():\n        made.mkdir()\n"
+                         "        (made / '__init__.py').write_text('')\n")):
         written(tmp_path, {"test_a.py": "import mmap\nimport os\nimport shutil\nimport sqlite3\n"
                                         "from pathlib import Path\n\n\ndef test_a():\n" + counted + body})
         (tmp_path / "runs").unlink(missing_ok=True)
@@ -1513,6 +1520,10 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
             kept = json.loads(cache_worker[1][place])
             assert kept["key"] is None and kept["depends"] is None
             assert any(path.partition(ci.followed.CODE)[0].endswith("docs/page.txt") for path in kept["read"])
+        if test == "shadowed":
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            kept = json.loads(cache_worker[1][place])
+            assert kept["key"] is None and "its task wrote its input src/held" in kept["why"], kept["why"]
 
 
 def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(ci, tmp_path, monkeypatch,
