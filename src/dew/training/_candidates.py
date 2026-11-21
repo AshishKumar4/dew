@@ -35,7 +35,7 @@ from dew.training._lowering import Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
 from dew.training.model_flops import batch_consumed, batch_tokens
-from dew.training.narrow import holds_copies, narrow_copies, narrowed
+from dew.training.narrow import holds_copies, narrow_copies, narrowed, read_paths
 from dew.training.planning import Candidate, splits
 from dew.training.stages import StageLocal
 from dew.training.transaction import COMMIT_FIELDS, outcome
@@ -324,8 +324,9 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
     the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
     `narrow` is off, or `copies` whole where given (a sampled pass count's step takes its cap's, which
-    every step of the window reads: `StepCompiler.admitted_at`), refused where the trace reads a parameter
-    narrow outside them; and the loss's forward program that trace made (None under a custom step)."""
+    every step of the window reads: `StepCompiler.admitted_at`): a parameter it would copy and they do not
+    it reads whole and casts, and one they copy it must read through that one cast or not at all, refused
+    otherwise; and the loss's forward program that trace made (None under a custom step)."""
     settings = stepping.settings
     window = split * settings.accumulation
     with group_of(state, batch) as (view, rows):
@@ -345,8 +346,12 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
         # parameter whose one use in it is that cast, which the copy is (row 10770: a sampled count below an
         # implicit loop's cap narrows the loop's layers, whose cap sums their cotangents over its passes and
         # reads them whole). A parameter it would narrow and the window does not it reads whole and casts.
+        # A copy of a parameter the step reads nowhere is no part of it (a later pass's θ, at one pass).
+        shaped = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
+        read = read_paths(traced, shaped, ("params",)) if traced is not None else frozenset()
         unread = sorted(".".join(path) for path, dtype in copies.items()
-                        if path not in own or jnp.dtype(own[path]) != jnp.dtype(dtype))
+                        if (path in own and jnp.dtype(own[path]) != jnp.dtype(dtype))
+                        or (path not in own and path in read))
         if unread:
             raise ValueError(f"the step reads {unread} other than through the narrow copies its window holds "
                              "of them: every step of one window reads one set of copies, each its one cast")

@@ -235,18 +235,21 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
     assert len(set(drawn)) > 1 and interval.microbatches == 8
 
 
-def test_a_sampled_run_of_an_implicit_loop_in_bf16_reads_its_caps_narrow_copies_at_every_count():
+@pytest.mark.parametrize("cap", [2, CAP])
+def test_a_sampled_run_of_an_implicit_loop_in_bf16_reads_its_caps_narrow_copies_at_every_count(cap):
     """A bf16 decoder whose implicit loop's pass count is drawn per microbatch, its parameters read through
     narrow copies (row 10770): at its cap the loop's layers sum their cotangents over its passes and are read
-    whole, and at one pass they are cast once and could be copied; the window reads the cap's copies at every
-    count, the loop's layers whole, so it plans and steps each count drawn, where it refused at its first
-    step."""
+    whole, and at one pass they are cast once and could be copied; and at a cap of two its one later pass
+    casts θ once, which one pass reads nowhere. The window reads the cap's copies at every count, the
+    loop's layers whole, θ through its copy where a pass reads it, so it plans and steps each count drawn,
+    where it refused at its first step."""
     from dew.nn.kernels.generation import chosen
 
-    model = dataclasses.replace(looped(implicit=True, steps=CAP), dtype=jnp.bfloat16)
+    model = dataclasses.replace(looped(implicit=True, steps=cap), dtype=jnp.bfloat16)
     batch = token_batch()
+    law = dataclasses.replace(TRAINED, cap=cap)
     with chosen(narrow_copies="on"):
-        sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, accumulation=2)
+        sampled = phased_trainer(model, 0, None, sampled_passes=law, accumulation=2)
         state, _, _ = sampled.place()
         step = sampled.compile(state, batch)
         interval = Interval(time.time(), None, microbatches=0)
