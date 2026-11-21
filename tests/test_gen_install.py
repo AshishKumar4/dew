@@ -62,6 +62,24 @@ def test_a_new_jax_requirement_is_written_into_the_page(tmp_path):
     assert generate(root, "--check") == 0
 
 
+def test_the_builds_sentence_follows_each_pin_and_refuses_pins_of_two_releases(tmp_path):
+    """The page's builds sentence states the plugins', PJRT's, jaxlib's and libtpu's releases as
+    pyproject.toml pins them (rows 10788 and 10789): a libtpu pin moved is written into the page, and a CUDA
+    13 PJRT pin of another release than the plugins' is refused, the page stating one release for them all."""
+    root = scratch(tmp_path)
+    pyproject = root / "pyproject.toml"
+    text = pyproject.read_text()
+    libtpu = next(line for line in text.splitlines() if line.startswith("tpu = ["))
+    pyproject.write_text(text.replace(libtpu, libtpu.replace('"libtpu==', '"libtpu==9.', 1), 1))
+    assert generate(root, "--check") == 1
+    assert generate(root) == 0
+    assert "libtpu 9." in (root / "docs/installation.md").read_text()
+    text = pyproject.read_text()
+    pjrt = next(line for line in text.splitlines() if line.startswith("cuda13 = ["))
+    pyproject.write_text(text.replace(pjrt, pjrt.replace('"jax-cuda13-pjrt==', '"jax-cuda13-pjrt==9', 1), 1))
+    assert generate(root) == 1 and generate(root, "--check") == 1
+
+
 def test_a_new_package_index_is_the_one_the_installer_and_the_pages_name(tmp_path):
     root = scratch(tmp_path)
     table = root / Path(_builds.__file__).resolve().relative_to(REPO)
