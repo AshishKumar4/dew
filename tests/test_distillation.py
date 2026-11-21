@@ -754,3 +754,41 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
     tiled, _ = fixture_objective(arrays)
     assert tiled.tile_head((3, vocab)) is not None
     assert holds_whole(gradient(objective)) and not holds_whole(gradient(tiled))
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_tiled_full_kl_over_a_batch_split_across_devices_gathers_no_states():
+    """The tiled full KL (`_tiled_divergence`) over final states whose rows are split across four devices
+    compiles with no all-gather of either model's states: each slice of positions keeps every row on its
+    own device, and the KL agrees with the whole logits' (row 9067: a slice of the flattened token axis
+    gathered `[B*S, D]` onto every device)."""
+    import math
+    import re
+
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from dew.nn import categorical
+    from dew.objectives.base import Prediction
+
+    arrays = fixture()
+    objective, _ = fixture_objective(arrays)
+    vocab, width, rows, positions = META["student"]["vocab_size"], 8, 4, 12
+    assert objective.tile_head((3, vocab)) is not None
+    keys = jax.random.split(jax.random.key(0), 4)
+    student_table, teacher_table = (jax.random.normal(key, (width, vocab)) for key in keys[:2])
+    states = [jax.random.normal(key, (rows, positions, width)) for key in keys[2:]]
+    mesh = Mesh(np.asarray(jax.devices()[:4]), ("data",))
+    split = NamedSharding(mesh, P("data"))
+
+    def divergence(student_states, teacher_states):
+        student = Prediction(None, None, None, (), final=student_states, head=lambda h: h @ student_table)
+        teacher = Prediction(None, None, None, (), final=teacher_states, head=lambda h: h @ teacher_table)
+        finite = jnp.ones((rows, positions), bool)
+        return objective._tiled_divergence(student, teacher, finite, jnp.asarray(2.0))
+
+    program = jax.jit(divergence, in_shardings=(split, split)).lower(*states).compile().as_text()
+    gathered = [tuple(map(int, shape.split(",")))
+                for shape in re.findall(r"\[([\d,]+)\][^ ]* all-gather\(", program)]
+    assert not any(math.prod(shape) >= rows * positions * width for shape in gathered), gathered
+    whole = categorical.kl_divergence((states[0] @ student_table) / 2.0, (states[1] @ teacher_table) / 2.0)
+    np.testing.assert_allclose(divergence(*states), whole, rtol=1e-5, atol=1e-6)

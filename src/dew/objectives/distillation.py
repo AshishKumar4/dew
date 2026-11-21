@@ -382,34 +382,37 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
     def _tiled_divergence(self, student: Prediction, teacher: Prediction, finite: jax.Array,
                           temperature: jax.Array) -> jax.Array:
         """The `[B, S]` KL of the teacher's tempered distribution from the student's, each position's
-        logits computed from its final states a tile of rows at a time (the student's head tile's), each
-        tile's recomputed in the backward: no `[B, S, vocab]` logits of either model are held."""
+        logits computed from its final states a slice of positions at a time over every row, each slice's
+        recomputed in the backward: no `[B, S, vocab]` logits of either model are held. A slice holds as
+        many tokens as the student's head tile's area allows logits of (`tile[0] * tile[1]` over the
+        vocabulary, every row at least one position), and is cut along the positions alone, so its rows
+        keep the batch's split over the devices and no device gathers another's states (row 9067)."""
         student_head, teacher_head = student.head, teacher.head
         assert student.final is not None and teacher.final is not None
         assert student_head is not None and teacher_head is not None
         tile = self._student_tile()
         assert tile is not None
         rows, positions = student.final.shape[:2]
-        count = rows * positions
-        size = min(tile[0], count)
-        chunks = -(-count // size)
+        vocab = jax.eval_shape(student_head, student.final[:, :1]).shape[-1]
+        per = max(1, min(positions, tile[0] * tile[1] // vocab // rows))
+        chunks = -(-positions // per)
 
-        def flat(values: jax.Array) -> jax.Array:
-            values = values.reshape(count, *values.shape[2:])
-            return jnp.pad(values, ((0, chunks * size - count), *((0, 0),) * (values.ndim - 1)))
+        def padded(values: jax.Array) -> jax.Array:
+            return jnp.pad(values, ((0, 0), (0, chunks * per - positions), *((0, 0),) * (values.ndim - 2)))
 
-        own, other, kept = flat(student.final), flat(teacher.final), flat(finite)
+        own, other, kept = padded(student.final), padded(teacher.final), padded(finite)
 
         @jax.checkpoint
         def one(at):
-            start = at * size
-            student_logits = student_head(jax.lax.dynamic_slice_in_dim(own, start, size))
-            teacher_logits = teacher_head(jax.lax.dynamic_slice_in_dim(other, start, size))
-            held = jnp.where(jax.lax.dynamic_slice_in_dim(kept, start, size)[..., None], teacher_logits, 0)
+            start = at * per
+            student_logits = student_head(jax.lax.dynamic_slice_in_dim(own, start, per, axis=1))
+            teacher_logits = teacher_head(jax.lax.dynamic_slice_in_dim(other, start, per, axis=1))
+            held = jnp.where(jax.lax.dynamic_slice_in_dim(kept, start, per, axis=1)[..., None],
+                             teacher_logits, 0)
             return categorical.kl_divergence(student_logits / temperature, held / temperature)
 
-        divergence = jax.lax.map(one, jnp.arange(chunks)).reshape(-1)[:count]
-        return divergence.reshape(rows, positions)
+        divergence = jax.lax.map(one, jnp.arange(chunks))
+        return jnp.moveaxis(divergence, 0, 1).reshape(rows, chunks * per)[:, :positions]
 
     def _distance(self, student: jax.Array, teacher: jax.Array) -> jax.Array:
         """The pair's per-position feature distance, `[B, S]`, in the pair's common dtype, at least fp32."""

@@ -1903,3 +1903,5 @@ def test_a_token_budget_reached_inside_a_split_step_ends_the_run_at_that_commit(
     state = trainer.fit(loader, tokens=1, log_every=1)
     assert int(state.step) == 2
     assert state.window is None or occupied(state.window) == 0
+    # Its accepted microbatches those its one update committed, as a run continued from it counts on.
+    assert int(state.updates) == 1 and int(state.microstep) == 2
