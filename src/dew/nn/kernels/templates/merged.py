@@ -333,11 +333,8 @@ def _launch(padded, stacked, *extra, units: means.Units, queries: int, width: in
             raw_t = init_t_ref[...].reshape(1, 1)
             raw_m = init_m_ref[...].reshape(1, 1)
             raw_acc = init_acc_ref[...].reshape(1, 1, block)
-            held = means.holding(raw_t)
-            init_out = jnp.where(held[..., None], means.finished(raw_acc, raw_t), 0.0)
-            init_m = algebra.raw_maximum(raw_m, raw_scale) if raw_scale is not None else raw_m
-            init_state: tuple | None = (init_out, jnp.where(jnp.isfinite(init_m), init_m, algebra.LEAST),
-                                        jnp.where(raw_t >= 0, raw_t, 0.0))
+            init_state: algebra.Partial | None = algebra.initial_state(
+                units, algebra.Partial(raw_acc, raw_m, raw_t), raw_scale=raw_scale)
         else:
             out_refs = rest
             init_state = None
@@ -348,12 +345,11 @@ def _launch(padded, stacked, *extra, units: means.Units, queries: int, width: in
             maximum = maxima_ref[0, at].reshape(chunk, 1)
             total = totals_ref[0, at].reshape(chunk, 1)
             if init_state is not None:
-                init_out, init_m, init_t = init_state
                 slice_pos = start + jax.lax.broadcasted_iota(jnp.int32, (chunk, 1), 0)
                 is_init = slice_pos == slices
-                out = jnp.where(is_init[..., None], init_out, out)
-                maximum = jnp.where(is_init, init_m, maximum)
-                total = jnp.where(is_init, init_t, total)
+                out = jnp.where(is_init[..., None], init_state.acc, out)
+                maximum = jnp.where(is_init, init_state.m, maximum)
+                total = jnp.where(is_init, init_state.total, total)
             return out, maximum, total
 
         state = algebra.finished_merged_chunked(units, *_chunks(total_slices, read))

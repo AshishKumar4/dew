@@ -69,7 +69,7 @@ def a_sparse_attention_step_is_on_par(case: tuple[str, ...]) -> None:
     """`sparse_selection.templated_context` on `case`'s GPU on par with `blocked_context` (check 1)."""
     combination = dict(zip(AXES["sparse_attention"], case, strict=True))
     dtype = _dtype(combination["dtype"])
-    ours_fn = functools.partial(sparse_selection.templated_context, scale=SCALE)
+    ours_fn = sparse_selection.templated_context(SCALE, None, LENGTH)
     ref_fn = functools.partial(sparse_selection.blocked_context, scale=SCALE, block=LENGTH)
 
     def run(*operands):
