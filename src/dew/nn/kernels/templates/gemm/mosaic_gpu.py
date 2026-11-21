@@ -1672,11 +1672,14 @@ def _gmm_prefetch(family: mosaic.Family, step: functools.partial) -> Callable | 
     """Dew: the walk's prefetch of a `_gmm_step`'s slots (`Transport.prefetches_fragments`): its one
     product's first fragments (`Issuer.first_fragments`), read under the step before's last product, for a
     plain step alone (one matrix, its rows as staged, every consumer's products issued unconditionally, a
-    compiled launch); None elsewhere, its steps walked as they were."""
+    compiled launch), its rows read untransposed: the prefetch reads the left operand an instruction's
+    granule at a time (`products_across`), which took a transposed left's kernel gradient 7% slower on an
+    A100 than its whole-swizzle-tile reads (FS-DENSE-AB1); None elsewhere, its steps walked as they were."""
     keywords = step.keywords
     plain = (len(keywords['matrices']) == 1 and keywords['prologue'] is None and keywords['idle'] is None
              and keywords.get('decoded') is None and not keywords['packed_rows']
-             and not keywords['block_scaled'] and keywords['chosen'] is None and not keywords['interpret'])
+             and not keywords['block_scaled'] and keywords['chosen'] is None and not keywords['interpret']
+             and not keywords['transpose_lhs'])
     if not (family.prefetches_fragments and plain):
         return None
 

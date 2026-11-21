@@ -433,7 +433,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
             fragments = ahead
         return self._mma(acc, *fragments)
 
-    def _fragments(self, lhs, rhs, seeded: tuple | None = None) -> tuple[Callable, range, Callable]:
+    def _fragments(self, lhs, rhs, seeded: tuple | None = None, *, sliced: bool = False
+                   ) -> tuple[Callable, range, Callable]:
         """`products`' fragment reads of `lhs @ rhs`: `loaded(start)`, instruction `start`'s fragments, its
         loads issued the first time a slice is asked for; the instructions' starts; and `first()`, the left
         and right slices instruction 0 reads, read (`first_fragments`), those `seeded` gives already read
@@ -444,10 +445,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         faster. A register operand (an accumulator's value) is cast once and sliced. Each instruction's
         fragments load before the product ahead of it issues, CUTLASS's warp-level double buffering: every
         dense kernel gradient on an A100 took 12 to 14% less time, its outputs bitwise the same, the forward
-        and input gradient unchanged (FS-C1-NARROW1-a100)."""
+        and input gradient unchanged (FS-C1-NARROW1-a100). `sliced`, the left loads as narrow as the right's
+        (an instruction's granule): what a step's prefetch holds across the step before's last product is
+        then the one instruction's fragments the lookahead holds within a step, no register beyond it."""
         instruction = self.fragment_depth(int(rhs.shape[0]))
-        lhs_depth = max(_depth_granule(lhs, 1, instruction),
-                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=swizzling.swizzle_of(lhs)))
+        widest = 0 if sliced else self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=swizzling.swizzle_of(lhs))
+        lhs_depth = max(_depth_granule(lhs, 1, instruction), widest)
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
@@ -477,12 +480,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def first_fragments(self, lhs, rhs):
         if jnp.dtype(lhs.dtype) != self.dtype:
             return self.for_dtype(lhs.dtype).first_fragments(lhs, rhs)
-        return self._fragments(lhs, rhs)[2]()
+        return self._fragments(lhs, rhs, sliced=True)[2]()
 
     def products_across(self, acc, lhs, rhs, prefetched, boundary: Callable):
         if jnp.dtype(lhs.dtype) != self.dtype:
             return self.for_dtype(lhs.dtype).products_across(acc, lhs, rhs, prefetched, boundary)
-        loaded, starts, _ = self._fragments(lhs, rhs, seeded=prefetched)
+        loaded, starts, _ = self._fragments(lhs, rhs, seeded=prefetched, sliced=True)
         fragments = loaded(starts[0])
         for following in starts[1:]:
             ahead = loaded(following)
