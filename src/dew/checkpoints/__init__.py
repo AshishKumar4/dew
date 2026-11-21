@@ -133,7 +133,7 @@ from dew.checkpoints.averaging import (
     averaged as averaged,
     averaged_pinned as averaged_pinned,
 )
-from dew.checkpoints.submesh import SubmeshArrays
+from dew.checkpoints.submesh import SubmeshArrays, save_args
 from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
@@ -263,6 +263,10 @@ class Envelope(TypedDict):
     training: JSON
     boxed: Mapping[tuple[str, ...], LogicalAxes] | None
     rollout: Mapping[str, object] | None
+    held_apart: bool
+    """Whether `state` holds a pipeline's rows each on its own stage's devices
+    (`dew.training.stages.StageLocal.saved`), which each tier writes by the processes holding them
+    (`submesh.HeldApart`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1000,7 +1004,7 @@ class Checkpoints:
         self._metadata: tuple[bool, int, _StepFacts] | None = None
         # The newest local step, the processes holding it and where its arrays lie, where some process
         # lost its copy and recovers it from them (`_local_latest`); None where every process holds it.
-        self._recovery: tuple[int, frozenset[int], Grid] | None = None
+        self._recovery: tuple[int, frozenset[int], tuple[Grid, ...]] | None = None
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -1323,11 +1327,11 @@ class Checkpoints:
         # every shard it held (`_covered`).
         holders = frozenset(index for index, step in enumerate(steps) if step == newest)
         recorded = self._from_holder(holders, lambda: (self._open_local().metadata(newest).custom_metadata
-                                                       or {}).get("grid"))
-        grid = None if recorded is None else from_record(Grid, recorded)
-        if grid is None or not _covered(grid, holders):
+                                                       or {}).get("grids"))
+        grids = None if recorded is None else tuple(from_record(Grid, grid) for grid in recorded)
+        if grids is None or not _covered(grids, holders):
             return None
-        self._recovery = newest, holders, grid
+        self._recovery = newest, holders, grids
         return newest
 
     def _from_holder(self, holders: frozenset[int], read: Callable[[], JSON]) -> JSON:
@@ -1434,6 +1438,7 @@ class Checkpoints:
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
         tokenizer: Tokenizer | None = None,
+        held_apart: bool = False,
     ) -> None:
         """Write `state` under `step`, asynchronously, a train state with its rollout's tree of arrays where
         it holds one (`rollout`), which `rollout_state` reads back, and the run holding `tokenizer`, where
@@ -1513,7 +1518,8 @@ class Checkpoints:
         try:
             with region("checkpoint.submit"):
                 persistent.save(step, args=ocp.args.Composite(**{
-                    name: ocp.args.PyTreeSave(tree) for name, tree in payloads.items()}),
+                    name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
+                    for name, tree in payloads.items()}),
                                 metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
             self._staged.pop(step)
@@ -1840,6 +1846,7 @@ class Checkpoints:
         training: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
+        held_apart: bool = False,
     ) -> None:
         """Write `state` under `step` to this process's local directory, asynchronously, with its
         rollout's tree where it holds one (`rollout`, replicated: every process writes it whole).
@@ -1853,7 +1860,7 @@ class Checkpoints:
         refuse_non_finite(state, step, lambda: self.latest)
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
-        grid = Grid.of({name: leaf for name, leaf in state_tree.items() if name != 'position'})
+        grids = Grid.each({name: leaf for name, leaf in state_tree.items() if name != 'position'})
         coded, deltas = _with_ema_deltas(state_tree)
         state_tree = dict(coded)
         if saved is not None:
@@ -1869,13 +1876,13 @@ class Checkpoints:
         with region("checkpoint.submit_local"):
             local.save(
                 step,
-                args=ocp.args.PyTreeSave(state_tree),
+                args=ocp.args.PyTreeSave(state_tree, save_args=save_args(state_tree, held_apart)),
                 force=True,
                 custom_metadata={
                     **step_record(deltas, control, rung, artifact, training, boxed, state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
-                    "grid": None if grid is None else to_record(grid, Grid),
+                    "grids": None if grids is None else [to_record(grid, Grid) for grid in grids],
                 },
             )
         if _written_in_place(state_tree):
@@ -2399,10 +2406,11 @@ class Checkpoints:
         recovery = self._recovery
         if recovery is None or recovery[0] != step:
             return restored
-        _, holders, grid = recovery
+        _, holders, grids = recovery
         table = restored.pop('position', None)
         # The leaves the step wrote, from their holders; one it never wrote is each process's own as made.
-        restored = _merged(_from_replicas(_written(restored, self._placement(step)), grid, holders), restored)
+        restored = _merged(_from_replicas(_written(restored, self._placement(step)), grids, holders),
+                           restored)
         if positioned:
             restored['position'] = _from_table_record(self._from_holder(
                 holders, lambda: _table_record(jax.tree.map(np.asarray, dict(table or {})))))
@@ -2415,7 +2423,7 @@ class Checkpoints:
         recovery = self._recovery
         written = (self._step_metadata(step, local=True).custom_metadata or {})
         if recovery is not None and written.get('processes') == jax.process_count() and (
-                Grid.of(_written(state_tree, self._placement(step))) == recovery[2]):
+                Grid.each(_written(state_tree, self._placement(step))) == recovery[2]):
             return
         raise ValueError(
             f"This process lost its copy of local step {step}, which the processes "

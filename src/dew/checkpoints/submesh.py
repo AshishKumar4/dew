@@ -9,8 +9,8 @@ restore without the dtype a process that holds none of it must state
 written by the processes that hold its shards, its metadata by the first of them, the others writing
 nothing of it, and read back by them, the others making it with no shard; every other array is Orbax's
 own. The files are Orbax's: each such row its own array, read by any topology as the stages wrote it
-(docs/design/training.md, checkpoints). Only an array a pipeline's checkpoint made (`dew.mesh.held_apart`,
-which `dew.training.stages.StageLocal.saved` names of each row it makes, by the array itself) is written
+(docs/design/training.md, checkpoints). Only an array a pipeline's checkpoint made, its `SaveArgs` a
+`HeldApart` (`save_args`, where the save holds `dew.training.stages.StageLocal.saved`'s rows), is written
 so; any other array on part of the pool, a `pmap`'s host-local output on each process's own devices under
 one name above all, is still refused as Orbax refuses it, with no round between the processes (a local
 tier's saves are each process's own)."""
@@ -27,15 +27,57 @@ from orbax.checkpoint._src.futures import future
 from orbax.checkpoint._src.path import async_path
 from orbax.checkpoint._src.serialization import jax_array_handlers as handlers, replica_slices
 
-from dew.mesh import is_held_apart
+from dew._coordination import spans_part_of_pool
 
 
 def apart(value) -> bool:
     """Whether `value` is an array whose devices are some processes' of a pool and not every one's, on any
     backend (a CPU-owned state's companion mesh spans every process, as its accelerator's does)."""
-    return (isinstance(value, jax.Array) and jax.process_count() > 1
-            and {device.process_index for device in value.sharding.device_set} != set(range(
-                jax.process_count())))
+    return isinstance(value, jax.Array) and spans_part_of_pool(value.sharding.device_set)
+
+
+@dataclasses.dataclass
+class HeldApart(ocp.SaveArgs):
+    """How a checkpoint holds an array a pipeline's checkpoint made on part of the pool (a stage's row,
+    `dew.training.stages.StageLocal.saved`), which `SubmeshArrays` writes so; Orbax's `SaveArgs` else."""
+
+
+def save_args(tree, held_apart: bool):
+    """The `SaveArgs` of each leaf of `tree`: `HeldApart` for each array on part of the pool where the tree
+    holds a pipeline's rows (`held_apart`, `StageLocal.apart`), Orbax's own for every other leaf (row 10832:
+    the arrays named by their identity, process-wide, before)."""
+    return jax.tree.map(lambda leaf: HeldApart() if held_apart and apart(leaf) else ocp.SaveArgs(), tree)
+
+
+def _unique(index) -> tuple:
+    """A shard's global index as a key: each of its slices' bounds."""
+    return tuple((part.start, part.stop, part.step) for part in index)
+
+
+def omitted_replicas(value) -> bool:
+    """Whether Orbax's local tier would leave out a shard of `value` this process holds: it writes the
+    shards of its first addressable shard's replica id alone (`replica_slices.get_replica_slices`, its
+    replica id None), and this process holds a global index on another replica id only (a stage or mesh
+    spanning several ranks; a data-by-tensor layout with one rank on its diagonal, row 10813)."""
+    shards = value.addressable_shards if isinstance(value, jax.Array) else []
+    if not shards:
+        return False
+    first = shards[0].replica_id
+    return ({_unique(shard.index) for shard in shards}
+            != {_unique(shard.index) for shard in shards if shard.replica_id == first})
+
+
+def held_slices(value: jax.Array) -> replica_slices.ReplicaSlices:
+    """Each global index of `value` this process holds, once, read to the host (`jax.device_get`, an
+    explicit transfer): a local tier's shards, by index whatever replica holds them."""
+    first: dict[tuple, jax.Shard] = {}
+    for shard in value.addressable_shards:
+        first.setdefault(_unique(shard.index), shard)
+    return replica_slices.ReplicaSlices(
+        global_shape=value.shape, local_shape=value.sharding.shard_shape(value.shape),
+        sharding=value.sharding, dtype=value.dtype, is_on_host=True, replica_slices=[
+            replica_slices.ReplicaSlice(index=shard.index, unsliced_data=jax.device_get(shard.data),
+                                        slice_args=None) for shard in first.values()])
 
 
 def _owner(sharding: jax.sharding.Sharding) -> int:
@@ -52,13 +94,22 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
         args = list(args or [ocp.SaveArgs()] * len(values))
         parted: list[int] = []
         whole: list[int] = []
+        # A local tier's array whose held shards Orbax's own write would leave some of, each index written
+        # once by this process (`held_slices`), whatever replica holds it.
+        local = self._primary_host is None and self._replica_id is None
+        indexed = [index for index, value in enumerate(values) if local and omitted_replicas(value)
+                   and (not apart(value) or isinstance(args[index], HeldApart))]
         for index, value in enumerate(values):
+            if index in indexed:
+                continue
             # A stage's array alone: any other's on part of the pool, Orbax's own refusal (module docstring).
             (parted if apart(value) and isinstance(value.sharding, jax.sharding.NamedSharding)
-             and is_held_apart(value) else whole).append(index)
+             and isinstance(args[index], HeldApart) else whole).append(index)
         futures = [] if not whole else list(await super().serialize(
             [values[index] for index in whole], [infos[index] for index in whole],
             [args[index] for index in whole]))
+        if indexed:
+            futures.append(self._written(values, infos, args, indexed))
         if not parted:
             return futures
         if any(jnp.issubdtype(values[index].dtype, jax.dtypes.prng_key) for index in parted):
@@ -103,6 +154,23 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
                 metadata_key=self._metadata_key, ext_metadata={}, array_metadata_store=None,
                 callback=self._callback))
         return futures
+
+    def _written(self, values, infos, args, indexed: list[int]) -> future.Future:
+        """The local tier's write of the arrays at `indexed`, each index this process holds once
+        (`held_slices`), with their shardings where the handler writes them, as Orbax's own write does."""
+        slices = [held_slices(values[index]) for index in indexed]
+
+        async def written() -> None:
+            if self._enable_write_sharding_file:
+                await handlers._async_serialize_shardings(
+                    shardings=[values[index].sharding for index in indexed],
+                    infos=[infos[index] for index in indexed], primary_host=None)
+            await handlers._async_serialize_replica_slices(
+                slices, [infos[index] for index in indexed], [args[index] for index in indexed],
+                primary_host=None, metadata_key=self._metadata_key, array_metadata_store=None,
+                enable_replica_parallel_separate_folder=False, use_replica_parallel=False, ext_metadata={})
+
+        return future.CommitFutureAwaitingContractedSignals(written(), name="serialize_local_indexed")
 
     async def deserialize(self, infos, args=None):
         # Orbax's own read where every array is placed where this process holds part of it.

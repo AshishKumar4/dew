@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew._coordination import from_every_process
+from dew._coordination import read_by_holders
 from dew._hashing import fmix32
 from dew.nn.kernels.options import program
 
@@ -104,16 +104,9 @@ def _digest(tree) -> str:
     # Each part's marks where its leaves are held, every process taking those it holds none of from one that
     # holds them, in one round where some part spans fewer than every process (a stage of one process's
     # devices, `dew.training.stages`): every process digests the tree alike.
-    held = [_held_marks([flat[index][1] for index in indices], pinned).tolist()
-            if flat[indices[0]][1].sharding.addressable_devices else None for _, indices, pinned in plan]
-    if any({device.process_index for device in devices} != set(range(jax.process_count()))
-           for devices, _, _ in plan):
-        every = from_every_process(held)
-        held = [next(read for read in (rank[at] for rank in every) if read is not None)
-                for at in range(len(held))]
-    # Every part is held by some process, so each part's marks are read once the round is taken.
-    reads = [read for read in held if read is not None]
-    assert len(reads) == len(plan), (len(reads), len(plan))
+    reads = read_by_holders([_held_marks([flat[index][1] for index in indices], pinned).tolist()
+                             if flat[indices[0]][1].sharding.addressable_devices else None
+                             for _, indices, pinned in plan], [devices for devices, _, _ in plan])
     marks = {index: np.asarray(mark, np.uint32) for (_, indices, _), read in zip(plan, reads, strict=True)
              for index, mark in zip(indices, read, strict=True)}
     digest = hashlib.sha256()

@@ -30,9 +30,9 @@ def replica_key(args) -> dict:
     template = {"key": key, "shape": shape}
     tree = ({"key": data, "shape": data} if jax.process_index() == 0
             else jax.tree.map(_zeros, template))
-    grid = Grid.of(template)
-    assert grid is not None, "a template placed by name lies on one grid"
-    recovered = _from_replicas(tree, grid, frozenset({0}))
+    grids = Grid.each(template)
+    assert grids is not None, "a template placed by name lies on its mesh's grid"
+    recovered = _from_replicas(tree, grids, frozenset({0}))
 
     def read(words, drawn) -> dict:
         # Each process's own copy of a value the pool replicates.

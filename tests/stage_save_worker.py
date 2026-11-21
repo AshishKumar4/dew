@@ -56,7 +56,8 @@ def mode_stage_save(args) -> dict:
     # persistent tier holds; then that resumed from the persistent tier alone to step 3, which it does not.
     steps = [run(1, resume="never"), run(2), run(3, local=False)]
     return {"process_index": jax.process_index(), "finite": read, "steps": steps, "handled": staged_values,
-            "refused": refused, "stray_refused": _stray(mesh.build(paired), args.run_dir)}
+            "refused": refused, "stray_refused": _stray(mesh.build(paired), args.run_dir),
+            "diagonal": _diagonal(args.local_dir)}
 
 
 def _handled(mesh, directory) -> tuple[dict, bool]:
@@ -70,18 +71,19 @@ def _handled(mesh, directory) -> tuple[dict, bool]:
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.checkpoints import _handler
-    from dew.mesh import held_apart
+    from dew.checkpoints.submesh import save_args
     from dew.training.stages import stage_mesh
 
     placed = {"scalar": NamedSharding(stage_mesh(mesh, 1), P()),
               "vector": NamedSharding(stage_mesh(mesh, 0), P())}
     values = {"scalar": np.float32(3.5), "vector": np.arange(4, dtype=np.float32)}
-    # Made as a pipeline's checkpoint makes its rows (`StageLocal.saved`, `held_apart`).
-    arrays = held_apart({name: jax.make_array_from_callback(
+    arrays = {name: jax.make_array_from_callback(
         np.shape(values[name]), placed[name], lambda index, name=name: np.asarray(values[name])[index],
-        dtype=np.float32) for name in values})
+        dtype=np.float32) for name in values}
     with ocp.Checkpointer(_handler()) as checkpointer:
-        checkpointer.save(f"{directory}/handled", arrays)
+        # Saved as a pipeline's checkpoint saves its rows (`StageLocal.saved`, `HeldApart`).
+        checkpointer.save(f"{directory}/handled", args=ocp.args.PyTreeSave(arrays, save_args=save_args(
+            arrays, held_apart=True)))
         restored = checkpointer.restore(f"{directory}/handled", restore_args={
             "scalar": ocp.ArrayRestoreArgs(sharding=placed["scalar"], dtype=np.float32, global_shape=()),
             "vector": ocp.ArrayRestoreArgs(sharding=placed["vector"])})
@@ -95,6 +97,42 @@ def _handled(mesh, directory) -> tuple[dict, bool]:
     except ValueError:
         refused = True
     return {name: {"shape": list(restored[name].shape), "held": held[name]} for name in held}, refused
+
+
+def _diagonal(directory) -> dict:
+    """An array split over a tensor axis and copied over a data axis, on a 2 x 2 mesh each of whose
+    processes holds one diagonal (process 0 one tensor index on the first data row, the other on the
+    second), written by each process to its own local directory as the local tier writes (`SubmeshArrays`
+    of no primary host and no replica id) and read back from it: whether each process read back every
+    shard it holds (row 10813: Orbax wrote its first shard's replica alone, one of the two indices)."""
+    import jax
+    import numpy as np
+    import orbax.checkpoint as ocp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from orbax.checkpoint.options import MultiprocessingOptions
+
+    from dew.checkpoints import _handler
+    from dew.checkpoints.submesh import SubmeshArrays
+
+    own = [sorted((device for device in jax.devices() if device.process_index == rank), key=lambda d: d.id)
+           for rank in range(2)]
+    grid = np.asarray([[own[0][0], own[1][0]], [own[1][1], own[0][1]]], dtype=object)
+    placed = NamedSharding(Mesh(grid, ("data", "tensor")), P(None, "tensor"))
+    values = np.arange(8, dtype=np.float32).reshape(2, 4)
+    array = jax.make_array_from_callback(values.shape, placed, lambda index: values[index])
+    me = jax.process_index()
+    multiprocessing = MultiprocessingOptions(primary_host=me, active_processes={me},
+                                             barrier_sync_key_prefix=f"diagonal{me}")
+    registry = ocp.type_handlers.create_type_handler_registry(
+        (jax.Array, SubmeshArrays(primary_host=None, replica_id=None, use_replica_parallel=False)))
+    handler = _handler(multiprocessing_options=multiprocessing, type_handler_registry=registry)
+    path = f"{directory}/diagonal-{me}"
+    with ocp.Checkpointer(handler, multiprocessing_options=multiprocessing) as checkpointer:
+        checkpointer.save(path, {"x": array})
+        restored = checkpointer.restore(path, args=ocp.args.PyTreeRestore(restore_args={
+            "x": ocp.ArrayRestoreArgs(sharding=placed, global_shape=values.shape, dtype=np.float32)}))["x"]
+    return {"held": all(np.array_equal(np.asarray(shard.data), values[shard.index])
+                        for shard in restored.addressable_shards)}
 
 
 def _stray(mesh, directory) -> bool:

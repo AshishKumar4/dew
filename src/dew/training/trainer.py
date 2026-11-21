@@ -2373,7 +2373,7 @@ class Trainer(Generic[Loss, Effects]):
                 # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
                 "rung": {**self._compiler.checkpoint_rung(), "host": list(self.layout.host)},
                 "artifact": self._artifact(), "training": self.objective.training_record(),
-                "boxed": self._boxed_axes(),
+                "boxed": self._boxed_axes(), "held_apart": self._staging.apart,
                 "rollout": None if weights_only else _rollout_saved(self.rollout)}
 
     def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
