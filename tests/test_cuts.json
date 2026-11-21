@@ -711,10 +711,6 @@
 "tests/test_chunked_cross_entropy.py::test_the_softcap_gradient_survives_saturated_logits",
 "tests/test_chunked_cross_entropy.py::test_the_whole_logits_head_computes_what_the_tiled_one_does[None-float32]"
 ],
-"tests/test_clusters.py": [
-"tests/test_clusters.py::test_a_pool_joins_through_a_scheduler_of_the_users_own",
-"tests/test_clusters.py::test_a_tpu_joins_by_jaxs_detection_on_a_tpu_vm_alone_and_leaves_its_place_to_jax"
-],
 "tests/test_compile_ahead.py": [
 "tests/test_compile_ahead.py::test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_loads_only_there",
 "tests/test_compile_ahead.py::test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_stated_links",
@@ -754,24 +750,24 @@
 "tests/test_contracts_attention.py": [
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-first orders]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-grad of grad]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-jvp of grad, nested jit]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-jvp of grad, scanned]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-jvp of grad]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-second jvp]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-second orders, staged]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-second jvp, remat]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-first orders]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-grad of grad]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-jvp of grad, nested jit]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-jvp of grad, scanned]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-jvp of grad]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-second orders, staged]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-first orders]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-second jvp]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-grad of grad]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad, nested jit]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad, remat]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad, scanned]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-second jvp, remat]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-second jvp]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-second orders, staged]",
-"tests/test_contracts_attention.py::test_a_quantized_attention_holds_its_reverse_orders[near the largest]",
-"tests/test_contracts_attention.py::test_the_sparse_latent_kernel_holds_every_order[near the largest]",
-"tests/test_contracts_attention.py::test_the_sparse_latent_kernel_holds_every_order[normal]"
+"tests/test_contracts_attention.py::test_the_paged_decode_kernel_holds_every_order[near the largest]",
+"tests/test_contracts_attention.py::test_the_sparse_latent_kernel_holds_every_order[near the least normal]"
 ],
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_gemm_prologue_holds_every_order[normal]",
@@ -1883,6 +1879,9 @@
 "tests/test_kimi_k3.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference",
 "tests/test_kimi_k3.py::test_situ_matches_the_released_activation"
 ],
+"tests/test_kv_cache.py": [
+"tests/test_kv_cache.py::test_a_pools_page_reads_and_writes_take_an_axis_counted_from_either_end"
+],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
 "tests/test_layer_stack.py::test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop",
@@ -1968,6 +1967,9 @@
 "tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[threshold]",
 "tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[whole stack]",
 "tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[z-loss]"
+],
+"tests/test_loop_compositions.py": [
+"tests/test_loop_compositions.py::test_a_looped_decoders_features_composed_plan_and_step[off-on-off-on]"
 ],
 "tests/test_loop_phases_decision.py": [
 "tests/test_loop_phases_decision.py::test_a_decision_runs_first_phase_is_a_one_pass_runs_over_its_first_source",
