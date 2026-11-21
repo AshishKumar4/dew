@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 from reference_error import FACTOR, ORDERS, assert_rows_as_exact_over_orders
 
-
 __accuracy_gate__ = True
 """The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 

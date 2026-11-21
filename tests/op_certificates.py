@@ -38,7 +38,6 @@ import math
 import ml_dtypes
 import numpy as np
 
-
 __accuracy_gate__ = True
 """The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 

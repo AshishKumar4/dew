@@ -11,7 +11,6 @@ import numpy as np
 from dew import parity as gate
 from dew._accuracy import distance, within
 
-
 __accuracy_gate__ = True
 """The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 

@@ -17,7 +17,6 @@ from jax.extend.core import primitives
 from dew.nn import programs
 from dew.nn.precision import FP32_SUMS
 
-
 __accuracy_gate__ = True
 """The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 
