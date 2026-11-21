@@ -30,25 +30,35 @@ exceeds what git holds."""
 
 
 def rule_inputs(seed: int) -> dict[str, np.ndarray]:
-    """A seed's fp32 operands and cotangents, the same on every run: ROWS rows of seven tokens of two
-    heads, keys of three and values of four, queries and keys of norms in [0.5, 2], decays below zero,
-    gates in (0, 1) and a small initial state."""
+    """A seed's fp32 operands and cotangents, the same bits on every platform: ROWS rows of seven tokens of
+    two heads, keys of three and values of four, queries and keys of norms in [0.5, 2], decays below zero,
+    gates in (0, 1) and a small initial state. Each value an integer of the seed's stream over a power of
+    two (`_exactly`), each norm summed in a fixed order in float64 and its root IEEE's, correctly rounded:
+    no libm function, whose last bit differs between an x86 host's and an aarch64 one's (a GH200 drew other
+    gates and norms than the recording's, row 5012)."""
     rng = np.random.default_rng([713, seed])
-    arrays = {name: rng.normal(size=shape).astype(np.float32) for name, shape in (
+    arrays = {name: _exactly(rng, shape) for name, shape in (
         ("query", (ROWS, 7, 2, 3)), ("key", (ROWS, 7, 2, 3)), ("value", (ROWS, 7, 2, 4)),
-        ("g", (ROWS, 7, 2, 3)), ("beta", (ROWS, 7, 2)), ("state", (ROWS, 2, 3, 4)))}
+        ("g", (ROWS, 7, 2, 3)), ("state", (ROWS, 2, 3, 4)))}
     # Queries and keys of norms in [0.5, 2]: the rules normalize them, and a near-zero one's gradient
     # through the norm is its reciprocal, a tail no count of seeds resolves.
     for name in ("query", "key"):
-        norms = np.linalg.norm(arrays[name], axis=-1, keepdims=True)
-        lengths = rng.uniform(0.5, 2.0, norms.shape)
-        arrays[name] = (arrays[name] / norms * lengths).astype(np.float32)
+        wide = arrays[name].astype(np.float64)
+        norms = np.sqrt(wide[..., :1] ** 2 + wide[..., 1:2] ** 2 + wide[..., 2:] ** 2)
+        lengths = 0.5 + 1.5 * rng.integers(0, 2 ** 16, size=norms.shape) / 2 ** 16
+        arrays[name] = (wide / np.maximum(norms, 2.0 ** -8) * lengths).astype(np.float32)
     arrays["g"] = -np.abs(arrays["g"]) * np.float32(.7)
-    arrays["beta"] = (1 / (1 + np.exp(-arrays["beta"]))).astype(np.float32)
+    arrays["beta"] = (rng.integers(1, 2 ** 16, size=(ROWS, 7, 2)) / 2 ** 16).astype(np.float32)
     arrays["state"] *= np.float32(.3)
-    arrays["output_cotangent"] = rng.normal(size=(ROWS, 7, 2, 4)).astype(np.float32)
-    arrays["state_cotangent"] = rng.normal(size=(ROWS, 2, 3, 4)).astype(np.float32)
+    arrays["output_cotangent"] = _exactly(rng, (ROWS, 7, 2, 4))
+    arrays["state_cotangent"] = _exactly(rng, (ROWS, 2, 3, 4))
     return arrays
+
+
+def _exactly(rng, shape) -> np.ndarray:
+    """`shape` integers in [-2**15, 2**15) from `rng`'s stream over 2**13, float32: uniform in [-4, 4),
+    every bit its integer's on any platform."""
+    return (rng.integers(-2 ** 15, 2 ** 15, size=shape) / 2 ** 13).astype(np.float32)
 
 
 def l2norm(x, eps=1e-6):
