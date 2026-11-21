@@ -926,6 +926,8 @@ class _Ruled(pygrain.IterDataset):
         self._drawn = drawn
 
     def __iter__(self) -> pygrain.DatasetIterator:
+        # Imported where a pack or windows lower, so a chain that packs nothing imports no packer.
+        from dew.data.packing import packed_documents
         from dew.data.steps.windows import CausalWindows
 
         seen = LayoutRule()
@@ -935,13 +937,8 @@ class _Ruled(pygrain.IterDataset):
             documents = documents.map(_ConsumedAt(stage.fields[0], held))
             laid = (*ACCOUNTS, *(() if held is None else (DOCUMENT,)))
             stage = dataclasses.replace(stage, fields=(*stage.fields, *laid))
-        if isinstance(stage, Pack):
-            # Imported where a pack lowers, so a chain that packs nothing imports no packer.
-            from dew.data.packing import packed_documents
-
-            windows = packed_documents(documents.map(stage.document), stage, consumed=self._consumed)
-        else:
-            windows = CausalWindows(documents, stage, held)
+        windows = (packed_documents(documents.map(stage.document), stage, consumed=self._consumed)
+                   if isinstance(stage, Pack) else CausalWindows(documents, stage, held))
         return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed, documents=held,
                               drawn=self._drawn)
 
