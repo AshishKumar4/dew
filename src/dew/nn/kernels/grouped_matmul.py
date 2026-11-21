@@ -2272,22 +2272,22 @@ def launched(launches, arguments, options, *, product: Product, whole: bool,
     products, `gemm._one_launch`): taken and reported as it is, the call selected once (row 8735)."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
     route = selection.select(GROUPED, case) if selected is None else generation.published(selected)
-    if route.kernel in ('xla', APART.name):
-        return None if route.kernel == 'xla' else APART
     if (collected := _WEIGHED.get()) is not None:
         collected.append((case.call, route.kernel))
+    if route.kernel in ('xla', APART.name):
+        return None if route.kernel == 'xla' else APART
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
 
 
 _WEIGHED: contextvars.ContextVar[list | None] = contextvars.ContextVar('weighed', default=None)
-"""The calls `launched` selects a template's launch for while `weighed` collects them."""
+"""The calls `launched` selects for while `weighed` collects them."""
 
 
 @contextlib.contextmanager
 def weighed() -> Iterator[list[tuple[base.Call, str]]]:
-    """Each call traced in the block that `launched` selects a template's launch for, in order, as its
-    templates' bindings (`base.Call`) and the launch's name: what a pass weighing a region reads of the
-    launches it would make (`fused_gemm.analysis`), whether or not they are built."""
+    """Each call traced in the block that `launched` selects for, in order, as its templates' bindings
+    (`base.Call`) and the launch it selected (a template's name, 'xla' or `APART`'s): what a pass weighing a
+    region reads of the launches it would make (`fused_gemm.analysis`), whether or not they are built."""
     found: list[tuple[base.Call, str]] = []
     token = _WEIGHED.set(found)
     try:
@@ -2311,6 +2311,8 @@ def resident(hooked: Sequence[tuple[base.Call, str]],
     if not hooked:
         return True
     call, kernel = hooked[-1]
+    if kernel not in call.bound:
+        return True
     template, ba = call.bound[kernel]
     if not isinstance(template, _Mosaic):
         return True
