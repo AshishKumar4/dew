@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 
 import jax
+import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from orbax.checkpoint._src.futures import future
 from orbax.checkpoint._src.path import async_path
@@ -60,7 +61,7 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
             [args[index] for index in whole]))
         if not parted:
             return futures
-        if any(jax.dtypes.issubdtype(values[index].dtype, jax.dtypes.prng_key) for index in parted):
+        if any(jnp.issubdtype(values[index].dtype, jax.dtypes.prng_key) for index in parted):
             raise ValueError("a PRNG key on part of the pool is not written: place it on every process")
         if self._enable_write_sharding_file:
             futures.append(future.CommitFutureAwaitingContractedSignals(
@@ -76,11 +77,14 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
                 global_shape=values[index].shape, local_shape=values[index].sharding.shard_shape(
                     values[index].shape), sharding=values[index].sharding, dtype=values[index].dtype,
                 is_on_host=True, replica_slices=[]) for index in absent]
-            futures.append(future.CommitFutureAwaitingContractedSignals(handlers._async_serialize_replica_slices(
-                empty, [infos[index] for index in absent], [args[index] for index in absent],
-                primary_host=None, metadata_key=self._metadata_key, array_metadata_store=None,
-                enable_replica_parallel_separate_folder=False, use_replica_parallel=False, ext_metadata={}),
-                name="serialize_submesh_metadata"))
+            async def metadata_written() -> None:
+                await handlers._async_serialize_replica_slices(
+                    empty, [infos[index] for index in absent], [args[index] for index in absent],
+                    primary_host=None, metadata_key=self._metadata_key, array_metadata_store=None,
+                    enable_replica_parallel_separate_folder=False, use_replica_parallel=False, ext_metadata={})
+
+            futures.append(future.CommitFutureAwaitingContractedSignals(metadata_written(),
+                                                                       name="serialize_submesh_metadata"))
         by_owner: dict[int, list[int]] = {}
         for index in parted:
             if values[index].addressable_shards:
