@@ -2340,12 +2340,15 @@ def _keys_first_registers(family: mosaic.Family, config: BackwardTiles, width: i
     # and the score cotangents in registers, its share of their columns.
     weights = (block_k, queries, dtype)
     columns = config.columns
+    dq_product = (resources.Product(queries, block_k, width,
+                                    beside=[step[0], (queries, width, jnp.float32)]),) if config.fused else ()
     fragments = _products(
         family, dtype,
         resources.Product(block_k, width, queries, beside=step[:1], transposed=True),
         resources.Product(block_k, value_width, queries, beside=step, transposed=True),
         resources.Product(block_k, queries, value_width // columns, beside=[weights], held=True),
         resources.Product(block_k, queries, width // columns, beside=[weights], held=True),
+        *dq_product,
         narrow=config.narrow)
     if accurate and family.operands_in_registers:
         # The accurate form's dK parts issued against one right operand, the queries, held at its whole depth

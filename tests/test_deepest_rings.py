@@ -138,3 +138,18 @@ def test_a_launch_at_its_deepest_ring_compiles_within_its_resources(cell, genera
         found = compile_mosaic_kernels([case], generation_name)
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm80", "sm100"])
+def test_fused_dkv_backward_64_derives_spill_free_without_stepping(generation_name):
+    """Row 6944 witness: `attention backward 64`'s raw derived config on `sm80` and `sm100` compiles
+    spill-free directly without certification stepping down from a spilling proposal."""
+    with generation.assumed(generation_name):
+        op, ba, config = _attention("backward", 64)
+        assert config is not None, f"attention backward 64 derives no config on {generation_name}"
+        lowered, shapes = op.lowering(ba, config)
+        case = KernelCase(f"attention backward 64 derived on {generation_name}", lambda: (lowered, shapes))
+        found = compile_mosaic_kernels([case], generation_name)
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
