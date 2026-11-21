@@ -38,7 +38,9 @@ dependencies = [
     # optax 0.2.8's Muon: the preconditionings Dew's Muon iterates by (`preconditioning`, its AOL and Schatten
     # first steps, whose clamp dew.newton_schulz reads) and the iteration, layout and shape scalings it calls.
     "optax>=0.2.8",
-    "orbax-checkpoint>=0.12.4",
+    # <0.13: dew.checkpoints.submesh reads Orbax's own internals (orbax.checkpoint._src's array handlers, its
+    # replica slices and futures), which a minor release may change (row 10833).
+    "orbax-checkpoint>=0.12.4,<0.13",
     "numpy>=2.0",
     "pillow>=10.1",
     # dew.data.images decodes, resizes and jitters every image record with it.

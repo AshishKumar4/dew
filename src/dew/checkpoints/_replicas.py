@@ -40,25 +40,36 @@ class Grid:
     split: Mapping[str, tuple[str, ...]]
 
     @classmethod
-    def of(cls, tree: Mapping[str, StateLeaf]) -> Grid | None:
-        """The grid `tree`'s arrays lie on; None where an array lies elsewhere than on one mesh by name
-        (a host-owned state's), which no replica recovers."""
-        meshes, split = set(), {}
+    def each(cls, tree: Mapping[str, StateLeaf]) -> tuple[Grid, ...] | None:
+        """The grids `tree`'s arrays lie on, one a mesh, each with the arrays on it (a pipeline's rows each
+        on its own stage's, `dew.training.stages.StageLocal.saved`); None where an array lies elsewhere
+        than on a mesh by name (a host-owned state's), which no replica recovers (row 10814: one grid alone
+        was recorded, and a step whose rows spanned several meshes was recovered from none)."""
+        meshes: dict[tuple, dict[str, tuple[str, ...]]] = {}
         for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
             if not isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)):
                 continue
             if not isinstance(leaf.sharding, jax.sharding.NamedSharding):
                 return None
             mesh = leaf.sharding.mesh
-            if not isinstance(mesh, jax.sharding.Mesh):
+            # A mesh of another backend's devices than the pool's default (a CPU-owned run's companion beside
+            # its accelerator's banks) is no grid a recovery resolves by device id.
+            if (not isinstance(mesh, jax.sharding.Mesh)
+                    or mesh.devices.flat[0].platform != jax.default_backend()):
                 return None
-            grid = mesh.devices
-            meshes.add((tuple(mesh.axis_names), tuple(device.id for device in grid.flat), grid.shape))
-            split[jax.tree_util.keystr(path)] = tuple(_split_axes(leaf.sharding.spec))
-        if len(meshes) != 1:
-            return None
-        ((axes, devices, shape),) = meshes
-        return cls(axes, tuple(shape), devices, split)
+            meshes.setdefault(_placed_on(mesh), {})[jax.tree_util.keystr(path)] = tuple(
+                _split_axes(leaf.sharding.spec))
+        return tuple(cls(axes, shape, devices, split) for (axes, shape, devices), split in meshes.items())
+
+    def holds(self, mesh: jax.sharding.Mesh) -> bool:
+        """Whether this grid is `mesh`'s: its axes, shape and devices."""
+        return (self.axes, self.shape, self.devices) == _placed_on(mesh)
+
+
+def _placed_on(mesh: jax.sharding.Mesh) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+    """`mesh`'s axes, shape and devices' ids in grid order, as a `Grid` records them."""
+    grid = mesh.devices
+    return tuple(mesh.axis_names), tuple(grid.shape), tuple(device.id for device in grid.flat)
 
 
 
@@ -83,39 +94,43 @@ def _sources(grid: Grid, split: Sequence[str], holders: frozenset[int],
     return np.transpose(first.reshape([shape[axis] for axis in order]), np.argsort(order))
 
 
-def _covered(grid: Grid | None, holders: frozenset[int],
+def _covered(grids: Sequence[Grid] | None, holders: frozenset[int],
              process: Mapping[int, int] | None = None) -> bool:
     """Whether the processes of `holders` hold a copy of every shard of every array a local save
-    placed over `grid` (`Grid`), so a process that lost its copy recovers it from them; each
+    placed over `grids` (`Grid.each`), so a process that lost its copy recovers it from them; each
     device's process by its id (`process`, the pool's own by default)."""
-    if grid is None:
+    if grids is None:
         return False
-    return all(_sources(grid, axes, holders, process) is not None for axes in set(grid.split.values()))
+    return all(_sources(grid, axes, holders, process) is not None
+               for grid in grids for axes in set(grid.split.values()))
 
 
-def _from_replicas(tree, grid: Grid, holders: frozenset[int]):
+def _from_replicas(tree, grids: Sequence[Grid], holders: frozenset[int]):
     """`tree`'s arrays, each shard on every device that holds it the bytes its first copy on a
     process of `holders` holds (`_sources`): a process that lost its local copy holds zeros there,
     and receives each shard as the sum, over the axes its copies lie along, of the source's bits and
     the others' zeros, which is the source's bits exactly. Every process calls it alike."""
-    masks: dict[tuple[str, ...], jax.Array] = {}
+    masks: dict[tuple, jax.Array] = {}
 
     def recovered(leaf):
         if not isinstance(leaf, jax.Array):
             return leaf
         placed = leaf.sharding
-        assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`Grid.of`)"
+        assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`Grid.each`)"
         mesh, split = placed.mesh, tuple(_split_axes(placed.spec))
+        assert isinstance(mesh, jax.sharding.Mesh), "a covered save places on concrete meshes (`Grid.each`)"
         # Every axis the copies lie along, those of one device too, so the sum is replicated as its
         # placement says.
         along = tuple(name for name in mesh.axis_names if name not in split)
         if all(mesh.shape[name] == 1 for name in along):
             return leaf
-        if split not in masks:
+        grid = next(grid for grid in grids if grid.holds(mesh))
+        if (_placed_on(mesh), split) not in masks:
             sources = _sources(grid, split, holders)
             assert sources is not None, "a recovered step's shards are covered (`_covered`)"
             every = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*mesh.axis_names))
-            masks[split] = jax.make_array_from_callback(sources.shape, every, lambda index: sources[index])
+            masks[_placed_on(mesh), split] = jax.make_array_from_callback(sources.shape, every,
+                                                                          lambda index: sources[index])
         typed = jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
         values = jax.random.key_data(leaf) if typed else leaf
         held = values.sharding
@@ -129,7 +144,8 @@ def _from_replicas(tree, grid: Grid, holders: frozenset[int]):
 
         summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
                                 in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
-        summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")), masks[split])
+        summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")),
+                                        masks[_placed_on(mesh), split])
         value = (summed != 0 if values.dtype == np.bool_
                  else jax.lax.bitcast_convert_type(summed, values.dtype))
         value = jax.device_put(value, held)

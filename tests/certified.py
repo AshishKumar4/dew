@@ -33,9 +33,6 @@ from dew.algebra import ratios, scaled, windows
 from dew.nn.precision import correctly_rounded_divide_p
 from dew.nn.programs import dot_arithmetic
 
-__accuracy_gate__ = True
-"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
-
 STORAGE = {"float32": np.uint32, "bfloat16": np.uint16}
 """Each format's storage bits, which a move of data is compared by."""
 

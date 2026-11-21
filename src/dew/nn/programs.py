@@ -247,6 +247,32 @@ def dot_algorithms(dtype) -> tuple[jax.lax.DotAlgorithmPreset, ...]:
     return tuple(found)
 
 
+def own_preset(dtype) -> jax.lax.DotAlgorithmPreset | None:
+    """A 16-bit float's own dot algorithm, its products exact and summed once in float32: of the presets
+    JAX runs its operands in as they are stored (`dot_algorithms`), the one of one primitive product of its
+    own width with float32 sums (BF16_BF16_F32, F16_F16_F32); None for any other dtype. The one statement
+    of it, which attention's jax.nn form, a product's precision (`dew.nn.precision`) and the normal form
+    read (row 10808)."""
+    return _own_preset(jnp.dtype(dtype))
+
+
+@functools.cache
+def _own_preset(dtype: jnp.dtype) -> jax.lax.DotAlgorithmPreset | None:
+    """`own_preset` of a dtype."""
+    if dtype.itemsize != 2 or not jnp.issubdtype(dtype, jnp.floating):
+        return None
+    width = _bits(dtype)
+
+    def own(preset: jax.lax.DotAlgorithmPreset) -> bool:
+        arithmetic = dot_arithmetic(preset, dtype, dtype)
+        return (arithmetic is not None and arithmetic.operand_bits == (width, width)
+                and arithmetic.operations == 1 and arithmetic.accumulation_bits == 32
+                and not arithmetic.imprecise)
+
+    (found,) = (preset for preset in dot_algorithms(dtype) if own(preset))
+    return found
+
+
 def _bits(dtype) -> int:
     """A dtype's width in bits."""
     return 8 * jnp.dtype(dtype).itemsize

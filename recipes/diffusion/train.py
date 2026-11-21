@@ -42,5 +42,11 @@ def default(train, held) -> DiffusionRunConfig:
         validation=held.pipe(presets.images, 128, batch=32, caption=images.caption(VALIDATION_TEMPLATE)))
 
 
+def main(argv: list[str] | None = None, images=None):
+    """Run the recipe on `argv`, the process's own command line where None, over `images`' training and
+    held-out records, Oxford flowers' where None, and return the run's last state."""
+    return DiffusionRunConfig.cli(argv, default=default(*(flowers() if images is None else images))).run()
+
+
 if __name__ == "__main__":
-    DiffusionRunConfig.cli(default=default(*flowers())).run()
+    main()

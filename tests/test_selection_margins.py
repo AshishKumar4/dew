@@ -6,9 +6,6 @@ import numpy as np
 import pytest
 from selection_margins import MARGIN, margin
 
-__accuracy_gate__ = True
-"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
-
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 INDEXER = {"mixer": {"fields": {"index_topk": 2}}}

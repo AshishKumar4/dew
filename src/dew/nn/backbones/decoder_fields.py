@@ -157,12 +157,14 @@ def _ngpt(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
 def _messaged_blocks(model: CausalTransformer, kinds: Mapping[str, ResolvedKind],
                      messages: CrossPass) -> None:
     """Refuse a loop passing messages (`Loop.messages`) where its blocks' summaries are not one stream's:
-    hyper-connections and AltUp carry several, a provider's store would break at a block's end, and under
+    hyper-connections and AltUp carry several, a normed residual makes each sublayer's normed input the
+    stream a merge would leave as it is, a provider's store would break at a block's end, and under
     attention residuals a block's summary is the depth state's partial sum, whole only where the message
-    blocks are the depth blocks."""
-    if model.hyper_connections is not None or model.altup is not None:
-        raise ValueError("a loop passing messages summarizes each block by its one residual stream, and "
-                         "hyper-connections and AltUp carry several")
+    blocks are the depth blocks. The one statement of these refusals (row 10858)."""
+    if model.hyper_connections is not None or model.altup is not None or model.normed_residual:
+        raise ValueError("a loop passing messages summarizes each block by its one residual stream and "
+                         "merges into a sublayer's input, leaving that stream as it is: hyper-connections "
+                         "and AltUp carry several, and a normed residual makes the normed input the stream")
     publishing = [layer_type for layer_type, kind in sorted(kinds.items())
                   if (mixer := kind.mixer or model.layer_mixer) is not None
                   and mixer.publishes(kv_shared=False)]

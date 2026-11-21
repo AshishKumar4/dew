@@ -29,5 +29,11 @@ def default(train, held) -> JepaRunConfig:
                          validation=held.pipe(presets.images, 224, batch=64))
 
 
+def main(argv: list[str] | None = None, images=None):
+    """Run the recipe on `argv`, the process's own command line where None, over `images`' training and
+    held-out records, Oxford flowers' where None, and return the run's last state."""
+    return JepaRunConfig.cli(argv, default=default(*(flowers() if images is None else images))).run()
+
+
 if __name__ == "__main__":
-    JepaRunConfig.cli(default=default(*flowers())).run()
+    main()

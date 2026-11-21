@@ -64,7 +64,7 @@ from dew.nn.float_bits import (
     widened_exactly,
 )
 from dew.nn.nested import nested
-from dew.nn.programs import UNROUNDED, equations
+from dew.nn.programs import UNROUNDED, equations, own_preset
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -655,10 +655,9 @@ def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
     algorithm whose products are whole for these operands (F32_F32_F32, and a 16-bit operand's own
     BF16_BF16_F32 or F16_F16_F32); not an algorithm that narrows them (TF32's, bf16 parts of an fp32
     product) or widens them (F64), which a route hands to XLA, which computes it."""
-    dtype = jnp.dtype(dtype)
     whole = {"DEFAULT", "HIGH", "HIGHEST", "F32_F32_F32"}
-    whole |= {jnp.dtype(jnp.bfloat16): {"BF16_BF16_F32"},
-              jnp.dtype(jnp.float16): {"F16_F16_F32"}}.get(dtype, set())
+    if (own := own_preset(dtype)) is not None:
+        whole.add(own.name)
     return precision_names(effective_precision(precision)) <= whole
 
 
@@ -1301,7 +1300,7 @@ def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = No
     from .kernels.generation import bf16_dot_runs
     if not bf16_dot_runs():
         return precision
-    return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    return own_preset(dtype)
 
 
 def fp32_result_dot_general(precision: PrecisionLike = None):
