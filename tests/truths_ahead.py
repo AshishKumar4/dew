@@ -413,17 +413,19 @@ def compiled_truths(directory: str | Path, *, prepare: bool, stamp: str,
 @contextlib.contextmanager
 def prepared(directory: Path, *, stamp: str, target) -> Iterator[CompiledTruths]:
     """A GPU tier part's test's prepare (`tests/conftest.py`'s `compiled_ahead`): its check-1 sites compiled
-    into `directory` for the node's GPU (`target`, a `BuildTarget`) with that GPU's compile-only device
-    this process's default, on which nothing computes, and their programs' needs (`admitted_needs`) filed
-    under the part's unit as it closes, whatever its test ended in (`tier_wire.unit_needs`, as a flow's are,
-    row 7900), by which the lane sizes the unit's worker."""
+    into `directory` for the node's GPU (`target`, its `GpuTarget`: `generation_support.node_target`) with
+    that GPU's compile-only device this process's default, on which nothing computes, every kernel chosen as
+    on that GPU (`generation.assumed`: its generation and facts, which a compile-only device placed off the
+    CPU backend reads as the bare platform 'gpu', every kernel it takes refused, rows 8076 and 10088), and
+    their programs' needs (`admitted_needs`) filed under the part's unit as it closes, whatever its test ended
+    in (`tier_wire.unit_needs`, as a flow's are, row 7900), by which the lane sizes the unit's worker."""
     import tier_wire
 
-    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.generation import assumed, compile_only_gpus
 
     try:
         with (compiled_truths(directory, prepare=True, stamp=stamp, target=target) as store,
-              jax.default_device(compile_only_gpus(target.generation, 1)[0])):
+              jax.default_device(compile_only_gpus(target.generation, 1)[0]), assumed(target)):
             yield store
     finally:
         arms, truths = compiled_memory(directory, arms=True), compiled_memory(directory)

@@ -230,7 +230,8 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
     if isinstance(tiles, Tiles):
-        return family.specialized(tiles.block_q, tiles.block_k)
+        return (family.specialized(tiles.block_q, tiles.block_k)
+                if tiles.block_q < family.role_rows else family)
     return backward_family(family, tiles)
 
 

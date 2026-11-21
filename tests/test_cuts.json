@@ -301,7 +301,7 @@
 "tests/test_attention_mosaic_compile.py::test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block[accurate]",
 "tests/test_attention_mosaic_compile.py::test_an_fp16_backward_compiles_spill_free_as_its_model_decides[128]",
 "tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm100]",
-"tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm90]",
+"tests/test_attention_mosaic_compile.py::test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free[e4m3fn]",
 "tests/test_attention_mosaic_compile.py::test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free[sm80]",
 "tests/test_attention_mosaic_compile.py::test_each_attention_launch_states_its_outputs_dimensions_for_an_h100[accurate]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[decision-inference]",
@@ -841,6 +841,9 @@
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-second orders, staged]"
 ],
+"tests/test_counted_passes.py": [
+"tests/test_counted_passes.py::test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one_steps_its_batches"
+],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_cached_document_reads_its_own_context_without_it[the layer's attention]",
 "tests/test_cross_attention.py::test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it",
@@ -994,6 +997,9 @@
 "tests/test_decision_state_once.py::test_each_question_reads_the_shared_part_and_itself",
 "tests/test_decision_state_once.py::test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores",
 "tests/test_decision_state_once.py::test_sibling_questions_packed_a_window_read_each_their_own_requests_context"
+],
+"tests/test_decision_streams.py": [
+"tests/test_decision_streams.py::test_each_token_reads_exactly_what_its_streams_record_says_in_a_packed_window[joint]"
 ],
 "tests/test_decision_task.py": [
 "tests/test_decision_task.py::test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in",
@@ -2393,6 +2399,9 @@
 "tests/test_norm_swiglu.py::test_rms_variants_and_every_gradient[True-False-float16-bfloat16]",
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float16-repeated]",
 "tests/test_norm_swiglu.py::test_stream_seam_takes_the_add_and_the_stream_cotangent[shape0-float32-False]"
+],
+"tests/test_online_loader.py": [
+"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-processes-map]"
 ],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
