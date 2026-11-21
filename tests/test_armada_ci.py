@@ -1192,11 +1192,12 @@ def test_a_group_past_its_bound_is_cut_again_with_its_nearest_groups_alone_and_t
     assert ci.cuts.rebalanced(ci.session, dict.fromkeys(nodes, 100.0), bounds, [210.0] * 6, 180.0) is None
 
 
-def test_a_stored_cut_another_cut_of_its_count_ran_in_place_of_is_stored_as_ran(ci):
+def test_a_stored_cut_another_cut_of_its_count_ran_in_place_of_is_stored_as_ran(ci, tmp_path):
     """A stored cut main's CI ran no group of as stored (a bound timed in another group than the one it
     starts: a reweighed plan cut the file afresh at the same count) stores the cut that ran, never its own,
     which a plan would take up again and rename every group of (review, row 10776); a bound timed in no
     group (skipped) proves nothing and keeps the stored cut, so none is recut every train."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 120, "environment": {}}))
     name = "tests/test_steady.py"
     nodes = [f"{name}::test_{index}" for index in range(4)]
     own = dict.fromkeys(nodes, 50.0)
