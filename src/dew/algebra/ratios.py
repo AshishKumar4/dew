@@ -6,6 +6,7 @@ of its float operands evaluated through `dew.algebra.windows`'s windowed compens
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 import math
 from collections.abc import Callable
@@ -28,6 +29,7 @@ from dew.algebra.windows import (
     _streamed,
     _Sum,
     _times,
+    _without_axis,
     chunk_width,
 )
 

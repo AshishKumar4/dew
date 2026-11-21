@@ -40,28 +40,38 @@ errors in the compensated sum are exact, so the rest's sum is one rounding of it
 from __future__ import annotations
 
 import dataclasses
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.interpreters import ad
 
 from dew.algebra import scaled
-from dew.algebra.ratios import Ratio as Ratio, Summed as Summed, ratio as ratio, ratio_p as ratio_p
+from dew.algebra.ratios import (
+    Ratio as Ratio,
+    Summed as Summed,
+    _ratio_sum,
+    ratio as ratio,
+    ratio_p as ratio_p,
+)
 from dew.algebra.windows import (
     CEILING as CEILING,
     CHUNK as CHUNK,
     FLOOR as FLOOR,
     Units as Units,
+    _arrays,
     _factors_value as _factors_value,
     _laid_to,
     _landed,
     _quotient,
     _streamed,
     _Sum,
+    _without_axis,
     chunk_width as chunk_width,
 )
 from dew.nn.derivatives import contracted
-
+from dew.nn.precision import two_product, two_sum
 
 
 def _laid(array: jax.Array, like: jax.Array) -> jax.Array:
@@ -278,16 +288,6 @@ def _landing(units: Units, joined: jax.Array, masses, axis: int) -> jax.Array:
     safe = landed_at((shift + 1) * ln2)
     held = landed_at(shift * ln2 + least)
     return jnp.where(shift > 0, jnp.where(jnp.isfinite(safe), safe, held), joined)
-
-
-def _without_axis(operand, axis: int):
-    """`operand`'s type without its states' `axis` (its shape and its sharding's spec), its dtype, weak type,
-    memory and manual axes (`shard_map`'s varying ones) its own: a merged result's (base review F3: a spec
-    kept whole beside a shape without the axis is refused under an explicit mesh)."""
-    spec = (*operand.sharding.spec, *(None,) * (operand.ndim - len(operand.sharding.spec)))
-    kept = PartitionSpec(*spec[:axis], *spec[axis + 1:])
-    return operand.update(shape=tuple(size for place, size in enumerate(operand.shape) if place != axis),
-                          sharding=operand.sharding.update(spec=kept))
 
 
 def _merged_state_value(outputs, totals, anchors, *, units: Units, axis: int):

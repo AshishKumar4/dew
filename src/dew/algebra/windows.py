@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import PartitionSpec
 
 from dew.algebra import scaled
 from dew.algebra.scaled import Scaled
@@ -546,3 +548,12 @@ def _binade(summed, axis: int) -> jax.Array:
     high, low, exponent = summed
     return jnp.expand_dims(exponent + scaled.scaled(high + low).exponent, axis)
 
+
+def _without_axis(operand, axis: int):
+    """`operand`'s type without its states' `axis` (its shape and its sharding's spec), its dtype, weak type,
+    memory and manual axes (`shard_map`'s varying ones) its own: a merged result's (base review F3: a spec
+    kept whole beside a shape without the axis is refused under an explicit mesh)."""
+    spec = (*operand.sharding.spec, *(None,) * (operand.ndim - len(operand.sharding.spec)))
+    kept = PartitionSpec(*spec[:axis], *spec[axis + 1:])
+    return operand.update(shape=tuple(size for place, size in enumerate(operand.shape) if place != axis),
+                          sharding=operand.sharding.update(spec=kept))
