@@ -15,6 +15,7 @@ leaves the files it reached without a key. The standard library alone: it runs b
 on the path."""
 
 import atexit
+import contextlib
 import os
 import runpy
 import sys
@@ -161,11 +162,10 @@ def noted(event: str | None = None, args: tuple = (), starting: bool = False) ->
     """Why the start just counted unfollowed is (`followed.described`; where `starting`, the multiprocessing
     start whose frame called `started`), its owner's evidence: nothing it does, a frame read or a line
     written, fails the start, which its marker counted already."""
-    try:
+    # A frame read the stack cannot give, or a line the log cannot take, fails nothing.
+    with contextlib.suppress(OSError, ValueError):
         frame = sys._getframe(2) if starting else None
         write(owner(), f"{WHY}{followed.described(root, event, args, frame)}")
-    except Exception:  # noqa: BLE001, S110 - evidence only
-        pass
 
 
 def peaked() -> None:

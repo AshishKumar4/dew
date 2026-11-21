@@ -445,7 +445,7 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
               closed=True):
         lines = [f"owner\t{file}", f"inherited\t{int(inherited)}", f"began\t{began}", f"file\tsrc/{index}.py",
                  *["start\tfollowed"] * expected,
-                 *([f"unfollowed\t1", f"why\t{unfollowed}"] if unfollowed else []),
+                 *(["unfollowed\t1", f"why\t{unfollowed}"] if unfollowed else []),
                  *([f"pool\t{pool}"] if pool else []), *([f"peak\t{peak}"] if peak is not None else []),
                  *([f"ended\t{ended}", "closed\t1"] if closed else [])]
         (tmp_path / f"{index}.log").write_text("\n".join(lines) + "\n")

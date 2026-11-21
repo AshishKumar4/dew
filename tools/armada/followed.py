@@ -13,6 +13,7 @@ It imports the standard library alone, since the `.pth` runs it in every child b
 imports."""
 
 import atexit
+import contextlib
 import dis
 import functools
 import importlib.machinery
@@ -403,17 +404,16 @@ def described(root: str, event: str | None = None, args: tuple = (), starting=No
                 break
             frame = frame.f_back
         said = f"{what} from {caller}"
-    except Exception as error:  # noqa: BLE001 - evidence only: the start is counted whatever this says
+    except Exception as error:  # Evidence only: the start is counted whatever this says.
         said = f"a start not described ({type(error).__name__})"
     return one_line(said)
 
 
 def noted(writing: Callable[[], None]) -> None:
-    """A reason written (`writing`), evidence only: its failure fails nothing, its start's marker written."""
-    try:
+    """A reason written (`writing`), evidence only: a log that cannot take it (closed, or an encoding it
+    refuses) fails nothing, its start's marker written already."""
+    with contextlib.suppress(OSError, ValueError):
         writing()
-    except Exception:  # noqa: BLE001, S110 - evidence only
-        pass
 
 
 def one_line(said: str) -> str:
@@ -425,8 +425,8 @@ def _recorders_or_process_modules(filename: str) -> bool:
     """Whether code of `filename` is the recorder's or the standard library's that starts a process for its
     caller (multiprocessing, concurrent.futures, subprocess, threading, os), by the modules' own files."""
     for package in ("multiprocessing", "concurrent.futures"):
-        module = sys.modules.get(package)
-        if module is not None and filename.startswith(os.path.dirname(module.__file__) + os.sep):
+        where = getattr(sys.modules.get(package), "__file__", None)
+        if where is not None and filename.startswith(os.path.dirname(where) + os.sep):
             return True
     files = {getattr(sys.modules.get(name), "__file__", None) for name in ("subprocess", "threading", "os")}
     recorder = {__file__, os.path.join(os.path.dirname(__file__), "lifetime.py")}
