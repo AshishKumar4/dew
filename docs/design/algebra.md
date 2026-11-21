@@ -71,8 +71,10 @@ they are declared: neither is generated yet.
 - **A manual mesh's body** (`jax.shard_map`'s, each device's program) is a boundary, not a leaf: the pass
   rewrites inside it in the map's recorded context (its newly manual axes bound, its abstract mesh manual,
   its variance checked as the map checks it), each traced value typed by the manual axes it varies over, and
-  nothing moves across it; a constant its rewrite holds becomes one of the map's replicated operands, as JAX
-  stages a map (row 6578).
+  nothing moves across it. No constant reaches its body: JAX stages a map's body, as a checkpoint's, without
+  constants, and their replay and lowering pass none, so a form whose program holds one is not spliced
+  (`program._splices`) and an `Algebra` span closing over one is rewritten within its call (row 6578, its
+  review's F1; rows 10692, 10720).
 - **Marked regions** (§6.10): Dew brackets a span of a computation with a marker primitive whose JVP and
   transpose rules bracket the span's tangent and cotangent too, so a span keeps its marker through autodiff. A
   marker carries its kind as an object, never a name string:
@@ -89,8 +91,11 @@ they are declared: neither is generated yet.
   - `Activation`: an activation's gated or ungated product (the fusion seam its epilogue reads), which rules
     rewrite within, as a `Surrogate` span's body.
   - `Algebra`: a derivative written only to restructure algebra (§1.3), which the pass rewrites freely: a span
-    with no effects over arrays opens into the region around it, and any other is rewritten within its call, as
-    a control-flow body is (its constants at hand, its inputs arrays).
+    with no effects over arrays whose body holds no constant opens into the region around it, and any other is
+    rewritten within its call, as a control-flow body is (its constants at hand, its inputs arrays). A span
+    closing over an array opens nowhere, a top-level program's or a nested jit's included: opened, its
+    constants would be the enclosing program's, which a manual mesh's body and a checkpoint's bind none of
+    (`program._opening`).
 - **Control flow:** the bodies of `scan`, `while`, `cond`, nested `jit` (`pjit`) and checkpoint (remat) are regions
   of their own, rewritten in place and recursively (a body whose constants are not all at hand, or one of
   whose inputs is no array, is left as traced). Bodies are never unrolled, so a step's program depth stays
