@@ -1799,3 +1799,49 @@ def test_a_mapped_bodys_sums_take_their_cheaper_form_varying_as_the_values_they_
     assert cheaper_spliced(mapped, *rows(17, *SHAPES_MARKED))
     assert_as_exact(jax.jit(algebra.rewritten(mapped)), jax.jit(mapped),
                     lambda seed: rows(seed, *SHAPES_MARKED), "a mapped body's joined sums", seeds=8)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_body_whose_rewrite_holds_a_constant_binds_it_as_an_operand():
+    """A manual mesh's body holding an Algebra span that closes over an array (`cumsum(sin(x * held))`,
+    nothing the rules lower) beside two sums the pass joins (`two_sums`): the join is spliced and the span,
+    its array a constant of its own, is rewritten within its call, so no constant reaches the map's body,
+    which JAX's lowering binds none of (row 6578's review, F1: opened, its array was the body's and the
+    map's lowering refused it), and the program computes what it computes."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    from dew.nn.derivatives import Algebra, marked
+
+    held = np.linspace(0.5, 1.5, SHAPES_MARKED[0][1], dtype=np.float32)
+
+    def both(x, y, a):
+        kept = marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x * held), axis=-1))(x)
+        return kept, two_sums(x, y, a)
+
+    split = PartitionSpec("data")
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    mapped = jax.shard_map(both, mesh=mesh, in_specs=(split,) * 3, out_specs=(split, split))
+    assert cheaper_spliced(mapped, *rows(18, *SHAPES_MARKED))
+    assert_as_exact(jax.jit(algebra.rewritten(mapped)), jax.jit(mapped),
+                    lambda seed: rows(seed, *SHAPES_MARKED), "a mapped body's span beside joined sums",
+                    seeds=8)
+
+
+def test_a_checkpoints_body_holding_a_span_of_a_constant_lowers_as_written():
+    """A checkpoint (`jax.checkpoint`) whose body holds an Algebra span that closes over an array beside two
+    sums the pass joins: the join is spliced and the span, its array a constant of its own, is rewritten
+    within its call, so no constant reaches the checkpoint's body, which JAX stages and lowers with none
+    (row 6578's review: opened, its array was the body's and the checkpoint's lowering refused it), and the
+    program computes what it computes."""
+    from dew.nn.derivatives import Algebra, marked
+
+    held = np.linspace(0.5, 1.5, SHAPES_MARKED[0][1], dtype=np.float32)
+
+    @jax.checkpoint
+    def both(x, y, a):
+        kept = marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x * held), axis=-1))(x)
+        return kept, two_sums(x, y, a)
+
+    assert cheaper_spliced(both, *rows(20, *SHAPES_MARKED))
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a checkpoint's span of a constant beside joined sums", seeds=8)

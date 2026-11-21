@@ -1527,9 +1527,10 @@ def test_a_gated_product_across_a_barrier_is_never_fused(barred):
 def test_a_mapped_products_written_casts_are_replayed_as_written():
     """A manual mesh's product of row-split operands by a scale and a weight the program cast to vary itself
     (`pcast`, JAX writing no cast of its own: `jax_auto_pcast` off) under the pass on an H100 whose template
-    a call names: the region's replay binds each cast as written (row 6578's review, F2: replayed as the
-    value it cast, the multiply's operands typed apart and refused), its product the template's launch per
-    shard, and the program computes as written."""
+    a call names: the fusion analysis's replay of the region binds each operand as the program typed it, the
+    casts' results among them (row 6578's review, F2: a cast replayed as the value it cast, the multiply's
+    operands varied apart and JAX refused it), its product the template's launch per shard, and the program
+    computes as written."""
     from jax._src import config as jax_config
     from jax.sharding import Mesh, PartitionSpec
 
