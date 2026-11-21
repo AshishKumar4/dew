@@ -29,6 +29,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 from collections.abc import Callable, Collection, Hashable, Sequence
 
 import jax
@@ -482,7 +483,8 @@ def _holdable(closed) -> bool:
     its first trace made), and none whose constants pass `SPAN_CONSTANTS_HELD` bytes."""
     if closed.effects or any(isinstance(const, Tracer) for const in closed.consts):
         return False
-    return sum(getattr(const, "nbytes", 0) for const in closed.consts) <= SPAN_CONSTANTS_HELD
+    return sum(math.prod(var.aval.shape) * var.aval.dtype.itemsize
+               for var in closed.jaxpr.constvars) <= SPAN_CONSTANTS_HELD
 
 
 def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hashable | None:
