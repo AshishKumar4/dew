@@ -837,5 +837,5 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
         loaded.export()
     assert refused.value.args == (MESSAGES_UNWRITTEN,)
     with pytest.raises(ValueError):
-        loaded.with_model(loaded.model.with_passes(messages=CrossPass(block_size=1, rank=8)))
+        loaded.with_model(loaded.model.with_passes(messages=CrossPass(block_size=1, rank=8)), key=0)
 
