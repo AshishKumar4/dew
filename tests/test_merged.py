@@ -351,3 +351,49 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
     small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
     assert merged._channel_block(spec, small_p, small_s, 1, 128, target) < 128
+
+
+def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
+    """A split decode merge with a sink or resumed `Initial` state (`merged.merged_split`, row 9804) lowers
+    through `merged_padded_p` (one launch on GPU), matches `algebra.merged_state` on value and vmap, and
+    prices its Triton launch body with the initial state."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
+    batch, slices, rows, heads, width = 2, 4, 8, 2, 16
+    queries = 3
+    key = jax.random.key(9804)
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+    padded = jax.random.normal(k1, (batch, slices, rows, heads, width), jnp.float32)
+    stacked = jnp.stack([
+        jax.random.normal(k2, (batch, heads, slices, rows), jnp.float32),
+        jax.random.uniform(k3, (batch, heads, slices, rows), jnp.float32, minval=0.1, maxval=2.0),
+    ])
+    init_m = jax.random.normal(k4, (batch, heads, queries), jnp.float32)
+    init_t = jax.random.uniform(k5, (batch, heads, queries), jnp.float32, minval=0.1, maxval=2.0)
+    init_acc = jax.random.normal(k1, (batch, heads, queries, width), jnp.float32)
+    initial = template.Initial(init_m, init_t, init_acc)
+
+    def run(p, s, im, it, ia):
+        res = merged.merged_split(spec, p, s, queries=queries, width=width,
+                                  initial=template.Initial(im, it, ia))
+        return res.acc, res.m, res.total
+
+    traced = jax.make_jaxpr(run)(padded, stacked, init_m, init_t, init_acc)
+    merge_eqns = [e for e in traced.jaxpr.eqns if e.primitive is merged.merged_padded_p]
+    assert len(merge_eqns) == 1 and len(merge_eqns[0].invars) == 5
+
+    got = run(padded, stacked, init_m, init_t, init_acc)
+    trimmed = merged._trimmed(padded, stacked, queries=queries, width=width)
+    ref = algebra.merged_state(spec, *trimmed, initial)
+    for a, b in zip(got, ref[:3], strict=True):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-5, atol=1e-5)
+
+    vmapped = jax.vmap(run)(padded[None], stacked[None], init_m[None], init_t[None], init_acc[None])
+    for a, b in zip(vmapped, got, strict=True):
+        np.testing.assert_allclose(np.asarray(a[0]), np.asarray(b), rtol=1e-5, atol=1e-5)
+
+    with generation.assumed("sm90"):
+        p_s = jax.ShapeDtypeStruct(padded.shape, padded.dtype)
+        s_s = jax.ShapeDtypeStruct(stacked.shape, stacked.dtype)
+        work = merged.launch_work(spec, p_s, s_s, queries, width, generation.gpu_target("sm90"),
+                                  has_initial=True)
+    assert work.kernels == 1 and work.device_bytes > 0
