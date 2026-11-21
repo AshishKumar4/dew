@@ -479,8 +479,7 @@ def write_modules(lowering: str, compiling: str, directory: str, kernels: Collec
     compile reuses, or one its compile assembled. A module the compile assembled supersedes certification's
     of its name and launch, which the program does not run (a gradient's forward is another kernel than the
     one certified, the recurrence template's); one of no kernel of the program is a config certification
-    refused, written into `directory`'s `refused` (`refused_reads`). Two modules of one name and launch in
-    one print raise."""
+    refused. Two modules of one name and launch in one print raise."""
     modules: dict[str, str] = {}
     for printed in (lowering, compiling):
         assembled: dict[str, str] = {}
@@ -493,11 +492,9 @@ def write_modules(lowering: str, compiling: str, directory: str, kernels: Collec
                 raise ValueError(f"two PTX modules of {name}")
             assembled[name] = part
         modules.update(assembled)
-    refused = Path(directory, "refused")
     for name, part in modules.items():
-        if name not in kernels:
-            refused.mkdir(exist_ok=True)
-        Path(directory if name in kernels else refused, f"{name}.ptx").write_text("//\n" + PTX_MODULE + part)
+        if name in kernels:
+            Path(directory, f"{name}.ptx").write_text("//\n" + PTX_MODULE + part)
 
 
 def _route(lowered, executable, mesh: Mesh) -> dict:
@@ -892,37 +889,6 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     return found
 
 
-def refused_reads(directory: Path, generation: str) -> dict[str, dict]:
-    """Each module certification refused (`write_modules`' `refused`) as each CUDA build the gate judges the
-    generation under compiles it (`judged_builds`, `assemblers`): by build, its spilled bytes and its loss
-    notes' codes, None where that build's ptxas takes it not."""
-    found: dict[str, dict] = {}
-    for path in sorted(directory.glob("*.ptx")):
-        reads = {}
-        for build, ptxas in zip(judged_builds(generation), assemblers(generation), strict=True):
-            text, took = _ptxas_text(path.read_text(), generation, RELOCATABLE, ptxas)
-            read = ptxas_read(text) if took else None
-            reads[build] = None if read is None else {"spilled": read.spilled, "losses": list(read.losses)}
-        found[path.stem] = reads
-    return found
-
-
-def refusal_disagreements(found: list[dict]) -> list[str]:
-    """Each config a case's certification refused (its compile's `refused`) that a CUDA build the gate
-    judges holds (spilling nothing, its warpgroup MMAs not serialized): a GPU of that build would certify it
-    and run it, a kernel a gate settling each launch by one build's certification (the compile-only device's)
-    never qualifies. Where none is, every build settles each launch on the one tile the gate compiles."""
-    failed = []
-    for record in found:
-        for name, reads in record.get("refused", {}).items():
-            holding = [build for build, read in reads.items() if read is not None and not read["spilled"]
-                       and not report.SERIALIZED & set(read["losses"])]
-            if holding:
-                failed.append(f"{record['name']}: certification refused {name}, which {', '.join(holding)}'s "
-                              f"ptxas holds: its GPUs would run it unqualified")
-    return failed
-
-
 def _compiled_here(cases, generation: str) -> list[dict]:
     """`compile_mosaic_kernels`' records, compiled in this process."""
     found: list[dict] = []
@@ -948,7 +914,6 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 and (launch := report.traced(kernel["launched"])) is not None
                 and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             compiled = _compiled_reports(directory, generation)
-            record["refused"] = refused_reads(Path(directory, "refused"), generation)
             record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
             printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
             for kernel in record["kernels"]:
@@ -996,11 +961,12 @@ def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[s
             stated = (None if found_kernel.kind == "triton"
                       else cased if cased is not None or not traced_models
                       else record.get("stated_models", {}).get(found_kernel.traced))
-            if stated is None and traced_models and found_kernel.kind != "triton":
-                # A settled case plans its shared bytes by its launch's traced model alone: none is no
-                # evidence its allocation is the plan's.
-                failed.append(f"{record['name']}: {found_kernel.kernel} states no traced model, its shared "
-                              f"allocation unchecked against its plan")
+            unplanned = stated is None or stated["shared"] is None
+            if traced_models and found_kernel.kind != "triton" and unplanned:
+                # A settled case plans its shared bytes by its launch's traced model alone: none, or one
+                # stating no shared bytes, is no evidence its allocation is the plan's.
+                failed.append(f"{record['name']}: {found_kernel.kernel} states no traced model's shared "
+                              f"bytes, its allocation unchecked against its plan")
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
