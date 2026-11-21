@@ -36,7 +36,7 @@ def _drawn(count: int) -> list[tuple[int, int, int | None]]:
 @pytest.mark.parametrize("window, bins, segments",
                          [(8, 1, None), (8, 3, None), (16, 4, 3), (5, 2, 2), *_drawn(16)])
 def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
-    """Dew plans first-fit windows by documents' lengths alone (`dew.data.tokens.first_fit`), a
+    """Dew plans first-fit windows by documents' lengths alone (`dew.data.placement.first_fit`), a
     placement Grain's packer reaches only by packing every token, so Grain's packer is its oracle,
     over packings drawn at random as over the edge cases. Documents from one token to well past the
     window, a few exactly the window, with ids and roles, cut by a chunk step before a first-fit pack:

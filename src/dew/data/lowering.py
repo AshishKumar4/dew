@@ -103,7 +103,6 @@ from dew.data.mixing import (
     rewound,
 )
 from dew.data.ordering import Skipping, place_of
-from dew.data.packing import packed_documents
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -927,6 +926,8 @@ class _Ruled(pygrain.IterDataset):
         self._drawn = drawn
 
     def __iter__(self) -> pygrain.DatasetIterator:
+        # Imported where a pack or windows lower, so a chain that packs nothing imports no packer.
+        from dew.data.packing import packed_documents
         from dew.data.steps.windows import CausalWindows
 
         seen = LayoutRule()

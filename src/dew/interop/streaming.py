@@ -26,7 +26,7 @@ import numpy as np
 
 from dew._coordination import read_home
 from dew._model_types import LAYER_SCALAR_COLLECTIONS
-from dew.distributed.host import evict
+from dew.distributed.pages import evict
 from dew.interop.unread import Stored, valued
 from dew.interop.weights import swapped
 from dew.nn.backbones.layer_names import StoredRow
