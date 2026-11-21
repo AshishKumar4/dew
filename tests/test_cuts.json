@@ -130,20 +130,9 @@
 "tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm90-128]",
 "tests/test_attention_decode_template.py::test_every_output_a_decode_steps_launches_declare_is_written_interpreted[one-query-no-rewalk]"
 ],
-"tests/test_attention_derived.py": [
-"tests/test_attention_derived.py::test_the_derived_backward_is_on_par_in_every_cell[full-keys-first-normalized-weights]"
-],
 "tests/test_attention_dropout.py": [
 "tests/test_attention_dropout.py::test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term[training-mosaic]",
 "tests/test_attention_dropout.py::test_an_fp16_output_whose_fp32_quotient_is_its_overflow_midpoint_narrows_below_it[training-mosaic]"
-],
-"tests/test_attention_metamorphic.py": [
-"tests/test_attention_metamorphic.py::test_a_causal_calls_first_queries_are_the_call_cut_to_them",
-"tests/test_attention_metamorphic.py::test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted[1]",
-"tests/test_attention_metamorphic.py::test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted[8]",
-"tests/test_attention_metamorphic.py::test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted",
-"tests/test_attention_metamorphic.py::test_a_full_calls_output_is_its_keys_permuted_together_with_their_values",
-"tests/test_attention_metamorphic.py::test_slices_whose_outputs_sum_past_fp32s_largest_merge_to_their_attention_interpreted"
 ],
 "tests/test_attention_mosaic.py": [
 "tests/test_attention_mosaic.py::test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpreted[sm80-128-default]",
@@ -571,10 +560,6 @@
 "tests/test_benchmark_step.py::test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer[unet_2d_condition-False]",
 "tests/test_benchmark_step.py::test_a_window_reads_invalid_where_any_of_its_steps_went_non_finite_not_only_its_last"
 ],
-"tests/test_bf16_reference.py": [
-"tests/test_bf16_reference.py::test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does[llama-tiny]",
-"tests/test_bf16_reference.py::test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16"
-],
 "tests/test_block_diffusion.py": [
 "tests/test_block_diffusion.py::test_a_canvas_reads_its_cache_alike_paged_or_dense[int8]",
 "tests/test_block_diffusion.py::test_a_canvas_whose_model_scores_nothing_refuses_rather_than_draw_a_token",
@@ -988,9 +973,6 @@
 "tests/test_decision_state_once.py::test_each_question_reads_the_shared_part_and_itself",
 "tests/test_decision_state_once.py::test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores",
 "tests/test_decision_state_once.py::test_sibling_questions_packed_a_window_read_each_their_own_requests_context"
-],
-"tests/test_decision_streams.py": [
-"tests/test_decision_streams.py::test_each_token_reads_exactly_what_its_streams_record_says_in_a_packed_window[joint]"
 ],
 "tests/test_decision_task.py": [
 "tests/test_decision_task.py::test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in",
@@ -1915,9 +1897,6 @@
 "tests/test_level_stacking.py": [
 "tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
 ],
-"tests/test_lfm3.py": [
-"tests/test_lfm3.py::test_plain_and_looped_lfm3_train_through_a_decision_run[looped]"
-],
 "tests/test_linear_attention.py": [
 "tests/test_linear_attention.py::test_a_cached_layer_traced_for_a_jvp_decodes_its_token[plain]",
 "tests/test_linear_attention.py::test_a_token_with_nothing_to_fuse_naming_the_fused_step_runs_the_step[512]",
@@ -2773,10 +2752,6 @@
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-spread gates-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-steep then mild-None]",
 "tests/test_recurrence_template_stability.py::test_the_narrow_gated_delta_gradient_compiles_for_an_h100"
-],
-"tests/test_recurrence_witness.py": [
-"tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
-"tests/test_recurrence_witness.py::test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches"
 ],
 "tests/test_recurrent_sequence_split.py": [
 "tests/test_recurrent_sequence_split.py::test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones[kimi delta attention-empty_shard_packed-default rules]",
