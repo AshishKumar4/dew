@@ -914,14 +914,14 @@ TARGETS = {target.generation: target for target in (
               step_seconds=5.41e-6,
               # In-kernel: a dependent lane reduction's 144.0 ns (its two rounds 144.05 and 144.04).
               kernel_step_seconds=144.0e-9,
-              # tools/device_facts.py on a B200 (lab-b200-20261113-facts2): its stream's line over 1 MiB to
+              # tools/device_facts.py on a B200: its stream's line over 1 MiB to
               # 1 GiB, 6.43 TB/s read at 1 GiB, as HS-CAL-b200's dram read of its 1.07 GB (6.40); its
               # launch HS-CAL-b200's, a kernel after another with no programmatic dependent launch (1.20 us);
               # its hand-off device_facts' (0.651 us a round trip). Its multiprocessors' clock under a
               # step's large products: 1.549 GHz, the time-weighted mean of sm__cycles_elapsed.avg.per_second
               # over the 15 GEMM launches of 0.1 ms or more in the 4B's one-row Muon step under ncu (1.520 to
-              # 1.600; the driver's software power capping counter running at the default 1,000 W limit;
-              # lab-b200-20261112-bundle2/ncu-muon-raw.csv), where its idle-sampled 1965 MHz above stands.
+              # 1.600; the driver's software power capping counter running at the default 1,000 W limit),
+              # where its idle-sampled 1965 MHz above stands.
               measured={'NVIDIA B200': Measured(4.29e-6, 6.593e12, launch=1.20e-6, handoff=0.651e-6,
                                                 loaded_clock=1.549e9)},
               # HGX B200's PCIe Gen5 x16 a GPU (its datasheet's 128 GB/s both ways); GB200's NVLink-C2C to
@@ -1660,10 +1660,12 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         def transposed(residuals, cotangent):
             operands, saved = residuals
-            if live_cotangents:
-                return list(jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live))))
-            pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, None))
-            return [pulled_back[index] for index in live]
+            pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live) if live_cotangents
+                                                 else None))
+            cotangents = pulled_back if live_cotangents else [pulled_back[index] for index in live]
+            # Each typed as its operand varies (`varying_as`).
+            leaves = jax.tree.leaves(operands)
+            return [varying_as(each, leaves[index]) for each, index in zip(cotangents, live, strict=True)]
 
         moving = [directions[index] for index in live]
         # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s
@@ -1688,6 +1690,27 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     return contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
+
+
+def varying_as(cotangent, operand):
+    """`cotangent` typed as `operand` varies over a checked manual map's axes (`dew.nn.sharding.checked`):
+    summed over each axis it varies over that `operand` does not, and cast to varying over each `operand`
+    varies over that it does not, as JAX's own transposes type an operand's cotangent. A kernel's result
+    varies over every axis an operand varies over (`launches._typed`, row 9808), so its gradient of an
+    operand every device holds the same of is each device's partial, which sums to the operand's (row 10526:
+    a GEMM template's kernel gradient for a replicated matrix reached `ad.ct_check` varying over the map's
+    axis), and a cotangent the backward formed from values the same on every device is cast to an operand
+    each device holds its own of. `cotangent` as it is outside a checked map or where typed as `operand`."""
+    import jax
+
+    if cotangent is None or operand is None:
+        return cotangent
+    have, want = jax.typeof(cotangent).mat.varying, jax.typeof(operand).mat.varying
+    if extra := tuple(sorted(have - want)):
+        cotangent = jax.lax.psum(cotangent, extra)
+    if missing := tuple(sorted(want - have)):
+        cotangent = jax.lax.pcast(cotangent, missing, to="varying")
+    return cotangent
 
 
 def unbroadcast(cotangent, shape: tuple[int, ...]):

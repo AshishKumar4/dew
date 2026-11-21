@@ -13,7 +13,7 @@ from generation_support import COMPILES_ON_CPU
 from kernel_compile import compile_kernels
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
 
-from dew.algebra import means
+from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, merged
@@ -394,7 +394,7 @@ def _emitted_device_bytes(body, *, rows: int, blocks: int, slices: int, read_wid
     ref bounds (`slices`, `read_width`, `width`)."""
     from jax import lax
 
-    chunk = means.chunk_width(slices)
+    chunk = windows.chunk_width(slices)
     chunks = -(-slices // chunk)
     channels = 1 << (width - 1).bit_length()
     slice_frac = slices / (chunks * chunk)
@@ -582,3 +582,63 @@ def test_a_finished_split_merge_ungroups_and_casts_in_one_launch():
         work_fin = merged.launch_work(spec, p_s, s_s, queries, width, target,
                                       out_dtype=jnp.bfloat16, out_heads=out_heads)
     assert work_fin.kernels == 1 and work_fin.device_bytes < work_plain.device_bytes
+
+
+def test_a_finished_split_merge_preserves_subnormal_initial_mass():
+    """When key slices are empty and `initial` carries subnormal mass (`2^-127`, row 10778), both
+    `merged.merged_finished` (`_value`) and the Pallas merge kernel (`_launch`) preserve the merge law's
+    normalized output `1.0` instead of flushing `state.total > 0` to `0.0`, while truly empty rows stay
+    `0.0`."""
+    batch, slices, rows, kv_heads, width, queries, out_heads = 1, 2, 4, 1, 16, 2, 2
+    spec = algebra.finished_form(algebra.Forward(form="full", ids=False, keys=16, scale=1.0))
+    padded = jnp.zeros((batch, slices, rows, kv_heads, width), jnp.float32)
+    maxima = jnp.full((batch, kv_heads, slices, rows), -jnp.inf, jnp.float32)
+    totals = jnp.zeros((batch, kv_heads, slices, rows), jnp.float32)
+    stacked = jnp.stack([maxima, totals])
+    sub = jnp.float32(2.0 ** -127)
+    init_m = jnp.zeros((batch, kv_heads, queries), jnp.float32)
+    init_t = jnp.array([[[sub, 0.0]]], jnp.float32)
+    init_acc = jnp.stack([jnp.full((batch, kv_heads, width), sub, jnp.float32),
+                          jnp.zeros((batch, kv_heads, width), jnp.float32)], axis=2)
+    initial = template.Initial(init_m, init_t, init_acc)
+
+    got = jax.jit(lambda p, s, i: merged.merged_finished(
+        spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+        initial=i))(padded, stacked, initial)
+    expected = np.concatenate([np.ones((1, 1, 1, width), dtype=np.float32),
+                               np.zeros((1, 1, 1, width), dtype=np.float32)], axis=2)
+    np.testing.assert_array_equal(np.asarray(got, dtype=np.float32), expected)
+
+
+def test_resumable_split_merge_preserves_subnormal_initial_mass():
+    """Row 10818: `algebra.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps its
+    natural maximum instead of replacing it with `LEAST`, so a subsequent `merged.merged_finished` with a
+    low-logit slice (`-140`) preserves the resumed output instead of letting the low-logit slice overwrite
+    it."""
+    batch, slices, rows, kv_heads, width, queries = 1, 2, 4, 1, 16, 2
+    spec = algebra.finished_form(algebra.Forward(form="full", ids=False, keys=16, scale=1.0))
+    padded = jnp.zeros((batch, slices, rows, kv_heads, width), jnp.float32)
+    sub = jnp.float32(2.0 ** -127)
+    scale = jnp.float32(2.0 ** 20)
+    state_acc = jnp.stack([jnp.full((batch, kv_heads, width), scale, jnp.float32),
+                           jnp.zeros((batch, kv_heads, width), jnp.float32)], axis=1)
+    state_m = jnp.zeros((batch, queries, kv_heads), jnp.float32)
+    state_total = jnp.array([[[sub], [0.0]]], jnp.float32)
+    state = algebra.Partial(state_acc, state_m, state_total)
+
+    low_m = jnp.full((batch, kv_heads, slices, rows), -160.0, jnp.float32)
+    low_t = jnp.ones((batch, kv_heads, slices, rows), jnp.float32)
+    low_stacked = jnp.stack([low_m, low_t])
+
+    def step(p_in, st_in, low_s):
+        resumed = algebra.resumable(spec, st_in)
+        next_init = template.Initial(jnp.swapaxes(resumed.m, 1, 2), jnp.swapaxes(resumed.total, 1, 2),
+                                     jnp.swapaxes(resumed.acc, 1, 2))
+        out = merged.merged_finished(spec, p_in, low_s, queries=queries, width=width,
+                                     out_dtype=jnp.float32, out_heads=queries, initial=next_init)
+        return resumed.m, out
+
+    resumed_m, got = jax.jit(step)(padded, state, low_stacked)
+    assert float(resumed_m[0, 0, 0]) == 0.0, resumed_m
+    np.testing.assert_array_equal(np.asarray(got[0, 0, 0]), np.full(width, float(scale), dtype=np.float32))
+    np.testing.assert_array_equal(np.asarray(got[0, 0, 1]), np.zeros(width, dtype=np.float32))

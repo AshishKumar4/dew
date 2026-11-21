@@ -934,3 +934,26 @@ def test_a_generation_from_a_stage_local_state_packs_its_projections():
     trained = run.fit(stream(), steps=1, log_every=1)
     groups = [pending(model, variables) for variables in (trained.variables, run.stored(trained).variables)]
     assert groups[1] and groups[0] == groups[1]
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_local_saves_rows_on_each_stages_mesh_are_recovered_where_its_holders_cover_every_mesh():
+    """A local save of a pipeline's rows, each on its own stage's mesh (`StageLocal.saved`), records a grid
+    a mesh (`Grid.each`), each with the rows on it, and a process that lost its copy recovers it where the
+    processes holding the step hold a copy of every row on every mesh: either of two processes that each
+    hold one device of every stage does, and one whose stage only the lost process holds does not (row
+    10814: one grid alone was recorded, none for rows on several meshes, so no such step was recovered)."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from dew.checkpoints._replicas import Grid, _covered
+
+    devices = jax.devices()[:4]
+    meshes = [Mesh(np.asarray(devices[2 * stage:2 * stage + 2]), ("data",)) for stage in range(2)]
+    rows = {f"row{stage}": jax.ShapeDtypeStruct((4,), jnp.float32, sharding=NamedSharding(mesh, P()))
+            for stage, mesh in enumerate(meshes)}
+    grids = Grid.each(rows)
+    assert grids is not None and len(grids) == 2 and all(len(grid.split) == 1 for grid in grids), grids
+    interleaved = {device.id: index % 2 for index, device in enumerate(devices)}
+    assert _covered(grids, frozenset({0}), interleaved) and _covered(grids, frozenset({1}), interleaved)
+    apart = {device.id: 0 if index < 2 else 1 for index, device in enumerate(devices)}
+    assert not _covered(grids, frozenset({0}), apart)

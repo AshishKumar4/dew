@@ -333,6 +333,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return dataclasses.replace(self, m_warps=m_warps)
 
     @property
+    def atom_columns(self) -> int:
+        # A warp's atom `m_warps * 16` rows by `(4 // m_warps) * 8` columns (`specialized`): a 16-row
+        # share's four warps along its columns tile 32 of them.
+        return (4 // self.m_warps) * 8
+
+    @property
     def transposed_rows(self) -> int:
         # The transposed stage casts to the products' left-operand layout in whole row atoms, `m_warps`
         # warps of 16 rows: a 32-row step at two row warps lowers, where the 64-row role it was held to
@@ -474,7 +480,9 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         their elements themselves."""
         return self.dtype.itemsize <= 2
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+        if pending:
+            raise ValueError(f"{type(self).__name__}.product is synchronous (pending={pending})")
         out = self.products(self.zeros(shape), lhs, rhs)
         if then is not None:
             then()
@@ -644,7 +652,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
 
-    adds_through_shared = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
+    adds_through_shared = False
+    stages_vectors = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
 
     @property
     @abc.abstractmethod
@@ -837,16 +846,27 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # one has no strided layout, which wants a multiple of 128), where its registers keep their own.
         del wait
         for part, view in zip(parts, views, strict=True):
-            if smem is None:
-                view[...] = part.astype(view.dtype)
+            if smem is None or len(smem.shape) == 1:
+                if isinstance(part, mosaic.StagedWriter):
+                    part.write(None)
+                elif len(view.shape) == 1 and not launches.interpreting():
+                    plgpu.store(view, part.astype(view.dtype), optimized=False)
+                else:
+                    view[...] = part.astype(view.dtype)
                 continue
-            if len(smem.shape) == 1:
-                plgpu.store(view, part.astype(view.dtype), optimized=False)
-                continue
-            plgpu.store(smem, part.astype(smem.dtype), optimized=False)
+            if isinstance(part, mosaic.StagedWriter):
+                part.write(smem)
+            else:
+                self.stage_output(part, smem)
             rows = smem.shape[0]
             stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
+
+    def stage_output(self, value: jax.Array, smem) -> None:
+        if launches.interpreting():
+            smem[...] = value.astype(smem.dtype)
+        else:
+            plgpu.store(smem, value.astype(smem.dtype), optimized=False)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so

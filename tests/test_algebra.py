@@ -454,8 +454,10 @@ def test_a_scalar_constant_built_by_shift_remainder_or_xor_is_the_literal_it_com
     `6 ^ 2`, each 4) and one scaling it by the literal `4`: recognition's normal form (`canonical`) reads
     both as one value, the constant folded by the shared scalar fold (`dew.nn.programs.SCALAR_FOLDED`); a
     list of normal_form's own kept the shift, the remainder and the XOR equations (base review bb25f261d's
-    F2, row 8705)."""
+    F2, row 8705). The fold compiles no program, JAX's in-memory caches cleared before it (`Compiles`: no
+    backend compile within it; row 8707, the fold proved through its consumer, not its helper alone)."""
     from dew.algebra.normal_form import canonical
+    from dew.telemetry.compiles import Compiles
 
     def four(seed):
         if built == "shift":
@@ -464,9 +466,12 @@ def test_a_scalar_constant_built_by_shift_remainder_or_xor_is_the_literal_it_com
             return jax.lax.rem(seed * 14, jnp.int32(5))
         return jax.lax.bitwise_xor(seed * 6, jnp.int32(2))
 
-    program = jax.make_jaxpr(lambda x: (x * four(jnp.int32(1)), x * 4))
-    both = canonical(program(jnp.arange(8, dtype=jnp.int32)))
+    program = jax.make_jaxpr(lambda x: (x * four(jnp.int32(1)), x * 4))(jnp.arange(8, dtype=jnp.int32))
+    jax.clear_caches()
+    with Compiles(None) as compiles:
+        both = canonical(program)
     assert both.outvars[0] is both.outvars[1]
+    assert compiles.count == 0, compiles.programs
 
 
 @pytest.mark.parametrize("shape", [(0, 4), (3, 4)], ids=["empty", "rows"])

@@ -29,7 +29,7 @@ from op_certificates import (
     two_sum,
 )
 
-from dew.algebra import means, scaled
+from dew.algebra import ratios, scaled, windows
 from dew.nn.precision import correctly_rounded_divide_p
 from dew.nn.programs import dot_arithmetic
 
@@ -392,9 +392,9 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.nd
     count = terms.shape[-1]
     if count == 0:
         return _same(native, np.zeros_like(native))
-    underflow = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
     error = np.abs(native - exact_sum(terms, -1))
-    slack = allowance(magnitude_sum(terms, -1), count if counts is None else counts, fmt, underflow)
+    slack = allowance(magnitude_sum(terms, -1), count if counts is None else counts, fmt,
+                      underflow(fmt, flushes))
     return np.isfinite(error) & (error <= np.nextafter(slack, np.inf))
 
 
@@ -508,7 +508,7 @@ def _exactly(values) -> np.ndarray:
 
 
 def _plain_fold(anchors: np.ndarray, joined: np.ndarray, scale: float) -> np.ndarray:
-    """Plain units' base-2 exponent of each factor (`means.Units(compensated=False)`) as the law's
+    """Plain units' base-2 exponent of each factor (`windows.Units(compensated=False)`) as the law's
     specification folds it, each step rounded in float32 apart from the law's code: the anchors' difference
     (at half each where it passes the format, doubled after: exact powers of two), times the scale times
     `log2(e)` rounded to float32, the product rounded (the merge P0's base review 12, F3: the fold, 0.24% off
@@ -524,28 +524,28 @@ def _plain_fold(anchors: np.ndarray, joined: np.ndarray, scale: float) -> np.nda
 
 EXPONENT_ROUNDING = 4
 """The relative rounding, in units of the format's roundoff, of the base-2 exponent a ratio's factor compares
-with its cutoffs (`_factors_hold`, `means._factors_value`'s high part): plain units round the anchors'
+with its cutoffs (`_factors_hold`, `windows._factors_value`'s high part): plain units round the anchors'
 difference, the scale times `log2(e)` and their product once each, `3u + O(u^2)`; compensated units the
 exponent's high part once and leave the difference's error in its low part, `2u + O(u^2)`; four bounds
 both."""
 
 
 def _factors_hold(form, laid, fmt, formed=None) -> bool:
-    """Whether each exponential factor a ratio reads (`means.Ratio`'s `("e", i, j)`, its numerator's, its
-    denominator's and its products' sums') is, as the ratio forms it (`means._factors_value`, the factor it
+    """Whether each exponential factor a ratio reads (`ratios.Ratio`'s `("e", i, j)`, its numerator's, its
+    denominator's and its products' sums') is, as the ratio forms it (`windows._factors_value`, the factor it
     receives), the exponential `exp(s (a_i - a_j))` of its anchors as read within its own stated roundings,
     checked apart from the code that forms it: the exact exponent `s (a_i - a_j)` (`s` the units' scale in
     the format) and its exponential enclosed by mpmath at 80 bits (`interval_precision`), the received factor
     within `2 u reach + 0.85 u + 4 ln2 u^2 |v| + u^2` of it relatively (`reach` the lane's exp's, `v` the
     exponent in base 2: the exponential's one rounding, its argument's two, the base-2 exponent's residual),
-    finite and nonzero wherever `v` is within its cutoffs (`means.FLOOR`, `means.CEILING`), zero past the
+    finite and nonzero wherever `v` is within its cutoffs (`windows.FLOOR`, `windows.CEILING`), zero past the
     floor, NaN past the ceiling, either within `EXPONENT_ROUNDING u |v|` of a cutoff, where the exponent the
-    law compares (`means._factors_value`'s high part) may round across it; a binade either side passed a
+    law compares (`windows._factors_value`'s high part) may round across it; a binade either side passed a
     zero factor in range (the merge P0's base review 11, F4). The ratio is then certified on the
     factors it received (`_ratio_factor`); one that fails here fails the call, which a factor's own fault
     would otherwise pass on both sides (the merge P0's base review 10, F6). `formed` forms the factors it
-    checks, the law's (`means._factors_value`) unless given."""
-    formed = means._factors_value if formed is None else formed
+    checks, the law's (`windows._factors_value`) unless given."""
+    formed = windows._factors_value if formed is None else formed
     terms = [*form.numerator, *form.denominator,
              *(term for _, sums in form.products for each in sums for term in each.terms)]
     pairs = {factor[1:] for _, factors in terms for factor in factors if factor[0] == "e"}
@@ -580,15 +580,15 @@ def _factors_hold(form, laid, fmt, formed=None) -> bool:
                     continue
                 v = fractions.Fraction(fold)
                 x, slack, residual = None, 0, 0
-            if v < means.FLOOR - slack:
+            if v < windows.FLOOR - slack:
                 if got != 0:
                     return False
                 continue
-            if v > means.CEILING + slack:
+            if v > windows.CEILING + slack:
                 if not math.isnan(got):
                     return False
                 continue
-            near = abs(v - means.FLOOR) <= slack or abs(v - means.CEILING) <= slack
+            near = abs(v - windows.FLOOR) <= slack or abs(v - windows.CEILING) <= slack
             if near and (got == 0 or math.isnan(got)):
                 continue
             if not math.isfinite(got):
@@ -605,15 +605,15 @@ def _factors_hold(form, laid, fmt, formed=None) -> bool:
 
 
 def _ratio_factor(factor, laid, units) -> np.ndarray:
-    """A ratio's factor (`means.Ratio`) exactly, as the ratio forms it: an operand as it is (a subnormal's
+    """A ratio's factor (`ratios.Ratio`) exactly, as the ratio forms it: an operand as it is (a subnormal's
     value kept, read from its bits: `scaled`'s account), the units' scale in the format, an exponential its
     factor as formed
-    (`means._factors_value`, a stated input: its one rounding is the exponential's), None where it is NaN."""
+    (`windows._factors_value`, a stated input: its one rounding is the exponential's), None if NaN."""
     if factor[0] == "v":
         return _exactly(laid[factor[1]])
     if factor[0] == "s":
         return _exactly(np.float32(units.scale))
-    significand, exponent = means._factors_value(np.float32(laid[factor[1]]), np.float32(laid[factor[2]]),
+    significand, exponent = windows._factors_value(np.float32(laid[factor[1]]), np.float32(laid[factor[2]]),
                                                  units=units)
     made = _exactly(significand)
     for place, power in np.ndenumerate(np.asarray(exponent)):
@@ -623,7 +623,7 @@ def _ratio_factor(factor, laid, units) -> np.ndarray:
 
 
 def _ratio_sums(terms, laid, form, shape, axis, over=()):
-    """A ratio's sum of `terms` (`means.Ratio`) exactly and its terms' magnitudes' sum, over `axis` where
+    """A ratio's sum of `terms` (`ratios.Ratio`) exactly and its terms' magnitudes' sum, over `axis` where
     given, and whether a term of it is NaN (a factor past its reach), each of the result's shape. A term
     with an exactly zero factor is zero whatever its others (`means._product`: a state of no mass, its
     factor past its reach included); over `over` each term is summed across its own extent there, one of
@@ -660,7 +660,7 @@ def _ratio_sums(terms, laid, form, shape, axis, over=()):
 
 
 def _ratio_holds(params, operands, result, fmt):
-    """`means.ratio_p`'s contract (its compensated sum's bound, `means`'s account): each element of the
+    """`ratios.ratio_p`'s contract (its compensated sum's bound, `means`'s account): each element of the
     ratio `R = N / D` of its operands as read and its factors as formed (`_ratio_factor`), exact, within
     `u |R| + u gamma_(n(f+3)+4) (sum |N's terms| + |R| sum |D's terms|) / |D|` (`n` its summands, `f` a term's
     most factors: each term a double float within `(f+3) u^2` of itself, their sum compensated, the quotient's
@@ -736,7 +736,7 @@ def _ratio_holds(params, operands, result, fmt):
 
 
 def _products_hold(form, laid, shape, result, fmt):
-    """`_ratio_holds` of a numerator of products of sums (`means.Ratio.products`), `R = sum_t c_t prod_j
+    """`_ratio_holds` of a numerator of products of sums (`ratios.Ratio.products`), `R = sum_t c_t prod_j
     S_tj / D^q`: each sum exactly (`_ratio_sums`) and within `E_j = u gamma_(n(f+3)+4) sum |its terms|` of
     its compensated value (the classic numerator's bound, sum by sum), each product of them within
     `|c| (prod_j (|S_j| + E_j) - prod_j |S_j|)` of its exact one beside its double floats' products'
@@ -836,7 +836,7 @@ def _landed_hold(result, quotients, slack, undefined, none, fmt) -> np.ndarray:
             holds[place] = math.isnan(got)
             continue
         if got == 0 and math.copysign(1.0, got) < 0:
-            # A ratio lands a zero as +0 (`means.Ratio`), whatever sign its exact value has.
+            # A ratio lands a zero as +0 (`ratios.Ratio`), whatever sign its exact value has.
             continue
         if none[place]:
             holds[place] = got == 0
@@ -1141,7 +1141,7 @@ def _integer_power(params, operands, result, fmt):
         powered = _wrapping(lambda a: a ** abs(power))
         return _bits(result) == _bits(powered(result, value))
     read = _read(value, lane().flushes)
-    lost = _underflow(fmt)
+    lost = underflow(fmt, lane().flushes)
     # A zero's or a non-finite value's power is exact in float64; each distinct finite magnitude's ends
     # once (`_power_ends`).
     with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
@@ -1164,15 +1164,15 @@ def _keyed(value) -> bool:
     return dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
 
 
-def _underflow(fmt: Format) -> float:
-    """What one rounding loses below `fmt`'s normal range: its least normal where the lane flushes, else
+def underflow(fmt: Format, flushes: bool) -> float:
+    """What one rounding loses below `fmt`'s normal range: its least normal where the lane `flushes`, else
     half its least subnormal."""
-    return 2.0 ** fmt.emin if lane().flushes else 2.0 ** (fmt.emin - fmt.precision)
+    return 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
 
 
 def _pair_held(params, operands, results, fmt) -> list[np.ndarray]:
     """A compensated sum's `(hi, lo)` pairs (`compensated_add`'s reduction of `(values, residuals)`): `hi +
-    lo` within 5u²·n·Σ|terms| of the terms' exact sum, plus what underflow loses (8n of `_underflow`), and
+    lo` within 5u²·n·Σ|terms| of the terms' exact sum, plus what underflow loses (8n of `underflow`), and
     `lo` within a rounding of `hi`. Each combine's TwoSums are exact and its residuals' two additions
     round (Ogita, Rump and Oishi, Accurate Sum and Dot Product, 2005, §4: an error of at most
     2.01u(|d| + |l1| + |l2|) ≤ 4.03u²(|h1| + |h2|) a combine), at most n combines on a term's path. A
@@ -1193,7 +1193,7 @@ def _pair_held(params, operands, results, fmt) -> list[np.ndarray]:
     count = terms.shape[-1] // 2
     high, low = (np.asarray(value, np.float64) for value in results)
     exact, magnitude = exact_sum(terms, -1), magnitude_sum(terms, -1)
-    u, lost = fmt.unit_roundoff, _underflow(fmt)
+    u, lost = fmt.unit_roundoff, underflow(fmt, lane().flushes)
     bound = 5 * u * u * count * magnitude + 8 * count * lost + 2.0 ** -52 * (np.abs(high) + np.abs(exact))
     one_signed = np.maximum(exact_sum(np.maximum(terms, 0), -1), exact_sum(np.maximum(-terms, 0), -1))
     overflows = ~np.all(np.isfinite(terms), -1) | (one_signed * (1 - gamma(2 * count, fmt)) >= fmt.overflow)
@@ -1210,7 +1210,7 @@ def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     within its bound of the exact Σ s_j e^(x_j - M): a term's path through at most n combines, each a
     subtraction of maxima (its error in the exponent, u|m - M|, summing along the path to at most
     u(M - x_j)), an exponential (the lane's reach for it, `lane`, relative r), a product and a sum, so the
-    term within e^(u(M - x_j) + n(r + 3u)) - 1 of itself, plus what underflow loses (4n of `_underflow`).
+    term within e^(u(M - x_j) + n(r + 3u)) - 1 of itself, plus what underflow loses (4n of `underflow`).
     A row of a NaN may hold any sums; a row whose maximum is -inf keeps its sums as they are, summed
     (γ_n). Its initial values are one more term of every row, its maximum's column the least of the
     columns holding the maximum, as the combine keeps the lesser on a tie."""
@@ -1227,7 +1227,7 @@ def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     peak = np.max(logits, -1)
     held = [_same(np.asarray(results[0], np.float64), peak)]
     nan = np.any(np.isnan(logits), -1)
-    u, lost = fmt.unit_roundoff, _underflow(fmt)
+    u, lost = fmt.unit_roundoff, underflow(fmt, lane().flushes)
     reach = 2 * u * lane().reach[jax.lax.exp_p, fmt.name]
     empty = peak == -np.inf
     with np.errstate(invalid="ignore", over="ignore"):
@@ -1253,15 +1253,15 @@ def _reductions() -> dict:
     together. A `reduce` equation carries the combine it was given (its `computation`, the function its
     owner handed `jax.lax.reduce`), and each of these owners hands a function of its module: the
     compensated pair sum (`dew.nn.precision.compensated_add`, and the renormalization a compensated
-    reduction combines its pairs by, `_renormalized`, its values read as one before it) and a row's online
+    reduction combines its pairs by, `renormalized_add`, its values read as one before it) and a row's online
     softmax with and without its maximum's column (`dew.objectives.lm.chunked`). A reduction is one of
     these where its combine is that function, whatever its traced program prints as."""
-    from dew.nn.precision import _renormalized, compensated_add
+    from dew.nn.precision import compensated_add, renormalized_add
     from dew.objectives.lm import chunked
 
-    # `_renormalized` is `compensated_add`'s arithmetic step for step (the his' TwoSum, then the total's
+    # `renormalized_add` is `compensated_add`'s arithmetic step for step (the his' TwoSum, then the total's
     # with the drop and both los summed), its operands read alike, so its pairs round as the pair sum's.
-    return {compensated_add: _pair_held, _renormalized: _pair_held, chunked._online_softmax: _softmax_held,
+    return {compensated_add: _pair_held, renormalized_add: _pair_held, chunked._online_softmax: _softmax_held,
             chunked._online_softmax_predicted: _softmax_held}
 
 
@@ -1813,7 +1813,7 @@ CONTRACTS = {
     jax.lax.square_p: _rounding(jax.lax.square_p, _wrapping(lambda a: a * a)),
     jax.lax.div_p: _rounding(jax.lax.div_p, _truncated),
     correctly_rounded_divide_p: _correctly_divided,
-    means.ratio_p: _ratio_holds,
+    ratios.ratio_p: _ratio_holds,
     # A float's significand and exponent (`scaled.split_p`), a value's alone: each result exact, bit for bit.
     scaled.split_p: _moved(lambda params, x, index: _split_part(x, int(index))),
     # A remainder (C's, the dividend's sign) is exact in IEEE arithmetic and in integers, and a sign is a

@@ -22,7 +22,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
 from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref, vector as mgpu_vector
 
-from dew.nn.kernels.templates import across, rings, stores, swizzling
+from dew.nn.kernels.templates import across, cost, emission, rings, stores, swizzling
 
 
 @dataclasses.dataclass(frozen=True)
@@ -36,7 +36,8 @@ class Ring(rings.Ring):
     of products); CUTLASS's sm90 gather is the producer warps' cp.async too."""
 
     def initialized(self) -> None:
-        plgpu.inline_mgpu(arg_types=(plgpu.RefType(),))(Initialized(self.stages))(self.full)
+        plgpu.inline_mgpu(arg_types=(plgpu.RefType(),))(
+            emission.stating(lambda *_: cost.Work())(Initialized(self.stages)))(self.full)
 
     def viewed(self, view: tuple, step):
         ref, index_map = view
@@ -56,13 +57,17 @@ class Ring(rings.Ring):
         swizzle = swizzling.swizzle_transforms(tokens.dtype, bytes_)
         copies = functools.partial(gathered_copies, swizzle=bytes_)
         refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(swizzle), plgpu.RefType())
-        plgpu.inline_mgpu(arg_types=refs)(lambda ctx, *refs: copies(*refs))(
+        plgpu.inline_mgpu(arg_types=refs)(
+            emission.stating(lambda _src, table, smem, _bar: cost.Work(
+                device_bytes=cost.stored(smem, table), shared_bytes=cost.stored(smem)))(
+                    lambda ctx, *refs: copies(*refs)))(
             source, rows.table.at[pl.ds(rows.start, height)], self.smem.at[slot],
             self.full.at[pl.ds(slot, 1)])
 
     def acquire(self, turn: rings.Turn):
         slot = rings.opaque(turn.slot)
-        plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.Layout.WG_SPLAT(())))(Waited())(
+        plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.Layout.WG_SPLAT(())))(
+            emission.stating(lambda *_: cost.Work())(Waited()))(
             self.full.at[pl.ds(slot, 1)], jnp.asarray(turn.rotation, jnp.int32))
         return self.smem.at[slot]
 
@@ -125,7 +130,9 @@ class Committed(Ring):
         height, _ = self.block
         splat = plgpu.Layout.WG_SPLAT(())
         plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), splat, splat))(
-            Started(self.share, rows.tiled))(self.entries, rows.table.at[pl.ds(rows.start, height)],
+            emission.stating(lambda _entries, table, *_: cost.Work(
+                device_bytes=cost.stored(table), shared_bytes=cost.stored(table)))(
+                    Started(self.share, rows.tiled)))(self.entries, rows.table.at[pl.ds(rows.start, height)],
                                              jnp.asarray(ahead.parity, jnp.int32),
                                              jnp.asarray(ahead.held, jnp.int32))
 
@@ -138,7 +145,8 @@ class Committed(Ring):
         pending = [jnp.asarray(not view[1].tiled, jnp.bool_) | (jnp.asarray(ahead.held, jnp.int32) == 0)
                    for view, ahead in steps]
         needed = functools.reduce(jnp.logical_or, pending).astype(jnp.int32)
-        plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT(()),))(Drained(self.share))(needed)
+        plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT(()),))(
+            emission.stating(lambda *_: cost.Work())(Drained(self.share)))(needed)
 
     def load(self, turn: rings.Turn, view, ahead: rings.Ahead | None = None) -> None:
         slot = rings.opaque(turn.slot)
@@ -156,7 +164,10 @@ class Committed(Ring):
             # This step's entries where its await left them (`awaited`): the step's parity (`Ahead.parity`).
             operands += (self.entries, jnp.asarray(ahead.parity, jnp.int32))
             refs += (plgpu.RefType(), splat)
-        plgpu.inline_mgpu(arg_types=refs)(Gathers(bytes_, self.share, ahead is not None))(*operands)
+        plgpu.inline_mgpu(arg_types=refs)(
+            emission.stating(lambda _tok, _tbl, smem, *_: cost.Work(
+                device_bytes=cost.stored(smem), shared_bytes=cost.stored(smem)))(
+                    Gathers(bytes_, self.share, ahead is not None)))(*operands)
         if ahead is not None:
             @pl.when(ahead.live)
             def _():
@@ -166,7 +177,9 @@ class Committed(Ring):
                 _, following = ahead.view()
                 next_rows = following.table.at[pl.ds(following.start, height)]
                 plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), splat))(
-                    Filled(self.share))(self.entries, next_rows,
+                    emission.stating(lambda _entries, table, *_: cost.Work(
+                        device_bytes=cost.stored(table), shared_bytes=cost.stored(table)))(
+                            Filled(self.share)))(self.entries, next_rows,
                                                 1 - jnp.asarray(ahead.parity, jnp.int32))
 
     def release(self, turn: rings.Turn) -> None:
@@ -544,7 +557,10 @@ def scattered_rows(smem, out: stores.Scattered, row_start, first, stored, column
         del ctx
         _scattered_pieces(smem_ref, table_ref, dest_ref, splat_value(first_value), splat_value(stored_value))
 
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), plgpu.RefType(), scalar, scalar))(pieces)(
+    plgpu.inline_mgpu(
+        arg_types=(plgpu.RefType(), plgpu.RefType(), plgpu.RefType(), scalar, scalar))(
+            emission.stating(lambda smem, table, *_: cost.Work(
+                device_bytes=cost.stored(smem, table), shared_bytes=cost.stored(smem)))(pieces))(
         smem, table, dest, jnp.asarray(first, jnp.int32), jnp.asarray(stored, jnp.int32))
 
 

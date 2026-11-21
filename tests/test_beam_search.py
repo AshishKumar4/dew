@@ -288,8 +288,9 @@ def test_a_renormalized_biased_search_is_transformers(name):
     np.testing.assert_array_equal(np.asarray(found.terminated), ended.any(-1))
 
 
+@pytest.mark.parametrize("store", ["resident", "offloaded bank"])
 @pytest.mark.parametrize("page_size", [2, 4])
-def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(model, page_size):
+def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(model, page_size, store):
     """A beam search over a model that declares an undivided paged pool (`KVCache(page_size=...)`) keeps
     its pages (`regrouped_layout`), each regrouped row sharing its parent's written pages: two prompts of
     five tokens, whose whole pages every beam of the prompt reads and whose part page the first child
@@ -297,12 +298,15 @@ def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(mode
     tokens, lengths and scores bit for bit (row 8034), the paged decode reading its gathered rows through
     the layer's attention (`paged_decode='gathered'`), the dense cache's arithmetic (a paged kernel's own
     is held to it by its cells); and the pool holds fewer slots than the dense cache's rows, by the
-    prompts' whole pages its beams share."""
+    prompts' whole pages its beams share. So does one over scanned layers whose pool lies in host memory
+    (`KVCache.offloaded`), each layer's regrouped pages copied a page at a time out of its bank (row
+    8509)."""
     # Rows long enough that a beam's own pages leave the prompt's shared ones to save.
-    decoder = model[0].clone(max_seq_len=24)
+    banked = store == "offloaded bank"
+    decoder = model[0].clone(max_seq_len=24, scan_layers=banked)
     params = nn.unbox(decoder.init(jax.random.key(0), jnp.ones((1, 3), jnp.int32)))
     prompts = jnp.asarray([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]], jnp.int32)
-    layout = KVCache(page_size=page_size)
+    layout = KVCache(page_size=page_size, offloaded=banked)
     # The paged decode reads its gathered rows through the layer's attention, the dense cache's arithmetic,
     # so its scores are the dense search's bit for bit wherever it runs.
     with generation.chosen(paged_decode="gathered"):

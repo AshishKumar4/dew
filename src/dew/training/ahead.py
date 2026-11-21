@@ -21,12 +21,15 @@ A configured run does both ends: `--trainer.compile-ahead.generation sm90 --trai
 (`AheadTarget`), and `--trainer.ahead step.dew-aot` on a host of that topology runs it in place of
 compiling its first step, where it is the very program the run compiles first (`AheadOfTime.taken`).
 
-A run's plan is the fewest microbatches at the least recomputation that fit, which memory decides; which
+A run's plan is the fewest microbatches that fit at the first rung its search admits (the remat rungs at
+its own head first, a tight cold start's second compile: docs/design/training.md), which memory decides; which
 plan steps fastest, a rung that recomputes more at fewer microbatches or the plan's own, the GPUs alone
 tell. `--trainer.compile-ahead.frontier`, with each GPU's memory stated, lists past the plan each rung
 above it that fits at fewer microbatches than every plan before it, at the fewest that fit there, and,
 where the ladder's top ('full') is reached, its sibling that offloads the residuals 'minimal' saves
-('minimal_offloaded') at the same split (`compile_ahead`'s `frontier`, `FitSearch.above`);
+('minimal_offloaded') at the same split (`compile_ahead`'s `frontier`, `FitSearch.above`), and below the
+plan each lighter rung the run's remat-first search passed over that fits, at the coarsest split it fits at
+(the plan's `lighter`, `FitSearch.below`: a head's tile, XLA's defaults or no copies at less recomputation);
 tools/benchmark_step.py times each on the GPUs, a case at its remat and head tile, a plan of s
 microbatches as its microbatch's rows accumulated s times (`accumulation`), the time it reports a
 microbatch's, s of them an update; and the run names the fastest by its model's remat, `--trainer.split`
@@ -166,8 +169,9 @@ def host_gpus(generation: str, topology: str | Path, count: int, share: float = 
     attached: XLA compiles over them as over that host's GPUs, the SKU's memory, clocks and multiprocessors
     its own, so a program compiled here keys the persistent cache as that host's compile of it does (its
     backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
-    canonical target (`compile_only_gpus`) keys another entry: the 80 GB A100 it names against a 40 GB
-    host's. Each is admitted at `share`, the pool's share in the host's run (`StatedGpu`)."""
+    canonical target (`compile_only_gpus`) keys another entry: the least memory of the generation's parts
+    it states (an A100's 40 GB, `GpuTarget.memory`) against an 80 GB host's. Each is admitted at `share`,
+    the pool's share in the host's run (`StatedGpu`)."""
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
@@ -606,6 +610,10 @@ class BuildTarget:
     libraries: tuple[tuple[str, int | None], ...] = ()
     """The cuBLAS and cuDNN versions the compile loaded (`dew._cache.cuda_libraries`), None for one it
     could not load, which then wrote none of its state; empty for a target of no CUDA GPU."""
+    chips: str | None = None
+    """A TPU target's physical layout (`tpu_chips`): each device's chip coordinates and core, which a TPU's
+    executable is partitioned over, so a build for a 2x2 slice is refused on a 1x4 one of as many chips of
+    its kind (row 9064). None for a GPU's or a CPU's, and for a build that recorded none."""
     topology: str | None = None
     """The digest of the GPU topology the programs were compiled over (`dew._cache.topology_digest`): a
     host's own GPUs as a file serialized them (`host_gpus`), None for a generation's canonical ones
@@ -616,7 +624,7 @@ class BuildTarget:
 
     @staticmethod
     def built(target: GpuTarget, devices: int, memory: int | None = None, *,
-              topology: bytes | None = None) -> BuildTarget:
+              topology: bytes | None = None, chips: str | None = None) -> BuildTarget:
         """The build for `devices` devices of the GPU `target` (its generation and multiprocessors), each
         holding the `memory` its plan states, over the serialized `topology` of a host's own GPUs where it
         was given one, under this process's JAX, jaxlib, computing XLA flags and host, and for a CUDA GPU
@@ -627,7 +635,7 @@ class BuildTarget:
                            importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
                            computation_flags(), platform.machine(), memory,
                            plugin=plugin_builds() if cuda else "", libraries=cuda_libraries() if cuda else (),
-                           topology=None if topology is None else topology_digest(topology))
+                           topology=None if topology is None else topology_digest(topology), chips=chips)
 
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
@@ -644,7 +652,7 @@ class BuildTarget:
                   if (limit := device_memory(device).get("bytes_limit")) is not None]
         own = device_target(devices[0])
         # No topology: the attached GPUs' serialization differs call to call (`topology`).
-        built = BuildTarget.built(own, len(devices), min(limits, default=None))
+        built = BuildTarget.built(own, len(devices), min(limits, default=None), chips=tpu_chips(devices))
         # A CPU's program is its host's code (`cpu`).
         return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
@@ -654,7 +662,7 @@ class BuildTarget:
         where this build loaded it and other's version is another (a build that loaded none wrote none of
         its state), and never the topology, which names the compile and binds no loader."""
         named = [field.name for field in dataclasses.fields(self)
-                 if field.name not in ("memory", "topology", "libraries")]
+                 if field.name not in ("memory", "topology", "libraries", "chips")]
         found = [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
                  if getattr(self, name) != getattr(other, name)]
         theirs = dict(other.libraries)
@@ -662,6 +670,8 @@ class BuildTarget:
                   if version is not None and theirs.get(name) != version]
         if self.memory is not None and other.memory is not None and other.memory < self.memory:
             found.append(f"memory {self.memory} bytes, not {other.memory}")
+        if self.chips is not None and other.chips != self.chips:
+            found.append(f"TPU chips {self.chips}, not {other.chips}")
         return found
 
     def own_devices(self) -> list:
@@ -676,6 +686,16 @@ class BuildTarget:
         if differences := self.differences(BuildTarget.of(devices)):
             raise ValueError(f"these programs were compiled for another target than this process's: "
                              f"{'; '.join(differences)}")
+
+
+def tpu_chips(devices: Sequence) -> str | None:
+    """`devices`' physical layout where they are TPUs: each device's chip coordinates and its core on the
+    chip, in order, as one string a record holds as it is; None for any other platform."""
+    if not devices or devices[0].platform != "tpu":
+        return None
+    return ";".join(f"{','.join(map(str, device.coords))}:{device.core_on_chip}"
+                    for device in sorted(devices, key=lambda device: (tuple(device.coords),
+                                                                      device.core_on_chip)))
 
 
 def programs_need(device, programs: Iterable[tuple[CompiledMemory | None, int, int]]) -> int | None:
@@ -1102,15 +1122,16 @@ class AheadTarget:
     capacity_gib: float | None = None
     frontier: bool = False
     """Whether the report lists each rung above the plan that fits at fewer microbatches than every plan
-    before it (`compile_ahead`, `FitSearch.above`)."""
+    before it (`compile_ahead`, `FitSearch.above`), and each lighter rung below it that the run's search
+    passed over and that fits (`lighter`, `FitSearch.below`)."""
     multiprocessors: int | None = None
     """The multiprocessors of the GPU of `generation` it compiles for (an H100 PCIe's 114, an L40S's 142),
     where it is not the generation's own (`built_target`): what the step's launches derive for and a GPU
     loading it must have (`BuildTarget`). A TPU topology states its own."""
     topology: str | None = None
-    """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole:
-    their memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A dew-ops
-    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
+    """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole: their
+    memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A GPU node's prepare
+    is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
     phases: tuple[int, ...] = ()
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
@@ -1485,7 +1506,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     again. Its batch is what `fit` hands to its step (`step_batch`), its fresh state abstract, and
     tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
     time the search took, and with `frontier` each rung above it that fits at fewer microbatches than
-    every plan before it (`FitSearch.above`), compiled and not saved: the plans a run's speed is chosen
+    every plan before it (`FitSearch.above`) and each lighter rung below it its search passed over that fits
+    (`lighter`, `FitSearch.below`), compiled and not saved: the plans a run's speed is chosen
     among (the module's docstring). With `fit`, what the run's `Trainer.fit` over `batch` is asked for, its
     evaluations' programs compile with its start's (`started`). The GPUs' memory is the one their
     compile-only devices carry (`compile_only_gpus`' `memory`, a host topology's own), the plan made against
@@ -1642,7 +1664,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         temp_bytes=memory.temp, code_bytes=memory.generated_code, live_bytes=memory.live, plan=trainer.plan,
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
-        built=BuildTarget.built(target, len(devices), need, topology=topology),
+        built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices)),
         refusals=report.refused_launches(), sampled=sampled, counts=counts,
         at_run=any(report.left_at_run(each) for each in held),
         starts={digest: Executable.of(executable) for digest, executable in starts.items()})

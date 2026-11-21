@@ -18,8 +18,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_arithmetic import drawn_on_the_host
 from interop_support import gemma_features
-from reference_error import as_given, assert_as_exact
+from reference_error import ahead_arm, as_given, assert_as_exact
 from safetensors.numpy import load_file
 
 from dew.interop.towers.audio import audio_config, audio_weight_path, audio_weights
@@ -49,6 +50,12 @@ def _audio(kind):
                                           precision=jax.lax.Precision.HIGHEST)
         projector_variables = {"params": translate_gemma4_projector_weights(tensors)[0]}
     return path, config, variables, model, projector, projector_variables
+
+
+def audio_on_host(kind):
+    """`_audio(kind)` built on the host's CPU (`drawn_on_the_host`): a GPU tier part's prepare computes
+    nothing on its GPU, where loading the weights there went unprepared (row 8074)."""
+    return drawn_on_the_host(_audio, kind)
 
 
 @pytest.fixture(params=("gemma3n", "gemma4"), scope="module")
@@ -220,9 +227,11 @@ def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
         return model.apply(variables, features,
                            jnp.arange(features.shape[1])[None, :] < lengths[:, None])
 
-    lengths = jnp.asarray(data["input_features_mask"].sum(1, dtype=np.int32))
-    encoded = encode(variables, jnp.asarray(data["input_features"]), lengths)
-    np.testing.assert_array_equal(encoded.mask, data["valid"])
+    lengths = data["input_features_mask"].sum(1, dtype=np.int32)
+    # A program with no check-1 site, prepared as an arm is in a GPU tier part (`ahead_arm`), its mask judged
+    # after the site below: a prepare's arm gives zeros.
+    mask = ahead_arm(jax.jit(lambda variables, features, lengths: encode(variables, features, lengths).mask),
+                     f"the {kind} encoder's mask")(variables, np.asarray(data["input_features"]), lengths)
 
     ref_cfg = reference_config(kind)
     if not is_3n:
@@ -240,8 +249,8 @@ def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
     # draw's by the same check.
     @jax.jit
     def ours(drawn):
-        return (encode(variables, drawn, lengths).features,
-                encode(variables, jnp.asarray(fixture_features), lengths).features)
+        return (encode(variables, drawn, jnp.asarray(lengths)).features,
+                encode(variables, jnp.asarray(fixture_features), jnp.asarray(lengths)).features)
 
     def ref_arm(tower, dtype, ctx):
         def one(features):
@@ -262,6 +271,7 @@ def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
     wide_fn = ref_arm(wide, torch.float64, widened)
     assert_as_exact(ours, narrow_fn, draw, f"{kind} in-jit audio mask encoder", seeds=AUDIO_JIT_SEEDS,
                     truth_fn=wide_fn)
+    np.testing.assert_array_equal(mask, data["valid"])
 
 
 def test_audio_input_gradients_and_sgd_step_match_reference(audio):

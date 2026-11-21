@@ -109,6 +109,63 @@ reader.close()
     assert reported == {"refused": "TOMLDecodeError", "cached": "cached bytes", "ids": list(range(8))}
 
 
+def test_the_data_layer_registers_its_cache_protocol_without_importing_storage_and_over_another():
+    """Importing dew.data registers `dewcache::` by its class's name and imports no storage module, which a
+    URL naming the protocol imports; where another class was registered under the name first, Dew's takes
+    its place."""
+    script = r"""
+import json, sys
+import fsspec
+from fsspec.implementations.memory import MemoryFileSystem
+if sys.argv[1] == "before":
+    fsspec.register_implementation("dewcache", MemoryFileSystem, clobber=True)
+import dew.data
+imported = "dew.data.storage" in sys.modules
+print(json.dumps({"storage": imported, "class": fsspec.get_filesystem_class("dewcache").__name__}))
+"""
+
+    def run(order: str) -> dict:
+        result = subprocess.run([sys.executable, "-c", script, order], capture_output=True, text=True,
+                                timeout=300, env={**os.environ, "PYTHONPATH": str(SOURCE),
+                                                  "JAX_PLATFORMS": "cpu"})
+        assert result.returncode == 0, result.stderr[-2000:]
+        return json.loads(result.stdout.splitlines()[-1])
+
+    assert run("none") == {"storage": False, "class": "BoundedFileCache"}
+    assert run("before") == {"storage": True, "class": "BoundedFileCache"}
+
+
+def test_a_chain_that_packs_nothing_compiles_and_reads_importing_no_packer(tmp_path):
+    """A chain that packs nothing, read from its store and from a generation it published, compiles and
+    reads without importing the packer or its placements, whose changes then reach none of its tests (the
+    test cache keys the modules a test imports)."""
+    script = r"""
+import json, sys
+import numpy as np
+from dew.data.cache import Cache
+from dew.data.compile import publish, validation
+from dew.data.dataset import DataPartition, Loading
+from dew.data.pipeline import Pipeline
+from dew.data.sources import Memory
+loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+prefix = Pipeline(Memory([{"id": np.int32(i)} for i in range(8)]))
+generation = publish(prefix, Cache(sys.argv[1]), read="indexed", loading=loading)
+read = []
+# One pass each, in order (a validation read's).
+for chain in (prefix, prefix.cache(generation)):
+    reader = validation(chain, batch=2, read="indexed", loading=loading)(DataPartition())
+    read.append(sorted(int(value) for batch in reader for value in batch["id"]))
+    reader.close()
+print(json.dumps({"read": read, "imported": sorted(name for name in ("dew.data.packing", "dew.data.placement")
+                                                   if name in sys.modules)}))
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path / "cache")], capture_output=True,
+                            text=True, timeout=600, env={**os.environ, "PYTHONPATH": str(SOURCE),
+                                                         "JAX_PLATFORMS": "cpu"})
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert json.loads(result.stdout.splitlines()[-1]) == {"read": [list(range(8))] * 2, "imported": []}
+
+
 @pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])
 def test_a_config_or_a_package_imports_no_trainer_until_a_run_trains(module):
     """A run's configuration reads its dataclasses' types and none of the trainer, which a run reads
@@ -198,6 +255,12 @@ FOREIGN |= dict.fromkeys(
      "dew.nn.kv_cache"),
     _ATTENTION_MAINLOOPS,
 )
+
+
+# The bundles a GPU launch composes load no TPU toolkit: Mosaic TPU's bundle loads where a TPU launch composes
+# it, so a TPU template's edit re-keys none of the GPU and CPU tests that compose a GPU bundle (2,592 of them
+# in train 1126's cache keys).
+FOREIGN |= {"dew.nn.kernels.templates.bundles": ("dew.nn.kernels.templates.mosaic_tpu",)}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))

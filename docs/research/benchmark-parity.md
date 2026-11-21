@@ -2,21 +2,21 @@
 
 ## Result
 
-Dew is not running at 1.6% utilization on the small UNet. The counter is wrong for that executable. The optimized HLO contains 646.39 GFLOP per step. XLA `cost_analysis()` reports 28.73 GFLOP. It omits 623.43 GFLOP in 131 cuDNN convolution calls. The matched step takes 16.32 ms. That is 39.6 analytic TFLOP/s, or 40.6% of Dew's 97.5 TFLOP/s denominator. Evidence: `/tmp/benchmark-parity/audit/unet_b16.rows.json` and `/tmp/benchmark-parity/jax_results.json`.
+Dew is not running at 1.6% utilization on the small UNet. The counter is wrong for that executable. The optimized HLO contains 646.39 GFLOP per step. XLA `cost_analysis()` reports 28.73 GFLOP. It omits 623.43 GFLOP in 131 cuDNN convolution calls. The matched step takes 16.32 ms. That is 39.6 analytic TFLOP/s, or 40.6% of Dew's 97.5 TFLOP/s denominator.
 
-The same counter error affects the small language model. The optimized HLO contains 3.406 TFLOP per step. XLA reports 1.436 TFLOP in the audit compile. It omits 1.986 TFLOP in six cuBLAS custom calls. Three of those calls are the tied vocabulary head and its two gradients. Evidence: `/tmp/benchmark-parity/audit/causal_transformer_b16.rows.json`.
+The same counter error affects the small language model. The optimized HLO contains 3.406 TFLOP per step. XLA reports 1.436 TFLOP in the audit compile. It omits 1.986 TFLOP in six cuBLAS custom calls. Three of those calls are the tied vocabulary head and its two gradients.
 
-`simple_dit` is the control. Its HLO contains 292.95 GFLOP. `cost_analysis()` reports 296.89 GFLOP in the audit compile. The difference is the compiler's elementwise accounting. There is no large missing custom-call term. Evidence: `/tmp/benchmark-parity/audit/simple_dit_b16.rows.json`.
+`simple_dit` is the control. Its HLO contains 292.95 GFLOP. `cost_analysis()` reports 296.89 GFLOP in the audit compile. The difference is the compiler's elementwise accounting. There is no large missing custom-call term.
 
 Against a matched PyTorch port, Dew is close on every case and ahead on three. Dew is 1.04x the best PyTorch UNet row (16.32 ms against 16.96 ms with `max-autotune`), 1.16x on the small DiT with fused attention (6.89 ms against 7.96 ms), 1.08x on the large DiT (72.34 ms against 78.31 ms), 0.95x on the small language model (75.70 ms against 72.18 ms), and 0.99x on the large language model (146.90 ms against 145.25 ms).
 
-The small cases are not host-dispatch bound on this machine. The profiler found GPU-busy fractions of 97.3% for UNet, 99.1% for `simple_dit`, and 100.0% for the causal transformer. The many small kernels still matter. They do not leave enough idle time to explain the reported utilization. Evidence: `/tmp/benchmark-parity/traces/*/plugins/profile/*xplane.pb` and the parsed profiles in `/tmp/benchmark-parity/jax_results.json`.
+The small cases are not host-dispatch bound on this machine. The profiler found GPU-busy fractions of 97.3% for UNet, 99.1% for `simple_dit`, and 100.0% for the causal transformer. The many small kernels still matter. They do not leave enough idle time to explain the reported utilization.
 
 ## Scope and fixed point
 
-The measurements were taken at Dew commit `5f8ff5d`. The repository moved to `3386f6e` while this ran; that range touches only `README.md`, `CONTRIBUTING.md`, `docs/index.md`, `docs/research/domain.md` and a workflow file, so no benchmarked code changed. The machine has one NVIDIA GeForce RTX 4080 16 GiB and driver 595.84. The JAX environment is Python 3.12.13, JAX and jaxlib 0.11.1, Flax 0.12.9, Optax 0.2.8, cuBLAS 12.9.2.10, and cuDNN 9.25.1.1. The PyTorch environment is `/tmp/torchbench`, Python 3.12.13, PyTorch 2.11.0+cu128, CUDA 12.8, and cuDNN 9.19.0. Version commands and output are in `/tmp/benchmark-parity/versions.txt`.
+The measurements were taken at Dew commit `5f8ff5d`. The repository moved to `3386f6e` while this ran; that range touches only `README.md`, `CONTRIBUTING.md`, `docs/index.md`, `docs/research/domain.md` and a workflow file, so no benchmarked code changed. The machine has one NVIDIA GeForce RTX 4080 16 GiB and driver 595.84. The JAX environment is Python 3.12.13, JAX and jaxlib 0.11.1, Flax 0.12.9, Optax 0.2.8, cuBLAS 12.9.2.10, and cuDNN 9.25.1.1. The PyTorch environment is a separate virtual environment, Python 3.12.13, PyTorch 2.11.0+cu128, CUDA 12.8, and cuDNN 9.19.0.
 
-All GPU runs started only when `nvidia-smi --query-compute-apps=pid --format=csv,noheader` showed the desktop process, PID 3243, and no training process. Every case ran in a fresh process for peak-memory measurement. The ceiling scripts sampled SM clock, board power, and temperature every 50 ms with `nvidia-smi`. Raw rows are in `/tmp/benchmark-parity/ceilings_jax.json` and `/tmp/benchmark-parity/ceilings_torch.json`.
+All GPU runs started only when `nvidia-smi --query-compute-apps=pid --format=csv,noheader` showed only the display server and no training process. Every case ran in a fresh process for peak-memory measurement. The ceiling scripts sampled SM clock, board power, and temperature every 50 ms with `nvidia-smi`.
 
 Correction, 2026-09-22: the source links in this note point at line ranges from `5f8ff5d`, and some have moved. `src/dew/training/objective_trainer.py` does not exist any more; the step, EMA and `grad_accum_steps` code the fairness table links to is now in `src/dew/training/trainer.py`. Fixes 4 and 5 below are done: `src/dew/telemetry/instrumentation.py:1-10` reads the step FLOPs off the optimized HLO instead of `cost_analysis()`, and `tools/benchmark_step.py` defaults to 100 steps (`tools/benchmark_step.py:460`) and reports p10/p50/p90 (`tools/benchmark_step.py:817`). Fix 1 is not the default for the causal transformer: its `attention_impl` field defaults to `None` (`src/dew/nn/backbones/causal_transformer.py:1420`), which runs the reference path (`src/dew/nn/attention.py:40`). For fix 3, the chunked head computes token accuracy from a running argmax; see [lm-head.md](lm-head.md).
 
@@ -103,7 +103,7 @@ Summing the forward, input-gradient, and weight-gradient operations gives 623.43
 | SimpleDiT train step | 296.8867 GFLOP | 292.9491 GFLOP | 0.987x | 0.3020 GFLOP in cuDNN calls; XLA also counts elementwise work |
 | causal transformer train step | 1,436.1024 GFLOP | 3,406.4459 GFLOP | 2.372x | 1,985.8855 GFLOP in six cuBLAS calls |
 
-The full-step XLA value changes across identical recompiles. The compiler sometimes selects a visible Triton dot and sometimes a cuBLAS custom call for the same matmul. The small LM audit compile reports 1.436 TFLOP. Another compile reports 2.069 TFLOP. The analytic HLO sum remains 3.406 TFLOP. This makes the current logged MFU dependent on compiler kernel selection even when the math and runtime are unchanged. Raw splits are in `/tmp/benchmark-parity/jax_results.json`.
+The full-step XLA value changes across identical recompiles. The compiler sometimes selects a visible Triton dot and sometimes a cuBLAS custom call for the same matmul. The small LM audit compile reports 1.436 TFLOP. Another compile reports 2.069 TFLOP. The analytic HLO sum remains 3.406 TFLOP. This makes the current logged MFU dependent on compiler kernel selection even when the math and runtime are unchanged.
 
 JAX's own AOT documentation warns that text and cost-analysis methods are aids for manual inspection, not a stable programmatic API, and that output varies by compiler, platform, and runtime: [JAX AOT documentation](https://docs.jax.dev/en/latest/aot.html).
 
@@ -280,7 +280,7 @@ Direct achieved DRAM bandwidth for a model step is unknown. Nsight Compute retur
 
 ```bash
 ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum \
-  /tmp/torchbench/bin/python tools/benchmark_torch.py ...
+  python tools/benchmark_torch.py ...
 ```
 
 `cost_analysis()['bytes accessed'] / wall time` is not substituted. It is compiler logical traffic. It can exceed 716.8 GB/s because it counts HLO operand traffic before cache reuse and fusion. The measured streaming ceiling is 610 GB/s, or 85.1% of 716.8 GB/s.
@@ -334,39 +334,19 @@ The two harnesses differ in one respect. Dew's bf16-head ablation still writes f
 
 ## Reproduction
 
-The retained harness is `/tmp/benchmark-parity`, a link to disk-backed storage. No repository source file is modified by the JAX audit harness.
+The FLOP audit, the card ceilings and the fixed-input JAX rows came from a harness outside the repository; it is not reproduced here. The PyTorch rows reproduce from the checkout, each case in its own process, with PyTorch installed in an environment of its own (`torch-python` below). Dew's environment writes each case's count first.
 
 ```bash
-# Environment and idle check, from the checkout
-nvidia-smi --query-compute-apps=pid --format=csv,noheader
-.venv/bin/python -c 'import jax,jaxlib,flax,optax; print(jax.__version__,jaxlib.__version__,flax.__version__,optax.__version__,jax.devices())'
-/tmp/torchbench/bin/python -c 'import torch; print(torch.__version__,torch.version.cuda,torch.backends.cudnn.version(),torch.cuda.get_device_name())'
-
-# FLOP audit and HLO dumps
-.venv/bin/python /tmp/benchmark-parity/audit_flops.py --probes
-.venv/bin/python /tmp/benchmark-parity/audit_flops.py --arch unet simple_dit causal_transformer --steps 10
-
-# Card ceilings
-.venv/bin/python /tmp/benchmark-parity/ceilings_jax.py
-/tmp/torchbench/bin/python /tmp/benchmark-parity/ceilings_torch.py
-
-# Fair fixed-input JAX rows
-.venv/bin/python /tmp/benchmark-parity/dew_bench.py --arch simple_dit \
-  --fixed-batch --fixed-rng --attention reference --warmup 20 --steps 100 --profile
-.venv/bin/python /tmp/benchmark-parity/dew_bench.py --arch causal_transformer \
-  --fixed-batch --attention cudnn --warmup 20 --steps 100 --profile
-
-# PyTorch rows. Use one process per case. Dew's environment writes each case's count first.
 PYTHONPATH=src JAX_PLATFORMS=cpu .venv/bin/python tools/reference_runs/work.py case \
-  --model simple_dit --out /tmp/benchmark-parity/dit-small.json
+  --model simple_dit --out dit-small.json
 PYTHONPATH=src JAX_PLATFORMS=cpu .venv/bin/python tools/reference_runs/work.py case \
-  --model causal_transformer --out /tmp/benchmark-parity/lm-small.json
-/tmp/torchbench/bin/python tools/benchmark_torch.py --model simple_dit \
+  --model causal_transformer --out lm-small.json
+torch-python tools/benchmark_torch.py --model simple_dit \
   --mode compile --attention reference --warmup 20 --steps 100 --profile \
-  --work /tmp/benchmark-parity/dit-small.json
-/tmp/torchbench/bin/python tools/benchmark_torch.py --model causal_transformer \
+  --work dit-small.json
+torch-python tools/benchmark_torch.py --model causal_transformer \
   --mode max-autotune --attention sdpa --sdpa-backend cudnn \
-  --warmup 20 --steps 100 --profile --work /tmp/benchmark-parity/lm-small.json
+  --warmup 20 --steps 100 --profile --work lm-small.json
 ```
 
-JAX profile files are parsed with `jax.profiler.ProfileData`. PyTorch profiles use `torch.profiler`. Both summaries take the union of GPU event intervals for busy time. Raw logs, HLO, profiles, ceiling samples, and JSON rows remain under `/tmp/benchmark-parity`.
+JAX profile files are parsed with `jax.profiler.ProfileData`. PyTorch profiles use `torch.profiler`. Both summaries take the union of GPU event intervals for busy time.

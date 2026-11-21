@@ -15,11 +15,11 @@ where a tangent passed its primal by the format's range and flushed where it fel
 value's, a coefficient's tangent flushed beside the terms it cancels against: the degenerate sweep,
 `tests/test_algebra_scaled_edges.py`), so a law over scaled values states its derivatives as one of its
 own operations whose derivative is that operation again, its tangents its float operands' and its values'
-(`dew.algebra.means.ratio_p`). Its primitives (`split_p`, `applied_p`) carry no derivative rule: a program
+(`dew.algebra.ratios.ratio_p`). Its primitives (`split_p`, `applied_p`) carry no derivative rule: a program
 differentiating one is refused by JAX, never silently differentiated through `frexp`. A subnormal operand
 is read from its bits, its value kept where XLA:CPU's arithmetic flushes it (`scaled`), and a zero is +0:
 no scaled value, nor a float the construct lands (`applied`, `landed`: a flushed landing's too), holds a
-zero's sign, which no law over them reads (a ratio lands its zero +0, `means.Ratio`)."""
+zero's sign, which no law over them reads (a ratio lands its zero +0, `ratios.Ratio`)."""
 
 from __future__ import annotations
 
@@ -153,7 +153,7 @@ def _valued(parameter) -> bool:
         return all(map(_valued, parameter))
     if dataclasses.is_dataclass(parameter):
         # The parameters `dataclasses` kept on the nearest class it made, beside its fields; each field a
-        # value too (a law's form holding the units a call passed, `means.Ratio`).
+        # value too (a law's form holding the units a call passed, `ratios.Ratio`).
         frozen = next(vars(made)["__dataclass_params__"] for made in type(parameter).__mro__
                       if "__dataclass_params__" in vars(made)).frozen
         fields = dataclasses.fields(parameter)
@@ -222,7 +222,7 @@ def primitive(name: str, value: Callable, typed: Callable, batched: Callable | N
     `dew.algebra.means`): computed by `value` (its lowering, and eagerly one dispatch of it, as JAX's own
     primitives run), typed by `typed`, batched by `batched` (entrywise, by broadcasting, where none is
     named), returning `several` values; a derivative and a transpose, where it has them, registered beside
-    it (`means.ratio_p`). Its parameters are values, held at bind (`_Primitive`); it is recorded with its
+    it (`ratios.ratio_p`). Its parameters are values, held at bind (`_Primitive`); it is recorded with its
     value (`MADE`)."""
     made = _Primitive(name)
     made.multiple_results = several

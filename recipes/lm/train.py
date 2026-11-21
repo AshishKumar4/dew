@@ -31,5 +31,11 @@ def default(store: str = "data/shakespeare-byte") -> LMRunConfig:
         presets.token_windows, seq_len=256, batch=32))
 
 
+def main(argv: list[str] | None = None):
+    """Run the recipe on `argv`, the process's own command line where None, and return the run's last
+    state."""
+    return LMRunConfig.cli(argv, default=default()).run()
+
+
 if __name__ == "__main__":
-    LMRunConfig.cli(default=default()).run()
+    main()

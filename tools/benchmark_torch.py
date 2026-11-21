@@ -15,8 +15,8 @@ comparison is between frameworks, not between JAX threefry and PyTorch
 Philox. The measured step is otherwise the whole of the Trainer's train
 step, not a bare forward pass.
 
-Environment: a uv venv at /tmp/torchbench with torch CUDA 12 wheels
-(see the report for the exact versions used). Compiler scratch and caches
+Environment: a uv venv of its own with torch CUDA 12 wheels, its python
+`torch-python` below (see the report for the exact versions used). Compiler scratch and caches
 default to $XDG_CACHE_HOME/dew/torchbench; set TMPDIR,
 TORCHINDUCTOR_CACHE_DIR, or TRITON_CACHE_DIR to override them.
 
@@ -26,11 +26,11 @@ environment writes it once per case, and this venv reads it with --work.
 Run from the dew repo root:
 
     PYTHONPATH=src JAX_PLATFORMS=cpu .venv/bin/python tools/reference_runs/work.py case \
-        --model causal_transformer --size small --out /tmp/lm-small.json
-    /tmp/torchbench/bin/python tools/benchmark_torch.py --model causal_transformer --mode compile \
-        --work /tmp/lm-small.json
-    /tmp/torchbench/bin/python tools/benchmark_torch.py --model unet --mode max-autotune \
-        --work /tmp/unet-small.json --json-out /tmp/out.json
+        --model causal_transformer --size small --out lm-small.json
+    torch-python tools/benchmark_torch.py --model causal_transformer --mode compile \
+        --work lm-small.json
+    torch-python tools/benchmark_torch.py --model unet --mode max-autotune \
+        --work unet-small.json --json-out out.json
 
 Modes: eager, compile (torch.compile default), max-autotune
 (torch.compile mode="max-autotune"), and max-autotune-no-graphs

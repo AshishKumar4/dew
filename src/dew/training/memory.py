@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import AbstractMesh, Mesh, NamedSharding
 
 from dew import communicators
 from dew._devices import allocator_limit, device_memory, fresh_pool, gpu_free_bytes, stated_share, xla_flag
@@ -245,7 +245,7 @@ def split_share(params: Variables) -> float:
 
 
 def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: Batch, variables: Variables,
-                                  mesh: Mesh, gathered: int | None = None
+                                  mesh: Mesh | AbstractMesh, gathered: int | None = None
                                   ) -> jax.stages.CompilerOptions | None:
     """The options a step over microbatches of `micro` on `mesh` compiles with
     (`step_compiler_options`): by the tokens one device steps of a microbatch split over the
@@ -253,7 +253,7 @@ def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: 
     `gathered` bytes (`layer_gathers`)."""
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
-                                 mesh.devices.size, gathered=gathered)
+                                 mesh.size, gathered=gathered)
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:

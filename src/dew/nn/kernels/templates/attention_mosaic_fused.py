@@ -11,10 +11,11 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked, stores
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
+    STATISTICS_STREAM_ORDER as _STREAM_ORDER,
     BackwardTiles,
     TileWalk,
     _coords,
@@ -28,6 +29,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     modelled,
     reducing,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -39,20 +41,19 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
 
 
 def streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                        reduced: int) -> int:
-    """How many of its query tiles' statistics (`STATISTICS`, in order) the fused launch at `config` streams
-    beside them: where its copies move a vector (`Transport.copies_vectors`), the most whose rings its block
-    holds beside its own allocations (the GPU's `shared_limit`, `launch_scope`); a step reads the rest from
-    global memory (`_rows`). FlashAttention 3's 64 x 64 launch on two consumers at width 128 holds two of
-    the five on an H100 (a ring 1,056 bytes, 2,976 free; all five put it past the block and the derivation on
-    one consumer, et-bwdderive, et-fusedbytes). `reduced` the launch's warpgroups reserving reduction scratch
-    (`reducing`: a score hook's)."""
+                        reduced: int, allocations_of: Callable[..., tuple[list, dict]] | None = None) -> int:
+    """How many of its query tiles' statistics (`_STREAM_ORDER`, `peak`/`total`/`delta` first) a fused or
+    shared-keys launch at `config` streams beside them: where its copies move a vector
+    (`Transport.copies_vectors`), the most whose rings its block holds beside its own allocations
+    (`allocations_of`, defaulting to `_fused_allocations`, against the GPU's `shared_limit`, `launch_scope`);
+    a step reads the rest from global memory (`_rows`). `reduced` the launch's warpgroups reserving reduction
+    scratch (`reducing`: a score hook's)."""
     if not family.copies_vectors:
         return 0
     limit = generation.gpu_target().shared_limit
-    for count in range(len(STATISTICS), 0, -1):
-        allocations = _fused_allocations(family, config, width, dtype, stages, streamed=count,
-                                         reduced=reduced)
+    allocator = _fused_allocations if allocations_of is None else allocations_of
+    for count in range(len(_STREAM_ORDER), 0, -1):
+        allocations = allocator(family, config, width, dtype, stages, streamed=count, reduced=reduced)
         if limit is None or resources.shared_bytes(
                 family, launch_scope(family, allocations, reduced, reduces=False)) <= limit:
             return count
@@ -119,19 +120,49 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     229,424 bytes held whole against its 166,912); where dK and dV leave `typed` (`stores_typed`), in `dtype`
     through a stage of their own after the walks, rounded once there."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
-    stage = family.staged_memory((consumers, max(block_q, block_k), width), jnp.float32)
     held = family.adds_through_shared
-    scoped = [family.staged_memory((consumers, block_k, width), dtype),
-              family.staged_memory((consumers, block_k, width), dtype),
+    # Chunk held fp32 add stages (`stores.staged_columns`: 64 cols = 32 KB at d128 vs 64 KB whole-width) so
+    # sm90 64x64 d128 frees 32 KB SMEM for streaming `delta`, `stores_typed`, and extra pipeline stages.
+    stage_width = stores.staged_columns(width, (jnp.float32,)) if held and width <= 128 else width
+    stage = family.staged_memory((consumers, max(block_q, block_k), stage_width), jnp.float32)
+    kv_swizzles = transposed_swizzles(config, "keys", "values")
+    scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("keys")),
+              family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("values")),
               family.staged_memory((consumers, 2 * staged_parts(dtype), block_q, block_k), dtype),
               *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     if streamed is None:
         streamed = streamed_statistics(family, config, width, dtype, stages, reduced=reduced)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
-              **{name: ((block_q,), kind) for name, kind in list(STATISTICS.items())[:streamed]}}
+              **{name: ((block_q,), STATISTICS[name]) for name in _STREAM_ORDER[:streamed]}}
     out = family.staged_memory((consumers, block_k, width), dtype) if typed else stage
     return scoped, family.streams(blocks, stages, consumers), [] if held and not typed else [out]
+
+def dq_and_dkv(walk: _Backward, accumulators: tuple, weights_ref, cotangents_ref,
+               q_rhs, k_rhs, do_rhs, *, looped: bool = False) -> tuple[jax.Array, tuple]:
+    """Issue dQ, dV, and dK for a bf16/fp32 backward query tile: on overlapping shared-memory issuers
+    (wgmma), issue dV and dK inside dQ's product scope and read dQ with `pending=2` so dQ/dV/dK issue
+    back-to-back with no wait bubble and `add_dq` overlaps dV/dK (row 5272, 10867)."""
+    family, tiles = walk.program.family, walk.program.tiles
+    dk_acc, dv_acc = accumulators
+    shape = (tiles.block_q, k_rhs.shape[-1])
+    issue = family.looped_products if looped else family.products
+    if family.products_overlap and not family.operands_in_registers and not walk.interpret:
+        def issue_dkv():
+            issue(dv_acc, weights_ref.transpose((1, 0)), do_rhs)
+            issue(dk_acc, cotangents_ref.transpose((1, 0)), q_rhs)
+
+        dq = family.product(cotangents_ref, k_rhs, shape, then=issue_dkv, pending=2)
+    else:
+        dq = (None if family.operands_in_registers
+              else family.product(cotangents_ref, k_rhs, shape))
+        dv_acc = issue(dv_acc, weights_ref.transpose((1, 0)), do_rhs)
+        dk_acc = issue(dk_acc, cotangents_ref.transpose((1, 0)), q_rhs)
+        if dq is None:
+            dq = (family.looped_product(cotangents_ref, k_rhs, shape) if looped
+                  else family.product(cotangents_ref, k_rhs, shape))
+    return dq, (dk_acc, dv_acc)
+
 
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
                 carry, accumulators, *, masked: bool | None = None):
@@ -150,23 +181,22 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    coords = coords_of(q_first, read=walk.places_read(masked=masked))
+    coords = functools.partial(coords_of, q_first, read=walk.places_read(masked=masked))
     if q_slot.dtype == jnp.float16:
         return _sixteen_step(walk, k_smem, staged, add_dq, slots, carry, accumulators, q_first, _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
             masked=masked, whole_operands=True))
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
                                   whole(index), shape, masked=masked)
-    family.staged(narrowed, staged.at[0])
-    dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     cotangents_staged = staged.at[1]
-    family.staged(part, cotangents_staged)
-    dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
-    # The tile's dQ, its staged cotangents times the resident keys (`algebra.cotangent_product`'s `a @ b`),
-    # added into dQ: the query tile's other key blocks add theirs.
-    add_dq(q_first, family.looped_product(cotangents_staged, k_smem,
-                                         (tiles.block_q, k_smem.shape[-1])))
-    return carry, (dk_acc, dv_acc)
+    # Stage P and dS under one proxy fence so narrowed and part free before products (`dq_and_dkv`).
+    with family.staged_together():
+        family.staged(narrowed, staged.at[0])
+        family.staged(part, cotangents_staged)
+    dq, accumulators = dq_and_dkv(walk, (dk_acc, dv_acc), staged.at[0], cotangents_staged,
+                                  q_slot, k_smem, do_slot, looped=True)
+    add_dq(q_first, dq)
+    return carry, accumulators
 
 def _sixteen_step(walk: _Backward, k_smem, staged, add_dq, slots, carry, accumulators, q_first,
                   operands: tuple[jax.Array, jax.Array]):
@@ -208,19 +238,21 @@ def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: in
 
 def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, streamed: int
                 ) -> tuple[dict, Callable]:
-    """A fused program's query tiles' statistics (`STATISTICS`, their `refs` at its batch `row` and `head`):
-    the views of the first `streamed`, streamed beside each tile (`streamed_statistics`), and
-    `rows_of(slots, first query)`, a tile's rows, those from its slots, the rest from global memory
-    (`_rows`)."""
-    names = list(STATISTICS)
-    views = {name: (ref.at[row, head], lambda j: (j,))
-             for name, ref in zip(names[:streamed], refs, strict=False)}
+    """A program's query tiles' statistics (`STATISTICS`, their `refs` at its batch `row` and `head`):
+    the views of the first `streamed` of `_STREAM_ORDER`, streamed beside each tile (`streamed_statistics`),
+    and `rows_of(slots, first query)`, a tile's rows in `STATISTICS` order, streamed ones from their slots
+    and the rest from global memory (`_rows`)."""
+    by_name = dict(zip(STATISTICS, refs, strict=True))
+    chosen = _STREAM_ORDER[:streamed]
+    views = {name: (by_name[name].at[row, head], lambda j: (j,)) for name in chosen}
+    streamed_names = frozenset(chosen)
 
     def rows_of(slots, first):
-        return tuple(family.rows_of(slots[name]) if index < streamed
-                     else _rows(family, ref, row, head, first, block_q)
-                     for index, (name, ref) in enumerate(zip(names, refs, strict=True)))
-
+        def read(name, ref):
+            return (family.rows_of(slots[name]) if name in streamed_names
+                    else _rows(family, ref, row, head, first, block_q))
+        return tuple(functools.partial(read, name, ref)
+                     for name, ref in zip(STATISTICS, refs, strict=True))
     return views, rows_of
 
 
@@ -325,8 +357,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                      *(outputs.axis(array, index) for index in axis_order), width)
                       for array in (key, value))
     launch = family.kernel(
-        entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
-        grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
+        entry, out_type=() if grouped else gradients, grid=(heads, batch, keys_padded // pair),
+        grid_names=("heads", "batch", "k_tiles"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused", reducing_warpgroups=reduced,
         registers=walk.registers(dq=False),
         # Its walk's statement, its work its emission's (`stated`); the model's products it owns

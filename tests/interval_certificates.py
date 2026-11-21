@@ -15,7 +15,7 @@ from typing import Literal, NamedTuple
 
 import numpy as np
 import tier_wire
-from certified import allowance
+from certified import allowance, underflow
 from native_certificates import TRUNCATING, truncating_underflow
 from op_certificates import (
     BFLOAT16,
@@ -121,6 +121,10 @@ class Lane:
     """Whether the call is fp32's, its output stored fp32 and a one-part operand TF32."""
     pairing: int = 1
     """The parts a factored pair's fp32 operand takes (`intra.pairing_parts`, `operand`)."""
+    unit_keys: bool = False
+    """Whether a sub-chunk's own pairs fold each decay into the row before the key (`mainloop.Call.unit_keys`,
+    a layer's unit keys: `own_pairs.own_bands`, `algebra.key_diagonal_bands`), not the row times the key
+    first (`key_diagonal`)."""
     merged: int = 0
     """The parts the doubling's merges take in fp32 (`mainloop._merged`): zero for fp16, else `merged`."""
     tf32: Literal["plain", "rna", "read"] = "read"
@@ -153,14 +157,24 @@ PART_BOUNDS = (1 + 2.0 ** -8, 2.0 ** -8 * (1 + 2.0 ** -8), 2.0 ** -16 * (1 + 2.0
 within half a bf16 unit, 2^-8 of it; each later the remainder rounded, within 2^-8 of the last."""
 
 
+def two_parts_reach(magnitude, lane: Lane):
+    """How far two bf16 parts' sum lies from the fp32 value of `magnitude` they split: the second part the
+    remainder rounded, within 2^-16 of the value, or within half bf16's least subnormal step where the
+    remainder lies below bf16's normals, or, on a lane that flushes, the whole of a remainder or value below
+    its normals, fp32's (`certified.underflow`): a value near 1e-40 split into parts dropped 2^-134, whose
+    relative reach was none, and Kimi's steep inverse lay one bf16 step outside its enclosure natively on a
+    GH200 (row 10007, M-JS-156: 68 of 24576 entries, each 2^-133 out)."""
+    return 2.0 ** -16 * magnitude + underflow(BFLOAT16, lane.flushes)
+
+
 def staged(iv: Iv, lane: Lane) -> Iv:
     """A register value as the call's launches hold it (`Lane.held`): cast to bf16 (a 16-bit call's), its fp32
     value (three parts summing to it, or one TF32 operand, which its product reads, `dot`), or two parts'
-    sum, within 2^-16 of it."""
+    sum (`two_parts_reach`)."""
     if lane.held == 1:
         return iv if lane.wide else cast(iv, BFLOAT16)
     if lane.held == 2:
-        reach = 2.0 ** -16 * np.maximum(np.abs(iv.lo), np.abs(iv.hi))
+        reach = two_parts_reach(np.maximum(np.abs(iv.lo), np.abs(iv.hi)), lane)
         return outward(iv.lo - reach, iv.hi + reach)
     return iv
 
@@ -172,7 +186,7 @@ def held_cell(x, lane: Lane) -> Iv:
         return cell(x, BFLOAT16)
     if lane.held == 2:
         x = np.asarray(x, np.float64)
-        reach = 2.0 ** -16 * np.abs(x) * (1 + 2.0 ** -7)
+        reach = two_parts_reach(np.abs(x) * (1 + 2.0 ** -7), lane)
         return outward(x - reach, x + reach)
     return point(x)
 

@@ -114,6 +114,7 @@ class _Paged(nn.Module):
         store.write(key, value, jnp.broadcast_to(jnp.arange(CAPACITY), (rows, CAPACITY)))
         kernel = store.paged_kernel(query, softcap=self.softcap, arithmetic=False, named="auto",
                                     sinks=sinks is not None)
+        assert kernel is not None
         return store.decode(query, lengths, kernel, self.softcap, sinks=sinks)
 
 

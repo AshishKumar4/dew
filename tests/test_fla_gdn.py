@@ -67,7 +67,14 @@ def assert_kernel_on_par(kernel, reference, draw, label: str) -> None:
     """A kernel against its expression in XLA with the same roundings (`fla_gdn_support`'s reference): the
     same shapes and dtypes, and every output on par with the reference's from float64 over the site's
     declared draws (check 1, `KERNEL_SEEDS`), the reference's expression on the inputs widened its truth
-    (`support.computed_at`)."""
+    (`support.computed_at`). An fp32 call's (its label's dtype, `site_label`) interpreted alone, where the
+    kernel's products are exact as the reference's are: natively the port takes fla's own, one TF32, about
+    2000 times an exact product's error (row 10860, M-JS-164-gh200), and the GPU tier holds it to fla's own
+    outputs instead (`the_port_is_as_exact_as_fla`). A 16-bit call's products are exact either way, and its
+    kernel is held here natively too: the GPU tier's fla cells run in fp32 alone (`FLA_DTYPES`)."""
+    if not INTERPRETED and jnp.dtype(label.split()[2]) == jnp.float32:
+        pytest.skip("an fp32 kernel's XLA expression holds the same roundings as the interpreted port alone")
+
     def laid(arm):
         return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), jax.eval_shape(arm, *draw(0)))
 
@@ -840,7 +847,7 @@ three."""
 def test_a_remat_policy_changes_no_gradient(policy):
     """A block's remat policy over the port's named residuals (`residuals.RESIDUALS`): none,
     'all_but_delta_memory', which the block applies by tracing its layers recomputing that name
-    (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, and a policy saving the output,
+    (`residuals.recomputing`) rather than by a checkpoint policy, and a policy saving the output,
     decay and inverse. Each computes the gradients the layer computes without remat, on
     par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
     (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient. A GPU compiles
@@ -849,7 +856,7 @@ def test_a_remat_policy_changes_no_gradient(policy):
     inside the loss each arm runs (`row_names_port`), under check 1's own scope, which would hand an fp32
     call on to XLA."""
     from dew.nn.backbones.decoder_block import remat_policy
-    from dew.nn.kernels.recurrence_chunk import recomputing
+    from dew.nn.residuals import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
     initialize = jax.jit(lambda *args: nn.unbox(layer.init(*args)))
@@ -1029,15 +1036,16 @@ def _lowered_dot(product, default: str) -> list:
 
 
 def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
-    """The port's fp32 dots lower alike under a run's default precision and the suite's 'highest', at
-    fla's own precision: one TF32, or one IEEE where fla turns TF32 off, never the global setting's (which
-    made the sm80 WY backward an IEEE kernel ptxas compiled for minutes). A dot that names nothing follows
-    the setting."""
+    """The port's fp32 dots lower alike under a run's default precision and the suite's 'highest', each the
+    algorithm the algebra chose at least as exact as fla's own (`fla_gdn._precision`): one TF32 where fla
+    takes TF32, never the global setting's (which made the sm80 WY backward an IEEE kernel ptxas compiled
+    for minutes). A dot that names nothing follows the setting."""
     from jaxlib.triton.dialect import InputPrecision
 
-    for ieee, named in ((False, InputPrecision.TF32), (True, InputPrecision.IEEE)):
+    for ieee in (False, True):
         product = functools.partial(fla_gdn._dot, exact=False, ieee=ieee)
-        assert _lowered_dot(product, "default") == _lowered_dot(product, "highest") == [named]
+        assert _lowered_dot(product, "default") == _lowered_dot(product, "highest")
+    assert _lowered_dot(functools.partial(fla_gdn._dot, exact=False), "default") == [InputPrecision.TF32]
 
     def unnamed(a, b):
         return jnp.dot(a, b, preferred_element_type=jnp.float32)

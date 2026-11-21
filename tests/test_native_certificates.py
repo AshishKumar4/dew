@@ -29,6 +29,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import recurrence_witness as rw
+import tier_wire
 from attention_witness import assert_faults_refused, assert_witnessed
 from gpu_flow import RUNNING, Cell, run_cells
 from interval_certificates import Lane, exp2_reach
@@ -648,6 +649,10 @@ def the_recurrence_templates_records_certify_natively_a_step_at_a_time(generatio
     memory is the fp32 memory the chunks before it leave, rounded as stored (end_j == start_{j+1})."""
     with generation.assumed(generation_name):
         run = rw.recorded(*rw.draw(0, regime, heads=2))
+    # Its one run recorded: a GPU tier's prepare gives it zeros, which judge nothing (as the attention
+    # witness's, row 9546); judged there, the cell went unprepared, its run compiling on its GPU (row 7882).
+    if tier_wire.preparing():
+        return
     held = rw.witness(run, mosaic_lane())
     for name in rw.RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
@@ -705,12 +710,13 @@ def the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively
         rw.assert_key_backward_witnessed(mosaic_lane(), heads=2)
 
 
-def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_name):
+def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_name, width):
     """The native step witness under a decay a key dimension
     (`recurrence_witness.assert_key_decays_witnessed`): a native bf16 call of two value heads, every record
-    inside its step's enclosure, and a kernel reading each token's mean decay for all its keys refused."""
+    inside its step's enclosure, and a kernel reading each token's mean decay for all its keys refused, at
+    `width` keys (128 its prefix a running sum down each column, 64 the doubling scan)."""
     with generation.assumed(generation_name):
-        rw.assert_key_decays_witnessed(mosaic_lane(), heads=2)
+        rw.assert_key_decays_witnessed(mosaic_lane(), heads=2, width=width)
 
 
 def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_name, mask):
@@ -777,7 +783,8 @@ def test_the_native_kernels_certify_on_this_gpu():
           for g in GENERATIONS),
         *(cell(the_recurrence_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary, g)
           for g in GENERATIONS),
-        *(cell(the_recurrence_witness_holds_a_decay_a_key_dimension_natively, g) for g in GENERATIONS),
+        *(cell(the_recurrence_witness_holds_a_decay_a_key_dimension_natively, g, w) for g in GENERATIONS
+          for w in (64, 128)),
         *(cell(the_recurrence_witness_holds_a_write_gate_on_the_keys_side_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_values_passed_in_parts_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_the_delta_rules_fast_backward_natively, g) for g in GENERATIONS),

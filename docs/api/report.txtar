@@ -37,8 +37,8 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .resumed(self, resume: Resume = 'auto') -> int | None
   .rollout_state(self, step: int, template: Mapping[str, object]) -> dict | None
   .rung(self, step: int) -> JSON
-  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, tokenizer: Tokenizer | None = None) -> None
-  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None) -> None
+  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, tokenizer: Tokenizer | None = None, held_apart: bool = False) -> None
+  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, held_apart: bool = False) -> None
   .source(self, step: int) -> str
   .stored(self, step: int | str | None = None) -> Variables
   .training(self, step: int) -> JSON
@@ -413,6 +413,10 @@ dew.config.DecoderRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
 dew.config.MetricConfig
   name: str
   fields: JsonDict = builtins.dict()
@@ -561,6 +565,10 @@ dew.config.lm.LMRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
   tokenizer: str = 'byte'
   prompt: str = ''
   max_new_tokens: int = 128
@@ -687,6 +695,10 @@ dew.decision.config.DecisionRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
   pretrained: str = 'convaiinnovations/laya'
   subfolder: str | None = None
   revision: str | None = None

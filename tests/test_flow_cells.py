@@ -311,3 +311,110 @@ def test_a_flow_module_importing_gpu_flow_first_imports_in_a_parts_prepare():
                           check=False)
     assert done.returncode == 0, done.stderr[-2000:]
 
+
+
+def test_a_cell_compiling_at_its_run_is_passed_by_in_a_parts_prepare(tmp_path, monkeypatch):
+    """A cell with no check-1 site that declares its programs compiled at its run (`Cell.at_run`: its GPU's
+    driver facts, a fresh process) is passed by in a GPU tier part's prepare, neither run nor recorded
+    deferred, and its flow passes its prepare; outside a prepare it runs, its failure its flow's (rows 8074,
+    8635: every such cell was deferred and its test named unprepared)."""
+    import tier_wire
+    from truths_ahead import DEFERRED, compiled_truths
+
+    ran = []
+
+    def facts():
+        ran.append("facts")
+        raise AssertionError("no driver facts here")
+
+    flow = [Cell("driver facts", facts, at_run="its GPU's driver facts")]
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells(flow)
+    assert ran == [] and not (tmp_path / DEFERRED).exists()
+    monkeypatch.delenv(tier_wire.PREPARE)
+    with pytest.raises(CellsFailed) as raised:
+        run_cells(flow)
+    assert ran == ["facts"] and raised.value.labels == ["driver facts"]
+
+
+def test_a_parts_prepare_chooses_kernels_as_its_nodes_gpu(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (`truths_ahead.prepared`, its node an H100) and in a child process of its
+    test's (`truths_ahead.of_the_parent`, its store the test's: `for_a_child`), a call reads the node's
+    generation and facts, as its run on that GPU does, where its compile-only device, placed off the CPU
+    backend, read the bare platform 'gpu' and every kernel that GPU takes refused (rows 8076, 10088; the
+    child's, row 10765)."""
+    import model_flows
+    from generation_support import node_target
+    from truths_ahead import for_a_child, of_the_parent, prepared
+
+    from dew.nn.kernels.generation import device_generation, gpu_target
+
+    def reads_the_nodes_gpu():
+        target = gpu_target()
+        return (device_generation(), target.generation, target.multiprocessors) == ("sm90", "sm90", 132)
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        assert reads_the_nodes_gpu()
+        child = for_a_child()
+    for name, value in child.items():
+        monkeypatch.setenv(name, value)
+    with of_the_parent():
+        assert reads_the_nodes_gpu()
+
+
+def test_a_parts_prepare_prepares_its_child_processs_arms(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), a check run in a process of its own, the approximate
+    divider's (`test_precision_policy.divides_as_ieee_division_on_an_approximate_divider`), prepares its arms
+    in its test's store (`truths_ahead.for_a_child`, `of_the_parent`), its failure on their zeros passing the
+    prepare: it was passed by, its run compiling every arm on its held GPU, unprepared and unrecorded, and its
+    child computed in the prepare (row 10748)."""
+    import model_flows
+    import test_precision_policy
+    import tier_wire
+    from arm_store import armed
+    from generation_support import node_target
+    from truths_ahead import CompiledTruths, prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        test_precision_policy.divides_as_ieee_division_on_an_approximate_divider()
+    edges = test_precision_policy.EDGES + test_precision_policy.APPROXIMATELY
+    assert CompiledTruths(tmp_path / "store", prepare=False, stamp="a").holds(armed(edges))
+
+
+def test_a_parts_prepare_draws_an_nvfp4_tiles_values_on_the_host(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), the NVFP4 tile of quantized values
+    (`test_algebra_bits._quantized_values`) is drawn and its arms prepared, nothing computed on the
+    compile-only GPU its default device is: its draw ran eagerly there and raised "'Executable' object has no
+    attribute 'local_devices'", naming its test unprepared (row 8617)."""
+    import model_flows
+    import test_algebra_bits
+    import tier_wire
+    from generation_support import node_target
+    from truths_ahead import prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        assert test_algebra_bits._quantized_values().shape == (256, 64)
+
+
+def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), the numerics flows' cells placed on the host's CPU, a
+    projection and the norm seams, are passed by, none recorded deferred: the prepare chooses every kernel as
+    on its GPU, so their CPU programs took Triton kernels that do not lower on a CPU, raised, and named their
+    tests unprepared (row 10764)."""
+    import model_flows
+    import test_gpu_numerics
+    import tier_wire
+    from generation_support import node_target
+    from truths_ahead import DEFERRED, prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        run_cells([*test_gpu_numerics.projection_cells(), *test_gpu_numerics.seams_cells(None)])
+    assert not (tmp_path / "store" / DEFERRED).exists()

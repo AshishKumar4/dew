@@ -28,13 +28,6 @@ def draw(seed: int = 7):
             rng.integers(-3, 4, (256, 256)).astype(jnp.bfloat16))
 
 
-def host_normal(seed: int, *shapes, dtype) -> tuple:
-    """Standard normal arrays of `shapes` in `dtype`, from `seed`, as the host holds them (NumPy's), which a
-    GPU tier part's prepare places nowhere (`draw`)."""
-    rng = np.random.default_rng(seed)
-    return tuple(rng.standard_normal(shape).astype(dtype) for shape in shapes)
-
-
 def ran(fn, label: str, *operands):
     """`fn` jitted over host arrays `operands`, as a GPU tier part's prepare compiles it ahead and its run
     runs it (`reference_error.ahead_arm`: a bitwise check's program, computing nothing in the prepare);
@@ -537,6 +530,94 @@ def test_a_name_on_a_products_rows_stays_outside_its_prologue():
     assert not [equation for equation in traced.jaxpr.jaxpr.eqns if equation.primitive is jax.lax.sin_p]
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_product_mapped_per_shard_runs_the_template_and_computes_as_written():
+    """A projection, its bias and a scale (`biased`) mapped per shard (`jax.shard_map` over rows split two
+    ways, each device's program its own rows' product, as `dew.nn.sharding.on_shards` maps a layer) under
+    the pass on an H100 whose template a call names: the map's body is rewritten in the map's own context,
+    so its product runs the template's launch per shard (row 6578: an opaque body ran XLA's dot), and the
+    program computes as written, as every program under the pass does (`assert_equal`)."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows, whole = PartitionSpec("data"), PartitionSpec()
+    mapped = jax.shard_map(biased, mesh=mesh, in_specs=(rows, whole, whole, rows), out_specs=rows)
+    operands = draw()
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
+        assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+        assert_equal(under_the_pass(mapped, *operands), as_written(mapped, *operands))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_norm_over_rows_split_on_an_explicit_axis_is_reported_where_unwritten():
+    """A plain program's RMSNorm over rows split on a mesh whose one axis is Explicit (a value's sharding its
+    type), through `dew.jit` on an H100, traces: its normal form types each value it erases or lifts by that
+    value's own sharding (`normal_form._erased`, `_lifted`: the whole result's spec on a value of another rank
+    raised). Its region's call, traced over its inputs' shapes and dtypes, makes `bfloat16[256,1024]` beside
+    the region's own `bfloat16[256@data,1024]`, so the region is not written and its route is reported
+    refused (`fusion.UNWRITTEN`), where it was dropped with no report (row 10691). Typed whole there, a
+    product region's replay contracted over the sharded axis with no output sharding, which JAX refuses."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    import dew
+    from dew.algebra import fusion
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    program, _, (rows, weight) = NORM_FORMS["plain RMSNorm"]
+    split, whole = NamedSharding(mesh, PartitionSpec("data")), NamedSharding(mesh, PartitionSpec())
+    with jax.set_mesh(mesh), generation.assumed("sm90"), generation.routes() as found:
+        dew.jit(program).trace(jax.ShapeDtypeStruct(rows, jnp.bfloat16, sharding=split),
+                               jax.ShapeDtypeStruct(weight, jnp.bfloat16, sharding=whole))
+    assert any(route.choice == "rms_norm" and route.refusal is not None
+               and route.refusal.code == fusion.UNWRITTEN for route in found)
+
+
+def test_a_region_whose_call_makes_other_types_is_reported_refused():
+    """A region the compile point writes (a norm Dew's kernel takes on an H100, `recognize.recognized`) whose
+    written call makes other types than the region's own (`jax_core.typematch`: here its outputs widened to
+    float32) is not written, its equations kept as traced, and each route its call took is reported XLA's,
+    refused for it (`fusion.UNWRITTEN`), where it was dropped with no report (row 10719), at the site its
+    call took it from (row 10856: reported anew, it took the reporting frame's)."""
+    from dew.algebra import fusion, recognize
+
+    closed = jax.make_jaxpr(_norm_of)(jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                                      jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    with generation.assumed("sm90"):
+        (region,) = recognize.recognized(closed, fusion.Index(closed), recognize.NORMS)
+        widened = region._replace(call=lambda *values: jax.tree.map(
+            lambda value: value.astype(jnp.float32), region.call(*values)), key=(region.key, "widened"))
+        with generation.routes() as found:
+            spliced = fusion._spliced(closed.jaxpr, [widened])
+    refused = [route for route in found
+               if route.refusal is not None and route.refusal.code == fusion.UNWRITTEN]
+    assert spliced is closed.jaxpr and refused
+    # Each reported as its call took it, its site the kernel's own dispatch's, not the report's (row 10856).
+    assert all(route.site.split(":")[0] != fusion.__name__ for route in refused)
+
+
+def test_an_unwritten_regions_route_to_xla_is_reported_as_it_ran():
+    """A region its compile point does not write (its call making other types than its own) reports every
+    route its call took: one to a kernel of Dew's as refused (`fusion.UNWRITTEN`), and one its call took to
+    XLA already as it ran, which reaches no other report, where it was dropped (row 10879)."""
+    from dew.algebra import fusion, recognize
+
+    closed = jax.make_jaxpr(_norm_of)(jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                                      jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    with generation.assumed("sm90"):
+        (region,) = recognize.recognized(closed, fusion.Index(closed), recognize.NORMS)
+
+        def on_xla(*values):
+            with generation.chosen(rms_norm="xla"):
+                return jax.tree.map(lambda value: value.astype(jnp.float32), region.call(*values))
+
+        widened = region._replace(call=on_xla, key=(region.key, "on xla, widened"))
+        with generation.routes() as found:
+            fusion._spliced(closed.jaxpr, [widened])
+    assert any(route.choice == "rms_norm" and route.kernel == "xla" for route in found)
+
+
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
     """A start-like program (row 6783): a region that makes a parameter and computes a grouped product from
     it, as a flax init's block makes its parameters inside its forward (here a checkpointed one), the
@@ -775,14 +856,14 @@ def test_flaxs_attention_computes_as_written(spelling):
     with generation.assumed("sm90"):
         for causal in (False, True):
             attend = flax_attention(causal=causal, wide=FLAX_SPELLINGS[spelling])
-            assert not _attention_routes(lambda attend=attend: dew.jit(attend).trace(*shapes))
+            assert not _routes("attention", lambda attend=attend: dew.jit(attend).trace(*shapes))
 
 
-def _attention_routes(trace) -> list[str]:
-    """The kernels the attention routes `trace()` reports name."""
+def _routes(choice: str, trace) -> list[str]:
+    """The kernels the routes of `choice` that `trace()` reports name."""
     with generation.routes() as found:
         trace()
-    return [route.kernel for route in found if route.choice == "attention"]
+    return [route.kernel for route in found if route.choice == choice]
 
 
 @pytest.mark.parametrize("spelling", list(SPELLINGS))
@@ -806,12 +887,12 @@ def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
         return scaled_dot_product_attention(q, k, v, scale_logits=True, causal=causal)
 
     with generation.assumed("sm90"):
-        assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
-        expected = {kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes))
+        assert not _routes("attention", lambda: jax.jit(attend).trace(*shapes))
+        expected = {kernel for kernel in _routes("attention", lambda: jax.jit(own).trace(*shapes))
                     if kernel not in KEPT}
-        assert expected and set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == expected
+        assert expected and set(_routes("attention", lambda: dew.jit(attend).trace(*shapes))) == expected
         with generation.chosen(attention="template"):
-            assert "template" in _attention_routes(lambda: dew.jit(attend).trace(*shapes))
+            assert "template" in _routes("attention", lambda: dew.jit(attend).trace(*shapes))
     draw = normal_drawn(37, (2, 64, 4, 32), (2, 64, key_heads, 32), (2, 64, key_heads, 32), (2, 64, 4, 32),
                         dtype=jnp.bfloat16)
     with generation.chosen(attention="template"):
@@ -949,10 +1030,10 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
         return scaled_dot_product_attention(q, k, v, scale_logits=True, **arguments(q, k, v))
 
     with generation.assumed("sm90"):
-        assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
-        expected = [] if arguments is None else [
-            kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes)) if kernel not in KEPT]
-        assert set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == set(expected)
+        assert not _routes("attention", lambda: jax.jit(attend).trace(*shapes))
+        expected = [] if arguments is None else [kernel for kernel in _routes(
+            "attention", lambda: jax.jit(own).trace(*shapes)) if kernel not in KEPT]
+        assert set(_routes("attention", lambda: dew.jit(attend).trace(*shapes))) == set(expected)
     drawn = (2, 64, 4, 32)
     draw = normal_drawn(41, *(drawn,) * 4, dtype=jnp.bfloat16)
     # The draw's rows by its declared shape, no draw computed: a GPU tier part's prepare computes nothing on
@@ -1022,8 +1103,8 @@ def test_a_programs_own_choice_by_the_platform_stays_as_written():
 
     shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
     with generation.assumed("sm90"):
-        assert _attention_routes(lambda: dew.jit(attend(doubled=False)).trace(*shapes))
-        assert not _attention_routes(lambda: dew.jit(attend(doubled=True)).trace(*shapes))
+        assert _routes("attention", lambda: dew.jit(attend(doubled=False)).trace(*shapes))
+        assert not _routes("attention", lambda: dew.jit(attend(doubled=True)).trace(*shapes))
 
 
 @pytest.mark.mesh(devices=2)
@@ -1068,7 +1149,7 @@ def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
     options = dict(options)
     shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), options.pop("dtype", jnp.bfloat16)),) * 3
     with generation.assumed("sm90"):
-        routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
+        routes = _routes("attention", lambda: dew.jit(written_out(**options)).trace(*shapes))
     assert bool(routes) == (variant in ("attention", "finite fill", "attention by a root")), routes
 
 
@@ -1095,7 +1176,7 @@ def test_a_bodys_attention_takes_each_scopes_kernel_choice(order):
     with generation.assumed("sm90"):
         for choice in order:
             with dew.kernels.use(attention=choice):
-                routes = _attention_routes(lambda: dew.jit(held).trace(*shapes))
+                routes = _routes("attention", lambda: dew.jit(held).trace(*shapes))
             assert bool(routes) == (choice == "template"), (choice, routes)
 
 
@@ -1430,7 +1511,9 @@ def test_a_norm_of_a_stopped_row_passes_no_gradient_to_it():
     def program(x, w):
         return _norm_of(jax.lax.stop_gradient(x), w).astype(jnp.float32).sum()
 
-    x, w = host_normal(4785, (256, 256), (256,), dtype=np.float32)
+    from contract_support import normal_draw
+
+    x, w = normal_draw(4785, (256, 256), (256,), dtype=np.float32)
     grad = jax.grad(functools.partial(_norms_rewritten, program))
     assert not np.any(np.asarray(ran(grad, "a stopped row's gradient, its norm written", x, w)))
 
@@ -1466,7 +1549,9 @@ def test_a_norm_of_a_row_under_its_own_derivative_rule_keeps_the_rule():
     def program(x, w):
         return _norm_of(jax.jit(_doubled_identity)(x), w).astype(jnp.float32)[0, 0]
 
-    x, w = host_normal(4786, (256, 256), (256,), dtype=jnp.bfloat16)
+    from contract_support import normal_draw
+
+    x, w = normal_draw(4786, (256, 256), (256,), dtype=jnp.bfloat16)
     np.testing.assert_array_equal(
         np.asarray(ran(jax.grad(functools.partial(_norms_rewritten, program)),
                        "the row's gradient, its norm written", x, w)),
@@ -1612,3 +1697,31 @@ def test_a_gated_product_across_a_barrier_is_never_fused(barred):
     assert fused and not crossed
     if barred is checkpointed_swiglu:
         assert any(equation.primitive is primitives.remat_p for equation in equations(made.jaxpr.jaxpr))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_products_written_casts_are_replayed_as_written():
+    """A manual mesh's product of row-split operands by a scale and a weight the program cast to vary itself
+    (`pcast`, JAX writing no cast of its own: `jax_auto_pcast` off) under the pass on an H100 whose template
+    a call names: the fusion analysis's replay of the region binds each operand as the program typed it, the
+    casts' results among them (row 6578's review, F2: a cast replayed as the value it cast, the multiply's
+    operands varied apart and JAX refused it), its product the template's launch per shard, and the program
+    computes as written."""
+    from jax._src import config as jax_config
+    from jax.sharding import Mesh, PartitionSpec
+
+    def scaled_product(x, w, scale):
+        scale, w = (jax.lax.pcast(value, ("data",), to="varying") for value in (scale, w))
+        return (x * scale) @ w
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows, whole = PartitionSpec("data"), PartitionSpec()
+    mapped = jax.shard_map(scaled_product, mesh=mesh, in_specs=(rows, whole, whole), out_specs=rows)
+    x, w, *_ = draw()
+    operands = (x, w, jnp.bfloat16(2))
+    with (jax_config.auto_pcast(new_val=False), generation.assumed("sm90"),
+          generation.chosen(grouped_matmul="mosaic")):
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
+        assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+        assert_equal(under_the_pass(mapped, *operands), as_written(mapped, *operands))

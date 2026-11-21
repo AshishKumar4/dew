@@ -55,7 +55,7 @@ def test_an_accurate_call_on_the_default_route_is_on_par_with_ieee_fp32(case):
     """Under a run's accurate numerics (`generation.run_precision`), a call on the default route ('auto'),
     whichever kernel it takes, is on par with the reference path's IEEE float32 products forward and
     backward, measured from float64 (check 1; row 2350: an accurate run's calls ran fast on FlashAttention,
-    cuDNN, xla and splash), over inputs a fast kernel fails on (`accurate_draws`); the kernel lab's GPU
+    cuDNN, xla and splash), over inputs a fast kernel fails on (`accurate_draws`); the GPU
     tier runs it on each target GPU."""
     assert_as_exact(jax.jit(routed_call("accurate")), jax.jit(ieee_reference), accurate_draws()[case],
                     f"the accurate form on the default route, {case}", seeds=SEEDS)

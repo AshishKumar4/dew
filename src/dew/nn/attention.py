@@ -23,6 +23,7 @@ from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
+from dew.nn.programs import own_preset
 from dew.nn.residuals import Residual
 
 from .attention_kernels import (
@@ -636,7 +637,7 @@ def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
     """The dot algorithm jax.nn's xla attention names for its logits' product
     (`_dot_product_attention_core`), which the reference's jax.nn form
     (`scale_logits`) declares as jax.nn does: a 16-bit operand's own product
-    with fp32 sums (bf16's `BF16_BF16_F32`, fp16's `F16_F16_F32`) where the
+    with fp32 sums (`dew.nn.programs.own_preset`) where the
     call states no precision above the default and the platform it is placed
     on lowers it (`placed_platform`: bf16's everywhere but a GPU before
     `BF16_GPU`, `bf16_dot_runs`; fp16's on a GPU alone, where a CPU's dot and
@@ -644,12 +645,10 @@ def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
     call's own precision taking the product."""
     if not asks_default_precision(precision):
         return None
-    if dtype == jnp.bfloat16 and bf16_dot_runs():
-        return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-    if dtype == jnp.float16 and generation.placed_platform() == 'gpu':
-        return jax.lax.DotAlgorithmPreset.F16_F16_F32
+    if (dtype == jnp.bfloat16 and bf16_dot_runs()) or (
+            dtype == jnp.float16 and generation.placed_platform() == 'gpu'):
+        return own_preset(dtype)
     return None
-
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation: AttentionImpl = 'auto',

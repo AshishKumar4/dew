@@ -15,6 +15,7 @@ import hashlib
 import itertools
 import math
 from collections.abc import Callable, Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -626,7 +627,8 @@ it fails at most 2 of 32,000 runs, where the width's factor alone failed up to 1
 width's factor alone failed 185, and 0 to 3 at 16 values. Dew's worst row must be ruled too, so a row of
 Dew's spread over its values (a row fault) keeps its width's factor beside a reference one value rules. At
 a site that declares its weighed check, a worst row one element of Dew's rules alone defers to it
-(`_judgement`'s `deferring`, row 10145). A
+(`_judgement`'s `deferring`, row 10145), as does one whose error lies along its truth row, one value it is
+all scaled by (row 9780). A
 Gaussian row of eight values or more is almost never ruled; rows of three or four values sometimes are,
 where a fault ruled alike is refused less often. A value's own error in a ruled row is check 2's to bound.
 A stacked-examples site's paired rows keep their width's factor (`_judgement`), and a recording's summary,
@@ -757,6 +759,9 @@ class RecordedLeaf:
     share: float | None = None
     """The share of its worst sized row's squared error the row's largest element carries (`_Draws.factor`),
     zero where no row is sized; None where the leaf was recorded as rows alone (`rows_summary`)."""
+    collinear: float | None = None
+    """The share of its worst sized row's squared error along its float64 truth row (`_collinear_share`), zero
+    where no row is sized; None where not recorded."""
     example_mse: np.ndarray | None = None
     example_worst: np.ndarray | None = None
     """At a site whose leaves stack independent examples, each example's evidence (`example_mse`,
@@ -887,8 +892,9 @@ def _error_rows(references, truths, *, xp):
         errors = values - truth
         width = _width(truth)
         rows = errors.reshape(-1, width) if width else xp.zeros((0, 1))
+        truth_rows = truth.reshape(-1, width) if width else xp.zeros((0, 1))
         found.append((log_mean_square(errors, xp), xp.isfinite(values).all(), _scaled_rms(rows, xp),
-                      _largest_share(rows, xp)))
+                      _largest_share(rows, xp), _collinear_share(rows, truth_rows, xp)))
     return found
 
 
@@ -916,6 +922,25 @@ def _largest_share(rows, xp=np):
     scaled = xp.square(xp.where(finite, rows, 0.0) / xp.where(finite & (largest > 0), largest, 1.0))
     total = xp.sum(scaled, axis=1)
     return xp.where(total > 0, 1.0 / xp.where(total > 0, total, 1.0), 0.0)
+
+
+def _collinear_share(rows, truth_rows, xp=np):
+    """Each row's share of its squared error along its truth row, `<e, t>^2 / (<e, e> <t, t>)`, each row read
+    over its largest magnitude first so no sum overflows or underflows: one for a row whose error is a scalar
+    multiple of its truth (one value its whole row is scaled by, row 9780), zero where either row is zero or
+    not finite."""
+    e = xp.asarray(rows)
+    t = xp.asarray(truth_rows)
+    e_max = xp.max(xp.abs(e), axis=1, keepdims=True) if e.shape[1] else xp.zeros((len(e), 1))
+    t_max = xp.max(xp.abs(t), axis=1, keepdims=True) if t.shape[1] else xp.zeros((len(t), 1))
+    ok = xp.isfinite(e_max) & xp.isfinite(t_max) & (e_max > 0) & (t_max > 0)
+    eu = xp.where(ok, e, 0.0) / xp.where(ok, e_max, 1.0)
+    tu = xp.where(ok, t, 0.0) / xp.where(ok, t_max, 1.0)
+    ee = xp.sum(xp.real(eu * xp.conj(eu)), axis=1)
+    tt = xp.sum(xp.real(tu * xp.conj(tu)), axis=1)
+    et = xp.sum(eu * xp.conj(tu), axis=1)
+    denom = ee * tt
+    return xp.where(denom > 0, xp.real(et * xp.conj(et)) / xp.where(denom > 0, denom, 1.0), 0.0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -979,8 +1004,9 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
                            [held.truths[at] for at in held.laid])
     log_mse = np.asarray([log_mse for log_mse, *_ in found], np.float64)
     finite = np.asarray([finite for _, finite, *_ in found], bool)
-    rows = np.concatenate([np.zeros(0), *(np.asarray(rows) for *_, rows, _ in found)])
-    shares = np.concatenate([np.zeros(0), *(np.asarray(shares) for *_, shares in found)])
+    rows = np.concatenate([np.zeros(0), *(np.asarray(rows) for _, _, rows, _, _ in found)])
+    shares = np.concatenate([np.zeros(0), *(np.asarray(shares) for _, _, _, shares, _ in found)])
+    collinears = np.concatenate([np.zeros(0), *(np.asarray(col) for _, _, _, _, col in found)])
     # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
     counts = held.counts
     starts = np.cumsum(counts) - counts
@@ -990,29 +1016,33 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     logs, over = log_over(rows[sized], held.sizes[sized]), _over(rows[sized], held.sizes[sized])
     # The worst sized row of each leaf that has one: the largest of its run of the sized rows.
     some = taken > 0
-    worst_log, worst, share = np.full(len(counts), LOG_ZERO), np.zeros(len(counts)), np.zeros(len(counts))
+    worst_log = np.full(len(counts), LOG_ZERO)
+    worst, share, collinear = np.zeros(len(counts)), np.zeros(len(counts)), np.zeros(len(counts))
     if some.any():
         firsts = (np.cumsum(taken) - taken)[some]
         worst_log[some] = np.maximum.reduceat(logs, firsts)
         worst[some] = np.maximum.reduceat(over, firsts)
-        # The worst row's largest element's share of its squared error, each leaf's worst sized row's.
-        sized_shares = shares[sized]
-        share[some] = [sized_shares[first + int(np.argmax(logs[first:first + count]))]
-                       for first, count in zip(firsts.tolist(), taken[some].tolist(), strict=True)]
+        # The worst row's largest element's share and truth-collinear share of its squared error.
+        sized_shares, sized_collinear = shares[sized], collinears[sized]
+        at_worst = [first + int(np.argmax(logs[first:first + count]))
+                    for first, count in zip(firsts.tolist(), taken[some].tolist(), strict=True)]
+        share[some] = [sized_shares[i] for i in at_worst]
+        collinear[some] = [sized_collinear[i] for i in at_worst]
     # The rows of float64 zero, each leaf's its span of them.
     unsized = np.flatnonzero(~sized)
     zero_rows = unsized - np.repeat(starts, counts - taken)
     zero_errors, zero_sizes = rows[unsized], held.own[unsized]
     ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
-    log_mse, worst, worst_log, share, finite = (log_mse.tolist(), worst.tolist(), worst_log.tolist(),
-                                                share.tolist(), (finite & held.finite).tolist())
+    log_mse, worst, worst_log, share, collinear, finite = (
+        log_mse.tolist(), worst.tolist(), worst_log.tolist(), share.tolist(), collinear.tolist(),
+        (finite & held.finite).tolist())
     for index, at in enumerate(held.laid):
         if read[index]:
             span = slice(ends[index], ends[index + 1])
             summaries[at] = RecordedLeaf(log_mse[index], worst[index], zero_rows[span], zero_errors[span],
                                          finite=finite[index], dtype=dtype(references[at]),
                                          zero_sizes=zero_sizes[span], worst_log=worst_log[index],
-                                         share=share[index])
+                                         share=share[index], collinear=collinear[index])
     return summaries
 
 
@@ -1039,10 +1069,11 @@ class _Draws:
     """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
     on the same example, each over its size (`_example_worst_rows`), else None."""
     shares: np.ndarray | None = None
-    """The share of each seed's worst row's squared error its largest element carries, Dew's and the
-    reference's (seed by leaf by arm, as `worst`), zero where no row is sized and NaN where it is unknown (a
-    recording's summary keeps no row's elements, a row of float64 zero a live reference measured); None
-    where none was kept (`held_shares`)."""
+    """Each seed's worst row's shares of its squared error, Dew's and the reference's, `[seed, leaf, kind,
+    arm]` (`SHARE_KINDS`: its largest element's, `ELEMENT`, and its share along its truth row, `COLLINEAR`,
+    `_collinear_share`), zero where no row is sized and NaN where one is unknown (a recording's summary keeps
+    no row's elements, a row of float64 zero a live reference measured); None where none was kept
+    (`held_shares`)."""
 
     def factor(self, index: int) -> float:
         """The worst-row rule's factor for leaf `index` (its maximum's, `_judgement`): its rows' width's
@@ -1051,21 +1082,26 @@ class _Draws:
         value rules alike. A share unknown keeps the width's."""
         width = self.widths[index]
         if width > 2:
-            shares = self.held_shares()
+            shares = self.held_shares()[:, index, ELEMENT]
             mine, theirs = (int(np.argmax(self.worst[:, index, arm])) for arm in (0, 1))
-            if shares[mine, index, 0] > RULED_SHARE and shares[theirs, index, 1] > RULED_SHARE:
+            if shares[mine, 0] > RULED_SHARE and shares[theirs, 1] > RULED_SHARE:
                 return row_factor(1)
         return row_factor(width)
 
     def ruled(self, index: int) -> bool:
-        """Whether one element carries past RULED_SHARE of Dew's worst row of leaf `index` over these draws
-        (`factor`'s first condition alone); a share unknown is not."""
+        """Whether one degree of freedom carries past RULED_SHARE of Dew's worst row of leaf `index` over
+        these draws: one element (`factor`'s first condition alone), or one value its whole row is scaled by,
+        its error along its truth row (row 9780); a share unknown is not. Read where a site declares its
+        weighed check alone (`_judgement`'s `deferring`); `factor` keeps the element's share."""
         mine = int(np.argmax(self.worst[:, index, 0]))
-        return bool(self.held_shares()[mine, index, 0] > RULED_SHARE)
+        return bool((self.held_shares()[mine, index, :, 0] > RULED_SHARE).any())
 
     def held_shares(self) -> np.ndarray:
         """`shares`, every cell unknown (NaN) where none was kept, so draws join and pick per cell."""
-        return np.full(self.worst.shape, np.nan) if self.shares is None else self.shares
+        if self.shares is not None:
+            return self.shares
+        seeds, leaves, arms = self.worst.shape
+        return np.full((seeds, leaves, len(SHARE_KINDS), arms), np.nan)
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
@@ -1143,7 +1179,7 @@ class _Draws:
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
         # A picked cell's worst row is the library arm's, and so is its share.
         shares = self.held_shares().copy()
-        shares[..., 1] = np.where(pick, library.held_shares()[..., 1], shares[..., 1])
+        shares[..., 1] = np.where(pick[:, :, None], library.held_shares()[..., 1], shares[..., 1])
 
         def uncovered(field: str):
             held = getattr(self, field)
@@ -1153,13 +1189,6 @@ class _Draws:
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
                       self.finite & (library.finite | ~covered), self.widths,
                       uncovered("examples"), uncovered("example_rows"), shares)
-
-
-def _shares(found: list[list], count: int) -> np.ndarray:
-    """The worst rows' shares over a run's seeds (`_Draws.shares`, seed by leaf by arm), NaN where one is
-    unknown (a recording's summary keeps no row's elements)."""
-    return np.asarray([[[np.nan if share is None else share for share in pair] for pair in seed]
-                       for seed in found], np.float64).reshape(count, -1, 2)
 
 
 def example_mse(arm, truth) -> np.ndarray | None:
@@ -1267,8 +1296,40 @@ def _prepared(dew, truth, terms=None) -> _Prepared:
     return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held), term_leaves)
 
 
+class Paired(NamedTuple):
+    """One seed's evidence of a leaf for check 1 (`_paired`), read by name (`_drawn_from`): its arms' log
+    mean squared errors, their worst sized rows, the rows of float64 zero with both arms' errors on them
+    (`ZeroRows`), whether every value was finite, and the shares of each arm's worst row's squared error,
+    one array `[kind, arm]` (`SHARE_KINDS`), NaN where unknown (row 10786: a share added as one more
+    positional field broke every reader unpacking the entry)."""
+
+    mse: float
+    their_mse: float
+    worst: float
+    their_worst: float
+    zero_rows: ZeroRows
+    finite: bool
+    shares: np.ndarray
+
+
+SHARE_KINDS = ("share", "collinear")
+"""The kinds of a worst row's share of its squared error, each the `RecordedLeaf` field holding it, in the
+order `Paired.shares` and `_Draws.shares` hold them: its largest element's (`share`) and its share along its
+truth row (`collinear`, row 9780)."""
+
+ELEMENT, COLLINEAR = (SHARE_KINDS.index(kind) for kind in SHARE_KINDS)
+"""Each kind's place on a shares array's kind axis (`SHARE_KINDS`)."""
+
+
+def _shares_of(mine: RecordedLeaf | None, theirs: RecordedLeaf | None) -> np.ndarray:
+    """`Paired.shares` from each arm's summary (`SHARE_KINDS` of it), NaN for an arm passed as None or a
+    share it does not know."""
+    return np.asarray([[np.nan if leaf is None or getattr(leaf, kind) is None else getattr(leaf, kind)
+                        for leaf in (mine, theirs)] for kind in SHARE_KINDS], np.float64)
+
+
 def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, their_terms=None,
-              own: bool = False) -> list[tuple]:
+              own: bool = False) -> list[Paired]:
     """One draw's `_paired` evidence of every leaf of Dew (`prepared`, read once a draw) and `reference`
     against their truths: the reference's leaves (a recorded one's `RecordedLeaf`) and its truth held to
     Dew's truth's leaves, paths and shapes, so no leaf is paired with another's truth or compared through
@@ -1307,7 +1368,8 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (path, kept, their.dtype)
-            row.append((-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0)))
+            row.append(Paired(-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, finite=True,
+                              shares=np.zeros((len(SHARE_KINDS), 2))))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (was and not own) or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
@@ -1329,7 +1391,7 @@ def _one_row(recorded: RecordedLeaf, truth, terms=None) -> RecordedLeaf:
     return dataclasses.replace(row, example_mse=recorded.example_mse, example_worst=recorded.example_worst)
 
 
-def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
+def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> Paired:
     """One seed's evidence of a leaf for check 1 (`_Draws`), Dew's and the reference's alike from
     `leaf_summary`: their mean squared errors, their worst sized rows, the rows of float64 zero with
     both arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and
@@ -1349,8 +1411,8 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
-        return (mine.log_mse, theirs.log_mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
-                mine.finite and theirs.finite, (mine.share, theirs.share))
+        return Paired(mine.log_mse, theirs.log_mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
+                      mine.finite and theirs.finite, _shares_of(mine, theirs))
     # Each of Dew's rows of float64 zero against the reference's same row, every row at once (up to 283k a
     # draw at 2469's chunk sites, which a loop of scalar logs held for a fifth of a GPU attention file's
     # time, row 5461): aligned in any order, a repeated row read at its last, as a mapping of rows reads it.
@@ -1374,10 +1436,10 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     carried = ~measured & ((errors != 0) | (their_errors != 0))
     rows, errors, their_errors = rows[carried], errors[carried], their_errors[carried]
     # A measured row of float64 zero that became an arm's worst keeps no share of its own: unknown.
-    shares = (mine.share if worst == mine.log_worst else None,
-              theirs.share if their_worst == theirs.log_worst else None)
-    return (mine.log_mse, theirs.log_mse, worst, their_worst, (rows, errors, their_errors),
-            mine.finite and theirs.finite, shares)
+    shares = _shares_of(mine if worst == mine.log_worst else None,
+                        theirs if their_worst == theirs.log_worst else None)
+    return Paired(mine.log_mse, theirs.log_mse, worst, their_worst, (rows, errors, their_errors),
+                  mine.finite and theirs.finite, shares)
 
 
 def _at_least(worst: float, logs: np.ndarray) -> float:
@@ -1466,7 +1528,8 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
     final verdict), a leaf its pooled ratio leaves inconclusive passed by its typical draw where that
     decides. Every factor is raised to `power`: WRITTEN against a reference as written, else one. With
     `deferring` (a site that declares its weighed check, `check1_judge.Verdict.defers_to`), a worst row past
-    its factor that one element of Dew's rules (`_Draws.ruled`) is left unresolved, for that check to judge
+    its factor that one degree of freedom of Dew's rules (`_Draws.ruled`: one element, or one value the row
+    is scaled by) is left unresolved, for that check to judge
     in units of the reference's rounding there: at an element its computation amplifies (a step's update of
     a gradient a few of its epsilons across), the two arms' errors are two values' alike, and the reference's
     worst row lies at another element wherever its own error there was the smaller, so RULED_SHARE's
@@ -1783,19 +1846,21 @@ def _judged_leaves(dew, weighing) -> tuple[list[str], tuple[int, ...]]:
             tuple(int(_width(leaf)) for leaf in jax.tree.leaves(judged)))
 
 
-def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[tuple]], examples=None,
+def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[Paired]], examples=None,
                example_rows=None) -> _Draws:
     """A site's draws (`_Draws`) from each seed's evidence (`_evidence`, one entry a leaf), the leaves'
     `names` and row `widths` (`_judged_leaves`), and where its leaves stack examples, each seed's
     examples' ratios and worst rows (`_example_ratios`, `_example_worst_rows`)."""
     count = len(evidence)
 
-    def each(at: int) -> list[list]:
-        return [[entry[at] for entry in row] for row in evidence]
+    def each(field: str) -> list[list]:
+        return [[getattr(entry, field) for entry in row] for row in evidence]
 
-    worst = np.asarray([[(entry[2], entry[3]) for entry in row] for row in evidence]).reshape(count, -1, 2)
-    return _Draws(names, np.asarray(each(0)), np.asarray(each(1)), worst, each(4), np.asarray(each(5)),
-                  widths, examples, example_rows, _shares(each(6), count))
+    worst = np.asarray([[(entry.worst, entry.their_worst) for entry in row]
+                        for row in evidence]).reshape(count, -1, 2)
+    shares = np.asarray(each("shares"), np.float64).reshape(count, -1, len(SHARE_KINDS), 2)
+    return _Draws(names, np.asarray(each("mse")), np.asarray(each("their_mse")), worst, each("zero_rows"),
+                  np.asarray(each("finite")), widths, examples, example_rows, shares)
 
 
 
@@ -1865,13 +1930,20 @@ def judge(draw, seeds: int, label: str, *, examples: bool = False,
         raise Inconclusive(unresolved)
 
 
+Sized = Callable[[int, int, int], None]
+"""A sizing's progress (`_sized_count`'s `progress`): told each count it draws for, before it draws, with
+that count's place among the counts it may try and their number (its doublings from its start to `most`)."""
+
+
 def seeds_for(draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
-              examples: bool = False, conditioning: Conditioning | None = None) -> int:
+              examples: bool = False, conditioning: Conditioning | None = None,
+              progress: Sized | None = None) -> int:
     """The seeds `judge` declares over `draw`: ours paired with the reference on sizing seeds from
-    SIZING_FROM on, which no verdict draws (`_sized_count`), weighed as `judge` is with `conditioning`."""
+    SIZING_FROM on, which no verdict draws (`_sized_count`, told its `progress`), weighed as `judge` is with
+    `conditioning`."""
     drawn = _drawn_over(draw, examples, conditioning)
     return _sized_count(lambda first, stop: drawn(SIZING_FROM + first, SIZING_FROM + stop), label,
-                        start=start, most=most, paired=True)
+                        start=start, most=most, paired=True, progress=progress)
 
 
 def _leaf_examples(examples: list, start: int, count: int, index: int) -> list[np.ndarray] | None:
@@ -1940,22 +2012,30 @@ def _unresolved(label: str, measure: float, message: str) -> Inconclusive:
     return Inconclusive([Finding(label, "inconclusive", measure, message)])
 
 
-def _sized_count(drawn, label: str, *, start: int, most: int, paired: bool) -> int:
+def _sized_count(drawn, label: str, *, start: int, most: int, paired: bool, progress: Sized | None = None
+                 ) -> int:
     """`seeds_for`'s count over `drawn(start, stop)`, the draws of sizing seeds start to stop (`_Draws`):
     doubling from `start`, the first whose draws resolve every leaf on its own block and the next
     (`_confirmed`), paired (Dew's errors against the reference's) or the reference compared with itself
     (each block twice the count); where paired, the leaves the pooled ratio leaves unresolved within `most`
-    sized by their typical draw on the draws held. Fails past `most`."""
+    sized by their typical draw on the draws held. Fails past `most`. `progress`, where given, is told each
+    count before its draws are drawn (`Sized`): a long sizing, a recording's, shows how far it is."""
     count = max(start, FEWEST_SEEDS)
     if count > most:
         raise AssertionError(f"{label}: sizing starts at {count} seeds, past the {most} it may take; "
                              f"give the site more pilots or start lower")
+    counts = (most // count).bit_length()
+
+    def told(at: int) -> None:
+        if progress is not None:
+            progress(at, (at // max(start, FEWEST_SEEDS)).bit_length(), counts)
 
     def through(count: int) -> int:
         """The sizing seeds a count's draws run to: its block and the confirming one, each twice the count
         for the reference compared with itself."""
         return 2 * (count if paired else 2 * count)
 
+    told(count)
     held = drawn(0, through(count))
     while True:
         wide = _confirmed(held.names, held.theirs, count, held.mine if paired else None)
@@ -1964,6 +2044,7 @@ def _sized_count(drawn, label: str, *, start: int, most: int, paired: bool) -> i
         count *= 2
         if count > most:
             break
+        told(count)
         held = held.joined(drawn(len(held.theirs), through(count)))
     if paired:
         # The leaves the pooled ratio does not size within `most`, its draws ruled by their largest (each arm

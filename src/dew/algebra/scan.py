@@ -54,7 +54,16 @@ from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.nested import nested
-from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, twice_scaled, vanishing
+from dew.nn.precision import (
+    accurate_exp,
+    at_least_fp32,
+    compensated_add,
+    renormalized_add,
+    rounding_alone,
+    twice_scaled,
+    uncontracted,
+    vanishing,
+)
 from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
@@ -1321,7 +1330,7 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False, resta
     rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
     element of it the first of its segment's, in either direction: a suffix sums to its segment's last).
     `low`, where given, is each value's own low part, the values then double floats themselves (an exact
-    product's pair, `two_product`: Mamba-3's turns). Each pair joined renormalized (`compensated_add`), the
+    product's pair, `two_product`: Mamba-3's turns). Each pair joined renormalized (`renormalized_add`), the
     hand math's sum: a pair left unrenormalized held a residual that a product XLA:CPU fused into its sum (a
     rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966).
     A nested program (`dew.nn.nested`), traced once for its arguments' types within a trace: the associative
@@ -1332,7 +1341,18 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False, resta
     scan reads each at every level (Mamba-3's frames took a step 13% past its kernels on a GH200 so, row
     7402): prefixes alone, a reverse scan's none."""
     low = jnp.zeros_like(values) if low is None else low
-    joined = compensated_add if wrap is None else (lambda left, right: wrap(compensated_add(left, right)))
+    # Each value read as one where it is made (`uncontracted`, or its additions marked to round alone), once:
+    # the scan's partial sums are its additions', which its combine reads unfenced (`renormalized_add`), where
+    # a fence at every level split its fusions (row 8498). A wrapped sum is no addition's, so a scan that
+    # wraps its sums fences each combine's (`compensated_add`).
+    with rounding_alone():
+        (values,) = uncontracted(values)
+
+    def renormalized(left, right):
+        with rounding_alone():
+            return renormalized_add(left, right)
+
+    joined = renormalized if wrap is None else (lambda left, right: wrap(compensated_add(left, right)))
     if chunk is not None:
         if reverse:
             raise ValueError("compensated's chunk walks prefixes alone: a reverse scan takes chunk=None")
@@ -1406,13 +1426,17 @@ def _chunk_walked(values, low, axis: int, restarts, joined: Callable,
 
 
 class _Split(NamedTuple):
-    """A decay `exp(x)` as two factors, each a normal float32 or one: `first`, `exp(max(x, -L))`, and `rest`,
-    `exp(x - max(x, -L))` (`L` its dtype's least normal's exponent, `_normal_floor`), applied in turn
-    (`_scaled`): each at most 1, so a value's product with them falls monotonically to its own, and a decay
-    alone past fp32's least normal (three gates of -40, `e^-120`) never zeroes a write of 2^100 whose decayed
-    value (`e^-51`) is normal (row 9660)."""
+    """A decay `exp(x)` as three factors, each a normal float32 or one: `first`, `exp(max(x, -L))`, `second`,
+    `exp(max(x - first's, -L))`, and `rest`, the remainder's (`L` its dtype's least normal's exponent,
+    `_normal_floor`; `_exponents`), applied in turn (`_scaled`): each at most 1, so a value's product with
+    them falls monotonically to its own. A decay alone past fp32's least normal (three gates of -40,
+    `e^-120`) never zeroes a write of 2^100 whose decayed value (`e^-51`) is normal (row 9660), nor one past
+    two normal factors' reach (2^-252: three gates of -58.375, `e^-175.125`) a state of 2^127 whose decayed
+    value (`e^-87.09`, 1.5e-38) is normal, where two factors' second was subnormal and flushed to zero.
+    Three normal factors reach 2^-378, past any finite value's way to a nonzero float32 (2^-277)."""
 
     first: jax.Array
+    second: jax.Array
     rest: jax.Array
 
 
@@ -1449,15 +1473,16 @@ def _flat_decays(decays: _Decays) -> tuple:
 
 def _decays_from(leaves: Sequence) -> _Decays:
     """`_flat_decays`' arrays as their decays."""
-    return _Decays(_Split(*leaves[0:2]), _Split(*leaves[2:4]), _Split(*leaves[4:6]), leaves[8],
-                   _Split(*leaves[6:8]), leaves[9])
+    width = len(_Split._fields)
+    entering, to_last, whole, before = (_Split(*leaves[at * width:(at + 1) * width]) for at in range(4))
+    return _Decays(entering, to_last, whole, leaves[4 * width], before, leaves[4 * width + 1])
 
 
 def _scaled(value, decay):
     """`value` times a decay (`_Split`'s factors in turn, else the array)."""
-    if isinstance(decay, _Split):
-        return value * decay.first * decay.rest
-    return value * decay
+    for factor in decay if isinstance(decay, _Split) else (decay,):
+        value = value * factor
+    return value
 
 
 def _normal_floor(dtype, base2: bool) -> float:
@@ -1465,21 +1490,29 @@ def _normal_floor(dtype, base2: bool) -> float:
     return math.ceil(math.log(float(jnp.finfo(dtype).tiny)) / (math.log(2.0) if base2 else 1.0))
 
 
-def _two_factors(base2: bool, exponent, kept) -> _Split:
-    """`exp(exponent)` (`exp2` where `base2`) as its two factors (`_Split`) where `kept`, else a crossed
-    decay's negative zero (`_crossed`) and one; each exponent masked before its exponential."""
-    floor = _normal_floor(exponent.dtype, base2)
-    exponent = jnp.where(kept, exponent, 0.0)
+def _exponents(exponent, floor: float) -> tuple:
+    """`exponent` (at most 0) as `_Split`'s three, each held from below at `floor` but the last (the rest),
+    summing to it exactly (each a difference of a multiple of `exponent`'s ulp and an integer `floor`, its
+    magnitude at most `exponent`'s)."""
     first = jnp.maximum(exponent, floor)
-    return _Split(jnp.where(kept, _exp(base2, first), -0.0),
-                  jnp.where(kept, _exp(base2, exponent - first), 1.0))
+    second = jnp.maximum(exponent - first, floor)
+    return first, second, exponent - first - second
+
+
+def _factors(base2: bool, exponent, kept) -> _Split:
+    """`exp(exponent)` (`exp2` where `base2`) as its factors (`_Split`, `_exponents`) where `kept`, else a
+    crossed decay's negative zero (`_crossed`) and ones; each exponent masked before its exponential."""
+    exponent = jnp.where(kept, exponent, 0.0)
+    first, *rest = (_exp(base2, part) for part in _exponents(exponent, _normal_floor(exponent.dtype, base2)))
+    return _Split(jnp.where(kept, first, -0.0), *(jnp.where(kept, factor, 1.0) for factor in rest))
 
 
 def _scaled_exp(value, exponent):
-    """`value` times `exp(exponent)` (natural units, at most 0: a walk's decay), its two factors in turn."""
-    floor = _normal_floor(exponent.dtype, base2=False)
-    first = jnp.maximum(exponent, floor)
-    return value * accurate_exp(first) * accurate_exp(exponent - first)
+    """`value` times `exp(exponent)` (natural units, at most 0: a walk's decay), its factors in turn
+    (`_Split`'s, `_exponents`)."""
+    for part in _exponents(exponent, _normal_floor(exponent.dtype, base2=False)):
+        value = value * accurate_exp(part)
+    return value
 
 
 def _decays(exponents, base2: bool) -> _Decays:
@@ -1521,10 +1554,10 @@ def _walked(exponents, base2: bool) -> jax.Array:
 
 
 def _vanished_walk(dtype) -> float:
-    """A walk's vanished decay in natural units: twice its dtype's vanished exponent (`vanishing`), so its two
+    """A walk's vanished decay in natural units: twice its dtype's vanished exponent (`vanishing`), so its
     factors applied in turn (`_scaled_exp`) are zero, where a walk's decay of `e^-120` (three gates of -40)
     takes a state of 2^100 to a normal `e^-51`, which a floor at the vanished exponent itself (-105) zeroed
-    (row 9660)."""
+    (row 9660); its last factor at it normal (`e^-36` in fp32), so every decay above it is kept."""
     return 2.0 * vanishing(dtype, base2=False)
 
 
@@ -1553,14 +1586,14 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN), and its
     # decay negative zero, which no exponential is (`_crossed`).
     between = jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), -0.0)
-    entering = _two_factors(base2, high + low, started)
+    entering = _factors(base2, high + low, started)
     return _Decays(entering=entering,
-                   to_last=_two_factors(base2, (high[-1] - high) + (low[-1] - low), ending),
-                   whole=_two_factors(base2, high[-1] + low[-1], started[-1]), between=between,
+                   to_last=_factors(base2, (high[-1] - high) + (low[-1] - low), ending),
+                   whole=_factors(base2, high[-1] + low[-1], started[-1]), between=between,
                    # A token back, `entering`'s and `between`'s shifted a row: through the tokens before the
                    # reader's alone, so a key whose decay vanishes at the reader is read whole (a document's
                    # start cuts them where the walk declares its resets, `_started`).
-                   entering_before=_Split(_back(entering.first, first=1.0), _back(entering.rest, first=1.0)),
+                   entering_before=_Split(*(_back(factor, first=1.0) for factor in entering)),
                    between_before=_back(between, first=-0.0))
 
 
@@ -1574,7 +1607,7 @@ def _started(decays: _Decays, resets) -> _Decays:
     at = jnp.asarray(resets, bool)[:, None]
     entering = decays.entering_before
     return decays._replace(entering_before=_Split(jnp.where(at, -0.0, entering.first),
-                                                  jnp.where(at, 1.0, entering.rest)),
+                                                  *(jnp.where(at, 1.0, factor) for factor in entering[1:])),
                            between_before=jnp.where(at[:, None], -0.0, decays.between_before))
 
 
@@ -1651,9 +1684,11 @@ def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
 
 
 def _split_term(decay: _Split, cotangent: _Split):
-    """A split decay's term of its exponent's gradient: its first factor's where its exponent is above the
-    floor (its rest one), its rest's below it (its first the floor's, a constant)."""
-    return jnp.where(decay.rest < 1, cotangent.rest * decay.rest, cotangent.first * decay.first)
+    """A split decay's term of its exponent's gradient: the factor whose exponent moves with it
+    (`_exponents`), its first's where its exponent is above the floor (the others one), its second's where
+    the remainder is (the first the floor's, a constant), its rest's below both."""
+    moved_first = jnp.where(decay.second < 1, cotangent.second * decay.second, cotangent.first * decay.first)
+    return jnp.where(decay.rest < 1, cotangent.rest * decay.rest, moved_first)
 
 
 

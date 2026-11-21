@@ -353,16 +353,23 @@ def test_a_launchs_cost_counts_a_scalar_predicate_as_the_gpu_computes_it(predica
     at the output dtype it names, base review f9953e23a F1; int4's wrap, 0f72bd41c F1), and both branches of
     each warpgroup where the predicate is a float's, which the fold computes none of. Each kernel lowered for
     a GPU: a uint64's wrap (edd99fc1d F1) is no cell, as Mosaic GPU lowers no uint64 arithmetic of a
-    warpgroup's index (std::bad_cast, Lane's and Warpgroup's alike)."""
+    warpgroup's index (std::bad_cast, Lane's and Warpgroup's alike). Its cost, JAX's in-memory caches
+    cleared before it, compiles no program (`Compiles`: no backend compile within its trace; row 8707, the
+    fold proved through the launch that consumes it, not its helper alone)."""
+    from dew.telemetry.compiles import Compiles
+
     def body(x_ref, o_ref, row):
         wg = lax.axis_index("wg").astype(jnp.int32)
         row[...] = lax.cond(predicate(wg), jnp.exp, lambda value: value, row[...])
 
     launch = _kernel(body, predicate)
     lowered_for(launch, (_ROW,), "sm90")
-    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
+    jax.clear_caches()
+    with Compiles(None) as compiles:
+        traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
     assert [equation.params["cost_estimate"].transcendentals for equation in programs.equations(traced.jaxpr)
             if "cost_estimate" in equation.params] == [exponentials]
+    assert compiles.count == 0, compiles.programs
 
 
 def test_a_launchs_cost_folds_a_bodys_64_bit_arithmetic_at_its_width():
@@ -635,3 +642,41 @@ def test_identical_scale_smem_bodies_keep_independent_emission_work():
     gc.collect()
     fixed = emission.emitted(closed, 1, "wg").roles[0].fixed
     assert fixed == work, fixed
+
+
+def test_launch_seconds_shares_sm_units_overlaps_paths_and_prices_integer_work():
+    """`cost.launch_seconds` (rows 10793, 10809, 10810):
+    1. Integer-only `Work` at `programs = multiprocessors + 1` and `resident = 1` prices launch latency
+       plus two waves of per-program integer work at one SM's integer rate.
+    2. Co-resident programs (`resident = 2`) share one SM's throughput units (`ceil(n / SMs)` times
+       per-program unit time, not divided by `resident`) while overlapping dependent paths (`ceil(n /
+       (SMs * resident))` waves of `path`)."""
+    target = generation.gpu_target("sm90")
+    sms = target.multiprocessors
+    assert sms is not None
+    launch = target.launch_seconds or 0.0
+    sm_rates = cost.rates(target, device=False)
+    assert sm_rates.integer is not None and sm_rates.tensor is not None
+
+    # 1. Integer-only work across sms + 1 programs (two waves on the busiest SM).
+    total_int = 1e11
+    programs = sms + 1
+    expected_int = 2 * ((total_int / programs) / sm_rates.integer) + launch
+    got_int = cost.launch_seconds(Work(integer_operations=total_int, kernels=1.0), programs, target,
+                                  resident=1)
+    assert got_int == expected_int, (got_int, expected_int)
+
+    # 2. Throughput-bound work: 176 programs on 132 SMs takes 2 programs on the busiest SM even at
+    #    resident=2 (co-resident programs share one SM's tensor cores, not 2x peak).
+    total_flops = 1e12
+    expected_tput = 2 * ((total_flops / 176) / sm_rates.tensor) + launch
+    got_tput_r1 = cost.launch_seconds(Work(flops=total_flops, kernels=1.0), 176, target, resident=1)
+    got_tput_r2 = cost.launch_seconds(Work(flops=total_flops, kernels=1.0), 176, target, resident=2)
+    assert got_tput_r1 == expected_tput, (got_tput_r1, expected_tput)
+    assert got_tput_r2 == expected_tput, (got_tput_r2, expected_tput)
+
+    # 3. Latency/path-bound work: resident=2 overlaps the two programs on the busiest SM into 1 wave.
+    path_work = Work(span=1e4, kernels=1.0)
+    got_path_r1 = cost.launch_seconds(path_work, 176, target, resident=1)
+    got_path_r2 = cost.launch_seconds(path_work, 176, target, resident=2)
+    assert got_path_r2 < got_path_r1, (got_path_r2, got_path_r1)

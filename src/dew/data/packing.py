@@ -24,17 +24,10 @@ from dew.batch import Batch
 from dew.data.dataset import Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ACCOUNTS, DOCUMENT, ExpandStep, Pack
+from dew.data.placement import FirstFit, first_fit
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
-from dew.data.tokens import (
-    FirstFit,
-    PackedWindows,
-    chunk_lengths,
-    chunk_table,
-    entries,
-    first_fit,
-    packed_window,
-)
+from dew.data.tokens import PackedWindows, chunk_lengths, chunk_table, entries, packed_window
 
 
 def plan_name(pack: Pack, field: str) -> str:
@@ -78,16 +71,17 @@ position's order fingerprints."""
 
 
 def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int | None = 0) -> Mapping[str, np.ndarray]:
-    """The first-fit plan of documents of `lengths` into `pack.seq_len`-token
-    windows, a document longer than a window cut into window-long pieces
+    """The first-fit plan (best-fit's, for a best-fit pack's whole documents) of documents of `lengths`
+    into `pack.seq_len`-token windows, a document longer than a window cut into window-long pieces
     `overlap` tokens apart: each chunk's document, offset and size, the chunks
     in packing order and where each window starts in it, each window's
     targets, and the windows that hold one (`accepted`), with their total and
     the count left out. With `overlap` None no chunk step cuts them: each document is one entry, an
     empty one too, as a stream of them places it (`FirstFitPacked`), counted against the windows'
     segments (row 6277)."""
-    if pack.policy != "first-fit":
-        raise ValueError("indexed packing currently needs policy='first-fit'")
+    if pack.policy == "concat" or (pack.policy == "best-fit" and overlap is not None):
+        # A best-fit pack places documents whole, as grain's packer does: planned for its publication alone.
+        raise ValueError("indexed packing plans first-fit windows, and best-fit ones of whole documents")
     if pack.along:
         raise ValueError("a plan of document lengths packs tokens alone; fields along other axes "
                          "pack as their rows arrive")
@@ -97,7 +91,7 @@ def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int | None = 0) -> Ma
     else:
         chunk_sizes = chunk_lengths(lengths, pack.seq_len, overlap)
         documents, offsets = chunk_table(lengths, pack.seq_len, overlap)
-    order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins, pack.segments)
+    order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins, pack.segments, policy=pack.policy)
     targets = np.asarray(
         [
             sum(max(0, int(chunk_sizes[index]) - 1) for index in order[starts[window] : starts[window + 1]])
@@ -478,6 +472,10 @@ class PackedSource(View[Source]):
         """The inputs each window of the pack holds (`Pack.max_length`), which a token budget divides
         into rows (`dew.data.pipeline.TokenGeometry`)."""
         return self.plan.pack.max_length
+
+    def packed_layout(self) -> tuple[Pack, int]:
+        """Its pack and the most documents a window it reads holds (`dew.data.pipeline.PackedLayout`)."""
+        return self.plan.pack, self.plan.most_documents
 
     def consumed(self, read: Read) -> PackedSource:
         documents = _consumed(self.source, "indexed" if read == "streamed" else read)

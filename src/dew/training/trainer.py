@@ -451,8 +451,7 @@ class Trainer(Generic[Loss, Effects]):
             # step donates the state.
             scale=None if self._loss_scale is None else jax.tree.map(transferred_copy, self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
-            variables=params,
-            opt_state=opt_state,
+            variables=params, opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
             # step donates the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(transferred_copy, select(params, ema.select)),
@@ -833,8 +832,7 @@ class Trainer(Generic[Loss, Effects]):
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints.rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
-        differs = computation_differs(checkpoints.artifact(resume), self._artifact(),
-                                      checkpoints.training(resume), self.objective.training_record())
+        differs = computation_differs(self, checkpoints, resume)
         if differs:
             raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
                              f"computation ({', '.join(differs)}); resume it with the objective, its "
@@ -2138,6 +2136,7 @@ class Trainer(Generic[Loss, Effects]):
         ends on, ranked by them: a budget's last step, a stream's that ran out and a
         plateau's (`_between_steps`)."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
+        state = plan.closed_at_budget(state, run.clock.read)
         self._take(plan, run, interval, state, unlogged=True)
         self._read_taken(run)
         if run.notice is not None and run.cooling is None:
@@ -2372,8 +2371,8 @@ class Trainer(Generic[Loss, Effects]):
         return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
                 # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
                 "rung": {**self._compiler.checkpoint_rung(), "host": list(self.layout.host)},
-                "artifact": self._artifact(), "training": self.objective.training_record(),
-                "boxed": self._boxed_axes(),
+                "artifact": self._artifact(), "training": self.phase_passes.training_record(self.objective),
+                "boxed": self._boxed_axes(), "held_apart": self._staging.apart,
                 "rollout": None if weights_only else _rollout_saved(self.rollout)}
 
     def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,

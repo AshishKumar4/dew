@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import raw_leaf
 from scipy import integrate, optimize, special, stats
 from test_pass_weights import looped, phased_trainer
 
@@ -181,11 +182,6 @@ def token_batch(seed: int = 2) -> dict:
     return {"text": jnp.asarray(token_draw(seed))}
 
 
-def held(leaf):
-    """A state's leaf as its bits compare: a key's words (`jax.random.key_data`), any other leaf itself."""
-    return jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf
-
-
 def words(key) -> tuple[int, ...]:
     """A key's words, as a draw reads them."""
     return tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
@@ -226,13 +222,50 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
         np.testing.assert_array_equal(np.asarray(loss), np.asarray(own_loss), err_msg=f"microbatch {index}")
         for name, value in jax.device_get(metrics).items():
             np.testing.assert_array_equal(value, jax.device_get(own_metrics)[name], err_msg=f"{index} {name}")
-        ours, theirs = (jax.tree_util.tree_flatten_with_path(jax.device_get(jax.tree.map(held, tree)))[0]
+        ours, theirs = (jax.tree_util.tree_flatten_with_path(jax.device_get(jax.tree.map(raw_leaf, tree)))[0]
                         for tree in (state, own))
         unlike = [jax.tree_util.keystr(path) for (path, a), (_, b) in zip(ours, theirs, strict=True)
                   if not np.array_equal(a, b)]
         assert not unlike, f"microbatch {index} at {count} passes: {unlike}"
     assert drawn == [TRAINED.count(words(sampled.key), position) for position in range(8)]
     assert len(set(drawn)) > 1 and interval.microbatches == 8
+
+
+@pytest.mark.parametrize("cap", [2, CAP])
+def test_a_sampled_run_of_an_implicit_loop_in_bf16_reads_its_caps_narrow_copies_at_every_count(cap):
+    """A bf16 decoder whose implicit loop's pass count is drawn per microbatch, its parameters read through
+    narrow copies (row 10770): at its cap the loop's layers sum their cotangents over its passes and are read
+    whole, and at one pass they are cast once and could be copied; and at a cap of two its one later pass
+    casts θ once, which one pass reads nowhere. The window reads the cap's copies at every count, the
+    loop's layers whole, θ through its copy where a pass reads it, so it plans and steps each count drawn,
+    where it refused at its first step."""
+    from dew.nn.kernels.generation import chosen
+
+    model = dataclasses.replace(looped(implicit=True, steps=cap), dtype=jnp.bfloat16)
+    batch = token_batch()
+    law = dataclasses.replace(TRAINED, cap=cap)
+    with chosen(narrow_copies="on"):
+        sampled = phased_trainer(model, 0, None, sampled_passes=law, accumulation=2)
+        state, _, _ = sampled.place()
+        step = sampled.compile(state, batch)
+        interval = Interval(time.time(), None, microbatches=0)
+        drawn = []
+        for index in range(8):
+            step.drawn(interval, index)
+            drawn.extend(step.counts)
+            state, loss, *_ = step(state, batch)
+            assert np.isfinite(float(loss)), (index, step.counts)
+        # The copies a run of the cap's passes alone reads, the loop's layers whole among them.
+        alone = phased_trainer(model, 0, None, accumulation=2)
+        start, _, _ = alone.place()
+        stepped, *_ = alone.compile(start, batch)(start, batch)
+
+    def copied(compute) -> list[str]:
+        flat = jax.tree_util.tree_flatten_with_path(compute)[0]
+        return sorted(jax.tree_util.keystr(path) for path, _ in flat)
+
+    assert len(set(drawn)) > 1 and state.compute is not None, drawn
+    assert copied(state.compute) == copied(stepped.compute) != [], copied(state.compute)
 
 
 def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
@@ -336,6 +369,14 @@ def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path, caplog):
     assert noted() == 1 and int(taken.step) == 4
     assert int(resumed.step) == 4
     assert_same(parameters(whole), parameters(resumed), "the resumed sampled run is not the run unstopped")
+    # A resume drawing by another law, or by none, would draw another schedule of passes from the same key
+    # and positions: its checkpoint's sampled law is the computation it trained, and the resume is refused
+    # (row 10783).
+    for law in (dataclasses.replace(TRAINED, mean=2.5), None):
+        with pytest.raises(ValueError):
+            phased_trainer(looped(steps=CAP), 0, None, sampled_passes=law,
+                           checkpoints=Checkpoints(str(tmp_path / "resumed"), keep=8)).fit(
+                phased_loader(tokens), steps=5, log_every=100, checkpoint_every=1, resume="require")
 
 
 def unnormed() -> CausalTransformer:

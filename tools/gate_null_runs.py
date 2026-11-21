@@ -491,7 +491,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
         # The reference and its truth run their programs unrewritten, as a site's do.
         reference, truth = unrewritten(reference), unrewritten(truth)
         [pool] = _drawn(reference, reference, draw, range(3 * OFFSET * 1024, 3 * OFFSET * 1024 + 512),
-                        truth)
+                        truth, repeats=True)
         names, values = pool.names, np.asarray(pool.mine)
     else:
         names, values = ["leaf"], None
@@ -531,7 +531,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
     import numpy as np
     from reference_error import _verdict
 
-    from dew.parity import NO_ZERO_ROWS, _Draws, _largest_share, _staged
+    from dew.parity import ELEMENT, NO_ZERO_ROWS, SHARE_KINDS, _Draws, _largest_share, _staged
     from dew.parity_stages import staged_units
 
     rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified) + 2 * int(shared)]
@@ -553,7 +553,11 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
             # Each seed's worst row's largest element's share, as check 1 reads each arm's.
             shares.append(_largest_share(errors[np.arange(span), np.argmax(sized, axis=1)]))
         worst = np.stack(arms, axis=-1)[:, None, :]
-        shares = np.stack(shares, axis=-1)[:, None, :]
+        # Each seed's shares as check 1's draws hold them (`_Draws.shares`, seed by leaf by kind by arm): the
+        # largest element's; the share along a truth row unknown, the controls drawing a row's size alone.
+        held = np.full((span, 1, len(SHARE_KINDS), 2), np.nan)
+        held[:, 0, ELEMENT] = np.stack(shares, axis=-1)
+        shares = held
 
         def drawn(start, stop, worst=worst, shares=shares):
             count = stop - start
@@ -637,7 +641,7 @@ def main(argv: list[str]) -> int:
 
         seeds = range(2 * OFFSET * 1024 + options.chunk * options.draws,
                       2 * OFFSET * 1024 + (options.chunk + 1) * options.draws)
-        [draws] = _drawn(reference, reference, draw, seeds, truth)
+        [draws] = _drawn(reference, reference, draw, seeds, truth, repeats=options.chunk == 0)
         print(json.dumps({"class": options.name, "chunk": options.chunk, "names": draws.names,
                           "mse": np.exp(np.asarray(draws.mine)).tolist(),
                           "log_worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)

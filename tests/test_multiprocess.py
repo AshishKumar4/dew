@@ -37,7 +37,7 @@ from interop_support import assert_same_stored_tensors, written_tensors
 from pool_records import served_image
 from process_support import (
     ProcessGroup,
-    free_port,
+    coordinator_port,
     output,
     report_of,
     run_pool,
@@ -723,7 +723,7 @@ def test_the_layouts_a_gang_crosses_hosts_with_match_one_device_across_four_proc
     rows = tmp_path / "rows.json"
     command = [sys.executable, "tools/layout_parity.py", "--models", model,
                "--seeds", str(POOLED_LAYOUT_SEEDS), "--out", str(rows), "--layouts", layout]
-    pool = {"DEW_PROCESS_COUNT": "4", "JAX_COORDINATOR_ADDRESS": f"127.0.0.1:{free_port()}"}
+    pool = {"DEW_PROCESS_COUNT": "4", "JAX_COORDINATOR_ADDRESS": f"127.0.0.1:{coordinator_port()}"}
     with ProcessGroup() as group:
         group.running.extend(start_process(command, 1, environment={**pool, "DEW_PROCESS_ID": str(rank)})
                              for rank in range(4))
@@ -761,6 +761,41 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
     assert pool[0]["sharding"]["fully_addressable"] == [False]
     assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
                            worker.params_dict(whole_state.variables))
+
+
+@pytest.mark.distributed
+def test_a_pipeline_whose_stages_are_each_one_processs_checkpoints_and_resumes(tmp_path):
+    """A two-stage pipeline over two processes, each stage one process's devices alone: every process reads
+    the finite check over leaves each placed on one process's devices alone, alike; the run checkpoints on
+    its local tier and resumes from it, then from its persistent tier, each stage writing its own rows; and
+    the persistent checkpoint, the plain per-layer one with its frozen scalar a layer, resumes in this one
+    process on one stage (row 10780: each rank read each stage's finite flag, and Orbax refused each
+    stage's rows as host-local)."""
+    from test_stage_local import ADAM, decoder, stream, trainer
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import MeshSpec
+
+    pool = run_pool("stage_save", tmp_path / "pool", 2, devices=2, run_dir=tmp_path / "run",
+                    local_dir=tmp_path / "local", script=Path(__file__).with_name("stage_save_worker.py"))
+    assert [report["finite"] for report in pool] == [[True, False]] * 2, pool
+    # A scalar on the second stage and a vector on the first, written and read back by the processes that
+    # hold them, the other making each with no shard; a pmap's output on each process's own devices refused.
+    assert [report["handled"] for report in pool] == [
+        {"scalar": {"shape": [], "held": []}, "vector": {"shape": [4], "held": [[0.0, 1.0, 2.0, 3.0]]}},
+        {"scalar": {"shape": [], "held": [3.5]}, "vector": {"shape": [4], "held": []}}], pool
+    assert [report["refused"] for report in pool] == [True, True], pool
+    # A value each process puts on its own stage's devices under one name, no checkpoint's row, is refused.
+    assert [report["stray_refused"] for report in pool] == [True, True], pool
+    # Each process's diagonal of a tensor-split array, written to its local directory and read back whole
+    # (row 10813: Orbax's local tier wrote one replica's shards, one index of the two each process holds).
+    assert [report["diagonal"] for report in pool] == [{"held": True}] * 2, pool
+    # The stepped step and the persistent tier's latest after each run: the first ran on the local tier
+    # alone, the second resumed from it, the third from the persistent tier's step 2.
+    assert [report["steps"] for report in pool] == [[[1, None], [2, 2], [3, 2]]] * 2, pool
+    alone = trainer(decoder(layer_scalar="frozen"), ADAM, MeshSpec(fsdp=2), 2,
+                    checkpoints=Checkpoints(str(tmp_path / "run")))
+    assert int(alone.fit(stream(), steps=3, log_every=1, resume="require", checkpoint_final=False).step) == 3
 
 
 # --------------------------------------------------------------------------
@@ -1387,7 +1422,7 @@ def killed_local_pool(tmp_path_factory):
     has committed local step eight, with persistent steps three and six."""
     directory = tmp_path_factory.mktemp("killed-local")
     channels = [channel(directory / f"blocked{index}") for index in range(2)]
-    coordinator = f"127.0.0.1:{free_port()}"
+    coordinator = f"127.0.0.1:{coordinator_port()}"
     (directory / "killed").mkdir()
     pool = [spawn("fit", directory / "killed" / f"process{index}.json", processes=2,
                   process_id=index, coordinator=coordinator,
@@ -1449,7 +1484,7 @@ def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
     waiting for ever in barriers the other will not reach: that shard's pool
     hung until its 600 s timeout."""
     directory = tmp_path
-    coordinator = f"127.0.0.1:{free_port()}"
+    coordinator = f"127.0.0.1:{coordinator_port()}"
     (directory / "out").mkdir()
     pool = [spawn("fit", directory / "out" / f"process{index}.json", processes=2, process_id=index,
                   coordinator=coordinator, **local_flags(directory), fail_local_save=LOCAL_EVERY * 2)
@@ -1530,7 +1565,7 @@ def killed_split_pool(tmp_path_factory):
     holds no copy."""
     directory = tmp_path_factory.mktemp("killed-split")
     channels = [channel(directory / f"blocked{index}") for index in range(2)]
-    coordinator = f"127.0.0.1:{free_port()}"
+    coordinator = f"127.0.0.1:{coordinator_port()}"
     (directory / "killed").mkdir()
     pool = [spawn("fit", directory / "killed" / f"process{index}.json", processes=2,
                   process_id=index, coordinator=coordinator,
@@ -1578,6 +1613,16 @@ def test_a_process_that_lost_its_copy_of_a_key_of_another_implementation_recover
         assert report["zeros"] == [[4], [4]]
         for name in ("key", "shape"):
             assert report[name] == report["expected"]
+
+
+@pytest.mark.distributed
+def test_a_local_step_on_two_meshes_is_recovered_on_each_from_a_replica(tmp_path):
+    """Two leaves the pool replicates, each on its own mesh of the same devices: the local step's record holds
+    a grid a mesh, the holders cover both, and the process that lost its copy receives each leaf's values
+    over its own mesh (row 10814; `replica_key_worker.replica_grids`)."""
+    for report in run_pool("replica_grids", tmp_path / "pool", 2, devices=2, script=REPLICA_KEY):
+        assert report["grids"] == 2 and report["covered"] is True, report
+        assert report["recovered"] == report["expected"], report
 
 
 # --------------------------------------------------------------------------

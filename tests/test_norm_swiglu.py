@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import drawn_on_the_host
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, equations, with_gradients
 from sharded import assert_runs_per_shard, placed_on
@@ -119,20 +120,23 @@ def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
                     draw, label, seeds=seeds, truth_fn=truth)
 
 
-def compare(functions, draw, labels, seeds, *, judged=None):
+def compare(functions, draw, labels, seeds, *, judged=None, site: str = ""):
     """Every output's dtype on `draw`'s first operands (`gated`); the accuracy of the `judged` labels (every
-    one by default) held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`)."""
+    one by default) held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`), its site's label the
+    labels' and `site`'s, where one test compares several (a GPU tier part's store holds one site a label)."""
     xla, pallas, exact = functions
-    operands, seed = draw(0)
-    reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
-    actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
+    # Drawn on the host and their types alone read, nothing computed: a GPU tier part's prepare computes
+    # nothing on its GPU before the site below.
+    operands, seed = drawn_on_the_host(draw, 0)
+    reference = jax.eval_shape(functools.partial(evaluated, xla), operands, seed)
+    actual = jax.eval_shape(functools.partial(evaluated, pallas), operands, seed)
     gated(labels, actual, reference)
 
     def leaves(result):
         return {label: value for label, value in zip(labels, result, strict=True)
                 if value is not None and label in (judged or labels)}
 
-    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(judged or labels), seeds)
+    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(judged or labels) + site, seeds)
 
 
 def gated(labels, actual, reference):
@@ -524,13 +528,16 @@ def swiglu_operands(shape, dtype, draw: int = 0):
 def each_config_holds(kernel, functions, draw, labels, seeds):
     """Each config the tuner may pick for `kernel` (`each_config` on `draw`'s first operands): the fused
     function, traced under it, held as `compare` holds it."""
-    operands, seed = draw(0)
+    operands, seed = drawn_on_the_host(draw, 0)
     configs = each_config(kernel, functools.partial(evaluated, functions[1]), operands, seed)
     assert len(configs) > 1
+    # Each config's site its own: a GPU flow's cells share their test's store, which holds one site a label
+    # (the norm cells' "y x scale" at every kernel, dtype, row shape and config collided there).
+    over = ", ".join(f"{np.shape(leaf)} {np.dtype(leaf.dtype).name}" for leaf in jax.tree.leaves(operands))
     for config in configs:
         try:
             with tuning.pinned({kernel: config}):
-                compare(functions, draw, labels, seeds)
+                compare(functions, draw, labels, seeds, site=f", {kernel.__name__} at {config} over {over}")
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
@@ -756,8 +763,8 @@ def a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_o
         y = gated_product("swiglu", implementation=implementation)(y, y).reshape(1, 4, 2, 64)
         return attention.attention_kernel(y, y, y).astype(jnp.float32).sum()
 
-    x = jax.device_put(jnp.linspace(-1, 1, 512, dtype=jnp.bfloat16).reshape(4, 128), cpu)
     with jax.default_device(cpu):
+        x = jax.device_put(jnp.linspace(-1, 1, 512, dtype=jnp.bfloat16).reshape(4, 128), cpu)
         eager = jax.value_and_grad(seams)(x)
     with jax.set_mesh(Mesh(np.array([cpu]), ("data",))):
         jitted = jax.jit(jax.value_and_grad(seams))(x)

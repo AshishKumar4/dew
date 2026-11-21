@@ -1115,6 +1115,50 @@ def test_a_products_mode_prices_it():
     assert product(eight, jnp.float8_e4m3fn).fp8_flops == flops
 
 
+def _priced(fn, *shapes, schedule=None):
+    """`fn`'s program over fp32 ones of `shapes`, its price (`cost.model`, under XLA's schedule on an H100
+    where none is given) and its traced program."""
+    traced = jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.float32) for shape in shapes))
+    region = terms.region(traced)
+    graph, bundle, _ = program.graphed(region)
+    _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag", cost_model=cost.model(
+        region, schedule or cost.fused(generation.TARGETS["sm90"])))
+    return price, traced
+
+
+@pytest.mark.parametrize("name", ["power", "clamp", "exponential", "selection", "conversion", "reduction"])
+def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(name):
+    """A term's arithmetic (`cost.work`) is what the kernels' counter prices its equation at in a kernel's
+    body (`emission.operation_work`, the one rule): a power an exponential an element, a clamp a maximum and
+    a minimum, an exponential, a comparison and a selection, a conversion and a reduction theirs, where the
+    algebra's own table priced a power as an operation and the counter a clamp as one (row 5901)."""
+    from dew.nn.kernels.templates import emission
+
+    fn = {"power": jax.lax.pow,
+          "clamp": lambda x, y: jax.lax.clamp(np.float32(-0.5), x, np.float32(0.5)) + y,
+          "exponential": lambda x, y: jax.lax.exp(x) * y,
+          "selection": lambda x, y: jax.lax.select(x < y, x, y),
+          "conversion": lambda x, y: jax.lax.convert_element_type(x, jnp.bfloat16) * y.astype(jnp.bfloat16),
+          "reduction": lambda x, y: jnp.sum(x * y, axis=-1)}[name]
+    price, traced = _priced(fn, (64, 128), (64, 128))
+    counted = emission.emitted(traced.jaxpr, 1, None).fixed
+    fields = ("operations", "exponentials", "conversions")
+    assert [getattr(price.work, field) for field in fields] == [getattr(counted, field) for field in fields]
+
+
+def test_an_operation_no_rule_prices_makes_no_form_cheaper_for_taking_more_of_it():
+    """An operation no rule prices (an atan2: no kernel's body holds one and no probe has measured it) is
+    work at no rate (`Work.unpriced_operations`), so a form taking more of it is never cheaper
+    (`cost.cheaper`), whatever its priced work's seconds: priced as one operation an element, two atan2s
+    compared cheaper than one beside a product."""
+    one, _ = _priced(lambda x, y, w: jax.lax.atan2(x, y) + jnp.sum(jnp.dot(w, w)), (64, 128), (64, 128),
+                     (512, 512))
+    two, _ = _priced(lambda x, y, w: jax.lax.atan2(x, y) + jax.lax.atan2(y, x) + jnp.sum(w), (64, 128),
+                     (64, 128), (512, 512))
+    assert two.value < one.value and not cost.cheaper(two, one)
+    assert (one.work.unpriced_operations, two.work.unpriced_operations) == (64 * 128, 2 * 64 * 128)
+
+
 def test_a_rewrites_persisted_record_names_the_limits_its_saturation_had():
     """A rewrite's record as a fit search persists it (`planning.rewrite_record`, `FitSearch.kernels`): the
     node and iteration limits its saturation had beside whether one stopped it (docs/design/algebra.md
@@ -1791,3 +1835,67 @@ def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
     held = traced(made())
     gc.collect()
     assert held() is None
+
+
+def _mapped_over_rows(program, specs, devices: int = 2):
+    """`program` mapped per shard (`jax.shard_map`) over `devices` of this process's devices, its axis
+    `data`, its inputs split as `specs` (each a PartitionSpec's axes) and its output along its rows."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.asarray(jax.devices()[:devices]), ("data",))
+    return jax.shard_map(program, mesh=mesh, in_specs=tuple(PartitionSpec(*spec) for spec in specs),
+                         out_specs=PartitionSpec("data"))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_bodys_sums_take_their_cheaper_form_varying_as_the_values_they_replace():
+    """Two sums a manual mesh's body joins (`two_sums`, every input split along their rows): the cheaper
+    form, traced over the window's inputs as the body types them (their manual axes among them,
+    `fusion.typed`), varies as the values it replaces do, so it is spliced (row 6578's review, F5: traced
+    over unsplit types, its values varied over nothing and the output-type gate discarded it), and the
+    program computes what it computes (check 1)."""
+    mapped = _mapped_over_rows(two_sums, (("data",), ("data",), ("data",)))
+    assert cheaper_spliced(mapped, *rows(17, *SHAPES_MARKED))
+    assert_as_exact(jax.jit(algebra.rewritten(mapped)), jax.jit(mapped),
+                    lambda seed: rows(seed, *SHAPES_MARKED), "a mapped body's joined sums", seeds=8)
+
+
+def _span_of_a_constant_beside_joined_sums(x, y, a):
+    """An Algebra span closing over an array (`cumsum(sin(x * held))`, nothing the rules lower) beside two
+    sums the pass joins (`two_sums`): the constant-span witnesses' body."""
+    from dew.nn.derivatives import Algebra, marked
+
+    held = np.linspace(0.5, 1.5, x.shape[-1], dtype=np.float32)
+    kept = marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x * held), axis=-1))(x)
+    return kept, two_sums(x, y, a)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_body_whose_rewrite_holds_a_constant_binds_it_as_an_operand():
+    """A manual mesh's body holding an Algebra span that closes over an array (`cumsum(sin(x * held))`,
+    nothing the rules lower) beside two sums the pass joins (`two_sums`): the join is spliced and the span,
+    its array a constant of its own, is rewritten within its call, so no constant reaches the map's body,
+    which JAX's lowering binds none of (row 6578's review, F1: opened, its array was the body's and the
+    map's lowering refused it), and the program computes what it computes."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    split = PartitionSpec("data")
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    mapped = jax.shard_map(_span_of_a_constant_beside_joined_sums, mesh=mesh, in_specs=(split,) * 3,
+                           out_specs=(split, split))
+    assert cheaper_spliced(mapped, *rows(18, *SHAPES_MARKED))
+    assert_as_exact(jax.jit(algebra.rewritten(mapped)), jax.jit(mapped),
+                    lambda seed: rows(seed, *SHAPES_MARKED), "a mapped body's span beside joined sums",
+                    seeds=8)
+
+
+def test_a_checkpoints_body_holding_a_span_of_a_constant_lowers_as_written():
+    """A checkpoint (`jax.checkpoint`) whose body holds an Algebra span that closes over an array beside two
+    sums the pass joins: the join is spliced and the span, its array a constant of its own, is rewritten
+    within its call, so no constant reaches the checkpoint's body, which JAX stages and lowers with none
+    (row 6578's review: opened, its array was the body's and the checkpoint's lowering refused it), and the
+    program computes what it computes."""
+    both = jax.checkpoint(_span_of_a_constant_beside_joined_sums)
+    assert cheaper_spliced(both, *rows(20, *SHAPES_MARKED))
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a checkpoint's span of a constant beside joined sums", seeds=8)

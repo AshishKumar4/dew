@@ -30,7 +30,7 @@ from jax.experimental import pallas as pl
 from jax.extend import core as jcore
 from jax.interpreters import batching, mlir
 
-from dew.algebra import means
+from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation, launches
@@ -45,7 +45,7 @@ def _trimmed(padded, stacked, *, queries: int, width: int) -> tuple[jax.Array, j
     return padded[:, :, :queries, :, :width], stacked[0, ..., :queries], stacked[1, ..., :queries]
 
 
-def _value(padded, stacked, *extra, units: means.Units, queries: int, width: int,
+def _value(padded, stacked, *extra, units: windows.Units, queries: int, width: int,
            raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None):
     """The law's merge of a split walk's padded slices (`_trimmed`) and optional raw `Initial` state
     (`extra` = `(init_m, init_total, init_acc)`), delegated directly to `algebra.merged_state`. When
@@ -57,9 +57,7 @@ def _value(padded, stacked, *extra, units: means.Units, queries: int, width: int
     if out_dtype is None:
         return tuple(state[:3])
     assert out_heads is not None
-    finished = jnp.where(algebra.expand(state.total > 0, state.acc), state.acc, 0.0)
-    return (ungrouped_rows(finished, out_heads).astype(out_dtype),)
-
+    return (ungrouped_rows(state.acc, out_heads).astype(out_dtype),)
 def merged_split(spec: algebra.Forward, padded, stacked, *, queries: int, width: int,
                  initial: Initial | None = None) -> algebra.Partial:
     """A split walk's padded slices merged (`_trimmed`'s layout) with the call's `initial` state where it has
@@ -156,18 +154,13 @@ def _tangent(units, queries, width, raw_scale, out_dtype, out_heads, primals, ta
     along an exponential's operand, which it refuses (the base review of 9bc8a9da1, F1)."""
     value = functools.partial(_value, units=units, queries=queries, width=width, raw_scale=raw_scale,
                               out_dtype=out_dtype, out_heads=out_heads)
-    moving = [i for i, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero)]
-    if not moving:
+    live = [not isinstance(tangent, SymbolicZero) for tangent in tangents]
+    if not any(live):
         out = value(*primals)
         return out, tuple(SymbolicZero(jax.typeof(x).to_tangent_aval()) for x in out)
-    if len(moving) == len(primals):
-        return jax.jvp(value, primals, tangents)
-
-    def moved(*active):
-        it = iter(active)
-        return value(*(next(it) if i in moving else primal for i, primal in enumerate(primals)))
-
-    return jax.jvp(moved, tuple(primals[i] for i in moving), tuple(tangents[i] for i in moving))
+    perturbed, fill = programs.holes(primals, live)
+    moving = tuple(tangent for tangent, is_live in zip(tangents, live, strict=True) if is_live)
+    return jax.jvp(lambda *active: value(*fill(active)), tuple(perturbed), moving)
 
 _merged = contracted("test_a_padded_merges_derivatives_are_the_laws")(
     declared_tangent(KernelGlue(), _launched, _tangent, nondiff_argnums=(0, 1, 2, 3, 4, 5),
@@ -176,9 +169,9 @@ _merged = contracted("test_a_padded_merges_derivatives_are_the_laws")(
 def _chunks(slices: int, read: Callable[[jax.Array], tuple]) -> tuple[Callable, int]:
     """A row's `slices` as the law reads them a chunk at a time (`means.merged_state_chunked`), `(load,
     chunks)`: `read(start)` a chunk's outputs `[K, 1, C]`, maxima and denominators `[K, 1]` from slice
-    `start`, `K` the law's width of a row of them (`means.chunk_width`), its slots past the count held by
+    `start`, `K` the law's width of a row of them (`windows.chunk_width`), its slots past the count held by
     none (`valid`)."""
-    width = means.chunk_width(slices)
+    width = windows.chunk_width(slices)
 
     def load(c):
         start = mosaic.step_index(c) * width
@@ -194,7 +187,7 @@ THREADS = 4 * 32
 """A program's threads: Pallas Triton's default of four warps (`CompilerParams.num_warps`), the merge's."""
 
 
-def _launch_for_block(units: means.Units, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
                       queries: int, width: int, block: int, has_initial: bool = False,
                       raw_scale: float | None = None, out_dtype=None,
                       out_heads: int | None = None) -> tuple[cost.Work, cost.Work, int]:
@@ -208,7 +201,7 @@ def _launch_for_block(units: means.Units, padded: jax.ShapeDtypeStruct, stacked:
     batch, slices, _, heads, read_width = padded.shape
     total_slices = slices + int(has_initial)
     channels = 1 << (width - 1).bit_length()
-    chunks = -(-total_slices // means.chunk_width(total_slices))
+    chunks = -(-total_slices // windows.chunk_width(total_slices))
     blocks = channels // block
     rows = batch * queries * heads
     launched = rows * blocks
@@ -226,8 +219,7 @@ def _launch_for_block(units: means.Units, padded: jax.ShapeDtypeStruct, stacked:
     if len(role.walks) == 3:
         joining_walk, mean_walk, _ = role.walks
     else:
-        joining_walk = cost.Work()
-        mean_walk, _ = role.walks
+        joining_walk, mean_walk = cost.Work(), role.walks[0]
     walk_work = emission.repeated(joining_walk, chunks - 1) + emission.repeated(mean_walk, 2 * chunks)
     passes = 3 * chunks
     padded_item, stacked_item = padded.dtype.itemsize, stacked.dtype.itemsize
@@ -248,7 +240,7 @@ def _launch_for_block(units: means.Units, padded: jax.ShapeDtypeStruct, stacked:
 
 
 @functools.cache
-def _planned_block(units: means.Units, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
                    queries: int, width: int, target: generation.GpuTarget, has_initial: bool = False,
                    raw_scale: float | None = None, out_dtype=None,
                    out_heads: int | None = None) -> tuple[int, cost.Work]:
@@ -259,23 +251,20 @@ def _planned_block(units: means.Units, padded: jax.ShapeDtypeStruct, stacked: ja
     total_slices = slices + int(has_initial)
     channels = 1 << (width - 1).bit_length()
     blocks = [block for block in (channels >> shift for shift in range(channels.bit_length()))
-              if block * means.chunk_width(total_slices) >= THREADS] or [channels]
+              if block * windows.chunk_width(total_slices) >= THREADS] or [channels]
 
     candidates = {block: _launch_for_block(units, padded, stacked, queries, width, block, has_initial,
                                            raw_scale, out_dtype, out_heads) for block in blocks}
 
     def seconds(block: int) -> float:
-        per_program, total, launched = candidates[block]
-        # A program a wave where the target states no multiprocessors; traffic free where no rate is known.
-        waves = -(-launched // (target.multiprocessors or 1))
-        traffic = total.device_bytes / target.memory_rate if target.memory_rate else 0.0
-        return max(waves * cost.walked(per_program, target), traffic)
+        _, total, launched = candidates[block]
+        return cost.launch_seconds(total, launched, target)
 
     chosen = min(blocks, key=lambda block: (seconds(block), -block))
     return chosen, candidates[chosen][1]
 
 
-def _channel_block(units: algebra.Forward | means.Units, padded: jax.ShapeDtypeStruct,
+def _channel_block(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
                    stacked: jax.ShapeDtypeStruct, queries: int, width: int, target: generation.GpuTarget,
                    has_initial: bool = False, raw_scale: float | None = None, out_dtype=None,
                    out_heads: int | None = None) -> int:
@@ -288,7 +277,7 @@ def _channel_block(units: algebra.Forward | means.Units, padded: jax.ShapeDtypeS
                           raw_scale, out_dtype, out_heads)[0]
 
 
-def launch_work(units: algebra.Forward | means.Units, padded: jax.ShapeDtypeStruct,
+def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
                 stacked: jax.ShapeDtypeStruct, queries: int, width: int, target: generation.GpuTarget,
                 has_initial: bool = False, raw_scale: float | None = None, out_dtype=None,
                 out_heads: int | None = None) -> cost.Work:
@@ -299,7 +288,7 @@ def launch_work(units: algebra.Forward | means.Units, padded: jax.ShapeDtypeStru
                           raw_scale, out_dtype, out_heads)[1]
 
 
-def _kernel(padded, stacked, *extra, units: means.Units, queries: int, width: int,
+def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: int,
             raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None):
     """`_value` as one launch (`_launch`), a program a row's block of channels (`_channel_block`)."""
     batch, _, _, heads, _ = padded.shape
@@ -314,7 +303,7 @@ def _kernel(padded, stacked, *extra, units: means.Units, queries: int, width: in
                    raw_scale=raw_scale, out_dtype=out_dtype, out_heads=out_heads)
 
 
-def _launch(padded, stacked, *extra, units: means.Units, queries: int, width: int, block: int,
+def _launch(padded, stacked, *extra, units: windows.Units, queries: int, width: int, block: int,
             raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None):
     """`_value` as one launch, a program a row's `block` of channels, its slices (plus any raw `Initial`
     state normalized in-kernel, row 9804) read a chunk at a time by `finished_merged_chunked`. When
@@ -323,7 +312,7 @@ def _launch(padded, stacked, *extra, units: means.Units, queries: int, width: in
     batch, slices, _, heads, _ = padded.shape
     has_initial = bool(extra)
     total_slices = slices + int(has_initial)
-    chunk = means.chunk_width(total_slices)
+    chunk = windows.chunk_width(total_slices)
     tile = 1 << (-(-total_slices // chunk) * chunk - 1).bit_length()
     channels = 1 << (width - 1).bit_length()
 
@@ -355,8 +344,7 @@ def _launch(padded, stacked, *extra, units: means.Units, queries: int, width: in
         state = algebra.finished_merged_chunked(units, *_chunks(total_slices, read))
         if out_dtype is not None:
             (merged_ref,) = out_refs
-            finished = jnp.where(algebra.expand(state.total > 0, state.acc), state.acc, 0.0)
-            merged_ref[...] = finished.astype(out_dtype)
+            merged_ref[...] = state.acc.astype(out_dtype)
         else:
             merged_ref, maximum_ref, total_ref = out_refs
             merged_ref[...] = state.acc
@@ -392,7 +380,7 @@ def _launch(padded, stacked, *extra, units: means.Units, queries: int, width: in
     )(padded, stacked, stacked, *extra))
 
 
-def _on_cuda(padded, stacked, *extra, units: means.Units, queries: int, width: int,
+def _on_cuda(padded, stacked, *extra, units: windows.Units, queries: int, width: int,
              raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None):
     """The merge on a CUDA GPU: one launch (`_kernel`) of fp32 states, a launch's; the law's path
     (`_value`) of any other's, a float64 truth's among them, whose constants Triton's float32 kernel holds

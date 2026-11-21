@@ -314,7 +314,7 @@ def test_a_row_both_arms_hold_exactly_is_not_carried_and_the_site_judges_as_befo
         x, w = a_product_draw(seed)
         return x.at[:4].set(0.0), w
 
-    [draws] = _drawn(jnp.matmul, jnp.matmul, zeroed_draw, range(2))
+    [draws] = _drawn(jnp.matmul, jnp.matmul, zeroed_draw, range(2), repeats=True)
     for rows, mine, theirs in (seed[0] for seed in draws.zero_rows):
         assert not np.any((mine == 0) & (theirs == 0)) and not np.isin(np.arange(4), rows).any()
     assert_as_exact(jnp.matmul, jnp.matmul, zeroed_draw, "rows held exactly", seeds=8)
@@ -654,6 +654,24 @@ def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm
     assert options.compiler_options() == {}
 
 
+def test_a_sizing_tells_each_count_it_draws_for_before_drawing_it():
+    """A sizing given its `progress` (`seeds_for`'s, `parity.Sized`) is told each count it draws for, in
+    order, each the one before it doubled from the start, with its place among them and their most (its
+    doublings from the start to the cap), its last the count it declares: a long recording (a GPU's,
+    chunked, cut short by its time) shows how far its sizing went, where it printed nothing until the end."""
+    from reference_error import seeds_for
+
+    from dew.parity import FEWEST_SEEDS, MOST_SEEDS
+
+    told = []
+    count = seeds_for(_product, _draw, "product", progress=lambda *each: told.append(each))
+    doublings = len(told)
+    assert [each for each, _, _ in told] == [FEWEST_SEEDS * 2 ** place for place in range(doublings)]
+    assert [place for _, place, _ in told] == list(range(1, doublings + 1))
+    assert {most for _, _, most in told} == {(MOST_SEEDS // FEWEST_SEEDS).bit_length()}
+    assert told[-1][0] == count
+
+
 def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
     """`seeds_resolving` over the reference's errors measured apart (a recording's merged shards) gives
     `seeds_for`'s count for the reference compared with itself on the same draws, and refuses a
@@ -663,7 +681,7 @@ def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
     from dew.parity import SIZING_FROM, seeds_resolving
 
     count = seeds_for(_product, _draw, "product")
-    [draws] = _drawn(_product, _product, _draw, range(SIZING_FROM, SIZING_FROM + 4 * count))
+    [draws] = _drawn(_product, _product, _draw, range(SIZING_FROM, SIZING_FROM + 4 * count), repeats=True)
     assert seeds_resolving(draws.theirs, draws.names, "product") == count
     with pytest.raises(AssertionError):
         seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)

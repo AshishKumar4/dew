@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
 
-from dew.algebra import derive, means
+from dew.algebra import derive, means, windows
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, raised_exactly
 from dew.nn.kernels.templates import bodies, layout, product
@@ -493,8 +493,10 @@ maximum underflows to 0 as -inf's did, onto another such state's is 1 over zero 
 
 def no_keys(total: jax.Array) -> jax.Array:
     """Whether each row of a state's denominator `total` saw no key: none of its sums, as any key's weight
-    at the row's maximum is 1 (a scaled walk's at its row's scale, never to 0)."""
-    return total == 0
+    at the row's maximum is 1 (a scaled walk's at its row's scale, never to 0; `means.holding` preserves
+    subnormal totals on flushing lanes while non-flushing GPU kernels avoid `stop_gradient`, row 10849)."""
+    return bodies.subnormals(lambda *, flushing: ~means.holding(total) if flushing else total == 0,
+                             total.dtype)
 
 
 def empty(rows: int, width: int, *, scaled: bool = False) -> Partial:
@@ -569,7 +571,8 @@ def finished_form(spec: Forward) -> Forward:
     return spec if spec.natural or spec.raw else unfolded(spec)
 
 
-def slice_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
+def slice_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Array, total: jax.Array
+                ) -> Partial:
     """A finished slice of a row's keys as a state of their merge (`finished_merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
     keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
@@ -582,7 +585,7 @@ def slice_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array,
     return Partial(out, jnp.where(jnp.isfinite(maximum), maximum, LEAST), jnp.where(total >= 0, total, 0.0))
 
 
-def initial_state(spec: Forward | means.Units, initial: Partial, *,
+def initial_state(spec: Forward | windows.Units, initial: Partial, *,
                   raw_scale: float | None = None) -> Partial:
     """A call's initial state (its sums unnormalized, its maximum natural) as a finished slice's
     (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units, saturated where a raw
@@ -599,7 +602,7 @@ def initial_state(spec: Forward | means.Units, initial: Partial, *,
     return slice_state(spec, out, maximum, initial.total)
 
 
-def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array, total: jax.Array,
+def merged_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Array, total: jax.Array,
                  initial: Initial | None = None, *, raw_scale: float | None = None) -> Partial:
     """A split walk's slices and the call's initial state merged into one finished state (`finished_merged`
     of `slice_state`s): their outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural
@@ -622,24 +625,24 @@ def resumable(spec: Forward, state: Partial) -> Partial:
     """A finished state (`finished_merged`'s: its output normalized, its maximum in `spec`'s units) as a
     call's initial state takes it (`initial_state`'s inverse): its sums unnormalized at its natural maximum,
     a state of no mass the walk's start, which adds nothing to a merge."""
-    held = state.total > 0
+    held = means.holding(state.total)
     return Partial(means.resumed(state.acc, state.total), jnp.where(held, spec.naturalized(state.m), LEAST),
                    state.total)
 
 
-def units_of(spec: Forward | means.Units) -> means.Units:
-    """The units a finished form's states merge in (`means.Units`), its factor `carried`'s: the accurate
+def units_of(spec: Forward | windows.Units) -> windows.Units:
+    """The units a finished form's states merge in (`windows.Units`), its factor `carried`'s: the accurate
     form's exponential of the anchors' difference taken exactly, at its raw products' scale where it keeps
     them; a raw fold's of that difference times `scale log2(e)` rounded, as its walk weighs a key."""
-    if isinstance(spec, means.Units):
+    if isinstance(spec, windows.Units):
         return spec
     if spec.natural:
-        return means.Units(scale=spec.scale if spec.raw else 1.0)
-    return means.Units(scale=spec.scale, compensated=False)
+        return windows.Units(scale=spec.scale if spec.raw else 1.0)
+    return windows.Units(scale=spec.scale, compensated=False)
 
 
 
-def finished_merged(spec: Forward | means.Units, stacked: Partial, axis: int) -> Partial:
+def finished_merged(spec: Forward | windows.Units, stacked: Partial, axis: int) -> Partial:
     """Finished states over disjoint keys (`slice_state`'s, their outputs normalized, or merges of them)
     stacked on `axis` as one merge of them, the algebra's law of finished means (`dew.algebra.means`, its
     derivative the law's own): their outputs' convex combination, each weighed by its mass at the largest of
@@ -656,9 +659,9 @@ def finished_merged(spec: Forward | means.Units, stacked: Partial, axis: int) ->
 
 
 
-def finished_merged_chunked(spec: Forward | means.Units, load: Callable[[jax.Array], tuple],
+def finished_merged_chunked(spec: Forward | windows.Units, load: Callable[[jax.Array], tuple],
                             chunks: int) -> Partial:
-    """`finished_merged` of a row's slices `load(c)` gives `means.CHUNK` at a time along axis 0 (a kernel's
+    """`finished_merged` of a row's slices `load(c)` gives `windows.CHUNK` at a time along axis 0 (a kernel's
     loads of its refs: the decode merge's, `merged`), `chunks` of them: each chunk's outputs, maxima,
     denominators and the slots it holds (`valid`, laid as the denominators are), its slices' states as
     `slice_state` takes them, merged by the law's chunked merge (`means.merged_state_chunked`, the value
@@ -1396,7 +1399,10 @@ def small_parts(small: jax.Array, dtype) -> tuple[product.Scaled, ...]:
     exactly (`product.formed`), each's product exact in fp32, so none loses its bits."""
     if jnp.dtype(dtype) == jnp.dtype(jnp.float32):
         return (product.Scaled(small, float(-SMALL_SHIFT)),)
-    return tuple(product.Scaled(part, float(-SMALL_SHIFT)) for part in product.formed(small, 3))
+    return tuple(
+        product.Scaled(part, float(-SMALL_SHIFT))
+        for part in product.formed(small, bf16_part_count(accurate=True))
+    )
 
 
 def taken_back(value: jax.Array, exponent: jax.Array | float) -> jax.Array:
@@ -1908,7 +1914,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     largest (`Forward.largest`), or at fp32's where `held` (an fp32 call's walk, `quotient`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
-        out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
+        out = jnp.where(expand(means.holding(state.total), state.acc), state.acc, 0.0)
     else:
         acc, total = dropped_total(spec, state.acc, state.total)
         state = state._replace(acc=acc, total=total)
@@ -1974,8 +1980,11 @@ def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Ar
 
 
 def inverse(total: jax.Array) -> jax.Array:
-    """Each query's `1 / total`, zero where it saw nothing (total 0)."""
-    return jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
+    """Each query's `1 / total`, zero where it saw nothing (`means.holding` on flushing lanes, `total > 0`
+    in non-flushing GPU kernels where `stop_gradient` does not lower, row 10849)."""
+    held = bodies.subnormals(lambda *, flushing: means.holding(total) if flushing else total > 0,
+                             total.dtype)
+    return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), 0.0)
 
 
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
@@ -2105,13 +2114,34 @@ def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool, rows: bool = F
         # The leading part saturates at bf16's largest: an fp32 cotangent past it by more than half its ulp
         # rounds to infinity in bf16, an infinite product, or a NaN against a zero operand. The accurate
         # form's later parts take the difference whole, the fast form's one part is within 2^-8 of it.
-        yield from product.bf16_parts(cotangents, 3 if accurate else 1, saturating=1)
+        yield from product.bf16_parts(cotangents, bf16_part_count(accurate=accurate), saturating=1)
         return
     scaled, high_exponent = _scaled(cotangents, rows)
     high = scaled.astype(dtype)
     yield product.Scaled(high, high_exponent)
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32), rows)
     yield product.Scaled(low, low_exponent + high_exponent)
+
+
+_BF16_PARTS: dict[tuple[str | None, bool], int] = {}
+
+def bf16_part_count(*, accurate: bool) -> int:
+    """bf16 parts for fp32 attention products from `dew.algebra.error.product_precision` (row 5473)."""
+    from dew.algebra.error import product_precision
+    from dew.nn import programs
+    from dew.nn.kernels import generation
+
+    target = generation.gpu_target()
+    key = (target.generation if target is not None else generation.placed_platform(), accurate)
+    if key not in _BF16_PARTS:
+        chosen = product_precision(
+            64, 64, 64, jnp.float32,
+            admits=lambda p: (a := programs.dot_arithmetic(p, jnp.float32, jnp.float32)) is not None
+            and a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
+            and not a.imprecise and a.operations >= (6 if accurate else 1))
+        arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
+        _BF16_PARTS[key] = max(1, (math.isqrt(1 + 8 * arith.operations) - 1) // 2) if arith else 1
+    return _BF16_PARTS[key]
 
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,

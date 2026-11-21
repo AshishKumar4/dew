@@ -1,16 +1,14 @@
 """A shared layer under JAX's persistent compilation cache, for CI on armada and the GPU queue.
 
 Each armada task and GPU pass starts on a cold machine, so the on-disk cache conftest turns on
-(`dew._cache.enable_compilation_cache`) is always empty there, and the suite spends most of its time
-in XLA: on the Colab A100 tier, compiling took 55% of every file's wall time. With
-DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN set (.armada.json), `install` keeps each test file's
-programs in that file's bundle on the dew-xla-cache Worker (deployed from the private dew-ops
-repository), through JAX's own cache directory: one GET as the file is collected writes its last
-run's programs into the directory, and one PUT after it ran, where it compiled any program the
-bundle lacked or did not use, sends the programs compiled under it and those of the fetched ones it opened.
-Bundles are kept
-under jaxlib's version, the backend, the Python minor and the device's kind, beside
-JAX's own key of each program and its flags.
+(`dew._cache.enable_compilation_cache`) is always empty there, and the suite spends most of its time in XLA:
+on the Colab A100 tier, compiling took 55% of every file's wall time. With DEW_XLA_CACHE_URL and
+DEW_XLA_CACHE_TOKEN set (.armada.json), `install` keeps each test file's programs in that file's bundle on the
+object store those name, through JAX's own cache directory: one GET as the file is collected writes its last
+run's programs into the directory, and one PUT after it ran, where it compiled any program the bundle lacked
+or did not use, sends the programs compiled under it and those of the fetched ones it opened. Bundles are kept
+under jaxlib's version, the backend, the Python minor and the device's kind, beside JAX's own key of each
+program and its flags.
 
 JAX keeps a program as one file, `<key>-cache`, in `jax_compilation_cache_dir`, and with no
 `jax_compilation_cache_max_size` (Dew sets none) it neither evicts nor stamps them
@@ -663,7 +661,7 @@ def main(arguments: list[str]) -> int:
     """`python tests/remote_cache.py prefetch TOPOLOGY ITEM...`: a GPU job's prepare, on its node's CPU,
     fetching the bundles of each of its run's items (a test file, or a group of one as CI names it,
     `<file>#G/N`) into the cache directory its run reads (`dew._cache.default_compilation_cache_dir`), keyed
-    for the node's GPU as its serialized TOPOLOGY names it (dew-ops' session hands a prepare its node's,
+    for the node's GPU as its serialized TOPOLOGY names it (a GPU node's session hands a prepare its node's,
     $DEW_NODE_TOPOLOGY)."""
     command, topology, *items = arguments
     if command != "prefetch" or not requested():

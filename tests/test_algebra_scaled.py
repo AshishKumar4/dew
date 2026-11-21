@@ -17,15 +17,15 @@ import pytest
 from hypothesis import strategies as st
 from reference_error import ahead_arm, as_given, assert_as_exact, dew_path, ran_here
 
-from dew.algebra import means, scaled
+from dew.algebra import means, scaled, windows
 from dew.algebra.forms import Refused
 from dew.parity import FEWEST_SEEDS
 
 LARGEST = float(np.finfo(np.float32).max)
 
 
-NATURAL = means.Units()
-"""Natural anchors, compensated: the accurate form's units (`means.Units`)."""
+NATURAL = windows.Units()
+"""Natural anchors, compensated: the accurate form's units (`windows.Units`)."""
 
 
 def _merge(outputs, totals, anchors):
@@ -55,6 +55,11 @@ WAYS = [pytest.param("jitted", marks=CPU_LANE), pytest.param("op by op", marks=C
         pytest.param("on a tpu", marks=pytest.mark.tpu(reason="the primitives on a TPU"))]
 """Each way a cell runs the law: jitted and op by op on the CPU lane, jitted on a GPU and on a TPU on their
 tiers, each from the programs its tier's prepare compiled ahead (`_ways`)."""
+
+FLOAT64_WAYS = [way for way in WAYS if way.values != ("on a tpu",)]
+"""The ways a float64 law runs (`WAYS`), a TPU's apart: a TPU keeps float64 as pairs of float32s within
+float32's range (`arm_arithmetic.float64_host`), where 2^900 is none, and a float64 truth computes on its
+host's CPU, the CPU lane's way (rows 10664, 10759: the TPU tiers' float64 merge was red on v5e and v6e)."""
 
 
 def test_a_scaled_value_lands_as_the_float_it_holds():
@@ -371,7 +376,7 @@ def test_a_state_negligible_beside_a_large_output_weighs_nothing(way):
     """Outputs 0 and 2^127, totals 2^-126 and 2^127, anchors 0 and -1000 (`means.merged_output`): the second
     state's mass is 2^-1316 beside the first's 2^-126, its weight in the mean 2^-1190, the mean 2^-1063,
     which rounds to 0; a factor held at a floor of 2^-378 merged them to 4 (base review F1). Its anchor a
-    billion below, past `means.FLOOR`, it weighs nothing too."""
+    billion below, past `windows.FLOOR`, it weighs nothing too."""
     for far in (-1000.0, -1e9):
         merged = _ways(_merge, "a state far below")[way](np.asarray([[0.0], [2.0 ** 127]], np.float32),
                                     np.asarray([2.0 ** -126, 2.0 ** 127], np.float32),
@@ -631,7 +636,7 @@ def test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts(way, to
             f"a merged state's gradient's derivatives against its parts', {totals}")
 
 
-@pytest.mark.parametrize("way", WAYS)
+@pytest.mark.parametrize("way", FLOAT64_WAYS)
 def test_a_float64_merge_keeps_what_float64_holds(way):
     """A merge of float64 states (a truth's) sums its terms placed beneath float64's largest power, not
     float32's: outputs 2^900, -2^900 and 2^-900 at unit totals and one anchor merge to 2^-900 / 3, bit for
@@ -860,12 +865,12 @@ def test_every_primitive_of_the_construct_is_recorded_with_the_value_it_lowers_a
 def test_a_parameter_made_at_each_call_is_refused_at_bind():
     """A law primitive's parameter keys its compiled programs (`scaled._Primitive`): units made at each call,
     a partial or a closure, are refused at bind, where each call would compile again and hold its executable;
-    the units' value (`means.Units`, a frozen dataclass's instance) merges."""
+    the units' value (`windows.Units`, a frozen dataclass's instance) merges."""
     outputs = jnp.asarray([[1.0, 2.0], [3.0, 4.0]], jnp.float32)
     totals, anchors = jnp.asarray([1.0, 2.0], jnp.float32), jnp.asarray([0.0, -1.0], jnp.float32)
     for made in (functools.partial(jnp.exp), lambda carried, now: jnp.exp(carried - now)):
         with pytest.raises(TypeError):
             means.merged_output(outputs, totals, anchors, made, 0)
-    np.testing.assert_array_equal(means.merged_output(outputs, totals, anchors, means.Units(), 0),
+    np.testing.assert_array_equal(means.merged_output(outputs, totals, anchors, windows.Units(), 0),
                                   means.merged_output(outputs, totals, anchors, NATURAL, 0))
 

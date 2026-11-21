@@ -16,7 +16,6 @@ import json
 import os
 import re
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -27,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
-from process_support import device_flags, raised
+from process_support import coordinator_port, device_flags, raised
 from reference_error import as_given, assert_as_exact
 
 from dew.distributed.placement import parameter_axes
@@ -374,9 +373,7 @@ def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
     variables beside Slurm's. JAX's detection reads Open MPI's first and
     forms the pool mpirun started, so the one-task rule has to leave the
     process to it, here a pool of one rank."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    port = coordinator_port()
     env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"),
            "JAX_PLATFORMS": "cpu",
            "OMPI_MCA_orte_hnp_uri": "1531576320.0;tcp://127.0.0.1:34911",

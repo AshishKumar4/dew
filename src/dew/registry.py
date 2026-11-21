@@ -614,7 +614,9 @@ def _record_of(value: Recorded | DataclassInstance, annotation: Annotation) -> d
         return {"class": import_path(type(value)),
                 "fields": {name: to_record(entry, object) for name, entry in view.items()}}
     fields = record_fields(value, type(value))
-    if type(value) is _unwrapped(annotation):
+    # The class the annotation names, a subscripted generic's origin among them, as every reader takes it
+    # (`nominal_class`, row 8403).
+    if type(value) is nominal_class(_unwrapped(annotation)):
         return fields
     return {"class": import_path(type(value)), "fields": fields}
 

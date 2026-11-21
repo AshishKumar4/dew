@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal, get_args
 
 import grain.python as pygrain
+import numpy as np
 
 from dew._records import JSON, json_value, record
 from dew.data.completion import cuts
@@ -267,7 +268,6 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     rows arrive, and so are documents counted by a role or a pad id (`_ruled`),
     whose windows a plan of their lengths does not count."""
     from dew.data.generation import Generation, _GenerationSource
-    from dew.data.packing import PackedSource, chunks_for, plan_name
     from dew.data.sources.tokens import TokenFiles
     from dew.data.steps.windows import WindowSource
 
@@ -275,6 +275,9 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         """The overlap of a chunk step that cuts documents as the pack after it plans them
         (`chunks_for`), or None where none comes first."""
         if len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack):
+            # The packer imported where a pack is promoted: a chain that packs nothing imports none.
+            from dew.data.packing import chunks_for
+
             return chunks_for(stages[0].step, stages[1])
         return None
 
@@ -296,25 +299,37 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             overlap = cutting(stages)
             at = int(overlap is not None)
             packing = stages[at] if len(stages) > at else None
-            # A published plan cuts a document as a window-long chunk step without overlap does.
-            if (isinstance(source, _GenerationSource) and isinstance(packing, Pack)
-                    and plan_name(packing, "accepted") in plans and overlap in (None, 0)
-                    and not _ruled(source)):
-                source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
-                stages = stages[at + 1 :]
+            # A published plan cuts a document as a window-long chunk step without overlap does, but places
+            # an empty document, which a chunk step after the generation drops (`chunk_table`): under a
+            # chunk step, a plan stands in only for a generation holding none, as its lengths state, and a
+            # best-fit plan, which places documents whole, never; elsewhere that step runs as written (rows
+            # 9053, 10736).
+            if isinstance(source, _GenerationSource) and isinstance(packing, Pack):
+                # The packer imported where a published generation is packed.
+                from dew.data.packing import PackedSource, plan_name
+
+                if (plan_name(packing, "accepted") in plans and overlap in (None, 0)
+                        and (overlap is None or (packing.policy != "best-fit" and _none_empty(source)))
+                        and not _ruled(source)):
+                    source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
+                    stages = stages[at + 1 :]
             break
     overlap = cutting(stages)
     at = int(overlap is not None)
     pack = stages[at] if len(stages) > at else None
     if (
         isinstance(pack, Pack)
-        and pack.policy == "first-fit"
+        # A best-fit pack of whole documents planned as a first-fit one is (`placement.BestFit`), one
+        # placement whatever reads it, grain's packer its test's oracle alone (row 10737).
+        and (pack.policy == "first-fit" or (pack.policy == "best-fit" and overlap is None))
         and not pack.along
         and not isinstance(source, Combined)
         and source.supports("indexed")
         and source.lengths() is not None
         and not _ruled(source)
     ):
+        from dew.data.packing import PackedSource
+
         source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
     first = stages[0] if stages else None
     if isinstance(first, Windows) and first.fields == TOKEN_FIELDS and isinstance(source, TokenFiles):
@@ -322,6 +337,13 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         stride = first.seq_len if first.stride is None else first.stride
         source, stages = WindowSource(source, source.tokens, first.seq_len, stride), stages[1:]
     return dataclasses.replace(pipeline, source=source, stages=stages)
+
+
+def _none_empty(source: Source) -> bool:
+    """Whether every document `source` holds has a token, as its lengths state (`Source.lengths`): False
+    where they state none."""
+    lengths = source.lengths()
+    return lengths is not None and bool(np.all(np.asarray(lengths) > 0))
 
 
 def _ruled(source: Source) -> bool:

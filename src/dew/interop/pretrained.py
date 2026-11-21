@@ -54,7 +54,7 @@ from dew.interop.generation_config import (
     source_cache,
     source_decoding,
 )
-from dew.interop.layouts import CROSSING_UNWRITTEN, SourceLayout, Unwritable
+from dew.interop.layouts import SourceLayout, Unwritable, unwritten_extension
 from dew.interop.pipeline_assembly import (
     SourceTask,
     assemble_pipeline,
@@ -202,7 +202,7 @@ def on_default_device(variables: Variables, *, cast: Callable[[KeyPath, Leaf], L
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
     jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
     completes before the next starts, and its host copy is released (a memory-mapped one's pages
-    evicted, `dew.distributed.host.evict`) once its device copy is written back in its place. A leaf is
+    evicted, `dew.distributed.pages.evict`) once its device copy is written back in its place. A leaf is
     as `cast(path, leaf)` makes it where given, cast as it is placed."""
     from dew.distributed.host import placed_leaves
 
@@ -440,23 +440,21 @@ class Pretrained:
                           else None)
             from dew.interop.layouts import source_layout
 
-            if isinstance(model, MediaWrapper):
-                bundle = PretrainedDecoder.carrying(model, variables, tokenizer=tokenizer,
-                                                    generation_config=generation)
+            kind = MultimodalTransformer if isinstance(model, MediaWrapper) else CausalTransformer
+            laid = from_record(kind, model)
+            crossing = laid.cross_attention is not None
+            stated = source_layout(laid.with_cross_attention(None) if crossing else laid)
+            if isinstance(stated, Unwritable):
+                # No family's layout writes it (a wrapper's or a decoder's alike): the run's own model,
+                # in Dew's layout, which a run starts from and whose export states the layout's reason.
+                bundle = PretrainedDecoder(laid, variables, None, {}, None, model_config.fields,
+                                           dict(decoders.GENERATION_DEFAULTS) if generation is None
+                                           else generation,
+                                           export_adapter=_unwritten(stated), tokenizer=tokenizer)
             else:
-                decoder = from_record(CausalTransformer, model)
-                stated = source_layout(decoder.with_cross_attention(None))
-                if isinstance(stated, Unwritable):
-                    # No family's layout writes it: the run's own model, in Dew's layout, which a run
-                    # starts from and whose export states the layout's reason.
-                    bundle = PretrainedDecoder(decoder, variables, None, {}, None, model_config.fields,
-                                               dict(decoders.GENERATION_DEFAULTS) if generation is None
-                                               else generation,
-                                               export_adapter=_unwritten(stated), tokenizer=tokenizer)
-                else:
-                    # Resolved once: the bundle is written in the layout just found.
-                    bundle = PretrainedDecoder.carrying(decoder, variables, tokenizer=tokenizer,
-                                                        generation_config=generation, layout=stated)
+                # Resolved once: the bundle is written in the layout just found.
+                bundle = PretrainedDecoder.carrying(laid, variables, tokenizer=tokenizer,
+                                                    generation_config=generation, layout=stated)
             bundle = replace(bundle, processor=processor)
             if isinstance(held, MaskedSettings):
                 # A masked run's model is a decoder: no wrapper denoises.
@@ -702,6 +700,7 @@ class Pretrained:
         loop's) starts them as a fresh model would. A model that declares none is this source's own; one
         that declares none of a parameter the source holds is refused, naming it, its weights unread."""
         from dew.batch import merge, thaw
+        from dew.nn.cross_pass import MERGE_PREFIX
         from dew.optim import parameter_name
 
         held = {("params", *path) for path in flatten_dict(dict(thaw(self.variables).get("params", {})))}
@@ -711,6 +710,21 @@ class Pretrained:
             dropped = sorted("/".join(path[1:]) for path in held - named)
             raise ValueError(f"this {type(model).__name__} reads none of the source's {dropped[:6]}: a "
                              "model in its place keeps every parameter it holds")
+        # A parameter drawn beside a source's own (drawn fresh, or a loop's merges, whatever drew them) is
+        # read again at the shape the new model declares, or refused: kept at another it would not apply.
+        def shapes(tree) -> dict[str, tuple[int, ...]]:
+            return {jax.tree_util.keystr(path, simple=True, separator="/"): np.shape(leaf)
+                    for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(tree).get("params", {}))}
+
+        def drawn_beside(name: str) -> bool:
+            return name in self.fresh or any(part.startswith(MERGE_PREFIX) for part in name.split("/"))
+
+        loaded, drawing = shapes(thaw(self.variables)), shapes(declared)
+        reshaped = sorted(name for name, shape in drawing.items()
+                          if name in loaded and loaded[name] != shape and drawn_beside(name))
+        if reshaped:
+            raise ValueError(f"this {type(model).__name__} declares {reshaped[:6]}, drawn fresh beside the "
+                             "loaded weights, at shapes other than the source holds: draw it without them")
         if not named - held:
             return replace(self, model=model)
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
@@ -805,10 +819,10 @@ class Pretrained:
         from dew.batch import thaw
         from dew.nn.backbones.layer_names import stored_layers
         from dew.nn.projections import unpacked
-        from dew.nn.protocols import CrossAttending, Differential
+        from dew.nn.protocols import Differential
 
-        if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
-            raise ValueError(CROSSING_UNWRITTEN)
+        if (reason := unwritten_extension(self.model)) is not None:
+            raise ValueError(reason)
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.

@@ -68,6 +68,7 @@ from dew.training.planning import (
     FitSearch,
     Planned,
     PlanRefused,
+    Rung,
     Trials,
     guided_compile,
     held_objects,
@@ -581,7 +582,8 @@ def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: 
 def _unlike(cap: Planned, other: Planned) -> list[str]:
     """What `other`'s step holds or returns otherwise than `cap`'s (`StepCompiler.admitted_at`), each leaf
     named by its path: the state it prepares, its window among them, with their shapes, dtypes and
-    shardings, and its outputs (`out_info`), the stepped state and the metrics a step's whole pools."""
+    shardings, and its outputs (`out_info`), the stepped state and the metrics a step's whole pools, these by
+    their nodes' kinds too (`_node_kinds`: a mean pooled as another kind over the same leaves, row 10815)."""
     def leaves(tree) -> dict[str, tuple]:
         return {jax.tree_util.keystr(path): (getattr(leaf, "shape", None), str(getattr(leaf, "dtype", leaf)),
                                              getattr(leaf, "sharding", None))
@@ -594,7 +596,20 @@ def _unlike(cap: Planned, other: Planned) -> list[str]:
         ours, theirs = leaves(held), leaves(given)
         unlike += [f"{name}{path}" for path in sorted(ours.keys() | theirs.keys())
                    if ours.get(path) != theirs.get(path)]
+    if not unlike and (_node_kinds(jax.tree.structure(cap.executable.out_info))
+                       != _node_kinds(jax.tree.structure(other.executable.out_info))):
+        unlike.append("outputs' node kinds")
     return unlike
+
+
+def _node_kinds(treedef) -> tuple | None:
+    """`treedef`'s node types, nested as its nodes are: which kind of mean each pooled metric is (`Ratio`,
+    `Exponentiated`), which a treedef's equality and its leaves' paths both leave out where two kinds
+    register alike."""
+    if treedef.num_nodes == 1 and treedef.num_leaves == 1:
+        return None
+    node = treedef.node_data()
+    return (None if node is None else node[0], tuple(_node_kinds(child) for child in treedef.children()))
 
 
 @dataclasses.dataclass
@@ -1026,15 +1041,6 @@ class StepCompiler[L, E]:
         several (row 7884)."""
         sampled, planned = self.phase_passes.sampled, cap.planned
         assert sampled is not None and planned is not None, "a sampled count's cap compiled on the devices"
-        # A window that pools its microbatches by their mean holds their gradient's sum and its mass
-        # (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that replays
-        # them holds their batches instead.
-        window = planned.candidate.prepared.window
-        if window is not None and window.mass is None:
-            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
-                             "its update replays each microbatch at the count that closes it: a pass count "
-                             "drawn per microbatch takes them one microbatch an update (split and "
-                             "accumulation 1), until replays run each at its own (row 7884)")
         plans, flops = {sampled.cap: planned}, {sampled.cap: cap.step_flops}
         for count, each in self.admitted_counts(holder, stepping, planned, state, batch):
             plans[count], flops[count] = each.released(), self._flops(each)
@@ -1058,6 +1064,21 @@ class StepCompiler[L, E]:
         own), else compiled here, as the run says."""
         sampled = self.phase_passes.sampled
         assert sampled is not None, "a run that draws its pass count per microbatch"
+        # Refused here, where a run and a build ahead (`compile_ahead`) both admit the counts: a window that
+        # pools its microbatches by their mean holds their gradient's sum and its mass
+        # (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that replays
+        # them holds their batches instead.
+        window = cap.candidate.prepared.window
+        if window is not None and window.mass is None:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
+                             "its update replays each microbatch at the count that closes it: a pass count "
+                             "drawn per microbatch takes them one microbatch an update (split and "
+                             "accumulation 1), until replays run each at its own (row 7884)")
+        if window is not None and window.batch_statistics is not None and cap.split > 1 and sampled.cap > 1:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics of a step's whole batch "
+                             "(`batch_statistics`) are computed at its first part, by that part's count, and "
+                             "read by every part: a pass count drawn per microbatch reads them one part a "
+                             "step (split 1), until each part's count computes its own (row 10770's audit)")
         counts, family, self.counts_ahead = range(1, sampled.cap), self.counts_ahead, None
         if family is None:
             _log.info("the run draws its pass count per microbatch: it compiles the steps of counts %s at "
@@ -1265,6 +1286,8 @@ class StepCompiler[L, E]:
             recorded = {**record(searched.rung, 'plan'), 'split': searched.split}
             source = "this process's search of the step"
         before = self.rung()
+        # Where the run was configured, before a record moves it: the ladder a frontier reads below its plan.
+        origin = Rung.of(self.objective, self._xla_defaults, self._narrow, self._ns_group)
         self.climb_to(recorded)
         self._resumed_rung = None
         if self.rung() != before:
@@ -1285,8 +1308,11 @@ class StepCompiler[L, E]:
         # within a prepare too, as no device run has tuned their programs (`report.read_offline`).
         with report.read_offline():
             above = search.above(candidates, planned.split) if frontier else None
+            below = search.below(candidates, origin, planned.at) if frontier else None
         for probe in above or ():
             _log.info("above the plan, fitting at fewer microbatches: %s", probe.named())
+        for probe in below or ():
+            _log.info("below the plan, a lighter rung its search passed over that fits: %s", probe.named())
         # Consume the artifact only after its program was accepted; a refusal leaves it pending. A run
         # that draws its pass count per microbatch keeps its counts' family for their admission
         # (`admitted_counts`).
@@ -1300,14 +1326,15 @@ class StepCompiler[L, E]:
             trials = Trials(state, batch, owned=False) if trials is None else trials
             run = self.runner(stepping, planned, mesh)
             relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
-            unguided = planned.candidate.lowered
+            unguided, replaced = planned.candidate.lowered, planned.executable
             asked = search.compiled_key(unguided, planned.options)
             planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
-            # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
-            # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
-            # for a refit.
-            hold(asked, planned.executable)
-            forget(unguided)
+            if planned.executable is not replaced:
+                # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
+                # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
+                # for a refit. An empty profile replaces nothing, and every kept lowering stays.
+                hold(asked, planned.executable)
+                forget(unguided)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)
@@ -1319,7 +1346,7 @@ class StepCompiler[L, E]:
         flops, counted = plan_flops(recorded, planned.executable)
         keep = (functools.partial(keep_rung, record_path, key, {**chosen, 'flops': counted})
                 if record_path is not None else lambda: None)
-        plan = settled(planned, probes, search, above)
+        plan = settled(planned, probes, search, above, below)
         if stepping.staging.read_whole:
             # A transformation given built that kept every layer whole on every stage (`StageLocal.of`).
             plan = {**plan, "layers_whole_for": list(stepping.staging.read_whole)}

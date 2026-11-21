@@ -94,7 +94,7 @@ from dew.objectives.base import Metric, Objective, joined
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.data.tokens import FirstFit
+    from dew.data.placement import FirstFit
     from dew.decision.objective import DecisionObjective
     from dew.decision.sources import PretrainedDecision
     from dew.distributed.placement import Layout as Placement, MeshSpec
@@ -1541,7 +1541,7 @@ class PassPlan:
         """A fresh placement of the pass's rows at `length`, over its most windows and the pass's
         questions, or None where they do not all fit."""
         from dew.data.packing import window_fields
-        from dew.data.tokens import FirstFit
+        from dew.data.placement import FirstFit
 
         most = [shape for shape in self.decide.pass_shapes if shape.length == length][-1]
         pack = self.decide.packing(most, self.questions)

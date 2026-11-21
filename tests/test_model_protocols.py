@@ -171,7 +171,8 @@ def _text(variables):
 
 
 @dtypes
-@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
+# The model's name alone, the id's last part (the dtype's, `dtypes`) left out: one key with its other tests.
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*(?=-[a-z0-9_+]+$)")
 @pytest.mark.parametrize("name", OWN)
 def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name, dtype):
     """The encoder the canvas shares its tree with, run over the whole

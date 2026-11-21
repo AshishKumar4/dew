@@ -2,12 +2,11 @@
 one a process runs under, and a pool joined through a scheduler of the user's own."""
 
 import os
-import socket
 import sys
 from pathlib import Path
 
 from lane_environment import outside_any_cluster
-from process_support import output, owned
+from process_support import coordinator_port, output, owned
 
 from dew.clusters import CloudTPU, Joining, Kubernetes, Launched, OpenMPI, Slurm, detected_environment
 
@@ -97,9 +96,7 @@ def test_mpirun_inside_a_slurm_allocation_is_open_mpis_pool_and_dew_launchs_is_i
 def test_a_pool_joins_through_a_scheduler_of_the_users_own():
     """Two processes a scheduler Dew does not know started, each telling its rank in variables of its own,
     join one pool through `prepare_process(cluster=...)`, its environment a class of the user's."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    port = coordinator_port()
     program = ("import dataclasses, os\n"
                "from dew.clusters import Joining\n"
                "from dew.training.runtime import prepare_process\n"

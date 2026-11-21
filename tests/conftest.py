@@ -203,6 +203,12 @@ def pytest_runtest_makereport(item, call):
         report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
                                                       f"computes before its first check-1 site, at {where}: "
                                                       "its run runs it unprepared")
+    elif call.when == "call" and judged_on_zeros(call.excinfo):
+        # A check of what its prepared sites and arms gave, each finished: zeros in a prepare, which judges
+        # nothing (`judged_on_zeros`); its run judges it, as a flow's cell's (`gpu_flow._deferred`).
+        report = outcome.get_result()
+        report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
+                                                      "checked its prepare's zeros: its run judges it")
     # A map task's sites of this test, written as its manifest once its call is done, whatever it ended in
     # (`map_judge.manifested`): its judge judges the test from them. Only a test that loaded the map judge
     # reached a site.
@@ -318,6 +324,28 @@ def pytest_runtest_setup(item):
         marker = item.get_closest_marker(backend)
         if marker and here != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
+    # A behavioral GPU test with no check-1 site, its programs compiled where its run reaches them (a training
+    # run, a save across two meshes: values its own steps compute steer what it compiles next), declares so
+    # (`compiles_at_run`, its reason): its part's prepare, whose device computes nothing, has nothing of it to
+    # compile ahead and skips it, where its first computation was filed as a check-1 site's prepare missed
+    # (rows 8310, 8097); its run runs it as any test's.
+    if tier_wire.preparing() and (declared := item.get_closest_marker("compiles_at_run")) is not None:
+        pytest.skip(f"compiles at run: {declared.kwargs['reason']}")
+
+
+def judged_on_zeros(excinfo) -> bool:
+    """Whether a test's failure (`excinfo`, None where it passed) is a check of what its GPU tier part's
+    prepare gave in place of every site and arm it began, each finished (`CompiledTruths.judged_its_zeros`,
+    a flow's cell's rule too): the zeros a prepared arm gives in a prepare (`reference_error.ahead_arm`),
+    which judges nothing, its run judging it (rows 10169 on: a cell asserting a product's value failed its
+    file's prepare). A failure before any site or arm is none (`pytest_runtest_makereport`'s unprepared), nor
+    a skip, which fails nothing."""
+    if excinfo is None or not tier_wire.preparing() or excinfo.errisinstance(pytest.skip.Exception):
+        return False
+    import store_wire
+
+    store = store_wire.COMPILED.get()
+    return store is not None and store.judged_its_zeros(excinfo.value)
 
 
 def _sites_store(item) -> Path | None:

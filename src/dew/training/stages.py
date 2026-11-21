@@ -372,6 +372,12 @@ class StageLocal:
                 for row in range(math.prod(shape))]
         return self.layered(shapes, cut)
 
+    @property
+    def apart(self) -> bool:
+        """Whether the state it saves (`saved`) holds rows each on its own stage's devices, on part of a pool
+        (`dew.checkpoints.submesh.HeldApart`): a pipelined run's over more than one stage."""
+        return bool(self.sites) and self.stages > 1
+
     def saved(self, state: TrainState) -> TrainState:
         """`state` as a checkpoint holds it, every layer `layers_N`, each row an array on its own
         stage's devices made from that stage's shards: a device copies its own rows, and nothing
@@ -383,10 +389,13 @@ class StageLocal:
             for stage in range(self.stages):
                 devices = stage_mesh(self.mesh, stage)
                 held = set(devices.devices.flat)
+                # A process outside the stage holds none of its piece, whose dtype it states (row 10780).
                 piece = jax.make_array_from_single_device_arrays(
                     (1, *leaf.shape[1:]), _sharded(sharding, devices, (None, *sharding.spec[1:])),
-                    [shard.data for shard in leaf.addressable_shards if shard.device in held])
+                    [shard.data for shard in leaf.addressable_shards if shard.device in held],
+                    dtype=leaf.dtype)
                 row = _sharded(sharding, devices, sharding.spec[len(shape):])
+                # Each row a checkpoint holds on its own stage's devices, on part of a pool (`apart`).
                 rows.extend(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
                     math.prod(shape) // self.stages))(piece, stacked=len(shape)))
             return rows
@@ -410,7 +419,7 @@ class StageLocal:
                                       out_shardings=piece)(held, within=shape[1:]))
             return jax.make_array_from_single_device_arrays(
                 (*shape, *rows[0].shape), self._stacked_sharding(row, len(shape)),
-                [shard.data for piece in pieces for shard in piece.addressable_shards])
+                [shard.data for piece in pieces for shard in piece.addressable_shards], dtype=rows[0].dtype)
         return self.staged(tree, stack)
 
     def whole(self, variables, *, consumed: bool = False):

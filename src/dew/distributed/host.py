@@ -8,7 +8,7 @@ cross-host device_put between different device sets (dispatch.py:488-516).
 from __future__ import annotations
 
 import dataclasses
-import mmap
+import functools
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Protocol, runtime_checkable
@@ -21,11 +21,26 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, Sing
 from jax.tree_util import KeyPath
 
 from dew.batch import Variables
+from dew.distributed.pages import evict
 from dew.distributed.placement import Placement
 from dew.nn.kernels.options import program
+from dew.nn.programs import on_host
 
 
 def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
+    """Replace each accelerator coordinate by its process-local CPU partner (`_companion`): admitted once a
+    process for an `accelerator` mesh over its own CPUs, its probe a collective every process runs, and the
+    same mesh after (row 10794: a streamed start probed it three to four times, pricing and placing)."""
+    return _admitted(accelerator) if devices is None else _companion(accelerator, devices)
+
+
+@functools.cache
+def _admitted(accelerator: Mesh) -> Mesh:
+    """The companion of `accelerator` over this process's CPUs, admitted once (`companion_mesh`)."""
+    return _companion(accelerator, None)
+
+
+def _companion(accelerator: Mesh, devices) -> Mesh:
     """Replace each accelerator coordinate by its process-local CPU partner.
 
     CPU cardinality is launch-time JAX configuration, never changed here.
@@ -71,7 +86,7 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
     try:
         # Run now, whatever the caller traces (a trainer's state mesh first read inside its start's trace,
         # row 9693: the probe's sum was a tracer, and `int` refused it).
-        with jax.ensure_compile_time_eval():
+        with on_host():
             total = program(jnp.sum)(probe)
         if int(total) != mesh.size:
             raise ValueError("the companion CPU collective did not include every device")
@@ -301,34 +316,6 @@ def place_leaf(value, target: Sharding | Format) -> jax.Array:
     jax.block_until_ready(landed)
     evict(source)
     return landed
-
-
-def evict(array: np.ndarray) -> None:
-    """Drop a memory-mapped checkpoint tensor's pages from this process.
-
-    A loader maps a checkpoint file once and hands out views into it, so
-    letting a view go frees nothing while another view is alive. The pages a
-    placed tensor was read from stay resident, and for a base that fills the
-    host that is one copy too many.
-
-    The pages the view covers whole are given back to the kernel here. A
-    boundary page shared with a neighbour stays until the neighbour is
-    placed. A later read of an evicted page faults it back from the file. An
-    array that is not such a view is left alone."""
-    root: np.ndarray = array
-    while isinstance(root.base, np.ndarray):
-        root = root.base
-    mapping = root.base
-    if not isinstance(root, np.memmap) or not isinstance(mapping, mmap.mmap) or array.nbytes == 0:
-        return
-    # The map starts at the allocation granule below the memmap's file
-    # offset; the memmap's data sits that remainder into it.
-    start = root.__array_interface__["data"][0] - root.offset % mmap.ALLOCATIONGRANULARITY
-    offset = array.__array_interface__["data"][0] - start
-    first = -(-offset // mmap.PAGESIZE) * mmap.PAGESIZE
-    last = (offset + array.nbytes) // mmap.PAGESIZE * mmap.PAGESIZE
-    if last > first:
-        mapping.madvise(mmap.MADV_DONTNEED, first, last - first)
 
 
 def transfer[TreeT](tree: TreeT, placement: Placement[TreeT] | NamedSharding) -> TreeT:

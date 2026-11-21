@@ -308,9 +308,9 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
     """What a rewrite's derivation reads beside its program, which keeps every rewrite the pass holds
     (`_derived`, `_closed`): the numerics' forms, the saturation, the device it is priced for (`cost.target`,
     resolved: a named target, an assumed generation or the process's own), the matmul precision a product
-    of none stated is priced at (`cost._mode`) and the rule sets the registry admits for those numerics
-    (`rules.admitted`, by name), so a target assumed, a precision set or a set registered later derives
-    afresh."""
+    of none stated is priced at (`product.product_mode`) and the rule sets the registry admits for those
+    numerics (`rules.admitted`, by name), so a target assumed, a precision set or a set registered later
+    derives afresh."""
     return (accurate, saturation, cost.target(), str(jax.config.jax_default_matmul_precision),
             rules.admitted_names(accurate))
 
@@ -366,8 +366,9 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
     first root that reads it, so a value two roots read is computed once, as extraction priced the roots
     together (spec alignment, 8995: each root traced apart emitted a shared product twice); a root of the
     form an earlier root makes is that root's value (`_placed`)."""
-    leaves = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype, weak_type=var.aval.weak_type)
-              for var in window.invars if isinstance(var.aval, ShapedArray)]
+    # Each input as the window holds it (`fusion.typed`): in a manual mesh's body the axes it varies over too,
+    # so a form traced over them varies as the values it replaces do.
+    leaves = [fusion.typed(var.aval, weak=True) for var in window.invars if isinstance(var.aval, ShapedArray)]
     if len(leaves) != len(window.invars):
         return {}
     chosen = []
@@ -756,13 +757,38 @@ def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostMo
     return list(forms[0].value), price
 
 
+def _mapped(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` is a manual mesh's (`jax.shard_map`'s): its body, each device's program, is a region
+    of its own the pass rewrites in the map's context (`_manual`), as a layer mapped per shard (a projection's
+    product, `dew.nn.sharding.on_shards`) runs its epilogue's math and products within it (row 6578)."""
+    from jax._src import shard_map
+
+    return equation.primitive is shard_map.shard_map_p
+
+
+@contextlib.contextmanager
+def _manual(params: Mapping) -> Iterator[None]:
+    """The context a manual mesh's body is traced in (`jax.shard_map`'s staging, jax/_src/shard_map.py): its
+    newly manual axes bound, its abstract mesh with them manual, and its variance checked as the map checks
+    it. A body rewritten in it (`_within`) traces its new values, a written region's call among them, as the
+    map traced the body's own."""
+    from jax._src import shard_map
+
+    mesh, manual = params["mesh"], params["newly_manual_axes"]
+    with (shard_map._extend_axis_env(mesh, manual),
+          jax.sharding.use_abstract_mesh(shard_map._as_manual_mesh(mesh, manual)),
+          jax_config._check_vma(params["check_vma"])):
+        yield
+
+
 def _holds_regions(equation: jcore.JaxprEqn) -> bool:
     """Whether the pass rewrites `equation`'s bodies in place, each a region of its own (§1.2): a call's
     program (`Primitive.inlined_call`, `dew.nn.programs.called`'s: a nested program, a checkpoint, a custom
     derivative's or batching rule's primal call, its rules kept) and control flow's
     (`dew.nn.programs.control_flow`: a scan's, a loop's predicate and body, a conditional's branches; nothing
-    moves across a body's boundary or a loop's carry). A marked span is read by its kind (`WITHIN`); any
-    other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf."""
+    moves across a body's boundary or a loop's carry). A marked span is read by its kind (`WITHIN`); a manual
+    mesh's body in its own context (`_mapped`); any other holder of a program (a native kernel's) is an opaque
+    leaf."""
     primitive = equation.primitive
     return (primitive.inlined_call and primitive is not marked_call_p) or control_flow(primitive)
 
@@ -777,7 +803,14 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     changed = False
     equations = []
     for equation in jaxpr.eqns:
-        if _holds_regions(equation) or _marked(equation, WITHIN) or (
+        if _mapped(equation):
+            # A manual mesh's body, each device's program, rewritten in its own context (`_manual`), within
+            # the context the equation was recorded in (its abstract mesh among it: a map staged on a mesh of
+            # its own beside the caller's, JAX's replay of an equation, `JaxprEqn.ctx`).
+            with equation.ctx.manager, _manual(equation.params):
+                params = with_bodies(equation.params,
+                                     lambda body: _closed(body, accurate, saturation, kernels))
+        elif _holds_regions(equation) or _marked(equation, WITHIN) or (
                 _marked(equation, (Algebra,)) and _opening(equation) is None):
             params = with_bodies(equation.params,
                                  lambda body: _closed(body, accurate, saturation, kernels))
@@ -851,7 +884,12 @@ def _opening(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     span is rewritten within its call."""
     opens = (_marked(equation, (Algebra,)) and not equation.effects
              and all(isinstance(var.aval, ShapedArray) for var in (*equation.invars, *equation.outvars)))
-    return called(equation) if opens else None
+    body = called(equation) if opens else None
+    # A span whose body holds constants (an array it closes over) opens not: inlined, they would be the
+    # enclosing program's, which a manual mesh's body and a checkpoint's bind none of (JAX stages both without
+    # constants, and their replay and lowering pass none), and a form reading them is no splice's
+    # (`_splices`); it is rewritten within its call, as any other marked span (row 6578's review, F1).
+    return body if body is not None and not body.consts else None
 
 
 def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
@@ -897,14 +935,12 @@ class _Span(NamedTuple):
 
 
 def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr:
-    """`jaxpr` with each Algebra span's call it opens (`_opening`) replaced by its body's equations, nested
-    spans opened too, over the call's operands, its body's constants the program's, and each reader of the
-    call's results reading what its body computes them as; `jaxpr` itself where it holds none. Each span it
-    opens recorded in `spans` (`_Span`), where given, so one no rewrite crosses is closed again
-    (`_reclosed`)."""
+    """`jaxpr` with each Algebra span's call it opens (`_opening`, one of no constants) replaced by its body's
+    equations, nested spans opened too, over the call's operands, and each reader of the call's results
+    reading what its body computes them as; `jaxpr` itself where it holds none. Each span it opens recorded
+    in `spans` (`_Span`), where given, so one no rewrite crosses is closed again (`_reclosed`)."""
     if all(_opening(equation) is None for equation in jaxpr.eqns):
         return jaxpr
-    constvars, consts = list(jaxpr.constvars), list(jaxpr.consts)
     computed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
     equations: list[jcore.JaxprEqn] = []
 
@@ -917,18 +953,12 @@ def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr
         if opening is None:
             equations.append(equation)
             continue
-        body = _opened(opening)
-        # The body's constants the program's own, each a fresh variable of it (`inlined`).
-        fresh = [jcore.Var(var.aval) for var in body.constvars]
-        constvars += fresh
-        consts += list(body.consts)
-        made, returned = inlined(body, equation.invars, fresh)
+        made, returned = inlined(_opened(opening), equation.invars)
         equations += made
         computed.update(zip(equation.outvars, returned, strict=True))
         if spans is not None:
             spans.append(_Span(equation, frozenset(map(id, made)), list(returned)))
-    return jaxpr.replace(constvars=constvars, consts=consts, eqns=equations,
-                         outvars=[outer(atom) for atom in jaxpr.outvars])
+    return jaxpr.replace(eqns=equations, outvars=[outer(atom) for atom in jaxpr.outvars])
 
 
 @dataclasses.dataclass(frozen=True)

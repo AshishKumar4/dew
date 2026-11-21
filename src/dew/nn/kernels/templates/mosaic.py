@@ -348,20 +348,30 @@ def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
         return [(value, view)]
     return [(piece, view.at[..., pl.ds(first, width)]) for first, piece in column_chunks(value, width)]
 
+@dataclasses.dataclass(frozen=True)
+class StagedWriter:
+    """A staged epilogue writer passed to `stored` / `Family.stored` in place of a register array:
+    `write(smem)` populates the shared staging buffer `smem` (or writes directly when `smem is None`)."""
+
+    write: Callable[[Ref | None], None]
+
 
 def stored(parts, views, *, smem, wait: bool = True) -> None:
-    """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, a
-    chunk of its columns at a time where `smem` is narrower (`chunked`), the buffer reused once its copy
-    has read it; the last copy waited for unless `wait` is false, when it stays in flight, one store group
-    (`Family.store_wait`)."""
-    pieces = [piece for part, view in zip(parts, views, strict=True) for piece in chunked(part, view, smem)]
+    """Each of `parts` (a register array or a `StagedWriter`) written whole to its view of `views` through
+    the shared buffer `smem`, in turn, a chunk of its columns at a time where `smem` is narrower (`chunked`),
+    the buffer reused once its copy has read it; the last copy waited for unless `wait` is false, when it
+    stays in flight, one store group (`Family.store_wait`)."""
+    pieces = [piece for part, view in zip(parts, views, strict=True)
+              for piece in ([(part, view)] if isinstance(part, StagedWriter) else chunked(part, view, smem))]
     last = len(pieces) - 1
     for index, (part, view) in enumerate(pieces):
-        smem[...] = part.astype(smem.dtype)
+        if isinstance(part, StagedWriter):
+            part.write(smem)
+        else:
+            smem[...] = part.astype(smem.dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(smem, view)
         if index < last:
-            # The next piece writes `smem`: this copy's reads of it done first.
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
         elif wait:
             plgpu.wait_smem_to_gmem(0)
@@ -597,6 +607,12 @@ class Issuer[Accumulator](abc.ABC):
     mma.sync's four warps of 16 each)."""
 
     @property
+    def atom_columns(self) -> int:
+        """The columns its accumulator layout tiles a value in, which a tile's columns fill whole: mma.sync's
+        warps along its columns (`specialized`), none finer elsewhere."""
+        return 1
+
+    @property
     def walked_rows(self) -> int:
         """The rows a walked tile (a forward's keys) comes in whole multiples of: the products' rows, which a
         consumer's weights' product takes as its depth (wgmma's and the chunks' 64, mma.sync's 16); a family
@@ -829,9 +845,10 @@ class Issuer[Accumulator](abc.ABC):
         bounds them (`resources.held_area`: a TPU core's VMEM); None where registers do."""
         return None
 
-    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
+    def value_scratch(self, blocks: dict, outputs: tuple, *, step: tuple = ()) -> tuple:
         """The `(shape, dtype)` stand-ins of the values it keeps in scratch memory beside a program's
         allocations (`gemm.mosaic_gpu.Allocations.scope`): none where they live in registers."""
+        del blocks, outputs, step
         return ()
 
     issues_in_consumers: bool = True
@@ -1127,9 +1144,12 @@ class Issuer[Accumulator](abc.ABC):
         return vector
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum)."""
+        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum).
+        `pending` is the count of this warpgroup's later product groups left in flight when `product` reads
+        its value (issued by `then()` before the read); synchronous issuers take `pending=0` only and raise
+        `ValueError` otherwise."""
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
@@ -1219,10 +1239,14 @@ class Issuer[Accumulator](abc.ABC):
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
 
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+        """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
+        (`WgmmaIssuer`), else in turn (`product`)."""
+        return self.product(lhs1, rhs1, shape), self.product(lhs2, rhs2, shape)
+
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""
         return self.product(lhs, rhs, shape)
-
     def read(self, acc: Accumulator, *, first: int = 0, columns: int | None = None, pending: int = 0
              ) -> jax.Array:
         """The accumulator's columns `first` to `first + columns` (all of them where None), once at most
@@ -1483,6 +1507,14 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether `added` reads its value through its `smem` (TMA's reduction from a staged tile), which is then
     live wherever a walk adds; an atomic add from registers (cp.async's `red.global`) reads none, so a tile
     staged for the program's stores alone may be scoped after its walks (`scoped`'s `after_walks`)."""
+
+    stages_vectors: bool = True
+    """Whether 1D per-row vectors (attention statistics, status, anchor keys, key sums) stage through shared
+    memory on store (`vector_stage`)."""
+
+    def vector_stage(self, shape: tuple[int, ...], dtype) -> list:
+        """A 1D vector staging allocation of `shape` and `dtype` where `stages_vectors`, else empty."""
+        return [self.staged_memory(shape, dtype)] if self.stages_vectors else []
 
     cluster: int = 1
     """The programs a cluster of the family's launch takes where they share a block or a product (`kernel`'s
@@ -1890,10 +1922,15 @@ class Transport[Allocated, Opened](abc.ABC):
         through its consumers' own loads (mma.sync's) has nothing to publish."""
         plgpu.commit_smem()
 
+    def stage_output(self, value: jax.Array, smem) -> None:
+        """Write an epilogue tile `value` into `smem` in its dtype (unoptimized on cp.async where
+        layout inference rejects narrow decode tiles, row 5272)."""
+        smem[...] = value.astype(smem.dtype)
+
     @abc.abstractmethod
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
-        """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so.
-        Unless `wait`, the last copy out of `smem` stays in flight as one store group, so the caller's
+        """Each of `parts` (a register array or `StagedWriter`) written whole to its view of `views`, through
+        `smem` where the family stores so. Unless `wait`, the last copy out of `smem` stays in flight as one
         next work overlaps it, and the caller owns `smem`'s reuse: it waits (`store_wait`) before writing
         `smem` again, an earlier deferred store's or an add's (`added`) reads of it included, so stores
         into other tiles stay in flight past the call (`store_wait(stores - 1)` keeps one a tile). A call

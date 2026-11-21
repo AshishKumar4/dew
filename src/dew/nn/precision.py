@@ -43,6 +43,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
+from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew.nn.derivatives import (
     Protected,
@@ -63,7 +64,7 @@ from dew.nn.float_bits import (
     widened_exactly,
 )
 from dew.nn.nested import nested
-from dew.nn.programs import UNROUNDED, equations
+from dew.nn.programs import UNROUNDED, equations, own_preset
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -142,6 +143,7 @@ __all__ = [
     "sqrt_or_zero",
     "stochastic_bf16",
     "summed_once",
+    "summed_pairs",
     "twice_scaled",
     "two_product",
     "two_sum",
@@ -653,10 +655,9 @@ def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
     algorithm whose products are whole for these operands (F32_F32_F32, and a 16-bit operand's own
     BF16_BF16_F32 or F16_F16_F32); not an algorithm that narrows them (TF32's, bf16 parts of an fp32
     product) or widens them (F64), which a route hands to XLA, which computes it."""
-    dtype = jnp.dtype(dtype)
     whole = {"DEFAULT", "HIGH", "HIGHEST", "F32_F32_F32"}
-    whole |= {jnp.dtype(jnp.bfloat16): {"BF16_BF16_F32"},
-              jnp.dtype(jnp.float16): {"F16_F16_F32"}}.get(dtype, set())
+    if (own := own_preset(dtype)) is not None:
+        whole.add(own.name)
     return precision_names(effective_precision(precision)) <= whole
 
 
@@ -1299,7 +1300,7 @@ def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = No
     from .kernels.generation import bf16_dot_runs
     if not bf16_dot_runs():
         return precision
-    return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    return own_preset(dtype)
 
 
 def fp32_result_dot_general(precision: PrecisionLike = None):
@@ -1458,19 +1459,13 @@ def uncontracted(*values):
     program lowers for fences the mark (`MARKED_BACKENDS`, `jax.lax.platform_dependent`): no step reading
     them contracts, and no barrier splits the fusions around them (row 8378); the barrier on any other.
 
-    In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
-    `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
-    post110, whose attention forms reach `two_product` and `two_sum` in a kernel body, `natural_exp` and
-    `natural_carried`), which the fork's post111 lowers (row 7954 retires this branch). XLA's TPU programs,
-    and an interpreted kernel's body, which lowers to them, keep the barrier."""
-    from dew.nn.kernels.generation import backend
+    In a kernel's body (`launches.interpreting` not None), whose platform is its launch's, the barrier, as
+    the body's lowering takes it: a compiled Pallas TPU kernel's to its operands as they are, Mosaic keeping
+    a kernel's multiply and add apart (the fork's lowering rule from post111, row 7954), Mosaic GPU's and
+    Triton's by their own rules, an interpreted body's as XLA's programs do."""
     from dew.nn.kernels.launches import interpreting
 
-    if (interpreted := interpreting()) is not None:
-        # A kernel's body, whose platform is its launch's: a compiled TPU kernel's as it is, any other's
-        # barriered (an interpreted body's lowers to XLA's programs, whose platform choice a body takes none).
-        return values if not interpreted and backend() == "tpu" else jax.lax.optimization_barrier(values)
-    if not _MARKING.get():
+    if interpreting() is not None or not _MARKING.get():
         return jax.lax.optimization_barrier(values)
     return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
 
@@ -1807,16 +1802,17 @@ def compensated_add(left, right):
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     with rounding_alone():
-        return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
+        return renormalized_add((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
 
 
 @_protected
-def _renormalized(left, right):
+def renormalized_add(left, right):
     """`compensated_add`'s arithmetic over pairs whose his no multiply makes in the same fusion (each read as
-    one value, `uncontracted`, or a compensated reduction's accumulator, made by additions alone): the his'
-    TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own: one in a
-    reduction's computation splits the fusions around the program, row 7953). A lo is read once, so a
-    multiply contracted into its addition reads it once too."""
+    one value, `uncontracted`, or a compensated reduction's or scan's accumulator, made by additions alone):
+    the his' TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own:
+    one in a reduction's computation splits the fusions around the program, row 7953). A lo is read once,
+    so a multiply contracted into its addition reads it once too. The combine of a compensated reduction
+    (`summed_pairs`) and a compensated scan (`dew.algebra.scan.compensated`)."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     total, dropped = _two_sum(left_hi, right_hi)
     return _two_sum(total, dropped + left_lo + right_lo)
@@ -1851,13 +1847,38 @@ def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """The sum of `values` over `axes` its compensated pair rounds once, its tangent the plain sum's: a
     protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
     algebra pass must not cancel."""
-    # Each value read as one (`uncontracted`) where it is made, or the reduction's additions marked to round
-    # alone (`rounding_alone`): the reduction's pairs are its additions'.
+    wide = values.astype(at_least_fp32(values.dtype))
+    pair = summed_pairs((wide, jnp.zeros_like(wide)), axes)
+    return compensated_total(pair, jnp.sum(wide, axes)).astype(values.dtype)
+
+
+def summed_pairs(pair: tuple[jax.Array, jax.Array], axes: Sequence[int]) -> tuple[jax.Array, jax.Array]:
+    """Double-float `(hi, lo)` pairs summed over `axes` in one XLA reduction, `(hi, lo)`: each `hi` read as
+    one value where it is made (`uncontracted`), or the reduction's additions marked to round alone
+    (`rounding_alone`), and the pairs combined by `compensated_add`'s arithmetic with no barrier of its own
+    (`renormalized_add`: one in a reduction's computation splits the fusions around the program, row 7953).
+    The one compensated pair reduction: a compensated sum's (`compensated_sum`), a kernel's programs' parts'
+    (`norm_swiglu`), a guidance projection's dot products' (row 8498). An axis of one element is no sum and
+    is taken out before the reduction: XLA:GPU's simplifier (post117) rewrote a pair reduction over such an
+    axis into one bitcast of a single array's shape and refused its own program (a RET_CHECK of
+    `ShapeUtil::Compatible`, row 10674)."""
+    hi, lo = pair
+    if hi.shape != lo.shape or hi.dtype != lo.dtype:
+        raise ValueError(f"a pair's limbs share one shape and dtype, not {hi.dtype}{list(hi.shape)} and "
+                         f"{lo.dtype}{list(lo.shape)}")
+    # An axis out of range or named twice refused as numpy refuses it (an AxisError, a ValueError).
+    axes = normalize_axis_tuple(tuple(axes), hi.ndim)
+    ones = tuple(axis for axis in axes if hi.shape[axis] == 1)
+    if ones:
+        hi, lo = jnp.squeeze(hi, ones), jnp.squeeze(lo, ones)
+    kept = tuple(axis - sum(one < axis for one in ones) for axis in axes if axis not in ones)
     with rounding_alone():
-        (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
-        zero = jnp.zeros((), wide.dtype)
-        hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
-    return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
+        (hi,) = uncontracted(hi)
+        zero = jnp.zeros((), hi.dtype)
+        if not kept:
+            # Each pair combined once with the reduction's zero, as a reduction over its one element is.
+            return renormalized_add((jnp.zeros_like(hi), jnp.zeros_like(lo)), (hi, lo))
+        return jax.lax.reduce((hi, lo), (zero, zero), renormalized_add, kept)
 
 
 def compensates_loops() -> bool:

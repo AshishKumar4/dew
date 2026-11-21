@@ -997,6 +997,15 @@ def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumer
     assert split.flops * steps[1] == unsplit.flops * steps[0]
 
 
+def test_a_launchs_costed_work_holds_the_integer_work_its_emission_counts():
+    """A causal forward's launch traced for an H100 (`_split_work`) counts the integer work its emission
+    issues (its mask's comparisons and index arithmetic, `cost.Work.integer_operations`) in its costed work,
+    as every other unit its emission counts: its launch's work had dropped them, pricing them at none in the
+    decode and the forward consumer's choice (row 10793)."""
+    work = _split_work("causal", 256, 256, 2, "wgmma", 1)
+    assert work.integer_operations > 0, work
+
+
 def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
     """A decode step of 256 rows of one query, 8 heads over 2 key heads 128 wide in bf16, on an H100 over
     4096 keys (`attention_decode.priced_step`): its programs, 512, pass the multiprocessors' count, so no
@@ -1060,7 +1069,7 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
     from test_merged import _traced_merge_bytes
 
-    from dew.algebra import means
+    from dew.algebra import windows
     from dew.nn.kernels.templates import merged
 
     target = generation.gpu_target("sm90")
@@ -1084,7 +1093,7 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     emitted_bytes = _traced_merge_bytes(merge_eq.params["units"], padded_s, stacked_s, queries, width, block,
                                         out_dtype=out_dtype, out_heads=out_heads)
     slices = padded_s.shape[1]
-    merge_span = float(3 * -(-slices // means.chunk_width(slices)))
+    merge_span = float(3 * -(-slices // windows.chunk_width(slices)))
     walk_launches = [w for eq in programs.equations(traced.jaxpr)
                      if eq.primitive in programs.NATIVE_KERNELS
                      and (w := emission.work_of(eq)) is not None]

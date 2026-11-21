@@ -243,10 +243,6 @@ class GatedMLP(nn.Module):
         axes = self._axes(x)
         if not isinstance(activation, (str, Situ)):
             up = checkpoint_name(self._placed(self.up_proj(x)), Residual.UP_PROJ)
-            # A named activation is one region wherever it runs (`ungated_activation`), a fusion pass's
-            # epilogue of the projection before it, the down projection's too where it follows it.
-            if isinstance(self.activation, str) and self.activation in UNGATED:
-                activation = functools.partial(ungated_activation, self.activation)
             out = self._down(activation(up), train)
             return activation(out) if self.activation_after else out
         # A packed MLP holds no gate_proj apart (`_fusable`): its projections are read past that.
@@ -338,8 +334,10 @@ class GatedMLP(nn.Module):
         ungated MLP's function."""
         if self.activation == XIELU:
             return self._learned
-        if isinstance(self.activation, str):
-            return UNGATED.get(self.activation, self.activation)
+        if isinstance(self.activation, str) and self.activation in UNGATED:
+            # A named activation is one region wherever it runs (`ungated_activation`), a fusion pass's
+            # epilogue of the projection before it, the down projection's too where it follows it.
+            return functools.partial(ungated_activation, self.activation)
         return self.activation
 
     def _learned(self, hidden):

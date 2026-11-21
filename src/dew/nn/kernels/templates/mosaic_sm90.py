@@ -70,16 +70,26 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         accumulator = min(widest, self.widest_product or widest) * self.rows // resources.THREADS
         return accumulator + self.assembled if widest else 0
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
 
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             mosaic.committed()
             if then is not None:
                 then()
-            return acc_ref[...]
+            return acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending)
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+        def both(acc1, acc2):
+            plgpu.wgmma(acc1, lhs1, rhs1)
+            plgpu.wgmma(acc2, lhs2, rhs2)
+            mosaic.committed()
+            return acc1[...], acc2[...]
+
+        return pl.run_scoped(both, plgpu.WGMMAAccumulatorRef(shape, jnp.float32),
+                             plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)

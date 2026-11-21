@@ -782,6 +782,10 @@ class MixerCall:
     depth: jax.Array | None = None
     """The layer's index in its stack `[B, S]`, where its mixer reads it (`MixerBase.reads_depth`):
     data a scan of like layers hands each one (`LayerInputs.depth`)."""
+    site_inputs: Mapping[str, jax.Array] | None = None
+    """The inputs of a mixer's sites past its first (`dew.nn.protocols.InputSites`), by site, where a looped
+    pass merges its message into each apart (`dew.nn.cross_pass`); None reads the call's input at every
+    site."""
 
     def unread(self, reads: frozenset[str]) -> tuple[str, ...]:
         """The `MIXING` fields this call sets that a mixer reading `reads` does not read."""

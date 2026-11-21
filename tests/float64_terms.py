@@ -16,7 +16,7 @@ import numpy as np
 from arm_arithmetic import on_float64_device, on_float64_host, unrewritten
 from jax.extend.core import primitives
 from jax.interpreters import partial_eval as pe
-from truths_ahead import AT_RUN, COMPILED as STORE, running
+from store_wire import COMPILED as STORE, running
 
 from dew.nn import programs
 from dew.nn.precision import correctly_rounded_divide_p
@@ -175,7 +175,7 @@ def _termed(fn, args, *, power: int):
     steered = None if ran is None else ran[0].walked(ran[1], f"terms {power}", args)
     if ran is not None and steered is None:
         # A run reading programs compiled ahead (`truths_ahead`): the truth's compiled run and the walk's,
-        # its terms alone, in turn (`reference_error._held_walk`); a walk its values steer runs as it is
+        # its terms alone, in turn (`arm_store._held_walk`); a walk its values steer runs as it is
         # walked, on the GPU, named.
         store, label = ran
         values = jax.tree.leaves(store.called(label, "truth", args))
@@ -187,6 +187,8 @@ def _termed(fn, args, *, power: int):
     if ran is not None:
         # In a part's run, a walk its values steer (its prepare held none) compiles its spans on the GPU as
         # it walks, its float64 on the GPU's FP64 units (bible §8), named as its prepare declared it.
+        from truths_ahead import AT_RUN
+
         ran[0].unprepared(f"{ran[1]}: its terms walk: {steered}", AT_RUN)
     token = POWER.set(power)
     try:
@@ -490,17 +492,43 @@ def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
     return all(static(body) for body in programs.bodies(equation))
 
 
+SPAN_STEPS = 1024
+"""The most steps one compiled span holds (`_runs`), a call's body's steps counted among them (`steps`): a run
+of static steps past it is compiled in parts, and a call whose body is past it walked as its own body's
+spans, so no one compile holds a model's whole walk (row 9780: a Gemma 3n site's tapped walk, 6534 steps,
+compiled whole peaked at 9.1 GiB; in parts of 1024, 4.5 GiB, in the same 176 s; row 10950: a jit-wrapped
+reference is one step whose body is the program)."""
+
+
+def steps(jaxpr) -> int:
+    """`jaxpr`'s steps, every program's within it at any depth counted (`programs.equations`): what a compile
+    of its walk holds."""
+    return sum(1 for _ in programs.equations(jaxpr))
+
+
+def _steps(equation) -> int:
+    """`equation` and its bodies' steps (`steps`)."""
+    return 1 + sum(steps(getattr(body, "jaxpr", body)) for body in programs.bodies(equation))
+
+
 def _runs(jaxpr) -> list[tuple[int, int]]:
-    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, each branch
-    or loop a span of its own."""
-    spans, start = [], 0
+    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, holding at
+    most `SPAN_STEPS` steps, its calls' bodies' counted; each branch or loop a span of its own, and so each
+    call of more steps than a span holds, which the walk then walks as its body's spans."""
+    spans, start, held = [], 0, 0
     picked = _platform_picked(jaxpr)
     for index, equation in enumerate(jaxpr.eqns):
-        if not _static_equation(equation, picked):
+        size = _steps(equation)
+        if not _static_equation(equation, picked) or size > SPAN_STEPS:
             if start < index:
                 spans.append((start, index))
             spans.append((index, index + 1))
-            start = index + 1
+            start, held = index + 1, 0
+        elif held + size > SPAN_STEPS:
+            spans.append((start, index))
+            start, held = index, size
+        else:
+            held += size
     if start < len(jaxpr.eqns):
         spans.append((start, len(jaxpr.eqns)))
     return spans
@@ -628,7 +656,10 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     walked = wanted or rule is not None
     if walked and body is not None:
         return evaluated(*body, inputs, given, compiling, rule, used)
-    if rule is not None and programs.control_flow(primitive) and _traced_values(inputs):
+    # A branch picks by its selector alone: one known (a platform's, `_platform`) walks its branch beside
+    # traced operands, never every dead one (a platform's other branches, primitives no rule evaluates).
+    picking = inputs[:1] if primitive is jax.lax.cond_p else inputs
+    if rule is not None and programs.control_flow(primitive) and _traced_values(picking):
         # Traced, its values pick no branch and bound no Python loop: the primitive itself over walked bodies.
         outputs = _bound_walk(equation, inputs, rule, used)
         return outputs, [None] * len(outputs)
@@ -738,7 +769,7 @@ def _stacked(*steps):
 def _traced_values(values) -> bool:
     """Whether any of `values` is a tracer: a walk inside a trace (a compiled span, a jit of the walk), a
     program calling `float64_terms` traced whole (a site's terms program its prepare compiles,
-    `reference_error._held_program`)."""
+    `arm_store._held_program`)."""
     return any(isinstance(value, jax.core.Tracer) for value in values)
 
 

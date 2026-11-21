@@ -22,7 +22,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import on_float64_device, widened
+from arm_arithmetic import drawn_on_the_host, on_float64_device, widened
 from float64_terms import float64_signed_sums
 
 LEAST = float(np.finfo(np.float32).tiny)
@@ -407,9 +407,12 @@ def on_a_tpu(fn):
 
 def normal_draw(seed, *shapes, scale: float = 1.0, dtype=jnp.float32) -> tuple:
     """Standard normal arrays of `shapes` at `scale` in `dtype`, from `seed` (a seed, or a site's salt and
-    a seed: NumPy's `SeedSequence` entropy)."""
-    rng = np.random.default_rng(seed)
-    return tuple(jnp.asarray(rng.standard_normal(shape) * scale, dtype) for shape in shapes)
+    a seed: NumPy's `SeedSequence` entropy), made on the host's CPU (`drawn_on_the_host`)."""
+    def drawn(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(jnp.asarray(rng.standard_normal(shape) * scale, dtype) for shape in shapes)
+
+    return drawn_on_the_host(drawn, seed)
 
 
 def normal_drawn(salt: int, *shapes, dtype=jnp.float32):

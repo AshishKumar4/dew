@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
@@ -51,12 +50,11 @@ from dew.inference.banks import (
     one_layer,
     without_banks,
 )
-from dew.mesh import batch_axes
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_names import layer_index
 from dew.nn.inspection import unscaled, unscaling
 from dew.nn.kernels.options import Option, owned_program, program
-from dew.training.memory import compiled_if_it_fits, device_tokens, step_compiler_options
+from dew.training.memory import compiled_if_it_fits, step_options
 from dew.training.transaction import Realization, discovered_probes, placed_as_rows, refuse_unread_probes
 
 if TYPE_CHECKING:
@@ -357,12 +355,9 @@ class HostExecution:
         """The XLA options the resident step compiles under (`step_compiler_options`), which the host
         step's forward and pullback take too, so the two differ by the host boundary alone: the
         tokens each accelerator device steps of `batch`, whether the step trains next to frozen
-        weights, and the accelerator's devices."""
-        shards = math.prod(self.accelerator.shape[axis] for axis in batch_axes(self.accelerator))
-        options = step_compiler_options(self.objective, device_tokens(self.objective, batch, shards),
-                                        FROZEN in variables, self.accelerator.size,
-                                        gathered=self.gathered)
-        return dict(options or {})
+        weights, and the accelerator's devices: the resident step's own (`memory.step_options`) on the
+        accelerator's mesh."""
+        return dict(step_options(self.objective, batch, variables, self.accelerator, self.gathered) or {})
 
     def snapshot(self, variables, *, moved=None):
         """The declared stacks as banks, everything else as it is stored, each moved by `moved` (this
@@ -616,7 +611,8 @@ def placed_host(objective, fresh: Callable[[], TrainState], state_mesh: Mesh, de
     one leaf, not the tree, and one JIT could not have returned to the two
     device sets anyway.
     """
-    from dew.distributed.host import evict, place_leaf, stream
+    from dew.distributed.host import place_leaf, stream
+    from dew.distributed.pages import evict
     held = objective.held_variables()
     with jax.default_device(state_mesh.local_devices[0]):
         state = fresh()

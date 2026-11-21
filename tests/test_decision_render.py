@@ -418,3 +418,43 @@ def test_a_cut_takes_the_longest_state_a_merge_lets_fit():
     tight = dataclasses.replace(empty, max_len=len(bare.tokens))
     [row] = tight.rows(laya, SPECIALS, "ta", {"team": TEAM})
     assert tight.fits(row) and row.state_kept >= 1
+
+
+class MergingAcrossCuts(ByteTokenizer):
+    """The byte vocabulary, but for "xyz", which encoding takes as one token (id 2): a row encoded whole
+    can merge a state's last bytes with the text after it."""
+
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
+        return self.offsets(text)[0]
+
+    def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
+        """Its ids, each covering its characters, "xyz" one id covering three."""
+        ids, starts, ends = super().offsets(text)
+        merged: tuple[list[int], list[int], list[int]] = ([], [], [])
+        at = 0
+        while at < len(ids):
+            width = 3 if ids[at:at + 3] == list(b"xyz") else 1
+            merged[0].append(2 if width == 3 else ids[at])
+            merged[1].append(starts[at])
+            merged[2].append(ends[at + width - 1])
+            at += width
+        return merged
+
+
+def test_a_state_cut_in_a_row_encoded_whole_takes_a_longer_cut_whose_row_encodes_shorter():
+    """A question row encoded whole whose room is one token short of the state "aaxyq" whole: the cut its
+    share counts ("aa", the state's own tokens against the room) grows past "aax", whose row overflows, to
+    "aaxy", whose "xy" merges with the "z" written after it into one token and whose row fits (row 9060:
+    the growth stopped at the first longer cut that overflowed)."""
+    _, _, _, *question = release().segments
+
+    def row(state: str, max_len: int):
+        layout = SegmentLayout.state_first_row(max_len=max_len, labels=release().labels, unit="whole",
+                                               segments=(Text("S:"), State(), Text("z\n"), *question))
+        [laid] = layout.rows(MergingAcrossCuts(), SPECIALS, state, {"team": TEAM})
+        return laid
+
+    # The row of the cut "aaxy" kept whole, its "xyz" one token: the room the cut state is given.
+    fitting = row("aaxy", 1 << 16)
+    assert 2 in list(fitting.tokens)
+    assert list(row("aaxyq", len(fitting.tokens)).tokens) == list(fitting.tokens)

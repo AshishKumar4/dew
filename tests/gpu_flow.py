@@ -27,7 +27,10 @@ class Cell:
     Mosaic GPU's where `mosaic` (run only where the device runs them as the generation lowers them,
     `generation_support.lowers_as`); `native` its values of the axes a GPU runs natively, which a class's
     covering reads (`covering`), and `fault` the GPU-only fault or red it is kept for by name, None where the
-    covering decides."""
+    covering decides. `at_run`, a cell with no check-1 site whose programs its run compiles as it reaches
+    them (its GPU's driver facts read, a fresh process's, a bitwise check), says why: its GPU tier part's
+    prepare has nothing of it to compile ahead and passes it by (`run_cells`), as the `compiles_at_run`
+    marker passes a test by (tests/conftest.py), where it was deferred and named unprepared (row 8074)."""
 
     label: str
     run: Callable[[], None]
@@ -35,6 +38,7 @@ class Cell:
     mosaic: bool = False
     native: Mapping[str, str] = dataclasses.field(default_factory=dict)
     fault: str | None = None
+    at_run: str | None = None
 
 
 def held(combination: Mapping[str, str], *, values: bool = True) -> set:
@@ -137,11 +141,12 @@ def _device() -> str:
 
 def _tried() -> frozenset[str] | None:
     """The sites the store of a GPU tier part's prepare has tried to prepare
-    (`truths_ahead.CompiledTruths.preparing`), read before a cell runs (`_deferred`); none outside one."""
+    (`truths_ahead.CompiledTruths.preparing`), read before a cell runs (`_deferred`); none outside one,
+    the store's machinery not loaded (`store_wire`)."""
+    import store_wire
     import tier_wire
-    import truths_ahead
 
-    store = truths_ahead.COMPILED.get()
+    store = store_wire.COMPILED.get()
     return frozenset(store.tried) if tier_wire.preparing() and store is not None and store.prepare else None
 
 
@@ -154,18 +159,18 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     past or failed within the programs its prepare holds, and is recorded deferred (`truths_ahead.DEFERRED`,
     where it raised and why), its run computing and judging it with the flow's other cells served by the store
     and naming the test unprepared (tests/conftest.py); one whose every site it began its prepare finished,
-    and then raised, checked what its prepare gives in their place (an `ahead_arm`'s zeros: a later failure in
-    its prepare judges nothing) and passes its prepare unrecorded, its run judging it (row 8555: every such
-    cell was named unprepared, falsely)."""
-    import os
-
-    import truths_ahead
-
+    and then raised, checked what its prepare gives in their place (`CompiledTruths.judged_its_zeros`, a
+    test's rule too) and passes its prepare unrecorded, its run judging it (row 8555: every such cell was
+    named unprepared, falsely)."""
     if tried_before is None:
         return False
-    store = truths_ahead.COMPILED.get()
-    new = store.tried - tried_before
-    if not new or not new <= store.done:
+    import os
+
+    import store_wire
+    import truths_ahead
+
+    store = store_wire.COMPILED.get()
+    if not store.judged_its_zeros(error, tried_before):
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {_raised(error)[:400]}",
                                 truths_ahead.DEFERRED)
@@ -181,6 +186,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     # Read when the flow runs: generation_support reads, in a prepare, model_flows' node target, whose
     # module imports this one, so importing it here made a flow module imported first refuse to import in
     # every GPU tier part's prepare (a circular import: its sites went unprepared).
+    import tier_wire
     from generation_support import lowers_as, runnable
 
     global _depth
@@ -188,10 +194,16 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     failed: list[tuple[str, str, list[tuple[str, int]]]] = []
     skipped: list[str] = []
     passed = deferred = 0
+    preparing = tier_wire.preparing()
     try:
         for cell in cells:
             if cell.generation is not None and not (lowers_as if cell.mosaic else runnable)(cell.generation):
                 skipped.append(cell.label)
+                continue
+            if preparing and cell.at_run is not None:
+                # Nothing of it to compile ahead (`Cell.at_run`): its run runs it, as a deferred cell's.
+                print(f"cell compiles at its run: {cell.label}: {cell.at_run}", flush=True)
+                deferred += 1
                 continue
             print(f"cell: {cell.label}", flush=True)
             tried_before = _tried()

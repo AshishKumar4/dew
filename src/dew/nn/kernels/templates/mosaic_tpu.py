@@ -99,15 +99,18 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         _one(consumers)
         return generation.shared_budget(generation.gpu_target()) // (VALUES * 4)
 
-    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
-        # Mosaic TPU holds a step's operand blocks as values and the fp32 accumulator and product tile
-        # beside them in VMEM (`VALUES`): a v5e refused 20.33 and 20.95 MiB at a 1024 x 512 x 2048 product
-        # and kernel gradient, 16.12 at a 256 x 512 x 4096 gradient, whose buffers alone counted 16.00, 16.00
-        # and 13.0 (the compile gate's libtpu runs of the launch this one replaced).
+    def value_scratch(self, blocks: dict, outputs: tuple, *, step: tuple = ()) -> tuple:
+        """VMEM scratch stand-ins for operand `blocks`, fp32 `outputs` accumulators, and a walk step's
+        live intermediate tiles `step` (each live value `VALUES` copies, as an accumulator): a v5e
+        refused 20.33 and 20.95 MiB at a 1024 x 512 x 2048 product and kernel gradient, 16.12 at a
+        256 x 512 x 4096 gradient, whose buffers alone counted 16.00, 16.00 and 13.0 (GEMM passes
+        `step=()`); attention passes its live score tiles (forward 6+6 score tiles, backward 10 beside
+        3 fp32 accumulators; v5e 22 MiB, row 10771)."""
         operands = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in blocks.values())
         values = tuple(jax.ShapeDtypeStruct(shape, jnp.float32)
                        for shape, _ in outputs for _ in range(VALUES))
-        return operands + values
+        live = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in step for _ in range(VALUES))
+        return operands + values + live
 
     # A tile, a row and a column are values: the members the GPU's issuers lay out are plain reads.
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
@@ -164,7 +167,9 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         del interpret
         return acc + value.astype(jnp.float32)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+        if pending:
+            raise ValueError(f"{type(self).__name__}.product is synchronous (pending={pending})")
         if then is not None:
             then()
         return _product(lhs, rhs)
@@ -205,7 +210,6 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     ring_slots = STAGES
 
     copies_tiled_rows = True
-
     def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
                   joined: tuple = ()) -> int:
         raise NotImplementedError("a TPU core budgets no registers: its values spill to VMEM")
@@ -274,12 +278,15 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 return named(*given, *made[:len(outputs)])
 
             spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(values))]
+            # Programs with no in-place aliased refs (`places`) have independent grid outputs (`parallel`);
+            # launches with `added` refs stay `arbitrary` so read-modify-writes never race.
+            semantics = ("arbitrary" if places else "parallel",) * len(grid)
             written = launches.pallas_call(
                 program, name=name or self.name, out_shape=(*outputs, *aliased), grid=grid,
                 in_specs=[pl.BlockSpec(memory_space=space) for space in spaces],
                 out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (len(outputs) + len(aliased)),
                 input_output_aliases={at: len(outputs) + k for k, at in enumerate(places)},
-                compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",) * len(grid)),
+                compiler_params=pltpu.CompilerParams(dimension_semantics=semantics),
                 interpret=pltpu.InterpretParams() if interpret else False,
                 cost_estimate=emission.built_with(cost))(*values)
             for at, added in zip(places, written[len(outputs):], strict=True):
@@ -338,15 +345,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # A core's scalar is its own: no lanes to read alike.
         return value
 
-    def decided_scratch(self, consumers: int) -> dict:
-        # One core a program, its walk its one role: it decides a second walk alone (`after_walk.Decided`).
-        del consumers
-        return {}
-
     def stream(self, streams, views, lo, hi, *, again=None) -> None:
-        # No producer role: the walk issues its own copies, a decided walk's second pass's too.
+        # No producer role: the walk issues its own copies.
         del streams, views, lo, hi, again
-
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
@@ -480,7 +481,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         del wait
         for part, view in zip(parts, views, strict=True):
-            smem[...] = part.astype(smem.dtype)
+            if isinstance(part, mosaic.StagedWriter):
+                part.write(smem)
+            else:
+                smem[...] = part.astype(smem.dtype)
             pltpu.sync_copy(smem, view)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:

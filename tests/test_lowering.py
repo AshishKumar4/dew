@@ -1,5 +1,6 @@
 """A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
+import dataclasses
 import json
 import logging
 import math
@@ -1239,10 +1240,10 @@ def each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
     """Two processes, each seeing one GPU (`CUDA_VISIBLE_DEVICES`): the second's device is global id 1
     and its own ordinal 0, and each process's kernel target holds the CUDA driver's clock, bandwidth and
     multiprocessors for that GPU, the same in both, as GPUs of one kind give."""
-    from process_support import ProcessGroup, free_port, report_of, start_process
+    from process_support import ProcessGroup, coordinator_port, report_of, start_process
 
     worker = Path(__file__).with_name("device_facts_worker.py")
-    coordinator = f"127.0.0.1:{free_port()}"
+    coordinator = f"127.0.0.1:{coordinator_port()}"
     outs = [tmp_path / f"process{rank}.json" for rank in range(2)]
     # The test's own two GPUs, as the run allotted them, one to each process, which allocates on demand
     # beside this process's preallocation.
@@ -1483,6 +1484,24 @@ def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
 
 
 # ------------------------------------------------------------------ a TPU topology, compiled ahead here
+
+
+def test_a_tpu_build_is_refused_on_as_many_chips_of_its_kind_laid_out_otherwise():
+    """A build target of a v5e 2x2 slice's chips (`BuildTarget.of`) admits that slice's own devices and
+    refuses four v5e chips laid out otherwise, the second half of a 2x4 slice, naming the chips; a GPU's
+    or a CPU's target states none (row 9064: a same-kind, same-count TPU mismatch reached the backend's
+    deserialization)."""
+    from dew.training.ahead import BuildTarget, compile_only_tpus
+
+    square = compile_only_tpus("v5e:2x2")
+    rows = [device for device in compile_only_tpus("v5e:2x4") if device.coords[1] >= 2]
+    assert len(rows) == len(square)
+    built = BuildTarget.of(square)
+    assert not built.differences(BuildTarget.of(square))
+    other = BuildTarget.of(rows)
+    assert other.chips != built.chips and built.differences(other)
+    assert not dataclasses.replace(built, chips=None).differences(other)
+    assert BuildTarget.of(jax.devices("cpu")).chips is None
 
 
 def _topology_trainer(topology: str, **options):

@@ -765,26 +765,37 @@ class Tcgen05Walked(Tcgen05Placed):
         # walk's end not taken (`mosaic.taken`), and marked (`mosaic.stepped`); then the issuer's last
         # products awaited (`finished`), whose sums the epilogue reads, zeros where the walk has no step.
         del streams, first, in_flight, unrolled, products
-        ((step, lo, hi),) = mosaic.stepped(segments)
-        own, count = mosaic.ROLE.get(), hi - lo
+        segments = list(mosaic.stepped(segments))
+        if not segments:
+            raise ValueError("Tcgen05Walked.walk requires at least one segment")
+        if len(segments) > 1 and self.consumers != TURNS:
+            raise ValueError(f"Tcgen05Walked.walk takes several segments only with {TURNS} consumers, "
+                             f"got {self.consumers}")
+        own = mosaic.ROLE.get()
+        lo, hi = segments[0][1], segments[-1][2]
+        count = hi - lo
+        def make_loop(step, seg_lo, seg_hi):
+            def placed(trip, carry, accumulators):
+                for turn in range(own, TURNS, self.consumers):
+                    n = TURNS * trip + turn
 
-        def placed(trip, carry, accumulators):
-            for turn in range(own, TURNS, self.consumers):
-                n = TURNS * trip + turn
+                    def stepped(carry, n=n, turn=turn):
+                        # No step's first is a constant here (the walk's trips are its compute warpgroups').
+                        slots = _PlacedSlots(n, turn, first=False, more=n + 1 < count)
+                        return step(lo + n, slots, carry, accumulators)[0]
 
-                def stepped(carry, n=n, turn=turn):
-                    # No step's first is a constant here (the walk's trips are its compute warpgroups').
-                    slots = _PlacedSlots(n, turn, first=False, more=n + 1 < count)
-                    return step(lo + n, slots, carry, accumulators)[0]
+                    if turn == own:
+                        carry = stepped(carry)
+                    else:
+                        (carry,) = mosaic.taken(n < count, lambda held, stepped=stepped: (stepped(held),),
+                                                carry)
+                return carry, accumulators
 
-                if turn == own:
-                    carry = stepped(carry)
-                else:
-                    (carry,) = mosaic.taken(n < count, lambda held, stepped=stepped: (stepped(held),),
-                                            carry)
-            return carry, accumulators
+            first_trip = lax.div(jnp.maximum(seg_lo - lo - own, 0) + TURNS - 1, TURNS)
+            end_trip = lax.div(jnp.maximum(seg_hi - lo - own, 0) + TURNS - 1, TURNS)
+            return mosaic.Loop(placed, first_trip, end_trip)
 
-        loops = (mosaic.Loop(placed, 0, lax.div(jnp.maximum(count - own, 0) + TURNS - 1, TURNS)),)
+        loops = tuple(make_loop(*segment) for segment in segments)
         carry, kept = self.accumulated(loops, start, shapes, interpret, initial)
         finished = self._hand_offs().finished
         finished.wait(finished.turn(0))
