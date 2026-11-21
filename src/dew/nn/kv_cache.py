@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
-PagedKernel = PagedKernel
+PagedKernel = Literal["template", "triton", "tpu"]
 """The storage formats a quantized cache takes."""
 
 TABLE = "page_table"
