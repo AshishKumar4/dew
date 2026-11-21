@@ -579,26 +579,32 @@ def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: 
     return stepping
 
 
-def _unlike(cap: Candidate, other: Candidate) -> list[str]:
+def _unlike(cap: Candidate, cap_outputs, other: Candidate, other_outputs) -> list[str]:
     """What `other`'s step holds or returns otherwise than `cap`'s (`StepCompiler.lowered_counts`), each
-    leaf named by its path, read off their lowerings: the state it prepares, its window among them, with
-    their shapes, dtypes and shardings, and its outputs (`out_info`), the stepped state and the metrics a
-    step's whole pools, these by their nodes' kinds too (`_node_kinds`: a mean pooled as another kind over
-    the same leaves, row 10815)."""
-    def leaves(tree) -> dict[str, tuple]:
+    leaf named by its path: the state it prepares, its window among them, with their shapes, dtypes and
+    shardings, and its outputs (`cap_outputs`, `other_outputs`: an executable's or a lowering's
+    `out_info`), the stepped state and the metrics a step's whole pools, by their shapes and dtypes, their
+    shardings where both state one, and their nodes' kinds (`_node_kinds`: a mean pooled as another kind
+    over the same leaves, row 10815)."""
+    def leaves(tree, placed: bool = True) -> dict[str, tuple]:
         return {jax.tree_util.keystr(path): (getattr(leaf, "shape", None), str(getattr(leaf, "dtype", leaf)),
-                                             getattr(leaf, "sharding", None))
+                                             getattr(leaf, "sharding", None) if placed else None)
                 for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
+
+    def placed(left, right) -> bool:
+        return all(isinstance(getattr(leaf, "sharding", None), jax.sharding.Sharding)
+                   for leaf in (*jax.tree.leaves(left), *jax.tree.leaves(right)))
 
     unlike: list[str] = []
     for name, (held, given) in {"state": (cap.prepared, other.prepared),
                                 "placement": (cap.shardings, other.shardings),
-                                "outputs": (cap.lowered.out_info, other.lowered.out_info)}.items():
-        ours, theirs = leaves(held), leaves(given)
+                                "outputs": (cap_outputs, other_outputs)}.items():
+        both = name != "outputs" or placed(held, given)
+        ours, theirs = leaves(held, both), leaves(given, both)
         unlike += [f"{name}{path}" for path in sorted(ours.keys() | theirs.keys())
                    if ours.get(path) != theirs.get(path)]
-    if not unlike and (_node_kinds(jax.tree.structure(cap.lowered.out_info))
-                       != _node_kinds(jax.tree.structure(other.lowered.out_info))):
+    if not unlike and (_node_kinds(jax.tree.structure(cap_outputs))
+                       != _node_kinds(jax.tree.structure(other_outputs))):
         unlike.append("outputs' node kinds")
     return unlike
 
@@ -1209,13 +1215,14 @@ class StepCompiler[L, E]:
                 planned = search.found(cap.split)
         finally:
             self._loss_shapes.clear()
-        self._refuse_unlike(cap.candidate, planned.candidate, passes)
+        self._refuse_unlike(cap, planned.candidate, planned.executable.out_info, passes)
         return planned
 
     @staticmethod
-    def _refuse_unlike(cap: Candidate, other: Candidate, passes: int) -> None:
-        """Refused where the step of `passes` holds or returns otherwise than its cap's (`_unlike`)."""
-        unlike = _unlike(cap, other)
+    def _refuse_unlike(cap: Planned, other: Candidate, outputs, passes: int) -> None:
+        """Refused where the step of `passes` (`other`, returning `outputs`) holds or returns otherwise than
+        its cap's (`_unlike`)."""
+        unlike = _unlike(cap.candidate, cap.executable.out_info, other, outputs)
         if unlike:
             raise ValueError(f"the step of {passes} passes holds {unlike} other than its cap's step does: a "
                              "sampled count's steps pass one state between them, its window pooling them all")
@@ -1235,7 +1242,7 @@ class StepCompiler[L, E]:
                 self.phase_passes.current = count
                 with self.phase_passes.scoped(holder, self):
                     lowered = self._lowered_at(stepping(), state, batch, cap)
-                self._refuse_unlike(cap.candidate, lowered, count)
+                self._refuse_unlike(cap, lowered, lowered.lowered.out_info, count)
         finally:
             self.phase_passes.current = sampled.cap
 
