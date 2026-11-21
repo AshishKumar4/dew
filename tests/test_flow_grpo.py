@@ -482,7 +482,7 @@ def test_deterministic_rollout_cannot_contribute_policy_gradient():
 
 
 
-def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
+def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods(monkeypatch):
     """The rollout's recorded likelihoods and their rescoring are on par with
     the authors' Gaussian at the DiT's own guided velocities over rollouts
     (check 1), guidance included: the rollout walks 4 points and guides its
@@ -517,8 +517,22 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     def reward(images, context):
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
+    from dew.objectives.rl import flow
+
+    # What the rollout's collective gathers (`collective_host`, the seam every process's walk crosses).
+    gathered = []
+
+    def recorded(tree, **settings):
+        gathered.append(tree[0])
+        return collective_host(tree, **settings)
+
+    collective_host = flow.collective_host
+    monkeypatch.setattr(flow, "collective_host", recorded)
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
     batch = rollout(state, prompts, jax.random.key(23), objective=objective)
+    walk = gathered[0][0]
+    assert (walk.states.shape[1], walk.log_probs.shape[1], walk.stochastic.shape[1], walk.times.shape) == (
+        3, 2, 2, (4,))
     # Its rows hold the walk's first two transitions alone, its trained prefix (row 10903).
     assert batch["timesteps"].shape == batch["transition_mask"].shape == (6, 2)
     rewards = np.asarray(batch["rewards"], np.float64).reshape(2, 3)
