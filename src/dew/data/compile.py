@@ -1208,7 +1208,8 @@ def _compiled(
         raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
                          "keeps no count of the examples its rows consume: run it before the bound, as a "
                          "step Dew names, or read the data in a global order")
-    held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
+    held_out = sum(integer(asked_facts(source, ("held_out",)).get("held_out", 0), "held_out")
+                   for _, source in _leaves(train))
     return Loader(
         training,
         held_reader,

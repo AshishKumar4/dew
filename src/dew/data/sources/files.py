@@ -988,7 +988,7 @@ class Files(Dataset):
         # Named by the paths Arrow reads, each a fragment of its dataset in turn, its schema unread
         # (row 9009: a compile building the dataset read every file's).
         shards = tuple(Shard(name, name, number) for number, name in enumerate(
-            self._shard_name(path) for path in self._arrow_files[1]))
+            self._shard_name(path) for path in (self._arrow_files[1] if self.paths else ())))
         return ShardManifest(shards, self._read_shard, self._row_groups,
                              counted=None if self.where is not None else self._file_rows, fixed_parts=True)
 
