@@ -469,18 +469,16 @@ def _running_prefix(call: Call, rows, decays: jax.Array, keys: int) -> tuple:
     mosaic.synced(call.interpret)
     layout = scan.striped(keys)
 
-    def row(t) -> tuple:
-        return tuple(plgpu.load(rows.at[half, t], layout=layout, optimized=False) for half in (0, 1))
-
-    # Unrolled, each row's load issued a row ahead of its add: one program a multiprocessor (its shared
-    # memory's) waited on every row's load in turn, 58% of its stalls (M-JS-145e, an emulated GH200).
-    zero = plgpu.layout_cast(jnp.zeros((keys,), jnp.float32), layout)
-    running, ahead = (zero, zero), row(0)
-    for t in range(chunk):
-        terms, ahead = ahead, row(t + 1) if t + 1 < chunk else None
-        running = compensated_add(running, terms)
-        for half, value in enumerate(running):
-            plgpu.store(rows.at[half, t], value, optimized=False)
+    if call.interpret:
+        # Interpreted, a row at a time in XLA's terms.
+        running = (jnp.zeros((keys,), jnp.float32),) * 2
+        for t in range(chunk):
+            terms = tuple(plgpu.load(rows.at[half, t], layout=layout, optimized=False) for half in (0, 1))
+            running = compensated_add(running, terms)
+            for half, value in enumerate(running):
+                plgpu.store(rows.at[half, t], value, optimized=False)
+    else:
+        scan.compensated_columns(rows)
     mosaic.synced(call.interpret)
     return tuple(call.family.tile_of(rows.at[half]) for half in (0, 1))
 

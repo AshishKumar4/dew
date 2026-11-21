@@ -122,6 +122,41 @@ def _to_striped(x: fa.FragmentedArray, staged):
     return fa.FragmentedArray(_registers=np.array(registers, dtype=object), _layout=layout, _is_signed=None)
 
 
+def compensated_columns(pairs) -> None:
+    """Each column of `pairs`, a plain fp32 shared tile `(2, rows, THREADS)` of compensated terms (each
+    position's `(hi, lo)`), replaced by its running compensated sum down the rows
+    (`precision.compensated_add`'s arithmetic: the his' TwoSum, then the pair's own over the dropped part and
+    both los), a column a thread in its own registers, its loads and stores its own words (no two of a warp's
+    in one bank), and the warpgroup met once when done. The terms staged, and the threads met, before: a
+    Pallas store a row at a time met the warpgroup at each, 44% of a running prefix's warp time an emulated
+    GH200's (M-JS-145e). Additions alone, so no multiply contracts into them."""
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(
+        lambda ctx, ref: _compensated_columns(ref))(pairs)
+
+
+def _compensated_columns(ref) -> None:
+    """`compensated_columns` in Mosaic GPU's terms."""
+    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+    rows = ir.MemRefType(ref.type).shape[1]
+    column = arith.index_cast(index, arith.remui(utils.thread_idx(), arith.constant(i32, THREADS)))
+    halves = [arith.constant(index, half) for half in (0, 1)]
+
+    def two_sum(left, right):
+        total = arith.addf(left, right)
+        part = arith.subf(total, left)
+        return total, arith.addf(arith.subf(left, arith.subf(total, part)), arith.subf(right, part))
+
+    hi = lo = arith.constant(ir.F32Type.get(), 0.0)
+    for row in range(rows):
+        at = [arith.constant(index, row), column]
+        term_hi, term_lo = (memref.load(ref, [half, *at]) for half in halves)
+        total, dropped = two_sum(hi, term_hi)
+        hi, lo = two_sum(total, arith.addf(arith.addf(dropped, lo), term_lo))
+        for half, value in zip(halves, (hi, lo), strict=True):
+            memref.store(value, ref, [half, *at])
+    utils.warpgroup_barrier()
+
+
 def summed(values: jax.Array, exchanged, *, interpret: bool = False) -> jax.Array:
     """The sum of `values`, fp32 `[T]` in `blocked(T)`'s layout, a scalar (`FragmentedArray.reduce`), its
     warps' aggregates through `exchanged` (`scratch()`'s)."""
