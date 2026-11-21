@@ -143,7 +143,7 @@ def test_a_chain_that_packs_nothing_compiles_and_reads_importing_no_packer(tmp_p
 import json, sys
 import numpy as np
 from dew.data.cache import Cache
-from dew.data.compile import compile, publish
+from dew.data.compile import publish, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline
 from dew.data.sources import Memory
@@ -151,8 +151,9 @@ loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 prefix = Pipeline(Memory([{"id": np.int32(i)} for i in range(8)]))
 generation = publish(prefix, Cache(sys.argv[1]), read="indexed", loading=loading)
 read = []
+# One pass each, in order (a validation read's).
 for chain in (prefix, prefix.cache(generation)):
-    reader = compile(chain.batch(2), read="indexed", loading=loading, epochs=1).train(DataPartition())
+    reader = validation(chain, batch=2, read="indexed", loading=loading)(DataPartition())
     read.append(sorted(int(value) for batch in reader for value in batch["id"]))
     reader.close()
 print(json.dumps({"read": read, "imported": sorted(name for name in ("dew.data.packing", "dew.data.placement")
