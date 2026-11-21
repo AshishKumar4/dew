@@ -516,9 +516,9 @@ class FlowRollout(GroupedRollout):
         # it, its densities and stochastic steps cut to it, its grid whole; the sample decoded before the cut
         # (row 10795: each process gathered every row's whole walk to train its first transitions).
         selected = self._selected()
-        trained = trajectory.replace(states=trajectory.states[:, :selected + 1],
-                                     log_probs=trajectory.log_probs[:, :selected],
-                                     stochastic=trajectory.stochastic[:, :selected])
+        trained = replace(trajectory, states=trajectory.states[:, :selected + 1],
+                          log_probs=trajectory.log_probs[:, :selected],
+                          stochastic=trajectory.stochastic[:, :selected])
         return trained, jnp.clip(samples, -1, 1), spatial
 
     def _selected(self) -> int:
