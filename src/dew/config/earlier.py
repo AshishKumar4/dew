@@ -42,14 +42,23 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    moved = _records.moved_record(record)
+    unsettable = record.get(LAYOUT_UNSETTABLE) is True
+    moved = _records.moved_record({key: value for key, value in record.items()
+                                   if key != LAYOUT_UNSETTABLE})
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(
-        earlier_trainer_layout(moved)))))
+        moved if unsettable else earlier_trainer_layout(moved)))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
     return records.earlier_chains(earlier_data_plan(earlier), _chains())
+
+
+LAYOUT_UNSETTABLE = "layout_unsettable"
+"""The key beside a run record's fields (`RunConfig.record`) that says it states its trainer's layout as
+this Dew does, unset as null: a record written while it could not be unset (`Layout()` its default) lacks
+it and reads `Layout()` as unset (`earlier_trainer_layout`), where one written since keeps a stated
+`Layout()` (row 9664). Beside the fields, where no field of the run's holds it (train 1109's review, F3)."""
 
 
 def earlier_trainer_layout(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -62,8 +71,14 @@ def earlier_trainer_layout(record: Mapping[str, object]) -> Mapping[str, object]
 
     fields = record.get("fields")
     trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
-    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(
-            trainer.get("layout"), Mapping) or from_record(Layout, trainer["layout"]) != Layout():
+    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping):
+        return record
+    # A record written while `layout_unsettable` was a trainer field (row 9664, until train 1109's review)
+    # states its `Layout()`: the field taken off.
+    if "layout_unsettable" in trainer:
+        return {**record, "fields": {**fields, "trainer": {key: value for key, value in trainer.items()
+                                                           if key != "layout_unsettable"}}}
+    if not isinstance(trainer.get("layout"), Mapping) or from_record(Layout, trainer["layout"]) != Layout():
         return record
     return {**record, "fields": {**fields, "trainer": {**trainer, "layout": None}}}
 

@@ -708,7 +708,7 @@ def _cache_view(stages: Sequence[Stage]) -> str | None:
             continue
         if not _cacheable(stage):
             return f"{type(stage).__name__} is no deterministic record step a cache can key"
-        if index < last and (_drops(stage, stages[index + 1:]) or isinstance(stage, FlatMap)):
+        if index < last and (_drops(stage) or isinstance(stage, FlatMap)):
             view = type(stages[last]).__name__
             return (f"{type(stage).__name__} before {view} drops or expands records, so the view orders "
                     "other rows than the source's inputs (expansions and drops before a view: roadmap 803b)")
@@ -728,9 +728,8 @@ def _one_to_one(stages: Sequence[Stage]) -> bool:
     order (`dew.data.lowering._Inputs`); one that drops or expands is read as a stream, per share. A
     step a run's facts haven't bound yet (`Configured`) may drop records once bound, so it counts as
     one that does unless it states it keeps one for each (`Configured.one_to_one`)."""
-    return not any(_drops(stage, stages[index + 1:])
-                   or (isinstance(stage, Configured) and not stage.one_to_one)
-                   for index, stage in enumerate(stages))
+    return not any(_drops(stage) or (isinstance(stage, Configured) and not stage.one_to_one)
+                   for stage in stages)
 
 
 def _indexed_cache(prefix: Sequence[Stage], read: Read) -> bool:
@@ -762,15 +761,38 @@ def _volatile(stage: Stage) -> bool:
     return ran is not None and isinstance(ran.step, Volatile) and ran.step.volatile
 
 
-def _drops(stage: Stage, after: Sequence[Stage] = ()) -> bool:
+def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
     the rows before it, one for one: a batched step that keeps its rows' count (`Batched.same_rows`) is
-    none, its groups formed in the order's own consecutive records (row 9007), where nothing `after` it
-    reads them out of their order (a global shuffle, whose random reads would each make a row's whole
-    group again, row 9711): it then reads as a stream, as one that drops does."""
+    none, its groups formed in the order's own consecutive records (rows 9007, 9784), so its rows are the
+    same at any share count, however a shuffle after it reads them."""
     if isinstance(stage, Batched):
-        return not stage.same_rows or any(isinstance(later, Shuffle) for later in after)
+        return not stage.same_rows
     return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native)) or rejects(stage)
+
+
+def groups_held(after: Sequence[Stage], size: int, threads: int) -> int:
+    """The groups of `size` a same-rows batched step's read holds at once (`dew.data.lowering._GroupedRows`):
+    a window shuffle's after it and the read's threads'. A global shuffle after it the analysis refused
+    (`_regrouped`)."""
+    threaded = 2 * max(1, threads)
+    windows = [stage.window for stage in after if isinstance(stage, Shuffle) and stage.window is not None]
+    return threaded if not windows else -(-windows[0] // size) + 1 + threaded
+
+
+def _regrouped(pipeline: Pipeline, read: Read, eager: int) -> None:
+    """Refuse a global shuffle after a same-rows batched step a reader runs over its order's rows, not one a
+    memory read's eager pass ran (before `eager`): it would draw each row's group anew, a group a draw
+    (`dew.data.lowering._GroupedRows`), naming the remedies its read has (row 9784). Refused as `compile`
+    analyzes the chain, where a reader lowering its stages refused it."""
+    grouped = False
+    for index, stage in enumerate(pipeline.stages):
+        grouped = grouped or (index >= eager and isinstance(stage, Batched) and stage.same_rows)
+        if grouped and isinstance(stage, Shuffle) and stage.window is None:
+            remedies = (*(("read it in memory (read='memory')",) if read != "memory" else ()),
+                        "shuffle within a window (window=)", "shuffle before the map")
+            raise ValueError(f"the global shuffle in {_name(pipeline)} after a batched map would read each "
+                             f"row's group anew: {', or '.join(remedies)}")
 
 
 def rejects(stage: Stage) -> bool:
@@ -948,11 +970,16 @@ def _analyzed(
         # Analyzed `bound`, a configured step counts as the step it binds to, eager unless it draws.
         stage = stages[eager]
         once_bound = bound and isinstance(stage, Configured) and not stage.random
-        held = 1 if isinstance(stage, _EAGER) or once_bound else _held_bound(stages, eager)
+        # A batched step that keeps its rows runs here too, its groups the source's own records, which a
+        # global shuffle after it then reads in memory (row 9784).
+        grouped = isinstance(stage, Batched) and stage.same_rows
+        held = 1 if isinstance(stage, _EAGER) or once_bound or grouped else _held_bound(stages, eager)
         if not held:
             break
         eager += held
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
+    if read != "streamed":
+        _regrouped(pipeline, read, eager)
     if isinstance(source, Mixture) and source.tokens is not None:
         per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in lowered)
@@ -1161,7 +1188,7 @@ def _checked(
             random = _identity(stage).name
             if validation and not canonical:
                 raise ValueError(f"validation random step {random} must use the canonical record index")
-        drops = _drops(stage, pipeline.stages[index + 1:])
+        drops = _drops(stage)
         reorders = isinstance(stage, (Shuffle, Repeat, Slice, Limit)) or drops
         canonical = canonical and not reorders
         if isinstance(stage, Artifact):
@@ -1261,8 +1288,7 @@ def _measured_members(pipeline: Pipeline) -> list[Source]:
     if isinstance(source, Mixture) and source.seed is None and source.tokens is None:
         found += [child.source for child in source.pipelines
                   if not isinstance(child.source, Combined)
-                  and not any(isinstance(stage, Repeat) or _drops(stage, child.stages[index + 1:])
-                              for index, stage in enumerate(child.stages))]
+                  and not any(isinstance(stage, Repeat) or _drops(stage) for stage in child.stages)]
     return found
 
 
