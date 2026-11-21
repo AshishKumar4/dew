@@ -30,7 +30,7 @@ from jax.experimental import pallas as pl
 from jax.extend import core as jcore
 from jax.interpreters import batching, mlir
 
-from dew.algebra import means, windows
+from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation, launches
