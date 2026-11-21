@@ -275,7 +275,7 @@ def test_a_split_merged_with_a_subnormal_initial_mass_keeps_its_output():
 
 @pytest.mark.parametrize("run", ["jitted", "op by op"])
 @pytest.mark.parametrize("form", sorted(SPECS))
-@pytest.mark.check1_shards(seeds=MERGE_SEEDS, per_task=8)
+@pytest.mark.check1_shards(seeds=32, per_task=8)
 def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     """The padded merge's finished output, its state's mass, the output's gradient and that gradient's
     derivative along a direction on par with the plain merge's (`_plain_state`, JAX's differentiation of it,
