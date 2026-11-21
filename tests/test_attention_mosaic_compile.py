@@ -1788,3 +1788,39 @@ def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compi
             cases.append(KernelCase(label, _make))
         found = compile_mosaic_kernels(cases, "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_attention_derives_bf16_part_count_from_product_precision():
+    """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) through
+    `dew.algebra.error.product_precision` (row 5473)."""
+    from dew.nn.kernels.templates import attention_algebra as algebra
+
+    with generation.assumed("sm90"):
+        assert algebra.bf16_part_count(accurate=True) == 3
+        assert algebra.bf16_part_count(accurate=False) == 1
+
+
+def test_derived_one_consumer_heights_are_compared_by_choose():
+    """Row 6216: `_derived` with `choose` evaluates one-consumer `heights` (e.g. 128x32 and 64x64 on
+    mma.sync) together so `cost.launch_seconds` can pick 64x64 over 128x32 instead of returning the first
+    fitting height uncompared (M-FS-15 A100 hooked forwards)."""
+    from dew.nn.kernels.templates import attention_mosaic_program as program
+
+    seen: list[list[attention_mosaic.Tiles]] = []
+
+    def choose(candidates):
+        seen.append(list(candidates))
+        return min(candidates, key=lambda c: (c.block_q, -c.block_k))
+
+    family = program.layouts("sm80", jnp.bfloat16, 512)[0]
+
+    def tiles(rows, walked, consumers):
+        return attention_mosaic.Tiles(rows, walked, 2, consumers, family=family.name)
+
+    def fits(cfg):
+        return (cfg.block_q == 128 and cfg.block_k == 32) or (cfg.block_q == 64 and cfg.block_k == 64)
+
+    picked = attention_mosaic._derived(family, jnp.bfloat16, 512, 512, tiles, fits, overlapped=True,
+                                       walks=program.walked_extents, choose=choose)
+    assert picked is not None and (picked.block_q, picked.block_k) == (64, 64), (picked, seen)
+    assert any({(c.block_q, c.block_k) for c in group} >= {(128, 32), (64, 64)} for group in seen), seen

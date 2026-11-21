@@ -220,47 +220,51 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     def counts(rows: int) -> range:
         return range(max(1, min(most, -(-held // rows))), 0, -1)
 
-    def first(rows: int, tried: Iterable[int]) -> Config | None:
+    def first(groups: Iterable[tuple[int, Iterable[int]]]) -> Config | None:
         picked: list[Config] = []
-        for consumers in tried:
-            if consumers > 1 and padded(rows, consumers) - padded(rows, consumers - 1) > held // 8:
-                # A count whose tile pads the held rows by more than an eighth of them beyond the next
-                # count's (a 192-row tile of three consumers over a 256-row shard pads it by half, where two
-                # consumers' 128 pad none): the call's padding is a copy and its last tile's work wasted.
-                continue
-            best_programs = 0
-            for extent in walks(family, dtype, max(walked, least_walked(rows))):
-                for narrow in stagings(family):
-                    config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
-                    if fits(config):
-                        if choose is None:
-                            return config
-                        held_programs = residency(config) if residency is not None else 1
-                        if not best_programs or held_programs > best_programs:
-                            picked.append(config)
-                            best_programs = held_programs
+        for grp_rows, tried in groups:
+            for consumers in tried:
+                if (consumers > 1
+                        and padded(grp_rows, consumers) - padded(grp_rows, consumers - 1) > held // 8):
+                    # A count whose tile pads the held rows by more than an eighth of them beyond the next
+                    # count's (a 192-row tile of 3 consumers over a 256-row shard pads it by half, where
+                    # 2 consumers' 128 pad none): the call's padding is a copy and its last tile wasted.
+                    continue
+                best_programs = 0
+                for extent in walks(family, dtype, max(walked, least_walked(grp_rows))):
+                    for narrow in stagings(family):
+                        config = dataclasses.replace(tiles(grp_rows, extent, consumers), narrow=narrow)
+                        if fits(config):
+                            if choose is None:
+                                return config
+                            held_programs = residency(config) if residency is not None else 1
+                            if not best_programs or held_programs > best_programs:
+                                picked.append(config)
+                                best_programs = held_programs
+                            break
+                    if best_programs and residency is None:
                         break
-                if best_programs and residency is None:
-                    break
         if not picked:
             return None
         return picked[0] if len(picked) == 1 or choose is None else choose(picked)
 
     # The unit at the counts above one first (FlashAttention 3's consumers); then one consumer's heights:
     # twice the unit where `wide` and the held rows take it, padding them by no more than an eighth beyond
-    # the unit's, then the unit; then, for a call of fewer rows than a role's, fewer of them a tile at every
-    # count, its issuer's rows at least, where no tile of them all holds (a 48-row training walk's scaled op
-    # on mma.sync held 278 registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`,
-    # et-sm86scaled). The first that holds is the config: legality steps down, nothing is ranked (design §7).
+    # the unit's, then the unit (priced together by `choose` so e.g. 64x64 can beat 128x32 on sm80, row
+    # 6216); then, for a call of fewer rows than a role's, fewer of them a tile at every count, its issuer's
+    # rows at least, where no tile of them all holds.
     top = (held if rows is None and not family.budgets_registers
            else 2 * unit if wide else unit)
     heights = [h for h in extents(family, dtype, top)
                if h > unit and padded(h, 1) - padded(unit, 1) <= held // 8]
     heights.append(unit)
     fewer = range(unit - family.rows, 0, -family.rows) if rows is None and few_rows(family, held) else ()
-    order = ((unit, [count for count in counts(unit) if count > 1]), *((height, [1]) for height in heights),
-             *((rows, counts(rows)) for rows in fewer))
-    return next((config for config in (first(*each) for each in order) if config is not None), None)
+    tiers = (
+        ((unit, [count for count in counts(unit) if count > 1]),),
+        tuple((height, [1]) for height in heights),
+        *(((r, counts(r)),) for r in fewer),
+    )
+    return next((config for config in (first(tier) for tier in tiers) if config is not None), None)
 
 
 def _role_rows(family: mosaic.Family, dtype, held: int) -> int:
@@ -881,8 +885,8 @@ class MosaicForward(_Mainloop[Tiles]):
         key = _choice_key(self, ba, tuple(launched), target)
         stored = None if key is None else tuning.stored_choice(target.generation, key)
         if isinstance(stored, (tuple, list)):
-            pair = tuple(stored)
-            matched = next((c for c in candidates if (c.consumers, c.block_k) == pair), None)
+            key_tuple = tuple(stored)
+            matched = next((c for c in candidates if (c.block_q, c.consumers, c.block_k) == key_tuple), None)
             if matched is not None:
                 return matched
         prices: dict[Tiles, float] = {}
@@ -893,7 +897,7 @@ class MosaicForward(_Mainloop[Tiles]):
             prices[config] = price
         best = min(candidates, key=prices.__getitem__)
         if key is not None:
-            tuning.store_choice(target.generation, key, (best.consumers, best.block_k))
+            tuning.store_choice(target.generation, key, (best.block_q, best.consumers, best.block_k))
         return best
 
     def offered(self, ba: tokamax.BoundArguments, family: mosaic.Family, target: generation.GpuTarget
@@ -1524,7 +1528,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     if hooks.score_mod is None and hooks.score_params:
         hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
-    parts = product.EXACT_PARTS if fp32 else 1
+    parts = algebra.bf16_part_count(accurate=True) if fp32 else 1
     if hooks.query_mod is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
         # program before the launch takes it.
