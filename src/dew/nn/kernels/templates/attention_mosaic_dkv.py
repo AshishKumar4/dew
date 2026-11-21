@@ -409,7 +409,8 @@ def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows
     the cotangents the fast form's one part in the queries' dtype where the launch takes it from the
     registers (`one_part`, the fused launch's), narrowed as they are formed."""
     values, queries = dtypes
-    exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows, masked=masked)
+    exponentials, weights, cotangents, slopes, seen = _scores(
+        walk, coords, params, s, dp, *rows, masked=masked)
     logits, pieces = gradient.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
     if one_part:
         parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
@@ -748,14 +749,14 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                   refs=(tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem,
                                         dq_ref, fused_stages),
                                   statistics=rows_of)
-            # The tiles its partner reads around its own, or its consumers' own loads of the query stream
-            # where they feed it, the one key block's readers (`Family.walk_own`).
-            run = program.whole_run(k_first, q_steps, spans_of) if placing and consumers == placed.TURNS else None
-            segments = functools.partial(program.segmented, step, run)
+            # Each consumer's walk over the key block's readers (`Family.walk_own`).
+            run = (program.whole_run(k_first, q_steps, spans_of)
+                   if placing and consumers == placed.TURNS else None)
             key_sums, (dk, dv) = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(
-                    streams, segments(lo, hi), tuple(family.zeros((block_k,)) for _ in key_refs),
+                    streams, program.segmented(step, run, lo, hi),
+                    tuple(family.zeros((block_k,)) for _ in key_refs),
                     tuple((block_k, share) for _, share in shares), walk.interpret, first=counted))
             if ring is not None:
                 ring.drained(lo, hi, index)
@@ -763,8 +764,6 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                 # The read turn's last phase, past the walk's last product, observed.
                 family.turn(stage[2], consumers, arrive=False)
             if split or (placing and index):
-                # The consumers' sums, added in a scope after the walk's (`_summed_stored`); a placed walk's
-                # its compute warpgroups' one pair, the first's to store.
                 return (dk, dv, *key_sums) if split else None
             out = head_slice(family, row, head, pl.ds(k_first, block_k))
             key_views = tuple(ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, block_k)]
