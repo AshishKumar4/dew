@@ -644,6 +644,9 @@ def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:
     """`jaxpr` with each of `regions`' equations replaced by one nested program of its call over its inputs
     (`_traced`), its outputs the very values the region made, written at its place."""
     traces = [(region, trace) for region in regions if (trace := _traced(region)) is not None]
+    if not traces:
+        # No region written: the program itself, whose identity JAX shares its lowering by.
+        return jaxpr
     removed = {place for region, _ in traces for place in region.places}
     written: dict[int, list[jcore.JaxprEqn]] = {}
     for region, (equation, invars, *_) in traces:

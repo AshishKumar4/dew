@@ -884,7 +884,12 @@ def _opening(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     span is rewritten within its call."""
     opens = (_marked(equation, (Algebra,)) and not equation.effects
              and all(isinstance(var.aval, ShapedArray) for var in (*equation.invars, *equation.outvars)))
-    return called(equation) if opens else None
+    body = called(equation) if opens else None
+    # A span whose body holds constants (an array it closes over) opens not: inlined, they would be the
+    # enclosing program's, which a manual mesh's body and a checkpoint's bind none of (JAX stages both without
+    # constants, and their replay and lowering pass none), and a form reading them is no splice's
+    # (`_splices`); it is rewritten within its call, as any other marked span (row 6578's review, F1).
+    return body if body is not None and not body.consts else None
 
 
 def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
@@ -930,14 +935,12 @@ class _Span(NamedTuple):
 
 
 def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr:
-    """`jaxpr` with each Algebra span's call it opens (`_opening`) replaced by its body's equations, nested
-    spans opened too, over the call's operands, its body's constants the program's, and each reader of the
-    call's results reading what its body computes them as; `jaxpr` itself where it holds none. Each span it
-    opens recorded in `spans` (`_Span`), where given, so one no rewrite crosses is closed again
-    (`_reclosed`)."""
+    """`jaxpr` with each Algebra span's call it opens (`_opening`, one of no constants) replaced by its body's
+    equations, nested spans opened too, over the call's operands, and each reader of the call's results
+    reading what its body computes them as; `jaxpr` itself where it holds none. Each span it opens recorded
+    in `spans` (`_Span`), where given, so one no rewrite crosses is closed again (`_reclosed`)."""
     if all(_opening(equation) is None for equation in jaxpr.eqns):
         return jaxpr
-    constvars, consts = list(jaxpr.constvars), list(jaxpr.consts)
     computed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
     equations: list[jcore.JaxprEqn] = []
 
@@ -950,18 +953,12 @@ def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr
         if opening is None:
             equations.append(equation)
             continue
-        body = _opened(opening)
-        # The body's constants the program's own, each a fresh variable of it (`inlined`).
-        fresh = [jcore.Var(var.aval) for var in body.constvars]
-        constvars += fresh
-        consts += list(body.consts)
-        made, returned = inlined(body, equation.invars, fresh)
+        made, returned = inlined(_opened(opening), equation.invars)
         equations += made
         computed.update(zip(equation.outvars, returned, strict=True))
         if spans is not None:
             spans.append(_Span(equation, frozenset(map(id, made)), list(returned)))
-    return jaxpr.replace(constvars=constvars, consts=consts, eqns=equations,
-                         outvars=[outer(atom) for atom in jaxpr.outvars])
+    return jaxpr.replace(eqns=equations, outvars=[outer(atom) for atom in jaxpr.outvars])
 
 
 @dataclasses.dataclass(frozen=True)
