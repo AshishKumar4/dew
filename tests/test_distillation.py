@@ -757,8 +757,7 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
 
 
 @pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("axes", [{"data": 4}, {"data": 2, "sequence": 2}],
-                         ids=["rows", "rows-and-positions"])
+@pytest.mark.parametrize("axes", [{}, {"sequence": 2}], ids=["rows", "rows-and-positions"])
 def test_a_tiled_full_kl_over_tokens_split_across_devices_gathers_no_states(axes):
     """The tiled full KL (`_tiled_divergence`) over final states whose rows, or rows and positions, are split
     across four devices compiles with no all-gather of either model's states: each device runs the slices
