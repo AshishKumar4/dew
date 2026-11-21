@@ -200,6 +200,40 @@ def test_the_tools_step_is_the_program_a_runs_first_step_compiles(monkeypatch):
     assert lowered(timed) == lowered(fitted)
 
 
+def test_a_prepare_that_cannot_compile_a_case_ahead_fails_and_a_run_handed_its_directory_refuses_one_missing(
+        tmp_path, monkeypatch):
+    """`--compile-ahead` keeps each case it compiled and fails where this host refused one (`Unlowerable`),
+    so the job's prepare fails; and a run handed a directory of steps compiled ahead refuses a case the
+    directory lacks, never compiling its own on the GPU in its place (row 10796: the prepare exited 0 without
+    the case's step, and the run compiled it)."""
+    from dew.nn.kernels.selection import Unlowerable
+
+    tool = load("benchmark_step")
+    config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['causal_transformer', 'simple_dit'],
+                                  warmup=1, steps=1, dtype='float32', compile_ahead=str(tmp_path / "ahead"),
+                                  generation="sm90", capacity_gib=80)
+    first, second = tool.build_cases(config)
+    saved = []
+
+    class Ahead:
+        def save(self, path):
+            saved.append(Path(path).name)
+
+    def ahead_of(case, *_):
+        if case.architecture == second.architecture:
+            raise Unlowerable("attention kernel 'flash' does not lower on this host")
+        return Ahead()
+
+    monkeypatch.setattr(tool, "ahead_of", ahead_of)
+    with pytest.raises(SystemExit, match="not compiled ahead"):
+        tool.main(config)
+    assert saved == [tool.ahead_name(first)]
+    run = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['simple_dit'], warmup=1, steps=1,
+                               dtype='float32', ahead=str(tmp_path / "ahead"))
+    with pytest.raises(SystemExit, match="no step compiled ahead"):
+        tool.measure(second, run)
+
+
 def test_a_steps_count_reads_as_the_bound_it_is():
     """A row's FLOPs and utilization show as the bound their count is (`StepFlops.bound`, `BOUND_MARKS`), as
     the trainer names its train/hfu: at least the value where a launch's work went uncounted (row 3023), at

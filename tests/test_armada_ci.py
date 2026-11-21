@@ -677,6 +677,19 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     # Its stall's record among this task's own artifacts (`stalls.kept`), never an enclosing task's.
     [kept] = interrupted["artifacts"]
     assert (tmp_path / "artifacts" / kept).is_file()
+    # So is a pass a task of which crashed, never started its file, or left no coverage data (row 10801).
+    shutil.rmtree(tmp_path / "runs/2")
+    complete = json.loads((tmp_path / "runs/0/rows.json").read_text())
+    for kind in ("whole", "stale", None):
+        shutil.copytree(tmp_path / "runs/0", tmp_path / "runs/2")
+        rows = ([{**row, "exitCode": 1, "kind": kind} for row in complete["rows"]] if kind
+                else complete["rows"])
+        (tmp_path / "runs/2/rows.json").write_text(json.dumps({**complete, "rows": rows}))
+        if kind is None:
+            for part in (tmp_path / "runs/2").glob(".coverage.*"):
+                part.unlink()
+        assert ci.coverage_report.report(tmp_path / "runs") == 1, kind
+        shutil.rmtree(tmp_path / "runs/2")
 
 
 def test_the_scenario_suites_coverage_items_are_its_tasks_alone(ci, tmp_path):
