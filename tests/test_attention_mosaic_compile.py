@@ -1673,6 +1673,9 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
             cases.append(KernelCase(label, lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)))
         found = compile_mosaic_kernels(cases, "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
 def test_sm90_and_sm100_forward_scale_prescaled_query_in_smem_without_spills():
     """Row 5272: sm90 wgmma and sm100 tcgen05.chunks forwards with a power-of-two query prescale (e.g.
     the natural rewalk launch) scale `q_smem` in place via `across.scale_smem` instead of emitting a
@@ -1696,6 +1699,7 @@ def test_sm90_and_sm100_forward_scale_prescaled_query_in_smem_without_spills():
                            lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)),
             ], gen)
             assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
 
 @COMPILES_ON_CPU
 def test_sm90_d256_forward_fits_single_launch_without_spills():
@@ -1726,6 +1730,9 @@ def test_sm90_d256_forward_fits_single_launch_without_spills():
             found = compile_mosaic_kernels(cases, gen)
             main_failures = [f for f in mosaic_failures(found) if "attention_forward_natural" not in f]
             assert not main_failures, "\n".join(main_failures)
+
+
+@COMPILES_ON_CPU
 def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
     """Row 10682: fused dK/dV at width 64 derives and compiles spill-free on sm80 and sm100."""
     from fla_gdn_support import KernelCase
