@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 
     from dew._records import JSON
     from dew.lora import _Bound
+    from dew.nn.attention_residuals import AttentionResiduals
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.backbones.decoder_stack import DecoderBank, Loop, StackView
     from dew.nn.continuum import HeadTerms, LevelTerms
@@ -782,6 +783,15 @@ class Looped(Protocol):
     def loop(self) -> Loop | None: ...
 
     def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses: ...
+
+
+@runtime_checkable
+class MixesDepth(Protocol):
+    """A decoder whose residual may be Kimi K3's depth mixture of its blocks (`AttentionResiduals`), None
+    where it is the plain stream."""
+
+    @property
+    def attention_residuals(self) -> AttentionResiduals | None: ...
 
 
 @runtime_checkable

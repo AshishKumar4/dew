@@ -734,19 +734,17 @@ def unwritten_extension(model: nn.Module) -> str | None:
     (`dew.nn.attention_residuals.NORMALIZED_UNWRITTEN`); None where it extends it with none. `source_layout`
     answers it as `Unwritable`, and an export refuses it before it converts a weight."""
     from dew.nn.attention_residuals import NORMALIZED_UNWRITTEN
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.cross_pass import MESSAGES_UNWRITTEN
-    from dew.nn.protocols import CrossAttending, MediaWrapper
+    from dew.nn.protocols import CrossAttending, Looped, MediaWrapper, MixesDepth
 
     decoder = model.language_model if isinstance(model, MediaWrapper) else model
-    if (isinstance(model, CrossAttending) and model.cross_attention is not None) or (
-            isinstance(decoder, CrossAttending) and decoder.cross_attention is not None):
+    if any(isinstance(each, CrossAttending) and each.cross_attention is not None
+           for each in (model, decoder)):
         return CROSSING_UNWRITTEN
-    if not isinstance(decoder, CausalTransformer):
-        return None
-    if decoder.loop is not None and decoder.loop.messages is not None:
+    if isinstance(decoder, Looped) and decoder.loop is not None and decoder.loop.messages is not None:
         return MESSAGES_UNWRITTEN
-    if decoder.attention_residuals is not None and decoder.attention_residuals.normalize_values:
+    residuals = decoder.attention_residuals if isinstance(decoder, MixesDepth) else None
+    if residuals is not None and residuals.normalize_values:
         return NORMALIZED_UNWRITTEN
     return None
 
