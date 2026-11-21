@@ -193,20 +193,21 @@ ROLE: contextvars.ContextVar[int] = contextvars.ContextVar("role", default=0)
 runs): the role's own share of what the program holds a role each (`Issuer.product_scratch`)."""
 
 
-def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
-    """`run(role, index)` for the role `index` names among `roles`, each role's built at its own static
-    index (`ROLE` while it is built): Mosaic GPU slices a swizzled tile only at static columns (a role's
-    share of a block's, shared keys at width 256: offsets from the traced index spilled 20 bytes, a static
-    role's none)."""
-    for role in range(roles):
-        def built(role=role):
-            token = ROLE.set(role)
-            try:
-                run(role, index)
-            finally:
-                ROLE.reset(token)
+def per_role(index: int | jax.Array, roles: int, run: Callable[[int, int | jax.Array], None]) -> None:
+    """`run(role, index)` for the role `index` names among `roles` (a static one alone), each built at its
+    static index (`ROLE`): Mosaic GPU slices swizzled tiles at static columns (traced, 20 bytes spilled)."""
+    def built(role):
+        token = ROLE.set(role)
+        try:
+            run(role, index)
+        finally:
+            ROLE.reset(token)
 
-        pl.when(index == role)(built)
+    if isinstance(index, int):
+        built(index)
+        return
+    for role in range(roles):
+        pl.when(index == role)(functools.partial(built, role))
 
 
 def rotated(turned: Callable, lo, hi, first, stages: int) -> tuple:
@@ -1594,18 +1595,19 @@ class Transport[Allocated, Opened](abc.ABC):
         (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
-                  exclusive: bool = False, issuer: Callable | None = None, joined: tuple = ()):
-        """The family's roles run (`role_schedule`, its producer lowered to `floor`): `consumer(index)`,
-        `producer()`, `issuer()` where it issues on a role (`Issuer.places_on_role`) and each `joined`
-        role's body at its index, `(role, count, body)` (a correction warpgroup's, a launch's reducing warps':
-        `(handoffs.REDUCER, consumers, reduce)`), each a branch of one switch where `exclusive`; the
-        consumers' value."""
+                  exclusive: bool = False, static_consumers: bool = False, issuer: Callable | None = None,
+                  joined: tuple = ()):
+        """The family's roles run (`role_schedule`, its producer at `floor`): `consumer(index)`, `producer()`,
+        `issuer()` where it issues on a role (`Issuer.places_on_role`), each `joined` role's body at its index
+        (`(role, count, body)`: a correction warpgroup's, a launch's reducing warps'), a switch's branches
+        where `exclusive`, a consumer's at a static index where `static_consumers`; the consumers' value."""
         schedule = self.role_schedule(consumers, floor, tuple((role, count) for role, count, _ in joined))
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
         units = {"producer": producer, "issuer": issuer}
         bodies = {"consumer": consumer, **{role.name: body for role, _, body in joined},
                   **{name: lambda index, body=body: body() for name, body in units.items()}}
-        return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
+        return schedule.run(exclusive=exclusive, static="consumer" if static_consumers else None,
+                            **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
         """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,
