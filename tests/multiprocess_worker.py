@@ -1069,6 +1069,48 @@ def mode_pipeline(args) -> dict:
     }
 
 
+def mode_stage_save(args) -> dict:
+    """A two-stage pipeline whose stages are each one process's devices alone (its devices interleaved
+    so the stage axis, the mesh's last, pairs one of each process's): its finite check over leaves placed
+    on each stage alone, then `--steps` steps that checkpoint every step into `--run-dir`, and a run that
+    resumes from them one step further (row 10780: each rank read each stage's finite flag, those outside
+    a stage holding none of it, and the save crashed)."""
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import MeshSpec
+    from dew.training.transaction import finite_flags
+
+    # One leaf on each process's devices alone, the second holding a NaN.
+    flags = []
+    for rank in range(jax.process_count()):
+        devices = [device for device in jax.devices() if device.process_index == rank]
+        sharding = NamedSharding(Mesh(devices, ("x",)), P())
+        value = np.full((4,), np.nan if rank == 1 else 1.0, np.float32)
+        flags.append(jax.make_array_from_single_device_arrays(
+            value.shape, sharding, [jax.device_put(value, device) for device in devices
+                                    if device.process_index == jax.process_index()]))
+    read = finite_flags(flags)
+
+    from test_stage_local import ADAM, decoder, stream, trainer
+
+    paired = [device for pair in zip(*(sorted((device for device in jax.devices()
+                                                if device.process_index == rank), key=lambda d: d.id)
+                                               for rank in range(jax.process_count())), strict=True)
+              for device in pair]
+    mesh = MeshSpec(fsdp=2, stage=2)
+
+    def run(steps: int) -> int:
+        staged = trainer(decoder(), ADAM, mesh, len(paired), checkpoints=Checkpoints(str(args.run_dir)))
+        staged.device_mesh = mesh.build(paired)
+        return int(staged.fit(stream(), steps=steps, checkpoint_every=1, log_every=1).step)
+
+    run(args.steps)
+    resumed = run(args.steps + 1)
+    return {"process_index": jax.process_index(), "finite": read, "resumed": resumed}
+
+
 class InjectedValueError(ValueError):
     """A failure mode_evaluation_contract injects into a host consumer (a metric, a preview, a tracker), its
     category its class's name, which the report carries in place of its words (row 4506)."""
@@ -2401,7 +2443,7 @@ def mode_matrix(args) -> dict:
 
 
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,
-         "decision_publish": mode_decision_publish,
+         "decision_publish": mode_decision_publish, "stage_save": mode_stage_save,
          "host_training": mode_host_training,
          "streamed_refused": mode_streamed_refused,
          "update_priced_apart": mode_update_priced_apart,

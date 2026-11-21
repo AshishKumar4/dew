@@ -763,6 +763,17 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
                            worker.params_dict(whole_state.variables))
 
 
+@pytest.mark.distributed
+def test_a_pipeline_whose_stages_are_each_one_processs_checkpoints_and_resumes(tmp_path):
+    """A two-stage pipeline over two processes, each stage one process's devices alone: every process reads
+    the finite check over leaves each placed on one process's devices alone, alike, and the run checkpoints
+    its step and resumes from it one step further (row 10780: each rank read each stage's finite flag,
+    those outside a stage holding none of it, and the save crashed)."""
+    pool = run_pool("stage_save", tmp_path / "pool", 2, devices=2, steps=1, run_dir=tmp_path / "run")
+    assert [report["finite"] for report in pool] == [[True, False]] * 2, pool
+    assert [report["resumed"] for report in pool] == [2, 2], pool
+
+
 # --------------------------------------------------------------------------
 # Checkpoints between topologies
 # --------------------------------------------------------------------------
