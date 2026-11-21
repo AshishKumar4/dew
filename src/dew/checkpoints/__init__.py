@@ -85,6 +85,7 @@ from dew._coordination import broadcast_from_process_zero, from_every_process, s
 from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
+from dew.checkpoints._exported import EXPORTED, exported
 from dew.checkpoints._integrity import _digest
 from dew.checkpoints._payloads import (
     _NEEDS,
@@ -955,21 +956,6 @@ def _rmtrees(paths: Sequence[epath.Path], failures: list[OSError]) -> None:
             failures.append(error)
 
 
-EXPORTED = "exported"
-"""The Orbax item a step exported for readers without Dew holds (`Checkpoints.export_model`): the model's
-variables and EMA whole, in Orbax's standard layout."""
-
-
-def exported(state: TrainState, held_apart: bool) -> dict[str, object]:
-    """`state`'s model as `EXPORTED` holds it: its variables, every collection among them, and its EMA where
-    it keeps one, each its own arrays. Refused for a pipeline's rows each on its own stage's devices
-    (`held_apart`), which Orbax's standard layout writes no part-of-pool array of."""
-    if held_apart:
-        raise ValueError("export_model writes the model in Orbax's standard layout, which holds no array on "
-                         "part of the pool; this pipeline's stages each hold their own rows")
-    return {"variables": state.variables, **({} if state.ema is None else {"ema": state.ema})}
-
-
 class Checkpoints:
     """Manages the checkpoints of one run in one directory.
 
@@ -992,9 +978,8 @@ class Checkpoints:
 
     `export_model` writes beside each persistent step of a train state its model whole (`EXPORTED`): its
     variables, every collection the store dedups among them (a LoRA base), and its EMA as its own arrays,
-    not as the deltas the step keeps, in Orbax's standard layout, so stock Orbax reads it with no Dew
-    (`ocp.StandardCheckpointer().restore(<step>/exported)`), at the cost of one copy of the model a step. A
-    run that keeps only its final checkpoint exports only that one.
+    in Orbax's standard layout, so stock Orbax reads it with no Dew (`<step>/exported`), at one copy of the
+    model a step; a run that keeps only its final checkpoint exports only that one.
     """
 
     def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
@@ -1552,11 +1537,12 @@ class Checkpoints:
                               tuple(name for name in (*ROLES, ONE_ITEM) if name in payloads))
         try:
             with region("checkpoint.submit"):
-                items = {name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
-                         for name, tree in payloads.items()}
+                saved: dict[str, ocp.args.CheckpointArgs] = {
+                    name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
+                    for name, tree in payloads.items()}
                 if self.export_model and not mapping:
-                    items[EXPORTED] = ocp.args.StandardSave(exported(state, held_apart))
-                persistent.save(step, args=ocp.args.Composite(**items),
+                    saved[EXPORTED] = ocp.args.StandardSave(exported(state, held_apart))
+                persistent.save(step, args=ocp.args.Composite(**saved),
                                 metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
             self._staged.pop(step)
