@@ -1584,7 +1584,7 @@ def test_fp32_forward_derives_parted_wgmma_and_consumer_choice_uses_launch_secon
     spans = template.spans(512, 512, 1, causal=True)
     with generation.assumed("sm90"):
         target = generation.gpu_target()
-        q32 = jax.ShapeDtypeStruct((1, 512, 8, 64), jnp.float32)
+        q32 = jnp.zeros((1, 512, 8, 64), jnp.float32)
         op32, args32 = attention_mosaic._forward_call(q32, q32, q32, spans, None, scale=None,
                                                       natural=attention_mosaic.NATURAL)
         ba32 = op32.bind(*args32, residuals=template.Kept.NONE, interpret=False)
