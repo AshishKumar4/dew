@@ -635,8 +635,8 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
               for array, (_, share) in zip((key, value), shares, strict=True))
     return family.kernel(
         entry, out_type=(dk, dv),
-        grid=(heads, keys_padded // (holders(family, consumers) * tiles.block_k), batch),
-        grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
+        grid=(heads, batch, keys_padded // (holders(family, consumers) * tiles.block_k)),
+        grid_names=("heads", "batch", "k_tiles"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math,
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.reduces),

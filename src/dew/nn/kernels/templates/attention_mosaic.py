@@ -75,7 +75,12 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     forward_products,
     logits_ahead,
 )
-from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, staged_parts, stores_typed
+from dew.nn.kernels.templates.attention_mosaic_fused import (
+    _fused_allocations,
+    staged_parts,
+    stores_typed,
+    streamed_statistics,
+)
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BACKWARD_CONSUMERS,
     ROUNDED,
@@ -1873,7 +1878,36 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
         dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
                if fed else {})
-        return self._one_launch(ba, target, family, fed, dkv) or self._two_launches(ba, target, family, dkv)
+        config = self._one_launch(ba, target, family, fed, dkv) or self._two_launches(ba, target, family, dkv)
+        return None if config is None else self._deepened(ba, config, target)
+
+    def _deepened(self, ba: tokamax.BoundArguments, config: BackwardTiles,
+                  target: generation.GpuTarget) -> BackwardTiles:
+        """Deepen a multi-consumer fused backward's TMA ring up to `consumers + 1` stages where SMEM holds
+        it without reducing SM residency or dropping streamed `peak`/`total`/`delta` statistics (row 5272)."""
+        if not config.fused or config.consumers < 2:
+            return config
+        query = ba.arguments["query"]
+        family = bundle_of(config, query.dtype)
+        if not family.budgets_registers or family.operands_in_registers:
+            return config
+        want = min(config.consumers + 1, -(-query.shape[1] // config.block_q))
+        if want <= config.stages:
+            return config
+        base_resident = self.resident(ba, config, target)
+        allocator = _coop_allocations if config.shared_keys else None
+        reduced = reducing(family, config.consumers, self.score_reduces,
+                           scaled=staged_parts(query.dtype) > 1)
+        base_stats = streamed_statistics(family, config, query.shape[3], query.dtype, config.stages,
+                                         reduced=reduced, allocations_of=allocator)
+        for stage_count in range(want, config.stages, -1):
+            candidate = dataclasses.replace(config, stages=stage_count)
+            if (self.takes(ba, candidate, target)
+                    and self.resident(ba, candidate, target) == base_resident
+                    and streamed_statistics(family, candidate, query.shape[3], query.dtype, stage_count,
+                                            reduced=reduced, allocations_of=allocator) >= min(3, base_stats)):
+                return candidate
+        return config
 
     def _one_launch(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, family: mosaic.Family,
                     fed: list, dkv: dict) -> BackwardTiles | None:

@@ -368,7 +368,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     stats_shape = outputs.output(jnp.float32, rows_count, rows, heads_of, positions)
     launch = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
-        grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
+        grid=(heads, batch, queries // pair), grid_names=("heads", "batch", "q_tiles"), consumers=consumers,
         interpret=walk.interpret, approx_math=walk.approx_math,
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.reduces),

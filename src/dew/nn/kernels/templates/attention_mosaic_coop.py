@@ -256,8 +256,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
     launch = family.kernel(
-        entry, out_type=(), grid=(heads, keys_padded // block_k, batch),
-        grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
+        entry, out_type=(), grid=(heads, batch, keys_padded // block_k),
+        grid_names=("heads", "batch", "k_tiles"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_shared",
         registers=walk.registers(dq=False),
         # A score hook's warpgroups reserve their reduction scratch, and fp16's running scale's (`reducing`).

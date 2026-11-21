@@ -348,8 +348,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                      *(outputs.axis(array, index) for index in axis_order), width)
                       for array in (key, value))
     launch = family.kernel(
-        entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
-        grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
+        entry, out_type=() if grouped else gradients, grid=(heads, batch, keys_padded // pair),
+        grid_names=("heads", "batch", "k_tiles"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused", reducing_warpgroups=reduced,
         registers=walk.registers(dq=False),
         # Its walk's statement, its work its emission's (`stated`); the model's products it owns
