@@ -498,11 +498,12 @@ def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
 @pytest.mark.parametrize('kernel', ['recurrence_alone_output', 'recurrence_states'],
                          ids=['forward alone spent', 'training forward spent'])
 def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
-    """The 27B gated delta net on an H100, one product's kernel refused at every rung of its ladder from the
-    derived tiles' base (`Mosaic.rungs`, as a compile spends it): the derivation steps that product's tiles
-    and leaves the other's launches as they were (`Mosaic._refused`'s product), the training call's where a
-    forward alone spent its output launch, the forward alone's where the training forward spent its states.
-    Named alike, a forward alone's spill refused the training call's candidates too (row 10559)."""
+    """The 27B gated delta net on an H100, one product's kernel refused at its derived tiles' base and every
+    rung of its ladder from there (`Mosaic.rungs`, as a compile spends it): the derivation steps that
+    product's tiles and leaves the other's launches as they were (`Mosaic._refused`'s product), the training
+    call's where a forward alone spent its output launch, the forward alone's where the training forward
+    spent its states. Named alike, a forward alone's spill refused the training call's candidates too (row
+    10559)."""
     from test_recurrence_mosaic import resource_operands
 
     from dew.nn.kernels.templates import report
@@ -525,7 +526,8 @@ def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
                 return template.MOSAIC.launches(bound, tiles, target, backward=True)
             return template.MOSAIC.launches(bound, tiles.forward or tiles, target, backward=False)
 
-        assert rungs and stepped is not None, (first, rungs, stepped)
+        # Spent: past every rung of its ladder (none where its launch moves no registers), no raise answers.
+        assert template.MOSAIC._exhausted(bound, base, target) and stepped is not None, (rungs, stepped)
         # The spent product off its ladder, the other's launches as they were.
         assert launches(stepped, not alone) != launches(first, not alone), (first, stepped)
         assert launches(stepped, alone) == launches(first, alone), (first, stepped)
