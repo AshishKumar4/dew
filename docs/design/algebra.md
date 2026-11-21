@@ -66,8 +66,13 @@ they are declared: neither is generated yet.
   - elementwise operations, casts, broadcasts, reshapes and transposes;
   - reductions (sum, max, min), `dot_general` and select;
   - rsqrt, sqrt, exp, log, log1p, expm1, abs and sign.
-- **Opaque leaves,** never rewritten: Pallas kernels, collectives, `shard_map`, sharding constraints, random
-  numbers, callbacks and effects.
+- **Opaque leaves,** never rewritten: Pallas kernels, collectives, sharding constraints, random numbers,
+  callbacks and effects.
+- **A manual mesh's body** (`jax.shard_map`'s, each device's program) is a boundary, not a leaf: the pass
+  rewrites inside it in the map's recorded context (its newly manual axes bound, its abstract mesh manual,
+  its variance checked as the map checks it), each traced value typed by the manual axes it varies over, and
+  nothing moves across it; a constant its rewrite holds becomes one of the map's replicated operands, as JAX
+  stages a map (row 6578).
 - **Marked regions** (§6.10): Dew brackets a span of a computation with a marker primitive whose JVP and
   transpose rules bracket the span's tangent and cotangent too, so a span keeps its marker through autodiff. A
   marker carries its kind as an object, never a name string:

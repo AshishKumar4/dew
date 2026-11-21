@@ -366,8 +366,9 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
     first root that reads it, so a value two roots read is computed once, as extraction priced the roots
     together (spec alignment, 8995: each root traced apart emitted a shared product twice); a root of the
     form an earlier root makes is that root's value (`_placed`)."""
-    leaves = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype, weak_type=var.aval.weak_type)
-              for var in window.invars if isinstance(var.aval, ShapedArray)]
+    # Each input as the window holds it (`fusion.typed`): in a manual mesh's body the axes it varies over too,
+    # so a form traced over them varies as the values it replaces do.
+    leaves = [fusion.typed(var.aval, weak=True) for var in window.invars if isinstance(var.aval, ShapedArray)]
     if len(leaves) != len(window.invars):
         return {}
     chosen = []
@@ -803,8 +804,10 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     equations = []
     for equation in jaxpr.eqns:
         if _mapped(equation):
-            # A manual mesh's body, each device's program, rewritten in its own context (`_manual`).
-            with _manual(equation.params):
+            # A manual mesh's body, each device's program, rewritten in its own context (`_manual`), within
+            # the context the equation was recorded in (its abstract mesh among it: a map staged on a mesh of
+            # its own beside the caller's, JAX's replay of an equation, `JaxprEqn.ctx`).
+            with equation.ctx.manager, _manual(equation.params):
                 params = with_bodies(equation.params,
                                      lambda body: _closed(body, accurate, saturation, kernels))
         elif _holds_regions(equation) or _marked(equation, WITHIN) or (
