@@ -426,7 +426,6 @@ def test_mosaic_held_prices_backward_launches_when_reverse_is_true():
         assert template.MOSAIC.held(ba, tiles, reverse=True) == template.MOSAIC._launches_hold(
             template.MOSAIC.launches(ba, tiles, target, backward=True), family)
 @pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
-@pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_an_fp32_turned_call_on_the_template_trains_as_the_portable_math_interpreted(packed):
     """Mamba-3's turned form (`TURNED`) in fp32 (three bf16 parts under the accurate forms, row 7673) trains
     on the recurrence template's fast backward, output, final memory and every operand's gradient on par
