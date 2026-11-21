@@ -1,7 +1,7 @@
 """The recurrence template's forward over a call's chunks: its operands laid in rows of sequences and padded
 to whole blocks and chunks (`prepared`), its launches in turn (`templates.recurrence.mainloop`'s: the
-inverse and the weighted keys and values, the states, the output or the fused scan), and the values its fast
-backward reads kept (`kept_forward`)."""
+inverse and the weighted keys and values, the states, then the output), and the values its fast backward
+reads kept (`kept_forward`)."""
 
 import dataclasses
 from collections.abc import Callable

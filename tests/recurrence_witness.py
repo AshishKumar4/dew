@@ -255,17 +255,16 @@ def output(q, k, entering, values, exponents: Exponents, scale: float, lane: Lan
     return fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
 
 
-def keys_gated_enclosures(step: "Step", scale: float, lane: Lane,
-                          entering: Iv | None = None) -> dict[str, Iv]:
+def keys_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, Iv]:
     """`enclosures` of a chunk whose write gate takes the keys' side (`mainloop.Call.gated_keys`, Mamba2's SSD
     under the fast forms): the memory it leaves, fp32 (`algebra.keys_gated_carried`: the carry decayed to the
     chunk's end, plus each key row gated in fp32 by its write gate times its decay to the end and rounded to
     the values' dtype, against the values as given), and its output before its store (`chunk_scores` with
     each key column scaled by its write gate before the scores round, `chunk_output`). The scores' tile is a
     derived form (`algebra.derived_tile`), its products, decays and gates multiplied in either association:
-    their enclosure is both's hull. `entering` is the memory its output reads, by default the stored `h`."""
+    their enclosure is both's hull. Its output reads the memory the chunk enters as stored (`h`)."""
     exponents = Exponents.of(step.g)
-    entering = point(step.h) if entering is None else entering
+    entering = point(step.h)
     gate = fp32(mul(exponents.gated(lane), point(step.beta)), lane)
     keys = staged(fp32(mul(point(step.k), Iv(gate.lo[:, None], gate.hi[:, None])), lane), lane)
     write = dot(Iv(keys.lo.T, keys.hi.T), point(step.v), lane, parts=(lane.held, lane.given))
@@ -589,20 +588,20 @@ def _through(operands: tuple, starts, last: int) -> tuple:
     return (*held, operands[5]), None if starts is None else starts & ~past[None]
 
 
-def _route_forward(route, operands: tuple, form: str) -> tuple:
+def _route_forward(route, operands: tuple, form: str, *, inference: bool = False) -> tuple:
     """The forward of `route` over `operands` as a training step runs it, the template's (`chosen`):
     `(output, final memory, tiles, trained)`. The training forward, the primal of the route's VJP, where
-    the template trains the call (`Mosaic.trains`, `trained`); else the inference forward: a training step
-    takes another kernel for a call the template does not train (an fp32 call's backward on an A100's
-    registers, 264 to 328 a thread). `form` names the options `route` closes over, which its launches'
-    labels carry."""
+    the template trains the call (`Mosaic.trains`, `trained`) and the `inference` forward is not asked; else
+    the inference forward: a training step takes another kernel for a call the template does not train (an
+    fp32 call's backward on an A100's registers, 264 to 328 a thread). `form` names the options `route`
+    closes over, which its launches' labels carry."""
     import jax
 
     (o, final), launches = launched(jax.jit(route), operands, f"inference forward, {form}")
     [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
                         zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
     trained = template.MOSAIC.trains(bound, template.Mosaic.launched())
-    if trained:
+    if trained and not inference:
         trained_forward = jax.jit(lambda *x: jax.vjp(route, *x)[0])
         (o, final), launches = launched(trained_forward, operands, f"training forward, {form}")
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
@@ -670,12 +669,13 @@ def tf32_conversion(family) -> Literal["plain", "rna", "read"]:
 
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None, carried: bool = True,
-             delta: bool = True, rounded: bool | None = None) -> Run:
+             delta: bool = True, rounded: bool | None = None, inference: bool = False) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `chunk_forward.kept_forward` at the tiles the route
     takes (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
-    build is production's), on the device's bundle, interpreted off a GPU; not a call no gradient follows
-    (`chunk_forward.forward`, one walk that stores no state it reads). Operands `[1, T, ...]`. With `carried`,
+    build is production's), on the device's bundle, interpreted off a GPU; where `inference`, the forward a
+    call no gradient follows runs (`chunk_forward.forward`, the same launches keeping nothing, at its own
+    tiles, `Tiles.forward`). Operands `[1, T, ...]`. With `carried`,
     each chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to it, whose
     final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`, each
     chunk's: end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's
@@ -713,12 +713,12 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         hasher = hashlib.sha1()
         if starts is not None:
             array_fingerprint(hasher, np.asarray(starts))
-        form = (f"delta {delta}, rounded {rounded}, segments {max_segments}, starts "
+        form = (f"delta {delta}, rounded {rounded}, inference {inference}, segments {max_segments}, starts "
                 f"{None if starts is None else hasher.hexdigest()[:16]}")
-        o, final, tiles, trained = _route_forward(route, operands, form)
+        o, final, tiles, trained = _route_forward(route, operands, form, inference=inference)
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
-        tiles = tiles if trained else tiles.forward or tiles
+        tiles = tiles if trained and not inference else tiles.forward or tiles
         chunk = tiles.chunk
 
         # One program for the call and each of its chunks' leaving memories (`through`), traced once, run as a

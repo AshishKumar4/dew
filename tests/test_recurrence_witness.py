@@ -52,3 +52,17 @@ def test_an_fp32_forward_the_template_does_not_train_is_witnessed_as_its_inferen
         held = rw.witness(run, rw.interpreted_lane())
     for name, inside in held.items():
         assert np.all(inside), (name, float(np.mean(inside)))
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_an_inference_forward_is_witnessed_at_its_own_tiles(target):
+    """A bf16 call no gradient follows, with the delta rule and without it (its keys taking the write gate),
+    its forward at its own tiles (`Tiles.forward`) as its states then output launches, no walk forming the
+    output in one (rows 5668, 7877): every record inside its step's enclosure (`rw.witness`)."""
+    with generation.assumed(target, interpreted=True):
+        operands = rw.draw(0, "mild", heads=2)
+        runs = (rw.recorded(*operands, inference=True), rw.recorded(*operands, delta=False, inference=True))
+        found = [rw.witness(run, rw.interpreted_lane()) for run in runs]
+    for held in found:
+        for name, inside in held.items():
+            assert np.all(inside), (name, float(np.mean(inside)))

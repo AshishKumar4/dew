@@ -491,3 +491,27 @@ def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
 
         forward, trained = names(tiles.forward or tiles, training=False), names(tiles, training=True)
     assert forward == trained, (forward, trained)
+
+
+def test_a_forward_alones_kernels_are_refused_at_its_own_tiles():
+    """Nemotron-H 4B's SSD forward no gradient follows, traced for an H100 at its own tiles beside the
+    training call's (`Tiles.forward`): its states and output kernels traced under those tiles
+    (`report.ran_at`), so a compile refusing them refuses the forward alone's tiles and not the training
+    call's, whose launches share their names (rows 5668, 7877: refused under the call's tiles, a forward's
+    spill refused the training call's unspilled tiles too)."""
+    from test_recurrence_mosaic import _form, _skipped, resource_operands
+
+    from dew.nn.kernels.templates import report
+
+    name, dtype = 'nemotron-h-4b-ssd', jnp.bfloat16
+    operands = resource_operands(name, dtype, 1, 4096)
+    options = dict(max_segments=None, bound=None, **_form(name, dtype), **_skipped(name))
+    facts = generation.gpu_target('sm90')
+    with generation.assumed(facts):
+        bound = template.MOSAIC.bind(*operands, None, **options)
+        tiles = template.MOSAIC.derived(bound, facts)
+        jax.eval_shape(lambda *x: template.MOSAIC(*x, None, **options), *operands)
+    identity = report._identity(template.MOSAIC, bound)
+    ran = {kernel for launch in report._LAUNCHES.values()
+           if launch.identity == identity and launch.config == tiles.forward for kernel in launch.kernels}
+    assert tiles.forward is not None and {'recurrence_states', 'recurrence_output'} <= ran, (tiles, ran)
