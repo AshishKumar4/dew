@@ -9,22 +9,21 @@ family a later transformers added, a release's remote code, diffusers' own
 Transformers 4 pipelines.
 """
 
-import re
 import tomllib
 from collections.abc import Mapping
 from importlib.metadata import version
 from pathlib import Path
+
+from pins import pinned
 
 
 def tested(distribution: str) -> str:
     """The release of `distribution` the reference suite pins in pyproject.toml's test extra, which
     the locks and CI install: the release most fixtures are recorded against."""
     extras = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
-    for requirement in extras["project"]["optional-dependencies"]["test"]:
-        pinned = re.fullmatch(rf"{re.escape(distribution)}==([^;\s]+)", requirement)
-        if pinned:
-            return pinned[1]
-    raise LookupError(f"pyproject.toml's test extra pins no {distribution} release")
+    if (release := pinned(extras["project"]["optional-dependencies"]["test"], distribution)) is None:
+        raise LookupError(f"pyproject.toml's test extra pins no {distribution} release")
+    return release
 
 
 MODELOPT = {"nvidia-modelopt": "0.47.0"}
