@@ -933,7 +933,7 @@ def _contract_cases(generation_name: str, form: str | None = None) -> list:
         if target_forms.issubset({key[0] for key in found}):
             by_form = {name: pricing.family_of(case.tile, jnp.bfloat16) for (name, _), case in found.items()}
             if all(all((name, count) in found
-                       for count in {1, min(by_form[name].consumers, mosaic_gpu.CONSUMERS)})
+                       for count in {1, min(by_form[name].consumers, tiling.CONSUMERS)})
                    for name in target_forms):
                 break
     return list(found.values())
