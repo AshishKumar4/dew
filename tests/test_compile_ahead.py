@@ -647,6 +647,39 @@ def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
     assert compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1)).starts
 
 
+@COMPILES_ON_CPU
+def test_a_steps_planner_certifies_its_launches_beside_the_trace_that_reaches_them():
+    """A step compiled ahead for a compile-only H100 (`compile_ahead`: its planner's trace of each candidate,
+    `FitSearch`, and its fit check's compile) certifies its attention launches beside the trace that
+    reaches them (`report.certified`, as a program traces): each launch's own compile, a `certified_`
+    program, runs on a certification thread (`dew-certify`), none on a thread that traces. Certified within
+    the planner's trace, a 4x1024 MoE step's 16 certifications compiled one after another (MC-6740-POOL),
+    and an sm90 plan certified 64 of its 82 seconds in turn (FS-P5324-MAIN, row 5324)."""
+    import threading
+
+    from dew.training.ahead import compile_ahead
+
+    compiled_on: list[tuple[str, str]] = []
+
+    def heard(event: str, seconds: float, *, fun_name: str = "", **_) -> None:
+        if event == "/jax/core/compile/backend_compile_duration":
+            compiled_on.append((threading.current_thread().name, fun_name))
+
+    tokens = 256
+    model = models.build("causal_transformer", vocab_size=VOCAB,
+                         **{**TINY_DECODER, "emb_features": 256, "max_seq_len": tokens}, num_kv_heads=2,
+                         dtype="bfloat16")
+    trainer = Trainer(LMObjective(model, tokens), optax.adam(1e-3), key=jax.random.key(0),
+                      mesh=MeshSpec().build(gpus("sm90")), layout=Layout(min_shard=TINY_SHARD))
+    jax.monitoring.register_event_duration_secs_listener(heard)
+    try:
+        assert compile_ahead(trainer, token_rows(VOCAB, BATCH, tokens + 1)).starts
+    finally:
+        jax.monitoring.unregister_event_duration_listener(heard)
+    certifying = [thread for thread, name in compiled_on if "certified_" in name]
+    assert certifying and all(thread.startswith("dew-certify") for thread in certifying), compiled_on
+
+
 def test_a_step_compiled_ahead_over_phases_of_other_batches_takes_a_split_that_cuts_each():
     """A run over phases of 12, then 8 rows a step compiles its step ahead in a split that cuts every
     phase's batch (`Trainer.reading`'s `Loader.batches`), as its fit plans it: a fixed split of 2 compiles,
