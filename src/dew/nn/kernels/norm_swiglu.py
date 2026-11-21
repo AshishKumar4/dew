@@ -94,6 +94,7 @@ from ..precision import (
     rms_weighted,
     rounded_to,
     two_product,
+    uncontracted,
 )
 from ..sharding import automatic_axes, manual_map, on_shards, varying_like
 from . import generation, tuning
@@ -205,8 +206,8 @@ def _neumaier_add(total, correction, value, *, interpret: bool) -> tuple[jax.Arr
             }""", constraints="=f,f,f,f", args=(total, correction, value),
             result_shape_dtypes=(shape,), pack=1)[0]
         return high, low
-    value = jax.lax.optimization_barrier(value)
-    merged = jax.lax.optimization_barrier(total + value)
+    (value,) = uncontracted(value)
+    (merged,) = uncontracted(total + value)
     lost = jnp.where(jnp.abs(total) >= jnp.abs(value),
                      (total - merged) + value, (value - merged) + total)
     return merged, correction + lost
@@ -228,7 +229,7 @@ def _product_parts(left, right, *, interpret: bool) -> tuple[jax.Array, jax.Arra
             }""", constraints="=f,f,f,f", args=(left, right, high),
             result_shape_dtypes=(shape,), pack=1)[0]
         return high, low
-    return two_product(left, right, bit_split=True, rounding=jax.lax.optimization_barrier)
+    return two_product(left, right, bit_split=True, rounding=lambda product: uncontracted(product)[0])
 
 
 def _selected[C](op: Op[C], case: C, implementation: str) -> str:

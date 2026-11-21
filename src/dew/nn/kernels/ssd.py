@@ -272,7 +272,7 @@ def _opened(given_ref, table, entry, load, add, document, zero):
 
     key, value, weight = (ref[document] for ref in entry)
     # Its terms' outer products summed aligned to the largest, which may leave fp32's range where the
-    # sum is in it (`precision.aligned_sum`).
+    # sum is in it (`aligned.aligned_sum`).
     return taken + entry_write(key, value, weight, values_first=True)
 
 
