@@ -158,7 +158,9 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    coords = coords_of(q_first, read=walk.places_read(masked=masked))
+    coords = (functools.partial(coords_of, q_first, read=walk.places_read(masked=masked))
+              if family.operands_in_registers
+              else coords_of(q_first, read=walk.places_read(masked=masked)))
     if q_slot.dtype == jnp.float16:
         return _sixteen_step(walk, k_smem, staged, add_dq, slots, carry, accumulators, q_first, _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
@@ -177,10 +179,9 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
         add_dq(q_first, dq)
         return carry, (dk_acc, dv_acc)
     family.staged(narrowed, staged.at[0])
-    dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     family.staged(part, cotangents_staged)
+    dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
-    # The tile's dQ, its staged cotangents times the resident keys (`algebra.cotangent_product`'s `a @ b`),
     # added into dQ: the query tile's other key blocks add theirs.
     add_dq(q_first, family.looped_product(cotangents_staged, k_smem,
                                           (tiles.block_q, k_smem.shape[-1])))
@@ -235,10 +236,14 @@ def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, s
              for name, ref in zip(names[:streamed], refs, strict=False)}
 
     def rows_of(slots, first):
-        return tuple(family.rows_of(slots[name]) if index < streamed
-                     else _rows(family, ref, row, head, first, block_q)
+        def read(index, name, ref):
+            return (family.rows_of(slots[name]) if index < streamed
+                    else _rows(family, ref, row, head, first, block_q))
+        if family.operands_in_registers:
+            return tuple(functools.partial(read, index, name, ref)
+                         for index, (name, ref) in enumerate(zip(names, refs, strict=True)))
+        return tuple(read(index, name, ref)
                      for index, (name, ref) in enumerate(zip(names, refs, strict=True)))
-
     return views, rows_of
 
 

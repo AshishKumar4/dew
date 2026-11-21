@@ -4,6 +4,7 @@ forward's statistics (`_scores`)."""
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 from jax import lax
@@ -141,7 +142,8 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
                         at=at)
                  for index, (ref, kind, kept) in enumerate(laid))
 
-def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords: algebra.Coords, whole,
+def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
+                 coords: algebra.Coords | Callable[[], algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
                  ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
@@ -164,11 +166,12 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
         dp = family.product(do_slot, values_t, shape)
     else:
         s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
+    tile_coords = coords() if callable(coords) else coords
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
-        exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, (), s, dp, *rows,
+        exponentials, weights, cotangents, slopes, seen = _scores(walk, tile_coords, (), s, dp, *rows,
                                                                   masked=masked)
-        multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
+        multiplier = algebra.drawn(tile_coords, tile_coords.q_pos, tile_coords.k_pos)
         if multiplier is not None:
             exponentials, weights = exponentials * multiplier, weights * multiplier
         return exponentials, weights, gradient.pulled(cotangents, slopes, seen, ())[0]

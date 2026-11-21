@@ -10,12 +10,12 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851]
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701]
-- The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010]
 - The kernel challenge's lessons in the templates. [5271]
 - Cached and block visibility on the template's spans. [1495, 245]
 - Performance measurements. [569, 285, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
+- The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900, 10742]
 - Convolution repairs above their owner. [5665]
