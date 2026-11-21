@@ -45,7 +45,7 @@ from dew.batch import Variables
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.precision import at_least_fp32, compensated_add, two_product
+from dew.nn.precision import at_least_fp32, compensated_add, summed_pairs, two_product
 from dew.sampling.solvers.common import given
 
 Pair = tuple[jax.Array, jax.Array]
@@ -315,14 +315,13 @@ def _projected_components(direction, output):
     vector, conditioned = direction.astype(dtype), output.astype(dtype)
     axes = tuple(range(1, output.ndim))
     shape = (output.shape[0],) + (1,) * (output.ndim - 1)
-    zero = jnp.asarray(0.0, dtype)
     # Finite inputs cannot overflow either dot product before the quotient removes their scale.
     vector, vector_exponent = _row_scaled(vector)
     conditioned, output_exponent = _row_scaled(conditioned)
     floor = jnp.ldexp(jnp.asarray(1e-24, dtype), -2 * output_exponent)
 
     def summed(left, right):
-        high, low = jax.lax.reduce(two_product(left, right), (zero, zero), compensated_add, axes)
+        high, low = summed_pairs(two_product(left, right), axes)
         return high.reshape(shape), low.reshape(shape)
 
     numerator, numerator_lo = summed(vector, conditioned)

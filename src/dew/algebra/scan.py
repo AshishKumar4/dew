@@ -54,7 +54,15 @@ from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.nested import nested
-from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, twice_scaled, vanishing
+from dew.nn.precision import (
+    accurate_exp,
+    at_least_fp32,
+    renormalized_add,
+    rounding_alone,
+    twice_scaled,
+    uncontracted,
+    vanishing,
+)
 from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
@@ -1321,16 +1329,22 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False,
     rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
     element of it the first of its segment's, in either direction: a suffix sums to its segment's last).
     `low`, where given, is each value's own low part, the values then double floats themselves (an exact
-    product's pair, `two_product`: Mamba-3's turns). Each pair joined renormalized (`compensated_add`), the
+    product's pair, `two_product`: Mamba-3's turns). Each pair joined renormalized (`renormalized_add`), the
     hand math's sum: a pair left unrenormalized held a residual that a product XLA:CPU fused into its sum (a
     rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966).
     A nested program (`dew.nn.nested`), traced once for its arguments' types within a trace: the associative
     scan otherwise traces its protected additions afresh at every level on every call, each chunk's walked
     sum among them."""
     low = jnp.zeros_like(values) if low is None else low
+    # Each value read as one where it is made (`uncontracted`, or its additions marked to round alone), once:
+    # the scan's partial sums are its additions', which its combine reads unfenced (`renormalized_add`), where
+    # a fence at every level split its fusions (row 8498).
+    with rounding_alone():
+        (values,) = uncontracted(values)
 
     def combine(left, right):
-        summed = compensated_add(left[:2], right[:2])
+        with rounding_alone():
+            summed = renormalized_add(left[:2], right[:2])
         if restarts is None:
             return summed
         # Where the right part restarts, the left's sums are not its segment's.

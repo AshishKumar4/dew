@@ -126,6 +126,7 @@ __all__ = [
     "projection_role",
     "recipe_role",
     "refuse_recipe",
+    "renormalized_add",
     "rms_statistics",
     "rms_weighted",
     "rounded_operand",
@@ -141,6 +142,7 @@ __all__ = [
     "sqrt_or_zero",
     "stochastic_bf16",
     "summed_once",
+    "summed_pairs",
     "twice_scaled",
     "two_product",
     "two_sum",
@@ -1804,16 +1806,17 @@ def compensated_add(left, right):
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     with rounding_alone():
-        return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
+        return renormalized_add((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
 
 
 @_protected
-def _renormalized(left, right):
+def renormalized_add(left, right):
     """`compensated_add`'s arithmetic over pairs whose his no multiply makes in the same fusion (each read as
-    one value, `uncontracted`, or a compensated reduction's accumulator, made by additions alone): the his'
-    TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own: one in a
-    reduction's computation splits the fusions around the program, row 7953). A lo is read once, so a
-    multiply contracted into its addition reads it once too."""
+    one value, `uncontracted`, or a compensated reduction's or scan's accumulator, made by additions alone):
+    the his' TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own:
+    one in a reduction's computation splits the fusions around the program, row 7953). A lo is read once,
+    so a multiply contracted into its addition reads it once too. The combine of a compensated reduction
+    (`summed_pairs`) and a compensated scan (`dew.algebra.scan.compensated`)."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     total, dropped = _two_sum(left_hi, right_hi)
     return _two_sum(total, dropped + left_lo + right_lo)
@@ -1848,13 +1851,22 @@ def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """The sum of `values` over `axes` its compensated pair rounds once, its tangent the plain sum's: a
     protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
     algebra pass must not cancel."""
-    # Each value read as one (`uncontracted`) where it is made, or the reduction's additions marked to round
-    # alone (`rounding_alone`): the reduction's pairs are its additions'.
+    wide = values.astype(at_least_fp32(values.dtype))
+    pair = summed_pairs((wide, jnp.zeros_like(wide)), axes)
+    return compensated_total(pair, jnp.sum(wide, axes)).astype(values.dtype)
+
+
+def summed_pairs(pair: tuple[jax.Array, jax.Array], axes: Sequence[int]) -> tuple[jax.Array, jax.Array]:
+    """Double-float `(hi, lo)` pairs summed over `axes` in one XLA reduction, `(hi, lo)`: each `hi` read as
+    one value where it is made (`uncontracted`), or the reduction's additions marked to round alone
+    (`rounding_alone`), and the pairs combined by `compensated_add`'s arithmetic with no barrier of its own
+    (`renormalized_add`: one in a reduction's computation splits the fusions around the program, row 7953).
+    The one compensated pair reduction: a compensated sum's (`compensated_sum`), a kernel's programs' parts'
+    (`norm_swiglu`), a guidance projection's dot products' (row 8498)."""
     with rounding_alone():
-        (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
-        zero = jnp.zeros((), wide.dtype)
-        hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
-    return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
+        (hi,) = uncontracted(pair[0])
+        zero = jnp.zeros((), hi.dtype)
+        return jax.lax.reduce((hi, pair[1]), (zero, zero), renormalized_add, tuple(axes))
 
 
 def compensates_loops() -> bool:
