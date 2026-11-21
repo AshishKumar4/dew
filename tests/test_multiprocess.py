@@ -787,6 +787,9 @@ def test_a_pipeline_whose_stages_are_each_one_processs_checkpoints_and_resumes(t
     assert [report["refused"] for report in pool] == [True, True], pool
     # A value each process puts on its own stage's devices under one name, no checkpoint's row, is refused.
     assert [report["stray_refused"] for report in pool] == [True, True], pool
+    # Each process's diagonal of a tensor-split array, written to its local directory and read back whole
+    # (row 10813: Orbax's local tier wrote one replica's shards, one index of the two each process holds).
+    assert [report["diagonal"] for report in pool] == [{"held": True}] * 2, pool
     # The stepped step and the persistent tier's latest after each run: the first ran on the local tier
     # alone, the second resumed from it, the third from the persistent tier's step 2.
     assert [report["steps"] for report in pool] == [[[1, None], [2, 2], [3, 2]]] * 2, pool
@@ -1610,6 +1613,16 @@ def test_a_process_that_lost_its_copy_of_a_key_of_another_implementation_recover
         assert report["zeros"] == [[4], [4]]
         for name in ("key", "shape"):
             assert report[name] == report["expected"]
+
+
+@pytest.mark.distributed
+def test_a_local_step_on_two_meshes_is_recovered_on_each_from_a_replica(tmp_path):
+    """Two leaves the pool replicates, each on its own mesh of the same devices: the local step's record holds
+    a grid a mesh, the holders cover both, and the process that lost its copy receives each leaf's values
+    over its own mesh (row 10814; `replica_key_worker.replica_grids`)."""
+    for report in run_pool("replica_grids", tmp_path / "pool", 2, devices=2, script=REPLICA_KEY):
+        assert report["grids"] == 2 and report["covered"] is True, report
+        assert report["recovered"] == report["expected"], report
 
 
 # --------------------------------------------------------------------------

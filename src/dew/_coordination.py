@@ -21,7 +21,7 @@ import socket
 import sys
 import threading
 import types
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Literal, overload
 
 import jax
@@ -254,6 +254,27 @@ def from_every_process(value) -> list:
     if jax.process_count() == 1:
         return [json.loads(json.dumps(value))]
     return [json.loads(word) for word in _round(json.dumps(value))]
+
+
+def spans_part_of_pool(devices: Iterable) -> bool:
+    """Whether `devices` are some processes' of a pool and not every one's, on any backend (a stage of one
+    process's devices, `dew.training.stages`; a CPU-owned state's companion mesh spans every process, as its
+    accelerator's does)."""
+    return {device.process_index for device in devices} != set(range(jax.process_count()))
+
+
+def read_by_holders[T](reads: list[T | None], spans: Sequence[Iterable]) -> list[T]:
+    """Each part's `reads`, as this process read it where it holds a device of the part's `spans` and None
+    where it holds none, as a process holding it read it: the rest taken from one, in one round
+    (`from_every_process`) where some part spans part of the pool (`spans_part_of_pool`), every process
+    deciding alike by the spans alone. Each part is held by some process. The reads are JSON values."""
+    if any(spans_part_of_pool(devices) for devices in spans):
+        every = from_every_process(reads)
+        reads = [next(read for read in (rank[at] for rank in every) if read is not None)
+                 for at in range(len(reads))]
+    held = [read for read in reads if read is not None]
+    assert len(held) == len(reads), "a part no process holds a device of"
+    return held
 
 
 def broadcast_from_process_zero(value):

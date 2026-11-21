@@ -93,6 +93,7 @@ from dew.telemetry.benchmark import carried
 from dew.telemetry.instrumentation import (
     BOUND_MARKS,
     compilation_cache_counts,
+    compiled_memory,
     count_compilation_cache,
     logged_utilization,
 )
@@ -297,15 +298,11 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
 
 
 def step_bytes(executable: jax.stages.Compiled | None) -> int | None:
-    """The bytes one device holds while the compiled step runs, as XLA planned
-    them: its arguments, the outputs not written over them, and the
-    temporaries; native workspaces (cuBLAS, cuDNN, a kernel's scratch) are
-    outside the plan, which `measured_row` reads."""
-    stats = None if executable is None else executable.memory_analysis()
-    if stats is None:
-        return None
-    return (stats.argument_size_in_bytes + stats.output_size_in_bytes
-            - stats.alias_size_in_bytes + stats.temp_size_in_bytes)
+    """The bytes one device holds while the compiled step runs, as XLA planned them (`CompiledMemory.summed`,
+    read once an executable, as the trainer read it); native workspaces lie outside the plan, which
+    `measured_row` reads."""
+    stats = None if executable is None else compiled_memory(executable)
+    return None if stats is None else stats.summed
 
 
 def parameter_count(params) -> int:

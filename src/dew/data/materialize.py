@@ -346,7 +346,7 @@ def _memory_pack(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], source
     stage, documents = _documents(stage, rows, marked=marked)
     sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
     refuse_overlong(sizes, stage, source.describe())
-    if stage.policy == "first-fit" and not stage.along:
+    if stage.policy in ("first-fit", "best-fit") and not stage.along:
         # The plan and windows reader of an indexed read of documents that state
         # their lengths (`PackedSource.planned`): it reads the windows that hold a
         # target, and the plan counts the rest as zero_targets.

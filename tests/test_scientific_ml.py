@@ -420,7 +420,8 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
     resumed from its checkpoint, steps on: its parameters and optimizer state stay float64, and its last
     checkpoint restores them bit for bit, float64 still."""
     # A float64 run sets x64 for its process, its data's worker threads among it, as
-    # examples/pinn_burgers.py does.
+    # examples/pinn_burgers.py does; the process's own setting comes back after (row 10803).
+    incoming = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", val=True)
     try:
         generator = np.random.default_rng(3)
@@ -442,7 +443,7 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
             assert left.dtype == np.float64
             np.testing.assert_array_equal(left, np.asarray(right))
     finally:
-        jax.config.update("jax_enable_x64", val=False)
+        jax.config.update("jax_enable_x64", val=incoming)
 
 
 @pytest.mark.parametrize("features", [64, 4], ids=["dual", "primal"])

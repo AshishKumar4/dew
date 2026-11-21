@@ -208,6 +208,11 @@ class FID:
     reads = ImageGrid
     shown = Shown(better="lower")
 
+    @property
+    def fields(self) -> tuple[str, ...]:
+        """The batch field it reads beside the grid, its reference images (`Metric`'s `fields`)."""
+        return (self.field,)
+
     def __call__(self, artifact: ImageGrid, batch) -> FIDStats:
         with metric_device():
             return FIDStats(_pooled_stats([artifact.images], population="generated",

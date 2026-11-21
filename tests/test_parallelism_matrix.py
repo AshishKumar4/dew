@@ -41,13 +41,12 @@ CELLS_ON_FOUR run on four of the eight, where four stages, or two beside a
 sequence axis of two, leave no axis for the rows: every device holds all of
 them."""
 
-import subprocess
 import sys
 
 import jax
 import pytest
 from map_judge import marked_seeds
-from process_support import REPO_ROOT, worker_env
+from process_support import REPO_ROOT, relayed, worker_env
 from tool_support import load
 
 CELLS: dict[str, tuple[str, ...]] = {
@@ -298,9 +297,9 @@ def test_a_layouts_step_read_back_from_the_compilation_cache_runs_as_compiled(tm
                        XDG_CACHE_HOME=str(tmp_path), PYTHONPATH=f"{REPO_ROOT / 'src'}:{REPO_ROOT / 'tests'}")
     written = []
     for run in ("compiled", "read back"):
-        ran = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                              "tests/test_parallelism_matrix.py", "-k", READ_BACK], env=environment,
-                             cwd=REPO_ROOT, capture_output=True, text=True, timeout=600)
-        assert ran.returncode == 0, (run, ran.stdout[-2000:], ran.stderr[-2000:])
+        # Owned by the suite: a child that hangs is aborted for its stacks, its output's tail failing it.
+        ran = relayed([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                       "tests/test_parallelism_matrix.py", "-k", READ_BACK], environment, timeout=600)
+        assert ran.returncode == 0, (run, ran.output[-4000:])
         written.append(sorted(path.name for path in cache.rglob("*-cache")))
     assert written[0] and written[1] == written[0], written
