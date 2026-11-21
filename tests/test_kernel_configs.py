@@ -147,15 +147,17 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
     assert not failures(found), "\n".join(failures(found))
 
 
+@pytest.mark.parametrize("case_index", [0, 1], ids=["kda", "kda-keys-256"])
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, case_index):
     """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
     compiled by XLA's CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py), within
-    the compile bound and the block's shared memory."""
-    found = compile_kernels(kda_training_cases(), target)
-    assert len(found) == 2
+    the compile bound and the block's shared memory (row 10557: each case its own pytest node)."""
+    cases = list(kda_training_cases())
+    assert len(cases) == 2
+    found = compile_kernels([cases[case_index]], target)
+    assert len(found) == 1
     assert not failures(found), "\n".join(failures(found))
-
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("target", gate_generations(scoped=True))
