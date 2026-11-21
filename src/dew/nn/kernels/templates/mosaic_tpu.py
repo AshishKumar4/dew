@@ -164,7 +164,9 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         del interpret
         return acc + value.astype(jnp.float32)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+        if pending:
+            raise ValueError(f"{type(self).__name__}.product is synchronous (pending={pending})")
         if then is not None:
             then()
         return _product(lhs, rhs)

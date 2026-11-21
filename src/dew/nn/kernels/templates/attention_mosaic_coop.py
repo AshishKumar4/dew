@@ -97,12 +97,21 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
                                                          index, slots, masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
     exchange.claim()
-    family.staged(narrowed, weights_ref.at[:, own])
-    family.staged(part, cotangents_ref.at[:, own])
+    with family.staged_together():
+        family.staged(narrowed, weights_ref.at[:, own])
+        family.staged(part, cotangents_ref.at[:, own])
     exchange.publish()
-    dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size))
-    dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
-    dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
+    if family.products_overlap and not family.operands_in_registers and not walk.interpret:
+        def issue_dkv():
+            family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
+            family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
+
+        dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size),
+                            then=issue_dkv, pending=2)
+    else:
+        dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size))
+        dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
+        dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
     add_dq(q_first, dq)
     family.settled(0)
     exchange.release()
@@ -126,16 +135,18 @@ def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, expon
     operands, own, mine, q_first = _share_scores(walk, share, resident, rows_of, coords_of, whole, index,
                                                  slots, masked=masked, whole_operands=True)
     exchange.claim()
-    for operand, left in enumerate(operands):
-        exponent = jnp.full((tiles.block_q,), algebra.tile_exponent(left), jnp.float32)
-        family.staged(family.as_row(exponent), exponents.at[operand, share])
+    with family.staged_together():
+        for operand, left in enumerate(operands):
+            exponent = jnp.full((tiles.block_q,), algebra.tile_exponent(left), jnp.float32)
+            family.staged(family.as_row(exponent), exponents.at[operand, share])
     exchange.publish()
     joined = tuple(functools.reduce(jnp.maximum, (jnp.max(family.rows_of(exponents.at[operand, other]))
                                                   for other in range(consumers)), last)
                    for operand, last in enumerate(carry))
-    for operand, left in enumerate(operands):
-        for offset, part in enumerate(algebra.parts_at(left, joined[operand])):
-            family.staged(part, exchanged.at[2 * operand + offset, :, own])
+    with family.staged_together():
+        for operand, left in enumerate(operands):
+            for offset, part in enumerate(algebra.parts_at(left, joined[operand])):
+                family.staged(part, exchanged.at[2 * operand + offset, :, own])
     exchange.publish()
     dk_acc, dv_acc = accumulators
     issued = [_rescaled_parts(walk, acc, algebra.running_shift(carry[operand], joined[operand]), rhs,

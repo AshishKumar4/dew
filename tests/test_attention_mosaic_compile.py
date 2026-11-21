@@ -1600,3 +1600,40 @@ def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
         assert algebra.bf16_part_count(accurate=False) == 1
         assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
         assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
+
+
+@COMPILES_ON_CPU
+def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pending():
+    """Row 5272: sm90 fused (d64, d128) and cooperative (d256) backward kernels stage P/dS under one
+    proxy fence and pipeline dQ/dV/dK WGMMAs via `product(..., pending=2)` with zero register spills, while
+    synchronous issuers (`MmaIssuer`) refuse nonzero `pending`."""
+    from kernel_compile import KernelCase, compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import bundles
+
+    mma = bundles.named("mma.sync", jnp.bfloat16)
+    with pytest.raises(ValueError):
+        mma.product(jnp.zeros((16, 16), jnp.bfloat16), jnp.zeros((16, 16), jnp.bfloat16), (16, 16), pending=1)
+
+    spans = template.spans(512, 512, 1, causal=True)
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        cases = []
+        for label, width in (("sm90-fused-d64", 64), ("sm90-fused-d128", 128), ("sm90-coop-d256", 256)):
+            q = jnp.zeros((1, 512, 8, width), jnp.bfloat16)
+            k = jnp.zeros((1, 512, 2, width), jnp.bfloat16)
+            dout = jnp.zeros_like(q)
+            residuals = (jnp.zeros((1, 8, 512), jnp.float32), jnp.ones((1, 8, 512), jnp.float32),
+                         jnp.zeros((1, 8, 512), jnp.int32),
+                         attention_mosaic.Split(jnp.zeros((1, 8, 512, width), jnp.float32),
+                                                jnp.ones((1, 8, 512), jnp.float32),
+                                                jnp.zeros((1, 8, 512), jnp.float32),
+                                                jnp.zeros((1, 8, 512), jnp.float32)))
+            op, args = attention_mosaic._backward_call(q, k, k, spans, None, dout, residuals, scale=None,
+                                                       natural=attention_mosaic.NATURAL, accurate=False)
+            ba = op.bind(*args, interpret=False)
+            cfg = op.derived(ba, target)
+            assert cfg is not None and cfg.fused, (label, cfg)
+            cases.append(KernelCase(label, lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)))
+        found = compile_mosaic_kernels(cases, "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
