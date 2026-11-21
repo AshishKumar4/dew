@@ -20,6 +20,31 @@ SIZES = (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)
 """Documents of these many characters, three longer than a 9-token window."""
 
 
+@pytest.mark.parametrize("bins, segments", [(3, None), (2, 2), (4, 3)])
+def test_a_published_best_fit_pack_reads_the_windows_its_streamed_pack_packs(tmp_path, bins, segments):
+    """A best-fit pack of whole documents is published (row 9053: refused before) with the plan grain's
+    best-fit packer places them by (`tokens.BestFit`): read back by index, it is window for window, in order,
+    what the same pack packs as it streams the documents (grain's `BestFitPackIterDataset`), and what a memory
+    read packs."""
+    sizes = (3, 7, 6, 2, 4, 5, 7, 1, 5, 6, 7, 2, 3)
+    source = Memory(tuple({"text": "x" * size} for size in sizes))
+    prefix = Pipeline(source).map(Tokenize())
+    packed = prefix.pack(9, bins=bins, segments=segments, policy="best-fit")
+    generation = publish(packed, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
+                                       shard_bytes=256 * 1024), read="indexed", loading=READ)
+
+    def windows(chain, read):
+        reader = compile(chain.batch(1), read=read, loading=READ, epochs=1).train(DataPartition())
+        try:
+            return [[np.asarray(leaf).tolist() for leaf in jax.tree.leaves(batch)] for batch in reader]
+        finally:
+            reader.close()
+
+    published = windows(prefix.cache(generation).pack(9, bins=bins, segments=segments, policy="best-fit"),
+                        "indexed")
+    assert published == windows(packed, "streamed") == windows(packed, "memory")
+
+
 def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tmp_path):
     source = Memory(tuple({"text": "x" * size} for size in SIZES))
     prefix = Pipeline(source).map(Tokenize())

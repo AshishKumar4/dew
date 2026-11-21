@@ -187,9 +187,42 @@ class FirstFit:
         return sum(held > 0 for held in self.held)
 
 
+class BestFit(FirstFit):
+    """Grain's best-fit placement (`BestFitPackedBatch.try_add_to_batch`, grain 0.2.18): a document goes to
+    the open window with room for it (and fewer than `segments` documents) that its fields fill most, the
+    first such where they tie; where none has room, the packer emits every window that holds a document and
+    starts afresh, as first-fit's does. A window takes a document only once every window before it has, so
+    the windows holding one are the first ones (`holding`)."""
+
+    def place(self, sizes: Sequence[int]) -> int | None:
+        size, rest, cap, held = sizes[0], sizes[1:], self.segments, self.held
+        if size > self.rooms[0] or (rest and any(
+                other > room for other, room in zip(rest, self.rooms[1:], strict=True))):
+            raise ValueError(f"a document of {list(sizes)} entries is longer than the windows of "
+                             f"{list(self.rooms)} it packs into; cut it first")
+        chosen, fullest = None, -1
+        for window, free in enumerate(self.free):
+            if free >= size and (cap is None or held[window] < cap) and (not rest or all(
+                    other <= room for other, room in zip(rest, self.others[window], strict=True))):
+                # What its fields already hold, summed: grain's score, its first maximum chosen.
+                used = self.rooms[0] - free + sum(room - left for room, left in zip(
+                    self.rooms[1:], self.others[window], strict=True))
+                if used > fullest:
+                    chosen, fullest = window, used
+        if chosen is None:
+            return None
+        self.free[chosen] -= size
+        if rest:
+            self.others[chosen] = [room - other for other, room in zip(rest, self.others[chosen],
+                                                                       strict=True)]
+        held[chosen] += 1
+        return chosen
+
+
 def first_fit(sizes: np.ndarray, window: int, bins: int,
-              segments: int | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """The plan grain's first-fit packer would follow over chunks of `sizes` (`FirstFit`).
+              segments: int | None = None, *, policy: str = "first-fit") -> tuple[np.ndarray, np.ndarray]:
+    """The plan grain's first-fit packer would follow over chunks of `sizes` (`FirstFit`), or its best-fit
+    packer's where `policy` is "best-fit" (`BestFit`, a published best-fit pack's plan: row 9053).
 
     Run over the lengths alone it is a plan rather than a pass: which window
     every chunk belongs to, without reading a token. That plan is what lets
@@ -208,7 +241,7 @@ def first_fit(sizes: np.ndarray, window: int, bins: int,
     goes to the first window with room and an empty window has room for
     anything.
     """
-    placement = FirstFit((window,), bins, segments)
+    placement = (BestFit if policy == "best-fit" else FirstFit)((window,), bins, segments)
     plan = np.empty(len(sizes), np.int64)
     closed = 0
     for index, size in enumerate(sizes.tolist()):
