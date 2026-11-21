@@ -251,7 +251,8 @@ cotangents `dPᵀ = V dOᵀ`, a step ahead, and dV's and dK's onto their sums, t
 cotangents the step's compute warpgroup writes over the scores' and cotangents' turns (`_placed_step`)."""
 
 
-def _placed_step(walk: _Backward, rows_of, coords_of, dq_added, index, slots, carry, accumulators):
+def _placed_step(walk: _Backward, rows_of, coords_of, dq_added, index, slots, carry, accumulators, *,
+                 masked: bool = True):
     """A compute warpgroup's query tile `index` of a walk whose family places its products on a role keys
     first (`placed.KEYS`, `KEYS_FIRST`): the tile's scores and their cotangents its issuer's (`awaited`, a key
     a thread's row in tensor memory's own layout), `PART` queries at a time under their statistics
@@ -266,13 +267,13 @@ def _placed_step(walk: _Backward, rows_of, coords_of, dq_added, index, slots, ca
     scores, cotangents = family.awaited(slots)
     weights = family.turn_of(placed.SCORES, slots.turn, narrowed=True)
     pulled = family.turn_of(placed.COTANGENTS, slots.turn, narrowed=True)
-    read = walk.places_read(masked=True)
+    read = walk.places_read(masked=masked)
     for first in range(0, tiles.block_q, PART):
         s = family.read(scores, first=first, columns=PART, layout=mosaic_sm100.TMEM)
         dp = family.read(cotangents, first=first, columns=PART, layout=mosaic_sm100.TMEM)
         coords = coords_of(q_first + first, shape=(tiles.block_k, PART), read=read)
         (narrowed,), logits, _ = _weighed(walk, coords, (), s, dp, rows_of(q_first + first, PART),
-                                          (weights.dtype, pulled.dtype), one_part=False)
+                                          (weights.dtype, pulled.dtype), one_part=False, masked=masked)
         family.write(weights, mosaic.unscaled_part(narrowed), first=first)
         (cotangent,) = algebra.formed_parts(logits * walk.grad_scale, pulled.dtype, accurate=False, rows=True)
         family.write(pulled, mosaic.unscaled_part(cotangent), first=first)
@@ -400,7 +401,7 @@ class _PlacedDq:
 
 
 def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,
-             one_part: bool) -> tuple:
+             one_part: bool, masked: bool = True) -> tuple:
     """A keys-first tile's: its weights narrowed for dV in the output cotangents' dtype
     (`algebra.value_weights`, the dropped ones, `algebra.drawn`; the dQ program's sums take them
     undropped), its pulled score cotangents and its hook's pieces (`gradient.pulled`), from its products `s`
@@ -408,7 +409,7 @@ def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows
     the cotangents the fast form's one part in the queries' dtype where the launch takes it from the
     registers (`one_part`, the fused launch's), narrowed as they are formed."""
     values, queries = dtypes
-    exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows, masked=True)
+    exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows, masked=masked)
     logits, pieces = gradient.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
     if one_part:
         parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
@@ -749,10 +750,12 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                   statistics=rows_of)
             # The tiles its partner reads around its own, or its consumers' own loads of the query stream
             # where they feed it, the one key block's readers (`Family.walk_own`).
+            run = program.whole_run(k_first, q_steps, spans_of) if placing and consumers == placed.TURNS else None
+            segments = functools.partial(program.segmented, step, run)
             key_sums, (dk, dv) = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(
-                    streams, ((step, lo, hi),), tuple(family.zeros((block_k,)) for _ in key_refs),
+                    streams, segments(lo, hi), tuple(family.zeros((block_k,)) for _ in key_refs),
                     tuple((block_k, share) for _, share in shares), walk.interpret, first=counted))
             if ring is not None:
                 ring.drained(lo, hi, index)
