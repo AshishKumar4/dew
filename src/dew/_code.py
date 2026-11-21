@@ -174,7 +174,7 @@ def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str] |
     return digests if len(digests) == len(found) else None
 
 
-def _held(value: object) -> Sequence[object]:
+def _held(value) -> Sequence[object]:
     """`value` and every value it holds: a dataclass's fields', a sequence's or a set's members, a mapping's
     values."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -434,10 +434,10 @@ def _table(package: str) -> dict[str, str] | None:
         return None
     for name, read in (("_EXPORTS", lambda target: target), ("_NAMED", lambda target: f"{package}.{target}")):
         value = _assigned(package, name)
-        found = None if value is None else _literal(value)
-        if value is not None and not isinstance(found, dict):
+        found = {} if value is None else _literal(value)
+        if not isinstance(found, dict):
             return None
-        table.update({key: read(target) for key, target in (found or {}).items()})
+        table.update({key: read(target) for key, target in found.items()})
     value = _assigned(package, "_SUBMODULES")
     members = None if value is None else _literal(value)
     if value is not None and not isinstance(members, list):
