@@ -56,7 +56,7 @@ from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost, program as algebra_program
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import gemm, generation, launches, tuning
+from dew.nn.kernels import gemm, generation, grouped_matmul, launches, tuning
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
@@ -159,6 +159,9 @@ class Analysis:
     refused: str | None = None
     """Why a kernel the call names (`generation.chosen`) refuses the region, as `fused` would raise
     (`selection.KernelRefused`); None where nothing named refuses."""
+    resident: bool = True
+    """Whether the region's launch keeps, with its hooks, the residency the product's own launch takes
+    (`Region.resident`): a pass fuses a neighbour only where it does (KERNEL-TEMPLATES-13)."""
 
 
 def analysis(region, *inputs) -> Analysis:
@@ -180,7 +183,8 @@ def analysis(region, *inputs) -> Analysis:
     def last(choice):
         return next((route for route in reversed(found) if route.choice == choice), None)
     seconds = priced(priced_calls[-1], generation.gpu_target()) if priced_calls else (None, None)
-    return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'), *seconds)
+    return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'), *seconds,
+                    resident=priced_calls[-1].resident if priced_calls else True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,6 +210,9 @@ class Region:
     operand before the launch either way."""
     consumed: bool = True
     """Whether consumers follow the product (its epilogue's); without, its outputs are the product's."""
+    resident: bool = True
+    """Whether its launch with its hooks keeps the residency of the product's launch as its unfused path
+    makes it, no hook and its declared result (`grouped_matmul.resident`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -301,14 +308,39 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     operand_bytes = float(sum(operand.size * operand.dtype.itemsize for operand in (lhs, rhs)))
     collected = _PRICED.get()
 
+    def bare(**hooks):
+        # The product as its unfused path launches it, at its declared result, with `hooks`.
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+                         precision=precision, interpret_on_cpu=interpret_on_cpu, **hooks)
+
+    def weighed(call):
+        # `call()`'s value, and whether its launch keeps the residency of the same launch of the bare product
+        # (`grouped_matmul.resident`), where `analysis` collects the region.
+        with grouped_matmul.weighed() as hooked:
+            value = call()
+        return value, grouped_matmul.resident(hooked, unhooked)
+
+    def unhooked():
+        # The bare product's call as its unfused path makes it, weighed and its routes no program's; one the
+        # call's named kernel refuses unhooked has no launch to weigh (as `gemm._keeps_launch` reads a call a
+        # chosen kernel refuses).
+        try:
+            with generation.routes(alone=True), grouped_matmul.weighed() as found:
+                bare()
+        except KernelRefused:
+            return []
+        return found
+
     def plain():
         # The product with no consumer the launch takes: its prologue alone priced, where it takes one.
-        if collected is not None and formed is not None:
-            collected.append(Region(lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype),
-                                    jnp.dtype(out_dtype), precision, operand_bytes, cost.Work(), 0.0,
-                                    float(math.prod(acc.shape) * acc.dtype.itemsize), formed, consumed=False))
-        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
-                         precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
+        if collected is None or formed is None:
+            return bare(**prologue)
+        value, resident = weighed(functools.partial(bare, **prologue))
+        collected.append(Region(lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype),
+                                jnp.dtype(out_dtype), precision, operand_bytes, cost.Work(), 0.0,
+                                float(math.prod(acc.shape) * acc.dtype.itemsize), formed, consumed=False,
+                                resident=resident))
+        return value
 
     if out_fusion is None:
         return plain()
@@ -324,15 +356,6 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
         # A consumer the launch takes not runs after the plain product, XLA's, unpriced, the program's
         # names where it wrote them.
         return _rewritten_consumer(named_consumer, values, acc)[0](values, plain())
-    # A consumer the launch takes as its epilogue is priced (`priced`), its work counted as the launch's
-    # body counts it.
-    if collected is not None:
-        outs = jax.tree.leaves(jax.eval_shape(consumer, values, acc))
-        collected.append(Region(
-            lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
-            operand_bytes, _chain(consumer, values, acc),
-            float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
-            float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs)), formed))
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
     # Its stage and declared derivative, from the consumer's program the algebra pass rewrote
@@ -345,10 +368,25 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
     # derivative under that name (`gemm`'s `named`), the consumer's outputs then the named values (`_named`).
     outputs = len(out_leaves) - len(names)
-    consumed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
+
+    def hooked():
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
                          epilogue_operands=tuple(zip(leaves, axes, strict=True)),
                          out_dtype=dtypes[0], out_dtypes=dtypes if several else None, precision=precision,
                          interpret_on_cpu=interpret_on_cpu, named=(None,) * outputs + names, **prologue)
+
+    if collected is None:
+        consumed = hooked()
+    else:
+        # A consumer the launch takes as its epilogue is priced (`priced`), its work counted as the launch's
+        # body counts it, and its launch's residency weighed against the bare product's.
+        consumed, resident = weighed(hooked)
+        collected.append(Region(
+            lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
+            operand_bytes, _chain(consumer, values, acc),
+            float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
+            float(sum(math.prod(out.shape) * out.dtype.itemsize for out in out_leaves)), formed,
+            resident=resident))
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))[0]
 
 
