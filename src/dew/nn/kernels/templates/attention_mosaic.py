@@ -854,13 +854,9 @@ class MosaicForward(_Mainloop[Tiles]):
         launched = [self._launchable(ba, config, target) or config for config in candidates]
         key = _choice_key(self, ba, tuple(launched), target)
         stored = None if key is None else tuning.stored_choice(target.generation, key)
-        if isinstance(stored, (tuple, list)) and len(stored) == 2:
+        if isinstance(stored, (tuple, list)):
             pair = tuple(stored)
             matched = next((c for c in candidates if (c.consumers, c.block_k) == pair), None)
-            if matched is not None:
-                return matched
-        elif isinstance(stored, int):
-            matched = next((config for config in candidates if config.consumers == stored), None)
             if matched is not None:
                 return matched
         prices: dict[Tiles, float] = {}

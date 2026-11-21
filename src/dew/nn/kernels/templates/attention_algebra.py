@@ -493,8 +493,9 @@ maximum underflows to 0 as -inf's did, onto another such state's is 1 over zero 
 
 def no_keys(total: jax.Array) -> jax.Array:
     """Whether each row of a state's denominator `total` saw no key: none of its sums, as any key's weight
-    at the row's maximum is 1 (a scaled walk's at its row's scale, never to 0)."""
-    return total == 0
+    at the row's maximum is 1 (a scaled walk's at its row's scale, never to 0; `means.holding` preserves
+    subnormal totals on flushing lanes, row 10849)."""
+    return ~means.holding(total)
 
 
 def empty(rows: int, width: int, *, scaled: bool = False) -> Partial:
@@ -1977,8 +1978,10 @@ def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Ar
 
 
 def inverse(total: jax.Array) -> jax.Array:
-    """Each query's `1 / total`, zero where it saw nothing (total 0)."""
-    return jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
+    """Each query's `1 / total`, zero where it saw nothing (`means.holding`, preserving subnormal totals on
+    flushing lanes, row 10849)."""
+    held = means.holding(total)
+    return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), 0.0)
 
 
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
