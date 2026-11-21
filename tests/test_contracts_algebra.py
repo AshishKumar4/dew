@@ -15,6 +15,12 @@ def _plain(outputs, totals, anchors):
     return jnp.sum(masses[..., None] * outputs, axis=0) / jnp.sum(masses, axis=0)[..., None]
 
 
+def _merged(outputs, totals, anchors):
+    """The merge of finished states the contract holds, one function at every edge, so the cell's programs
+    compiled at one edge serve the others (`contract_support._mesh_program`)."""
+    return means.merged_output(outputs, totals, anchors, means.Units(), 0)
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_convex_mean_holds_every_order(edge):
     """The merge of finished states (`means.merged_output`, its derivative the law's own over scaled values,
@@ -28,7 +34,4 @@ def test_the_convex_mean_holds_every_order(edge):
     direction = (direction[0] * EDGES[edge], direction[1] * EDGES[edge], direction[2])
     (cotangent,) = normal_draw(6098, (4, 8))
 
-    def merged(outputs, totals, anchors):
-        return means.merged_output(outputs, totals, anchors, means.Units(), 0)
-
-    assert_contract(merged, primals, direction, cotangent, f"the convex mean {edge}", plain_fn=_plain)
+    assert_contract(_merged, primals, direction, cotangent, f"the convex mean {edge}", plain_fn=_plain)
