@@ -123,7 +123,8 @@ class Report:
     whatever assembler made it; None where it states none (a launch of no producer, or no disassembler)."""
     cap: int | None = None
     """The registers its launch runs a thread at, as its compile states them (`_compiled_here`'s), None where
-    unstated: a kernel whose registers are read and whose cap is not fails (`failure`, row 6670)."""
+    unstated: a Mosaic kernel whose registers are read and whose cap is not fails (`failure`, row 6670); a
+    Triton kernel's launch states none."""
     kind: str = "mosaic_gpu"
     """The compiler that produced the binary (`report.Binary.kind`: `mosaic_gpu` or `triton`)."""
     index: str | None = None
@@ -149,10 +150,11 @@ class Report:
                  else "serializes its warpgroup MMAs") + f" ({code})" for code in self.losses)
         if self.sass:
             return "its machine code holds " + "; ".join(self.sass)
-        if self.registers is not None and self.cap is None:
-            # No thread count and no raise: its allocation judged against nothing (row 6670).
+        if self.registers is not None and self.cap is None and self.kind != "triton":
+            # A Mosaic kernel's with no thread count and no raise: its allocation judged against nothing (row
+            # 6670). A Triton kernel's launch states no register bound to judge it by: its compile picks them.
             return f"its reports state no register cap its launch runs at for its {self.registers} registers"
-        if self.registers is not None and self.registers > self.cap:
+        if self.registers is not None and self.cap is not None and self.registers > self.cap:
             return f"{self.registers} registers a thread, above its launch's {self.cap}"
         if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
                 and self.tmem <= tmem_limit and self.spilled == 0):
