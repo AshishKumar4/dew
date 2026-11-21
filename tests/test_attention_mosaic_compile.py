@@ -251,7 +251,6 @@ def test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for(dtype, k
         shared = op.staged_bytes(ba, config, target)
         (found,) = compile_mosaic_kernels([KernelCase("forward", lambda: op.lowering(ba, config))], "sm80")
         assert found["shared"] == shared
-        assert shared > target.shared_limit
 
 
 @COMPILES_ON_CPU
@@ -1562,3 +1561,42 @@ def test_fused_keys_first_register_model_counts_dq_product():
         reg_unfused = attention_mosaic_program.backward_registers(
             dkv_family, unfused.dkv, 128, 128, jnp.bfloat16, accurate=False, dq=False, split=True)
         assert reg_fused > reg_unfused, (reg_fused, reg_unfused)
+
+
+@COMPILES_ON_CPU
+def test_an_a100_d128_and_d256_forward_use_whole_row_warps_and_high_residency():
+    """An A100's 64x64 forward at width 128 keeps four warps along rows (no relay or cross-warp softmax)
+    and omits unused vector staging (`CpAsync.stages_vectors`), fitting two resident programs per SM
+    spill-free; width 256 at columns=128 caps its natural rewalk at columns=128 and compiles spill-free
+    (rows 5272, 5273)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        spans = template.spans(512, 512, 1, causal=True)
+        q128 = jnp.zeros((1, 512, 4, 128), jnp.bfloat16)
+        k128 = jnp.zeros((1, 512, 2, 128), jnp.bfloat16)
+        op128, args128 = attention_mosaic._forward_call(q128, k128, k128, spans, None, scale=None,
+                                                        natural=attention_mosaic.NATURAL)
+        ba128 = op128.bind(*args128, residuals=template.Kept.NONE, interpret=False)
+        cfg128 = op128._launchable(ba128, attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync"), target)
+        assert cfg128 is not None
+        assert attention_mosaic_program.bundle_of(cfg128, jnp.bfloat16).rows_whole
+        assert op128.resident(ba128, cfg128, target) >= 2
+
+        q256 = jnp.zeros((1, 512, 4, 256), jnp.bfloat16)
+        k256 = jnp.zeros((1, 512, 2, 256), jnp.bfloat16)
+        op256, args256 = attention_mosaic._forward_call(q256, k256, k256, spans, None, scale=None,
+                                                        natural=attention_mosaic.NATURAL)
+        ba256 = op256.bind(*args256, residuals=template.Kept.NONE, interpret=False)
+        cfg256 = op256._launchable(
+            ba256, attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync", columns=128), target)
+        assert cfg256 is not None
+        assert cfg256.relaunch_columns == 128
+
+        found = compile_mosaic_kernels([
+            KernelCase("sm80-d128-64x64", lambda: op128.lowering(ba128, cfg128)),
+            KernelCase("sm80-d256-64x64-c128", lambda: op256.lowering(ba256, cfg256)),
+        ], "sm80")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

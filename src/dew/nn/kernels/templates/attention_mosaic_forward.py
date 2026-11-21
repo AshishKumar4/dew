@@ -244,7 +244,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     them)."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
     scoped = [family.staged_memory((consumers, parts * block_q, width), dtype, query_swizzle(family)),
-              family.staged_memory((consumers, block_q), jnp.float32)]
+              *([family.staged_memory((consumers, block_q), jnp.float32)] if family.stages_vectors else [])]
     # The output's stage (a training walk's split sums', fp32), which no walk reads: after the walks on a
     # family that scopes them apart, in their slots (`stages_after_walks`).
     stage = None
@@ -872,7 +872,7 @@ class _Refs(NamedTuple):
     read: _Read
     written: tuple
     q_smem: Ref
-    row_smem: Ref
+    row_smem: Ref | None
     out_smem: Ref | None
     stages: tuple
     q_loaded: Ref
@@ -898,6 +898,7 @@ class _Layout(NamedTuple):
     """Whether the output's stage is scoped after the walks (`stages_after_walks`), none of the program's."""
     decides: bool = False
     """Whether its consumers decide a second walk (`after_walk.Decided`), its verdicts' scratch last."""
+    stages_vectors: bool = True
 
     def unpacked(self, family: mosaic.Family, q_ref, k_ref, v_ref, *refs) -> _Refs:
         """A program's refs, its kernel's then its scoped allocations': the weights' relay tile last where
@@ -905,7 +906,12 @@ class _Layout(NamedTuple):
         where it `converts` them (`_forward_allocations`' `codes`)."""
         read, refs = refs[:self.reads], refs[self.reads:]
         written, refs = refs[:self.outputs], refs[self.outputs:]
-        (q_smem, row_smem, *stages), (q_loaded, schedule, *verdicts) = refs[:self.arrays], refs[self.arrays:]
+        head_refs, (q_loaded, schedule, *verdicts) = refs[:self.arrays], refs[self.arrays:]
+        if self.stages_vectors:
+            q_smem, row_smem, *stages = head_refs
+        else:
+            q_smem, *stages = head_refs
+            row_smem = None
         words, barrier = verdicts if verdicts else (None, None)
         consumers = 1 if words is None else words.shape[0]
         decided = after_walk.Decided(words, barrier, consumers, family.uniform) if self.decides else None
@@ -2083,7 +2089,8 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
             if peaks:
                 _peak_consumer(program, spec, index, q_view,
                                lambda: tuple(ref.at[afresh().state] for ref in refs.written), *stages,
-                               refs.row_smem.at[index], refs.stages[0].at[index], streams, views, turn,
+                               None if refs.row_smem is None else refs.row_smem.at[index],
+                               refs.stages[0].at[index], streams, views, turn,
                                streamed, block.first, read.spans, read.hooked,
                                (row, head, lax.div(head, group)), hooks=hooks, interpret=interpret)
                 return
@@ -2100,7 +2107,8 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
             certificate = viewed(block).certify if certified else None
             out_stage = functools.partial(staged_after, after, None if after else refs.out_smem, index)
             _consumer(program, spec, index, q_view,
-                      lambda: viewed(afresh()), *stages, out_stage, refs.row_smem.at[index], streams, views,
+                      lambda: viewed(afresh()), *stages, out_stage,
+                      None if refs.row_smem is None else refs.row_smem.at[index], streams, views,
                       turn, streamed, block.first, read.spans, read.hooked,
                       (row, head, lax.div(head, group)), hooks=hooks, training=training,
                       anchors=read.anchors, interpret=interpret, certified=certificate,
@@ -2182,7 +2190,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     layout = _Layout(treedef.num_leaves, treedef.unflatten, len(out_type), len(scoped) - 2 - verdicts,
                      peaks or (reuse and not training),
                      relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
-                     bool(after), decides)
+                     bool(after), decides, family.stages_vectors)
 
     products = (products if products is not None else
                 forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,

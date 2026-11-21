@@ -1035,22 +1035,27 @@ class MosaicForward(_Mainloop[Tiles]):
         decides = self.deciding(ba, config)
         # Its value columns whole first, then in blocks (`_column_blocks_of`): a launch a block (row 2526: at
         # width 256 no tile held the anchored rewalk's whole sums).
+        col_blocks = _column_blocks_of(family, query.dtype, value.shape[-1])
+        if config.columns is not None:
+            col_blocks = [c for c in col_blocks if c is not None and c <= config.columns]
         relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True,
                                           columns=columns)
-                      for columns in _column_blocks_of(family, query.dtype, value.shape[-1])
+                      for columns in col_blocks
                       for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k, parts=self.parts)
                       if config.block_k % block == 0)
-        relaunch = next((tiles for tiles in relaunches
-                         if self._launch_legal(ba, tiles, target, decides=decides)
-                         and self.proposes(ba, tiles, target,
-                                           held=lambda tiles=tiles: self.within(
-                                               self.registers(ba, tiles, decides=decides), tiles))),
-                        None)
-        if relaunch is None:
-            return None
-        return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers,
-                                   relaunch_columns=relaunch.columns)
+        for tiles in relaunches:
+            if not (self._launch_legal(ba, tiles, target, decides=decides)
+                    and self.proposes(ba, tiles, target,
+                                      held=lambda tiles=tiles: self.within(
+                                          self.registers(ba, tiles, decides=decides), tiles))):
+                continue
+            launched = dataclasses.replace(config, relaunch_k=tiles.block_k,
+                                           relaunch_consumers=tiles.consumers,
+                                           relaunch_columns=tiles.columns)
+            if not any(NATURAL_NAME in kernel for kernel in report.refused_at(self, ba, launched)):
+                return launched
+        return None
 
     def _rewalked_apart(self, ba: tokamax.BoundArguments, config: Tiles, family: mosaic.Family,
                         target: generation.GpuTarget) -> Tiles | None:
