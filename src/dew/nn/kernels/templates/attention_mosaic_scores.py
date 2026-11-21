@@ -259,7 +259,8 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
     dQ reduce runs off the consumers' path."""
     row, head = place
     rows = dq.shape[0]
-    view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
+    view = dq_ref.at[index if walk.interpret else 0,
+                     *head_slice(walk.program.family, row, head, pl.ds(q_first, rows))]
     if out_smem is None:
         walk.program.family.added(dq, view, walk.interpret, smem=None)
         return
