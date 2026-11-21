@@ -43,6 +43,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
+from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew.nn.derivatives import (
     Protected,
@@ -1864,11 +1865,27 @@ def summed_pairs(pair: tuple[jax.Array, jax.Array], axes: Sequence[int]) -> tupl
     (`rounding_alone`), and the pairs combined by `compensated_add`'s arithmetic with no barrier of its own
     (`renormalized_add`: one in a reduction's computation splits the fusions around the program, row 7953).
     The one compensated pair reduction: a compensated sum's (`compensated_sum`), a kernel's programs' parts'
-    (`norm_swiglu`), a guidance projection's dot products' (row 8498)."""
+    (`norm_swiglu`), a guidance projection's dot products' (row 8498). An axis of one element is no sum and
+    is taken out before the reduction: XLA:GPU's simplifier (post117) rewrote a pair reduction over such an
+    axis into one bitcast of a single array's shape and refused its own program (a RET_CHECK of
+    `ShapeUtil::Compatible`, row 10674)."""
+    hi, lo = pair
+    if hi.shape != lo.shape or hi.dtype != lo.dtype:
+        raise ValueError(f"a pair's limbs share one shape and dtype, not {hi.dtype}{list(hi.shape)} and "
+                         f"{lo.dtype}{list(lo.shape)}")
+    # An axis out of range or named twice refused as numpy refuses it (an AxisError, a ValueError).
+    axes = normalize_axis_tuple(tuple(axes), hi.ndim)
+    ones = tuple(axis for axis in axes if hi.shape[axis] == 1)
+    if ones:
+        hi, lo = jnp.squeeze(hi, ones), jnp.squeeze(lo, ones)
+    kept = tuple(axis - sum(one < axis for one in ones) for axis in axes if axis not in ones)
     with rounding_alone():
-        (hi,) = uncontracted(pair[0])
+        (hi,) = uncontracted(hi)
         zero = jnp.zeros((), hi.dtype)
-        return jax.lax.reduce((hi, pair[1]), (zero, zero), renormalized_add, tuple(axes))
+        if not kept:
+            # Each pair combined once with the reduction's zero, as a reduction over its one element is.
+            return renormalized_add((jnp.zeros_like(hi), jnp.zeros_like(lo)), (hi, lo))
+        return jax.lax.reduce((hi, lo), (zero, zero), renormalized_add, kept)
 
 
 def compensates_loops() -> bool:

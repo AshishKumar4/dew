@@ -20,7 +20,6 @@ from jax.ad_checkpoint import checkpoint_name
 from .activations import GATE_ACTIVATIONS, logistic, silu
 from .dense import Dense
 from .derivatives import portable_formed
-from .kernels import norm_swiglu
 from .precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted, rounded_to
 from .sharding import LogicalAxes, declared
 
@@ -133,6 +132,8 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
     it is elementwise (`norm_swiglu.elementwise`), else on XLA's path.
     `weight_first` as `rms_normalized`'s.
     """
+    from .kernels import norm_swiglu
+
     if weight_first and scale_after_cast and scale is not None:
         raise ValueError("a weight folded into the inverse (weight_first) multiplies before any cast; "
                          "scale_after_cast multiplies after one")
@@ -162,6 +163,8 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     pass; XLA's arithmetic is the portable path and the oracle. `axes`, the
     inputs' logical axes, place the kernel's rows on a mesh.
     """
+    from .kernels import norm_swiglu
+
     def portable(x, gate, scale):
         wide = at_least_fp32(x.dtype)
         x = x.astype(wide)
@@ -224,6 +227,8 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
     takes it where the target's row names it, rounding the inverse as they do
     (`norm_swiglu.rms_norm`'s `inverse_rounded`).
     """
+    from .kernels import norm_swiglu
+
     if norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True) == 'pallas':
         def portable(x, scale):
             return unweighted_rmsnorm(x, eps, implementation='xla')
