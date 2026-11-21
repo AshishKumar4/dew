@@ -192,8 +192,9 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     that clock, the tensor cores at its datasheet's dense peak where it states no clock), where a tile walk's
     device bytes and XLA's fusion's staged bytes cost nothing (infinite). What XLA's fusion keeps on chip is a
     TPU's VMEM traffic, with `device` at its VMEM rate (`GpuTarget.vmem_rate`), and nothing a GPU's or a tile
-    walk's (infinite). None for a unit the target states no rate of (a TPU's vector and transcendental units,
-    an unmeasured TPU's VMEM, a datasheet's missing clock, an integer rate unread)."""
+    walk's (infinite); a TPU tile walk's staged bytes are its VMEM's too, at that rate (its shared memory's
+    slot). None for a unit the target states no rate of (a TPU's vector and transcendental units, an
+    unmeasured TPU's VMEM, a datasheet's missing clock, an integer rate unread)."""
     clock = target.loaded_clock_hz
     if not device:
         each = clock
@@ -203,17 +204,21 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     def rate(per_clock: float | None) -> float | None:
         return None if per_clock is None or each is None else per_clock * each
 
-    # A TPU has no CUDA multiprocessor, nor its shared memory's rate.
-    architecture, held = target.architecture, target.architecture.multiprocessor
+    # A TPU has no CUDA multiprocessor, nor its shared memory's rate: its one VMEM is the on-chip memory a
+    # Pallas template stages its tiles in (`Work.shared_bytes`), at the chip's VMEM rate (its one core a tile
+    # walk's multiprocessor, `multiprocessors=1`), where it was work no rate priced and a TPU template's
+    # forms were compared without it (row 8729); an unmeasured TPU's is none.
+    architecture, held, tpu = target.architecture, target.architecture.multiprocessor, generation.tpu(target)
     tensor = rate(target.tensor_rate("16bit"))
     if tensor is None and device:
         tensor = target.bf16_peak
     eight = rate(target.tensor_rate("8bit")) or tensor
-    kept = target.vmem_rate if device and generation.tpu(target) else math.inf
+    kept = target.vmem_rate if device and tpu else math.inf
+    staged = target.vmem_rate if tpu else rate(None if held is None else held.shared_bytes_per_clock)
     return Rates(tensor=tensor, tf32=rate(target.tensor_rate("tf32")), eight=eight,
                  cuda=rate(architecture.vector_per_clock), special=rate(architecture.exponentials_per_clock),
-                 shared=math.inf if device else rate(None if held is None else held.shared_bytes_per_clock),
-                 kept=kept, integer=rate(architecture.integer_per_clock),
+                 shared=math.inf if device else staged, kept=kept,
+                 integer=rate(architecture.integer_per_clock),
                  device=target.memory_rate if device else math.inf)
 
 
