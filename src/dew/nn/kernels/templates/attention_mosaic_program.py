@@ -527,18 +527,23 @@ def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
     return _multiples(family, math.lcm(family.role_rows, family.column_unit(dtype)), extent)
 
 
-def walked_extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
+def walked_extents(family: mosaic.Family, dtype, extent: int, *, parts: int = 1) -> tuple[int, ...]:
     """A walked tile's extents on `family`, largest first: whole multiples of its swizzled rows
     (`Family.column_unit`), a walked tile (a forward's or a dQ launch's keys, a dK/dV launch's queries) a
     product's depth and no consumer's rows, within `extents`' bounds: mma.sync's walks take 32-row tiles,
     where its 64-row unit held no guarded state at width 128 (FS-GUARD80-2) and no plain tile's stages at
-    width 256 (64 x 64 staged 199,696 bytes of an A100's 166,912, 64 x 32 134,160, et-d256e); a family
-    whose products a role issues, whole multiples of its walked rows (`Family.walked_rows`: the depth its
-    walk's right operands are staged for, `placed.walked_swizzles`; tcgen05's rows' a swizzle's 64 rows).
-    """
-    unit = family.walked_rows if family.places_on_role else family.column_unit(dtype)
+    width 256 (64 x 64 staged 199,696 bytes of an A100's 166,912, 64 x 32 134,160, et-d256e); an fp32
+    parted forward (`parts > 1`) on wgmma likewise steps by 64-byte swizzled rows (32 bf16 keys) so width
+    256's three parts fit Hopper's 232,448-byte block (row 6508); a family whose products a role issues,
+    whole multiples of its walked rows (`Family.walked_rows`: the depth its walk's right operands are
+    staged for, `placed.walked_swizzles`; tcgen05's rows' a swizzle's 64 rows)."""
+    if family.places_on_role:
+        unit = family.walked_rows
+    elif parts > 1:
+        unit = min(family.column_unit(dtype), swizzling.swizzle_columns(dtype, 64))
+    else:
+        unit = family.column_unit(dtype)
     return _multiples(family, unit, extent)
-
 
 def _multiples(family: mosaic.Family, unit: int, extent: int) -> tuple[int, ...]:
     """Whole multiples of `unit`, largest first, at most what one of `family`'s copies moves and the call's

@@ -750,7 +750,8 @@ class MosaicForward(_Mainloop[Tiles]):
                 return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
 
             config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits, overlapped=True,
-                              walks=walked_extents, least_walked=functools.partial(_least_keys, family))
+                              walks=functools.partial(walked_extents, parts=self.parts),
+                              least_walked=functools.partial(_least_keys, family))
             if config is not None:
                 return config
         return None
@@ -862,7 +863,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                           columns=columns)
                       for columns in _column_blocks_of(family, query.dtype, value.shape[-1])
                       for consumers in range(config.consumers, 0, -1)
-                      for block in walked_extents(family, query.dtype, config.block_k)
+                      for block in walked_extents(family, query.dtype, config.block_k, parts=self.parts)
                       if config.block_k % block == 0)
         relaunch = next((tiles for tiles in relaunches
                          if self._launch_legal(ba, tiles, target, decides=decides)

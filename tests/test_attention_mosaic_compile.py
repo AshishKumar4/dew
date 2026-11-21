@@ -543,6 +543,33 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
     assert not failed, "\n".join(failed)
 
 
+@COMPILES_ON_CPU
+def test_an_fp32_forward_at_width_256_compiles_spill_free_on_hopper():
+    """An fp32 call's inference forward (`MosaicForward.parts = 3`) at width 256 derives a 32-key tile on
+    Hopper (`sm90`) within its 232,448-byte shared memory and compiles spill-free (row 6508)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, queries, 4, 256), jnp.float32)
+    key = jax.ShapeDtypeStruct((1, queries, 2, 256), jnp.float32)
+    with generation.assumed("sm90"):
+        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
+        op, args = attention_mosaic._forward_call(*zeros, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        config = op.derived(ba, generation.gpu_target())
+        assert config is not None, "the Mosaic forward derives no fp32 config 256 wide on sm90"
+
+        def forward(query, key, value):
+            return attention_mosaic.forward(query, key, value, spans, None)
+
+        found = compile_mosaic_kernels(
+            [KernelCase("fp32-forward-256", lambda: (forward, (query, key, key)))], "sm90")
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
 @INTERPRETS
 @pytest.mark.parametrize("call", ["full", "causal"])
 def test_a_deterministic_backward_holds_check_1_interpreted(call, with_deterministic_ops):
