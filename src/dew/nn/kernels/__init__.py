@@ -54,9 +54,9 @@ _EXPORTS = {
 __getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 __all__ = [
-    "GpuTarget",
     "PALLAS_CHOICES",
     "TARGETS",
+    "GpuTarget",
     "assumed",
     "backend",
     "bf16_dot_runs",
