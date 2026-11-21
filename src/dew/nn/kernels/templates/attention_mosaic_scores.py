@@ -157,11 +157,12 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
     cotangents."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
-    held = keys.transpose((1, 0))
-    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
-         if walk.scaled else family.product(q_slot, held, shape))
-    dp = family.product(do_slot, values.transpose((1, 0)), shape)
-
+    held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
+    if walk.scaled:
+        s = family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
+        dp = family.product(do_slot, values_t, shape)
+    else:
+        s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
         exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, (), s, dp, *rows,
