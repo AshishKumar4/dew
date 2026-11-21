@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Literal
 
 DURATIONS = Path("tests/test_durations.json")
-"""Each test's least seconds, by its node id: a number, its least warm time, where only runs whose programs
-the shared compilation cache held have timed it; [warm, cold] once a run that compiled its programs has,
-its least time so beside the least warm one; and [warm, cold or null, peak] once a task that ran it has
+"""Each test's seconds, by its node id, as main's CI fold estimates them (fold.py's `entries`): a number, its
+warm time, where only runs whose programs the shared compilation cache held have timed it; [warm, cold] once
+a run that compiled its programs has, its newest green cold time beside the warm one; and [warm, cold or
+null, peak] once a task that ran it has
 measured its memory, the resident peak in bytes of the newest task that ran it (`entry`), a bound of its
 own above (row 6003). Every cut and weight reads an entry's cost (`cost`), every size its peak (`peak`)."""
 
@@ -31,15 +32,15 @@ type Entry = float | list[float | None]
 
 
 def entry(warm: float, cold: float | None, peak: int | None = None) -> Entry:
-    """A durations record's entry of a test timed `warm` at least warm and `cold` at least cold (None:
-    never timed cold), its newest task's resident peak `peak` bytes (None: none measured)."""
+    """A durations record's entry of a test timed `warm` warm and `cold` cold (None: never timed cold), its
+    newest task's resident peak `peak` bytes (None: none measured)."""
     if peak is not None:
         return [round(warm, 3), None if cold is None else round(cold, 3), int(peak)]
     return round(warm, 3) if cold is None else [round(warm, 3), round(cold, 3)]
 
 
 def warm_cold(held: Entry) -> tuple[float, float | None]:
-    """An entry's least warm seconds and least cold ones, None where no cold run has timed it."""
+    """An entry's warm seconds and cold ones, None where no cold run has timed it."""
     if not isinstance(held, list):
         return float(held), None
     warm, cold = held[0], held[1]
@@ -55,11 +56,11 @@ def peak(held: Entry) -> int | None:
 
 
 def cost(held: Entry) -> float:
-    """What a test costs a task that runs it, by its entry: its cold time where one is recorded, else its
-    warm one. Cuts and weights read this whatever the cache holds, so a cut is one function of the
-    record, the same in the plan and in the task that recomputes its group (split.py), and a group runs
-    within its share cold as warm (Main, 2026-11-18, row 7939: 14 cells recorded at 0.2-18.8 s warm,
-    packed in one group, took 25-100 s each cold and set a run's 1,107 s wall; a cut by the cache's
+    """What a test costs a task that runs it, by its entry: the greater of its warm and cold times where a
+    cold one is recorded, else its warm one. Cuts and weights read this whatever the cache holds, so a cut is
+    one function of the record, the same in the plan and in the task that recomputes its group (split.py), and
+    a group runs within its share cold as warm (Main, 2026-11-18, row 7939: 14 cells recorded at 0.2-18.8 s
+    warm, packed in one group, took 25-100 s each cold and set a run's 1,107 s wall; a cut by the cache's
     state would change its groups' bundles each run)."""
     warm, cold = warm_cold(held)
     return warm if cold is None else max(warm, cold)
@@ -647,8 +648,7 @@ GROUP_AT = "#"
 
 
 def entries(path: Path = DURATIONS) -> dict[str, Entry]:
-    """The durations record's entries as kept, each test's least warm and least cold seconds and its peak
-    (`entry`)."""
+    """The durations record's entries as kept, each test's warm and cold seconds and its peak (`entry`)."""
     return json.loads(path.read_text()) if path.is_file() else {}
 
 
