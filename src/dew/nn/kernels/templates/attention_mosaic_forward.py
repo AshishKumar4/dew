@@ -1602,11 +1602,10 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
         elif (hooks.output_mod is None and keep is None and family.budgets_registers
-              and not family.operands_in_registers and state.acc.shape[-1] > 128
-              and state.acc.shape[-1] % 64 == 0):
-            # Chunk wide (>128) TMA register epilogues into 64-column slices (32 regs/slice) so `state.acc`
-            # and `output` (`quotient` + `midpoint_settled`) fit without spilling 96-112 B on sm90 d256
-            # forward (which forced 2-launch `columns=128`, row 5272).
+              and state.acc.shape[-1] > 128 and state.acc.shape[-1] % 64 == 0):
+            # Chunk wide (>128) register epilogues into 64-column slices (32 regs/slice) into SMEM, then
+            # flush once (`store_staged`) so `state.acc` and `output` fit without spilling on sm90/sm80
+            # d256 forward (which forced 2-launch `columns=128`, row 5272).
             maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
 
             def store_chunks(stage):
@@ -1616,10 +1615,12 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                     chunk = state._replace(acc=state.acc[:, col:col + 64])
                     out_chunk = algebra.finish(spec, chunk, initial=hooked.initial is not None,
                                                held=program.parts > 1)[0]
-                    stage[:, pl.ds(col, 64)] = out_chunk.astype(stage.dtype)
-                plgpu.commit_smem()
-                plgpu.copy_smem_to_gmem(stage, out_view)
-                plgpu.wait_smem_to_gmem(0)
+                    sl = pl.ds(col, 64)
+                    if family.operands_in_registers and not interpret:
+                        plgpu.store(stage.at[:, sl], out_chunk.astype(stage.dtype), optimized=False)
+                    else:
+                        stage[:, sl] = out_chunk.astype(stage.dtype)
+                family.store_staged(stage, out_view)
 
             out_stage(store_chunks)
         else:

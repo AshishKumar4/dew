@@ -1722,7 +1722,7 @@ def test_sm90_d256_forward_fits_single_launch_without_spills():
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     spans = template.spans(4096, 4096, 1, causal=True)
-    for gen in ("sm90",):
+    for gen in ("sm90", "sm80"):
         with generation.assumed(gen):
             target = generation.gpu_target()
             q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)

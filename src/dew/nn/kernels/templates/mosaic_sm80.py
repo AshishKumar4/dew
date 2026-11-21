@@ -781,9 +781,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                     view[...] = part.astype(view.dtype)
                 continue
             plgpu.store(smem, part.astype(smem.dtype), optimized=False)
-            rows = smem.shape[0]
-            stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
-                              widest=resources.copied_rows(smem.shape[1], smem.dtype))
+            self.store_staged(smem, view)
+
+    def store_staged(self, smem, view, *, wait: bool = True) -> None:
+        del wait
+        rows = smem.shape[0]
+        stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
+                          widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so
