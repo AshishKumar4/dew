@@ -425,14 +425,19 @@ class Merging(ByteTokenizer):
     can merge a state's last bytes with the text after it."""
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
-        ids, merged, at = super().encode(text, add_special_tokens=add_special_tokens), [], 0
+        return self.offsets(text)[0]
+
+    def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
+        """Its ids, each covering its characters, "xyz" one id covering three."""
+        ids, starts, ends = super().offsets(text)
+        merged: tuple[list[int], list[int], list[int]] = ([], [], [])
+        at = 0
         while at < len(ids):
-            if ids[at:at + 3] == list(b"xyz"):
-                merged.append(2)
-                at += 3
-            else:
-                merged.append(ids[at])
-                at += 1
+            width = 3 if ids[at:at + 3] == list(b"xyz") else 1
+            merged[0].append(2 if width == 3 else ids[at])
+            merged[1].append(starts[at])
+            merged[2].append(ends[at + width - 1])
+            at += width
         return merged
 
 
