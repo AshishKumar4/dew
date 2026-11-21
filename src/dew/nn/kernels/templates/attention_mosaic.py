@@ -1929,7 +1929,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         (row 5272)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if not family.budgets_registers or family.operands_in_registers:
+        if not family.budgets_registers:
             return config
         q_steps = -(-query.shape[1] // config.block_q)
         steps = q_steps if config.fused else min(q_steps, -(-ba.arguments["key"].shape[1] // config.block_k))
