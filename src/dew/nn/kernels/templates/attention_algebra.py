@@ -494,8 +494,9 @@ maximum underflows to 0 as -inf's did, onto another such state's is 1 over zero 
 def no_keys(total: jax.Array) -> jax.Array:
     """Whether each row of a state's denominator `total` saw no key: none of its sums, as any key's weight
     at the row's maximum is 1 (a scaled walk's at its row's scale, never to 0; `means.holding` preserves
-    subnormal totals on flushing lanes, row 10849)."""
-    return ~means.holding(total)
+    subnormal totals on flushing lanes while non-flushing GPU kernels avoid `stop_gradient`, row 10849)."""
+    return bodies.subnormals(lambda *, flushing: ~means.holding(total) if flushing else total == 0,
+                             total.dtype)
 
 
 def empty(rows: int, width: int, *, scaled: bool = False) -> Partial:
@@ -1978,9 +1979,10 @@ def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Ar
 
 
 def inverse(total: jax.Array) -> jax.Array:
-    """Each query's `1 / total`, zero where it saw nothing (`means.holding`, preserving subnormal totals on
-    flushing lanes, row 10849)."""
-    held = means.holding(total)
+    """Each query's `1 / total`, zero where it saw nothing (`means.holding` on flushing lanes, `total > 0`
+    in non-flushing GPU kernels where `stop_gradient` does not lower, row 10849)."""
+    held = bodies.subnormals(lambda *, flushing: means.holding(total) if flushing else total > 0,
+                             total.dtype)
     return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), 0.0)
 
 
