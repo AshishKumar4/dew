@@ -395,9 +395,10 @@ def test_a_cut_state_takes_a_longer_cut_whose_row_encodes_shorter_past_one_that_
     the growth stopped at the first longer cut that overflowed)."""
     tokenizer, state = Merging(), "aaxy"
     segments = (Text("S:"), State(), Text("z"), Schema())
-    [whole] = SegmentLayout.joint_row(max_len=1 << 20, segments=segments).rows(tokenizer, SPECIALS, state,
-                                                                                QUESTIONS)
-    [row] = SegmentLayout.joint_row(max_len=len(whole.tokens), segments=segments).rows(
+    # Encoded whole, as a row merges across its segments (`unit='whole'`).
+    [whole] = SegmentLayout.joint_row(max_len=1 << 20, segments=segments, unit="whole").rows(
+        tokenizer, SPECIALS, state, QUESTIONS)
+    [row] = SegmentLayout.joint_row(max_len=len(whole.tokens), segments=segments, unit="whole").rows(
         tokenizer, SPECIALS, state, QUESTIONS)
     # The whole state, its "xy" merged with the "z" after it: the row the room past all lays out.
     assert list(row.tokens) == list(whole.tokens) and 1 in list(row.tokens)
