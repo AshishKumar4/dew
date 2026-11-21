@@ -934,7 +934,13 @@ def _forms(kernel) -> Mapping | None:
         held = held.get("mosaic_gpu")
     if not isinstance(held, gpu_core.CompilerParams):
         return None
-    return APPROXIMATE_FORMS if held.approx_math else ACCURATE_FORMS
+    return special_forms(held.approx_math)
+
+
+def special_forms(approx_math: bool) -> Mapping:
+    """The special functions' forms a Mosaic GPU kernel compiled with or without `approx_math` lowers them
+    to: `APPROXIMATE_FORMS` or `ACCURATE_FORMS`."""
+    return APPROXIMATE_FORMS if approx_math else ACCURATE_FORMS
 
 
 def _body(kernel) -> jax_core.Jaxpr:
