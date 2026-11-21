@@ -1978,28 +1978,31 @@ def test_a_launch_runs_a_flags_branch_and_its_negations_branch_each_alone(semant
     np.testing.assert_array_equal(np.asarray(out), np.repeat(np.asarray([2, 1], np.int32), 128))
 
 
-def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_the_planned_gpu():
-    """mma.sync's walk sizes its shared memory as `emit_pipeline` scopes it for the GPU a derivation plans
-    (`CpAsync.lifetimes`, read from JAX's own builder, row 6135): an A100's cp.async walk a slot of each block
-    a stage and no barrier; an RTX PRO 6000's (sm120, whose copies `emit_pipeline` makes TMA's) a barrier a
-    stage beside them, which a copy of the cp.async rule left out of its plan; a walk of fewer steps than
-    stages as many slots as steps, also planned inside a jit's trace over a mesh of its own."""
+def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_copies():
+    """mma.sync's walk sizes its shared memory as `emit_pipeline` scopes it for the cp.async copies every
+    device the family runs on makes (`CpAsync.lifetimes`, read from JAX's own builder, row 6135): a slot of
+    each block a stage and no barrier, whatever GPU is assumed (an sm120, whose copies would be TMA's and
+    take a barrier a stage, runs no mma.sync on cp.async: `bundles.legal`); a walk of fewer steps than stages
+    as many slots as steps, also planned inside a jit's trace over a mesh of its own. That the plan is the
+    kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`: its
+    planned shared bytes against those the compiled kernel asks for)."""
     family = bundles.named("mma.sync", jnp.bfloat16)
     streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 1)
 
-    def walked(target: str, steps: int | None = None) -> tuple[list, list]:
-        with generation.assumed(target):
-            (), (walk,) = family.lifetimes(streams, steps)
+    def walked(steps: int | None = None) -> tuple[list, list]:
+        (), (walk,) = family.lifetimes(streams, steps)
         barriers = [int(np.prod(leaf.num_barriers)) for leaf in walk if isinstance(leaf, plgpu.Barrier)]
         return [leaf.shape for leaf in walk if not isinstance(leaf, plgpu.Barrier)], barriers
 
-    assert walked("sm80") == ([(3, 64, 32), (3, 32, 64)], [])
-    assert walked("sm120") == ([(3, 64, 32), (3, 32, 64)], [3])
+    for target in ("sm80", "sm120"):
+        with generation.assumed(target):
+            assert walked() == ([(3, 64, 32), (3, 32, 64)], []), target
     planned = []
     mesh = Mesh(np.array(jax.devices("cpu")[:1]), ("data",))
     with jax.set_mesh(mesh):
-        jax.make_jaxpr(lambda: planned.append(walked("sm120", 2)))()
-    assert planned == [([(2, 64, 32), (2, 32, 64)], [2])]
+        jax.make_jaxpr(lambda: planned.append(walked(2)))()
+    assert planned == [([(2, 64, 32), (2, 32, 64)], [])]
+
 
 @pytest.mark.gpu(reason="a warp's lanes hold values of their own only on the device")
 @pytest.mark.parametrize("read", ["uniform", "own"])

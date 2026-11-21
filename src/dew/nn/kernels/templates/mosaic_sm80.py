@@ -67,7 +67,6 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
 
     blocks = streams.pipeline.blocks
     names = tuple(blocks)
-    swizzles = {name: gathered_rows.swizzled(shape, dtype) for name, (shape, dtype) in blocks.items()}
     for step, lo, hi in segments:
         if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
             continue
@@ -88,7 +87,8 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
                         source = ref.at[:, pl.ds(depth * width, width)]
                         table = rows.table.at[pl.ds(rows.start, height)]
                         slot = ring.at[lax.rem(index - lo, stages)]
-                        _row_copied(source, table, slot, swizzles[name], interpret)
+                        # At the swizzle its ring is staged at (`_gathered_slots`), the one decision.
+                        _row_copied(source, table, slot, swizzling.swizzle_of(ring), interpret)
 
                 if not interpret:
                     plgpu.inline_mgpu()(gathered_rows.commit_group)()
@@ -140,15 +140,20 @@ def _specs(pipeline: "Pipeline", index_maps: dict | None = None) -> list:
             for name, (shape, dtype) in pipeline.blocks.items()]
 
 
+CP_ASYNC_GENERATION = "sm80"
+"""The generation an mma.sync walk's shared memory is planned for (`_pipelined`): its copies are cp.async's
+on every device the family runs on (`bundles.legal`: no device moving its blocks by TMA runs it), so one
+plan holds for each; Ampere's, the least of them (`generation.BF16_GPU`)."""
+
+
 @functools.lru_cache(maxsize=256)
-def _pipelined(key: tuple, steps: int | None, target: str) -> tuple:
+def _pipelined(key: tuple, steps: int | None) -> tuple:
     """The shared memory `emit_pipeline` scopes for a walk of `steps` steps (its stages where they are not
     known) over the streams `key` names (`_pipeline_key`), as JAX's own builder allocates them
-    (`get_allocations`): a slot of each block a stage, fewer for fewer steps, and the barriers of its
-    copies where they are TMA's, none for cp.async's, which it picks by the capability it lowers for. So
-    it is traced for `target`'s (an abstract device stating it), whatever GPU, mesh or trace the caller is
-    in: a derivation's plan for an sm120 lowers TMA copies where an sm80's lowers cp.async. Once a walk of
-    the candidate search's: read in a trace of its own that runs nothing."""
+    (`get_allocations`) for the copies the walk makes (`CP_ASYNC_GENERATION`'s, a slot of each block a stage,
+    fewer for fewer steps, no barrier), whatever GPU, mesh or trace the caller is in: traced on an abstract
+    device of that generation, in a trace of its own that runs nothing, once a walk of the candidate
+    search's."""
     stages, streams = key
     pipeline = Pipeline({name: (shape, jnp.dtype(dtype)) for name, shape, dtype, _ in streams}, stages,
                         {name: swizzle for name, _, _, swizzle in streams if swizzle is not None})
@@ -160,19 +165,9 @@ def _pipelined(key: tuple, steps: int | None, target: str) -> tuple:
         found.update(built.get_allocations(*(jax.ShapeDtypeStruct(shape, dtype)
                                              for shape, dtype in pipeline.blocks.values())))
 
-    version = generation.capability(target)
-    if version is None:
-        # No CUDA GPU planned (a walk interpreted on a CPU): its pipeline lowers for the architecture Mosaic
-        # GPU infers where it is traced (`utils._infer_arch`, Hopper's where the device states none), so its
-        # allocations are read there, as the walk's own are made.
+    planned = generation.gpu_mesh(jax.sharding.AbstractMesh((1,), ("walk",)), CP_ASYNC_GENERATION)
+    with meshless(), jax.sharding.use_abstract_mesh(planned):
         jax.make_jaxpr(allocated)()
-    else:
-        # A device stating the capability lowered for (`utils._infer_arch`), an unseen GPU's too.
-        device = jax.sharding.AbstractDevice(device_kind=target, num_cores=None, platform="gpu",
-                                             compute_capability=".".join(map(str, version)))
-        with meshless(), jax.sharding.use_abstract_mesh(
-                jax.sharding.AbstractMesh((1,), ("walk",), abstract_device=device)):
-            jax.make_jaxpr(allocated)()
     leaves = (*found["in_smem_refs"], *found["out_smem_refs"], found["barrier_ref"])
     return tuple(leaf for leaf in leaves if leaf is not None)
 
@@ -721,14 +716,14 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
-        # A walk's shared memory in its own scope: `emit_pipeline`'s, as JAX's builder allocates it for the
-        # target (`_pipelined`), or a gathered walk's own rings (`_gathered_slots`); none for a walk of no
-        # steps, which the walk skips.
+        # A walk's shared memory in its own scope: `emit_pipeline`'s, as JAX's builder allocates it for its
+        # cp.async copies (`_pipelined`), or a gathered walk's own rings (`_gathered_slots`); none for a walk
+        # of no steps, which the walk skips.
         if steps == 0:
             return (), ((),)
         if streams.gathered:
             return (), (_gathered_slots(streams, steps),)
-        return (), (_pipelined(_pipeline_key(streams), steps, generation.gpu_target().generation),)
+        return (), (_pipelined(_pipeline_key(streams), steps),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
