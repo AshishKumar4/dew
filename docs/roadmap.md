@@ -41,6 +41,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
 - The wgmma consumer's register model against ptxas on the GEMM gate's sm90 tiles. [8723]
 - Grouped scores' gradient cancellation untested. [10551]
+- The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
