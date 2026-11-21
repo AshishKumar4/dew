@@ -94,7 +94,7 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
     scoped = [family.staged_memory((consumers, block_q, width), dtype),
               family.staged_memory((consumers, block_q, value_width), dtype),
               *([] if after else [out]),
-              family.staged_memory((consumers, block_q), jnp.float32),
+              *family.vector_stage((consumers, block_q), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers),
               *_relay_tiles(family, consumers, block_q, block_k, dtype)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
@@ -291,7 +291,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         rows_ref, (q_smem, do_smem, *refs) = refs[0], refs[1:]
         # Its output stage the program's where no scope after the walks holds it (`stages_after_walks`).
         out_smem, refs = (None, refs) if after is not None else (refs[0], refs[1:])
-        row_smem, q_loaded, do_loaded, *relay = refs
+        row_smem, refs = (refs[0], refs[1:]) if family.stages_vectors else (None, refs)
+        q_loaded, do_loaded, *relay = refs
         row, head, views, streams, pair_first, streamed = _query_program(
             program, streams, k_ref, v_ref, spans_of, score=(score_refs, kinds), heads=heads,
             kv_heads=kv_heads, queries=queries, consumers=consumers)
@@ -343,8 +344,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             family.stored(tuple(family.as_row(part) for part in parts),
                           tuple(rows_ref.at[place, row, head, pl.ds(first, block_q)]
                                 for place in range(rows_count)),
-                          smem=row_smem.at[index])
-
+                          smem=None if row_smem is None else row_smem.at[index])
         def producer():
             family.stream(streams, views, *streamed)
 

@@ -513,16 +513,17 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 @pytest.mark.parametrize("generation_name", FP32_GATED)
 def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name):
     """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
-    of a causal call 64 and 128 wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
-    launch within its shared memory, spilling nothing."""
+    of a causal call 64, 128 (and 256 on Hopper, row 6508) wide, lowered and compiled by ptxas for
+    `generation_name` on this CPU: every launch within its shared memory, spilling nothing."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
+    widths = (64, 128, 256) if generation_name == "sm90" else (64, 128)
     cases = []
     with generation.assumed(generation_name):
-        for width in (64, 128):
+        for width in widths:
             query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.float32)
             key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.float32)
             zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
@@ -539,34 +540,6 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
 
             cases.append(KernelCase(f"fp32-forward-{width}", _make))
         found = compile_mosaic_kernels(cases, generation_name)
-    failed = mosaic_failures(found)
-    assert not failed, "\n".join(failed)
-
-
-@COMPILES_ON_CPU
-def test_an_fp32_forward_at_width_256_compiles_spill_free_on_hopper():
-    """An fp32 call's inference forward (`MosaicForward.parts = 3`) at width 256 derives a 32-key tile on
-    Hopper (`sm90`) within its 232,448-byte shared memory and compiles spill-free (row 6508)."""
-    from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    queries = 512
-    spans = template.spans(queries, queries, 1, causal=True)
-    query = jax.ShapeDtypeStruct((1, queries, 4, 256), jnp.float32)
-    key = jax.ShapeDtypeStruct((1, queries, 2, 256), jnp.float32)
-    with generation.assumed("sm90"):
-        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
-        op, args = attention_mosaic._forward_call(*zeros, spans, None, scale=None,
-                                                  natural=attention_mosaic.NATURAL)
-        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
-        config = op.derived(ba, generation.gpu_target())
-        assert config is not None, "the Mosaic forward derives no fp32 config 256 wide on sm90"
-
-        def forward(query, key, value):
-            return attention_mosaic.forward(query, key, value, spans, None)
-
-        found = compile_mosaic_kernels(
-            [KernelCase("fp32-forward-256", lambda: (forward, (query, key, key)))], "sm90")
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 

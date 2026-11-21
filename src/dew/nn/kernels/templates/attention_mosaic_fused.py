@@ -11,14 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import (
-    attention_algebra as algebra,
-    mosaic,
-    outputs,
-    resources,
-    stacked,
-    swizzling,
-)
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
@@ -35,6 +28,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     modelled,
     reducing,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -128,9 +122,9 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     stage = family.staged_memory((consumers, max(block_q, block_k), width), jnp.float32)
     held = family.adds_through_shared
-    kv_swizzle = swizzling.NARROWEST_SWIZZLE_BYTES if config.narrow else None
-    scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzle),
-              family.staged_memory((consumers, block_k, width), dtype, kv_swizzle),
+    kv_swizzles = transposed_swizzles(config, "keys", "values")
+    scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("keys")),
+              family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("values")),
               family.staged_memory((consumers, 2 * staged_parts(dtype), block_q, block_k), dtype),
               *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
