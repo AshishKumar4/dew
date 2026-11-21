@@ -1755,7 +1755,8 @@ def test_rescaled_uses_exact_power_of_two_constants_for_dropout_reach():
     """`algebra.rescaled` scales a dropping call's bound by exact host power-of-two constants (row 10161),
     never `jnp.exp2`, so the scaled bound is bitwise exact on XLA:CPU for both normal and wide reaches."""
     for binades in (10, 140):
-        drop = template.Draw(rate=1.0 - 2.0 ** -binades, seed=0)
+        zero = jnp.int32(0)
+        drop = template.Draw((jnp.uint32(0), jnp.uint32(0)), zero, zero, 1.0 - 2.0 ** -binades)
         assert math.log2(drop.reach) == binades
         prior = jnp.array([1.5], jnp.float32)
         state = algebra.Partial(jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32),

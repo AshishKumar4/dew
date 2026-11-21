@@ -1859,10 +1859,11 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         if not flushing:
             return plain
         divisor = expand(total, acc)
-        apart = binade_of(acc) - binade_of(divisor)
+        div_binade = binade_of(divisor)
+        apart = binade_of(acc) - div_binade
         raised = jnp.where(apart < -124, -apart, 0)
         lifted = raised_exactly(acc, raised)
-        return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
+        return jnp.where((raised > 0) | (div_binade >= 126), lowered_divide(lifted, divisor, raised), plain)
 
     out = bodies.subnormals(divided, acc.dtype)
     return out if held is None else saturated(out, finite(acc), held)
