@@ -48,16 +48,19 @@ def on_float64_host(tree):
         return jax.tree.map(put, tree)
 
 
-def drawn_on_the_host[S, R](inputs_of: Callable[[S], R], seed: S) -> R:
+def drawn_on_the_host[S, R](inputs_of: Callable[[S], R], seed: S, *, held: bool = False) -> R:
     """`inputs_of(seed)` drawn on the host's CPU, as a recording's inputs were, whatever device the test runs
     on: jax.random's draws are the same bits on every device but its normal's float transform is not (a
     recorded site's seed drawn on an H100 had another digest than on the CPU, the recording's, in 157 of the
     recurrence GPU flow's cells, draw-digest at 996fa29f1), so a draw on the test's device would not be the
     recorded inputs; and a GPU tier part's prepare, whose default device is a compile-only GPU, computes
     nothing there (a draw or a weight load made there left its cell unprepared, rows 8074, 8635, 10552). The
-    arrays, committed to no device, then go where the run reads them."""
+    arrays, committed to no device, then go where the run reads them; with `held`, fetched to the host as
+    NumPy's (`jax.device_get`), as a matrix a cell's every program closes over or a flow's prepare pickles
+    is held (row 10831: its inline copies)."""
     with jax.default_device(jax.devices("cpu")[0]):
-        return inputs_of(seed)
+        made = inputs_of(seed)
+    return jax.device_get(made) if held else made
 
 
 def widened(tree):
