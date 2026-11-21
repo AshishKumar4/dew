@@ -210,7 +210,10 @@ def _scaled(jaxpr, tapped, keys):
     key, drawn = keys
     plain = tapped(key, 0.0)
     floating = [jnp.issubdtype(var.aval.dtype, jnp.floating) for var in jaxpr.outvars]
-    folds = [(jnp.zeros_like(value), jnp.zeros_like(value)) if kept else None
+    # The largest displacement at the outputs' own width (a float64 output's may lie below float32's range),
+    # the scaled squares, at most the count, in float32: held, the untapped outputs, one draw's and about
+    # one more output's (rows 9780 on: a 2 GiB float64 gradient tree's walk peaked at 6.15 GiB).
+    folds = [(jnp.zeros_like(value), jnp.zeros(jnp.shape(value), jnp.float32)) if kept else None
              for value, kept in zip(plain, floating, strict=True)]
     for each in drawn:
         draw = tapped(each, 1.0)
@@ -229,14 +232,16 @@ def _folded(value, draw, largest, squares):
     moved = jnp.abs(draw - value)
     larger = moved > largest
     held = jnp.where(larger, moved, jnp.where(largest > 0, largest, 1))
-    squares = jnp.where(larger, squares * jnp.square(largest / held) + 1,
-                        squares + jnp.where(largest > 0, jnp.square(moved / held), 0))
+    # Each ratio at most 1 at the outputs' width, then the sum's float32 (`_scaled`).
+    squares = jnp.where(larger, squares * jnp.square(largest / held).astype(squares.dtype) + 1,
+                        squares + jnp.where(largest > 0, jnp.square(moved / held), 0).astype(squares.dtype))
     return jnp.maximum(largest, moved), squares
 
 
 def _spread(largest, squares, count: int):
-    """The root mean square of `count` folded displacements (`_folded`), zero where none moved."""
-    return jnp.where(largest > 0, largest * jnp.sqrt(squares / count), largest)
+    """The root mean square of `count` folded displacements (`_folded`), zero where none moved, at the
+    largest's width."""
+    return jnp.where(largest > 0, largest * jnp.sqrt(squares / count).astype(largest.dtype), largest)
 
 
 def _widened(leaf):
