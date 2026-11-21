@@ -672,10 +672,6 @@ class StepCompiler[L, E]:
         self.objective = objective
         self.phase_passes = phase_passes
         self.ahead = ahead
-        # The step its artifact handed, once a search admitted it whole, by its compiled key: every search
-        # of this compiler takes it again for that program rather than compiling it afresh (row 7988), and
-        # no other trainer's does (`FitSearch.taken_ahead`).
-        self._taken_ahead: dict[Hashable, jax.stages.Compiled] = {}
         # The step compiled ahead a run was handed, whose counts' family a run that draws its pass count per
         # microbatch takes after its first compile took the cap's (`admitted_counts`).
         self.counts_ahead: AheadOfTime | None = None
@@ -1118,8 +1114,7 @@ class StepCompiler[L, E]:
                     lower, lambda candidate: step_options(
                         self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
                     self.objective, mesh, cap.at.xla_defaults, cap.at.narrow, cap.at.ns_group,
-                    None if self._base_rung is None else self._base_rung[1], None, ahead=ahead,
-                    taken_ahead=self._taken_ahead)
+                    None if self._base_rung is None else self._base_rung[1], None, ahead=ahead)
                 if not search.fits_here(cap.split):
                     short = search.probes[-1].headroom
                     raise ValueError(f"the step of {passes} passes misses the devices at its cap's plan "
@@ -1283,7 +1278,7 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
             None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
-            provisional=provisional, unplaced=unplaced, taken_ahead=self._taken_ahead)
+            provisional=provisional, unplaced=unplaced)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # The rungs above the plan are read for their memory alone, no device ever running them: offline
