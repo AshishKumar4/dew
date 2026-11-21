@@ -767,18 +767,19 @@ class LiveSet:
     scaled: int
     unknown: int
     vocabulary: int | None = None
-    """The bytes of its buffers a dimension of which descends from a vocabulary table's (`tables`), with
-    those it states no provenance of and those whose size descends from no argument (a GEMM's workspace):
-    the most a head's tile or fusion can change, the head's logits and their gradients, those of its table
-    among them, and the workspaces of the calls computing them, the rest of the step left as it is. None
-    where no table's axes were given."""
+    """The bytes of its buffers a head's tile or fusion can change (`Head`): those a dimension of which
+    descends from a vocabulary table's or, where no op states it (a GPU's every kernel and fusion), is as
+    long as the vocabulary or the head's tile; and those whose size descends from no argument or is a byte
+    vector, a GEMM's workspace, sized by its call. The head's logits and their gradients, those of its table
+    among them, and the workspaces of the calls computing them: the rest of the step is as it is. None where
+    no head was given."""
 
     @staticmethod
     def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]],
-           tables: frozenset[tuple[int, int]] | None = None) -> LiveSet | None:
-        """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows and `tables`
-        those of a vocabulary table's rows (`dew.training.planning.vocabulary_axes`); None where the backend
-        states none."""
+           head: Head | None = None) -> LiveSet | None:
+        """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows and `head`
+        what marks a buffer of the head's (`dew.training.planning.head_of`); None where the backend states
+        none."""
         live = executable.peak_live()
         if live is None:
             return None
@@ -787,18 +788,33 @@ class LiveSet:
             if buffer.kind == "parameter":
                 continue
             dimensions = [dimension for dimension in buffer.dims if dimension is not None]
-            if len(dimensions) < len(buffer.dims):
+            stated = len(dimensions) == len(buffer.dims)
+            if not stated:
                 unknown += buffer.bytes
-                vocabulary += buffer.bytes
-                continue
-            if any(dimension & rows for dimension in dimensions):
+            elif any(dimension & rows for dimension in dimensions):
                 scaled += buffer.bytes
-            # A buffer whose size descends from no argument (a GEMM's workspace, sized by its call) can
-            # change with the head's tile as well.
-            if tables is not None and (not any(dimensions) or any(dimension & tables
-                                                                  for dimension in dimensions)):
+            if head is not None and head.holds(buffer, dimensions if stated else None):
                 vocabulary += buffer.bytes
-        return LiveSet(scaled, unknown, None if tables is None else vocabulary)
+        return LiveSet(scaled, unknown, None if head is None else vocabulary)
+
+
+@dataclasses.dataclass(frozen=True)
+class Head:
+    """What marks a live buffer a head's tile or fusion can change (`LiveSet.vocabulary`): the (argument,
+    axis) pairs of a vocabulary table's rows among the step's arguments (`tables`), and the lengths of its
+    vocabulary and of the head's tile (`lengths`), which a buffer whose provenance no op states is read by
+    (a GPU's live set states none: a 4B decoder's every kernel and fusion on a GH200, UB-PLANNER3-DIAG)."""
+
+    tables: frozenset[tuple[int, int]]
+    lengths: frozenset[int]
+
+    def holds(self, buffer, dimensions: Sequence[frozenset] | None) -> bool:
+        """Whether `buffer` is one of the head's, its `dimensions`' provenance where every one is stated."""
+        workspace = len(buffer.shape) == 1 and buffer.dtype in ("u8", "s8")
+        if dimensions is not None:
+            return (not any(dimensions) or workspace
+                    or any(dimension & self.tables for dimension in dimensions))
+        return workspace or any(length in self.lengths for length in buffer.shape)
 
 
 def fits_everywhere(read: Callable[[], int | None]) -> tuple[bool, int | None]:

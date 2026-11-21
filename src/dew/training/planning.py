@@ -68,6 +68,7 @@ from dew.training.distributed import batch_divisor
 from dew.training.interval import latest
 from dew.training.memory import (
     LIMIT_EXIT,
+    Head,
     LiveSet,
     MemoryMiss,
     compile_limit,
@@ -777,18 +778,20 @@ def named_as(asked: Sequence[tuple[Rung, str]], rung: Rung) -> str | None:
     return next((name for place, name in asked if place == rung), None)
 
 
-def vocabulary_axes(objective, candidate: Candidate) -> frozenset[tuple[int, int]] | None:
-    """The (argument, axis) pairs among `candidate`'s step's arguments (`batch_rows`) of a vocabulary
-    table's rows: each axis of a leaf of its state as long as the vocabulary of a module its objective runs
-    states (`StatesVocabulary`), which a head's logits and their gradients descend from; None where none
-    states one. An axis of another leaf as long counts too, the head's share of the step read no smaller."""
+def head_of(objective, candidate: Candidate) -> Head | None:
+    """What marks a buffer of the head of `candidate`'s step (`Head`): the (argument, axis) pairs among its
+    arguments (`batch_rows`) of each axis of a leaf of its state as long as the vocabulary of a module its
+    objective runs states (`StatesVocabulary`), which a head's logits and their gradients descend from, and
+    the vocabulary's and the head's tile's lengths (`head_tile_of`); None where no module states one. An axis
+    or a buffer of another leaf as long counts too, the head's share of the step read no smaller."""
     sizes = {entry.module.vocab_size for entry in objective.program_key()
              if isinstance(entry.module, StatesVocabulary)}
     if not sizes:
         return None
     leaves = jax.tree.leaves(apart(candidate.prepared))
-    return frozenset((index, axis) for index, leaf in enumerate(leaves)
-                     for axis, size in enumerate(np.shape(leaf)) if size in sizes)
+    return Head(frozenset((index, axis) for index, leaf in enumerate(leaves)
+                          for axis, size in enumerate(np.shape(leaf)) if size in sizes),
+                frozenset({*sizes, *(head_tile_of(objective) or ())}))
 
 
 def batch_rows(candidate: Candidate) -> frozenset[tuple[int, int]]:
@@ -1133,7 +1136,7 @@ class FitSearch[LossT, EffectsT]:
         self.probes.append(probe)
         if not fit and headroom is not None and probe.temp is not None:
             live = None if executable is None else LiveSet.of(executable, batch_rows(candidate),
-                                                              vocabulary_axes(self.objective, candidate))
+                                                              head_of(self.objective, candidate))
             # Its temporaries a microbatch's rows scale, as its live set states them, those it states no
             # provenance of among them (the most a split can free of them); every one where it states none.
             scaled = probe.temp if live is None else live.scaled + live.unknown
