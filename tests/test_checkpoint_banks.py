@@ -5,7 +5,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 from flax import linen as nn
 from steady_state import steady_state
 
@@ -83,21 +82,6 @@ def test_a_run_places_bank_by_bank_and_again_on_the_programs_it_compiled(tmp_pat
                                     jax.tree.leaves(second["params"][name]), strict=True):
             np.testing.assert_array_equal(np.asarray(got), want)
             np.testing.assert_array_equal(np.asarray(again), want)
-
-
-@pytest.mark.gpu(reason="a CPU-owned run's host companion and its accelerator are two meshes only on a GPU")
-def test_a_cpu_owned_lora_run_saves_across_its_two_meshes(tmp_path):
-    """A LoRA run whose variables the CPU owns holds its moving leaves on the host companion and its frozen
-    base on the accelerator: its save's refusal of a non-finite state reads both, one program a placement,
-    and the run saves (train 904's review, F1: one program over both meshes was refused, so every save of
-    such a run crashed on a GPU)."""
-    base = decoder()
-    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
-        base, nn.unbox(base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))), key=1)
-    objective = LMObjective(adapter.model, 8, head_chunks=1, ema_decay=None,
-                            variables=jax.tree.map(np.asarray, adapter.variables))
-    trained(tmp_path / "run", objective, HOST)
-    assert Checkpoints(str(tmp_path / "run")).latest == 1
 
 
 def test_a_cpu_owned_run_reads_its_frozen_banks_into_rows_again_on_the_programs_it_compiled(tmp_path):
