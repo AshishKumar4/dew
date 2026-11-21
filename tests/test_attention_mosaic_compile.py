@@ -1891,3 +1891,19 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
 
         found = compile_mosaic_kernels([KernelCase(f"{gen}-fused-d128-3stage", _make)], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_planned_stages_deepens_at_residency_two_with_registers():
+    """Row 10993: `_planned_stages` passes the launch's consumer registers to `resources.plan`, so a
+    launch at `resident >= 2` deepens its ring rather than falling back to `floor`."""
+    from dew.nn.kernels.templates import attention_mosaic_program as program, resources
+
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        family = program.layouts("sm80", jnp.bfloat16, 4096)[0]
+        tile = ((64, 64), jnp.bfloat16)
+        def scope_of(stages):
+            return resources.Scope(program=(tile,), walks=((stages, (tile,)),))
+        stages = attention_mosaic._planned_stages(family, scope_of, target, consumers=1, registers=128,
+                                                  floor=2, most=3, resident=2)
+        assert stages == 3, stages
