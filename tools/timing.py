@@ -321,10 +321,12 @@ def run(manifest: dict, out: Path, repo: Path) -> int:
     finally:
         for worker_of in processes.values():
             worker_of.close()
+    # The window's verdict written before any profile runs: a failed profile fails the job, its rows and
+    # summary kept (train 642's review: ncu's failure left every row and no summary).
+    summarized(manifest, out)
     for case in manifest["cases"]:
         if "profile" in case:
             profiled(case, out, repo)
-    summarized(manifest, out)
     return 0
 
 

@@ -1590,14 +1590,21 @@ class _Program[T: (Tiles, BackwardTiles)]:
         assert spans.q_lo is not None and spans.q_hi is not None, "a key block's walk reads its readers"
         return at(spans.q_lo, block), at(spans.q_hi, block), seen_whole
 
-    def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
+    def segmented(self, step: Callable, run: tuple[jax.Array | None, jax.Array] | None, lo, hi) -> tuple:
         """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its
         whole tiles run unbroken (`run`, `whole_run`), those one segment of their own, unmasked, and the
         tiles around them masked, so no step chooses at run time, whose two branches' registers join
-        (FlashAttention 3's masked and unmasked iterations); else one segment choosing a tile at a time."""
+        (FlashAttention 3's masked and unmasked iterations); where `run[0]` is None (`forward_whole_run`),
+        the unmasked run starts at `lo` so only two segments emit; else one segment choosing a tile at a
+        time."""
         if run is None:
             return ((step, lo, hi),)
-        start, end = (jnp.clip(bound, lo, hi) for bound in run)
+        raw_start, raw_end = run
+        end = jnp.clip(raw_end, lo, hi)
+        if raw_start is None:
+            return ((functools.partial(step, masked=False), lo, end),
+                    (functools.partial(step, masked=True), end, hi))
+        start = jnp.clip(raw_start, lo, hi)
         return ((functools.partial(step, masked=True), lo, start),
                 (functools.partial(step, masked=False), start, end),
                 (functools.partial(step, masked=True), end, hi))
@@ -1610,13 +1617,14 @@ class _Program[T: (Tiles, BackwardTiles)]:
         faster a causal one at Qwen3-8B's)."""
         return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
 
-    def forward_whole_run(self, first, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
-        """The key tiles `[0, whole_end)` a causal forward query block from `first` sees whole (`reach`), one
-        unbroken run for `segmented`; None for non-causal or spans calls (row 10790)."""
+    def forward_whole_run(self, first, spans: _Spans | None) -> tuple[None, jax.Array] | None:
+        """The key tiles `[0, whole_end)` a causal forward/dQ query block from `first` sees whole (`reach`),
+        one unbroken run from `lo` for `segmented`; None for non-causal or spans calls (rows 10790, 4839)."""
         if spans is not None or not self.causal:
             return None
         walked = self.walked(first)
-        return jnp.int32(0), jnp.where(self.padded(first), jnp.int32(0), self.whole(first, walked))
+        return None, jnp.where(self.padded(first), jnp.int32(0), self.whole(first, walked))
+
     def _first_reader(self, k_first, q_steps: int) -> jax.Array:
         """The first query tile that sees the key block from `k_first` (`first_reader`)."""
         return first_reader(k_first, self.tiles.block_q, q_steps, self.keys, self.causal)

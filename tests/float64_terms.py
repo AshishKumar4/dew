@@ -21,6 +21,9 @@ from store_wire import COMPILED as STORE, running
 from dew.nn import programs
 from dew.nn.precision import correctly_rounded_divide_p
 
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
+
 SUMS = frozenset({jax.lax.dot_general_p, primitives.ragged_dot_general_p, jax.lax.reduce_sum_p,
     jax.lax.conv_general_dilated_p, jax.lax.cumsum_p, jax.lax.scatter_add_p})
 """The operations that sum terms: a leaf's terms are those its own sums add,

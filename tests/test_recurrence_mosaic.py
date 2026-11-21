@@ -1551,9 +1551,9 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     once a spilling launch steps down as a run's compile steps it (`stepped_down`,
     `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's shared
     memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
-    rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds for its
-    own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the newer targets are
-    the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
+    rule's 16-bit call and Kimi's, the production cells, derive tiles on every family. A GPU host's ptxas
+    builds for its own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the
+    newer targets are the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
     if jax.default_backend() == 'gpu':
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
@@ -1565,7 +1565,8 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     # apart fails launch by launch.
     failed = resource_failures(cases, found, plans, apart)
     failed += [f"{case}: no tiles derived" for case in refused
-               if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
+               if case.startswith(("qwen3.5-27b-gdn bfloat16", "kimi-linear-kda bfloat16"))
+               and "fast backward" not in case]
     if target == 'sm100':
         failed += [f"{case}: no tiles derived" for case in refused
                    if case.startswith("a write gate bfloat16")]
@@ -1618,9 +1619,8 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     certification reads too, `report.Binary.refused`) at a config not refused before, its launch refused
     (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
-    derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
-    first derivation, before any compile); the plans and launches held apart are those of the cases
-    returned."""
+    derives none and leaves the template. `refused` holds the calls the template refuses, at its first
+    derivation or a retry's; the plans and launches held apart are those of the cases returned."""
     from kernel_compile import compile_mosaic_kernels
 
     launched: dict = {}
@@ -1649,7 +1649,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         plans.clear()
         apart.clear()
         launched.clear()
-        cases = compiled_cases(target, plans, [], apart, only=group, launched=launched)
+        cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
         found = compile_mosaic_kernels(cases, target)
     return cases, found
 

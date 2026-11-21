@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from tool_support import StandInSession, git, load, run_from
 
 TIMING = Path(__file__).resolve().parents[1] / "tools/timing.py"
@@ -214,7 +215,7 @@ def windowed_run(tmp_path: Path, case_extra: dict, session: StandInSession) -> l
     stand_ins.mkdir()
     (stand_ins / "ncu").write_text(
         '#!/bin/sh\necho "$(date +%s.%N) $([ -e "$OUT/window.granted" ] && echo open || echo shut)" '
-        '>> "$PROFILED"\n')
+        '>> "$PROFILED"\nexit "${NCU_EXIT:-0}"\n')
     (stand_ins / "ncu").chmod(0o755)
     manifest = {"clock": "wall", "cases": [{
         "name": "cells", "builder": "cells:built", "cells": [{"size": 8}], "rounds": 2, "repeats": 2,
@@ -254,6 +255,17 @@ def test_a_cases_profiles_run_inside_one_more_window(tmp_path):
     assert [state for _, state in profiled] == ["open", "open"]
     assert all(session.granted[1] <= float(at) <= session.released[1] for at, _ in profiled)
 
+
+
+def test_a_failed_profile_fails_the_window_and_keeps_its_verdict(tmp_path, monkeypatch):
+    """A profile that fails (Nsight Compute's exit, a stand-in's here) fails the window's job, and the
+    verdict its rounds made is written first: summary.json and summary.md are there (train 642's review:
+    profiled before summarized, a failed ncu left every row and no summary)."""
+    monkeypatch.setenv("NCU_EXIT", "1")
+    with StandInSession(tmp_path) as session, pytest.raises(subprocess.CalledProcessError):
+        windowed_run(tmp_path, {"profile": {"kernel": "sin"}}, session)
+    verdict = json.loads((tmp_path / "out/summary.json").read_text())
+    assert verdict["cases"] and (tmp_path / "out/summary.md").read_text()
 
 
 def test_a_device_worker_runs_no_command_buffers_unless_its_arm_names_them(monkeypatch):

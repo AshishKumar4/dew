@@ -931,9 +931,11 @@ class KernelOp(tokamax.Op):
         return key
 
     def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
-        """The launch of `ba` at `config` as a resource derivation lowers it (never run): a function of the
-        call's arrays, making this launch's kernels alone, and their abstract values; compiled, not
-        interpreted, where the launch takes `interpret`."""
+        """The launch of `ba` at `config` as a resource derivation lowers it (never run), or with `config`
+        None at the config a call of it takes (`__call__`: derived, and where a device certifies launches
+        certified as it traces, `report.certified`, a config whose kernels spill refused and the next taken):
+        a function of the call's arrays, making this launch's kernels alone, and their abstract values;
+        compiled, not interpreted, where the launch takes `interpret`."""
         leaves, treedef = jax.tree.flatten((ba.args, ba.kwargs))
         held = [hasattr(leaf, "shape") and hasattr(leaf, "dtype") for leaf in leaves]
 
@@ -943,6 +945,8 @@ class KernelOp(tokamax.Op):
                                                         for leaf, array in zip(leaves, held, strict=True)])
             if "interpret" in kwargs:
                 kwargs = {**kwargs, "interpret": False}
+            if config is None:
+                return self(*args, **kwargs)
             # Traced as a call of it is (`__call__`): its kernels carry the launch's digest, and the register
             # models they state are the launch's (`report.Launch.kernels`).
             with report.launching(self, ba, config):

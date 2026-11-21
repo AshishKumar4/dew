@@ -121,6 +121,10 @@ class Lane:
     """Whether the call is fp32's, its output stored fp32 and a one-part operand TF32."""
     pairing: int = 1
     """The parts a factored pair's fp32 operand takes (`intra.pairing_parts`, `operand`)."""
+    unit_keys: bool = False
+    """Whether a sub-chunk's own pairs fold each decay into the row before the key (`mainloop.Call.unit_keys`,
+    a layer's unit keys: `own_pairs.own_bands`, `algebra.key_diagonal_bands`), not the row times the key
+    first (`key_diagonal`)."""
     merged: int = 0
     """The parts the doubling's merges take in fp32 (`mainloop._merged`): zero for fp16, else `merged`."""
     tf32: Literal["plain", "rna", "read"] = "read"

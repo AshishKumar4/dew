@@ -72,9 +72,10 @@ LOG2E = recurrence_algebra.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
 """How far a position's prefix `hi + lo` (`recurrence_algebra.prefix`) lies from its exact `log2(e)
 cumsum(g)`, as a share of `log2(e) sum |g|` over the positions it spans: each compensated add rounds two adds
-of its remainders, each within 2^-23 of their sum, at most 2^-24 of the running value each; an element of a
-64-long `associative_scan` takes at most 2 log2(64) such adds, under 2^-41 in all, and each token's exponent
-`g log2(e)` is a Dekker product and its rounded remainder, within 2^-46 of it. Four times their sum."""
+of its remainders, each within 2^-23 of their sum, at most 2^-24 of the running value each, 2^-47; a
+position of a 64-long chunk takes at most 63 such adds (the prefix launch's running sum down a column,
+`intra._running_prefix`; a doubling scan's 12), under 2^-41 in all, and each token's exponent `g log2(e)` is
+a Dekker product and its rounded remainder, within 2^-46 of it. Twice their sum, and more."""
 FRACTION = 2.0 ** -22
 """What `algebra.raised` rounds off its exponent: the fraction `(whole - floor(whole)) + part`, under 2,
 rounded twice to nearest."""
@@ -368,31 +369,38 @@ def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane, scale: float = 1.0)
 
 def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     """`algebra.key_diagonal_bands` `[C, C]` under a decay a key dimension, the pairs within each row's
-    sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks): `sum_k r_ik k_jk
-    exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`, `between`
-    of each token against the one before), rounded a factor at a time from the row's own token back
-    (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its decay,
-    the multiply an add may fuse, and the terms' sum over every key block within one sum's bound of them (a
-    key block's sum and its adds into the total, at most as many roundings as the width's terms)."""
+    sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks): `sum_k r_ik
+    k_jk exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`,
+    `between` of each token against the one before), rounded a factor at a time from the row's own token
+    back (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its
+    decay; under `Lane.unit_keys` the row itself decayed a factor at a time, then times the key (the native
+    loop's fold, `own_pairs._own_span`); the last multiply an add may fuse, and the terms' sum over every
+    key block within one sum's bound of them (a key block's sum and its adds into the total, at most as
+    many roundings as the width's terms)."""
     exact, bound = exponents.exact, exponents.bound
     size = np.shape(k)[0]
     tokens = np.arange(size)
     placed = ((tokens[:, None] // SUB) == (tokens[None, :] // SUB)) & (tokens[:, None] >= tokens[None, :])
     # Each token's own decay against the one before, `own[t - 1]` token `t`'s.
     own = between(exact[1:], bound[1:], exact[:-1], bound[:-1], lane)
+    # Each row's chain so far, from its own token back: its pair's decay, or under `unit_keys` the row
+    # itself decayed (`own_pairs._own_span`'s fold), each factor rounded in turn.
+    start = Iv(rows.lo, rows.hi) if lane.unit_keys else point(np.ones(exact.shape))
     lo, hi = np.zeros((size, size, *exact.shape[1:])), np.zeros((size, size, *exact.shape[1:]))
-    lo[tokens, tokens] = hi[tokens, tokens] = 1.0
-    # Each row's pair so far, from its own token back.
-    pair_lo, pair_hi = np.ones(exact.shape), np.ones(exact.shape)
+    lo[tokens, tokens], hi[tokens, tokens] = start.lo, start.hi
+    chain_lo, chain_hi = start.lo.copy(), start.hi.copy()
     for e in range(1, SUB):
         rows_e = tokens[tokens % SUB >= e]
-        found = fp32(mul(Iv(pair_lo[rows_e], pair_hi[rows_e]), Iv(own.lo[rows_e - e], own.hi[rows_e - e])),
+        found = fp32(mul(Iv(chain_lo[rows_e], chain_hi[rows_e]), Iv(own.lo[rows_e - e], own.hi[rows_e - e])),
                      lane)
-        pair_lo[rows_e], pair_hi[rows_e] = found.lo, found.hi
+        chain_lo[rows_e], chain_hi[rows_e] = found.lo, found.hi
         lo[rows_e, rows_e - e], hi[rows_e, rows_e - e] = found.lo, found.hi
-    decay = Iv(lo, hi)
-    keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), point(np.asarray(k)[None, :, :])), lane)
-    terms = fused(mul(keyed, decay), lane)
+    chain, key = Iv(lo, hi), point(np.asarray(k)[None, :, :])
+    if lane.unit_keys:
+        terms = fused(mul(chain, key), lane)
+    else:
+        keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), key), lane)
+        terms = fused(mul(keyed, chain), lane)
     terms = where(placed[:, :, None], terms, point(np.zeros(terms.lo.shape)))
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
     magnitude = np.maximum(np.abs(terms.lo), np.abs(terms.hi)).sum(-1) * (1 + 2.0 ** -50)
@@ -531,6 +539,9 @@ class Run:
     trained: bool
     """Whether the template trains the call (`Mosaic.trains`): its records the training forward's, the primal
     of the route's VJP, and its fast backward the template's; else the inference forward's."""
+    unit_keys: bool
+    """Whether its own pairs fold each decay into the row before the key (`Lane.unit_keys`): a delta rule's
+    unit keys, as the draws' layers declare them."""
 
     @property
     def chunks(self) -> int:
@@ -774,9 +785,9 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide),
-               pairing=intra.pairing_parts(family, held),
+               pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
-               tf32=tf32_conversion(family), trained=bool(trained),
+               tf32=tf32_conversion(family), trained=bool(trained), unit_keys=write_bound is not None,
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -836,7 +847,8 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32)
+                               merged=run.merged, tf32=run.tf32,
+                               unit_keys=run.unit_keys)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1049,11 +1061,12 @@ KEY_DECAY_SHARES = {"leaving": 0.5}
 mean is refused."""
 
 
-def assert_key_decays_witnessed(lane: Lane, heads: int = 1) -> None:
+def assert_key_decays_witnessed(lane: Lane, heads: int = 1, width: int = 64) -> None:
     """The step witness under a decay a key dimension (Kimi delta attention's, `key_enclosures`' pairs): a
     bf16 call of three chunks, every record inside its step's enclosure, and a kernel reading each token's
-    mean decay for all its keys refused (`shared_decay_refusals`, `KEY_DECAY_SHARES`)."""
-    operands = draw(0, "mild", heads=heads, per_key=True)
+    mean decay for all its keys refused (`shared_decay_refusals`, `KEY_DECAY_SHARES`). At `width` 128 its
+    prefix a running sum down each column (`intra._running`), at 64 the doubling scan."""
+    operands = draw(0, "mild", heads=heads, per_key=True, width=width)
     held, shared = witness(recorded(*operands), lane), shared_decay_refusals(operands, lane)
     for name in RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
@@ -1377,7 +1390,8 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32)
+                               merged=run.merged, tf32=run.tf32,
+                               unit_keys=run.unit_keys)
 
     def stored(iv: Iv, dtype) -> Iv:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where

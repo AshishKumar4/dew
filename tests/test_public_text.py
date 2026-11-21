@@ -64,10 +64,10 @@ def test_a_change_that_adds_a_forecast_to_prose_fails(repository, files, message
 def test_a_date_of_the_day_in_utc_as_the_commit_is_written_is_no_forecast(repository):
     """A commit written in an evening west of UTC may name the day it is in UTC, as Dew's records date their
     work: no forecast; a day after that still is (2026-10-28: a commit written at 23:00 -05:00 on the 27th,
-    naming "Main, 2026-10-28", failed the gate)."""
+    naming "the maintainer, 2026-10-28", failed the gate)."""
     (repository / "docs/guide.md").write_text(f"{GUIDE}\nMeasured as the commit was written.\n")
     git(repository, "add", "-A")
-    git(repository, "commit", "-qm", "docs: a measurement (Main, 2026-10-23)",
+    git(repository, "commit", "-qm", "docs: a measurement (the maintainer, 2026-10-23)",
         "--date=2026-10-22T23:30:00-05:00")
     gate = [sys.executable, str(REPO / "tools/public_text.py"), "base"]
     assert subprocess.run(gate, cwd=repository, capture_output=True, timeout=60).returncode == 0

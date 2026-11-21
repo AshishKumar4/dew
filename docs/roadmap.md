@@ -13,7 +13,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010]
 - The kernel challenge's lessons in the templates. [5271]
 - Cached and block visibility on the template's spans. [1495, 245]
-- Performance measurements. [569, 285, 1378]
+- Performance measurements. [569, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
@@ -23,10 +23,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
-- 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 683 s (a check-1 site: its longest draws task 621 s (1 draws),…. [7603]
-- 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - The wgmma consumer's register model against ptxas on the GEMM gate's sm90 tiles. [8723]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
+- The fla ports' fp32 calls fail check 1 natively against recorded fla, every fp32 port kernel at about 1600x fla's RMS error from float64. [10860]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -77,7 +76,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [5292]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353]
 - A device-plan search whose devices hold no plan walks the whole remat/head ladder before refusing. [8541]
-- The saved data plan as recorded rules, one last version, and the resume modes. [10814, 10816]
+- The saved data plan as recorded rules, one last version, and the resume modes. [10814]
 - The BFC bound places a step's non-aliased outputs beside its temporaries at XLA's raw sizes (memory.placed_beside: stats.output - stats.alias), where each…. [8792]
 
 ## RL and serving
@@ -92,7 +91,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
-- Product mode on a TPU (src/dew/nn/kernels/templates/product.py product_mode). [10845]
+- Rounding walk formatted primitives. [10876]
+- Rounding walk dead platform branches. [10877]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
@@ -108,8 +108,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## CI and tooling
 
-- Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
+- Dew's CI, test cache and compile-ahead tests. [5491, 5670]
 - Shared XLA cache (tests/remote_cache.py). [9797]
 - The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
-- The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
+- The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]

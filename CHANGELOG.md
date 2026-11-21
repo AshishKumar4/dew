@@ -629,7 +629,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - A step compiled ahead may compile over a host's own GPUs as that host serialized their topology
   (`--trainer.compile-ahead.topology PATH`, `dew.training.ahead.host_gpus`): its programs key the persistent
   compilation cache as the host's own compiles do, so the host's run reads them. Compiled for a generation alone,
-  they key other entries (the generation's canonical SKU's memory: an A100's 80 GB, where a host's may hold 40 GB).
+  they key other entries (the memory the generation's canonical target states, the least of its parts: an A100's
+  40 GB, where a host's may hold 80 GB).
 - A decision objective's "none of the above" draws no longer touch a yes-or-no choice by default
   (`none_of_the_above_options` defaults to 3); a run recorded before keeps its recorded floor.
 - A profile window may convert its reports as it stops, in the run's own process (`ProfileWindow(wait=True)`),
@@ -658,11 +659,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `joining()`), with Open MPI, Slurm, Cloud TPU, Kubernetes and `dew launch`'s pool built in. `prepare_process(cluster=...)`
   joins a scheduler's pool without `dew launch`, a scheduler of your own among them; `dew launch` reads the same
   environments, through public `jax.distributed.initialize` alone.
-- A decision run's question rows can ask a request's questions over one copy of its state (`--shared-state n`,
-  `QuestionLayout.shared_state`): a row holds the state once and up to `n` questions after it, each read as
-  its own row reads it, at its own row's positions, so a request of `q` questions reads its state once a row
-  rather than `q` times. `--siblings` lets each question also read the questions before it in its row. A
-  request that outgrows a row takes several, each repeating the state.
 - The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
   Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
   GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells

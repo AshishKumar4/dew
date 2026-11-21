@@ -266,6 +266,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return dataclasses.replace(self, m_warps=m_warps)
 
     @property
+    def atom_columns(self) -> int:
+        # A warp's atom `m_warps * 16` rows by `(4 // m_warps) * 8` columns (`specialized`): a 16-row
+        # share's four warps along its columns tile 32 of them.
+        return (4 // self.m_warps) * 8
+
+    @property
     def transposed_rows(self) -> int:
         # The transposed stage casts to the products' left-operand layout in whole row atoms, `m_warps`
         # warps of 16 rows: a 32-row step at two row warps lowers, where the 64-row role it was held to

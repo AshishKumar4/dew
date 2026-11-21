@@ -36,7 +36,11 @@ from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
+from dew.nn.kernels.generation import device_generation
 from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p
+
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
              primitives.reduce_scatter_p: "axis_name"}
@@ -71,7 +75,13 @@ def compensating() -> frozenset:
 
 SCALES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 """Each function's compiled rounding scale (`rounding_scale`) of a static program, by its arguments' tree,
-shapes, dtypes and weak types and the matmul precision it traced under, held while the function lives."""
+shapes, dtypes and weak types and the matmul precision it traced under (`_signature`), held while the
+function lives."""
+
+TRACED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+"""Each function's program as `rounding_scale` traces it (`_traced`), by the same signature, held while the
+function lives: a weighed site's recording asks its reference's scale at thousands of draws of one program,
+and tracing it again at each took 6.8 of a recording's 25 s (row 5864)."""
 
 
 @jax.tree_util.register_dataclass
@@ -167,12 +177,8 @@ def rounding_scale(fn, *args, seed: int = 0):
     weighs alike for every arm. The program is traced at `args` as given, its roundings those formats', and
     evaluated in float64; a non-floating output's scale is None. A static program (no branch or loop its
     values pick) evaluates compiled, once a signature and matmul precision; any other walks eagerly."""
-    # The program as written: traced with the algebra pass off, a reference's (`arm_arithmetic.unrewritten`),
-    # its outputs' tree read from the same trace.
-    closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
-    tree = jax.tree.structure(shapes)
-    # Traced in the caller's arithmetic (its default matmul precision among it), replayed in float64's own.
-    traced = str(jax.config.jax_default_matmul_precision)
+    signature = _signature(args)
+    closed, tree = _traced(fn, args, signature)
     moved = on_float64_host(jax.tree.leaves(args))
     with on_float64_device(), evaluated_on(moved), jax.enable_x64(new_val=True), \
             jax.default_matmul_precision("highest"):
@@ -180,24 +186,46 @@ def rounding_scale(fn, *args, seed: int = 0):
         consts = [_widened(value) for value in on_float64_host(closed.consts)]
         keys = _keys(seed)
         if static(closed.jaxpr):
-            signature = (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
-                                                          getattr(jax.typeof(leaf), "weak_type", False))
-                                                         for leaf in jax.tree.leaves(args)),
-                         traced, _target())
             held = SCALES.setdefault(fn, {})
-            if signature not in held:
+            # Compiled for the device it evaluates on (`float64_terms.evaluated_on`), which its trace is not.
+            compiled = (signature, _target())
+            if compiled not in held:
                 jaxpr = closed.jaxpr
                 # One tapped evaluation compiled, which every draw runs with its own key: a program of
                 # one copy of `fn`, not one of each draw's.
-                held[signature] = jax.jit(lambda consts, leaves, key, scale: walked(
+                held[compiled] = jax.jit(lambda consts, leaves, key, scale: walked(
                     jaxpr, consts, leaves, TapRule(key, scale)))
-            outputs, scales = _scaled(closed.jaxpr, functools.partial(held[signature], consts, leaves), keys)
+            outputs, scales = _scaled(closed.jaxpr, functools.partial(held[compiled], consts, leaves), keys)
         else:
             # Its runs of static steps between a branch and a loop compiled, the rule passed in (`_span`).
             outputs, scales = _scaled(closed.jaxpr, lambda key, scale: walked(
                 closed.jaxpr, consts, leaves, TapRule(key, jnp.float64(scale)), compiling=True), keys)
     return (tree.unflatten([np.asarray(value) for value in outputs]),
             tree.unflatten([None if scale is None else np.asarray(scale) for scale in scales]))
+
+
+def _signature(args) -> tuple:
+    """What a program `rounding_scale` traces at `args` is keyed by (`TRACED`; `SCALES` beside the device it
+    evaluates on): the arguments' tree, shapes, dtypes and weak types, and the context a trace reads beside
+    them: the matmul precision it is traced under (the caller's arithmetic, which its replay in float64 does
+    not keep), whether x64 is on (its constants' widths), the abstract mesh (its values' shardings) and the
+    generation its kernels are chosen for (`generation.device_generation`)."""
+    return (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
+                                             getattr(jax.typeof(leaf), "weak_type", False))
+                                            for leaf in jax.tree.leaves(args)),
+            str(jax.config.jax_default_matmul_precision), bool(jax.config.jax_enable_x64),
+            jax.sharding.get_abstract_mesh(), device_generation())
+
+
+def _traced(fn, args, signature: tuple) -> tuple:
+    """`fn`'s program as written at `args`, traced with the algebra pass off, a reference's
+    (`arm_arithmetic.unrewritten`), and its outputs' tree from the same trace, once a signature
+    (`TRACED`): a function is its program, as `SCALES` holds it."""
+    held = TRACED.setdefault(fn, {})
+    if signature not in held:
+        closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
+        held[signature] = (closed, jax.tree.structure(shapes))
+    return held[signature]
 
 
 def _scaled(jaxpr, tapped, keys):

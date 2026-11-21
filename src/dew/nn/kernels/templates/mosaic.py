@@ -607,6 +607,12 @@ class Issuer[Accumulator](abc.ABC):
     mma.sync's four warps of 16 each)."""
 
     @property
+    def atom_columns(self) -> int:
+        """The columns its accumulator layout tiles a value in, which a tile's columns fill whole: mma.sync's
+        warps along its columns (`specialized`), none finer elsewhere."""
+        return 1
+
+    @property
     def walked_rows(self) -> int:
         """The rows a walked tile (a forward's keys) comes in whole multiples of: the products' rows, which a
         consumer's weights' product takes as its depth (wgmma's and the chunks' 64, mma.sync's 16); a family
