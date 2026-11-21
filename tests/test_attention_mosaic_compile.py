@@ -1831,13 +1831,14 @@ def test_derived_one_consumer_heights_are_compared_by_choose():
 
 
 @COMPILES_ON_CPU
-def test_sm90_fed_fused_backward_deepens_to_3_stages_and_compiles_spill_free():
-    """Row 5272: sm90 WgmmaFed fused backward (`dkv_fused`, qwen3-8b d128) deepens its TMA ring to
-    3 stages while preserving `streamed_statistics >= 3` and compiles spill-free."""
+@pytest.mark.parametrize("gen", ["sm90", "sm80"])
+def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
+    """Row 5272: qwen3-8b d128 fused backward deepens its ring to 3 stages without losing SM residency
+    on both sm90 (`wgmma.fed`) and sm80 (`mma.sync` cp.async) and compiles spill-free."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    with generation.assumed("sm90"):
+    with generation.assumed(gen):
         target = generation.gpu_target()
         spans = template.spans(4096, 4096, 1, causal=True)
         q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
@@ -1848,39 +1849,9 @@ def test_sm90_fed_fused_backward_deepens_to_3_stages_and_compiles_spill_free():
                                                    accurate=False)
         ba = op.bind(*args, interpret=False)
         cfg = op.derived(ba, target)
-        assert cfg is not None and cfg.fused and cfg.stages >= 3, cfg
-
-        def _make():
-            def backward(query, key, value, dout, residuals):
-                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                                  residuals=residuals, accurate=False)
-                return grads.query, grads.key, grads.value
-            return backward, (q, k, k, q, shapes)
-
-        found = compile_mosaic_kernels([KernelCase("sm90-fed-fused-d128", _make)], "sm90")
-        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
-
-@COMPILES_ON_CPU
-def test_sm80_d128_backward_deepens_to_3_stages_without_losing_residency():
-    """Row 5272: sm80 mma.sync d128 fused backward (`64x64`, qwen3-8b) deepens its cp.async ring to
-    3 stages without losing SM residency and compiles spill-free."""
-    from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    with generation.assumed("sm80"):
-        target = generation.gpu_target()
-        spans = template.spans(4096, 4096, 1, causal=True)
-        q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
-        k = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
-        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
-        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, residuals=shapes,
-                                                   scale=None, natural=attention_mosaic.NATURAL,
-                                                   accurate=False)
-        ba = op.bind(*args, interpret=False)
-        cfg = op.derived(ba, target)
-        assert cfg is not None and cfg.stages >= 3, cfg
+        assert cfg is not None and cfg.fused and cfg.stages >= 3, (gen, cfg)
         assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
+
         def _make():
             def backward(query, key, value, dout, residuals):
                 grads = attention_mosaic.backward(query, key, value, spans, None, dout,
@@ -1888,5 +1859,5 @@ def test_sm80_d128_backward_deepens_to_3_stages_without_losing_residency():
                 return grads.query, grads.key, grads.value
             return backward, (q, k, k, q, shapes)
 
-        found = compile_mosaic_kernels([KernelCase("sm80-d128-bwd-3stage", _make)], "sm80")
+        found = compile_mosaic_kernels([KernelCase(f"{gen}-fused-d128-3stage", _make)], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

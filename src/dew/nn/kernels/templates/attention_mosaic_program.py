@@ -2222,21 +2222,21 @@ STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total",
 the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
 
 def tpu_forward_step_tiles(block_q: int, block_k: int, *, natural_form: bool, scaled: bool) -> tuple:
-    """Live `(block_q, block_k)` fp32 score-tile stand-ins held in TPU VMEM during a forward step
-    (`MxuIssuer.value_scratch(step=...)`, billed once each; 6+6 live pairs matching v5e 22 MiB, row 10771)."""
+    """Live `(block_q, block_k)` fp32 score tiles held in TPU VMEM during a forward step
+    (`MxuIssuer.value_scratch(step=...)` bills `VALUES` copies each; 6 + 6 natural/scaled, row 10771)."""
     base = ("logits", "coords", "shifted", "exponentials", "weights", "rescaled")
     extra = ("scaled_logits", "small_weights", "small_exp", "guard_mask", "scaled_sum", "restored")
-    count = 2 * (len(base) + (len(extra) if natural_form or scaled else 0))
+    count = len(base) + (len(extra) if natural_form or scaled else 0)
     return (((block_q, block_k), jnp.float32),) * count
 
 
 def tpu_backward_step_tiles(block_q: int, block_k: int) -> tuple:
-    """Live `(block_q, block_k)` fp32 score-tile stand-ins held in TPU VMEM during a backward step
-    (`MxuIssuer.value_scratch(step=...)`, billed once each; 10 live pairs beside 3 fp32 accumulators,
+    """Live `(block_q, block_k)` fp32 score tiles held in TPU VMEM during a backward step
+    (`MxuIssuer.value_scratch(step=...)` bills `VALUES` copies each; 10 beside 3 fp32 accumulators,
     v5e 22 MiB, row 10771)."""
     names = ("logits", "dp", "coords", "mask", "shifted", "exponentials", "weights", "ds",
              "weights_cast", "ds_cast")
-    return (((block_q, block_k), jnp.float32),) * (2 * len(names))
+    return (((block_q, block_k), jnp.float32),) * len(names)
 
 
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
