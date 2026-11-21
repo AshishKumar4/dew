@@ -117,6 +117,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     split_queries,
     stagings,
     streams_operands,
+    tpu_backward_score_tiles,
+    tpu_forward_score_tiles,
     value_columns,
     varying_slopes,
     walked_extents,
@@ -1148,7 +1150,8 @@ class MosaicForward(_Mainloop[Tiles]):
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
-        score_pairs = 12 if (config.natural_form or self.scales_in_kernel(ba)) else 6
+        score_pairs = tpu_forward_score_tiles(natural_form=config.natural_form,
+                                              scaled=self.scales_in_kernel(ba))
         tpu_values = ({"keys": ((config.block_k, width), query.dtype),
                        "values": ((config.block_k, value_width), query.dtype)},
                       (((config.block_q, value_width), jnp.float32),
@@ -1926,7 +1929,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         (row 5272)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if family.feeds_itself or not family.budgets_registers or family.operands_in_registers:
+        if not family.budgets_registers or family.operands_in_registers:
             return config
         q_steps = -(-query.shape[1] // config.block_q)
         steps = q_steps if config.fused else min(q_steps, -(-ba.arguments["key"].shape[1] // config.block_k))
@@ -2099,7 +2102,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                  "values": ((tiles.block_k, value_width), dtype)},
                 (((tiles.block_k, width), jnp.float32), ((tiles.block_k, value_width), jnp.float32),
                  ((tiles.block_q, width), jnp.float32),
-                 *(((tiles.block_q, tiles.block_k), jnp.float32),) * 10))))
+                 *(((tiles.block_q, tiles.block_k), jnp.float32),) * tpu_backward_score_tiles()))))
             for layout, tiles, allocations, reduces in launches)
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
         # None on a family that budgets none (`Family.budgets_registers`), which holds every config.

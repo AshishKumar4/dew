@@ -1824,3 +1824,33 @@ def test_derived_one_consumer_heights_are_compared_by_choose():
                                        walks=program.walked_extents, choose=choose)
     assert picked is not None and (picked.block_q, picked.block_k) == (64, 64), (picked, seen)
     assert any({(c.block_q, c.block_k) for c in group} >= {(128, 32), (64, 64)} for group in seen), seen
+
+
+@COMPILES_ON_CPU
+def test_sm90_fed_fused_backward_deepens_to_3_stages_and_compiles_spill_free():
+    """Row 5272: sm90 WgmmaFed fused backward (`dkv_fused`, llama3.2-1b d64) deepens its TMA ring to
+    3 stages while preserving `streamed_statistics >= 3` and compiles spill-free."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((2, 4096, 32, 64), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, 8, 64), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, residuals=shapes,
+                                                   accurate=False)
+        ba = op.bind(*args, interpret=False)
+        cfg = op.derived(ba, target)
+        assert cfg is not None and cfg.fused and cfg.stages >= 3, cfg
+
+        def _make():
+            def backward(query, key, value, dout, residuals):
+                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                                  residuals=residuals, accurate=False)
+                return grads.query, grads.key, grads.value
+            return backward, (q, k, k, q, shapes)
+
+        found = compile_mosaic_kernels([KernelCase("sm90-fed-fused-d64", _make)], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

@@ -2210,6 +2210,21 @@ launch over a shared dQ streams each beside its queries, and the fused launch th
 STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total", "delta", *STATISTICS)))
 """Stream priority for per-query statistics (`STATISTICS`): `peak`, `total`, and `delta` first so
 the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
+def tpu_forward_score_tiles(*, natural_form: bool, scaled: bool) -> int:
+    """Live `(block_q, block_k)` fp32 intermediate tiles held in TPU VMEM during a forward step:
+    base softmax fold (logits, mask/coords, shifted, exp, weights, rescaled) plus the extra
+    natural-form/scaled-walk intermediates when active (`MosaicForward._staged_bytes`, row 10771)."""
+    base = ("logits", "coords", "shifted", "exponentials", "weights", "rescaled")
+    extra = ("scaled_logits", "small_weights", "small_exp", "guard_mask", "scaled_sum", "restored")
+    return len(base) + (len(extra) if natural_form or scaled else 0)
+
+
+def tpu_backward_score_tiles() -> int:
+    """Live `(block_q, block_k)` fp32 intermediate tiles held in TPU VMEM during a backward step:
+    scores, score cotangents, coords/mask, shifted logits, exponentials, weights, dP, dS, and the
+    two product-operand casts (`MosaicBackward.staged_bytes`, row 10771)."""
+    return len(("logits", "dp", "coords", "mask", "shifted", "exponentials", "weights", "ds",
+                "weights_cast", "ds_cast"))
 
 
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
