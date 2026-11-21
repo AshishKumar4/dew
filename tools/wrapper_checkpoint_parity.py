@@ -10,17 +10,12 @@ import dataclasses
 import functools
 import json
 from pathlib import Path
+from typing import Any
 
 import jax
 import numpy as np
 import torch
-from transformers import (
-    AutoConfig,
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    GenerationMixin,
-    PreTrainedModel,
-)
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, PreTrainedModel
 
 from dew._accuracy import distance
 from dew.interop import PretrainedDecoder
@@ -102,10 +97,9 @@ class Runs:
     def continued(self, batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dew's greedy continuation of `batch` by CONTINUATION tokens, the reference's, and the reference's
         logits at each of its steps."""
-        # A model that generates is a GenerationMixin (transformers 5's PreTrainedModel is not one).
-        model = self.reference_model
-        if not isinstance(model, GenerationMixin):
-            raise TypeError(f"{type(model).__name__} does not generate: no continuation to compare")
+        # transformers types `generate`'s model as a protocol its own models meet only at runtime (their
+        # quantizer, set as they load), so it is called as the loaded model holds it.
+        model: Any = self.reference_model
         with torch.no_grad():
             generated = model.generate(
                 **tensors(batch), max_new_tokens=CONTINUATION, do_sample=False, eos_token_id=None,

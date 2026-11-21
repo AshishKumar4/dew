@@ -552,7 +552,7 @@ def compiled_step(case, fields: Layout, batch, *, one_device: bool = False,
     step = trainer.compile(state, data)
     compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
-                "replicated": replicated_share(case, trainer.objective, fields.get("stage", 1))}
+                "replicated": replicated_share(case, trainer.objective, sizes(fields).get("stage", 1))}
     return state, data, step, compiled, trainer
 
 

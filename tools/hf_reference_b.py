@@ -117,6 +117,7 @@ What lands in tests/fixtures/gemma4, for tests/test_gemma4_moe.py:
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -985,7 +986,7 @@ def write_llama4_blocks(directory: Path) -> None:
     hidden = torch.randn(2, 12, config.hidden_size, generator=generator)
     positions = torch.arange(12)[None]
     rotary = Llama4TextRotaryEmbedding(config)
-    arrays: dict[str, np.ndarray] = {"hidden": hidden.numpy()}
+    arrays: dict[str, Any] = {"hidden": hidden.numpy()}
     # Layer 0 rotates and chunks, layer 3 is the global layer of the pattern.
     for name, index in (("local", 0), ("global", 3)):
         attention = Llama4TextAttention(config, layer_index := index).eval()
@@ -1006,7 +1007,7 @@ def write_llama4_blocks(directory: Path) -> None:
     scatter_weights(moe, seed=43)
     with torch.no_grad():
         output, _ = moe(hidden)
-    arrays = {"hidden": hidden.numpy(), "output": output.numpy()}
+    arrays: dict[str, Any] = {"hidden": hidden.numpy(), "output": output.numpy()}
     arrays.update({f"feed_forward.{tensor_name}": tensor.detach().numpy()
                    for tensor_name, tensor in moe.named_parameters()})
     np.savez(directory / "moe.npz", **arrays)
