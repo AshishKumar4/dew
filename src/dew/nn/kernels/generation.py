@@ -1665,7 +1665,6 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live) if live_cotangents
                                                  else None))
             cotangents = pulled_back if live_cotangents else [pulled_back[index] for index in live]
-            # Each summed to its operand's type (`sharding.summed_to`).
             leaves = jax.tree.leaves(operands)
             return [summed_to(each, leaves[index]) for each, index in zip(cotangents, live, strict=True)]
 
