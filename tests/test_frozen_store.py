@@ -338,14 +338,14 @@ def test_an_exported_step_restores_whole_in_stock_orbax_with_no_dew(tmp_path):
         records(rows), steps=2, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     assert FROZEN in state.variables and state.ema is not None
-    program = ("import json, sys\\n"
-               "import numpy as np\\n"
-               "import orbax.checkpoint as ocp\\n"
-               "from flax.traverse_util import flatten_dict\\n"
-               "restored = ocp.StandardCheckpointer().restore(sys.argv[1])\\n"
-               "assert not any(name.startswith('dew') for name in sys.modules)\\n"
-               "print(json.dumps({'/'.join(map(str, path)): np.asarray(value).tolist()\\n"
-               "                  for path, value in flatten_dict(restored).items()}))\\n")
+    program = ("import json, sys\n"
+               "import numpy as np\n"
+               "import orbax.checkpoint as ocp\n"
+               "from flax.traverse_util import flatten_dict\n"
+               "restored = ocp.StandardCheckpointer().restore(sys.argv[1])\n"
+               "assert not any(name.startswith('dew') for name in sys.modules)\n"
+               "print(json.dumps({'/'.join(map(str, path)): np.asarray(value).tolist()\n"
+               "                  for path, value in flatten_dict(restored).items()}))\n")
     ran = subprocess.run([sys.executable, "-c", program, str(tmp_path / "run" / "2" / "exported")],
                          capture_output=True, text=True, timeout=300, check=False)
     assert ran.returncode == 0, ran.stderr[-3000:]
