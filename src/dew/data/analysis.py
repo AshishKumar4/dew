@@ -908,7 +908,8 @@ def reach(stages: Sequence[Stage], unending: bool) -> tuple[bool, bool]:
 
 
 def _analyzed(
-    pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False, bound: bool = False
+    pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False, bound: bool = False,
+    sealing: bool = False,
 ) -> _Lowering:
     """The analysis of `pipeline` at `read`, a scored branch with
     `validation`. A token split in a training order cut per share is refused
@@ -931,7 +932,8 @@ def _analyzed(
             kind, verb = ("concatenation", "concat") if joined else ("mixture", "mix")
             raise ValueError(f"{kind} member {_name(batched)} is batched; a {kind} batches once, after "
                              f"{verb}: move the member's batch and the stages after it onto the {kind}")
-    lowered = tuple(_analyzed(child, read, validation=validation, promotion=promotion) for child in nested)
+    lowered = tuple(_analyzed(child, read, validation=validation, promotion=promotion, sealing=sealing)
+                    for child in nested)
     # A concatenation's members each end where they are read, so the join is finite where its own stages
     # leave it so: a member's repeat repeats that member alone.
     ancestry = tuple(stage for child in nested for stage in _steps(child)
@@ -958,7 +960,8 @@ def _analyzed(
         if not held:
             break
         eager += held
-    per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
+    per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion,
+                         sealing=sealing)
     if isinstance(source, Mixture) and source.tokens is not None:
         per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in lowered)
@@ -1122,9 +1125,12 @@ def _checked(
     *,
     validation: bool,
     promotion: bool,
+    sealing: bool = False,
 ) -> bool:
     """Walk the stages once, refusing what no lowering takes where it stands,
-    and say whether the order must be cut per share."""
+    and say whether the order must be cut per share. A `sealing` pass (a snapshot's) is a scored one whose
+    draws stand as its records do in the one order it seals: no draw of its is held to the canonical index
+    (row 10567)."""
     from dew.data.handoff import pooled
     random = next((_identity(stage).name for stage in ancestry if isinstance(stage, RandomMap)), None)
     indexed, batched, workers, host = read != "streamed", False, False, False
@@ -1165,7 +1171,7 @@ def _checked(
         finite = finite and not isinstance(stage, Repeat)
         if _random(stage):
             random = _identity(stage).name
-            if validation and not canonical:
+            if validation and not canonical and not sealing:
                 raise ValueError(f"validation random step {random} must use the canonical record index")
         drops = _drops(stage, pipeline.stages[index + 1:])
         reorders = isinstance(stage, (Shuffle, Repeat, Slice, Limit)) or drops

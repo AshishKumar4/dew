@@ -155,7 +155,7 @@ def _materialize(
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
     # A sealing pass's draws stand as its records do (`compile._prepared`'s `sealing`).
-    lowering = _analyzed(pipeline, "memory", validation=not training and not sealing)
+    lowering = _analyzed(pipeline, "memory", validation=not training, sealing=sealing)
     # A cache among the eager stages fills over the whole source here; one after a view of the
     # inputs is the lowering's, which reads it by input (`_Build.indexed`).
     eager = lowering.cache if lowering.cache is not None and lowering.eager > lowering.cache else None

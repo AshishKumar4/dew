@@ -570,7 +570,7 @@ def _prepared(
         trained = _row_tokens(branches[0])
         branches = tuple(_budgeted(branch, trained) for branch in branches)
     for branch, scored in zip(branches, held, strict=True):
-        _analyzed(branch, read, validation=scored and not sealing)
+        _analyzed(branch, read, validation=scored, sealing=sealing)
     return branches
 
 
@@ -625,10 +625,10 @@ def _measure(
         raise ValueError(f"unknown read mode {read!r}")
     held = [not training or index > 0 for index in range(len(branches))]
     for branch, scored in zip(branches, held, strict=True):
-        _analyzed(branch, read, validation=scored and not sealing, promotion=True)
+        _analyzed(branch, read, validation=scored, promotion=True, sealing=sealing)
     branches = tuple(_promoted(branch) for branch in branches)
     for branch, scored in zip(branches, held, strict=True):
-        _analyzed(branch, read, validation=scored and not sealing)
+        _analyzed(branch, read, validation=scored, sealing=sealing)
     _capabilities(branches, read, provision,
                   [branch for branch, scored in zip(branches, held, strict=True) if scored])
     branches = _pin_sources(branches, read)
@@ -2010,7 +2010,7 @@ def iterate(
                         read, ({},), training=False, sealing=sealing)
     # Publication reads records, unbatched.
     build = _build(pipeline, read, loading, batch=1, training=False, seed=0 if seed is None else seed,
-                   lowering=_analyzed(pipeline, read) if sealing else None)
+                   lowering=_analyzed(pipeline, read, validation=True, sealing=True) if sealing else None)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 
