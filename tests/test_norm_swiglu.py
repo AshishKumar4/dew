@@ -119,9 +119,10 @@ def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
                     draw, label, seeds=seeds, truth_fn=truth)
 
 
-def compare(functions, draw, labels, seeds, *, judged=None):
+def compare(functions, draw, labels, seeds, *, judged=None, site: str = ""):
     """Every output's dtype on `draw`'s first operands (`gated`); the accuracy of the `judged` labels (every
-    one by default) held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`)."""
+    one by default) held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`), its site's label the
+    labels' and `site`'s, where one test compares several (a GPU tier part's store holds one site a label)."""
     xla, pallas, exact = functions
     operands, seed = draw(0)
     # Their types alone, nothing computed: a GPU tier part's prepare computes nothing before the site below.
@@ -133,7 +134,7 @@ def compare(functions, draw, labels, seeds, *, judged=None):
         return {label: value for label, value in zip(labels, result, strict=True)
                 if value is not None and label in (judged or labels)}
 
-    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(judged or labels), seeds)
+    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(judged or labels) + site, seeds)
 
 
 def gated(labels, actual, reference):
@@ -544,10 +545,13 @@ def each_config_holds(kernel, functions, draw, labels, seeds):
     operands, seed = draw(0)
     configs = each_config(kernel, functools.partial(evaluated, functions[1]), operands, seed)
     assert len(configs) > 1
+    # Each config's site its own: a GPU flow's cells share their test's store, which holds one site a label
+    # (the norm cells' "y x scale" at every kernel, dtype, row shape and config collided there).
+    over = ", ".join(f"{np.shape(leaf)} {np.dtype(leaf.dtype).name}" for leaf in jax.tree.leaves(operands))
     for config in configs:
         try:
             with tuning.pinned({kernel: config}):
-                compare(functions, draw, labels, seeds)
+                compare(functions, draw, labels, seeds, site=f", {kernel.__name__} at {config} over {over}")
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
