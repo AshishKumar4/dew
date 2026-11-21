@@ -403,7 +403,7 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, s
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("generation_name", "width"), [("sm80", 64), ("sm90", 256), ("sm100", 256)])
+@pytest.mark.parametrize(("generation_name", "width"), [("sm80", 64), ("sm100", 256)])
 def test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources(generation_name, width):
     """Row 7263: a public fp32 decode whose head width or GPU falls back to Pallas-Triton plain-forward
     kernels (`attention_route.attend`: sm80 64-wide, sm90/sm100 256-wide) reports every Triton kernel's

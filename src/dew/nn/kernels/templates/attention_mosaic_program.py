@@ -539,7 +539,7 @@ def walked_extents(family: mosaic.Family, dtype, extent: int, *, parts: int = 1)
     staged for, `placed.walked_swizzles`; tcgen05's rows' a swizzle's 64 rows)."""
     if family.places_on_role:
         unit = family.walked_rows
-    elif parts > 1:
+    elif parts > 1 and not scopes_products(family):
         unit = min(family.column_unit(dtype), swizzling.swizzle_columns(dtype, 64))
     else:
         unit = family.column_unit(dtype)
@@ -594,7 +594,8 @@ def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles", *, parts:
     rows, a row a consumer thread: a keys-first walk's its key block (`placed.KEYS`)."""
     held, walked = held_walked(family, tiles)
     rows = held == family.rows if family.places_on_role else held % family.rows == 0
-    walked_unit = (min(family.walked_rows, 32) if parts > 1 and not family.places_on_role
+    walked_unit = (min(family.walked_rows, 32)
+                   if parts > 1 and not family.places_on_role and not scopes_products(family)
                    else family.walked_rows)
     return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
             and rows and walked % walked_unit == 0)

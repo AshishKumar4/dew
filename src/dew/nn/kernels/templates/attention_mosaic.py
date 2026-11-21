@@ -111,6 +111,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     refused,
     scaled_drop,
+    scopes_products,
     score_places,
     split_queries,
     stagings,
@@ -788,7 +789,8 @@ class MosaicForward(_Mainloop[Tiles]):
             return False
         # wgmma's P·V depth (`block_k`) must be a multiple of V's swizzle tile (`swizzle_for(val_columns)`):
         # 64 for >=64-column V blocks, 32 for 32-column V blocks (row 6508).
-        if (self.parts > 1 and not family.places_on_role and not family.operands_in_registers
+        if (self.parts > 1 and not family.places_on_role and not scopes_products(family)
+                and not family.operands_in_registers
                 and config.block_k % swizzling.swizzle_columns(
                     query.dtype, swizzling.swizzle_for(query.dtype, val_columns))):
             return False
