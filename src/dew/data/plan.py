@@ -1058,9 +1058,11 @@ class Plan:
             return self
         with described_under(version):
             fresh = self.rebuilt()
-        # What the rule describes, its manifest and members' digests, as it describes them; the rest as this
-        # plan holds it, what its read set on it after it was built (its topology) among it.
-        return dataclasses.replace(self, manifest=fresh.manifest, members=fresh.members, rebuilt=None)
+        # What the rule describes, its manifest, members' digests and derived facts (a store's lengths, which
+        # a rule before `ASKED` recorded for every store), as it describes them; the rest as this plan holds
+        # it, what its read set on it after it was built (its topology) among it.
+        return dataclasses.replace(self, manifest=fresh.manifest, members=fresh.members,
+                                   derived=fresh.derived, rebuilt=None)
 
     def record(self) -> dict[str, JSON]:
         """The plan as a position holds it, its order's stages held by their steps' places in its manifest

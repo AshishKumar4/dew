@@ -35,6 +35,11 @@ class Delta(Files):
         """The file as the table's log names it, where Delta's dataset reads it."""
         return path
 
+    def _read_files(self) -> tuple[str, ...]:
+        """The files of the table's version as its log names them (`DeltaTable.files`), its dataset
+        unbuilt, which a resume's shards name alike wherever the table is mounted."""
+        return tuple(self.table.files())
+
     @cached_property
     def paths(self) -> tuple[str, ...]:
         return tuple(self.table.file_uris())

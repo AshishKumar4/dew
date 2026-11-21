@@ -1792,6 +1792,41 @@ def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
     assert {rows[index]["split"] for index in range(len(rows))} == {"train", "held"}
 
 
+def test_a_delta_runs_position_resumes_on_its_table_moved_elsewhere(tmp_path):
+    """A Delta table's streamed position, saved over the table at one place, resumes over the table copied
+    to another onto the rows after: its shards are named as its log names its files, not where they are
+    mounted (row 9009's review: absolute URIs refused the moved table's resume)."""
+    import shutil
+
+    from deltalake import write_deltalake
+
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.delta import Delta
+
+    root = str(tmp_path / "delta")
+    write_deltalake(root, pa.table({"value": list(range(8))}))
+    loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+
+    def opened(table):
+        return compile(Pipeline(table).batch(2), read="streamed", loading=loading).train(DataPartition())
+
+    stream = opened(Delta(root))
+    try:
+        next(stream)
+        saved = stream.get_state()
+        expected = np.asarray(next(stream)["value"]).tolist()
+    finally:
+        stream.close()
+    shutil.copytree(root, tmp_path / "moved")
+    moved = opened(Delta(str(tmp_path / "moved")))
+    try:
+        moved.set_state(saved)
+        assert np.asarray(next(moved)["value"]).tolist() == expected
+    finally:
+        moved.close()
+
+
 def test_a_delta_run_resumes_with_its_version_pinned_and_refuses_another_predicate(tmp_path):
     """A table's identity is its resolved version, files and read options: a run started on the
     table's head resumes exactly with that version pinned, and a run reading it through another

@@ -863,6 +863,11 @@ class Files(Dataset):
         (`_arrow_files`), which its shards' ids are made of."""
         return self._places[self._arrow_files[2][path]]
 
+    def _read_files(self) -> tuple[str, ...]:
+        """The names of the files its dataset reads, in its order, each its shard's (`_shard_name`), read off
+        the paths Arrow reads with no dataset built."""
+        return tuple(self._shard_name(path) for path in (self._arrow_files[1] if self.paths else ()))
+
     @cached_property
     def arrow(self) -> ds.Dataset:
         filesystem, paths, _, base = self._arrow_files
@@ -937,7 +942,8 @@ class Files(Dataset):
         if (self.kind not in ("jsonl", "text", "csv") or self.where is not None or not self.paths
                 or any(infer_compression(url.lower()) for url in self.paths) or not self.supports("indexed")):
             return self.manifest()
-        return _single_indexed_manifest(self, self.describe())
+        # Named by its files' places (`_places`), which every host that mounted them anywhere names alike.
+        return _single_indexed_manifest(self, ",".join(self._places[url] for url in self.paths))
 
     def manifest(self) -> ShardManifest:
         """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a fill
@@ -985,10 +991,9 @@ class Files(Dataset):
         Each file's rows are counted from its footer where a read needs them (`ShardManifest.sized`), unless
         `where` filters them, and its row groups are its shards where readers and workers outnumber its
         files (`_row_groups`)."""
-        # Named by the paths Arrow reads, each a fragment of its dataset in turn, its schema unread
-        # (row 9009: a compile building the dataset read every file's).
-        shards = tuple(Shard(name, name, number) for number, name in enumerate(
-            self._shard_name(path) for path in (self._arrow_files[1] if self.paths else ())))
+        # Named by the files Arrow reads, its dataset unbuilt and its schema unread (row 9009: a compile
+        # building the dataset read every file's).
+        shards = tuple(Shard(name, name, number) for number, name in enumerate(self._read_files()))
         return ShardManifest(shards, self._read_shard, self._row_groups,
                              counted=None if self.where is not None else self._file_rows, fixed_parts=True)
 

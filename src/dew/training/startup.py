@@ -155,6 +155,13 @@ def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "
     checkpoints = trainer.checkpoints
     if checkpoints is None:
         return None
+    if checkpoints.export_model:
+        from dew.checkpoints._exported import export_refusal
+        from dew.mesh import STAGE_AXIS
+
+        # Refused as the run starts, not at its last checkpoint.
+        if (refusal := export_refusal(trainer.device_mesh, STAGE_AXIS)) is not None:
+            raise ValueError(refusal)
 
     def continued() -> int | None:
         step, held = checkpoints.resumed(resume), max(checkpoints.committed(), default=None)

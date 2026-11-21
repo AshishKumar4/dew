@@ -52,3 +52,17 @@ def test_a_positioned_stream_reads_the_records_a_producers_subset_index_lists(tm
     indexed = files.records("indexed")
     expected = [(place, indexed[place]["id"]) for place in range(len(indexed))]
     assert sorted(numbered(files)[:len(expected)]) == expected and expected[1] == (1, 2)
+
+
+def test_a_positioned_streams_shards_are_named_alike_wherever_its_store_is_mounted(tmp_path):
+    """One indexed JSONL store at two mounts (two hosts', a resume's after a move): its positioned stream's
+    shards are named alike at both, by its files' places, so a position one saved resumes on the other (row
+    9051's review: they were named by the mount's path)."""
+    for mount in ("a", "b"):
+        (tmp_path / mount / "data").mkdir(parents=True)
+        path = tmp_path / mount / "data" / "rows.jsonl"
+        path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
+        Files(str(path), shard_bytes=40).provision()
+    first, second = (Files(str(tmp_path / mount / "data" / "rows.jsonl"),
+                           shard_bytes=40).positioned_manifest() for mount in ("a", "b"))
+    assert [shard.id for shard in first.shards] == [shard.id for shard in second.shards]

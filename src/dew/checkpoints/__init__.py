@@ -976,10 +976,8 @@ class Checkpoints:
     because no process holds another process's shards (`_check_placement`);
     one process's, and the persistent checkpoint, restore onto any mesh.
 
-    `export_model` writes beside each persistent step of a train state its model whole (`EXPORTED`): its
-    variables, every collection the store dedups among them (a LoRA base), and its EMA as its own arrays,
-    in Orbax's standard layout, so stock Orbax reads it with no Dew (`<step>/exported`), at one copy of the
-    model a step; a run that keeps only its final checkpoint exports only that one.
+    `export_model` writes beside each persistent step of a train state its model whole (`EXPORTED`), every
+    collection (a LoRA base) and EMA as their own arrays, in Orbax's standard layout stock Orbax reads.
     """
 
     def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
@@ -1541,7 +1539,7 @@ class Checkpoints:
                     name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
                     for name, tree in payloads.items()}
                 if self.export_model and not mapping:
-                    written[EXPORTED] = ocp.args.StandardSave(exported(state, held_apart))
+                    written[EXPORTED] = ocp.args.StandardSave(exported(state))
                 persistent.save(step, args=ocp.args.Composite(**written),
                                 metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
@@ -1605,12 +1603,14 @@ class Checkpoints:
                     continue
                 root = epath.Path(self.path(step))
                 kept = [name for name in ROLES if name in needed and name in payloads]
-                leftover = not self._swept and any((root / name).exists() for name in ROLES
-                                                   if name not in kept)
+                # A step's exported model is its model's: kept with it, else cut with it (`EXPORTED`).
+                own, items = [*kept, *([EXPORTED] if MODEL in kept else [])], (*ROLES, EXPORTED)
+                leftover = not self._swept and any((root / name).exists() for name in items
+                                                   if name not in own)
                 if len(kept) == len(payloads) and not leftover:
                     continue
                 write_atomically(root / PROJECTED, json.dumps(kept))
-                doomed += [root / name for name in ROLES if name not in kept and (root / name).exists()]
+                doomed += [root / name for name in items if name not in own and (root / name).exists()]
                 cuts[str(step)] = kept
         cuts = broadcast_from_process_zero(cuts)
         if doomed:

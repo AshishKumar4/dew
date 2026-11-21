@@ -1,6 +1,8 @@
 """A dataset's facts (`Dataset.facts`), read without opening a reader: what its stores state, then what
 each step makes of them, in order. They say what the first batch the chain makes holds."""
 
+import itertools
+import json
 from pathlib import Path
 
 import numpy as np
@@ -246,3 +248,39 @@ def test_a_seeded_streamed_mix_of_raw_parquet_stores_reads_no_schema_to_compile(
     finally:
         stream.close()
     assert SCHEMAS_READ
+
+
+def test_a_position_saved_under_plan_16_of_a_store_stating_lengths_resumes_under_17(tmp_path):
+    """A store whose files state each row's length (a `length` column), read whole with no packing: a
+    position its read saved under plan 16, which recorded every store's lengths, resumes under this Dew's
+    plan (17), which records them only where a step packs by them, onto the rows after (row 9009's review:
+    the earlier plan's derived facts were compared with this Dew's)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.pipeline import Pipeline
+    from dew.data.plan import DECIDED, described_under
+
+    pq.write_table(pa.table({"x": list(range(12)), "length": [3] * 12}), tmp_path / "rows.parquet")
+
+    def loader():
+        return compile(Pipeline(Files(str(tmp_path / "rows.parquet"))).batch(2), read="streamed",
+                       loading=Loading(workers=0))
+
+    def read(stream, count) -> list[int]:
+        return [int(value) for batch in itertools.islice(stream, count) for value in batch["x"]]
+
+    with described_under(DECIDED):
+        saving = loader().train(DataPartition())
+        try:
+            assert read(saving, 2) == [0, 1, 2, 3]
+            saved = saving.get_state()
+        finally:
+            saving.close()
+    assert json.loads(saved)["dew_data_plan"]["version"] == DECIDED
+    resumed = loader().train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert read(resumed, 2) == [4, 5, 6, 7]
+    finally:
+        resumed.close()
