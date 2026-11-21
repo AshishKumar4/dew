@@ -91,10 +91,12 @@ def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, b
 
 
 TRITON_ALGORITHMS = tuple(preset for preset in jax.lax.DotAlgorithmPreset
-                          if preset.name.startswith(("TF32", "F32", "F16", "BF16")))
+                          if preset.supported_lhs_types is not None
+                          and preset is not jax.lax.DotAlgorithmPreset.F64_F64_F64)
 """The dot algorithms Pallas's Triton lowering runs as named (`_dot_general_lowering`): TF32's one and three
 passes and IEEE fp32 as `tt.dot`'s input precisions, each 16-bit one as its operands' own product, and a bf16
-split of fp32 operands (X3, X6, X9) as its parts' bf16 products; an FP8 one and fp64's it refuses."""
+split of fp32 operands (X3, X6, X9) as its parts' bf16 products; of those naming their operand types, it
+refuses fp64's (the default and the FP8 ones name none)."""
 
 
 def _upstream(dtype, ieee: bool) -> jax.lax.DotAlgorithmPreset:
