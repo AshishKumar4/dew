@@ -90,14 +90,11 @@ def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, b
         write_rows(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=ieee))
 
 
-TRITON_ALGORITHMS = (jax.lax.DotAlgorithmPreset.TF32_TF32_F32, jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3,
-                     jax.lax.DotAlgorithmPreset.F32_F32_F32, jax.lax.DotAlgorithmPreset.F16_F16_F16,
-                     jax.lax.DotAlgorithmPreset.F16_F16_F32, jax.lax.DotAlgorithmPreset.BF16_BF16_BF16,
-                     jax.lax.DotAlgorithmPreset.BF16_BF16_F32)
+TRITON_ALGORITHMS = tuple(preset for preset in jax.lax.DotAlgorithmPreset
+                          if preset.name.startswith(("TF32", "F32", "F16", "BF16")))
 """The dot algorithms Pallas's Triton lowering runs as named (`_dot_general_lowering`): TF32's one and three
-passes and IEEE fp32 as `tt.dot`'s input precisions, and each 16-bit one as its operands' own product. A
-bf16 split of fp32 operands (X3, X6, X9) it issues as one `tt.dot` of no input precision, Triton's default
-IEEE fp32 product (TritonOps.td's `inputPrecision`), not the split it names."""
+passes and IEEE fp32 as `tt.dot`'s input precisions, each 16-bit one as its operands' own product, and a bf16
+split of fp32 operands (X3, X6, X9) as its parts' bf16 products; an FP8 one and fp64's it refuses."""
 
 
 def _upstream(dtype, ieee: bool) -> jax.lax.DotAlgorithmPreset:
@@ -875,8 +872,8 @@ def _summed_back(index, pairs, after, *, exact: bool):
 
 def _exactly(x, mask, exact: bool):
     """`x @ mask` fp32 for a mask of zeros and ones, each product exact: at least IEEE fp32's (`_dot`'s
-    `ieee`; the bf16x6 named here Triton ran as that product, `TRITON_ALGORITHMS`); interpreted, as `_dot`
-    sums an fp32 contraction."""
+    `ieee`: bf16x6's three parts of an fp32 value its 24 bits, where one IEEE product compiles to FMA loops
+    on sm80, at the target's cost); interpreted, as `_dot` sums an fp32 contraction."""
     x = x.astype(jnp.float32)
     return _dot(x, mask, exact=True) if exact else _dot(x, mask, exact=False, ieee=True)
 
