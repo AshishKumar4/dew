@@ -514,12 +514,21 @@ def _refuse_reshaped(template, stored, where: str) -> None:
 
 def _packed_checked(tree) -> None:
     """Refuse a restored tree holding a packed bank whose words another encoder packed (its stored form
-    version, `dew.nn.kernels.formats.NvFp4.checked`), as this Dew's decode reads them wrong."""
+    version, `dew.nn.kernels.formats.NvFp4.checked`), gathering every packed leaf's form whole across
+    processes in one collective (`collective_host`, row 8958)."""
+    from dew._coordination import collective_host
     from dew.nn.kernels.formats import NvFp4
 
-    for leaf in jax.tree.leaves(tree, is_leaf=lambda leaf: isinstance(leaf, NvFp4)):
-        if isinstance(leaf, NvFp4):
-            leaf.checked()
+    packed = [(jax.tree_util.keystr(path, simple=True, separator="/"), leaf)
+              for path, leaf in jax.tree_util.tree_flatten_with_path(
+                  tree, is_leaf=lambda node: isinstance(node, NvFp4))[0]
+              if isinstance(leaf, NvFp4)]
+    forms = collective_host([leaf.form for _, leaf in packed], phase="packed forms")
+    for (name, leaf), form in zip(packed, forms, strict=True):
+        try:
+            leaf.checked(form)
+        except ValueError as error:
+            raise ValueError(f"{name}: {error}") from error
 
 
 def _paths(tree) -> set[str]:

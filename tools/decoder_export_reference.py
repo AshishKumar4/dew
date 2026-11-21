@@ -249,6 +249,8 @@ class _StableTopK(TorchFunctionMode):
 _INDEXERS = {
     'glm5_next_text': ('transformers.models.glm5_next.modeling_glm5_next', 'Glm5NextTextIndexer'),
     'deepseek_v4': ('transformers.models.deepseek_v4.modeling_deepseek_v4', 'DeepseekV4Indexer'),
+    'glm_moe_dsa': ('transformers.models.glm_moe_dsa.modeling_glm_moe_dsa', 'GlmMoeDsaIndexer'),
+    'deepseek_v32': ('transformers.models.deepseek_v32.modeling_deepseek_v32', 'DeepseekV32Indexer'),
 }
 
 
