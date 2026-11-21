@@ -5,6 +5,7 @@ it repeats; at drawn gates it computes the passes unrolled from the stack's own 
 recomputed and decoded alike; and it trains, resumes and loads as a loop does (check 1 throughout)."""
 
 import dataclasses
+import functools
 from pathlib import Path
 
 import jax
@@ -185,11 +186,15 @@ def test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repea
     without the loop: its logits and the gradient of every parameter the decoder holds, the merges'
     gradients apart, on par with the decoder's own in float64 (check 1), whether its layers attend, mix a
     hybrid's delta nets or read Kimi K3's depth residuals, one pass or more (two a later pass traced
-    alone, three a scan of them); at one pass bit for bit."""
+    alone, three a scan of them); at one pass bit for bit. A one-pass loop gaining messages
+    (`with_passes`) of more passes is the attention decoder's loop of them, which that case judges."""
     if form == "one pass gaining messages":
         # A loop of one pass, its step norm as `Loop` defaults it, gaining messages (`with_passes`).
         plain = decoder("attention")
         looped = dataclasses.replace(plain, loop=Loop(1, layers=(1, 4))).with_passes(steps, messages=MESSAGES)
+        if steps > 1:
+            assert looped.loop == decoder("attention", steps=steps).loop
+            return
     else:
         plain, looped = decoder(form), decoder(form, steps=steps)
     draw = with_logit_cotangent(model_draw(looped, (2, 12), VOCAB), VOCAB, 0xC401 + steps)
@@ -206,17 +211,21 @@ def test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repea
         return {"logits": result["logits"], "gradients": {
             **result["gradients"], "params": _without_merges(result["gradients"]["params"])}}
 
-    def unlooped(dtype):
-        model = plain.clone(dtype=dtype)
+    assert_as_exact(merged, _unlooped(form, jnp.float32), draw, f"{form} at zero gates, {steps} passes",
+                    seeds=SEEDS["zero gates"], truth_fn=_unlooped(form, jnp.float64))
 
-        def run(variables, ids, cotangent):
-            logits, gradients = with_gradients(lambda tree: model.apply(tree, ids))(
-                {**variables, "params": _without_merges(variables["params"])}, cotangent)
-            return {"logits": logits, "gradients": gradients}
-        return jax.jit(run)
 
-    assert_as_exact(merged, unlooped(jnp.float32), draw, f"{form} at zero gates, {steps} passes",
-                    seeds=SEEDS["zero gates"], truth_fn=unlooped(jnp.float64))
+@functools.cache
+def _unlooped(form: str, dtype):
+    """The decoder of `form` without its loop in `dtype`, its logits and the gradients of its own
+    parameters, compiled once for every pass count the zero-gates cases judge against it."""
+    model = decoder(form).clone(dtype=dtype)
+
+    def run(variables, ids, cotangent):
+        logits, gradients = with_gradients(lambda tree: model.apply(tree, ids))(
+            {**variables, "params": _without_merges(variables["params"])}, cotangent)
+        return {"logits": logits, "gradients": gradients}
+    return jax.jit(run)
 
 
 def _without_merges(params):
