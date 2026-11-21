@@ -335,11 +335,26 @@ def _emitted_device_bytes(body, *, rows: int, blocks: int) -> float:
                 return True
         return False
 
+    def live_vars(jaxpr) -> set:
+        """Variables that reach a side-effecting store or control-flow input, ignoring `sub(v, v)`
+        type-carrying zero probes (which LLVM folds to 0 and DCEs)."""
+        needed = set(jaxpr.outvars)
+        for eq in reversed(jaxpr.eqns):
+            name = eq.primitive.name
+            if name == "sub" and len(eq.invars) == 2 and eq.invars[0] is eq.invars[1]:
+                continue
+            if name in ("swap", "scan", "while", "cond") or any(v in needed for v in eq.outvars):
+                needed.update(eq.invars)
+        return needed
+
     def walk(jaxpr) -> float:
+        live = live_vars(jaxpr)
         total = 0.0
         for eq in jaxpr.eqns:
             name = eq.primitive.name
             if name == "get":
+                if eq.outvars[0] not in live:
+                    continue
                 aval = eq.outvars[0].aval
                 total += math.prod(aval.shape) * aval.dtype.itemsize
             elif name == "swap":

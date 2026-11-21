@@ -365,7 +365,7 @@ def test_the_sparse_latent_template_shards_over_batch_and_heads():
     latent = jax.ShapeDtypeStruct((batch, keys, rank), jnp.bfloat16)
     rot = jax.ShapeDtypeStruct((batch, keys, rope), jnp.bfloat16)
     indices = jax.ShapeDtypeStruct((batch, length, top_k), jnp.int32)
-    with jax.set_mesh(mesh), generation.assumed("sm90"):
+    with jax.sharding.use_abstract_mesh(mesh), generation.assumed("sm90"):
         traced = jax.make_jaxpr(lambda *args: _template_forward(*args, scale=1.0)[0])(
             absorbed, query_rot, latent, rot, indices)
     (mapped,) = [eq for eq in traced.jaxpr.eqns if eq.primitive.name == "shard_map"]
