@@ -2130,27 +2130,24 @@ def _bf16_parts_for(target_key: str | None, accurate: bool) -> int:
     from dew.nn import programs
 
     need = 6 if accurate else 1
-
-    def admits(preset: jax.lax.DotAlgorithmPreset) -> bool:
-        arith = programs.dot_arithmetic(preset, jnp.float32, jnp.float32)
-        return (arith is not None and arith.operand_bits == (16, 16) and not arith.tf32
-                and arith.accumulation_bits == 32 and not arith.imprecise
-                and arith.operations >= need)
-
-    chosen = product_precision(64, 64, 64, jnp.float32, admits=admits)
+    chosen = product_precision(
+        64, 64, 64, jnp.float32,
+        admits=lambda p: (a := programs.dot_arithmetic(p, jnp.float32, jnp.float32)) is not None and (
+            a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
+            and not a.imprecise and a.operations >= need))
     arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
     assert arith is not None, chosen
     return max(1, (math.isqrt(1 + 8 * arith.operations) - 1) // 2)
 
 
 def bf16_part_count(*, accurate: bool) -> int:
-    """Number of bf16 parts for fp32 attention products (`product.bf16_parts` / `product.formed`), derived
-    from `dew.algebra.error.product_precision` on the active target (row 5473)."""
+    """bf16 parts for fp32 attention products from `dew.algebra.error.product_precision` (row 5473)."""
     from dew.nn.kernels import generation
 
     target = generation.gpu_target()
-    key = target.generation if target is not None else generation.placed_platform()
-    return _bf16_parts_for(key, accurate)
+    return _bf16_parts_for(target.generation if target is not None else generation.placed_platform(),
+                           accurate)
+
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
                       dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool) -> jax.Array:
