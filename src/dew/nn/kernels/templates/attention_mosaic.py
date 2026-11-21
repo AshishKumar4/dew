@@ -111,6 +111,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     refused,
     scaled_drop,
+    scopes_products,
     score_places,
     split_queries,
     stagings,
@@ -363,6 +364,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     UNBUNDLED: ClassVar[str] = "the Mosaic mainloop has no bundle for {name} yet"
     """Why a launch runs on no device of a family it has no bundle of (`declined`)."""
 
+    @property
+    def _tile_parts(self) -> int:
+        return 1
     @staticmethod
     def _bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
         """The bundle the launch runs on (`bundle`)."""
@@ -446,8 +450,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # Blackwell's, an unseen NVIDIA GPU's: `bundles.of`, row 4727).
         alone = family is not None and isinstance(config, Tiles) and config.consumers == 1
         return (family is not None and (walks_whole or alone or not split_queries(family))
-                and whole_tiles(family, config) and self.refusal(ba, family) is None
-                and super().legal(ba, config, target))
+                and whole_tiles(family, config, parts=self._tile_parts)
+                and self.refusal(ba, family) is None and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
@@ -551,6 +555,10 @@ class MosaicForward(_Mainloop[Tiles]):
     """The bf16 parts each of an fp32 call's operands enters as (`product.EXACT_PARTS`, `product.formed`),
     stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
     each 16-bit (attention.md 4b). One for a 16-bit call."""
+
+    @property
+    def _tile_parts(self) -> int:
+        return self.parts
     rounds: float | None = None
     """A quantized model's weights' bound (`Hooks.rounds`), which the anchored training walk rounds them to
     at each row's maximum: a call that keeps its split residuals' alone. None where its weights stay whole."""
@@ -787,6 +795,13 @@ class MosaicForward(_Mainloop[Tiles]):
         if not (family.takes_right(width, config.block_k)
                 and family.takes_right(config.block_k, val_columns)):
             return False
+        # wgmma's P·V depth (`block_k`) must be a multiple of V's swizzle tile (`swizzle_for(val_columns)`):
+        # 64 for >=64-column V blocks, 32 for 32-column V blocks (row 6508).
+        if (self.parts > 1 and not family.places_on_role and not scopes_products(family)
+                and not family.operands_in_registers
+                and config.block_k % swizzling.swizzle_columns(
+                    query.dtype, swizzling.swizzle_for(query.dtype, val_columns))):
+            return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
         tiles = (config.block_k, config.relaunch_k or config.block_k)
@@ -910,8 +925,8 @@ class MosaicForward(_Mainloop[Tiles]):
                 return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
 
             config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits, overlapped=True,
-                              walks=walked_extents, least_walked=functools.partial(_least_keys, family),
-                              choose=choose)
+                              walks=functools.partial(walked_extents, parts=self.parts),
+                              least_walked=functools.partial(_least_keys, family), choose=choose)
             if config is not None:
                 return config
         return None
@@ -1023,7 +1038,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                           columns=columns)
                       for columns in _column_blocks_of(family, query.dtype, value.shape[-1])
                       for consumers in range(config.consumers, 0, -1)
-                      for block in walked_extents(family, query.dtype, config.block_k)
+                      for block in walked_extents(family, query.dtype, config.block_k, parts=self.parts)
                       if config.block_k % block == 0)
         relaunch = next((tiles for tiles in relaunches
                          if self._launch_legal(ba, tiles, target, decides=decides)
