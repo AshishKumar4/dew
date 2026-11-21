@@ -1495,8 +1495,12 @@ class LaterCounts:
                 phases = trainer.phase_passes.apart(count)
                 links = trainer._compiler.links(trainer.device_mesh)
                 compiler = StepCompiler(phases.base, links, None, phases)
-                compiler.admitted_at(trainer._stepping(phases.base, compiler), shapes, batch, cap,
-                                     count).released()
+                stepping = trainer._stepping(phases.base, compiler)
+                # The count its microbatches count their work at, as the loop's step at it states it
+                # (`PhasePasses.drawn_count`): the loop's own count stands at the cap meanwhile.
+                stepping = dataclasses.replace(stepping, settings=dataclasses.replace(
+                    stepping.settings, sampled_passes=count))
+                compiler.admitted_at(stepping, shapes, batch, cap, count).released()
 
         def begin(step, position: int) -> None:
             order = [count for count in step.upcoming(position, UPCOMING_STEPS * step.split)
