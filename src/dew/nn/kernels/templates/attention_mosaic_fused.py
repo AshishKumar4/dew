@@ -58,7 +58,7 @@ def streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int
     (`Transport.copies_vectors`), the most whose rings its block holds beside its own allocations
     (`allocations_of`, defaulting to `_fused_allocations`, against the GPU's `shared_limit`, `launch_scope`);
     a step reads the rest from global memory (`_rows`). `reduced` the launch's warpgroups reserving reduction
-    scratch (`reducing`: a score hook's); `anchored` False drops dead `chosen` on undropped fast-form walks."""
+    scratch (`reducing`: a score hook's); `anchored=False` drops dead `chosen` on undropped fast walks."""
     if not family.copies_vectors:
         return 0
     limit = generation.gpu_target().shared_limit
@@ -197,9 +197,9 @@ def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged
         logits, slopes = gradient.tile_logits(tile_coords.hooked(walk.spec.score_mod), s, seen,
                                               tile_coords.q_pos, tile_coords.k_pos, (), scale=scale,
                                               slopes=True)
-        exponentials, weights = derived_weights(False, how, False).mapped(
+        exponentials, weights = derived_weights(keys_first=False, how=how, accurate=False).mapped(
             {"logits": logits, "peak": peak, "total": total})
-        narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, False)
+        narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped)
         family.staged(narrowed, staged.at[0])
         return weights, slopes, seen
 
@@ -211,7 +211,7 @@ def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged
     tiles_ds = {"weights": weights, "products": dp, "anchor": anchor, "delta": delta}
     if seen is not None:
         tiles_ds["seen"] = seen
-    cotangents = derived_from_weights(False, seen is not None).mapped(tiles_ds)
+    cotangents = derived_from_weights(keys_first=False, masked=seen is not None).mapped(tiles_ds)
     pulled = gradient.pulled(cotangents, slopes, seen, ())[0]
     part = mosaic.unscaled_part(*algebra.cotangent_parts(pulled * walk.grad_scale, q_slot.dtype,
                                                          accurate=False))

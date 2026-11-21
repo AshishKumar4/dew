@@ -1893,7 +1893,11 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
 def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
     """Row 5272: split `derived_weights` + `derived_from_weights` match `derived_cotangents` bit-for-bit
     (masked and unmasked), and `streamed_statistics(..., anchored=False)` excludes dead `chosen`."""
-    from dew.nn.kernels.templates import attention_backward_algebra as bwd_alg, attention_mosaic_fused as fused
+    from dew.nn.kernels.templates import (
+        attention_backward_algebra as bwd_alg,
+        attention_mosaic_fused as fused,
+        attention_mosaic_program as program,
+    )
 
     rng = jax.random.key(5272)
     k1, k2, k3, k4, k5 = jax.random.split(rng, 5)
@@ -1908,12 +1912,13 @@ def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
     for masked in (False, True):
         full_in = {"logits": logits, "products": products, "peak": peak, "total": total,
                    "anchor": anchor, "delta": delta, **({"seen": seen} if masked else {})}
-        e_ref, w_ref, ds_ref = bwd_alg.derived_cotangents(False, False, masked).mapped(full_in)
-        e_got, w_got = bwd_alg.derived_weights(False, accurate=False).mapped(
+        e_ref, w_ref, ds_ref = bwd_alg.derived_cotangents(
+            keys_first=False, dropped=False, masked=masked).mapped(full_in)
+        e_got, w_got = bwd_alg.derived_weights(keys_first=False, accurate=False).mapped(
             {"logits": logits, "peak": peak, "total": total})
         ds_in = {"weights": w_got, "products": products, "anchor": anchor, "delta": delta,
                  **({"seen": seen} if masked else {})}
-        ds_got = bwd_alg.derived_from_weights(False, masked).mapped(ds_in)
+        ds_got = bwd_alg.derived_from_weights(keys_first=False, masked=masked).mapped(ds_in)
         assert jnp.array_equal(e_got, e_ref)
         assert jnp.array_equal(w_got, w_ref)
         assert jnp.array_equal(ds_got, ds_ref)
