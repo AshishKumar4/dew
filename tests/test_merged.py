@@ -445,16 +445,16 @@ def _emitted_device_bytes(body, *, rows: int, blocks: int, slices: int, read_wid
 
 
 def _traced_merge_bytes(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
-                        queries: int, width: int, block: int) -> float:
+                        queries: int, width: int, block: int, *, out_dtype=None,
+                        out_heads: int | None = None) -> float:
     """Independent device-byte count for `merged._launch` at `block` from its emitted Pallas body."""
     batch, slices, _, heads, read_width = padded.shape
     channels = 1 << (width - 1).bit_length()
     launch = functools.partial(merged._launch, units=algebra.units_of(spec), queries=queries, width=width,
-                               block=block)
+                               block=block, out_dtype=out_dtype, out_heads=out_heads)
     (kernel,) = (eq for eq in jax.make_jaxpr(launch)(padded, stacked).jaxpr.eqns if programs.opaque(eq))
     return _emitted_device_bytes(kernel.params["jaxpr"], rows=batch * queries * heads,
                                  blocks=channels // block, slices=slices, read_width=read_width, width=width)
-
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
     """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (rows 8845,
