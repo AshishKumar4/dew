@@ -1518,13 +1518,14 @@ class Dataset:
         return self._then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
 
     def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] | Writer = "array_record",
-                 rows_per_shard: int = 100_000,
-                 deduplicate: NearDuplicates | None = None) -> Mapping[str, object]:
+                 rows_per_shard: int = 100_000, deduplicate: NearDuplicates | None = None,
+                 seed: int = 0) -> Mapping[str, object]:
         """Run this dataset once over every record and seal what it makes at
         `url`: immutable shards and their committed manifest, which
         `Files(url)` reads back, written as ArrayRecord, as Parquet or by a
-        native writer (`dew.data.sinks.Writer`). A fetch's outcomes are sealed with it, so a
-        run that reads the snapshot resumes exactly. With `deduplicate`
+        native writer (`dew.data.sinks.Writer`). A fetch's outcomes are sealed with it, and a random
+        step's draws (`random_map`, a video's clips, say) drawn once under `seed`, which the manifest's
+        metadata records, so a run that reads the snapshot resumes exactly. With `deduplicate`
         (`dew.data.text.NearDuplicates`, the `curation` extra), each group of
         near-duplicates in that one pass is sealed as one record, and the
         manifest's metadata records the rule, DataTrove's release and the
@@ -1532,8 +1533,11 @@ class Dataset:
         from dew.data.sinks import export, passed
 
         chain = self._chain()
+        # The seed is the sealed rows' fact only where a step drew under it.
+        drawn = {"seed": seed} if any(isinstance(stage, RandomMap) for stage in chain.stages) else {}
         if deduplicate is None:
-            return export(chain, url, format=format, rows_per_shard=rows_per_shard)
+            return export(passed(chain, seed), url, format=format, rows_per_shard=rows_per_shard,
+                          metadata=drawn or None)
         import tempfile
         from importlib.metadata import version
 
@@ -1544,13 +1548,15 @@ class Dataset:
         # whatever a fetch makes of them the next time.
         with tempfile.TemporaryDirectory(prefix="dew-deduplicate-") as sealed:
             # A pass that kept no record seals none, and has none to deduplicate.
-            if export(chain, sealed, format="array_record", rows_per_shard=rows_per_shard)["rows"]:
+            sealed_rows = export(passed(chain, seed), sealed, format="array_record",
+                                 rows_per_shard=rows_per_shard)["rows"]
+            if sealed_rows:
                 kept, removed = near_duplicates_removed(lambda: passed(Files(sealed)), deduplicate)
             else:
                 kept, removed = iter(()), 0
             rule = {**dataclasses.asdict(deduplicate), "datatrove": version("datatrove"), "removed": removed}
             return export(kept, url, format=format, rows_per_shard=rows_per_shard,
-                          metadata={"near_duplicates": rule})
+                          metadata={"near_duplicates": rule, **drawn})
 
     def rename_columns(self, names: Mapping[str, str]) -> Pipeline:
         """Each record with its fields renamed, as `rename_columns({"txt": "caption"})`."""

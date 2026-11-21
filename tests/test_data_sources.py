@@ -1261,6 +1261,30 @@ def test_snapshot_provisions_the_requested_indexed_read(tmp_path):
     assert [stored[index] for index in range(len(stored))] == [{"id": 0}, {"id": 1}]
 
 
+def test_a_snapshot_seals_a_random_steps_draws_and_a_publication_holds_none(tmp_path):
+    """A snapshot of a chain with a random step (a video's clip drawn per record, say) draws once under its
+    seed and seals the rows it drew, which read back as drawn, its seed in the manifest's metadata; the
+    same seed seals the same rows, another seed others. A publication, whose cache a later pass writes
+    through, still refuses the draw (row 9056)."""
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    chain = Pipeline(Memory({"id": np.arange(16)}, identity="clips")).random_map(
+        lambda row, rng: {**row, "clip": int(rng.integers(0, 1000))}, identity="clip@1")
+
+    def sealed(name: str, seed: int) -> tuple[list[tuple[int, int]], dict]:
+        manifest = chain.snapshot(str(tmp_path / name), seed=seed)
+        stored = Files(str(tmp_path / name)).records("indexed")
+        return [(int(stored[at]["id"]), int(stored[at]["clip"])) for at in range(len(stored))], manifest
+
+    drawn, manifest = sealed("first", 7)
+    assert [row for row, _ in drawn] == list(range(16)) and manifest["metadata"]["seed"] == 7
+    assert sealed("again", 7)[0] == drawn
+    assert sealed("other", 8)[0] != drawn
+    with pytest.raises(ValueError, match="publication needs deterministic"):
+        iterate(chain)
+
+
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")
     manifest = export(
