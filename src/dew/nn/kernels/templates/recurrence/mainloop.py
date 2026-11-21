@@ -693,6 +693,11 @@ def named(name: str, call: "Call | None") -> str:
     return name.replace("recurrence", "recurrence_alone", 1) if call is not None and call.alone else name
 
 
+def ran_alone(kernel: str) -> bool:
+    """Whether a forward alone launched `kernel` (`named`): a refusal of it is that product's alone."""
+    return kernel.startswith("recurrence_alone")
+
+
 def building(kernels: Callable[[Callable], Collection[str]]) -> Callable[[Callable], Callable]:
     """`lowered_once` for launches building the `kernels` of their function: each given its call and tiles
     narrowed to those kernels' producers (`Call.at`, `Tiles.at`), named as its call launches them

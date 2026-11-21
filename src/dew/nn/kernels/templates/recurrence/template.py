@@ -506,7 +506,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if family is None:
             return self.takes(ba, tiles, target)
         return (self._product_fits(ba, tiles, target, training=training)
-                and not self._refused(ba, tiles, target))
+                and not self._refused(ba, tiles, target, training=training))
 
     def _product_fits(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
                       *, training: bool) -> bool:
@@ -519,8 +519,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return (max(launch.shared for launch in launches) <= self.program_shared(tiles, target)
                 and self._launches_hold(launches, family))
 
-    def _refused(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
-                 ) -> bool:
+    def _refused(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
+                 *, training: bool | None = None) -> bool:
         """Whether a compile refused `tiles` past what its derivation's raise answers (`_exhausted`), or a
         launch it spilled so at other tiles plans at `tiles` as it did there but its grid (`_spilled`): the
         same kernel at the same registers, shared memory, ring, roles and residency, which a compile spills
@@ -530,13 +530,15 @@ class Mosaic(base.Template[mainloop.Tiles]):
         ring depths, whose ring it does not read, and its training step raised Unfitted after 3,107 s (row
         6816); on an A100 its prefill certified its output walk fifteen times, fourteen spilling 336 bytes at
         255 registers stated alike, and the gated delta net's training call its scores' backward 32 times,
-        each 8 bytes at 255 stated alike."""
-        if self._exhausted(ba, tiles, target):
+        each 8 bytes at 255 stated alike. Asked for one product (`training`: a training call's, else a
+        forward alone's), its own kernels' refusals alone (`mainloop.ran_alone`), so a spill of one leaves
+        the other's tiles as they are (row 10559)."""
+        if self._exhausted(ba, tiles, target, training=training):
             return True
         # Planned only against a spilled launch's plans: where no compile spilled one, every first derivation
         # and every identity unit, its plans' traces read nothing (row 9697: a third of a derivation's plan
         # traces, jsf-holds).
-        spilled = self._spilled(ba, target)
+        spilled = {(name, plan) for name, plan in self._spilled(ba, target) if _of(name, training)}
         return bool(spilled) and not spilled.isdisjoint(self._plans(ba, tiles, target).items())
 
     def _spilled(self, ba: tokamax.BoundArguments, target: generation.GpuTarget
@@ -581,12 +583,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
         refused = [report.refused_at(self, ba, rung) for rung in walk[:walk.index(config) + 1]]
         return frozenset(kernel for kernel in terminal if all(kernel in at for at in refused))
 
-    def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
-                   ) -> bool:
+    def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
+                   *, training: bool | None = None) -> bool:
         """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
-        (`report.refused_at`) whose launch's producer can rise no further, or would leave its tiles unheld
-        (`_raised`)."""
-        spilled = report.refused_at(self, ba, tiles)
+        (`report.refused_at`), of the product `training` names where it names one (`_refused`), whose
+        launch's producer can rise no further, or would leave its tiles unheld (`_raised`)."""
+        spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles) if _of(kernel, training))
         return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
 
     def _plans(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
@@ -957,9 +959,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 training: bool = False) -> mainloop.Launch:
         """The forward's walk over each sequence's chunks, its states launch: a forward without a gradient's,
         or where `training` the forward its fast backward takes (`chunk_forward.kept_forward`)."""
+        # The launch whose ring its tiles' stages are (`mainloop.Launch.ring`), the states launch's alone.
         return next(launch for launch in self.launches(ba, tiles, target, backward=False,
                                                         training_forward=training)
-                    if launch.name.startswith(("recurrence_states", "recurrence_alone_states")))
+                    if launch.ring is not None)
 
     def _blocks(self, ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
                 ) -> list[int]:
@@ -1091,6 +1094,12 @@ def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> f
     alone's, at its own tiles where it has them (`Tiles.forward`)."""
     return report.refused_at(op, ba, tiles) | (report.refused_at(op, ba, tiles.forward) if tiles.forward
                                                else frozenset())
+
+
+def _of(kernel: str, training: bool | None) -> bool:
+    """Whether `kernel` is the product's `training` names (a training call's, else a forward alone's,
+    `mainloop.ran_alone`), every product's where it names none."""
+    return training is None or mainloop.ran_alone(kernel) != training
 
 
 def _owner(kernel: str, names: Iterable[str]) -> str | None:

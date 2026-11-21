@@ -1087,8 +1087,8 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     # The call takes legal tiles other than the refused ones.
     assert legal and stepped != first and taken == (stepped,)
     if kernel == 'recurrence_alone_output':
-        assert dataclasses.replace(stepped, forward=None) == dataclasses.replace(first, forward=None), (
-            first, stepped)
+        trained = [template.MOSAIC.launches(bound, each, target, backward=True) for each in (first, stepped)]
+        assert trained[0] == trained[1], (first, stepped)
 
 
 @pytest.mark.parametrize('product', ['forward', 'fast backward'])

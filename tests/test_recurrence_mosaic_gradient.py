@@ -493,3 +493,34 @@ def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
     # Named apart, a forward alone's (`mainloop.named`).
     alone = [name.replace('recurrence', 'recurrence_alone', 1) for name in trained]
     assert forward == alone, (forward, trained)
+
+
+@pytest.mark.parametrize('kernel', ['recurrence_alone_output', 'recurrence_states'],
+                         ids=['forward alone spent', 'training forward spent'])
+def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
+    """The 27B gated delta net on an H100, one product's kernel refused at every rung of its ladder from the
+    derived tiles' base (`Mosaic.rungs`, as a compile spends it): the derivation steps that product's tiles
+    and leaves the other's launches as they were (`Mosaic._refused`'s product), the training call's where a
+    forward alone spent its output launch, the forward alone's where the training forward spent its states.
+    Named alike, a forward alone's spill refused the training call's candidates too (row 10559)."""
+    from test_recurrence_mosaic import resource_operands
+
+    from dew.nn.kernels.templates import report
+
+    operands = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
+    bound = template.MOSAIC.bind(*operands, None, bound=1.0)
+    alone = mainloop.ran_alone(kernel)
+    with report.refusals(), generation.assumed('sm90'):
+        target = template.Mosaic.launched()
+        first = template.MOSAIC.derived(bound, target)
+        base = template._base(first)
+        report.refuse([(report._identity(template.MOSAIC, bound), rung, {kernel})
+                       for rung in (base, *template.MOSAIC.rungs(bound, base))])
+        stepped = template.MOSAIC.derived(bound, target)
+
+        def others(tiles):
+            if alone:
+                return template.MOSAIC.launches(bound, tiles, target, backward=True)
+            return template.MOSAIC.launches(bound, tiles.forward or tiles, target, backward=False)
+
+        assert stepped is not None and stepped != first and others(stepped) == others(first), (first, stepped)
