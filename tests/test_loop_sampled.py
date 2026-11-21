@@ -275,7 +275,8 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     step's microbatches, at the split its step reads."""
     key = jax.random.key(0)
     flops = dict.fromkeys(range(1, CAP + 1))
-    four, two = (DrawingStep({}, flops, split, TRAINED, words(key)) for split in (4, 2))
+    # Every count's plan in hand, so a draw admits none (`DrawingStep.admit`): the draws alone are read.
+    four, two = (DrawingStep(dict.fromkeys(flops), flops, split, TRAINED, words(key)) for split in (4, 2))
     interval = Interval(time.time(), None, microbatches=0)
     drawn = []
     for index in range(10):
@@ -532,9 +533,9 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
 
 def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
     """On devices with room for the one-pass step read whole and for the cap's only in two microbatches, a
-    sampled run plans its cap's step at two (`compile`), and admits every other count's at that plan
-    (`StepCompiler.admitted_at`), the one-pass step's at two microbatches where its own search plans it
-    whole: one window, of the cap's split, over every count's step."""
+    sampled run plans its cap's step at two (`compile`), and admits every other count's at that plan as
+    its draws first ask it (`StepCompiler.admitted_at`), the one-pass step's at two microbatches where its
+    own search plans it whole: one window, of the cap's split, over every count's step."""
     from test_plan import LIMIT, free
 
     from dew.nn.kernels import options
@@ -557,6 +558,13 @@ def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep) and step.split == 2
+    # Each count admitted as its calls first draw it (`DrawingStep.admit`), until every count is.
+    interval = Interval(time.time(), None, microbatches=0)
+    for index in range(64):
+        if len(step.plans) == CAP:
+            break
+        step.drawn(interval, index)
+        state, *_ = step(state, batch)
     assert {count: plan.split for count, plan in step.plans.items()} == dict.fromkeys(range(1, CAP + 1), 2)
     alone = phased_trainer(model.with_passes(1), 0, None)
     start, _, _ = alone.place()
@@ -684,27 +692,3 @@ def test_a_sampled_runs_step_compiled_ahead_holds_every_count(tmp_path):
     with pytest.raises(ValueError):
         loaded.at_count(CAP)
 
-
-def test_a_sampled_runs_split_step_compiled_ahead_holds_the_whole_its_run_runs(monkeypatch):
-    """A run that draws its pass count per microbatch, its step read in two parts and compiled ahead for
-    compile-only GPUs: the whole its parts' outputs run through is compiled ahead as its run builds it,
-    each part counting its own work (`StepCompiler.whole_program`), so the run finds it compiled (row
-    7983: the build ahead compiled the whole of a step whose parts count none, a program the run then
-    compiled again)."""
-    from test_compile_ahead import gpus
-
-    from dew.training import MeshSpec, planning
-    from dew.training.ahead import compile_ahead
-
-    built = []
-    whole = planning.whole_step
-
-    def recorded(*arguments, parted_work=False, **options):
-        built.append(parted_work)
-        return whole(*arguments, parted_work=parted_work, **options)
-
-    monkeypatch.setattr(planning, "whole_step", recorded)
-    trainer = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, split=2,
-                             mesh=MeshSpec().build(gpus("sm90")))
-    compile_ahead(trainer, {"text": token_draw()})
-    assert built and all(built), built

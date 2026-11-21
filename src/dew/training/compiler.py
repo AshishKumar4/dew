@@ -579,25 +579,26 @@ def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: 
     return stepping
 
 
-def _unlike(cap: Planned, other: Planned) -> list[str]:
-    """What `other`'s step holds or returns otherwise than `cap`'s (`StepCompiler.admitted_at`), each leaf
-    named by its path: the state it prepares, its window among them, with their shapes, dtypes and
-    shardings, and its outputs (`out_info`), the stepped state and the metrics a step's whole pools, these by
-    their nodes' kinds too (`_node_kinds`: a mean pooled as another kind over the same leaves, row 10815)."""
+def _unlike(cap: Candidate, other: Candidate) -> list[str]:
+    """What `other`'s step holds or returns otherwise than `cap`'s (`StepCompiler.lowered_counts`), each
+    leaf named by its path, read off their lowerings: the state it prepares, its window among them, with
+    their shapes, dtypes and shardings, and its outputs (`out_info`), the stepped state and the metrics a
+    step's whole pools, these by their nodes' kinds too (`_node_kinds`: a mean pooled as another kind over
+    the same leaves, row 10815)."""
     def leaves(tree) -> dict[str, tuple]:
         return {jax.tree_util.keystr(path): (getattr(leaf, "shape", None), str(getattr(leaf, "dtype", leaf)),
                                              getattr(leaf, "sharding", None))
                 for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
     unlike: list[str] = []
-    for name, (held, given) in {"state": (cap.candidate.prepared, other.candidate.prepared),
-                                "placement": (cap.candidate.shardings, other.candidate.shardings),
-                                "outputs": (cap.executable.out_info, other.executable.out_info)}.items():
+    for name, (held, given) in {"state": (cap.prepared, other.prepared),
+                                "placement": (cap.shardings, other.shardings),
+                                "outputs": (cap.lowered.out_info, other.lowered.out_info)}.items():
         ours, theirs = leaves(held), leaves(given)
         unlike += [f"{name}{path}" for path in sorted(ours.keys() | theirs.keys())
                    if ours.get(path) != theirs.get(path)]
-    if not unlike and (_node_kinds(jax.tree.structure(cap.executable.out_info))
-                       != _node_kinds(jax.tree.structure(other.executable.out_info))):
+    if not unlike and (_node_kinds(jax.tree.structure(cap.lowered.out_info))
+                       != _node_kinds(jax.tree.structure(other.lowered.out_info))):
         unlike.append("outputs' node kinds")
     return unlike
 
@@ -1079,6 +1080,8 @@ class StepCompiler[L, E]:
         ahead = self.counts_ahead is not None
         for count, each in (self.admitted_counts(holder, stepping, planned, state, batch) if ahead else ()):
             plans[count], flops[count] = each.released(), self._flops(each)
+        if not ahead:
+            self.lowered_counts(holder, stepping, planned, state, batch)
         self.phase_passes.current = sampled.cap
         with self.phase_passes.scoped(holder, self):
             capped = stepping()
@@ -1206,11 +1209,53 @@ class StepCompiler[L, E]:
                 planned = search.found(cap.split)
         finally:
             self._loss_shapes.clear()
-        unlike = _unlike(cap, planned)
+        self._refuse_unlike(cap.candidate, planned.candidate, passes)
+        return planned
+
+    @staticmethod
+    def _refuse_unlike(cap: Candidate, other: Candidate, passes: int) -> None:
+        """Refused where the step of `passes` holds or returns otherwise than its cap's (`_unlike`)."""
+        unlike = _unlike(cap, other)
         if unlike:
             raise ValueError(f"the step of {passes} passes holds {unlike} other than its cap's step does: a "
                              "sampled count's steps pass one state between them, its window pooling them all")
-        return planned
+
+    def lowered_counts(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Planned,
+                       state: TrainState, batch: Batch) -> None:
+        """Every count below the cap of a run that draws its pass count per microbatch lowered at the cap's
+        plan `cap` (its split, rung and narrow copies, as `admitted_at` lowers it), traced and not
+        compiled, each under its count's objective (`PhasePasses.scoped`), and refused, as the step is
+        built, where its state, window or outputs are other than the cap's step's (`_unlike`): a sampled
+        count's steps pass one state between them, its window pooling them all. Each compiles as it is
+        first drawn (`DrawingStep.admit`)."""
+        sampled = self.phase_passes.sampled
+        assert sampled is not None, "a run that draws its pass count per microbatch"
+        try:
+            for count in range(1, sampled.cap):
+                self.phase_passes.current = count
+                with self.phase_passes.scoped(holder, self):
+                    lowered = self._lowered_at(stepping(), state, batch, cap)
+                self._refuse_unlike(cap.candidate, lowered, count)
+        finally:
+            self.phase_passes.current = sampled.cap
+
+    def _lowered_at(self, stepping: Stepping, state: TrainState, batch: Batch, cap: Planned) -> Candidate:
+        """The step the objective's count runs lowered at the cap's plan `cap`, as `admitted_at` lowers it."""
+        settings = stepping.settings
+        mesh = settings.device_mesh
+        cap.at.put(self.objective)
+        self.phase_passes.restored(self.objective)
+        stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=cap.split))
+        try:
+            with stepping.traced_on(mesh, self.links(mesh)) as schedule, held_objects():
+                shaped = self.loss_shaped(stepping, schedule)
+                grouped = dataclasses.replace(shaped, settings=dataclasses.replace(
+                    shaped.settings, ns_group=cap.at.ns_group))
+                return candidate_for(grouped, state, batch, schedule, batch_shardings(mesh, batch),
+                                     NamedSharding(mesh, P()), cap.split, cap.at.narrow,
+                                     copies=cap.candidate.copies)
+        finally:
+            self._loss_shapes.clear()
 
     def _plan(self, stepping: Stepping, state: TrainState, batch: Batch, trials: Trials | None,
               frontier: bool = False, *, unplaced: int | None = None, provisional: bool = False
