@@ -1008,17 +1008,22 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
                                           heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
     assert priced is not None
     assert priced.device_bytes >= 2 * rows * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
-    # Non-deciding fallback target (sm100 tcgen05, row 8813 F2) prices only the common bounded arm.
-    sm100 = generation.gpu_target("sm100")
-    fallback = attention_decode.priced_step(sm100, rows=1, queries=32, keys=keys, heads=8, kv_heads=kv_heads,
-                                            width=width, dtype=jnp.bfloat16)
-    with generation.assumed(sm100):
-        q100 = jnp.zeros((1, 32, 8, width), jnp.bfloat16)
-        k100 = jnp.zeros((1, keys, kv_heads, width), jnp.bfloat16)
-        plan100, *_ = attention_decode.planned(q100, k100, k100, attention_decode.key_spans(32, keys, 1),
-                                               template.Hooks())
-    assert plan100 is not None and "bounded" in plan100 and "scaled" in plan100
-    expected_kernels = 1 + int(plan100["bounded"].slices > 1)
+    # Non-deciding fallback (`natural_form=True`, row 8813 F2) prices only the common bounded arm, not both.
+    sm90 = generation.gpu_target("sm90")
+    with generation.assumed(sm90):
+        q90 = jnp.zeros((1, 1, 8, width), jnp.bfloat16)
+        k90 = jnp.zeros((1, keys, kv_heads, width), jnp.bfloat16)
+        base_plan, *_ = attention_decode.planned(q90, k90, k90, attention_decode.key_spans(1, keys, 1),
+                                                 template.Hooks())
+        assert base_plan is not None
+        non_deciding = dataclasses.replace(base_plan["plain"].config, natural_form=True)
+        with tuning.pinned({attention_mosaic.MosaicForward: non_deciding}):
+            plan90, *_ = attention_decode.planned(q90, k90, k90, attention_decode.key_spans(1, keys, 1),
+                                                  template.Hooks())
+            fallback = attention_decode.priced_step(sm90, rows=1, queries=1, keys=keys, heads=8,
+                                                    kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
+    assert plan90 is not None and "bounded" in plan90 and "scaled" in plan90
+    expected_kernels = 1 + int(plan90["bounded"].slices > 1)
     assert fallback is not None and fallback.kernels == expected_kernels
     assert fallback.device_bytes >= 2 * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
 
