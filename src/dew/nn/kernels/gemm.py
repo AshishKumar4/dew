@@ -1118,12 +1118,12 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     # default), not as the forward's narrower outputs, whose rounding hid the tensor cores' sums within a
     # step (row 5406: an A100's fp16 row-scaled product's scale gradient 1.72 times XLA's error).
     # Varying over every manual axis its operands vary over (`sharding.varying_like`, read from their own
-    # types: the backward traces with no map's context): at an accumulator typed the same on every device,
-    # the VJP of an epilogue adding a side each device reads its own of summed the devices' cotangents into
-    # it (the add's broadcast transposed to a psum), every device's gradient then their sum (row 10526).
-    zeros = functools.partial(jnp.zeros, acc_shape, at_least_fp32(compute))
-    acc = jax.eval_shape(lambda *operands: varying_like(zeros(), *operands), lhs, *matrices,
-                         *jax.tree.leaves(prologue_arrays))
+    # types: the backward traces with no map's context), as each stand-in for it below: at an accumulator
+    # typed the same on every device, the VJP of an epilogue adding a side each device reads its own of
+    # summed the devices' cotangents into it (the add's broadcast transposed to a psum), every device's
+    # gradient then their sum (row 10526).
+    operands = (lhs, *matrices, *jax.tree.leaves(prologue_arrays))
+    acc = jax.eval_shape(lambda: varying_like(jnp.zeros(acc_shape, at_least_fp32(compute)), *operands))
     # The epilogue's VJP, traced once, its accumulators' reads and pass-through cotangents read from it.
     vjp = _epilogue_vjp(kept, count, acc, sides)
     rounded = _rounded_accumulator(saved or {}, count, epilogue, acc, sides)
@@ -1137,7 +1137,8 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
                                paired=matrices[1] if count > 1 else None, summed_as=(acc.dtype,) * count,
                                **plain))
     else:
-        accs = (jnp.zeros(acc.shape, acc.dtype),) * count
+        # Typed as the accumulators it stands for (`acc`'s varying axes).
+        accs = (varying_like(jnp.zeros(acc.shape, acc.dtype), *operands),) * count
 
     def epilogued(*args):
         # Each row's side values, whose transpose sums a groups axis's cotangents over each group's rows.
