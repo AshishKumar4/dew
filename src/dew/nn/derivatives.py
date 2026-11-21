@@ -174,7 +174,7 @@ def _floating(leaf) -> bool:
 def portable_formed[Value](portable: Callable[..., Value], /) -> Callable[..., Value]:
     """`portable`, an XLA program whose last operand is a parameter, or a tree of them (a projection's kernel
     and its bias, a norm's weight, an attention's sinks), its value and every derivative XLA's of it
-    (`generation.linear_tangent`), its reverse mode the rule's: it reads its live operands only once its
+    (`generation.linear_tangent`), its reverse mode the rule's: it reads its operands only once its
     cotangent has arrived (`with_cotangent_arrived`) and returns the inputs' cotangents only with the
     parameters' gradients formed (`with_gradients_formed`), each formed only where a reverse pass
     differentiates it (`live_cotangents`: a frozen operand's never is). Its forward saves nothing; its
@@ -186,8 +186,10 @@ def portable_formed[Value](portable: Callable[..., Value], /) -> Callable[..., V
         count = len(jax.tree.leaves(operands))
         first = count - len(jax.tree.leaves(operands[-1]))
         # `portable` of the live leaves, the others held as they are.
+        # Every operand the VJP reads (a frozen kernel the input's cotangent reads transposed among them)
+        # read once its cotangent has arrived; `live` chooses the cotangents formed.
+        cotangent, operands = with_cotangent_arrived(cotangent, operands)
         moving, fill = programs.holes(operands, [index in live for index in range(count)])
-        cotangent, moving = with_cotangent_arrived(cotangent, moving)
         pulled = jax.vjp(lambda *values: portable(*fill(values)), *moving)[1](cotangent)
         inputs, formed = with_gradients_formed(
             tuple(each for index, each in zip(live, pulled, strict=True) if index < first),

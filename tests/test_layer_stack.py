@@ -259,8 +259,11 @@ class ScanCase:
             ids = np.random.default_rng([0x5CA7, key]).integers(0, VOCAB, (rows, SEQ_LEN)).astype(np.int32)
             return ids, np.float32(1.0)
 
+        # The plain loop's program, made once: its arm runs it compiled (`measured`'s), and the weighed check
+        # replays it for each draw's rounding scale (`scale`), keyed by this one function.
+        self.plain_run = self.computed(self.plain, self.variables, self.training)
         self.runs = {"scanned": self.measured(self.scanned, self.variables, self.training),
-                     "plain": self.measured(self.plain, self.variables, self.training)}
+                     "plain": without_ynn(self.plain_run)}
         self.drawn = drawn
         if selection_margins.selects(self.config):
             selected = selection_margins.capture(self.plain)
@@ -297,11 +300,10 @@ class ScanCase:
 
     def scale(self, inputs, seed):
         """The plain loop's rounding scale at a draw (`rounding_bound.rounding_scale`, as its arm sums:
-        `summed_as_run`), which the weighed check reads (`assert_as_exact`'s `conditioning_scale`): its
-        program traced here, where its arm runs compiled apart (`without_ynn`)."""
+        `summed_as_run`), which the weighed check reads (`assert_as_exact`'s `conditioning_scale`): the plain
+        arm's own program (`plain_run`), replayed here, where its arm runs it compiled (`without_ynn`)."""
         with summed_as_run():
-            return rounding_scale(self.computed(self.plain, self.variables, self.training), *inputs,
-                                  seed=seed)[1]
+            return rounding_scale(self.plain_run, *inputs, seed=seed)[1]
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""

@@ -235,12 +235,15 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
 @pytest.mark.parametrize("layer", [Dense(16), DenseGeneral((2, 8))], ids=["dense", "general"])
 def test_a_biased_layers_reverse_mode_holds_its_cotangent_once(layer):
     """A biased projection's reverse mode returns its input's cotangent only with its kernel's and its bias's
-    gradients formed, the three through one barrier (`projections.dot_general`'s `bias`), where an entry
-    hold and the bias's own rule made three barriers a layer, each a bound on XLA's fusions (row 6740). A
-    frozen bias's gradient is formed nowhere, the barrier holding the input's and the kernel's; with every
-    parameter frozen, nothing is held."""
+    gradients formed, the three through one exit barrier (`projections.dot_general`'s `bias`), where the
+    bias's own rule added its own, each a bound on XLA's fusions (row 6740); and reads its operands only
+    once its cotangent has arrived, the cotangent and every operand through one entry barrier
+    (`derivatives.with_cotangent_arrived`: read ahead of it, they raised a Muon LM's need past what parting
+    its stacks recovered, train 1113). A frozen bias's gradient is formed nowhere, the exit holding the
+    input's and the kernel's; with every parameter frozen, the entry alone holds."""
     x = jnp.ones((4, 8), jnp.float32)
     params = layer.init(jax.random.key(0), x)["params"]
+    out = jax.eval_shape(lambda x: layer.apply({"params": params}, x), x).size
 
     def held(live):
         def loss(trained, x):
@@ -248,21 +251,27 @@ def test_a_biased_layers_reverse_mode_holds_its_cotangent_once(layer):
 
         trained = {name: params[name] for name in live}
         program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(trained, x).jaxpr
-        # Each barrier's operands by size (a bias's cotangent held shaped as the product broadcasts it), each
-        # of its results one its program returns reads (`read_by`): the gradients leave through it.
-        sizes = []
+        # Each barrier's operands by size (a bias's cotangent held shaped as the product broadcasts it), the
+        # entry's holding the cotangent (the output's size), each exit's results ones its program returns
+        # reads (`read_by`): the gradients leave through it.
+        entries, exits = [], []
         for jaxpr in programs(program):
             returned = read_by(jaxpr, jaxpr.outvars)
             for eqn in jaxpr.eqns:
                 if eqn.primitive is jax.lax.optimization_barrier_p:
-                    assert all(var in returned for var in eqn.outvars)
-                    sizes.append(sorted(var.aval.size for var in eqn.invars))
-        return sizes
+                    sizes = sorted(var.aval.size for var in eqn.invars)
+                    if out in sizes:
+                        entries.append(sizes)
+                    else:
+                        assert all(var in returned for var in eqn.outvars)
+                        exits.append(sizes)
+        return entries, exits
 
     kernel, bias = params["kernel"].size, params["bias"].size
-    assert held(("kernel", "bias")) == [sorted([x.size, kernel, bias])]
-    assert held(("kernel",)) == [sorted([x.size, kernel])]
-    assert held(()) == []
+    entry = [sorted([out, x.size, kernel, bias])]
+    assert held(("kernel", "bias")) == (entry, [sorted([x.size, kernel, bias])])
+    assert held(("kernel",)) == (entry, [sorted([x.size, kernel])])
+    assert held(()) == (entry, [])
 
 
 def programs(jaxpr):
