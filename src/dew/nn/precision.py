@@ -44,8 +44,6 @@ from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
 
-# The aligned sum is `dew.nn.aligned`'s; its callers read it here too.
-from dew.nn.aligned import aligned_sum as aligned_sum
 from dew.nn.derivatives import (
     Protected,
     bound_span,

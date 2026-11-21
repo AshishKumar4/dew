@@ -33,9 +33,16 @@ import ml_dtypes
 import numpy as np
 import pytest
 from arm_arithmetic import Truth
-from attention_oracle import exact_attention
+from attention_oracle import anchored_softmax, exact_attention
 from generation_support import here, interprets
-from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, widened, with_gradients
+from reference_error import (
+    FEWEST_SEEDS,
+    as_given,
+    assert_as_exact,
+    assert_merges_no_ties,
+    widened,
+    with_gradients,
+)
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -907,7 +914,7 @@ def _cast(family: Family, draw: Callable[[int], tuple]) -> Callable[[int], tuple
     return cast
 
 
-def _reference(family: Family, *, anchored: bool) -> Callable:
+def _reference(family: Family, *, anchored: bool, round_logits=None) -> Callable:
     """The reference's output `(query, key, value, extra) -> out`, in the call's dtype as every attention
     call returns it, its gradients autodiff's (`reference_error.with_gradients`); the float64 truth's
     derivative `anchored`. The reference arm
@@ -927,7 +934,8 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
 
     def attend(query, key, value, extra):
         if isinstance(extra, tuple):
-            out = _resumed_attention(query, key, value, extra, family.keep)
+            out = _resumed_attention(query, key, value, extra, family.keep, anchored=anchored,
+                                     round_logits=round_logits)
         elif extra is None and jax_holds and family.query_first:
             scale = query.shape[-1] ** -0.5
             assert float(np.log2(scale)).is_integer(), "a query scaled first is exact at a power of two alone"
@@ -937,31 +945,34 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
             out = jax.nn.dot_product_attention(query, key, value, mask=jnp.asarray(family.keep),
                                                implementation="xla")
         else:
-            out = exact_attention(query, key, value, extra, keep=family.keep, anchored=anchored)
+            out = exact_attention(query, key, value, extra, keep=family.keep, anchored=anchored,
+                                  round_logits=round_logits)
         return out.astype(query.dtype)
 
     return attend
 
 
-def _resumed_attention(query, key, value, state, keep):
+def _resumed_attention(query, key, value, state, keep, *, anchored: bool, round_logits=None):
     """Attention resumed from a softmax state `(m, total, acc)` (one query head a key head), written apart
-    from Dew with normalized weights, so a state whose sums are near fp32's largest stays finite: the
-    state's weight `total e^(m - M)` and each kept key's `e^(s - M)` over their sum, the state reading its
-    values' mean `acc / total`; in fp32 or the inputs' wider dtype, as the state is, the probabilities
-    rounded to the values' dtype for their product (row 1362)."""
+    from Dew: the state one more column of the softmax, its logit `m + log total` and its value its values'
+    mean `acc / total`, so a state whose sums are near fp32's largest stays finite; in fp32 or the inputs'
+    wider dtype, as the state is, the probabilities rounded to the values' dtype for their product (row
+    1362). Its derivative the float64 truth's where `anchored` (`anchored_softmax`): the state's logit's
+    is `p_state sum_k p_k c (mean - v_k)`, no term cancelling, where a state of total 2^126 beside two keys
+    had its `2 mean / total` share rounded off `total + 2` (row 6302: 6.34e-35 against 1.268e-34)."""
     wide = jnp.promote_types(query.dtype, jnp.float32)
     m, total, acc = (jnp.asarray(x, wide) for x in state)
     query, key = query.astype(wide), key.astype(wide)
     logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(jnp.asarray(query.shape[-1], wide))
+    if round_logits is not None:
+        logits = logits + jax.lax.stop_gradient(logits.astype(round_logits).astype(logits.dtype) - logits)
     logits = jnp.where(keep, logits, -jnp.inf)
-    top = jnp.maximum(m, jnp.max(logits, axis=-1))
-    own = total * jnp.exp(m - top)
-    weights = jnp.exp(logits - top[..., None])
-    denominator = own + weights.sum(axis=-1)
+    joined = jnp.concatenate([(m + jnp.log(total))[..., None], logits], axis=-1)
+    weights = (anchored_softmax if anchored else functools.partial(jax.nn.softmax, axis=-1))(joined)
     mean = acc / total[..., None]
-    shares = weights / denominator[..., None]
-    weighted = jnp.einsum("bhqk,bkhd->bhqd", shares.astype(value.dtype), value, preferred_element_type=wide)
-    out = mean * (own / denominator)[..., None] + weighted
+    weighted = jnp.einsum("bhqk,bkhd->bhqd", weights[..., 1:].astype(value.dtype), value,
+                          preferred_element_type=wide)
+    out = mean * weights[..., :1] + weighted
     return jnp.swapaxes(out, 1, 2)
 
 
@@ -1142,17 +1153,20 @@ its own, so none holds a CPU task past the suite's target (row 1849); those past
 @pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
 def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, name):
     """A template mainloop's output and query, key and value gradients in the accurate form (`ACCURATE`),
-    check 1 over the family's draws; a row that sees nothing, zero."""
+    check 1 over the family's draws, merging no ties the reference keeps apart (`assert_merges_no_ties`,
+    row 6302); a row that sees nothing, zero."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
     reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
     truth = with_gradients(_reference(family, anchored=True))
+    rounded = with_gradients(_reference(family, anchored=True, round_logits=jnp.float32))
     label = f"{name} accurate {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, ACCURATE)[name]))
     # Each result check 1 draws (its second stage's too) held empty at the family's empty rows (row 9041).
     held = (None if family.empty is None
             else lambda outputs, inputs: _held_empty(family.empty, outputs, label))
     assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth, held=held)
+    assert_merges_no_ties(differentiated, reference, truth, draw, label, seeds=seeds, rounded_fn=rounded)
 
 
 def default_is_finite(family_name: str, mainloop_name: str) -> None:
@@ -1472,13 +1486,15 @@ def hookless_families() -> tuple[str, ...]:
 
 
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
+                       "a small weight on a large value, float32",
                        "a small column beside an overflowing one",
                        "a cotangent on a small column beside an overflowing one",
                        "a column near fp32's least normal beside an overflowing one",
-                       "a resumed state beside an overflowing column")
+                       "a resumed state beside an overflowing column",
+                       "a resumed state of a large denominator")
 """The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
 (tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (123 to 257
-s, rows 1849, 2193, 4344; `GPU_ONLY`)."""
+s, rows 1849, 2193, 4344, 5533; `GPU_ONLY`)."""
 
 
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
@@ -1527,7 +1543,7 @@ def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     query, key, value, dout = (first(fill, 1, 1, 1, 16) for fill in (4.0, m0, size, 2.0 ** -8))
     state = (jnp.full((1, 1, 1), m0, jnp.float32), jnp.ones((1, 1, 1), jnp.float32), first(size, 1, 1, 1, 16))
     family = Family(lambda seed: (query, key, value, state, dout), np.ones((1, 1, 1, 1), bool))
-    reference = with_gradients(lambda *args: _resumed_attention(*args, family.keep))
+    reference = with_gradients(lambda *args: _resumed_attention(*args, family.keep, anchored=False))
     ours = jax.jit(with_gradients(_mainloops(family, {})["portable"]))
     for name, found in (("reference", reference(query, key, value, state, dout)),
                         ("default", ours(query, key, value, state, dout))):

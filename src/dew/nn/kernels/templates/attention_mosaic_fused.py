@@ -22,6 +22,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    head_layout,
+    head_slice,
     launch_scope,
     modelled,
     reducing,
@@ -246,10 +248,10 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     q_steps = queries // block_q
     grouped, group = heads != kv_heads, heads // kv_heads
     leaves, treedef = jax.tree.flatten((spans, drop))
-    # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
-    shapes = [(batch, keys_padded, kv_heads, width)] * 2
+    kv_shape = ((batch, kv_heads, keys_padded, width) if family.copies_tiled_rows
+                else (batch, keys_padded, kv_heads, width))
+    shapes = [kv_shape] * 2
     groups = stacked.groups(shapes)
-
     def body(*refs, streams, after=None):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         (spans_of, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
@@ -264,7 +266,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, group)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
-        views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head), **statistics}
+        views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         pair_first = family.program_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
@@ -272,7 +274,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
         def consumer(index):
             k_first = pair_first + index * block_k
-            keys_view = (row, pl.ds(k_first, block_k), key_head)
+            keys_view = head_slice(family, row, key_head, pl.ds(k_first, block_k))
             family.loaded(((k_ref.at[keys_view], k_smem.at[index], k_loaded.at[index]),
                            (v_ref.at[keys_view], v_smem.at[index], v_loaded.at[index])))
             lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
@@ -318,8 +320,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
 
     # dK and dV as their own arrays' axes (`outputs.Output`).
+    axis_order = (0, 2, 1) if family.copies_tiled_rows else (0, 1, 2)
     gradients = tuple(outputs.output(array.dtype if typed else jnp.float32,
-                                     *(outputs.axis(array, index) for index in range(3)), width)
+                                     *(outputs.axis(array, index) for index in axis_order), width)
                       for array in (key, value))
     launch = family.kernel(
         entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
@@ -333,10 +336,11 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
+    query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    return _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
-                         grouped=grouped)
-
+    dq, dk, dv = _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
+                               grouped=grouped)
+    return head_layout(family, dq), head_layout(family, dk), head_layout(family, dv)
 
 def _fused_called(launch: Callable, operands: tuple, grads: tuple, *, copies: int, grouped: bool
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:

@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from map_judge import marked_seeds
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, dew_path, with_gradients
 
@@ -563,8 +564,8 @@ def test_a_loaded_decoder_gains_an_implicit_loop_at_zero_theta():
 
 
 EXIT_SEEDS = {"whole stack": 128, "a block before a coda": 256, "a block before a coda with a z-loss": 256,
-              "a block before a coda exiting at a threshold": 256, "the last pass trained": 256,
-              "a saturated gate": 512}
+              "a block before a coda exiting at a threshold": 256, "the last pass trained": 256}
+"""Each exit site's seeds, but a site that `check1_shards` shards, whose mark states them (`marked_seeds`)."""
 """Check 1's declared seeds for the exit objective against its formula, sized by `seeds_for` on armada, its
 formula compiled alike and as written: the saturated gate's as-written check resolves Gated DeltaNet's
 decay parameters (A_log, dt_bias) at 32 rows only over 512 seeds, at 4 or 16 rows not within them."""
@@ -606,7 +607,7 @@ def _unrolled_passes(module, ids):
                  marks=pytest.mark.check1_shards(seeds=512, per_task=64))],
     ids=["whole stack", "coda", "z-loss", "threshold", "the last trained", "saturated"])
 def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name, layers, loop, z_loss, shift,
-                                                                           spread, rows):
+                                                                           spread, rows, request):
     """A two-pass Qwen 3.5 with an exit gate (`Loop.exit_gate`, its block the whole stack or one before a
     coda, each pass's coda its own) trained under Ouro's objective (`LMObjective.exit_entropy`): its loss
     and every parameter's gradient, the gate's and the passes' states' through it, on par with the formula
@@ -654,7 +655,8 @@ def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name,
         return lambda variables, ids: jax.value_and_grad(lambda v: loss(v, ids))(variables)
 
     assert_as_exact(jax.jit(ours), jax.jit(formula(looped)), draw, f"the exit objective over {name}",
-                    seeds=EXIT_SEEDS[name], truth_fn=jax.jit(formula(looped.clone(dtype=jnp.float64))))
+                    seeds=EXIT_SEEDS[name] if name in EXIT_SEEDS else marked_seeds(request),
+                    truth_fn=jax.jit(formula(looped.clone(dtype=jnp.float64))))
 
 
 EXITING_SEEDS = {"forward": 8, "decode": 8, "shared": 8}

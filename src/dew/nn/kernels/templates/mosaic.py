@@ -1774,7 +1774,7 @@ class Transport[Allocated, Opened](abc.ABC):
         `resources.producer_floor` where None), the floor its launch plans with; a family without a producer
         role takes none. With `pingpong`, on a family that takes it (`takes_pingpong`), its two consumers take
         alternate tiles whole, their products in turn (`persistent.consumed`'s `turns`), each consumer's tile
-        its own share (`gemm.mosaic_gpu.Tiles.pingpong`)."""
+        its own share (`gemm.tiling.Tiles.pingpong`)."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -1961,12 +1961,6 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     """Whether its programs hold a block of keys, a key a row, and walk the queries a tile a step (a
     keys-first placement's, `placed.KEYS`); every other family's hold queries and walk the keys
     (`held_walked`)."""
-
-    @property
-    def derived_consumers(self) -> int:
-        """The compute roles a forward's derivation tries first (`attention_mosaic._derived`), at most
-        `consumers`: the count its programs run fastest at where measured (`Wgmma`'s), else `consumers`."""
-        return self.consumers
 
     @property
     def register_step(self) -> int:

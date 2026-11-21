@@ -191,16 +191,18 @@ def test_lm_packs_documents_into_rows_that_keep_every_target():
 
 def test_lm_lays_one_document_a_row_padded_where_its_segments_are_one():
     """`segments=1` lays each document, or each piece of one longer than a row, in a row of its own, the
-    rest of the row padding (segment 0): a padded run's rows through the one preset; a pack that lays no
-    document whole is refused it (pack=None by the preset, a concatenating pack by its `Pack`)."""
+    rest of the row padding (segment 0): a padded run's rows through the one preset, whether it packs
+    first-fit or by concatenation (data.md's `lm` row; row 9059: a concatenating pack refused it);
+    `pack=None`, which lays no document of its own, is refused it."""
     documents = [{"text": "dew trains jax models " * (1 + index % 4)} for index in range(16)]
-    batch = next(iter(Memory(documents).pipe(presets.lm, "byte", seq_len=32, batch=8, segments=1)))
-    segments = np.asarray(batch["text_coordinates"].segments)
-    assert segments.max() == 1 and (segments == 0).any()
-    assert all(set(row[row > 0]) == {1} for row in segments)
-    for pack in (None, "concat"):
-        with pytest.raises(ValueError):
-            Memory(documents).pipe(presets.lm, "byte", seq_len=32, batch=8, pack=pack, segments=1)
+    for pack in ("first-fit", "concat"):
+        batch = next(iter(Memory(documents).pipe(presets.lm, "byte", seq_len=32, batch=8, pack=pack,
+                                                 segments=1)))
+        segments = np.asarray(batch["text_coordinates"].segments)
+        assert segments.max() == 1 and (segments == 0).any(), pack
+        assert all(set(row[row > 0]) == {1} for row in segments), pack
+    with pytest.raises(ValueError):
+        Memory(documents).pipe(presets.lm, "byte", seq_len=32, batch=8, pack=None, segments=1)
 
 
 @pytest.mark.parametrize("read", ["memory", "streamed"])

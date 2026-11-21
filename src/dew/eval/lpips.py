@@ -160,5 +160,5 @@ class LPIPS(ImageMetric):
             samples, targets = paired(artifact, batch, field)
             return _distance()(frame_batch(samples), frame_batch(targets))
 
-        super().__init__(name="lpips", measure=measure, better="lower", reads=reads)
+        super().__init__(name="lpips", measure=measure, better="lower", reads=reads, fields=(field,))
 

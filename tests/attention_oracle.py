@@ -120,18 +120,22 @@ def _anchored_backward(weights, cotangent):
 anchored_softmax.defvjp(_anchored_forward, _anchored_backward)
 
 
-def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False, bias=None, score=None):
+def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False, bias=None, score=None,
+                    round_logits=None):
     """The attention weights of `[B, S, H, D]` queries over their keys, key
     heads repeated over their group, and the logits before the cap: over
     sqrt(D), capped `c tanh(l / c)`, a `bias` `[B or 1, H or 1, q, k]` added
     after the cap, or a `score` of them in the cap's place (a Dew score hook,
     `template.score_modded`), the keys `keep` `[B or 1, 1, q, k]` keeps, a
     softmax whose denominator a sink joins, its derivative the float64
-    truth's (`anchored_softmax`) where `anchored`. A query that keeps no key
-    has no weight."""
+    truth's (`anchored_softmax`) where `anchored`. Where `round_logits` names a
+    float format, `raw` is rounded to it in value (straight-through) for
+    `assert_merges_no_ties`'s `rounded_fn`. A query that keeps no key has no weight."""
     heads, kv_heads = q.shape[2], k.shape[2]
     group = jnp.arange(heads) // (heads // kv_heads)
     raw = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(q.shape[3])
+    if round_logits is not None:
+        raw = raw + jax.lax.stop_gradient(raw.astype(round_logits).astype(raw.dtype) - raw)
     logits = raw if softcap is None else softcap * jnp.tanh(raw / softcap)
     if score is not None:
         logits = score(raw)
@@ -223,7 +227,8 @@ def traced_attention_terms(query, key, value, cotangent, keep, sinks=None, softc
         return [jnp.sqrt(x) for x in squares]
 
 
-def exact_attention(q, k, v, s=None, *, softcap=None, keep=None, anchored: bool = False, **structure):
+def exact_attention(q, k, v, s=None, *, softcap=None, keep=None, anchored: bool = False,
+                    round_logits=None, **structure):
     """Attention written out apart from every Dew path, in the inputs' dtype: the logits of query
     head h against key head h // (Hq // Hkv) over sqrt(D), capped `c tanh(l / c)`, then the keys
     `keep` `[B or 1, 1, q, k]` keeps (`kept`'s by `structure` where None), a softmax whose denominator
@@ -232,7 +237,7 @@ def exact_attention(q, k, v, s=None, *, softcap=None, keep=None, anchored: bool 
     (`anchored_softmax`); the reference arm, the plain one, as XLA differentiates it."""
     group = jnp.arange(q.shape[2]) // (q.shape[2] // k.shape[2])
     keep = kept(q.shape[1], k.shape[1], **structure) if keep is None else keep
-    weights, _ = float64_weights(q, k, keep, s, softcap, anchored=anchored)
+    weights, _ = float64_weights(q, k, keep, s, softcap, anchored=anchored, round_logits=round_logits)
     return jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
 
 

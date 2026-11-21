@@ -34,11 +34,13 @@ from dew.nn.kernels.templates import (
 )
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
+    BLOCK,
     DKV_GRADS,
     DQ_GRADS,
     DTYPES,
     NATURAL,
     TRACED_TILE,
+    WARPS,
     AttentionLaunch,
     Gradients,
     Hooks,
@@ -78,19 +80,8 @@ class Tiles:
     stages: int
 
 
-WARPS = 4
-"""A program's warps: one warpgroup, its tile's rows over its four warps, FlashAttention 2's."""
-
 STAGES = 2
 """A launch's pipeline stages: one tile loading beside the one consumed (`resources.Launch.floor`)."""
-
-ROWS = 32
-"""A warp's rows of the block: two mma.sync instructions' sixteen."""
-
-BLOCK = WARPS * ROWS
-"""The most rows or keys a tile takes, the block a call pads to (`padded_call`): a warp's rows a warp
-(FlashAttention 2's 128 a program)."""
-
 LEAST = 16
 """The fewest rows, and keys, a tile takes: one mma.sync instruction's sixteen, for a launch no tile of a
 warp's rows holds (a scaled fp32 training walk at width 256, its small weights fp32 and their products' sums

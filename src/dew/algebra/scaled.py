@@ -425,6 +425,15 @@ def varying(typed, *read):
     return typed.update(manual_axis_type=typed.mat.update(varying=axes))
 
 
+def compensated_pair(a: jax.Array, a_error: jax.Array, b: jax.Array, b_error: jax.Array
+                     ) -> tuple[jax.Array, jax.Array]:
+    """One step of a compensated sum's cascade: two partial sums added exactly (`precision.two_sum`), the
+    rounded sum and its error carried with the halves' errors, `error + a_error + b_error` in that order.
+    The one pair step `compensated` and a sum over an axis in halves (`dew.algebra.means`) take."""
+    summed, error = two_sum(a, b)
+    return summed, error + a_error + b_error
+
+
 def compensated(terms: Sequence[jax.Array]) -> tuple[jax.Array, jax.Array]:
     """`terms`' sum (each an array of one shape), compensated, in pairs: a tree over their order, each
     pair's sum exact (`precision.two_sum`, a span the algebra pass keeps as written) and its error carried
@@ -442,9 +451,9 @@ def compensated(terms: Sequence[jax.Array]) -> tuple[jax.Array, jax.Array]:
     while len(parts) > 1:
         paired, carried = [], []
         for at in range(0, len(parts) - 1, 2):
-            summed, error = two_sum(parts[at], parts[at + 1])
+            summed, error = compensated_pair(parts[at], errors[at], parts[at + 1], errors[at + 1])
             paired.append(summed)
-            carried.append(error + errors[at] + errors[at + 1])
+            carried.append(error)
         if len(parts) % 2:
             paired.append(parts[-1])
             carried.append(errors[-1])

@@ -29,7 +29,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels.templates import mosaic, rings
 
 if TYPE_CHECKING:
-    from dew.nn.kernels.templates.gemm.mosaic_gpu import Tiles
+    from dew.nn.kernels.templates.gemm.tiling import Tiles
 
 
 @dataclasses.dataclass(frozen=True)

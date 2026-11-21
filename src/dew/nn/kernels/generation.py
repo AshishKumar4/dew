@@ -366,11 +366,6 @@ class Architecture:
     bf16 at the same shapes compiles (rows 6993, 7227). Measured False on a v5e (those rows) and True on a
     v6e (control runs of the same cells, colab7062); the default True is the path every device took before
     the v5e refused it, unmeasured on v2, v3, v4, v5p and the GPUs."""
-    packed_slices: bool = True
-    """Whether its Mosaic slices one row of a 16-bit tile's packed sublane pair, as a one-head block of a
-    16-bit `[..., heads, width]` array is: a v5e's does not ("Offsets along tiled dimensions must be aligned
-    to tiles", the unit subtile 2 on the heads; bf16 and fp16 alike, rows 6993, 7227). Measured False on a
-    v5e and True on a v6e as `float16` is; the default True unmeasured elsewhere."""
     fp32_by_bf16_precise: bool = True
     """Whether its matrix unit takes an fp32 by bf16 product at fp32 precision, which a default matmul
     precision of 'highest' asks of a kernel's fp32 weights and bf16 values: a v5e's MXU does not (row 6994,
@@ -471,7 +466,7 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=1.67e12 / (197e12 / 131072),
                              exponentials_per_clock=1.54e12 / (197e12 / 131072), float16=False,
-                             packed_slices=False, fp32_by_bf16_precise=False),
+                             fp32_by_bf16_precise=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
                              exponentials_per_clock=1.79e12 / (918e12 / 524288))}
@@ -652,12 +647,6 @@ class GpuTarget:
     def float16(self) -> bool:
         """Whether the device computes in float16 (`Architecture.float16`)."""
         return self.architecture.float16
-
-    @property
-    def packed_slices(self) -> bool:
-        """Whether its Mosaic slices one row of a 16-bit tile's sublane pair
-        (`Architecture.packed_slices`)."""
-        return self.architecture.packed_slices
 
     @property
     def fp32_by_bf16_precise(self) -> bool:

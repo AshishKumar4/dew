@@ -13,6 +13,7 @@ from contract_support import CANCELLING_LEVELS, MOST
 from low_precision_support import edge_values
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
+from dew.nn.aligned import aligned_sum
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
@@ -37,7 +38,6 @@ from dew.nn.precision import (
     ACCURATE,
     Numerics,
     _rounded_significand,
-    aligned_sum,
     compensated_add,
     compensated_difference,
     exact_products,
@@ -1970,6 +1970,34 @@ def test_an_aligned_sum_over_an_axis_a_mesh_splits_sums_it_shard_by_shard():
     assert gradient.sharding.is_equivalent_to(rows, gradient.ndim)
     np.testing.assert_array_equal(np.asarray(beside), np.full((6, 2), 2.0))
     assert beside.sharding.is_equivalent_to(whole, beside.ndim)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis_type, ambient", [(jax.sharding.AxisType.Explicit, True),
+                                                (jax.sharding.AxisType.Auto, True),
+                                                (jax.sharding.AxisType.Auto, False)],
+                         ids=["explicit", "auto", "auto-placed-alone"])
+def test_an_elementwise_aligned_sum_split_over_a_mesh_is_computed_shard_by_shard(axis_type, ambient):
+    """`aligned_sum([(x, y), (z,)])` elementwise of `[8, 4]` operands split over a two-device data axis,
+    Explicit or Auto (the Auto mesh set around the trace, or only placing the operands), is each element's
+    exact sum (`3 + 2^-30` rounded, 3, everywhere) and its compiled program holds no collective
+    (`dew.telemetry.trace.collective`): each shard's sums are its own, where the digits' walk bounded itself
+    by the extrema of every limb across the shards, an all-reduce of independent sums (row 8841)."""
+    from dew.telemetry.trace import collective
+
+    mesh = jax.make_mesh((2,), ("data",), (axis_type,), devices=jax.devices()[:2])
+    rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+    with jax.set_mesh(mesh) if ambient else contextlib.nullcontext():
+        x, y, z = (jax.device_put(jnp.full((8, 4), value, jnp.float32), rows)
+                   for value in (2.0 ** -15, 2.0 ** -15, 3.0))
+        summed = jax.jit(lambda x, y, z: aligned_sum([(x, y), (z,)]), out_shardings=rows)
+        compiled = summed.lower(x, y, z).compile()
+        value = compiled(x, y, z)
+    instructions = hlo_instructions(compiled).values()
+    assert instructions
+    assert not [each.op for each in instructions if collective(each.op) is not None]
+    np.testing.assert_array_equal(np.asarray(value), np.full((8, 4), 3.0, np.float32))
+    assert value.sharding.is_equivalent_to(rows, value.ndim)
 
 
 def test_an_aligned_sum_over_an_empty_axis_is_zero():

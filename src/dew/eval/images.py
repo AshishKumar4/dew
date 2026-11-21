@@ -127,7 +127,7 @@ class CLIPDistance(ImageMetric):
         def measure(artifact, batch):
             return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
 
-        super().__init__(name="clip_similarity", measure=measure, better="lower")
+        super().__init__(name="clip_similarity", measure=measure, better="lower", fields=(field,))
 
 
 class CLIPScore(ImageMetric):
@@ -141,7 +141,7 @@ class CLIPScore(ImageMetric):
     def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = CAPTIONS):
         def measure(artifact, batch):
             return _clip_score(_artifact_cosine(artifact, batch, field, self.modelname))
-        super().__init__(name='clip_score', measure=measure)
+        super().__init__(name='clip_score', measure=measure, fields=(field,))
         self.modelname = modelname
 
     def score(self, images: ArrayLike, prompts: Sequence[str], *, batch_size: int = 64) -> float:

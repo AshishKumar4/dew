@@ -17,7 +17,7 @@ from low_precision_support import nvfp4
 from dew.algebra import bits
 from dew.nn import fake_quant
 from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
 
 
 def test_an_nvfp4_matrix_holds_its_codes_and_the_staged_order_reads_back():
@@ -85,7 +85,7 @@ def test_the_mainloop_decodes_an_nvfp4_stage_in_place(family):
     matrix, _ = nvfp4(6, 512, 128, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(7).integers(-3, 4, size=(136, 512)), jnp.bfloat16)
     expected = np.asarray(rows, np.float64) @ np.asarray(matrix.decoded(), np.float64)
-    tiles = mosaic_gpu.Tiles(64, 64, 256, 2, 1, family=family)
+    tiles = tiling.Tiles(64, 64, 256, 2, 1, family=family)
 
     def packed(step_tiles):
         return mosaic_gpu.gmm(rows, matrix.words[None], jnp.asarray([136], jnp.int32), tiles=step_tiles,
@@ -111,7 +111,7 @@ def test_the_mainloop_decodes_an_nvfp4_matrixs_rows_into_its_products_left_opera
 
     def swapped(family):
         return mosaic_gpu.gmm(matrix.words, rows[None], jnp.asarray([256], jnp.int32),
-                              tiles=mosaic_gpu.Tiles(128, 16, 256, 2, 1, warpgroups=2, family=family),
+                              tiles=tiling.Tiles(128, 16, 256, 2, 1, warpgroups=2, family=family),
                               transpose_rhs=True, out_dtype=jnp.float32, multiprocessors=4,
                               interpret=grouped_launch.INTERPRETED, dense=True, scales=matrix.scales,
                               packed_rows=True)
@@ -131,7 +131,7 @@ def test_the_mainloops_nvfp4_stage_decode_lowers_for_cuda(family):
     scales = jax.ShapeDtypeStruct((1, 128, 512 // 16), jnp.float8_e4m3fn)
     rows = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
     name = "sm90" if family == "wgmma" else "sm80"
-    tiles = mosaic_gpu.Tiles(64, 64, 256, 2, 1, family=family)
+    tiles = tiling.Tiles(64, 64, 256, 2, 1, family=family)
 
     def packed(rows, words, scales):
         return mosaic_gpu.gmm(rows, words, jnp.asarray([256], jnp.int32), tiles=tiles, transpose_rhs=True,
@@ -149,7 +149,7 @@ def test_the_mainloops_nvfp4_rows_decode_lowers_for_hopper():
     words = jax.ShapeDtypeStruct((256, 512 // 8), jnp.uint32)
     scales = jax.ShapeDtypeStruct((256, 512 // 16), jnp.float8_e4m3fn)
     rows = jax.ShapeDtypeStruct((1, 16, 512), jnp.bfloat16)
-    tiles = mosaic_gpu.Tiles(128, 16, 256, 2, 1, warpgroups=2, family="wgmma")
+    tiles = tiling.Tiles(128, 16, 256, 2, 1, warpgroups=2, family="wgmma")
 
     def swapped(words, rows, scales):
         return mosaic_gpu.gmm(words, rows, jnp.asarray([256], jnp.int32), tiles=tiles, transpose_rhs=True,
@@ -208,7 +208,7 @@ def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
     exact in fp32."""
     matrix, values = nvfp4(13, 1024, 256, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(14).integers(-3, 4, size=(13, 1024)), jnp.float32)
-    swapped = mosaic_gpu.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
+    swapped = tiling.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
     launch = grouped_matmul.MosaicPackedGmm()
 
     def product(x, kernel):

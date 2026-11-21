@@ -21,17 +21,29 @@ def _merged(outputs, totals, anchors):
     return means.merged_output(outputs, totals, anchors, windows.Units(), 0)
 
 
-@pytest.mark.parametrize("edge", EDGES)
-def test_the_convex_mean_holds_every_order(edge):
+ORDERS = {"its gradient's gradient": ("grad of grad",),
+          "its forward derivatives of the gradient": ("jvp of grad", "second jvp", "jvp of grad, remat",
+                                                      "second jvp, remat"),
+          "its first orders, nested and scanned": ("primal", "jvp", "vjp", "jvp of grad, nested jit",
+                                                  "jvp of grad, scanned")}
+"""The contract's orders (`contract_support.orders`) in three cells, each about a third of its compiling,
+every edge in each (rows 9806, 9807, 10132, 10163: a cell an edge compiled every order cold, three times a
+train, each past the train's bound; an order's programs are alike at every edge, so a cell compiles each
+once)."""
+
+
+@pytest.mark.parametrize("taken", ORDERS)
+def test_the_convex_mean_holds_every_order(taken):
     """The merge of finished states (`means.merged_output`, its derivative the law's own over scaled values,
     `dew.algebra.scaled`'s `applied` and `_split` within it): every order, forward and reverse, under a nested
     jit and a scan, in the outputs, the totals and the anchors, finite wherever its own float64 run is a
-    normal float32 and the plain mean is, its outputs and totals at `edge`: the law runs in float64 too,
-    its construct of its operands' format."""
+    normal float32 and the plain mean is, its outputs and totals at each edge (`EDGES`): the law runs in
+    float64 too, its construct of its operands' format. The orders `taken` names (`ORDERS`), at every edge."""
     outputs, totals, anchors = normal_draw(6096, (3, 4, 8), (3, 4), (3, 4))
-    primals = (outputs * EDGES[edge], (jnp.abs(totals) + 0.25) * EDGES[edge], anchors)
-    direction = normal_draw(6097, (3, 4, 8), (3, 4), (3, 4))
-    direction = (direction[0] * EDGES[edge], direction[1] * EDGES[edge], direction[2])
+    along = normal_draw(6097, (3, 4, 8), (3, 4), (3, 4))
     (cotangent,) = normal_draw(6098, (4, 8))
-
-    assert_contract(_merged, primals, direction, cotangent, f"the convex mean {edge}", plain_fn=_plain)
+    for edge, scale in EDGES.items():
+        primals = (outputs * scale, (jnp.abs(totals) + 0.25) * scale, anchors)
+        direction = (along[0] * scale, along[1] * scale, along[2])
+        assert_contract(_merged, primals, direction, cotangent, f"the convex mean {edge}", plain_fn=_plain,
+                        taking=ORDERS[taken])

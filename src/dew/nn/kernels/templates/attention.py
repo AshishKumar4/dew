@@ -53,6 +53,18 @@ from dew.nn.precision import (
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The operand dtypes the attention template's kernels take, one on queries, keys and values alike."""
+
+WARPS = 4
+"""A program's warps: one warpgroup, its tile's rows over its four warps, FlashAttention 2's."""
+
+ROWS = 32
+"""A warp's rows of the block: two mma.sync instructions' sixteen."""
+
+BLOCK = WARPS * ROWS
+"""The most rows or keys a tile takes, the block a call pads to (`padded_call`): a warp's rows a warp
+(FlashAttention 2's 128 a program)."""
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class KeySpans:

@@ -669,7 +669,11 @@ class Aside:
     awaiting: dict[tuple[str, bool], tuple] = dataclasses.field(default_factory=dict)
 
 
-_ASIDE: contextvars.ContextVar[Aside | None] = contextvars.ContextVar("certifying_aside", default=None)
+# Untraced (`_cache.untraced`), as `_RECORDING`: the block's pending launches change as it captures them, and
+# a trace keyed on them lowered a second layer's calls apart from its first's, so a cold build lowered
+# another program than a warm run (rows 7322, 8299, 8372).
+_ASIDE: contextvars.ContextVar[Aside | None] = _cache.untraced(
+    contextvars.ContextVar("certifying_aside", default=None))
 
 
 @contextlib.contextmanager

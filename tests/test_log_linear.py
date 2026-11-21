@@ -136,3 +136,28 @@ def test_a_blocks_pairs_keep_a_decay_past_a_vanished_one_and_no_future_overflow(
         value, grads = jax.value_and_grad(summed, argnums=(0, 1, 2))(query, key, g)
         assert value == 0.0
         assert all(np.isfinite(np.asarray(grad)).all() for grad in grads)
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90", "sm100", "sm120"])
+def test_log_linear_levels_train_on_the_template_on_each_gpu_family(target):
+    """A log-linear call of Kimi's geometry (64 value heads on one key head of 128, bf16), traced as each
+    GPU family's device: each level's recurrence takes the recurrence template for its forward and its
+    gradient (`generation.routes`), where a key head's value heads summed in one program held sm120's
+    consumer-fed scores' gradient launch past 255 registers and every level trained on the portable math,
+    1091 ms of a step against its forward's 4.6 (row 10522)."""
+    from dew.nn.kernels import generation
+
+    length, heads = 512, 64
+    shapes = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((1, length, 1, 128), jnp.bfloat16), ((1, length, 1, 128), jnp.bfloat16),
+        ((1, length, heads, 64), jnp.bfloat16), ((1, length, heads), jnp.float32),
+        ((1, length, heads, levels(length)), jnp.bfloat16))]
+
+    def call(*operands):
+        return log_linear_attention(*operands, scale=1.0)
+
+    with generation.assumed(target), generation.routes() as found:
+        jax.eval_shape(lambda *x: jax.vjp(call, *x)[1](call(*x)), *shapes)
+    taken = {(route.kernel, None if route.refusal is None else route.refusal.code)
+             for route in found if route.choice == generation.Choice.GATED_DELTA_RULE}
+    assert taken == {("mosaic_gpu", None)}, taken
