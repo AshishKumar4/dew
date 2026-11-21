@@ -228,7 +228,10 @@ def _prefix_halves(g, taken, call: Call):
 
         def zeroed():
             # Each column's running pair zero as the chunk starts.
-            plgpu.store(carried[0], jnp.zeros((2, keys), jnp.float32), optimized=False)
+            if call.interpret:
+                plgpu.store(carried[0], jnp.zeros((2, keys), jnp.float32), optimized=False)
+            else:
+                scan.zeroed_columns(carried[0])
 
         def step(index, slots, carry, accumulators):
             slots.acquire_all()
@@ -240,17 +243,18 @@ def _prefix_halves(g, taken, call: Call):
             else:
                 _scan_zeroed(call, rows, keys)
                 found = _intra_prefix(call, rows, decays, keys)
-            # A running sum's halves through its decays' slot in turn where a TMA store lands them, read and
-            # staged before (each store waited; the operand's form and tile, a landing's own), else through
-            # one landing in turn; the doubling's through their own.
-            slot = tile.refs[0] if not family.stores_through_registers else landing["prefix0"]
             for i, ref in enumerate((hi_ref, lo_ref)):
                 # A running sum's halves read as each is stored, one tile held at a time: both at once
                 # spilled the program's 128 registers at two programs a multiprocessor (M-JS-145g). Row-major,
-                # as a step's rows are fewer than a warpgroup accumulator's tile takes.
+                # as a step's rows are fewer than a warpgroup accumulator's tile takes, and through their own
+                # plain rows where a TMA store lands them (fp32, the gates' form: a family's swizzled slot
+                # took no row-major tile, an sm100's), else through the landing in turn; the doubling's
+                # through their own.
                 half = _rows_of(rows.at[i], keys) if found is None else found[i]
+                smem = (landing[f"prefix{i}"] if not running
+                        else landing["prefix0"] if family.stores_through_registers else rows.at[i])
                 gates.store(ref, half, row + index * rows_a_step, rows_a_step, column, keys, family=family,
-                            smem=slot if running else landing[f"prefix{i}"])
+                            smem=smem)
             return carry, accumulators
 
         return mosaic.Walk(views, step, steps=steps, prologue=zeroed if running else None)

@@ -144,6 +144,24 @@ def compensated_columns(pairs, running) -> None:
     plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * 2, return_type=())(body)(pairs, running)
 
 
+def zeroed_columns(running) -> None:
+    """Each column's running pair in `running`, a plain fp32 shared tile `(2, THREADS)`, set to zero, a column
+    a thread in its own words (`compensated_columns`' starting pairs), the warpgroup met once when done."""
+    body = emission.stating(lambda ref: Work(operations=0, shared_bytes=8 * THREADS))(
+        lambda ctx, ref: _zeroed_columns(ref))
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(body)(running)
+
+
+def _zeroed_columns(running) -> None:
+    """`zeroed_columns` in Mosaic GPU's terms."""
+    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+    column = arith.index_cast(index, arith.remui(utils.thread_idx(), arith.constant(i32, THREADS)))
+    zero = arith.constant(ir.F32Type.get(), 0.0)
+    for half in (0, 1):
+        memref.store(zero, running, [arith.constant(index, half), column])
+    utils.warpgroup_barrier()
+
+
 def _compensated_columns(ref, running) -> None:
     """`compensated_columns` in Mosaic GPU's terms."""
     index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
