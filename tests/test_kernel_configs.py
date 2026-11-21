@@ -642,11 +642,14 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                     residencies = dict.fromkeys((config.programs, 1))
                     # At the derived step's depth, else twice it.
                     depths = dict.fromkeys((config.block_k, 2 * config.block_k))
-                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, block_k=depth,
-                                        stages=stages, programs=programs,
+                    # At the derived tile's columns, else half of them, where every tile of the derived
+                    # columns at the count spills (sm120's two consumers at 256 columns, `_witnessed`).
+                    widths = dict.fromkeys((config.block_n, config.block_n // 2))
+                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, block_n=columns,
+                                        block_k=depth, stages=stages, programs=programs,
                                         cluster=config.cluster if consumers > 1 else 1)
-                              for rows_ in shares for depth in depths for programs in residencies
-                              for stages in range(config.stages, 1, -1))
+                              for columns in widths for rows_ in shares for depth in depths
+                              for programs in residencies for stages in range(config.stages, 1, -1))
                     legal = [tile for tile in staged
                              if isinstance(tile, tiling.Tiles) and launch.legal(ba, tile, target)]
                     if legal:
