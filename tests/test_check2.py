@@ -87,6 +87,156 @@ def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(p
         assert not held[3]
 
 
+def test_a_floats_split_is_held_exactly_and_a_step_off_either_part_breaks_it():
+    """`scaled.split_p`'s contract (`certified._split_part`): the law's own split of float32 values at every
+    scale, a subnormal and both zeros among them, holds it in its significand and its exponent, each a
+    value's alone; a significand a step off, or an exponent one off, breaks it at that element alone (the
+    merge P0's base review 3: a derivative of the law split its quotients' binades, which check 2 had no
+    contract for)."""
+    from dew.algebra import scaled
+
+    x = np.float32([1.5, -3.0, 2.0 ** 100, 2.0 ** -120, 2.0 ** -140, 0.0, -0.0, 7.0 * 2.0 ** -126])
+    significand, exponent = (np.asarray(part) for part in jax.jit(scaled.split_p.bind)(x))
+    contract, parts = ct.CONTRACTS[scaled.split_p], ct.RESULT_OPERANDS[scaled.split_p]
+    held = [contract({}, parts({}, [x], index), result, oc.FLOAT32)
+            for index, result in enumerate((significand, exponent))]
+    assert all(np.all(each) for each in held)
+    stepped, shifted = significand.copy(), exponent.copy()
+    stepped[0] = np.nextafter(stepped[0], np.float32(np.inf))
+    shifted[2] += 1
+    broken = contract({}, parts({}, [x], 0), stepped, oc.FLOAT32)
+    assert not broken[0] and np.all(broken[1:])
+    broken = contract({}, parts({}, [x], 1), shifted, oc.FLOAT32)
+    assert not broken[2] and np.all(np.delete(broken, 2))
+
+
+def test_the_ratios_contract_holds_a_zero_as_plus_zero_alone():
+    """`means.ratio_p`'s contract (`certified._ratio_holds`) holds a ratio's landing of a zero as +0 alone
+    (`means.Ratio`): the law's own landing of a negative product that flushes (a resumed state's output
+    -2^-126 times its total 2^-100) holds, and the same result as -0 breaks it, which a contract reading the
+    zero's sign away passed (the law's review)."""
+    from dew.algebra import means
+
+    operands = [np.float32([-(2.0 ** -126)]), np.float32([2.0 ** -100])]
+    params = {"form": means._RESUMED}
+    landed = np.asarray(means.ratio_p.bind(*map(jnp.asarray, operands), form=means._RESUMED))
+    assert landed.tolist() == 0.0 and not np.signbit(landed)
+    contract = ct.CONTRACTS[means.ratio_p]
+    assert np.all(contract(params, operands, landed, oc.FLOAT32))
+    assert not np.any(contract(params, operands, -landed, oc.FLOAT32))
+
+
+@pytest.mark.parametrize(("numerators", "denominators", "summed", "apart"), [
+    ([1.0, 1.0], [3.0, 3.0], 2 / 3, [1 / 3]),
+    ([2.0 ** 126, -(2.0 ** 127)], [0.25, 0.5], 0.0, [np.inf, -np.inf, np.nan])],
+    ids=["thirds", "opposite quotients past the format"])
+def test_the_ratios_contract_holds_quotients_summed_across_as_their_sum(numerators, denominators, summed,
+                                                                        apart):
+    """`means.ratio_p`'s contract (`certified._ratio_holds`) of quotients summed across an axis before they
+    land (`means.Ratio.across`, `sum_c N_c / D_c`) holds the law's own landing of their sum, exact (2/3, and 0
+    where each quotient passes the format), and refuses a quotient's own and their sum landed apart (`apart`),
+    as a contract reading one quotient alone, or the quotients landed, would pass them (the merge P0's base
+    review F1)."""
+    from dew.algebra import means
+
+    form = means.Ratio(((1.0, (("v", 0),)),), ((1.0, (("v", 1),)),), 0, reduced=False, units=means.Units(),
+                       across=(1,))
+    operands = [np.float32([numerators]), np.float32([denominators])]
+    landed = np.asarray(means.ratio_p.bind(*map(jnp.asarray, operands), form=form))
+    assert landed.tolist() == [[float(np.float32(summed))]]
+    contract = ct.CONTRACTS[means.ratio_p]
+    params = {"form": form}
+    assert np.all(contract(params, operands, landed, oc.FLOAT32))
+    assert not any(np.any(contract(params, operands, np.float32([[wrong]]), oc.FLOAT32)) for wrong in apart)
+
+
+def _formed_high(anchors, joined, *, units):
+    """The law's factors (`means._factors_value`) formed `2^-12` high: a factor's fault."""
+    from dew.algebra import means
+
+    significand, exponent = means._factors_value(anchors, joined, units=units)
+    return np.asarray(significand) * np.float32(1 + 2.0 ** -12), exponent
+
+
+@pytest.mark.parametrize(("stated", "anchors"), [
+    ({}, ([0.0, -1.5, -0.25], [0.0])),
+    ({"scale": 0.125, "compensated": False}, ([-262144.0, -262144.0, -262144.0], [0.015625]))],
+    ids=["compensated", "plain units' fold"])
+def test_the_ratios_factor_check_refuses_a_factor_formed_off_its_exponential(stated, anchors):
+    """`means.ratio_p`'s contract checks each exponential factor a ratio reads apart from the code that forms
+    it (`certified._factors_hold`), the exponential of its specified exponent enclosed in mpmath: compensated
+    units' exact `s (a - b)`, plain units' fold with its difference, coefficient and product each rounded in
+    float32 (`certified._plain_fold`, some 0.24% off the exact exponential at a scale of 1/8 and anchors
+    -262144 and 1/64, which the compensated bound refused: the merge P0's base review 12, F3). The law's own
+    factors hold, and factors formed `2^-12` high are refused, which the law and the contract's own sums
+    would both have read (base review 10, F6: a factor's fault passed on both sides)."""
+    from dew.algebra import means
+
+    form = means.Ratio(((1.0, (("v", 0), ("e", 1, 2))),), (), 0, reduced=True, units=means.Units(**stated))
+    laid = [np.float64([1.0, 2.0, 3.0]), *map(np.float64, anchors)]
+    assert ct._factors_hold(form, laid, oc.FLOAT32)
+    assert not ct._factors_hold(form, laid, oc.FLOAT32, formed=_formed_high)
+
+
+MOST = float(np.finfo(np.float32).max)
+"""Float32's largest value."""
+
+
+@pytest.mark.parametrize(("anchor", "joined"), [(-MOST, MOST), (MOST, -MOST)],
+                         ids=["past the floor", "past the ceiling"])
+def test_the_ratios_factor_check_holds_a_fold_past_the_format_to_its_cutoffs_factor(anchor, joined):
+    """Plain units at a scale of 1/2 over an anchor and a joined anchor at float32's largest of either sign:
+    the fold's halves exact, their difference times the coefficient doubled overflows
+    (`certified._plain_fold`) to -inf past the floor, where the law's factor is zero, or +inf past the
+    ceiling, where it is NaN. The check holds the law's own factor and refuses a factor of one in its place;
+    it raised making a Fraction of the infinity (the merge P0's head review, F5)."""
+    from dew.algebra import means
+
+    form = means.Ratio(((1.0, (("v", 0), ("e", 1, 2))),), (), 0, reduced=True,
+                       units=means.Units(scale=0.5, compensated=False))
+    laid = [np.float64([1.0]), np.float64([anchor]), np.float64([joined])]
+
+    def one(anchors, joined, *, units):
+        significand, exponent = means._factors_value(anchors, joined, units=units)
+        return np.ones_like(np.asarray(significand)), np.zeros_like(np.asarray(exponent))
+
+    assert ct._factors_hold(form, laid, oc.FLOAT32)
+    assert not ct._factors_hold(form, laid, oc.FLOAT32, formed=one)
+
+
+def test_the_ratios_contract_holds_a_refused_factor_over_a_zero_denominator_to_zero():
+    """`exp(2^22) / 0`: a numerator factor past the law's ceiling (refused, NaN) over a denominator that is
+    exactly zero, a row of no mass, which the law lands as +0 (`means._quotient`, whatever its numerator).
+    Check 2's ratio contract holds the law's +0 and refuses a NaN in its place; it held the NaN and refused
+    the +0 (the merge P0's base review 13, F3)."""
+    from dew.algebra import means
+
+    form = means.Ratio(((1.0, (("v", 0), ("e", 1, 2))),), ((1.0, (("v", 3),)),), 0, reduced=True,
+                       units=means.Units(scale=1.0))
+    operands = [np.float32([1.0]), np.float32([2.0 ** 22]), np.float32([0.0]), np.float32([0.0])]
+    landed = np.asarray(jax.jit(lambda *xs: means.ratio_p.bind(*xs, form=form))(*operands))
+    assert ct._ratio_holds({"form": form}, operands, landed, oc.FLOAT32)
+    assert not ct._ratio_holds({"form": form}, operands, np.full_like(landed, np.nan), oc.FLOAT32)
+
+
+def test_the_ratios_factor_check_refuses_a_zero_factor_its_exponent_holds_within_its_floor():
+    """Anchors `-45425.75` and `0` at scale 1: the factor's exact base-2 exponent is `means.FLOOR + 0.496`,
+    within the floor and far past the rounding of the exponent the law compares with it, so a zero formed for
+    it is refused, the law's own factor held; a binade either side of a cutoff passed the zero (the merge
+    P0's base review 11, F4)."""
+    from dew.algebra import means
+
+    form = means.Ratio(((1.0, (("v", 0), ("e", 1, 2))),), (), 0, reduced=True, units=means.Units(scale=1.0))
+    laid = [np.float64([1.0]), np.float64([-45425.75]), np.float64([0.0])]
+
+    def zero(anchors, joined, *, units):
+        significand, exponent = means._factors_value(anchors, joined, units=units)
+        return np.zeros_like(np.asarray(significand)), exponent
+
+    assert ct._factors_hold(form, laid, oc.FLOAT32)
+    assert not ct._factors_hold(form, laid, oc.FLOAT32, formed=zero)
+
+
 @pytest.mark.parametrize("primitive, fn", [(jax.lax.expm1_p, jnp.expm1), (jax.lax.log1p_p, jnp.log1p)],
                          ids=_named)
 def test_a_primitive_keeping_a_subnormal_its_lanes_multiply_flushes_is_held_as_it_computes(primitive, fn):

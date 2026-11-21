@@ -417,6 +417,17 @@ RECORDING = (KERNEL_SEEN, KERNEL_ROUTES)
 values' identities so a cached trace records again, and the program is the same under any of them, as
 the persistent cache's key reads none."""
 
+
+@contextlib.contextmanager
+def unrecorded() -> Iterator[None]:
+    """A block whose traces record into none of a trace's collections (`RECORDING`): a nested trace whose
+    launches and routes are its caller's to record (a portable walk under its dispatch's receipt) keys alike
+    under every receipt around it, so one cached trace serves them all, where each receipt's identity traced
+    it again (row 6740: a decision step's walk traced twice, 0.84 s against 0.30). A trace that records
+    launches or routes of its own is not one to run here: its records would be dropped."""
+    with KERNEL_SEEN(None), KERNEL_ROUTES(()):
+        yield
+
 KERNEL_PINS = _context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
 thread, keyed on as `KERNEL_TUNES` is."""

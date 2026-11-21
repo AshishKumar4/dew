@@ -95,10 +95,15 @@ import numpy as np
 import pytest
 from lane_environment import outside_suite
 from flax import linen as nn
-from float64_terms import float64_forward
-from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
+from interop_support import (
+    assert_restores,
+    assert_same_stored_tensors,
+    clearing_selections,
+    reference_read,
+    token_draw,
+    written_tensors,
+)
 from model_support import cached_round_trips, encoded_form, flat_tree, prediction_logits, streamed_export
-from one_draw import assert_as_exact_as_the_reference
 from process_support import raised
 from reference_error import (
     FACTOR,
@@ -145,6 +150,30 @@ GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next"
 # Every case runs each train since the export checks compile Dew's forward (ledgers 2182, 2278): GLM-5's
 # released standalone export, 173 s in train 279's CI before, is 99 s on armada at 7f18417b3 after; the
 # gradients and the cases reading GLM-5 Next's round trip 41-55 s.
+
+
+EXPORT_SEEDS = {"mixtral": 8, "qwen3_moe": 8, "glm4_moe": 8, "glm_moe_dsa": 32, "deepseek_v2": 8,
+                "deepseek_v3": 8, "deepseek_v32": 8, "deepseek_v4": 32, "kimi_k2": 8, "kimi_k25": 8,
+                "llama4_text": 8, "olmo3": 8, "opt": 8, "gpt_neox": 8, "mamba2": 8, "glm5_next": 16}
+"""Each family's check-1 seeds over its trained export's logits (`export_logits_site`), the fewest whose
+verdict resolves, paired with Dew's arm (`reference_error.seeds_for`, armada's CPU, 2026-11-20)."""
+
+
+def export_logits_site(trip, label: str):
+    """Check 1's site of a trained export's logits (row 1305: it held one draw, the fixture's own ids): Dew's
+    forward over the trained weights, and transformers' over the exported files (`interop_support
+    .reference_read`), on ids drawn in the fixture's own range (`token_draw`: 23 to 246, clear of every
+    family's special and media placeholder ids, whose rules the two implementations read apart), redrawn
+    where a selection would break apart between the runs (`clearing_selections`: a mixture's routing, a
+    lightning indexer's top-k); the truth transformers in float64 over the same files. Its arms, draw and
+    truth, as `assert_as_exact` and `seeds_for` take them."""
+    forward = jax.jit(trip.source.model.apply)
+    ids = np.asarray(trip.ids)
+    drawn = token_draw(0xDE0, int(ids.max()) + 1, ids.shape, low=int(ids.min()))
+    return (as_given(lambda tokens: np.asarray(forward(trip.trained, tokens), np.float64)),
+            reference_read(trip.case, trip.export, wide=False),
+            clearing_selections(trip.reloaded, drawn, label),
+            reference_read(trip.case, trip.export, wide=True))
 
 
 @pytest.fixture(scope="module")
@@ -237,8 +266,8 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
     assert actual == expected
     label = f"{trip.case.name} logits"
     if not trip.case.orders:
-        _, terms = float64_forward(trip.source.model, trip.trained, np.asarray(trip.ids, np.int32))
-        assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, label, terms=terms)
+        ours, theirs, draw, truth = export_logits_site(trip, label)
+        assert_as_exact(ours, theirs, draw, label, seeds=EXPORT_SEEDS[trip.case.name], truth_fn=truth)
         return
     forward = jax.jit(trip.source.model.apply)  # one compile for every order
     mine, theirs = [], [distance(trip.theirs, trip.truth)]
@@ -318,6 +347,7 @@ def test_an_expert_index_past_the_stack_is_refused(indexed):
         beyond.export(trip.trained)
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", COPIED_MTP, ids=COPIED_MTP)
 def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
     """GLM's prediction depth ships copies of the trunk's embedding and
@@ -352,6 +382,7 @@ def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
     assert np.any(trip.exported_tensors[projection] != trip.source_tensors[projection])
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", GRADIENTS, ids=GRADIENTS)
 def test_the_gradients_match_the_reference_implementation(name, trips):
     """Compare all trunk next-token CE gradients by source tensor name.
@@ -384,6 +415,7 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
         f"dew's largest deviation is on {worst}")
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", BALANCED, ids=BALANCED)
 def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trips):
     """The routers' balancing bias is state the step moves, not a
@@ -1395,6 +1427,7 @@ def assert_same_tensors(written: dict, expected: dict) -> None:
         assert written[tensor].dtype == value.dtype and np.array_equal(written[tensor], value), tensor
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny", "glm5-next-tiny"])
 def test_a_moe_decoder_saves_every_tensor_its_source_holds(name, tmp_path):
     """A causal MoE decoder saved in its source's layout writes every tensor the source checkpoint

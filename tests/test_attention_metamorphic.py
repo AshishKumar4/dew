@@ -27,6 +27,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_portable,
     attention_triton,
+    merged,
 )
 from dew.nn.kernels.templates.attention import Kept
 
@@ -128,14 +129,19 @@ def _slices_merged(query, key, value, spans, *, slices: int = 8, subtracted: boo
         config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
                                        target=generation.gpu_target()).config
         with tuning.pinned({attention_mosaic.MosaicForward: config}):
-            out, maximum, total = attention_mosaic.forward(
+            walked = attention_mosaic.forward(
                 rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
                 residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=slices,
-                subtracted=subtracted)[:3]
+                subtracted=subtracted)
             spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-            # One slice's output its rows' whole (`attention_decode.attend`'s), nothing to merge.
-            merged = out if slices == 1 else algebra.merged_slices(spec, out, maximum, total)
-        return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
+            if slices == 1:
+                # One slice's output its rows' whole (`attention_decode.attend`'s), nothing to merge.
+                merged_rows = walked[0]
+            else:
+                # The slices merged where the launch wrote them, as `attention_decode.attend` merges them.
+                state = merged.merged_padded(spec, *walked[:2], queries=rows.shape[1], width=value.shape[-1])
+                merged_rows = algebra.finish(spec, state, initial=True, normalized=True)[0]
+        return template.ungrouped_rows(merged_rows, DECODE_HEADS).astype(query.dtype)
 
 
 @INTERPRETS

@@ -1822,16 +1822,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
-                layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]:
+                layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]:
         """Return the loss over `batch` as `loss` computes it, together with the prediction behind it.
 
         The result holds the statistics, the `Aux` reports and a `Prediction`
         with the token logits (none unless `logits`), the weight of every position and the hidden
-        states of `layers`. The statistics are one `Ratio` over the positions
-        the weights count, so a distillation can mix in terms over the same
-        mass. `train` turns dropout on, as `loss` has it; a frozen teacher
-        scores with it off. Objectives that score no token logits raise
-        `TypeError`.
+        states of `layers`. The statistics are the loss's own: a `Ratio` over the positions the weights
+        count, which a distillation mixes its terms into over the same mass (`prediction_of`), or that
+        `Ratio` beside terms of their own mass (a mixture's router terms, `RoutedStatistics`), which a
+        distillation keeps as they are and its `reduce_loss` adds as the loss's does. `train` turns
+        dropout on, as `loss` has it; a frozen teacher scores with it off. Objectives that score no token
+        logits raise `TypeError`.
         """
         raise TypeError(f"{type(self).__name__} scores no token logits")
 
