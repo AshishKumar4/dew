@@ -1808,7 +1808,8 @@ def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compi
                                                       natural=attention_mosaic.NATURAL)
             ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
             cfg = op.derived(ba, target)
-            assert cfg is not None and cfg.stages >= 3, (label, cfg)
+            assert cfg is not None and (cfg.stages >= 3 if width <= 128 or cfg.consumers == 1
+                                        else cfg.stages == 2), (label, cfg)
             def _make(q=q, k=k):
                 def forward(query, key, value):
                     return attention_mosaic.forward(query, key, value, spans, None,
@@ -1901,7 +1902,7 @@ def test_planned_stages_deepens_at_residency_two_with_registers():
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         family = program.layouts("sm80", jnp.bfloat16, 4096)[0]
-        tile = ((64, 64), jnp.bfloat16)
+        tile = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
         def scope_of(stages):
             return resources.Scope(program=(tile,), walks=((stages, (tile,)),))
         stages = attention_mosaic._planned_stages(family, scope_of, target, consumers=1, registers=128,
