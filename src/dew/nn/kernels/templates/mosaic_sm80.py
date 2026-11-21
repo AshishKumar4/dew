@@ -431,16 +431,21 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        loaded, starts, _ = self._fragments(lhs, rhs)
+        acc, last = self._all_but_last(acc, *self._fragments(lhs, rhs)[:2])
+        return self._mma(acc, *last)
+
+    def _all_but_last(self, acc, loaded: Callable, starts: range) -> tuple[jax.Array, tuple]:
+        """`acc` with every instruction's product of `starts` issued but the last, each instruction's
+        fragments loaded (`loaded`) before the product ahead of it issues, and the last instruction's
+        fragments."""
         fragments = loaded(starts[0])
         for following in starts[1:]:
             ahead = loaded(following)
             acc = self._mma(acc, *fragments)
             fragments = ahead
-        return self._mma(acc, *fragments)
+        return acc, fragments
 
-    def _fragments(self, lhs, rhs, seeded: tuple | None = None, *, sliced: bool = False
-                   ) -> tuple[Callable, range, Callable]:
+    def _fragments(self, lhs, rhs, seeded: tuple | None = None) -> tuple[Callable, range, Callable]:
         """`products`' fragment reads of `lhs @ rhs`: `loaded(start)`, instruction `start`'s fragments, its
         loads issued the first time a slice is asked for; the instructions' starts; and `first()`, the left
         and right slices instruction 0 reads, read (`first_fragments`), those `seeded` gives already read
@@ -451,13 +456,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         faster. A register operand (an accumulator's value) is cast once and sliced. Each instruction's
         fragments load before the product ahead of it issues, CUTLASS's warp-level double buffering: every
         dense kernel gradient on an A100 took 12 to 14% less time, its outputs bitwise the same, the forward
-        and input gradient unchanged (FS-C1-NARROW1-a100). `sliced`, the left loads as narrow as the right's
-        (an instruction's granule): what a step's prefetch holds across the step before's last product is
-        then the one instruction's fragments the lookahead holds within a step, no register beyond it."""
+        and input gradient unchanged (FS-C1-NARROW1-a100)."""
         instruction = self.fragment_depth(int(rhs.shape[0]))
-        widest = 0 if sliced else self.lhs_fragment_depth(int(lhs.shape[1]),
-                                                           swizzle=swizzling.swizzle_of(lhs))
-        lhs_depth = max(_depth_granule(lhs, 1, instruction), widest)
+        lhs_depth = max(_depth_granule(lhs, 1, instruction),
+                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=swizzling.swizzle_of(lhs)))
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
@@ -487,21 +489,16 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def first_fragments(self, lhs, rhs):
         if jnp.dtype(lhs.dtype) != self.dtype:
             return self.for_dtype(lhs.dtype).first_fragments(lhs, rhs)
-        return self._fragments(lhs, rhs, sliced=True)[2]()
+        return self._fragments(lhs, rhs)[2]()
 
     def products_across(self, acc, lhs, rhs, prefetched, boundary: Callable):
         if jnp.dtype(lhs.dtype) != self.dtype:
             return self.for_dtype(lhs.dtype).products_across(acc, lhs, rhs, prefetched, boundary)
-        loaded, starts, _ = self._fragments(lhs, rhs, seeded=prefetched, sliced=True)
-        fragments = loaded(starts[0])
-        for following in starts[1:]:
-            ahead = loaded(following)
-            acc = self._mma(acc, *fragments)
-            fragments = ahead
+        acc, last = self._all_but_last(acc, *self._fragments(lhs, rhs, seeded=prefetched)[:2])
         # The last product's operands are in registers: the next step's slots awaited and its first
         # fragments read now, under it.
         following = boundary()
-        return self._mma(acc, *fragments), following
+        return self._mma(acc, *last), following
 
     def looped_products(self, acc, lhs, rhs, *, accumulate: bool = True):
         """`products`, its instruction slices issued in a loop of their own, each slice's operands loaded from
