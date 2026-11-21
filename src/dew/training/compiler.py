@@ -594,6 +594,11 @@ def _unlike(cap: Planned, other: Planned) -> list[str]:
         ours, theirs = leaves(held), leaves(given)
         unlike += [f"{name}{path}" for path in sorted(ours.keys() | theirs.keys())
                    if ours.get(path) != theirs.get(path)]
+        # The outputs' trees too, whose nodes' classes and static fields say what the leaves mean: a
+        # statistic pooled as one kind of mean by the cap and another by a count holds the same leaves.
+        if name == "outputs" and not unlike and jax.tree.structure(held) != jax.tree.structure(given):
+            unlike.append(f"{name}'s tree: {jax.tree.structure(given)} where the cap's is "
+                          f"{jax.tree.structure(held)}")
     return unlike
 
 
@@ -1030,6 +1035,11 @@ class StepCompiler[L, E]:
         # (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that replays
         # them holds their batches instead.
         window = planned.candidate.prepared.window
+        if window is not None and window.batch_statistics is not None and planned.split > 1:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics of a step's whole batch "
+                             "(`batch_statistics`) are computed at its first part, by that part's count, and "
+                             "read by every part: a pass count drawn per microbatch reads them one part a "
+                             "step (split 1), until each part's count computes its own (row 10770's audit)")
         if window is not None and window.mass is None:
             raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
                              "its update replays each microbatch at the count that closes it: a pass count "
