@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import gen_exports
 import lint_scopes as scopes
 
 FEATURES = ("dew.nn", "dew.data", "dew.inputs", "dew.objectives", "dew.training", "dew.inference",
@@ -121,7 +120,7 @@ def read(root: Path) -> Source:
     parents = {module: scopes.package_of(module, path.name == "__init__.py")
                for module, path in paths.items()}
     named = {module: scopes.modules_imported(tree, parents[module]) for module, tree in trees.items()}
-    walk = gen_exports.walker().Walk({module: str(path) for module, path in paths.items()},
+    walk = scopes.walker().Walk({module: str(path) for module, path in paths.items()},
                                      lambda module: paths[module].read_bytes())
     runs = {module: walk.imports(module)[0] for module in paths}
     return Source(paths, named, runs)

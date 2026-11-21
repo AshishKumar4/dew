@@ -95,6 +95,22 @@ class Walk:
         return frozenset(seen), tuple(sorted(sites))
 
 
+def resolved(name: str, package: str) -> str:
+    """The module a relative `name` (`..sibling`, `.`) names from `package`, the package its module's
+    relative imports start from; an absolute `name` itself. The one resolver of a relative import: a `from`
+    statement's (`imported_from`), an `import_module`'s, tools/lint_scopes.py's."""
+    level = len(name) - len(name.lstrip("."))
+    if not level:
+        return name
+    parts = package.split(".") if package else []
+    return ".".join([*parts[:len(parts) - level + 1], *([name[level:]] if name[level:] else [])])
+
+
+def imported_from(node: ast.ImportFrom, package: str) -> str:
+    """The module a `from` statement reads, a relative one resolved from `package` (`resolved`)."""
+    return resolved("." * node.level + (node.module or ""), package)
+
+
 def assigned(tree: ast.Module, name: str) -> ast.expr | None:
     """The value `tree` assigns `name` at its top level, None where it assigns none."""
     for node in tree.body:
@@ -310,10 +326,7 @@ class _Imports(ast.NodeVisitor):
                       alias.name if alias.asname else alias.name.partition(".")[0])
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        base = node.module or ""
-        if node.level:
-            parts = self.package.split(".")
-            base = ".".join([*parts[:len(parts) - node.level + 1], *([node.module] if node.module else [])])
+        base = imported_from(node, self.package)
         self.read(base)
         for alias in node.names:
             if alias.name == "*":
@@ -427,7 +440,7 @@ class _Imports(ast.NodeVisitor):
         found = None if name is None else self.stated(name)
         if found is not None and found.startswith("."):
             base = None if package is None else self.stated(package)
-            found = None if base is None else self.relative(found, base)
+            found = None if base is None else resolved(found, base)
         within = ".".join(self.within) or "<module>"
         site = f"{self.module}:{within}:{'' if name is None else ast.unparse(name)}"
         called = ast.unparse(node.func).rpartition(".")[2]
@@ -492,9 +505,5 @@ class _Imports(ast.NodeVisitor):
             return None if None in parts else "".join(part for part in parts if part is not None)
         return None
 
-    def relative(self, name: str, package: str) -> str:
-        level = len(name) - len(name.lstrip("."))
-        parts = package.split(".")
-        return ".".join([*parts[:len(parts) - level + 1], *([name[level:]] if name[level:] else [])])
 
 

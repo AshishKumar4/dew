@@ -879,10 +879,10 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: fro
     from dew.nn.kernels.tuning import encoded
 
     installed = seal().digest
-    if installed is None or (code := provenance_code(__name__, provenance)) is None:
+    if installed is None:
         return None
-    stated = [code, installed.hex(), _assemblers(), identity, encoded(config), reverse,
-              _keyed_environment()]
+    stated = [provenance_code(__name__, provenance), installed.hex(), _assemblers(), identity,
+              encoded(config), reverse, _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 

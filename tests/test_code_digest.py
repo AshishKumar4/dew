@@ -111,3 +111,24 @@ def test_every_module_a_stores_code_imports_is_in_its_closure():
     for module in ("dew.nn.kernels.templates.report", "dew.nn.kernels.templates.attention_mosaic",
                    "dew.communicators"):
         assert fresh(IMPORTED.format(module=module), platforms="cpu") == [], module
+
+
+KERNELS = """
+import json
+from pathlib import Path
+import dew.nn.kernels
+from dew._code import REVIEWED, closure
+root = Path(dew.nn.kernels.__file__).parent
+parts = [("dew", "nn", "kernels", *path.relative_to(root).with_suffix("").parts) for path in root.rglob("*.py")]
+modules = sorted(".".join(each).removesuffix(".__init__") for each in parts)
+print(json.dumps({module: sorted(set(closure(module)[1]) - REVIEWED.keys()) for module in modules}))
+"""
+
+
+def test_every_kernel_modules_code_is_keyed_by_its_closure_no_import_site_unreviewed():
+    """Every module of `dew.nn.kernels`, each a launch's op's possible home (`op_provenance`), holds in its
+    closure no dynamic import site `REVIEWED` does not: a site added unreviewed keys a family's every launch
+    by the whole package (train 1159's review F6: the recurrence family's closures reached the codec's and the
+    checkpoint parts' sites, unreviewed, through short_conv's linear layer)."""
+    found = fresh(KERNELS, platforms="cpu")
+    assert len(found) > 100 and {module: sites for module, sites in found.items() if sites} == {}
