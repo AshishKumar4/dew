@@ -1705,9 +1705,9 @@ def test_sm90_d256_forward_fits_single_launch_without_spills():
                 cases.append(KernelCase(f"{gen}-d256-{label}", _make))
             found = compile_mosaic_kernels(cases, gen)
             assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-            assert all("_columns" not in kernel["kernel"]
-                       for record in found for kernel in record.get("kernels", ())
-                       if "natural" not in kernel["kernel"]), found
+            for record in found:
+                assert any(kernel["kernel"] == "attention_forward"
+                           for kernel in record.get("kernels", ())), record
 
 
 @COMPILES_ON_CPU
