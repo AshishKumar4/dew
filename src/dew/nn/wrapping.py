@@ -131,6 +131,11 @@ class DecoderWrapper(DecoderHooks):
     def _decoder(self) -> CausalTransformer:
         return getattr(self, self.wraps)
 
+    @property
+    def max_seq_len(self) -> int:
+        """The decoder's, which a causal transformer states (`DecoderHooks`' a protocol's, unstated)."""
+        return self._decoder.max_seq_len
+
     @nn.nowrap
     def replicated_flops(self, stages: int, lengths) -> float:
         return self._decoder.replicated_flops(stages, lengths)

@@ -1082,7 +1082,7 @@ class BlockReading(Protocol):
     def block_chunks(self) -> tuple[int | None, ...]: ...
 
 
-def block_chunks_of(model: nn.Module) -> tuple[int | None, ...]:
+def block_chunks_of(model: object) -> tuple[int | None, ...]:
     """The attention chunk of each trunk layer that reads blocks whole, None where a layer has none; empty for
     a model that says nothing, or whose layers read none (`BlockReading`)."""
     return model.block_chunks() if isinstance(model, BlockReading) else ()

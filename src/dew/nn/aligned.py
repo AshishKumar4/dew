@@ -270,12 +270,15 @@ def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
 
 def _may_split(limbs) -> bool:
     """Whether a limb may lie across devices: its type's sharding names a mesh axis (an Explicit one), or
-    the trace's mesh has an Auto axis of more than one device, which the compiler may split it over and its
-    type does not state."""
-    mesh = jax.sharding.get_abstract_mesh()
-    auto = any(kind == jax.sharding.AxisType.Auto and size > 1
-               for kind, size in zip(mesh.axis_types, mesh.axis_sizes, strict=True))
-    return auto or any(entry is not None for limb in limbs for entry in jax.typeof(limb).sharding.spec)
+    the trace's mesh or its type's has an Auto axis of more than one device, which the compiler may split it
+    over and its type does not state."""
+    def split(mesh) -> bool:
+        return any(kind == jax.sharding.AxisType.Auto and size > 1
+                   for kind, size in zip(mesh.axis_types, mesh.axis_sizes, strict=True))
+
+    kinds = [jax.typeof(limb).sharding for limb in limbs]
+    return split(jax.sharding.get_abstract_mesh()) or any(
+        split(kind.mesh) or any(entry is not None for entry in kind.spec) for kind in kinds)
 
 
 def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> jax.Array:
