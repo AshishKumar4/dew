@@ -536,11 +536,13 @@ class FlowRollout(GroupedRollout):
         prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
                                                  context[condition.field])
                     for condition in self.objective.inputs.conditions.values()}
-        # This rank's rows of the walk, laid out as every flow batch is (`transition_rows`).
-        stochastic = np.asarray(generated.stochastic)[owned]
-        trains = stochastic[:, :selected] & (local_advantages[:, None] != 0) & real[:, None]
-        prepared.update({**transition_rows(np.asarray(generated.states)[owned], np.asarray(generated.times),
-                                           np.asarray(generated.log_probs)[owned], stochastic,
+        # This rank's rows of the walk, laid out as every flow batch is (`transition_rows`): the trained
+        # prefix of each part cut on the devices before its rows are read to the host, the states one past it.
+        stochastic = np.asarray(generated.stochastic[:, :selected])[owned]
+        trains = stochastic & (local_advantages[:, None] != 0) & real[:, None]
+        prepared.update({**transition_rows(np.asarray(generated.states[:, :selected + 1])[owned],
+                                           np.asarray(generated.times),
+                                           np.asarray(generated.log_probs[:, :selected])[owned], stochastic,
                                            local_advantages, selected=selected, trains=trains),
                          REWARDS_KEY: rewards[owned]})
         if spatial:
@@ -555,11 +557,15 @@ def transition_rows(states: ArrayLike, times: ArrayLike, log_probs: ArrayLike, s
     first `selected` transitions (every one where None), each row's states and the states they step to,
     both endpoints' times, its walk's grid points (`rollout_steps`), its recorded log densities, which
     transitions train (`trains`, the walk's stochastic ones where None) and each row's advantage. In NumPy
-    over a walk on the host, in JAX over one on the devices or traced."""
+    over a walk on the host, in JAX over one on the devices or traced. The walk's grid is `times`', whole;
+    its states may be cut to the `selected` transitions' (one more than them), its densities and stochastic
+    steps to those transitions, as a rank reading its rows of a long walk cuts them (row 10795)."""
     xp = np if isinstance(states, np.ndarray) else jnp
     states, times = xp.asarray(states), xp.asarray(times)
-    count, points = states.shape[:2]
+    count, points = states.shape[0], times.shape[0]
     taken = points - 1 if selected is None else selected
+    if states.shape[1] < taken + 1:
+        raise ValueError(f"a walk's {taken} transitions read {taken + 1} states, not {states.shape[1]}")
     shape = (count, taken)
     return {"latents": states[:, :taken], "next_latents": states[:, 1:taken + 1],
             "timesteps": xp.broadcast_to(times[:taken], shape),
