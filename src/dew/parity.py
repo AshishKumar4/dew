@@ -1350,7 +1350,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (path, kept, their.dtype)
-            row.append((-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0)))
+            row.append((-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0), (0.0, 0.0)))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (was and not own) or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
