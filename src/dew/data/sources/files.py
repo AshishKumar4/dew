@@ -1120,6 +1120,18 @@ class Files(Dataset):
     def metadata(self) -> Mapping[str, object]:
         return self._metadata
 
+    SCHEMA_FACTS = frozenset({"class_names", "rows", "count_rules"})
+    """The facts a raw Parquet or Arrow store's schema can state (`_metadata`), and no other."""
+
+    def asked(self, keys: Iterable[str]) -> Mapping[str, object]:
+        """Those of its facts named by `keys` (`dew.data.compile.asked_facts`): a raw Parquet or Arrow
+        store, whose schema states none of the others, opens no file for a fact outside `SCHEMA_FACTS`
+        (row 9009: a seeded streamed mix read every member's schema to check the tokenizer contract)."""
+        wanted = set(keys)
+        if self.committed is None and self.kind in ("parquet", "arrow") and not wanted & self.SCHEMA_FACTS:
+            return {}
+        return {key: value for key, value in self._metadata.items() if key in wanted}
+
     def stated(self) -> Mapping[str, object]:
         """What its committed manifest says, or a parquet or Arrow store's schema names (class
         names), no record read; files not here state nothing."""
