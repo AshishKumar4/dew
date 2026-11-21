@@ -36,7 +36,8 @@ from benchmark_recurrence import SHAPES, operands
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.options import program
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk, recomputing
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.residuals import recomputing
 from dew.telemetry.benchmark import device_time
 from dew.training.memory import peak_memory_gib
 

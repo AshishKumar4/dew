@@ -849,7 +849,7 @@ def test_a_remat_policy_changes_no_gradient(policy):
     inside the loss each arm runs (`row_names_port`), under check 1's own scope, which would hand an fp32
     call on to XLA."""
     from dew.nn.backbones.decoder_block import remat_policy
-    from dew.nn.kernels.recurrence_chunk import recomputing
+    from dew.nn.residuals import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
     initialize = jax.jit(lambda *args: nn.unbox(layer.init(*args)))
