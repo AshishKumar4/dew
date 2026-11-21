@@ -141,6 +141,32 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     out = family.staged_memory((consumers, block_k, width), dtype) if typed else stage
     return scoped, family.streams(blocks, stages, consumers), [] if held and not typed else [out]
 
+def dq_and_dkv(walk: _Backward, accumulators: tuple, weights_ref, cotangents_ref,
+               q_rhs, k_rhs, do_rhs, *, looped: bool = False) -> tuple[jax.Array, tuple]:
+    """Issue dQ, dV, and dK for a bf16/fp32 backward query tile: on overlapping shared-memory issuers
+    (wgmma), issue dV and dK inside dQ's product scope and read dQ with `pending=2` so dQ/dV/dK issue
+    back-to-back with no wait bubble and `add_dq` overlaps dV/dK (row 5272, 10867)."""
+    family, tiles = walk.program.family, walk.program.tiles
+    dk_acc, dv_acc = accumulators
+    shape = (tiles.block_q, k_rhs.shape[-1])
+    issue = family.looped_products if looped else family.products
+    if family.products_overlap and not family.operands_in_registers and not walk.interpret:
+        def issue_dkv():
+            issue(dv_acc, weights_ref.transpose((1, 0)), do_rhs)
+            issue(dk_acc, cotangents_ref.transpose((1, 0)), q_rhs)
+
+        dq = family.product(cotangents_ref, k_rhs, shape, then=issue_dkv, pending=2)
+    else:
+        dq = (None if family.operands_in_registers
+              else family.product(cotangents_ref, k_rhs, shape))
+        dv_acc = issue(dv_acc, weights_ref.transpose((1, 0)), do_rhs)
+        dk_acc = issue(dk_acc, cotangents_ref.transpose((1, 0)), q_rhs)
+        if dq is None:
+            dq = (family.looped_product(cotangents_ref, k_rhs, shape) if looped
+                  else family.product(cotangents_ref, k_rhs, shape))
+    return dq, (dk_acc, dv_acc)
+
+
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
                 carry, accumulators, *, masked: bool | None = None):
     """A fused dK/dV consumer's query tile `index`, queries first (`[bq, bk]`, the fast form's one
@@ -166,28 +192,14 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
                                   whole(index), shape, masked=masked)
     cotangents_staged = staged.at[1]
-    # Stage P and dS under one proxy fence so narrowed and part free before products; on overlapping
-    # shared-memory issuers (wgmma), issue dV and dK inside dQ's product scope and read dQ with
-    # `pending=2` so dQ/dV/dK issue back-to-back with no wait bubble and `add_dq` overlaps dV/dK (row 5272).
+    # Stage P and dS under one proxy fence so narrowed and part free before products (`dq_and_dkv`).
     with family.staged_together():
         family.staged(narrowed, staged.at[0])
         family.staged(part, cotangents_staged)
-    if family.products_overlap and not family.operands_in_registers and not walk.interpret:
-        def issue_dkv():
-            family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
-            family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
-
-        dq = family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]),
-                            then=issue_dkv, pending=2)
-    else:
-        dq = (None if family.operands_in_registers
-              else family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
-        dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
-        dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
-        if dq is None:
-            dq = family.looped_product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]))
+    dq, accumulators = dq_and_dkv(walk, (dk_acc, dv_acc), staged.at[0], cotangents_staged,
+                                  q_slot, k_smem, do_slot, looped=True)
     add_dq(q_first, dq)
-    return carry, (dk_acc, dv_acc)
+    return carry, accumulators
 
 def _sixteen_step(walk: _Backward, k_smem, staged, add_dq, slots, carry, accumulators, q_first,
                   operands: tuple[jax.Array, jax.Array]):

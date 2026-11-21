@@ -1905,13 +1905,6 @@ class Transport[Allocated, Opened](abc.ABC):
         through its consumers' own loads (mma.sync's) has nothing to publish."""
         plgpu.commit_smem()
 
-    def store_staged(self, smem, view, *, wait: bool = True) -> None:
-        """Flush an already-populated shared-memory tile `smem` to `view` (row 5272)."""
-        plgpu.commit_smem()
-        plgpu.copy_smem_to_gmem(smem, view)
-        if wait:
-            plgpu.wait_smem_to_gmem(0)
-
     @abc.abstractmethod
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so.

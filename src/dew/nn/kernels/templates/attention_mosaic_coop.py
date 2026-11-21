@@ -18,6 +18,7 @@ from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stack
 from dew.nn.kernels.templates.attention_mosaic_fused import (
     _STREAM_ORDER,
     _statistics,
+    dq_and_dkv,
     staged_parts,
     streamed_statistics,
     walked_sums,
@@ -100,7 +101,7 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     consumer's are published, its share of the head's columns of dV, dK and dQ over every key of the block
     (`aᵀ @ b`, `a @ b`), dQ added into dQ (`add_dq`), and the block released."""
     k_smem = resident[0]
-    family, tiles = walk.program.family, walk.program.tiles
+    family = walk.program.family
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     (narrowed, part), own, mine, q_first = _share_scores(walk, share, resident, rows_of, coords_of, whole,
@@ -111,21 +112,12 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
         family.staged(narrowed, weights_ref.at[:, own])
         family.staged(part, cotangents_ref.at[:, own])
     exchange.publish()
-    if family.products_overlap and not family.operands_in_registers and not walk.interpret:
-        def issue_dkv():
-            family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
-            family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
-
-        dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size),
-                            then=issue_dkv, pending=2)
-    else:
-        dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size))
-        dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
-        dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
+    dq, accumulators = dq_and_dkv(walk, (dk_acc, dv_acc), weights_ref, cotangents_ref,
+                                  q_slot.at[:, mine], k_smem.at[:, mine], do_slot.at[:, mine])
     add_dq(q_first, dq)
     family.settled(0)
     exchange.release()
-    return carry, (dk_acc, dv_acc)
+    return carry, accumulators
 
 
 def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, exponents, rows_of, coords_of,

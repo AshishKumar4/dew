@@ -1692,26 +1692,21 @@ def test_sm90_d256_forward_fits_single_launch_without_spills():
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     spans = template.spans(4096, 4096, 1, causal=True)
+    q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
     for gen in ("sm90", "sm80"):
         with generation.assumed(gen):
-            target = generation.gpu_target()
-            q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
-            k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
-            op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
-                                                      natural=attention_mosaic.NATURAL)
             cases = []
             for label, residuals in (("infer", template.Kept.NONE), ("train", template.Kept.OUTPUT)):
-                ba = op.bind(*args, residuals=residuals, interpret=False)
-                cfg = op.derived(ba, target)
-                assert cfg is not None, (gen, label)
-                assert cfg.columns is None, (gen, label, cfg)
-                # Step to 1 consumer (255 regs/thread) as certification does when 2-consumer spills.
-                one = dataclasses.replace(cfg, consumers=1, relaunch_consumers=1)
-                cases.append(KernelCase(f"{gen}-d256-{label}",
-                                        lambda op=op, ba=ba, cfg=one: op.lowering(ba, cfg)))
+                def _make(residuals=residuals):
+                    def forward(query, key, value):
+                        return attention_mosaic.forward(query, key, value, spans, None, residuals=residuals)
+                    return forward, (q, k, k)
+                cases.append(KernelCase(f"{gen}-d256-{label}", _make))
             found = compile_mosaic_kernels(cases, gen)
-            main_failures = [f for f in mosaic_failures(found) if "attention_forward_natural" not in f]
-            assert not main_failures, "\n".join(main_failures)
+            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+            assert all("_columns" not in kernel["name"]
+                       for record in found for kernel in record.get("kernels", ())), found
 
 
 @COMPILES_ON_CPU

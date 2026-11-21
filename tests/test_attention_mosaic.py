@@ -2018,9 +2018,11 @@ def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
         def ours(query, key, value, dout, scale=scale):
             del dout
             with _device(interpret=True):
-                return attention_mosaic_forward._plain_forward(
+                spec, launch, finished, in_place = attention_mosaic_forward._plain_walk(
                     query, key, value, spans, template.Hooks(), scale=scale, natural=attention_mosaic.NATURAL,
                     tiles=_form_tiles(), interpret=True)
+                return finished(attention_mosaic_forward.algebra.walked_launches(
+                    spec, launch, in_place=in_place))
 
         def reference(query, key, value, dout, scale=scale):
             del dout

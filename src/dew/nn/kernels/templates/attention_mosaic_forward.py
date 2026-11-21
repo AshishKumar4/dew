@@ -30,7 +30,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.float_bits import TWO_FACTOR_REACH
 from dew.nn.kernels import generation, launches, tuning
@@ -327,7 +326,7 @@ def relays(family: mosaic.Family, tiles: Tiles, *, peaks: bool = False) -> bool:
 def _plain_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                 masked: bool = False, **walk):
     """Return `(spec, launch, finished, in_place)` for an inference forward walk (`_inference_walk`), the one
-    owner of the `in_place` rewalk rule shared by `_plain_forward`, `_fwd`, and `_main_launch` (row 10677)."""
+    owner of the `in_place` rewalk rule shared by `_fwd` and `_main_launch` (row 10677)."""
     if masked and hooks.output_mod is not None:
         raise ValueError("a masked walk rewalks in place, which an output hook formed past its launch does "
                          "not take")
@@ -340,13 +339,6 @@ def _plain_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     spec, launch, finished = _inference_walk(query, key, value, spans, hooks, masked=masked, flagged=in_place,
                                              **walk)
     return spec, launch, finished, in_place
-
-
-def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                   masked: bool = False, **walk):
-    """`MosaicForward`'s launch without residuals (`_plain_walk`), walked by the fold's guard."""
-    spec, launch, finished, in_place = _plain_walk(query, key, value, spans, hooks, masked=masked, **walk)
-    return finished(algebra.walked_launches(spec, launch, in_place=in_place))
 
 
 def _copy_costs_more(query: jax.Array, value: jax.Array) -> bool:
@@ -726,19 +718,6 @@ def _training_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                 anchors[:, :, :queries], split)
 
     return spec, launch, finished
-
-
-def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                     scale: float, natural: bool, tiles: Tiles, interpret: bool, scaled: bool = False,
-                     counts: bool = True, registered: ForwardRegisters | None = None,
-                     tmem_columns: int | None = None
-                     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
-    """`MosaicForward`'s training launches at `tiles` (`_training_walk`), its launches walked by the fold's
-    guard (`algebra.walked_launches`): its rewalk is this kernel's natural launch."""
-    spec, launch, finished = _training_walk(query, key, value, spans, hooks, scale=scale, natural=natural,
-                                            tiles=tiles, interpret=interpret, scaled=scaled, counts=counts,
-                                            registered=registered, tmem_columns=tmem_columns)
-    return finished(algebra.walked_launches(spec, launch))
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -1603,32 +1582,24 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
         elif (hooks.output_mod is None and keep is None and family.budgets_registers
-              and state.acc.shape[-1] > 128 and state.acc.shape[-1] % 64 == 0):
-            # Chunk wide (>128) register epilogues into 64-column slices (32 regs/slice) into SMEM, then
-            # flush once (`store_staged`) so `state.acc` and `output` fit without spilling on sm90/sm80
-            # d256 forward (which forced 2-launch `columns=128`, row 5272).
-            finished = stored().finished
-            if finished is not None:
-                maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
-                family.stored(tuple(family.as_row(part) for part in (maximum, denominator)),
-                              finished, smem=row_smem)
+              and state.acc.shape[-1] > 128):
+            # Chunk wide (>128) register epilogues by `stores.staged_columns` so `state.acc` and `output`
+            # fit without spilling on sm90/sm80 d256 forward (row 5272, 10864).
+            width = state.acc.shape[-1]
+            chunk = stores.staged_columns(width, (out_view.dtype,))
+            maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
 
             def store_chunks(stage):
-                width = state.acc.shape[-1]
-                assert stage is not None and stage.shape[-1] == width
-                for col in range(0, width, 64):
-                    chunk = state._replace(acc=state.acc[:, col:col + 64])
-                    out_chunk = algebra.finish(spec, chunk, initial=hooked.initial is not None,
+                for col in range(0, width, chunk):
+                    sl = pl.ds(col, chunk)
+                    piece = state._replace(acc=state.acc[:, col:col + chunk])
+                    out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
                                                held=program.parts > 1)[0]
-                    sl = pl.ds(col, 64)
-                    if family.operands_in_registers and not interpret:
-                        plgpu.store(stage.at[:, sl], out_chunk.astype(stage.dtype), optimized=False)
-                    else:
-                        stage[:, sl] = out_chunk.astype(stage.dtype)
-                family.store_staged(stage, out_view)
+                    sub_stage = None if stage is None else stage.at[:, sl]
+                    family.stored((out_chunk,), (out_view.at[:, sl],), smem=sub_stage,
+                                  wait=col + chunk == width)
 
             out_stage(store_chunks)
-            return
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,
