@@ -644,6 +644,21 @@ def test_the_executable_a_profile_replaces_goes_with_its_program():
                                                             holding(live - trials.live))
 
 
+def test_a_guided_compile_releases_an_earlier_trainers_unguided_executable():
+    """A trainer under AutoPGLE whose unguided step an earlier trainer of the same program compiled takes
+    that step, compiles the guided one, and lets the unguided go: no lowering the earlier trainer kept holds
+    it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
+    trained(lm(), steps=0)
+    with autopgle(2):
+        trainer = lm()
+        state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
+    assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
+    assert trials.unguided is not None and trials.unguided() is None
+    live = live_executables()
+    assert live == trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
+                                                            holding(live - trials.live))
+
+
 def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
                                                                                             monkeypatch):
     """A fit's window opens once its warmup steps have run and its first step has compiled, so a window of

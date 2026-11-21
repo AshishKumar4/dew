@@ -605,6 +605,28 @@ def test_a_companion_takes_the_partners_it_needs_from_more_cpus():
 
 
 @pytest.mark.mesh
+def test_a_companion_mesh_probes_outside_an_enclosing_accelerator_mesh():
+    """A companion mesh made under the accelerator's mesh (`jax.set_mesh`), eagerly or inside a trace, as a
+    trainer's start reads its state mesh, probes its CPUs outside that mesh, its explicit axes or automatic
+    ones: the probe's sum over the CPUs was refused as on other devices than the mesh's (row 7986: `dew
+    profile`'s streamed pricing on a GH200)."""
+    devices = jax.devices("cpu")
+    assert len(devices) >= 4
+    for axis_type in (AxisType.Auto, AxisType.Explicit):
+        accelerator = Mesh(np.asarray(devices[:2], dtype=object), ("fsdp",), axis_types=(axis_type,))
+        traced: list[Mesh] = []
+
+        def within(accelerator=accelerator, traced=traced):
+            traced.append(companion_mesh(accelerator, devices[2:4]))
+
+        with jax.set_mesh(accelerator):
+            cpu = companion_mesh(accelerator, devices[2:4])
+            jax.eval_shape(within)
+        assert list(cpu.devices.flat) == list(devices[2:4])
+        assert list(traced[0].devices.flat) == list(devices[2:4])
+
+
+@pytest.mark.mesh
 @pytest.mark.distributed
 def test_companion_pool_uses_one_global_optimizer_reduction(tmp_path):
     from test_multiprocess import run_pool, run_worker

@@ -1300,14 +1300,15 @@ class StepCompiler[L, E]:
             trials = Trials(state, batch, owned=False) if trials is None else trials
             run = self.runner(stepping, planned, mesh)
             relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
-            unguided = planned.candidate.lowered
+            unguided, replaced = planned.candidate.lowered, planned.executable
             asked = search.compiled_key(unguided, planned.options)
             planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
-            # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
-            # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
-            # for a refit.
-            hold(asked, planned.executable)
-            forget(unguided)
+            if planned.executable is not replaced:
+                # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
+                # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
+                # for a refit. An empty profile replaces nothing, and every kept lowering stays.
+                hold(asked, planned.executable)
+                forget(unguided)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)
