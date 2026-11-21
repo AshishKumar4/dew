@@ -14,8 +14,10 @@ or resolved by the literal table it selects from (`SELECTED`), and a closure hol
 table no literal states, is keyed by the whole package instead (`dew._cache.package_digest`), logged, so a
 site added unreviewed costs warm records, never a stale one.
 
-A closure is walked once a tree (its whole package's digest) and kept in Dew's cache, so a start reads its
-files' bytes, not their syntax: a walk parses a kernel's 225 files in about 1.5 s."""
+Every read is of one snapshot of the tree a process takes once (`_snapshot`: each file's digest), so a
+closure and its digest state one revision; a process whose files changed after keeps no record. A closure
+is walked once a tree and kept in Dew's cache, so a start reads its files' bytes, not their syntax: a walk
+parses an op's 153 files in about a second."""
 
 import ast
 import contextlib
@@ -90,32 +92,34 @@ _LOADERS = frozenset({"spec_from_file_location", "exec_module", "run_path", "run
 
 
 @functools.cache
-def code_digest(*roots: str) -> str:
+def code_digest(*roots: str) -> str | None:
     """The digest of the modules `roots` name and every module of Dew's their code can import (`closure`),
-    each by its path and contents, the release's version (`dew._version`) not read: what a record of what
-    those modules computed keys on. The whole package's (`package_digest`) where the closure holds a
-    dynamic import site not `REVIEWED`, which is logged: its code could import any module. Read once a
-    process, as the whole package's is."""
-    modules, sites = _kept_closure(roots)
+    each by its path and contents (`_snapshot`), the release's version (`dew._version`) not read: what a
+    record of what those modules computed keys on. The whole package's (`package_digest`) where the
+    closure holds a dynamic import site not `REVIEWED`, which is logged: its code could import any module.
+    None where Dew's source is not the one this process first read (a checkout edited while it ran), whose
+    code no digest of the files states: such a process keeps and reads no record, logged. Read once a
+    process."""
+    try:
+        modules, sites = _kept_closure(roots)
+        current = _listed() == _snapshot()
+    except _Changed:
+        current = False
+    if not current:
+        _log.warning("Dew's source changed while this process ran: it keeps no record of %s",
+                     ", ".join(roots))
+        return None
     unreviewed = sorted(set(sites) - REVIEWED.keys())
     if unreviewed:
         _log.warning("the code of %s imports by computed names at %s, none reviewed (dew._code.REVIEWED): "
                      "its records are keyed by all of Dew's code", ", ".join(roots), ", ".join(unreviewed))
         return package_digest()
-    if not _unchanged() or not all(map(_as_read, modules)):
-        # A file changed since this process first read the tree: the code it runs is the one it imported,
-        # which no read now states, so its records key as the whole package it first read.
-        _log.warning("Dew's source changed while this process ran: the records of %s are keyed by all of "
-                     "Dew's code", ", ".join(roots))
-        return package_digest()
+    files = _snapshot()
     digest = hashlib.sha256()
     for module in sorted(modules):
-        path = _path(module)
-        if path is None:
-            raise LookupError(f"{module}, which the code of {', '.join(roots)} imports, has no source file")
-        relative = path.relative_to(SOURCE)
-        if relative != Path("dew", VERSION_FILE):
-            digest.update(relative.as_posix().encode() + b"\0" + _source(module))
+        relative, contents = files[module]
+        if relative != f"dew/{VERSION_FILE}":
+            digest.update(f"{relative}\0{contents}\0".encode())
     return digest.hexdigest()
 
 
@@ -130,40 +134,48 @@ def defining_modules(values: Sequence[object]) -> frozenset[str]:
     return frozenset(found)
 
 
+class _Changed(Exception):
+    """A source file is not the one this process's snapshot of Dew's source holds (`_snapshot`)."""
+
+
+def _listed() -> dict[str, tuple[str, str]]:
+    """Each module of Dew's packages as its source is now: its file's path under `SOURCE` and the digest of
+    its contents, by its name."""
+    files = {}
+    for package in PACKAGES:
+        for path in sorted((SOURCE / package).rglob("*.py")):
+            relative = path.relative_to(SOURCE)
+            name = ".".join(relative.with_suffix("").parts).removesuffix(".__init__")
+            files[name] = (relative.as_posix(), hashlib.sha256(path.read_bytes()).hexdigest())
+    return files
+
+
+@functools.cache
+def _snapshot() -> dict[str, tuple[str, str]]:
+    """Dew's source as this process first read it (`_listed`): which modules exist, where, and what each
+    holds. A closure is walked from it (`_path`, `_source`) and a digest computed from it, one tree
+    throughout, however the files change after."""
+    return _listed()
+
+
 def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ...]]:
-    """`closure(*roots)`, kept in Dew's cache under the whole package's digest, the Python that parsed it
-    and the roots, so a later start of the same tree reads it, walking nothing. A walk is kept only where
-    the package's files were those the digest names throughout it; a kept closure that does not name its
-    roots, or names a module with no file, is walked again."""
-    whole = package_digest()
+    """`closure(*roots)`, kept in Dew's cache under the digest of the source it was walked from
+    (`_snapshot`), the Python that parsed it and the roots, so a later start of the same tree reads it,
+    walking nothing; one that does not name its roots, or names a module the tree has not, is walked
+    again."""
+    tree = hashlib.sha256(json.dumps(sorted(_snapshot().values())).encode()).hexdigest()
     named = hashlib.sha256(json.dumps(roots).encode()).hexdigest()[:16]
     python = "{}.{}".format(*sys.version_info[:2])
-    kept = Path(dew_cache_dir()) / "code" / f"{whole}-{python}-{named}.json"
-    unchanged = _unchanged()
+    kept = Path(dew_cache_dir()) / "code" / f"{tree}-{python}-{named}.json"
     with contextlib.suppress(FileNotFoundError, ValueError):
         found = json.loads(kept.read_text())
-        if unchanged and _sound(found, roots):
+        if _sound(found, roots):
             return frozenset(found["modules"]), tuple(found["sites"])
     modules, sites = closure(*roots)
-    # Kept only where the files are still the digest's and each the walk read is still the read it walked:
-    # a tree changed during the walk, or before it, keeps nothing.
-    if unchanged and _unchanged() and all(map(_as_read, modules)):
-        kept.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(kept, json.dumps({"roots": list(roots), "modules": sorted(modules),
-                                           "sites": list(sites)}))
+    kept.parent.mkdir(parents=True, exist_ok=True)
+    write_atomically(kept, json.dumps({"roots": list(roots), "modules": sorted(modules),
+                                       "sites": list(sites)}))
     return modules, sites
-
-
-def _unchanged() -> bool:
-    """Whether the package's files are those its digest this process read names (`package_digest`): where
-    not, a file changed since, and no closure is read from Dew's cache or kept there."""
-    return package_digest.__wrapped__() == package_digest()
-
-
-def _as_read(module: str) -> bool:
-    """Whether `module`'s file is still the source this process read of it (`_source`)."""
-    path = _path(module)
-    return path is not None and path.read_bytes() == _source(module)
 
 
 def _sound(found: JSON, roots: tuple[str, ...]) -> bool:
@@ -197,16 +209,11 @@ def closure(*roots: str) -> tuple[frozenset[str], tuple[str, ...]]:
     return frozenset(seen), tuple(sorted(sites))
 
 
-@functools.cache
 def _path(module: str) -> Path | None:
-    """The source file of Dew's `module`, None where none is (a library's, an absent one)."""
-    if module.partition(".")[0] not in PACKAGES:
-        return None
-    base = SOURCE.joinpath(*module.split("."))
-    for path in (base.with_suffix(".py"), base / "__init__.py"):
-        if path.is_file():
-            return path
-    return None
+    """The source file of Dew's `module` in this process's snapshot of the tree (`_snapshot`), None where
+    it holds none (a library's, an absent one)."""
+    found = _snapshot().get(module)
+    return None if found is None else SOURCE / found[0]
 
 
 def _ours(module: str) -> set[str]:
@@ -218,12 +225,15 @@ def _ours(module: str) -> set[str]:
 
 @functools.cache
 def _source(module: str) -> bytes:
-    """`module`'s source as this process first read it: the bytes its closure was walked from and its
-    digest hashes, one snapshot however the file changes after."""
+    """`module`'s source as this process's snapshot of the tree holds it (`_snapshot`); `_Changed` where
+    its file holds another now."""
     path = _path(module)
     if path is None:
         raise LookupError(f"no module of Dew's is named {module}")
-    return path.read_bytes()
+    contents = path.read_bytes()
+    if hashlib.sha256(contents).hexdigest() != _snapshot()[module][1]:
+        raise _Changed(f"{path} changed after this process first read Dew's source")
+    return contents
 
 
 @functools.cache

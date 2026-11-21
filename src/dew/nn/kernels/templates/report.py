@@ -369,19 +369,20 @@ def _parts(value) -> Iterator[object]:
         yield from _parts(each)
 
 
-def launch_code(provenance: frozenset[str] | None) -> list[str]:
+def launch_code(provenance: frozenset[str] | None) -> list[str] | None:
     """The digests of the code a launch's stored verdict and choice are a function of
     (`dew._code.code_digest`): the certification's own and every module its code imports (each GPU
     family's template, `mosaic_sm80`, `mosaic_sm90`, ..., among them), and those of the modules of Dew's
     its `provenance` names (`_provenance`): an op's lowering, a value it holds. An edit of Dew's code
     elsewhere (a trainer's, another op's) keeps them (row 10743). The whole package's where `provenance`
-    is None."""
+    is None. None where Dew's source changed while this process ran (`code_digest`): it keeps no record."""
     from dew._cache import package_digest
     from dew._code import code_digest
 
     if provenance is None:
         return [package_digest()]
-    return [code_digest(__name__), *(code_digest(module) for module in sorted(provenance))]
+    found = [code_digest(module) for module in (__name__, *sorted(provenance))]
+    return None if None in found else [digest for digest in found if digest is not None]
 
 
 def _digest(text: str) -> str:
@@ -922,10 +923,10 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: fro
 
     from dew.nn.kernels.tuning import encoded
 
-    installed = seal().digest
-    if installed is None:
+    installed, code = seal().digest, launch_code(provenance)
+    if installed is None or code is None:
         return None
-    stated = [launch_code(provenance), installed.hex(), _assemblers(), identity, encoded(config), reverse,
+    stated = [code, installed.hex(), _assemblers(), identity, encoded(config), reverse,
               _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 

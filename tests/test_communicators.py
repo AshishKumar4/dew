@@ -271,7 +271,7 @@ def test_a_programs_communicators_are_kept_under_the_digest_of_their_readers_cod
     def unread() -> str:
         raise AssertionError("the text of a program whose communicators this Dew kept is read again")
 
-    ours = kept / code_digest("dew.communicators") / f"{b'kept'.hex()}.json"
+    ours = kept / str(code_digest("dew.communicators")) / f"{b'kept'.hex()}.json"
     ours.parent.mkdir(parents=True)
     ours.write_text(json.dumps(planted.to_json()))
     assert communicators.collectives_kept(b"kept", (0, 1, 2, 3), unread) == planted
@@ -667,7 +667,7 @@ def a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_commun
     environment = {**os.environ, "XDG_CACHE_HOME": str(cache), "JAX_COMPILATION_CACHE_DIR": str(compiled),
                    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
                    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0"}
-    kept = cache / "dew" / "communicators" / "programs" / code_digest("dew.communicators")
+    kept = cache / "dew" / "communicators" / "programs" / str(code_digest("dew.communicators"))
 
     def ran() -> tuple[list[int], dict[str, tuple[int, int]]]:
         done = subprocess.run([sys.executable, "-c", COMPILED_ON_GPU], check=True, env=environment,

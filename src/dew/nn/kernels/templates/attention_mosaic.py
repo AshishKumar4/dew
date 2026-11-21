@@ -175,15 +175,15 @@ def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
     """What decides `op`'s priced consumer count on `target` (`tuning.stored_choice`), keyed as
-    `report._verdict_key` is; None where the installation has no seal."""
+    `report._verdict_key` is; None where the installation has no seal or Dew's source changed while the
+    process ran."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
-    installed = seal().digest
-    if installed is None:
+    installed, code = seal().digest, report.launch_code(report._provenance(op, ba))
+    if installed is None or code is None:
         return None
-    stated = [report.launch_code(report._provenance(op, ba)), installed.hex(), report._identity(op, ba),
-              target.generation,
+    stated = [code, installed.hex(), report._identity(op, ba), target.generation,
               target.multiprocessors, tuning.encoded(candidates), _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
