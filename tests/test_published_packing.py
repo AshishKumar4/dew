@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from dew.data.cache import Cache
-from dew.data.compile import compile, publish
+from dew.data.compile import compile, publish, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline
 from dew.data.sources.memory import Memory
@@ -34,7 +34,8 @@ def test_a_published_best_fit_pack_reads_the_windows_its_streamed_pack_packs(tmp
                                        shard_bytes=256 * 1024), read="indexed", loading=READ)
 
     def windows(chain, read):
-        reader = compile(chain.batch(1), read=read, loading=READ, epochs=1).train(DataPartition())
+        # One pass, in order (a validation read's).
+        reader = validation(chain, batch=1, read=read, loading=READ)(DataPartition())
         try:
             return [[np.asarray(leaf).tolist() for leaf in jax.tree.leaves(batch)] for batch in reader]
         finally:
