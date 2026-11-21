@@ -689,6 +689,12 @@ class MosaicForward(_Mainloop[Tiles]):
         if not (family.takes_right(width, config.block_k)
                 and family.takes_right(config.block_k, val_columns)):
             return False
+        # wgmma's P·V depth (`block_k`) must be a multiple of V's swizzle tile (`swizzle_for(val_columns)`):
+        # 64 for >=64-column V blocks, 32 for 32-column V blocks (row 6508).
+        if (self.parts > 1 and not family.places_on_role and not family.operands_in_registers
+                and config.block_k % swizzling.swizzle_columns(
+                    query.dtype, swizzling.swizzle_for(query.dtype, val_columns))):
+            return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
         tiles = (config.block_k, config.relaunch_k or config.block_k)
