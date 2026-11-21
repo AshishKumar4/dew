@@ -15,12 +15,19 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import launches, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stacked, stores, swizzling
-from dew.nn.kernels.templates.attention_mosaic_fused import staged_parts, walked_sums
+from dew.nn.kernels.templates.attention_mosaic_fused import (
+    _STREAM_ORDER,
+    _statistics,
+    dq_and_dkv,
+    staged_parts,
+    streamed_statistics,
+    walked_sums,
+)
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    STATISTICS,
     BackwardTiles,
     TileWalk,
     _coords,
-    _rows,
     _Spans,
     _streamed,
     _views_of,
@@ -36,8 +43,8 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
 )
 
 
-def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
-                      ) -> tuple[list, dict]:
+def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
+                      reduced: int = 0, streamed: int | None = None) -> tuple[list, dict]:
     """The shared-keys launch's allocations as `Family.scoped` takes them, in `_coop_launch`'s order: the
     program's resident keys and values; a tile's weights and score cotangents, every consumer's share of
     the keys whole rows of their swizzle, the widest whose row divides it and the products' contractions
@@ -45,8 +52,8 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     each (`staged_parts`); each consumer's fp32 stage of its adds a chunk of its columns at a time
     (`stores.staged_columns`: width 256's two stages of its 64 x 256 slots fit beside it); the two loads'
     barriers and the exchange's (`Family.exchange`); fp16's shares' exponents, a row each of the weights'
-    and of the cotangents' (`_sixteen_step`); and its query and output-cotangent streams in `stages` slots
-    (`Family.streams`)."""
+    and of the cotangents' (`_sixteen_step`); and its query, output-cotangent, and streamed-statistics
+    streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     chunk = stores.staged_columns(width // consumers, (jnp.float32,))
     swizzle = swizzling.swizzle_for(dtype, block_k // consumers, block_q, block_k)
@@ -57,7 +64,11 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
               family.load_barriers(2), *family.exchange(consumers)]
     if parts > 1:
         scoped.append(family.staged_memory((2, consumers, block_q), jnp.float32))
-    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
+    if streamed is None:
+        streamed = streamed_statistics(family, config, width, dtype, stages, reduced=reduced,
+                                       allocations_of=_coop_allocations)
+    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
+              **{name: ((block_q,), STATISTICS[name]) for name in _STREAM_ORDER[:streamed]}}
     return scoped, family.streams(blocks, stages, consumers)
 
 
@@ -73,7 +84,7 @@ def _share_scores(walk: _Backward, share: int, resident: tuple, rows_of, coords_
     own = pl.ds(share * keys, keys)
     coords = coords_of(q_first, read=walk.places_read(masked=masked))
     scores = _tile_scores(walk, (slots["queries"], slots["douts"]), (k_smem.at[own], v_smem.at[own]),
-                          rows_of(q_first), coords, whole(index), (tiles.block_q, keys), masked=masked,
+                          rows_of(slots, q_first), coords, whole(index), (tiles.block_q, keys), masked=masked,
                           whole_operands=whole_operands)
     return scores, own, pl.ds(share * columns, columns), q_first
 
@@ -90,23 +101,23 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     consumer's are published, its share of the head's columns of dV, dK and dQ over every key of the block
     (`aᵀ @ b`, `a @ b`), dQ added into dQ (`add_dq`), and the block released."""
     k_smem = resident[0]
-    family, tiles = walk.program.family, walk.program.tiles
+    family = walk.program.family
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     (narrowed, part), own, mine, q_first = _share_scores(walk, share, resident, rows_of, coords_of, whole,
                                                          index, slots, masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
     exchange.claim()
-    family.staged(narrowed, weights_ref.at[:, own])
-    family.staged(part, cotangents_ref.at[:, own])
+    with family.staged_together():
+        family.staged(narrowed, weights_ref.at[:, own])
+        family.staged(part, cotangents_ref.at[:, own])
     exchange.publish()
-    dq = family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size))
-    dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
-    dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
+    dq, accumulators = dq_and_dkv(walk, (dk_acc, dv_acc), weights_ref, cotangents_ref,
+                                  q_slot.at[:, mine], k_smem.at[:, mine], do_slot.at[:, mine])
     add_dq(q_first, dq)
     family.settled(0)
     exchange.release()
-    return carry, (dk_acc, dv_acc)
+    return carry, accumulators
 
 
 def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, exponents, rows_of, coords_of,
@@ -126,16 +137,18 @@ def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, expon
     operands, own, mine, q_first = _share_scores(walk, share, resident, rows_of, coords_of, whole, index,
                                                  slots, masked=masked, whole_operands=True)
     exchange.claim()
-    for operand, left in enumerate(operands):
-        exponent = jnp.full((tiles.block_q,), algebra.tile_exponent(left), jnp.float32)
-        family.staged(family.as_row(exponent), exponents.at[operand, share])
+    with family.staged_together():
+        for operand, left in enumerate(operands):
+            exponent = jnp.full((tiles.block_q,), algebra.tile_exponent(left), jnp.float32)
+            family.staged(family.as_row(exponent), exponents.at[operand, share])
     exchange.publish()
     joined = tuple(functools.reduce(jnp.maximum, (jnp.max(family.rows_of(exponents.at[operand, other]))
                                                   for other in range(consumers)), last)
                    for operand, last in enumerate(carry))
-    for operand, left in enumerate(operands):
-        for offset, part in enumerate(algebra.parts_at(left, joined[operand])):
-            family.staged(part, exchanged.at[2 * operand + offset, :, own])
+    with family.staged_together():
+        for operand, left in enumerate(operands):
+            for offset, part in enumerate(algebra.parts_at(left, joined[operand])):
+                family.staged(part, exchanged.at[2 * operand + offset, :, own])
     exchange.publish()
     dk_acc, dv_acc = accumulators
     issued = [_rescaled_parts(walk, acc, algebra.running_shift(carry[operand], joined[operand]), rhs,
@@ -178,16 +191,13 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, heads // kv_heads)
-        views = _views_of(family, {"queries": q_ref, "douts": do_ref}, row, head)
+        statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
+        views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         k_first = family.program_index("k_tiles") * block_k
         lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
         streamed = _streamed([(lo, hi)] * consumers)
         run = program.whole_run(k_first, q_steps, spans_of)
-
-        def rows_of(q_first):
-            return tuple(_rows(family, ref, row, head, q_first, block_q) for ref in stat_refs)
-
         def cooperate(share: int, index):
             # Each consumer's columns its own, so each slices its tiles at offsets it holds statically.
             keys_view = (row, pl.ds(k_first, block_k), key_head)
@@ -227,19 +237,23 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
 
         family.scheduled(consumers, consumer, producer)
 
-    scoped, rings = _coop_allocations(family, program.tiles, width, query.dtype,
-                                      min(program.tiles.stages, q_steps))
+    stages = min(program.tiles.stages, q_steps)
+    reduced = reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1)
+    stats_streamed = streamed_statistics(family, program.tiles, width, query.dtype, stages, reduced=reduced,
+                                         allocations_of=_coop_allocations)
+    scoped, rings = _coop_allocations(family, program.tiles, width, query.dtype, stages,
+                                      reduced=reduced, streamed=stats_streamed)
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
     launch = family.kernel(
-        entry, out_type=(), grid=(heads, keys_padded // block_k, batch),
-        grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
+        entry, out_type=(), grid=(heads, batch, keys_padded // block_k),
+        grid_names=("heads", "batch", "k_tiles"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_shared",
         registers=walk.registers(dq=False),
         # A score hook's warpgroups reserve their reduction scratch, and fp16's running scale's (`reducing`).
-        reducing_warpgroups=reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1),
+        reducing_warpgroups=reduced,
         # Its walk's statement, its work its emission's (`stated`); the model's products it owns
         # (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads, query, key, value, dout,

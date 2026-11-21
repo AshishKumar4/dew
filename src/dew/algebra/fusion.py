@@ -658,16 +658,16 @@ def _unwritten(region: Written, trace: _Trace) -> None:
     refused for it (`UNWRITTEN`, the two outputs' types named), its site, target and forcing its own: the
     region is not written, its equations kept as traced, and a kernel report says so (row 10719: the choice
     was dropped with no report; row 10856: reported anew, it took the reporting frame's site and lost its
-    forcing). A route its call took to XLA already is as it ran, its own refusal kept."""
+    forcing). A route its call took to XLA already is reported as it ran, its own refusal kept: the region's
+    routes reach no other report (`Recorded.replay` runs for a written region alone; row 10879)."""
     from dew.nn.kernels.selection import Refusal
 
     made = [str(var.aval) for var in trace.equation.outvars]
     own = [str(var.aval) for var in region.outputs]
     refusal = Refusal(UNWRITTEN, f"its written call makes {made}, not the region's own {own}")
     for taken in trace.record.routes:
-        if taken.kernel != "xla":
-            generation.published(dataclasses.replace(taken, kernel="xla", preferred=taken.kernel,
-                                                      refusal=refusal))
+        generation.published(taken if taken.kernel == "xla" else dataclasses.replace(
+            taken, kernel="xla", preferred=taken.kernel, refusal=refusal))
 
 
 def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:

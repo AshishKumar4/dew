@@ -491,7 +491,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
         # The reference and its truth run their programs unrewritten, as a site's do.
         reference, truth = unrewritten(reference), unrewritten(truth)
         [pool] = _drawn(reference, reference, draw, range(3 * OFFSET * 1024, 3 * OFFSET * 1024 + 512),
-                        truth)
+                        truth, repeats=True)
         names, values = pool.names, np.asarray(pool.mine)
     else:
         names, values = ["leaf"], None
@@ -641,7 +641,7 @@ def main(argv: list[str]) -> int:
 
         seeds = range(2 * OFFSET * 1024 + options.chunk * options.draws,
                       2 * OFFSET * 1024 + (options.chunk + 1) * options.draws)
-        [draws] = _drawn(reference, reference, draw, seeds, truth)
+        [draws] = _drawn(reference, reference, draw, seeds, truth, repeats=options.chunk == 0)
         print(json.dumps({"class": options.name, "chunk": options.chunk, "names": draws.names,
                           "mse": np.exp(np.asarray(draws.mine)).tolist(),
                           "log_worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)

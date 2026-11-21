@@ -386,9 +386,10 @@ class WalkStep:
 @dataclasses.dataclass(frozen=True)
 class Activation:
     """An activation's region (`dew.nn.activations`): `name`'s activation of its operand, or where `gated` a
-    gated product's, the activation of its gate times its up projection, its operands gate then up. Its one
-    reader is a fusion pass's choice of a matmul's epilogue that computes it; inlined, it lowers to its body,
-    Dew's arithmetic as it stands."""
+    gated product's, the activation of its gate times its up projection, its operands gate then up. A gated
+    one a fusion pass replays as a matmul's epilogue (`dew.algebra.fusion._activation`); either ends the
+    algebra's region around it (`program.WITHIN`); inlined, it lowers to its body, Dew's arithmetic as it
+    stands."""
     name: str
     gated: bool
 

@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A beam search (`Beam`, any `Regrouping`) over a paged model decodes over its pool, sized for the search,
+  each beam sharing its parent's written pages; only a pool split among groups, or a model that rebuilds
+  its cache past a position, decodes unpaged. A pool named smaller than the search needs is refused.
 - A host step's startup, a sampled streamed step's admission, a rollout's and a fetched executable's
   admission share the planner's paths: the streamed step of an inspecting run is admitted with its
   sampled step; a rollout's copy and generation are admitted as a step is (`memory.admitted`); an

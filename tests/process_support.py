@@ -117,6 +117,25 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
+_COORDINATORS: list[socket.socket] = []
+"""The ports this process reserved for a pool's coordinator (`coordinator_port`), each held while it lives."""
+
+
+def coordinator_port() -> int:
+    """A port for a pool's coordinator (JAX's coordination service, a gRPC server that binds with
+    SO_REUSEPORT), held by a socket of this process's bound with SO_REUSEPORT too, not listening, for the
+    rest of its life: the coordinator binds it beside the hold, and no other bind for a free port on the host
+    is handed it meanwhile, as one released at once (`free_port`) may be: two pools on one host could take
+    one port between its release and their coordinators' binds, and a coordinator see another pool's task
+    connect. Row 6856's abort ("1 unexpectedly tried to connect with a different incarnation") is such a
+    connection; that this race made it is not proven."""
+    held = socket.socket()
+    held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    held.bind(("127.0.0.1", 0))
+    _COORDINATORS.append(held)
+    return held.getsockname()[1]
+
+
 def device_flags(devices: int, flags: str | None = None) -> str:
     """XLA's `flags` (this process's where none are given) with `devices` CPU devices, the one way a worker of
     the suite sets its device count: the lane's other flags kept (`lane_environment`: its CPU collectives'
@@ -358,7 +377,7 @@ def run_pools(*pools: tuple[str | Path, Path, int, Mapping], timeout: float = 60
         launched = []
         for mode, directory, processes, flags in pools:
             directory.mkdir(parents=True, exist_ok=True)
-            coordinator = f"127.0.0.1:{free_port()}"
+            coordinator = f"127.0.0.1:{coordinator_port()}"
             outs = [directory / f"process{index}.json" for index in range(processes)]
             for index, out in enumerate(outs):
                 group.running.append(start(mode, out, processes=processes, process_id=index,

@@ -321,7 +321,7 @@ A decoder tells the server what its layers allow through `dew.nn.protocols.Servi
 
 | Field | Meaning |
 |---|---|
-| `page_size` | Pages the cache. All rows share one pool, and a request is admitted once the pool holds its prompt and budget, so the pool is sized to memory rather than to `slots * capacity`. A strategy that reparents its rows (`Regrouping`: `Beam`) cannot share pages, so `generate` decodes it over the cache unpaged, each row whole, and its memory is the dense model's. |
+| `page_size` | Pages the cache. All rows share one pool, and a request is admitted once the pool holds its prompt and budget, so the pool is sized to memory rather than to `slots * capacity`. A strategy that reparents its rows (`Regrouping`: `Beam`) decodes over the pool sized for its search, each regrouped row sharing its parent's written pages, so a prompt is held once across its beams; a pool split among groups, or a model that rebuilds its cache past a position, decodes unpaged, each row whole. A pool named smaller than the search needs is refused, with the least it can be. |
 | `pages` | Size of the shared pool. `None` allocates one page per slot of every row, as much memory as the dense layout. Outside a server leave it unset: nothing hands out a smaller pool, and a row that would write past it fails its request. |
 | `quantized` | `"int8"` stores keys and values in eight bits with one float32 scale per token and head, and rotates the keys by a Hadamard matrix first, which needs a power-of-two `head_dim`. `"float8_e4m3fn"` stores unrotated e4m3 at any `head_dim`. Either works dense or paged. |
 | `groups` | Splits a paged pool into that many parts, one per equal group of rows. |

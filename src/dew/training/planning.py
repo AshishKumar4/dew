@@ -683,14 +683,18 @@ def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
 
 
 def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
-            frontier: Sequence[Probe] | None = None) -> dict[str, JSON]:
+            frontier: Sequence[Probe] | None = None,
+            lighter: Sequence[Probe] | None = None) -> dict[str, JSON]:
     """The admitted plan, its kernel report, every compile needed to find it, and the kernels those compiles
     found spilling and the launch configs refused where it searched (`FitSearch.kernels`), which the run's
     telemetry reports with it (`StepCompiled`); planned ahead with its `frontier`, each rung above the plan
-    that fits at fewer microbatches (`FitSearch.above`). There is no alternative-policy timing or selection
-    in the record."""
+    that fits at fewer microbatches (`FitSearch.above`), and each rung below it that the search passed over
+    and that fits (`FitSearch.below`, `lighter`). There is no alternative-policy timing or selection in the
+    record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
     above: dict[str, JSON] = {} if frontier is None else {"frontier": [probe.record() for probe in frontier]}
+    if lighter is not None:
+        above["lighter"] = [probe.record() for probe in lighter]
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
             "probes": [probe.record() for probe in probes], **search.kernels,
             "pool": pool_record(local_devices(search.mesh)),
@@ -855,6 +859,9 @@ class FitSearch[LossT, EffectsT]:
     one 38.88 GiB block its pool could give of 70.88 GiB free, 22.41 GiB short, fits). A candidate holds
     none of them (`Candidate.held`), so one cached for a
     placed state serves an unplaced one."""
+    asked: list[Rung] = dataclasses.field(default_factory=list)
+    """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
+    asks none of again (`below`)."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`), each launch config they refused
@@ -1121,7 +1128,8 @@ class FitSearch[LossT, EffectsT]:
         rung.put(self.objective)
         self.xla_defaults, self.narrow, self.ns_group = rung.xla_defaults, rung.narrow, rung.ns_group
 
-    def ladder(self, start: Rung, narrow: bool, ns_group: int | None) -> list[list[Rung]]:
+    def ladder(self, start: Rung, narrow: bool, ns_group: int | None, *, remat_set: bool | None = None,
+               defaults: tuple[bool, ...] | None = None) -> list[list[Rung]]:
         """The rungs above `start`, where the search began, by remat rung, least recomputation first: the
         places the one climb visits from `start` (`recompute_more`: at each remat rung its head's rungs,
         then the next remat rung with its head back at the run's tile), each under the step's options and
@@ -1130,16 +1138,20 @@ class FitSearch[LossT, EffectsT]:
         and joining its Newton-Schulz stacks `ns_group` at a time.
         A run that states its remat has its head's rungs alone (docs/design/training.md, every choice can be
         overridden). The rungs at `start`'s remat and head are left out, asked already; the objective is
-        read from `start` and left there, wherever the search stood before."""
+        read from `start` and left there, wherever the search stood before. `remat_set` and `defaults` state
+        those two choices where a caller reads the ladder for another run's state (`below`): the search's
+        own (`remat_set`, its options' twins) where None."""
         self.at(start)
         # The step's own options as its program reads them, the compile's stop past the limit no option of
         # the program's (`limited`): where they are XLA's defaults, a rung under them is the same program.
         own = {name: value for name, value in (self.chosen or {}).items() if name != LIMIT_EXIT} or None
-        defaults = (False, True) if own != self.required else (False,)
+        if defaults is None:
+            defaults = (False, True) if own != self.required else (False,)
+        remat_set = self.remat_set if remat_set is None else remat_set
         places = [Rung.of(self.objective, xla_defaults=False, narrow=narrow, ns_group=ns_group)]
         while recompute_more(self.objective, self.base):
             place = Rung.of(self.objective, xla_defaults=False, narrow=narrow, ns_group=ns_group)
-            if self.remat_set and place.modules != start.modules:
+            if remat_set and place.modules != start.modules:
                 break
             places.append(place)
         ladder: list[list[Rung]] = []
@@ -1174,11 +1186,11 @@ class FitSearch[LossT, EffectsT]:
         if split is not None:
             return split
         # The rungs walked already, all missed: none is asked again; and each as its record names it.
-        asked: list[Rung] = [start]
+        self.asked = [start]
         named = [self.rung()]
 
         def ask(rung: Rung, said: str) -> int | None:
-            asked.append(rung)
+            self.asked.append(rung)
             self.at(rung)
             named.append(self.rung())
             _log.warning(said, json.dumps(self.current(), sort_keys=True))
@@ -1197,7 +1209,7 @@ class FitSearch[LossT, EffectsT]:
                 _log.warning("the step's joined Newton-Schulz stacks free nothing it needs: it keeps them "
                              "joined and climbs on")
         for rung in self.recomputing(start, narrow, ns_group):
-            if rung in asked:
+            if rung in self.asked:
                 continue
             split = ask(rung, "the step does not fit the devices; compiling it again recomputing more at %s")
             if split is not None:
@@ -1220,7 +1232,7 @@ class FitSearch[LossT, EffectsT]:
                 # so the copies come back, their 1-2% of a step kept, and the ladder climbs with them.
                 _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
         for rung in (rung for group in self.ladder(start, narrow, ns_group) for rung in group):
-            if rung in asked:
+            if rung in self.asked:
                 continue
             split = ask(rung, "the step does not fit the devices; compiling it again at %s")
             if split is not None:
@@ -1228,6 +1240,44 @@ class FitSearch[LossT, EffectsT]:
                 return split
         self.said(named)
         return None
+
+    def below(self, candidates: Sequence[int], origin: Rung, plan: Rung) -> tuple[Probe, ...]:
+        """Each rung the ladder reads before the plan's from `origin`, the rung the run was configured at,
+        cheapest first, that no search asked (`asked`; a plan taken from its record asked none), at the
+        coarsest of `candidates` it fits at, compiled: the copies' drop at `origin`'s rung, then each rung
+        the one climb visits (`ladder`) before the plan's, a head's tile or XLA's defaults at less
+        recomputation, which a run settled recomputing in its fewest compiles (`searched`) leaves for a plan
+        made offline to tell (`dew.training.ahead.compile_ahead`'s frontier). `plan` is the admitted rung,
+        whatever the frontier above it asked since (`above`). Every rung's twin under XLA's defaults is read,
+        whichever split's options it differs from (`step_options` reads a microbatch's size): where it is the
+        step's own program at its split, its entry states the same figures as the own one's. None where the
+        plan is no rung of that climb (the run's own, or one past a release the climb does not read). The
+        objective is left at the last rung read, the run's to restore."""
+        self.at(origin)
+        # The climb as the configured run reads it: one that set its own remat climbs its head alone, whatever
+        # remat a record then moved it to.
+        record = recompute_record(self.objective)
+        explicit = any(entry is not None for entry in (record if isinstance(record, list) else [record]))
+        start = dataclasses.replace(origin, ns_group=plan.ns_group)
+        copies = start.narrow and any(candidate.copies for candidate in self.lowered.values())
+        order = [*([dataclasses.replace(start, narrow=False)] if copies else []),
+                 *(rung for group in self.ladder(start, start.narrow, start.ns_group, remat_set=explicit,
+                                                 defaults=(False, True)) for rung in group)]
+        if plan not in order:
+            return ()
+        # A rung read here that misses is no checkpoint's rung missing (`fits_here`).
+        self.resumed = None
+        found = []
+        for rung in order[:order.index(plan)]:
+            if rung in self.asked:
+                continue
+            self.at(rung)
+            # Every split in turn, coarsest first, to the first that fits: no forecast passes one over
+            # (`walked` may, its miss's figures no bound on what the compiler allocates), as this report
+            # states the coarsest split each fits at.
+            if next((split for split in sorted(candidates) if self.fits_here(split)), None) is not None:
+                found.append(self.probes[-1])
+        return tuple(found)
 
     def recomputing(self, start: Rung, narrow: bool, ns_group: int | None) -> list[Rung]:
         """The ladder's remat rungs above `start`'s, each at the run's own head and the step's own options

@@ -717,11 +717,17 @@ class Prediction:
     - `weights`: the `[B, S]` weight the objective gives each position.
     - `hidden`: the `[B, S, D]` states of the layers the caller asked for,
       in the order asked.
+    - `final`: the `[B, S, D]` final states its head scored (or the logits of a model that gives them
+      from its tokens), and `head` the logits of any slice of them, through the head the loss read: a
+      caller that reads every column takes them a slice at a time (a distillation's tiled KL), none
+      where the objective states none.
     """
     logits: jax.Array | None
     losses: jax.Array
     weights: jax.Array
     hidden: tuple[jax.Array, ...]
+    final: jax.Array | None = None
+    head: Callable[[jax.Array], jax.Array] | None = struct.field(pytree_node=False, default=None)
 
 
 TEACHER = "teacher"
