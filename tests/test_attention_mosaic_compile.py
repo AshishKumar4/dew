@@ -1637,5 +1637,6 @@ def test_forward_pricing_aligns_with_m_fs_15_sm90_and_sm80_receipts():
         attention_mosaic._derived(
             family, jnp.bfloat16, 512, 512,
             lambda r, w, c: attention_mosaic.Tiles(r, w, 2, c, family=family.name),
-            lambda cfg: cfg.block_k <= 64, overlapped=True, choose=choose, residency=fake_res)
+            lambda cfg: cfg.block_k <= 64, overlapped=True,
+            walks=attention_mosaic_program.walked_extents, choose=choose, residency=fake_res)
         assert seen and any(c.block_k == 64 for c in seen[0]) and any(c.block_k == 32 for c in seen[0]), seen
