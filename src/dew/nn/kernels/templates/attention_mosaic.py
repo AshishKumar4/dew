@@ -16,7 +16,6 @@ from typing import ClassVar, Literal, overload
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import tokamax
 from jax._src.pallas import mpmd
 
@@ -183,12 +182,6 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
     stated = [package_digest(), installed.hex(), report._identity(op, ba), target.generation,
               target.multiprocessors, tuning.encoded(candidates), _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
-
-
-def _abstract(value):
-    """`value`'s arrays as `ShapeDtypeStruct`s, leaving non-array leaves unchanged."""
-    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
-                        if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
 
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
@@ -835,7 +828,7 @@ class MosaicForward(_Mainloop[Tiles]):
         through `tuning.lowered_once` under `report.launching` so the winning count's trace is held."""
         names = ("query", "key", "value", "start", "end", "query_ids", "key_ids", "score_params",
                  "output_params", "initial", "drop", "table", "sources", "scales", "query_params")
-        operands = tuple(_abstract(ba.arguments[name]) for name in names)
+        operands = tuple(tuning.shapes(ba.arguments[name]) for name in names)
         residuals = ba.arguments["residuals"]
         identity = report._identity(self, ba)
 

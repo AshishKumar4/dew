@@ -857,7 +857,7 @@ class KernelOp(tokamax.Op):
         def shaped(name: str, value):
             if name in self.ROWS and value is not None:
                 return bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
-            return _shapes(value)
+            return shapes(value)
         return tokamax.BoundArguments(_identity(self), {name: shaped(name, value)
                                                         for name, value in ba.arguments.items()})
 
@@ -1495,7 +1495,7 @@ def store_choice(target: str, key: str, choice: Hashable, *, path: str | None = 
     _store_entry(_CHOICES, "priced", "choice", target, key, choice, path=path)
 
 
-def _shapes(value):
+def shapes(value):
     """`value`'s arrays as their shapes and dtypes, its other parts as they are: NumPy operands (an unpacked
     delta rule's chunk and span descriptors) as JAX's, a tracer as the value it stands for."""
     return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
@@ -1519,7 +1519,7 @@ class Seen(list[Launch]):
         the trace that made it."""
         kept = Seen()
         kept.extend(self)
-        kept.taken.extend((config, tokamax.BoundArguments(ba.op, {name: _shapes(value)
+        kept.taken.extend((config, tokamax.BoundArguments(ba.op, {name: shapes(value)
                                                                  for name, value in ba.arguments.items()}))
                           for config, ba in self.taken)
         return kept
