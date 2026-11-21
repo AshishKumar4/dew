@@ -30,7 +30,7 @@ from collections.abc import Callable, Collection, Sequence
 
 import jax
 import jax.numpy as jnp
-from jax.core import Tracer, eval_context
+from jax.core import Tracer, eval_context, eval_jaxpr
 from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
 from jax.extend.core import create_call_primitive
@@ -411,7 +411,7 @@ def triton_lowerings() -> None:
     from jax._src.pallas.triton import lowering as triton_lowering
 
     triton_lowering.register_lowering(marked_call_p)(triton_lowering.lower_fun(
-        lambda *args, call_jaxpr, **_: jax.core.eval_jaxpr(call_jaxpr, (), *args), multiple_results=True))
+        lambda *args, call_jaxpr, **_: eval_jaxpr(call_jaxpr, (), *args), multiple_results=True))
 
 
 def _evaluating() -> bool:
