@@ -1676,17 +1676,20 @@ def _rows_of(slots, matrices: dict, mine_rows, transpose_lhs: bool) -> dict:
 
 
 def _gmm_prefetch(family: mosaic.Family, step: functools.partial) -> Callable | None:
-    """Dew: the walk's prefetch of a `_gmm_step`'s slots (`Transport.prefetches_fragments`): its one
-    product's first fragments (`Issuer.first_fragments`), read under the step before's last product, for a
-    plain step alone (one matrix, its rows as staged, every consumer's products issued unconditionally, a
-    compiled launch), its rows read untransposed: the prefetch reads the left operand an instruction's
-    granule at a time (`products_across`), which took a transposed left's kernel gradient 7% slower on an
-    A100 than its whole-swizzle-tile reads (FS-DENSE-AB1); None elsewhere, its steps walked as they were."""
+    """Dew: the walk's prefetch of a `_gmm_step`'s slots (`Transport.prefetches_fragments`): its one product's
+    first fragments (`Issuer.first_fragments`), read under the step before's last product, for a plain step
+    alone (one matrix, its rows as staged, every consumer's products issued unconditionally, a compiled
+    launch), its rows and its matrix read untransposed: the prefetch reads the left operand an instruction's
+    granule at a time (`products_across`), which took a transposed left's kernel gradient 7% slower on an A100
+    than its whole-swizzle-tile reads (FS-DENSE-AB1), and an input gradient's transposed matrix, prefetched,
+    ran Llama-3-8B's and Qwen3-32B's gate_up input gradients 1.33x and 1.28x slower with an output other than
+    the unprefetched walk's (M-FS-53-a100), where every forward ran faster, its output the same (0.954x
+    geomean); None elsewhere, its steps walked as they were."""
     keywords = step.keywords
     plain = (len(keywords['matrices']) == 1 and keywords['prologue'] is None and keywords['idle'] is None
              and keywords.get('decoded') is None and not keywords['packed_rows']
              and not keywords['block_scaled'] and keywords['chosen'] is None and not keywords['interpret']
-             and not keywords['transpose_lhs'])
+             and not keywords['transpose_lhs'] and not keywords['transpose_rhs'])
     if not (family.prefetches_fragments and plain):
         return None
 
