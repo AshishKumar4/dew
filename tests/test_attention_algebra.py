@@ -1772,3 +1772,17 @@ def test_rescaled_uses_exact_power_of_two_constants_for_dropout_reach():
     up = jax.jit(lambda x: algebra.taken_back(x, 140))(down)
     np.testing.assert_array_equal(np.asarray(down), np.array([np.float32(1.5 * 2.0 ** -20)], np.float32))
     np.testing.assert_array_equal(np.asarray(up), np.asarray(big))
+
+
+def test_taken_back_avoids_double_rounding_and_quotient_preserves_large_total_tangent():
+    """`taken_back` uses balanced normal factors so wide negative exponents do not double-round at the
+    subnormal boundary (row 10161), and `output_of` preserves finite tangents when total >= 2^126."""
+    x = jnp.array([np.nextafter(np.float32(2.0 ** -10), np.float32(np.inf))], jnp.float32)
+    got = jax.jit(lambda v: algebra.taken_back(v, -140))(x)
+    np.testing.assert_array_equal(np.asarray(got), np.array([np.float32(2.0 ** -149)], np.float32))
+
+    big = jnp.array([np.float32(2.0 ** 126)], jnp.float32)
+    val, tan = jax.jit(lambda a, d: jax.jvp(
+        lambda u: algebra.output_of(u, d, guarded=False), (a,), (a,)))(big[:, None], big)
+    np.testing.assert_array_equal(np.asarray(val), np.ones((1, 1), np.float32))
+    np.testing.assert_array_equal(np.asarray(tan), np.ones((1, 1), np.float32))

@@ -398,3 +398,10 @@ def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
         work = merged.launch_work(spec, p_s, s_s, queries, width, generation.gpu_target("sm90"),
                                   has_initial=True)
     assert work.kernels == 1 and work.device_bytes > 0
+    # Empty batch (vmap over size 0) handles CUDA lowering without ZeroDivisionError.
+    empty_p = jnp.zeros((0, slices, rows, heads, width), jnp.float32)
+    empty_s = jnp.zeros((2, 0, heads, slices, rows), jnp.float32)
+    with generation.assumed("sm90"):
+        empty_out = merged._kernel(empty_p, empty_s, units=algebra.units_of(spec), queries=queries,
+                                   width=width)
+    assert empty_out[0].shape == (0, queries, heads, width)

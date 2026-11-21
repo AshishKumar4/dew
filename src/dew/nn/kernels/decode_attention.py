@@ -299,14 +299,16 @@ def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, 
 
 
 def _resident(step_bytes: int, target: GpuTarget) -> int:
-    """Programs of `WARPS` warps staging two double-buffered key and value tiles (`4 * step_bytes`) a
-    multiprocessor of `target` holds at once (`GpuTarget.multiprocessor`, `GpuTarget.shared_limit`; row
-    1954): 7 on an H100, 5 on an A100 and 3 on a 99 KB sm86/sm89 block at `KEY_STEP_BYTES`."""
+    """Programs of `WARPS` warps staging two double-buffered key and value tiles (`4 * step_bytes`) plus each
+    block's `reserved_shared` a multiprocessor of `target` holds at once (`GpuTarget.multiprocessor`,
+    `GpuTarget.shared_limit`; row 1954): 6 on an H100, 4 on an A100 and 3 on a 99 KB sm86/sm89 block."""
     mp = target.multiprocessor
     by_threads = min(mp.resident_threads // (WARPS * 32), mp.resident_blocks)
     if not target.shared_limit or not step_bytes:
         return max(1, by_threads)
-    return max(1, min(by_threads, target.shared_limit // (4 * step_bytes)))
+    sm_shared = target.shared_limit + mp.reserved_shared
+    per_block = 4 * step_bytes + mp.reserved_shared
+    return max(1, min(by_threads, sm_shared // per_block))
 
 
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
@@ -478,9 +480,9 @@ class PagedDecodeAttention(tuning.KernelOp):
         """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop over
         its table, a step's key-tile bytes, and the GPU target."""
         query, pages = ba.arguments['query'], ba.arguments['value_pages']
-        step = step_keys(pages.dtype, query.shape[-1])
-        steps = pl.cdiv(ba.arguments['table'].shape[1], max(step // pages.shape[2], 1))
-        step_bytes = step * query.shape[-1] * jnp.dtype(pages.dtype).itemsize
+        pages_per_step = max(step_keys(pages.dtype, query.shape[-1]) // pages.shape[2], 1)
+        steps = pl.cdiv(ba.arguments['table'].shape[1], pages_per_step)
+        step_bytes = pages_per_step * pages.shape[2] * query.shape[-1] * jnp.dtype(pages.dtype).itemsize
         return _rows(query) * query.shape[1], steps, step_bytes, gpu_target()
 
 

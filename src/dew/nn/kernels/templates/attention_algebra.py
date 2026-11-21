@@ -54,7 +54,15 @@ from dew.nn.kernels.templates.attention import (
     saturated,
     within,
 )
-from dew.nn.precision import float32_einsum, lowered_divide, power2, scalar_power2, two_product, two_sum
+from dew.nn.precision import (
+    correctly_rounded_divide,
+    float32_einsum,
+    lowered_divide,
+    power2,
+    scalar_power2,
+    two_product,
+    two_sum,
+)
 
 
 def folds(scale: float, prescale: float, *, natural: bool, score_mod) -> bool:
@@ -590,7 +598,7 @@ def initial_state(spec: Forward, initial: Partial) -> Partial:
 
 
 def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array, total: jax.Array,
-                 initial: Initial | None = None) -> Partial:
+                 initial: Initial | None = None, *, raw_scale: float | None = None) -> Partial:
     """A split walk's slices and the call's initial state merged into one finished state (`finished_merged`
     of `slice_state`s): their outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural
     `spec`'s units, `finished_rows`', a fold's `unfolded`, raw products where it keeps them) and denominators
@@ -600,9 +608,13 @@ def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array
         raise ValueError("a split walk's merge takes its finished form's states (`finished_form`)")
     state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
     if initial is not None:
-        assert isinstance(spec, Forward), "merging an initial state requires a Forward spec"
-        own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
-                                          jnp.swapaxes(initial.total, 1, 2)))
+        raw = spec.scale if isinstance(spec, Forward) and spec.raw else raw_scale
+        held = means.holding(jnp.swapaxes(initial.total, 1, 2))
+        init_total = jnp.swapaxes(initial.total, 1, 2)
+        init_out = jnp.where(held[..., None], means.finished(jnp.swapaxes(initial.acc, 1, 2), init_total), 0.0)
+        init_m = jnp.swapaxes(initial.m, 1, 2)
+        init_m = raw_maximum(init_m, raw) if raw is not None else init_m
+        own = slice_state(spec, init_out, init_m, init_total)
         acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
                          for mine, theirs in zip(state[:3], own[:3], strict=True))
         state = Partial(acc, m, total)
@@ -1396,15 +1408,17 @@ def taken_back(value: jax.Array, exponent: jax.Array | float) -> jax.Array:
     host constants (split past fp32's normal range `[-126, 127]`), no power built in the kernel (Mosaic
     GPU's lowering holds no scalar a constant's arithmetic makes); a traced one's by `power2`."""
     if isinstance(exponent, int | float):
-        remaining = float(exponent)
+        exp = float(exponent)
+        if -126.0 <= exp <= 127.0:
+            return value * np.float32(2.0 ** exp)
+        # Balanced normal powers of two keep intermediate products normal (no double rounding).
+        parts = math.ceil(abs(exp) / 126.0)
+        step = float(int(exp / parts))
         out = value
-        while remaining > 127.0:
-            out = out * np.float32(2.0 ** 126)
-            remaining -= 126.0
-        while remaining < -126.0:
-            out = out * np.float32(2.0 ** -126)
-            remaining += 126.0
-        return out * np.float32(2.0 ** remaining)
+        for _ in range(parts - 1):
+            out = out * np.float32(2.0 ** step)
+            exp -= step
+        return out * np.float32(2.0 ** exp)
     return power2(value, exponent)
 
 
@@ -1863,7 +1877,9 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         apart = binade_of(acc) - div_binade
         raised = jnp.where(apart < -124, -apart, 0)
         lifted = raised_exactly(acc, raised)
-        return jnp.where((raised > 0) | (div_binade >= 126), lowered_divide(lifted, divisor, raised), plain)
+        # Use correctly_rounded_divide (which preserves tangents) for large totals where XLA:CPU flushes 1/d.
+        safe_plain = jnp.where(div_binade >= 126, correctly_rounded_divide(acc, divisor), plain)
+        return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), safe_plain)
 
     out = bodies.subnormals(divided, acc.dtype)
     return out if held is None else saturated(out, finite(acc), held)
