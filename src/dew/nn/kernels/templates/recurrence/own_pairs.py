@@ -377,10 +377,14 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
     chunk = call.chunk
     if by_thread(call):
         # The bands summed in shared memory (`own_bands`): the keys' and decays' forming, then an
-        # output's rows formed (its operand, its write strengths and the rows), then a thread's step of its
-        # own pairs (a run of the row, the keys, the factors and the pair's decay).
-        return Held(phases=([f32(chunk, block)] * 6, [f32(chunk, block)] * 3, [f32(chunk, block)] * 2,
-                            [f32(chunk, algebra.SUB)] * 2))
+        # output's rows formed (its operand, its write strengths and the rows), then a thread's loop over its
+        # own pairs (`_own_span`): its carried decays (each output's decayed row where `unit_keys`), a step's
+        # words (a run of the keys, the factors and each output's row) and the next step's, read ahead.
+        run = block // QUARTERS
+        state = run * (outputs if call.unit_keys else 1)
+        words = run * (2 + outputs)
+        return Held(phases=([f32(chunk, block)] * 6, [f32(chunk, block)] * 3,
+                            [f32(scan.THREADS, state + 2 * words)], [f32(chunk, algebra.SUB)] * 2))
     return Held(carried=[f32(chunk, algebra.SUB)] * outputs, phases=(
         [f32(chunk, block)] * 6,
         [f32(chunk, block)] * (outputs + 6),

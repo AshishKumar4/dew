@@ -88,8 +88,7 @@ def _intra_solve(system, taken, call: Call):
         system, taken)
 
 
-@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_intra_system",
-                          "recurrence_prefix_halves"))
+@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_prefix_halves"))
 def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     """`(Aqk [R, HV * C], A [R, HV * C] where the call `solves`, hi, lo [R, HV * Dk])` of each chunk and value
     head under a decay a key dimension: the decay's prefix halves (`call.gates`, `algebra.prefix`'s pair)
@@ -380,10 +379,14 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
             held: list = []
             for j in range(later):
                 first = (j + 1) * algebra.SUB
+                if j and len(raised) == 1:
+                    # One buffer for every sub-chunk's keys (`_sub_chunk_staged`): the last sub-chunk's
+                    # products read it before this one's keys overwrite it.
+                    mosaic.synced(call.interpret)
                 # A sub-chunk's keys staged and published once (`Family.staged_together`), the row sets' gated
-                # rows with the first's, its products issued then, running under the next sub-chunk's forming.
+                # rows with the first's, its products issued then.
                 with family.staged_together():
-                    keyed = operands.staged(family, gated_up(j + 1), raised[j]).T
+                    keyed = operands.staged(family, gated_up(j + 1), raised[j % len(raised)]).T
                     held = held or [operands.staged(family, value, lefts[r]) for r, value in enumerate(gated)]
                 for r, tile in enumerate(held):
                     at = _sum_index(call, r, j)
@@ -451,16 +454,19 @@ def pair_streams(call: Call, keys: int, *, queries: bool) -> dict:
 
 
 def _sub_chunk_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
-    """`_sub_chunk_walk`'s staging at key block `keys`: each output's gated rows once, each later sub-chunk's
+    """`_sub_chunk_walk`'s staging at key block `keys`: each output's gated rows once, the later sub-chunks'
     keys gated up (`algebra.key_block_pairs`), and the step's separated prefix, plain (its rows read
     at the sub-chunks' first tokens); its landings a sub-chunk's row of pairs each output's
-    (`intra_block_stored`)."""
+    (`intra_block_stored`). The keys gated up take one buffer every sub-chunk restages where the issuer's
+    products are done when issued (mma.sync's, `Family.products_overlap` false), one a sub-chunk where its
+    products may still read them as the next is staged: a buffer a sub-chunk held 32 KiB more a program at
+    Kimi Linear's 64-key block in two parts."""
     chunk, pairing = call.chunk, _pairing_operand(call)
     landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(algebra.SUB, chunk)}
                   if "scores" in products else {}),
                **({"system": systems(call).landing(algebra.SUB, chunk)} if "system" in products else {})}
     lefts = tuple(staging_tiles(pairing, (chunk, keys))[0] for _ in products)
-    raised = staging_tiles(pairing, *((chunk, keys),) * _later(call))
+    raised = staging_tiles(pairing, *((chunk, keys),) * (_later(call) if call.family.products_overlap else 1))
     separated = swizzling.plain((2, chunk, keys), jnp.float32)
     return (lefts, raised, separated), landing
 

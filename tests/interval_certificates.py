@@ -121,6 +121,10 @@ class Lane:
     """Whether the call is fp32's, its output stored fp32 and a one-part operand TF32."""
     pairing: int = 1
     """The parts a factored pair's fp32 operand takes (`intra.pairing_parts`, `operand`)."""
+    unit_keys: bool = False
+    """Whether a sub-chunk's own pairs fold each decay into the row before the key (`mainloop.Call.unit_keys`,
+    a layer's unit keys: `own_pairs.own_bands`, `algebra.key_diagonal_bands`), not the row times the key
+    first (`key_diagonal`)."""
     merged: int = 0
     """The parts the doubling's merges take in fp32 (`mainloop._merged`): zero for fp16, else `merged`."""
     tf32: Literal["plain", "rna", "read"] = "read"
@@ -129,9 +133,6 @@ class Lane:
     'rna', rounded to TF32 to nearest, a tie away from zero, first (`cvt.rna.tf32.f32`,
     `Family.rounds_tf32`: mma.sync's); 'read', read as TF32 from its fp32 register by the instruction, no
     conversion stated (warpgroup MMA's), which encloses either of the others."""
-    pairs_tf32: Literal["plain", "rna", "read"] | None = None
-    """How the intra walk's factored pairs take a one-part fp32 operand, their own issuer's
-    (`intra.pairs_family`, mma.sync's on every target), where it differs from `tf32`; None where the same."""
 
 
 def fp32(iv: Iv, lane: Lane) -> Iv:

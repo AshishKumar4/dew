@@ -369,31 +369,38 @@ def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane, scale: float = 1.0)
 
 def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     """`algebra.key_diagonal_bands` `[C, C]` under a decay a key dimension, the pairs within each row's
-    sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks): `sum_k r_ik k_jk
-    exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`, `between`
-    of each token against the one before), rounded a factor at a time from the row's own token back
-    (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its decay,
-    the multiply an add may fuse, and the terms' sum over every key block within one sum's bound of them (a
-    key block's sum and its adds into the total, at most as many roundings as the width's terms)."""
+    sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks): `sum_k r_ik
+    k_jk exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`,
+    `between` of each token against the one before), rounded a factor at a time from the row's own token
+    back (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its
+    decay; under `Lane.unit_keys` the row itself decayed a factor at a time, then times the key (the native
+    loop's fold, `own_pairs._own_span`); the last multiply an add may fuse, and the terms' sum over every
+    key block within one sum's bound of them (a key block's sum and its adds into the total, at most as
+    many roundings as the width's terms)."""
     exact, bound = exponents.exact, exponents.bound
     size = np.shape(k)[0]
     tokens = np.arange(size)
     placed = ((tokens[:, None] // SUB) == (tokens[None, :] // SUB)) & (tokens[:, None] >= tokens[None, :])
     # Each token's own decay against the one before, `own[t - 1]` token `t`'s.
     own = between(exact[1:], bound[1:], exact[:-1], bound[:-1], lane)
+    # Each row's chain so far, from its own token back: its pair's decay, or under `unit_keys` the row
+    # itself decayed (`own_pairs._own_span`'s fold), each factor rounded in turn.
+    start = Iv(rows.lo, rows.hi) if lane.unit_keys else point(np.ones(exact.shape))
     lo, hi = np.zeros((size, size, *exact.shape[1:])), np.zeros((size, size, *exact.shape[1:]))
-    lo[tokens, tokens] = hi[tokens, tokens] = 1.0
-    # Each row's pair so far, from its own token back.
-    pair_lo, pair_hi = np.ones(exact.shape), np.ones(exact.shape)
+    lo[tokens, tokens], hi[tokens, tokens] = start.lo, start.hi
+    chain_lo, chain_hi = start.lo.copy(), start.hi.copy()
     for e in range(1, SUB):
         rows_e = tokens[tokens % SUB >= e]
-        found = fp32(mul(Iv(pair_lo[rows_e], pair_hi[rows_e]), Iv(own.lo[rows_e - e], own.hi[rows_e - e])),
+        found = fp32(mul(Iv(chain_lo[rows_e], chain_hi[rows_e]), Iv(own.lo[rows_e - e], own.hi[rows_e - e])),
                      lane)
-        pair_lo[rows_e], pair_hi[rows_e] = found.lo, found.hi
+        chain_lo[rows_e], chain_hi[rows_e] = found.lo, found.hi
         lo[rows_e, rows_e - e], hi[rows_e, rows_e - e] = found.lo, found.hi
-    decay = Iv(lo, hi)
-    keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), point(np.asarray(k)[None, :, :])), lane)
-    terms = fused(mul(keyed, decay), lane)
+    chain, key = Iv(lo, hi), point(np.asarray(k)[None, :, :])
+    if lane.unit_keys:
+        terms = fused(mul(chain, key), lane)
+    else:
+        keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), key), lane)
+        terms = fused(mul(keyed, chain), lane)
     terms = where(placed[:, :, None], terms, point(np.zeros(terms.lo.shape)))
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
     magnitude = np.maximum(np.abs(terms.lo), np.abs(terms.hi)).sum(-1) * (1 + 2.0 ** -50)
@@ -417,14 +424,11 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     tokens = np.arange(size)
     own = (tokens[:, None] // SUB) == (tokens[None, :] // SUB)
 
-    # The pairs of sub-chunks issued by their own bundle (`Lane.pairs_tf32`).
-    paired = dataclasses.replace(lane, tf32=lane.pairs_tf32 or lane.tf32)
-
     def pairs(rows: Iv) -> Iv:
         """Each sub-chunk's own pairs (`key_diagonal`) and the pairs of sub-chunks (`key_pairs`), each zero
         where the other is taken, so their sum exact."""
         within = key_diagonal(rows, step.k, exponents, lane)
-        return where(own, within, key_pairs(rows, step.k, exponents, paired))
+        return where(own, within, key_pairs(rows, step.k, exponents, lane))
 
     writes = fp32(mul(point(step.k), point(np.asarray(step.beta)[:, None])), lane)
     system = where(_lags(size) > 0, pairs(writes), zeros)
@@ -443,7 +447,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     # across the key blocks), the rest and its sign the read sums'; each sub-chunk's own scaled once summed
     # (`algebra.band_masked`).
     shrinking, growing = min(abs(scale), 1.0), math.copysign(max(abs(scale), 1.0), scale)
-    crossed = fp32(mul(key_pairs(point(step.q), step.k, exponents, paired, shrinking),
+    crossed = fp32(mul(key_pairs(point(step.q), step.k, exponents, lane, shrinking),
                        point(np.float32(growing))), lane)
     within = fp32(mul(key_diagonal(point(step.q), step.k, exponents, lane), factor), lane)
     scores = staged(where(_lags(size) >= 0, where(own, within, crossed), zeros), lane)
@@ -532,12 +536,12 @@ class Run:
     tf32: Literal["plain", "rna", "read"]
     """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
     the launches were interpreted."""
-    pairs_tf32: Literal["plain", "rna", "read"]
-    """How the intra walk's factored pairs take one (`Lane.pairs_tf32`): their bundle's issuer's
-    (`intra.pairs_family`), or plain where interpreted."""
     trained: bool
     """Whether the template trains the call (`Mosaic.trains`): its records the training forward's, the primal
     of the route's VJP, and its fast backward the template's; else the inference forward's."""
+    unit_keys: bool
+    """Whether its own pairs fold each decay into the row before the key (`Lane.unit_keys`): a delta rule's
+    unit keys, as the draws' layers declare them."""
 
     @property
     def chunks(self) -> int:
@@ -783,9 +787,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                write=write, held=held, given=given, wide=bool(wide),
                pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
-               tf32=tf32_conversion(family), trained=bool(trained),
-               pairs_tf32=tf32_conversion(intra.pairs_family(generation.gpu_target().generation, dtype)
-                                          or family),
+               tf32=tf32_conversion(family), trained=bool(trained), unit_keys=write_bound is not None,
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -845,7 +847,8 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32, pairs_tf32=run.pairs_tf32)
+                               merged=run.merged, tf32=run.tf32,
+                               unit_keys=run.unit_keys)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1387,7 +1390,8 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32, pairs_tf32=run.pairs_tf32)
+                               merged=run.merged, tf32=run.tf32,
+                               unit_keys=run.unit_keys)
 
     def stored(iv: Iv, dtype) -> Iv:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
