@@ -105,7 +105,7 @@ def _merges(form):
     spec = SPECS[form]
     return (spec, lambda padded, stacked: tuple(merged.merged_padded(spec, padded, stacked, queries=QUERIES,
                                                                      width=WIDTH)),
-            functools.partial(merged._value, spec=spec, queries=QUERIES, width=WIDTH))
+            functools.partial(merged._value, units=algebra.units_of(spec), queries=QUERIES, width=WIDTH))
 
 
 @pytest.mark.parametrize("argnums", [0, 1], ids=["outputs", "states"])
@@ -285,58 +285,36 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("width", [80, 96, 100, 128, 192])
 @pytest.mark.parametrize("name", ["sm90", "sm100"])
-def test_a_padded_merge_lowers_and_compiles_as_one_launch_at_any_value_width(name, width):
-    """The padded merge's one launch (`merged._kernel`, a GPU's lowering) lowers and compiles for a
-    compile-only H100 and B200 at value widths 80, 96, 100 and 192 as at 128: a row's channels one block of
-    the least power of two past the width (Triton's tiles), its loads and stores past the columns masked."""
-    _one_launch(name, slices=16, width=width)
-
-
-@COMPILES_ON_CPU
-@pytest.mark.parametrize("name", ["sm90", "sm100"])
-def test_a_batch_of_splits_merges_as_one_launch(name):
-    """The padded merge mapped over a batch of three splits (`jax.vmap`, its batching rule) compiles for a
-    compile-only H100 and B200 to one launch of `merged_padded`, the batch folded into its rows, beside
-    nothing but the one transpose that folds it (the stacked states' batch moved past their two kinds), its
-    every launch typed (`report.launched_thunks`): mapped by the law's path, a batched split merge ran XLA's
-    law, no launch (the merge P0's base review of aa990591f, F9; its head reviews of e97ed082d and
-    fb1f405be, F6: custom kernels alone counted, then an instruction count, neither a launch count)."""
+def test_a_padded_merge_compiles_as_one_launch(name):
+    """The padded merge's one launch (`merged._kernel`, a GPU's lowering) compiles for a compile-only H100
+    and B200 in one process per GPU across: value widths 80, 96, 100, 128 and 192 (a row's channels one block
+    of the least power of two past the width, its loads and stores past the columns masked); a `jax.vmap`
+    batch of three splits (the batch folded into its rows, beside nothing but the one transpose that folds it,
+    every launch typed by `report.launched_thunks`); and long splits of 64 and 256 slices (row 8439: its
+    program a chunk of the law's at a time, `merged._chunks`)."""
     from fla_gdn_support import KernelCase
 
-    padded = jax.ShapeDtypeStruct((3, 2, 16, 16, 8, 64), jnp.float32)
-    stacked = jax.ShapeDtypeStruct((3, 2, 2, 8, 16, 16), jnp.float32)
-    merge = jax.vmap(lambda padded, stacked: tuple(merged.merged_padded(SPECS["natural"], padded, stacked,
-                                                                        queries=4, width=64)))
+    def one_case(label: str, *, slices: int, width: int) -> KernelCase:
+        padded = jax.ShapeDtypeStruct((2, slices, 16, 8, width), jnp.float32)
+        stacked = jax.ShapeDtypeStruct((2, 2, 8, slices, 16), jnp.float32)
+        merge = functools.partial(merged.merged_padded, SPECS["natural"], queries=4, width=width)
+        return KernelCase(
+            label, lambda merge=merge, padded=padded, stacked=stacked: (merge, (padded, stacked)))
+    batched_padded = jax.ShapeDtypeStruct((3, 2, 16, 16, 8, 64), jnp.float32)
+    batched_stacked = jax.ShapeDtypeStruct((3, 2, 2, 8, 16, 16), jnp.float32)
+    batched = jax.vmap(lambda padded, stacked: tuple(merged.merged_padded(SPECS["natural"], padded, stacked,
+                                                                          queries=4, width=64)))
+    cases = [*(one_case(f"width-{width}", slices=16, width=width) for width in (80, 96, 100, 128, 192)),
+             KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
+             *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256))]
     with generation.assumed(name):
-        (record,) = compile_kernels([KernelCase("batched", lambda: (merge, (padded, stacked)))], name)
-    assert "error" not in record, record
-    assert sorted(record["thunks"]) == ["merged_padded", "wrapped_transpose"], record["thunks"]
-
-
-@COMPILES_ON_CPU
-@pytest.mark.parametrize("slices", [64, 256])
-@pytest.mark.parametrize("name", ["sm90", "sm100"])
-def test_a_long_splits_merge_compiles_as_one_launch(name, slices):
-    """The padded merge of a long split's 64 and 256 slices (row 8439's: its law's states unrolled made
-    the one launch's program grow with them, 236 s and past 15 min to compile for an H100) compiles as one
-    launch for a compile-only H100 and B200, its program a chunk of the law's at a time (`merged._chunks`)."""
-    _one_launch(name, slices=slices, width=128)
-
-
-def _one_launch(name: str, *, slices: int, width: int) -> None:
-    """The padded merge of `slices` slices at value `width`, compiled for a compile-only `name` GPU
-    (`kernel_compile.compile_kernels`): its executable launches `merged_padded` once and no other custom
-    kernel, a lowering of XLA's alone none, and launches nothing else (`report.launched_thunks`)."""
-    from fla_gdn_support import KernelCase
-
-    padded = jax.ShapeDtypeStruct((2, slices, 16, 8, width), jnp.float32)
-    stacked = jax.ShapeDtypeStruct((2, 2, 8, slices, 16), jnp.float32)
-    merge = functools.partial(merged.merged_padded, SPECS["natural"], queries=4, width=width)
-    with generation.assumed(name):
-        (record,) = compile_kernels([KernelCase("merge", lambda: (merge, (padded, stacked)))], name)
-    assert "error" not in record and record["thunks"] == ["merged_padded"], record
+        records = compile_kernels(cases, name)
+    for record in records:
+        assert "error" not in record, record
+        expected = (["merged_padded", "wrapped_transpose"] if record["name"] == "batched"
+                    else ["merged_padded"])
+        assert sorted(record["thunks"]) == expected, record
 
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
@@ -373,3 +351,57 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
     small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
     assert merged._channel_block(spec, small_p, small_s, 1, 128, target) < 128
+
+
+def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
+    """A split decode merge with a sink or resumed `Initial` state (`merged.merged_split`, row 9804) lowers
+    through `merged_padded_p` (one launch on GPU), matches `algebra.merged_state` on value and vmap, and
+    prices its Triton launch body with the initial state."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
+    batch, slices, rows, heads, width = 2, 4, 8, 2, 16
+    queries = 3
+    key = jax.random.key(9804)
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+    padded = jax.random.normal(k1, (batch, slices, rows, heads, width), jnp.float32)
+    stacked = jnp.stack([
+        jax.random.normal(k2, (batch, heads, slices, rows), jnp.float32),
+        jax.random.uniform(k3, (batch, heads, slices, rows), jnp.float32, minval=0.1, maxval=2.0),
+    ])
+    init_m = jax.random.normal(k4, (batch, heads, queries), jnp.float32)
+    init_t = jax.random.uniform(k5, (batch, heads, queries), jnp.float32, minval=0.1, maxval=2.0)
+    init_acc = jax.random.normal(k1, (batch, heads, queries, width), jnp.float32)
+    initial = template.Initial(init_m, init_t, init_acc)
+
+    def run(p, s, im, it, ia):
+        res = merged.merged_split(spec, p, s, queries=queries, width=width,
+                                  initial=template.Initial(im, it, ia))
+        return res.acc, res.m, res.total
+
+    traced = jax.make_jaxpr(run)(padded, stacked, init_m, init_t, init_acc)
+    from dew.nn import programs
+    merge_eqns = [e for e in programs.equations(traced.jaxpr) if e.primitive is merged.merged_padded_p]
+    assert len(merge_eqns) == 1 and len(merge_eqns[0].invars) == 5
+
+    got = run(padded, stacked, init_m, init_t, init_acc)
+    trimmed = merged._trimmed(padded, stacked, queries=queries, width=width)
+    ref = algebra.merged_state(spec, *trimmed, initial)
+    for a, b in zip(got, ref[:3], strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    vmapped = jax.vmap(run)(padded[None], stacked[None], init_m[None], init_t[None], init_acc[None])
+    for a, b in zip(vmapped, got, strict=True):
+        np.testing.assert_array_equal(np.asarray(a[0]), np.asarray(b))
+
+    with generation.assumed("sm90"):
+        p_s = jax.ShapeDtypeStruct(padded.shape, padded.dtype)
+        s_s = jax.ShapeDtypeStruct(stacked.shape, stacked.dtype)
+        work = merged.launch_work(spec, p_s, s_s, queries, width, generation.gpu_target("sm90"),
+                                  has_initial=True)
+    assert work.kernels == 1 and work.device_bytes > 0
+    # Empty batch (vmap over size 0) handles CUDA lowering without ZeroDivisionError.
+    empty_p = jnp.zeros((0, slices, rows, heads, width), jnp.float32)
+    empty_s = jnp.zeros((2, 0, heads, slices, rows), jnp.float32)
+    with generation.assumed("sm90"):
+        empty_out = merged._kernel(empty_p, empty_s, units=algebra.units_of(spec), queries=queries,
+                                   width=width)
+    assert empty_out[0].shape == (0, queries, heads, width)

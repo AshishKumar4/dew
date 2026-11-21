@@ -7,6 +7,7 @@ past the fold's reach, and the builders' inverse (`unpacked` of `packed`) and th
 covering each row's keys.
 """
 
+import dataclasses
 import itertools
 
 import jax
@@ -371,7 +372,7 @@ def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk
 @INTERPRETS
 def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_interpreted():
     """A decode step on an H100 of two rows over 4096 keys, its four programs' keys cut into slices (`plan`)
-    whose states merge by their masses (`algebra.merged_slices`): the first row reads every key, whole key
+    whose states merge by their masses (`algebra.merged_state`): the first row reads every key, whole key
     tiles and whole slices, the second none. On par with the reference path (check 1), the empty row zero.
     The merge at fp32's edges is the stability suite's (tests/test_attention_stability.py's template
     decode at fp32's edges)."""
@@ -764,7 +765,8 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
         initial = template.Initial(sink, jnp.ones_like(sink), jnp.zeros((*sink.shape, values.shape[-1])))
         spec = algebra.Forward("spans", 40, ids=False, scale=1.0, natural=True, initial=True)
         out, maximum, total = _states(logits, values, cuts)
-        return algebra.merged_slices(spec, out, maximum, total, initial)
+        state = algebra.merged_state(spec, out, maximum, total, initial)
+        return algebra.finish(spec, state, initial=True, normalized=True)[0]
 
     def whole(logits, values, sink):
         scores = jnp.concatenate([logits, jnp.transpose(sink, (0, 2, 1))[..., None]], axis=-1)
@@ -794,7 +796,7 @@ def _resumed(maximum: jax.Array, acc: jax.Array) -> template.Initial:
 @pytest.mark.parametrize("slices", [1, 3])
 def test_merging_slices_with_a_resumed_maximum_past_fp32s_largest_in_raw_units_keeps_its_share(slices):
     """A row's slices in the raw fold's units fp16's decode takes (`attention_decode._spec`: a scale of 1/8),
-    merged in XLA with a resumed state whose first row's maximum is `RESUMED` (`algebra.merged_slices`): the
+    merged in XLA with a resumed state whose first row's maximum is `RESUMED` (`algebra.merged_state`): the
     state's maximum saturates there as the walk's does (`algebra.initial_state`, `raw_maximum`), so that row
     is the state's own sums over its denominator, every row on par with the whole softmax (check 1)."""
     cuts = np.linspace(0, 40, slices + 1).astype(int)
@@ -803,7 +805,8 @@ def test_merging_slices_with_a_resumed_maximum_past_fp32s_largest_in_raw_units_k
 
     def ours(logits, values, maximum, acc):
         out, peak, total = _states(logits, values, cuts)
-        return algebra.merged_slices(spec, out, peak / spec.scale, total, _resumed(maximum, acc))
+        state = algebra.merged_state(spec, out, peak / spec.scale, total, _resumed(maximum, acc))
+        return algebra.finish(spec, state, initial=True, normalized=True)[0]
 
     def whole(logits, values, maximum, acc):
         initial = _resumed(maximum, acc)
@@ -1005,6 +1008,24 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
                                           heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
     assert priced is not None
     assert priced.device_bytes >= 2 * rows * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
+    # Non-deciding fallback (`natural_form=True`, row 8813 F2) prices only the common bounded arm, not both.
+    sm90 = generation.gpu_target("sm90")
+    with generation.assumed(sm90):
+        q90 = jnp.zeros((1, 1, 8, width), jnp.bfloat16)
+        k90 = jnp.zeros((1, keys, kv_heads, width), jnp.bfloat16)
+        base_plan, *_ = attention_decode.planned(q90, k90, k90, attention_decode.key_spans(1, keys, 1),
+                                                 template.Hooks())
+        assert base_plan is not None
+        non_deciding = dataclasses.replace(base_plan["plain"].config, natural_form=True)
+        with tuning.pinned({attention_mosaic.MosaicForward: non_deciding}):
+            plan90, *_ = attention_decode.planned(q90, k90, k90, attention_decode.key_spans(1, keys, 1),
+                                                  template.Hooks())
+            fallback = attention_decode.priced_step(sm90, rows=1, queries=1, keys=keys, heads=8,
+                                                    kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
+    assert plan90 is not None and "bounded" in plan90 and "scaled" in plan90
+    expected_kernels = 1 + int(plan90["bounded"].slices > 1)
+    assert fallback is not None and fallback.kernels == expected_kernels
+    assert fallback.device_bytes >= 2 * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
 
 
 @COMPILES_ON_CPU
@@ -1051,7 +1072,7 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
             scales=None, bounds=None, finished=True, in_key=False))(query, key, key)
     (merge_eq,) = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive is merged.merged_padded_p]
     merge_work = merged.launch_work(
-        merge_eq.params["spec"],
+        merge_eq.params["units"],
         jax.ShapeDtypeStruct(merge_eq.invars[0].aval.shape, merge_eq.invars[0].aval.dtype),
         jax.ShapeDtypeStruct(merge_eq.invars[1].aval.shape, merge_eq.invars[1].aval.dtype),
         merge_eq.params["queries"], merge_eq.params["width"], target)
@@ -1061,3 +1082,30 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     assert merge_work.span >= 3.0 and merge_work.device_bytes > 0
     assert priced.span == sum(w.span for w in walk_launches) + merge_work.span
     assert priced.device_bytes == sum(w.device_bytes for w in walk_launches) + merge_work.device_bytes
+
+
+@INTERPRETS
+def test_a_decode_step_resuming_an_initial_state_near_fp32s_largest_keeps_its_mass():
+    """A decode step through the public entry (`attention_decode.attend`) resuming an `Initial` state whose
+    total is `1.5 * 2^126` (rows 6904, 6928, 6984): `initial_state` divides through `means.finished` without
+    XLA:CPU reciprocal underflow so the resumed state's value is preserved instead of flushing to zero."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    query, _, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    total = jnp.full((query.shape[0], heads, positions), np.float32(1.5 * 2.0 ** 126), jnp.float32)
+    m = jnp.full((query.shape[0], heads, positions), np.float32(20.0), jnp.float32)
+    acc = total[..., None] * jnp.ones((query.shape[0], heads, positions, value.shape[-1]), jnp.float32)
+    def ours(q, k, v, im, it, ia):
+        with generation.assumed("sm90"):
+            hooks = template.Hooks(initial=template.Initial(im, it, ia))
+            return attention_decode.attend(q, k, v, spans, hooks, interpret=True)
+
+    def reference(q, k, v, im, it, ia):
+        return template.reference(q, k, v, spans, template.Hooks(initial=template.Initial(im, it, ia)))
+
+    def draw(seed: int):
+        q, k, v, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(seed)
+        return q, k, v, m, total, acc
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    "decode step resuming initial state near fp32s largest", seeds=SEEDS)

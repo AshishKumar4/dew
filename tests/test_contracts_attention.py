@@ -41,17 +41,6 @@ def attention_inputs(salt: int, shape: tuple):
     return inputs
 
 
-@pytest.fixture(autouse=True)
-def _released_as_each_test_ends():
-    """Each test's compiled executables released as it ends (`conftest.release`), where the file's releases
-    them at its end alone: a group of its cells holding every earlier cell's programs, each order's on a
-    mesh and its check-1 seeds', was killed at 10 GiB on armada."""
-    import conftest
-
-    yield
-    conftest.release()
-
-
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_fused_attention_call_in_forward_mode_holds_every_order(edge):
     """`attention.forward_differentiable` (a fused call under `forward_mode_attention`: the template's value,

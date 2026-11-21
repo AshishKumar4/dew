@@ -418,6 +418,13 @@ MAPPINGS_BUDGET = (int(Path("/proc/sys/vm/max_map_count").read_text()) // 2
                    if Path("/proc/sys/vm/max_map_count").exists() else None)
 """The mappings past which a test's end releases the compiled executables (`released_past_budget`): half
 the kernel's limit, leaving the next test the other half to compile in; None where no limit is listed."""
+STATM = Path("/proc/self/statm")
+"""This process's memory pages, resident second, where Linux lists them."""
+RSS_BUDGET = 4 * 1024 ** 3
+"""The resident bytes past which a test's end releases the compiled executables (`released_past_budget`):
+under half of armada's 10 GiB container, so no file accumulates executables to an OOM kill
+(test_capability_matrix.py peaked at 4.6 GB without per-test release; test_attention_algebra.py and
+test_contracts_attention.py hit 10 GiB)."""
 
 
 def release() -> None:
@@ -462,11 +469,15 @@ def fresh_held_steps():
 
 @pytest.fixture(autouse=True)
 def released_past_budget():
-    """A test that leaves the process past `MAPPINGS_BUDGET` mappings releases them as it ends, so no file
-    compiles its way to the limit: test_serving.py alone reached 64,581 of armada's 65,530 and failed its
-    next compile ("LLVM compilation error: Cannot allocate memory"); held to the budget it peaked at
-    32,683 and passed. Reading the list takes a few milliseconds at the budget."""
+    """A test that leaves the process past `RSS_BUDGET` resident bytes or `MAPPINGS_BUDGET` mappings
+    releases compiled executables as it ends, so no file compiles its way to an OOM kill or the mapping
+    limit: test_serving.py alone reached 64,581 of armada's 65,530 mappings and failed its next compile
+    ("LLVM compilation error: Cannot allocate memory"); held to the budget it peaked at 32,683 and passed.
+    Reading `/proc/self/statm` takes microseconds and `/proc/self/maps` a few milliseconds at the budget."""
     yield
+    if STATM.exists() and int(STATM.read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE") > RSS_BUDGET:
+        release()
+        return
     if MAPPINGS_BUDGET is not None:
         with MAPPINGS.open("rb") as mapped:
             if sum(1 for _ in mapped) > MAPPINGS_BUDGET:

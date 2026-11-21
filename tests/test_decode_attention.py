@@ -127,7 +127,7 @@ def spanned(starts, lengths, capacity):
 DECODE_KERNEL_SEEDS = 8
 """The decode kernel's declared check-1 seeds a config, sized by `seeds_for` paired."""
 
-CHECKED_SPLITS = (1, 2, decode_attention.SPLITS[-1])
+CHECKED_SPLITS = (1, 2, decode_attention.MAX_SPLITS)
 """The slice counts check 1 holds the decode kernel at: one slice a row (no merge), two (the merge of its
 slices' fp32 sums) and the most (slices of a block or of none, whose empty partial states the merge reads).
 A count between two and the most runs the two slices' merge at another count, and the compile gate holds
@@ -840,9 +840,9 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
 
 COMPILED = [(kernel, variant, splits) for kernel, variants in
             (("dense", ("bfloat16", "float32")), ("natural", ("raw", "sinks")), ("paged", (16, 32)))
-            for variant in variants for splits in (1, decode_attention.SPLITS[-1])]
+            for variant in variants for splits in (1, decode_attention.MAX_SPLITS)]
 """The decode compile gate's cases: each kernel's variants at unsplit (`1`) and max split
-(`decode_attention.SPLITS[-1]`, 32) — splits 2..32 compile the same split-KV Triton body (identical shared
+(`decode_attention.MAX_SPLITS`, 32) — splits 2..32 compile the same split-KV Triton body (identical shared
 bytes, registers and 0 spills, e.g. sm90 dense bf16: 44032 B / 167 regs / 0 B frame for all splits 2..32
 vs 168 regs at split 1), cutting 108 to 36 cells."""
 
@@ -993,3 +993,19 @@ def flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(with
 
     attention_on_par(flash, plain, draw, f"flash over a cache call's documents, window {window}",
                      keep=np.asarray(mask) & np.asarray(positions >= 0)[:, None, :, None])
+
+
+def test_decode_residency_derives_from_target_shared_memory_and_threads():
+    """`decode_attention._resident` and `_heuristic` derive residency from `GpuTarget.shared_limit` and
+    `GpuTarget.multiprocessor` rather than a fixed constant (row 1954): an H100 holds more resident programs
+    than an A100, which holds more than a 99 KB sm86 GPU."""
+    from dew.nn.kernels import generation
+
+    step_bytes = decode_attention.KEY_STEP_BYTES
+    h100 = generation.gpu_target("sm90")
+    a100 = generation.gpu_target("sm80")
+    a10 = generation.gpu_target("sm86")
+    assert decode_attention._resident(step_bytes, h100) > decode_attention._resident(step_bytes, a100)
+    assert decode_attention._resident(step_bytes, a100) > decode_attention._resident(step_bytes, a10)
+    assert decode_attention._heuristic(32, 64, step_bytes, h100).splits >= decode_attention._heuristic(
+        32, 64, step_bytes, a10).splits

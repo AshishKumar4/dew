@@ -1060,7 +1060,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
-                        together: tuple[int, ...] = ()) -> dict:
+                        together: tuple[int, ...] = (),
+                        tmem_limit: int | None = None) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
         # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
         # refused one, jsf-tmem4). A 16-column product is issued 32 wide, its right operand padded
@@ -1075,6 +1076,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # of that width in turn; a narrower group is summed in turn, in its width's one accumulator.
         # The padded tile only where a product is narrower than `PADDED` (a forward at width 256 over 64-key
         # tiles takes none: 8 KB its two consumers' training program needs for its split sums' stage).
+        del tmem_limit
         narrow = min((*widths, *ahead, *sums, *together), default=PADDED) < PADDED
         kept = all(self.keeps_sums(width) for width in sums)
         alone = tuple(width for width in together if width < PADDED)

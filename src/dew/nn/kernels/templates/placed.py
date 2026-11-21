@@ -140,6 +140,7 @@ class Tcgen05Placed(Tcgen05Rings):
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
                         together: tuple[int, ...] = (), tmem_limit: int | None = None) -> dict:
+        # A role's two turns of the one product it issues ahead, each its logits' accumulator (`LOGITS`) and
         # over it the one left operand it is given (`WEIGHTS`, 16-bit two to a column): a turn's weights are
         # written once its consumer has read the turn's logits whole into its registers, which they are
         # formed from, and the turn's next logits issued after the product reading those weights, the tensor
