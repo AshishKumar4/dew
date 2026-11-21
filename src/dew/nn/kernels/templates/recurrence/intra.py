@@ -507,7 +507,7 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
     staging, landing = _sub_chunk_staged(call, keys, products=products)
     return launch_kernel(program, call, out_type=tuple(form.shape(call.heads * chunk) for form in formed),
                          grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=blocks,
-                         stages=2, live=chunk_liveness(4), steps=steps,
+                         stages=2, live=chunk_liveness(5), steps=steps,
                          model=outputs * 2 * later * algebra.SUB * chunk * width,
                          held=_sub_chunk_held(call, keys, outputs), staging=staging, landing=landing,
                          name=_named("recurrence_intra", products), sums=(chunk,) * (outputs * later),
