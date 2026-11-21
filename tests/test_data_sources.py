@@ -2096,14 +2096,16 @@ def test_a_streamed_line_store_with_a_provisioned_index_places_each_record_at_it
         files.append(str(path))
 
     def placed(source) -> list[tuple[int, int]]:
+        # The batch size is global: three rows give each of the three shares one.
         chain = Pipeline(source).map_with_index(lambda index, row: {**row, "place": index},
-                                                identity="place@1").batch(1)
+                                                identity="place@1").batch(3)
         read = compile(chain, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1), epochs=1)
         held = []
         for share in range(3):
             stream = read.train(DataPartition(share, 3))
             try:
-                held += [(int(batch["id"][0]), int(batch["place"][0])) for batch in stream]
+                held += [(int(batch["id"][at]), int(batch["place"][at]))
+                         for batch in stream for at in range(len(batch["id"]))]
             finally:
                 stream.close()
         return sorted(held)
