@@ -57,7 +57,7 @@ from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import called, read_by
-from dew.nn.sharding import automatic_axes
+from dew.nn.sharding import automatic_axes, computed_from
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 """The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
@@ -1117,7 +1117,11 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     # summed as an output of its own dtype sums (`product.promoted`: exactly at a precision above the
     # default), not as the forward's narrower outputs, whose rounding hid the tensor cores' sums within a
     # step (row 5406: an A100's fp16 row-scaled product's scale gradient 1.72 times XLA's error).
-    acc = jax.ShapeDtypeStruct(acc_shape, at_least_fp32(compute))
+    # Typed as its operands make it in a checked manual map (`sharding.computed_from`, as a launch's result,
+    # row 9808): beside a side each device reads its own of, the epilogue's VJP traced at an accumulator
+    # typed the same on every device added the two apart (row 10526).
+    acc = computed_from(jax.ShapeDtypeStruct(acc_shape, at_least_fp32(compute)), lhs, *matrices,
+                        *jax.tree.leaves(prologue_arrays))
     # The epilogue's VJP, traced once, its accumulators' reads and pass-through cotangents read from it.
     vjp = _epilogue_vjp(kept, count, acc, sides)
     rounded = _rounded_accumulator(saved or {}, count, epilogue, acc, sides)
