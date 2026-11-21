@@ -938,11 +938,13 @@ def _compiled_here(cases, generation: str) -> list[dict]:
     return found
 
 
-def mosaic_failures(found: list[dict]) -> list[str]:
+def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[str]:
     """Compile errors, spills, missing or excessive shared/TMEM allocations, a launch its lowering did not
     certify (`report.certified`), and a producer its schedule lowers to other registers than its model
     states (`setmaxnreg.dec` against `RegisterModel.producer`: a launch's plan and its emission one fact).
-    Whether a launch's registers hold is its certification's alone: the gate judges no register model."""
+    Whether a launch's registers hold is its certification's alone: the gate judges no register model. A
+    kernel's planned shared bytes are its case's model's, or with `traced_models`, where its case states
+    none, its launch's as it traced (a case settled as a call takes its tile, `KernelOp.lowering` at None)."""
     failed = failures(found)
     for record in found:
         if refused(record):
@@ -955,11 +957,9 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             found_kernel = _report(kernel)
             if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
-            # Its model as its case states it, else as its launch stated it tracing (a case settled as a call
-            # takes its tile states none of its own).
             cased = record.get("models", {}).get(found_kernel.kernel)
             stated = (None if found_kernel.kind == "triton"
-                      else cased if cased is not None
+                      else cased if cased is not None or not traced_models
                       else record.get("stated_models", {}).get(found_kernel.traced))
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "

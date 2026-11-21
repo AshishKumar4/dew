@@ -801,7 +801,7 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
         found = compile_mosaic_kernels(contract + cases, generation_name)
     failed = failures(found) + mosaic_failures(found[:len(contract)])
     required = [record for case, record in zip(cases, found[len(contract):], strict=True) if case.required]
-    failed += mosaic_failures(required)
+    failed += mosaic_failures(required, traced_models=True)
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
