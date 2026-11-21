@@ -94,6 +94,7 @@ __all__ = [
     "bf16_logits",
     "bf16_product",
     "biased",
+    "biased_value",
     "capped_logits",
     "compensated_add",
     "compensated_difference",
@@ -268,10 +269,12 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     return _biased(product, bias)
 
 
-def _biased_value(product: jax.Array, bias: jax.Array) -> jax.Array:
+def biased_value(product: jax.Array, bias: jax.Array) -> jax.Array:
     """`biased`'s value: `product` plus `bias` spread at fp32 (`broadcast_summed`) over the product's
     trailing axes, as flax's layers reshape it, so no rank is promoted implicitly; rounded back, it adds as
-    flax adds it (XLA folds the round trip, so the product and bias fuse as before)."""
+    flax adds it (XLA folds the round trip, so the product and bias fuse as before). Differentiated as it
+    is, its bias's gradient sums at fp32 (`broadcast_summed`'s): a projection's rule over its product and
+    bias together reads it so (`dew.nn.kernels.projections.dot_general`'s `bias`)."""
     dtype = jnp.result_type(product, bias)
     leading = product.ndim - bias.ndim
     spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)), dtype=dtype)
@@ -289,7 +292,7 @@ def _biased_tangent(primals, tangents):
     product, bias = primals
     d_product, d_bias = tangents
     d_product, d_bias = with_tangents_formed(d_product, d_bias)
-    value = _biased_value(product, bias)
+    value = biased_value(product, bias)
     dtype = value.dtype
     leading = product.ndim - bias.ndim
     terms = ([] if isinstance(d_product, SymbolicZero) else [d_product.astype(dtype)]) + (
@@ -302,7 +305,7 @@ def _biased_tangent(primals, tangents):
 
 
 _biased = contracted("test_a_biased_sum_holds_every_order")(
-    declared_tangent(Protected(), _biased_value, _biased_tangent, symbolic_zeros=True))
+    declared_tangent(Protected(), biased_value, _biased_tangent, symbolic_zeros=True))
 
 
 def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...], *,

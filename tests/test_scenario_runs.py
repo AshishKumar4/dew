@@ -749,18 +749,31 @@ def first_cells(held: Callable[[Scenario], object]) -> list:
 def test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs(name, cell,
                                                                                           tmp_path):
     """Resume equals the uninterrupted run, and a resumed run reuses its compiled programs (testing.md's
-    contracts), once a flow of a scenario on its first cell (`assert_resumes_onto_its_uninterrupted_run`)."""
-    assert_resumes_onto_its_uninterrupted_run(SCENARIOS[name].trained(cell, tmp_path), tmp_path)
-
-
-@pytest.mark.parametrize(("name", "cell"), first_cells(lambda scenario: scenario.sampled))
-def test_a_scenarios_sampling_reruns_from_its_compiled_programs(name, cell, tmp_path):
-    """A repeated run reuses its compiled programs, sampling (testing.md's contracts), once a flow of a
-    scenario on its first cell: its sampling of the cell's trained run, or of what it writes under the cell's
-    root, twice in fresh processes over one persistent cache (`assert_samples_from_its_cached_programs`)."""
+    contracts), once a flow of a scenario on its first cell (`assert_resumes_onto_its_uninterrupted_run`); and
+    where the scenario samples its trained run, a repeated run reuses its compiled programs, sampling
+    (`samples_from_its_cached_programs`), over that uninterrupted run, where a test of its own trained the
+    run again first (row 10137's cut)."""
     scenario = SCENARIOS[name]
-    source = scenario.trained(cell, tmp_path).trained()[0] if scenario.sampled_from == "run" else tmp_path
-    assert_samples_from_its_cached_programs(MODULE, scenario.sampled, cell, str(source), root=tmp_path)
+    whole = assert_resumes_onto_its_uninterrupted_run(scenario.trained(cell, tmp_path), tmp_path)
+    if scenario.sampled is not None and scenario.sampled_from == "run":
+        samples_from_its_cached_programs(name, cell, whole, tmp_path)
+
+
+def samples_from_its_cached_programs(name: str, cell: Mapping, source: Path, root: Path) -> None:
+    """A repeated run reuses its compiled programs, sampling (testing.md's contracts), once a flow of a
+    scenario on its first cell: its sampling of `source`, the cell's trained run or its root, where it samples
+    what it writes there itself, twice in fresh processes over one persistent cache under `root`
+    (`assert_samples_from_its_cached_programs`)."""
+    assert_samples_from_its_cached_programs(MODULE, SCENARIOS[name].sampled, cell, str(source), root=root)
+
+
+@pytest.mark.parametrize(("name", "cell"), first_cells(
+    lambda scenario: scenario.sampled and (scenario.sampled_from == "root" or not scenario.trained)))
+def test_a_scenarios_sampling_reruns_from_its_compiled_programs(name, cell, tmp_path):
+    """A repeated run reuses its compiled programs, sampling, of what a scenario's first cell writes under its
+    root (`samples_from_its_cached_programs`); a scenario that samples its trained run holds it beside its
+    resume (`test_a_scenarios_run_resumed_ends_on_its_uninterrupted_run_from_its_compiled_programs`)."""
+    samples_from_its_cached_programs(name, cell, tmp_path, tmp_path)
 
 
 # --- a first step however its rows are laid or split ------------------------------------------------------

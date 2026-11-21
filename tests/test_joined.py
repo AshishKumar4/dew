@@ -590,18 +590,25 @@ def test_a_named_side_by_side_product_keeps_its_callers_grouped_choice_and_refus
 
 def test_a_side_by_side_forward_runs_the_route_its_admission_decided():
     """An attention layer's query, key and value admitted side by side on an assumed H100, the GEMM template
-    named: their forward runs and reports the grouped route `gemm.side_by_side` decided as it admitted them
-    (its site), once, where the call bound and selected its launch a second time (base review b68fc2382
-    F5)."""
+    named: the route `gemm.side_by_side` decides for their rows and kernels (the admission's) is the route
+    their forward reports, once (base review b68fc2382 F5: the call selected its launch a second time and
+    reported that one)."""
+    from dew.nn.kernels import gemm
+
     layer, x, params, under = _watched_layer()
+    unboxed = nn.unbox(params)
+    kernels = tuple(jax.ShapeDtypeStruct(unboxed["params"][name]["kernel"].shape, jnp.bfloat16)
+                    for name in ("q_proj", "k_proj", "v_proj"))
+    rows = jax.ShapeDtypeStruct((x.shape[0] * x.shape[1], x.shape[2]), x.dtype)
     with contextlib.ExitStack() as stack:
         for context in under():
             stack.enter_context(context)
+        admitted = gemm.side_by_side(rows, kernels, x.dtype, None, whole=True)
         routes = stack.enter_context(generation.routes())
         jax.eval_shape(layer.apply, params, x)
+    assert admitted is not None and admitted.kernel == "mosaic", admitted
     assert [route.kernel for route in routes if route.choice == "qkv"] == ["joined"]
-    sites = [route.site for route in routes if route.choice == "grouped_matmul"]
-    assert sites.count("dew.nn.kernels.gemm:side_by_side") == 1, sites
+    assert list(routes).count(admitted) == 1, routes
 
 
 def _watched_layer():

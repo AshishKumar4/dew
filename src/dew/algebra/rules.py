@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import importlib
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
@@ -985,7 +986,11 @@ def armed(sets: Rules) -> Rules:
 
 
 def nameable() -> frozenset[str]:
-    """The sets a receipt's arm may leave out: every registered set but a dev-time one, and each `ARMS`."""
+    """The sets a receipt's arm may leave out: every registered set but a dev-time one, and each `ARMS`, a
+    derivation's set its own module arms as it loads (`dew.algebra.carry`'s): loaded first, so the names are
+    every one of them whatever this process has read of the algebra (its package loads each module where it
+    is first read)."""
+    importlib.import_module("dew.algebra.carry")
     return frozenset(name for name, sets in RULES.items() if not sets.dev) | frozenset(ARMS)
 
 

@@ -14,8 +14,6 @@ from arm_arithmetic import as_written, products_held, summed_as_run, unrewritten
 from arm_forms import _bounded, _declared, _given, _own_function, _refuse_numpy_arms, _RunToRun, _Windowed
 from truths_ahead import AT_RUN, CompiledTruths, arm_role, named
 
-from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import report
 from dew.parity_stages import staged_units
 
 
@@ -93,6 +91,8 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
             for drawn in inputs.values():
                 _arm_program(programs, held, role, fn, drawn, reference=reference, written=written)
     if programs:
+        from dew.nn.kernels.templates import report
+
         compiled = _arm_compile(compile, as_written(store.device().platform) if written else None)
         with summed_as_run():
             try:
@@ -115,6 +115,10 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     trace's (a window loop's at one window's). A twin compiled as written (`written`,
     `arm_forms._written_twin`) traces a `without_ynn` program's own function (`arm_forms._own_function`), as
     its run compiles it."""
+    # The kernels' records read where an arm is prepared, never at load: a test of the gate imports no kernel
+    # (the test cache keys a row on every module it loads).
+    from dew.nn.kernels import generation, tuning
+
     if isinstance(fn, _RunToRun):
         return _arm_program(programs, held, role, fn.fn, inputs, reference=reference, written=written)
     if isinstance(fn, _Windowed):
@@ -180,6 +184,8 @@ class _Whole:
         return self.fn(*leaves)
 
     def lower(self, *args, **options):
+        from dew.nn.kernels import tuning
+
         with tuning.seen() as found:
             lowered = self.fn.lower(*args, **options)
         self.record["launches"] = found.held()

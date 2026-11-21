@@ -345,8 +345,12 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
             state = algebra.merged_state(spec, out, maximum, total, initial)
         else:
-            # The slices merged where the launch wrote them (`merged.merged_split`).
+            # The slices merged where the launch wrote them (`merged_finished` / `merged_split`).
             assert isinstance(walked_out, attention_mosaic.SplitOutput)
+            if finished:
+                return merged.merged_finished(spec, walked_out.padded, walked_out.stacked, queries=queries,
+                                              width=width, out_dtype=query.dtype, out_heads=heads,
+                                              initial=initial)
             state = merged.merged_split(spec, walked_out.padded, walked_out.stacked, queries=queries,
                                         width=width, initial=initial)
         if finished:
@@ -412,7 +416,8 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
                 equation.params["units"], jax.ShapeDtypeStruct(padded_aval.shape, padded_aval.dtype),
                 jax.ShapeDtypeStruct(stacked_aval.shape, stacked_aval.dtype),
                 equation.params["queries"], equation.params["width"], target,
-                has_initial=len(equation.invars) > 2, raw_scale=equation.params.get("raw_scale")))
+                has_initial=len(equation.invars) > 2, raw_scale=equation.params.get("raw_scale"),
+                out_dtype=equation.params.get("out_dtype"), out_heads=equation.params.get("out_heads")))
     all_launches = launches + merges
     return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
 

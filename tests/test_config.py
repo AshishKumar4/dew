@@ -962,11 +962,15 @@ def test_a_saved_runs_default_layout_reads_as_unset_and_a_stated_one_as_it_is():
     assert earlier_trainer_layout(default)["fields"]["trainer"]["layout"] is None
     stated = {"class": "lm", "fields": {"trainer": {"layout": to_record(Layout(min_shard=8), Layout)}}}
     assert earlier_trainer_layout(stated) == stated
+    # Written while the trainer held `layout_unsettable` as a field (train 1109's review, F3): stated.
+    fielded = {"class": "lm", "fields": {"trainer": {"layout": to_record(Layout(), Layout),
+                                                     "layout_unsettable": True}}}
+    assert earlier_trainer_layout(fielded)["fields"]["trainer"] == {"layout": to_record(Layout(), Layout)}
 
 
 def test_a_run_stating_the_default_layout_saves_and_loads_it_stated(tmp_path):
     """A run whose trainer states `Layout()`, the device layout kept, saves and loads it as stated: a record
-    written today says so (`TrainerConfig.layout_unsettable`), so the migration of records written while
+    written today says so beside its fields (`LAYOUT_UNSETTABLE`), so the migration of records written while
     `Layout()` was the default leaves it (row 9664: it loaded unset, and the chooser could offload)."""
     from dew.distributed.placement import Layout
 

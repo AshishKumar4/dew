@@ -54,7 +54,6 @@ __all__ = [
     "marked_call_p",
     "portable_formed",
     "surrogate",
-    "with_cotangent_arrived",
     "with_gradients_formed",
     "with_gradients_formed_at",
     "with_tangents_formed",
@@ -83,7 +82,7 @@ def with_gradients_formed[Input, Gradients](d_input: Input, gradients: Gradients
     Only floating arrays enter the barrier: an integer operand's zero cotangent (`float0`) and an unreached
     one (None) pass through as they are, and where no gradient is a floating array (an unhooked call's, a
     sinkless attention's) there is nothing to form and the cotangents leave as they are, fusing into their
-    readers."""
+    readers. A projection's rule holds its entry too (`with_cotangent_arrived`, `portable_formed`)."""
     if not any(_floating(leaf) for leaf in jax.tree.leaves(gradients)):
         return d_input, gradients
     return _held(d_input, gradients)
@@ -91,12 +90,13 @@ def with_gradients_formed[Input, Gradients](d_input: Input, gradients: Gradients
 
 def with_cotangent_arrived[Cotangent, Operands](cotangent: Cotangent, operands: Operands
                                                ) -> tuple[Cotangent, Operands]:
-    """The rule's entry (`with_gradients_formed`'s): a reverse mode reads its operands only once its cotangent
-    has arrived, both through one barrier, so XLA computes nothing of a reverse mode from its operands alone
-    (a projection's kernel transposed for its input gradient) ahead of the cotangent, where it held one of
-    them a layer to the backward's start (a Mamba-2 decoder's in-projection, 0.8 MB a layer: its
-    temporaries' growth from two blocks to four 1.87 MB past what its forward saves, 0.23 MB under it with
-    the entry)."""
+    """The rule's entry (`with_gradients_formed`'s exit beside it): a reverse mode reads its operands only
+    once its cotangent has arrived, both through one barrier, so XLA computes nothing of a reverse mode from
+    its operands alone (a projection's kernel transposed for its input gradient) ahead of the cotangent,
+    where it held one of them a layer to the backward's start (a Mamba-2 decoder's in-projection, 0.8 MB a
+    layer: its temporaries' growth from two blocks to four 1.87 MB past what its forward saves, 0.23 MB under
+    it with the entry; a four-layer Muon LM's measured need 6.34 MB joined and 4.27 MB parted with it, 7.76 MB
+    either way without, so its planner could no longer part its stacks: row 6740's review in train 1113)."""
     return _held(cotangent, operands)
 
 
@@ -172,23 +172,33 @@ def _floating(leaf) -> bool:
 
 
 def portable_formed[Value](portable: Callable[..., Value], /) -> Callable[..., Value]:
-    """`portable`, an XLA program whose last operand is a parameter (a projection's kernel, a norm's weight,
-    an attention's sinks), its value and every derivative XLA's of it (`generation.linear_tangent`), its
-    reverse mode the rule's: it reads its operands only once its cotangent has arrived
-    (`with_cotangent_arrived`) and returns the inputs' cotangents only with the parameter's gradient formed
-    (`with_gradients_formed`). Its forward saves nothing; its backward recomputes `portable` as its VJP
-    reads it."""
+    """`portable`, an XLA program whose last operand is a parameter, or a tree of them (a projection's kernel
+    and its bias, a norm's weight, an attention's sinks), its value and every derivative XLA's of it
+    (`generation.linear_tangent`), its reverse mode the rule's: it reads its operands only once its
+    cotangent has arrived (`with_cotangent_arrived`) and returns the inputs' cotangents only with the
+    parameters' gradients formed (`with_gradients_formed`), each formed only where a reverse pass
+    differentiates it (`live_cotangents`: a frozen operand's never is). Its forward saves nothing; its
+    backward recomputes `portable` as its VJP reads it."""
     from dew.nn.kernels.generation import linear_tangent
 
-    def backward(saved, operands, cotangent):
+    def backward(saved, operands, cotangent, live):
         del saved
+        count = len(jax.tree.leaves(operands))
+        first = count - len(jax.tree.leaves(operands[-1]))
+        # `portable` of the live leaves, the others held as they are.
+        # Every operand the VJP reads (a frozen kernel the input's cotangent reads transposed among them)
+        # read once its cotangent has arrived; `live` chooses the cotangents formed.
         cotangent, operands = with_cotangent_arrived(cotangent, operands)
-        *inputs, parameter = jax.vjp(portable, *operands)[1](cotangent)
-        inputs, parameter = with_gradients_formed(tuple(inputs), parameter)
-        return (*inputs, parameter)
+        moving, fill = programs.holes(operands, [index in live for index in range(count)])
+        pulled = jax.vjp(lambda *values: portable(*fill(values)), *moving)[1](cotangent)
+        inputs, formed = with_gradients_formed(
+            tuple(each for index, each in zip(live, pulled, strict=True) if index < first),
+            tuple(each for index, each in zip(live, pulled, strict=True) if index >= first))
+        return (*inputs, *formed)
 
     return contracted("test_a_portable_formed_rule_holds_every_order")(linear_tangent(
-        lambda *operands: (portable(*operands), ()), backward, portable, kind=KernelGlue()))
+        lambda *operands: (portable(*operands), ()), backward, portable, kind=KernelGlue(),
+        live_cotangents=True))
 
 
 def contracted[Function](test: str, /) -> Callable[[Function], Function]:
