@@ -1726,10 +1726,19 @@ def _rows(family: mosaic.Family, ref, row, head, first, count: int):
     return family.rows_of(ref.at[row, head, pl.ds(first, count)])
 
 
-def _views_of(refs: dict, row, head) -> dict:
+def head_slice(family: mosaic.Family, row, head, span) -> tuple:
+    """Index `(row, head, span)` for a head-first TPU ref (`Family.copies_tiled_rows`), where placing the
+    head axis before the sequence keeps every 16-bit slice tile-aligned on v5e (rows 6993, 10152), else
+    `(row, span, head)`."""
+    return (row, head, span) if family.copies_tiled_rows else (row, span, head)
+
+
+def _views_of(refs: dict, row, head, *, heads_first: bool = False) -> dict:
     """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each `[B, S, H, D]`
-    operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
-    return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
+    (or `[B, H, S, D]` where `heads_first`) operand's `[S, D]` at batch row `row` and head `head`, step
+    `j` its `j`-th block of rows."""
+    return {name: (ref.at[row, head, :] if heads_first else ref.at[row, :, head], lambda j: (j, 0))
+            for name, ref in refs.items()}
 
 
 def _fused_held(logits: tuple, dtype, *, dropped: bool) -> list:

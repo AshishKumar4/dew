@@ -38,8 +38,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     column_share,
+    head_slice,
     held_params,
-    holders,
     issued_into,
     modelled,
     param_types,
@@ -621,7 +621,8 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
     # Each a query head's (`outputs.Output`): the query's batch rows and heads, the key's padded keys, a share
     # of the columns.
     rows, keys, heads_of = outputs.axis(query, 0), outputs.axis(key, 1), outputs.axis(query, 2)
-    dk, dv = (outputs.output(jnp.float32, rows, keys, heads_of, column_share(array, share))
+    dkv_shape = (rows, heads_of, keys) if family.copies_tiled_rows else (rows, keys, heads_of)
+    dk, dv = (outputs.output(jnp.float32, *dkv_shape, column_share(array, share))
               for array, (_, share) in zip((key, value), shares, strict=True))
     return family.kernel(
         entry, out_type=(dk, dv),
@@ -759,7 +760,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                 # The consumers' sums, added in a scope after the walk's (`_summed_stored`); a placed walk's
                 # its compute warpgroups' one pair, the first's to store.
                 return (dk, dv, *key_sums) if split else None
-            out = (row, pl.ds(k_first, block_k), head)
+            out = head_slice(family, row, head, pl.ds(k_first, block_k))
             key_views = tuple(ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, block_k)]
                               for ref in key_refs)
             _keys_stored(family, (dk, dv, *key_sums), (dk_ref.at[out], dv_ref.at[out], *key_views),
@@ -792,8 +793,14 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                            walk.interpret)
 
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
+    heads_first = family.copies_tiled_rows
+    if heads_first:
+        query, key, value, dout = (jnp.swapaxes(arr, 1, 2) for arr in (query, key, value, dout))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    return _dkv_launched(walk, launch, operands, graded, buffers, groups)
+    result = _dkv_launched(walk, launch, operands, graded, buffers, groups)
+    if heads_first:
+        return (jnp.swapaxes(result[0], 1, 2), jnp.swapaxes(result[1], 1, 2), *result[2:])
+    return result
 
 
 def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:
@@ -811,7 +818,7 @@ def _block_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: tuple
     head (`place`) copied into its `smem` (`Family.loaded`, each awaited on its `loaded` barrier), the
     copies issued where `issued` (one consumer's for every consumer that shares them)."""
     row, kv_head = place
-    view = (row, pl.ds(k_first, block_k), kv_head)
+    view = head_slice(family, row, kv_head, pl.ds(k_first, block_k))
     family.loaded(tuple((ref.at[view], tile.at[holder], barrier.at[holder])
                         for ref, tile, barrier in zip(refs, smem, loaded, strict=True)), issued=issued)
 
@@ -847,7 +854,7 @@ def _query_streams(family: mosaic.Family, streams, named: dict, score: tuple, ro
     hook's parameters that ride them (`score`, their refs and kinds: `score_views`, at the program's key
     tile), and its streams opened with them."""
     refs, kinds = score
-    views = _views_of(named, row, head)
+    views = _views_of(named, row, head, heads_first=family.copies_tiled_rows)
     if riding(family, kinds, "queries"):
         views |= score_views(family, refs, kinds, "queries", row, head, family.program_index("k_tiles"))
     return views, family.opened(streams, views)

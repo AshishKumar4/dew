@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
+from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from kernel_compile import gate_generations, lowered_for
 from test_attention_mosaic import (
@@ -1261,6 +1261,29 @@ def test_the_launches_lower_for_a_v5e(call):
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals)).trace(q, kv, kv, q, residuals).lower(
             lowering_platforms=("tpu",))
+
+
+@COMPILES_FOR_TPU
+def test_bf16_template_compiles_for_a_v5e():
+    """Head-first `[B, H, S, D]` TPU layout lets the template's bf16 forward and training step compile on
+    v5e through `libtpu` without Mosaic's packed-sublane head-slice error (rows 6993, 10152)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_tpu_kernels, failures
+
+    query = jax.ShapeDtypeStruct((1, 256, 4, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 256, 2, 128), jnp.bfloat16)
+
+    def fwd(q, k, v):
+        return scaled_dot_product_attention(q, k, v, causal=True, implementation="template")
+
+    def step(q, k, v, dout):
+        out, pull = jax.vjp(fwd, q, k, v)
+        return out, *pull(dout)
+
+    cases = [KernelCase("v5e-bf16-fwd", lambda: (fwd, (query, key, key))),
+             KernelCase("v5e-bf16-step", lambda: (step, (query, key, key, query)))]
+    found = compile_tpu_kernels(cases, "v5e")
+    assert not failures(found), "\n".join(failures(found))
 
 
 APPROXIMATED_BY_MOSAIC = ("exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",

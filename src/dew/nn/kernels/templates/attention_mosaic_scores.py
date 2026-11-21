@@ -24,8 +24,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Program,
     _streamed,
     _views_of,
+    head_slice,
     indexed_views,
-    riding,
     score_stream,
     score_views,
 )
@@ -280,7 +280,8 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     row, head = family.program_index("batch"), family.program_index("heads")
     pair = consumers * block_q
     refs, kinds = score
-    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads),
+                      heads_first=family.copies_tiled_rows)
     if riding(family, kinds, "keys"):
         views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
     if spans is not None and spans.walk_count is not None:
@@ -299,6 +300,6 @@ def _query_tile_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: 
     """Consumer `index`'s query tile from `first` and its output cotangents, each `(ref, smem)` of `refs`
     and `smem` loaded whole against its `loaded` barrier at the program's batch row and head (`place`)."""
     row, head = place
-    rows = (row, pl.ds(first, smem[0].shape[1]), head)
+    rows = head_slice(family, row, head, pl.ds(first, smem[0].shape[1]))
     family.loaded(tuple((ref.at[rows], stage.at[index], barrier.at[index])
                         for ref, stage, barrier in zip(refs, smem, loaded, strict=True)))
