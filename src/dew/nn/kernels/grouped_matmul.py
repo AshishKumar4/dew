@@ -2275,7 +2275,7 @@ def launched(launches, arguments, options, *, product: Product, whole: bool,
     if route.kernel in ('xla', APART.name):
         return None if route.kernel == 'xla' else APART
     if (collected := _WEIGHED.get()) is not None:
-        collected.append(case.call.bound[route.kernel])
+        collected.append((case.call, route.kernel))
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
 
 
@@ -2284,11 +2284,11 @@ _WEIGHED: contextvars.ContextVar[list | None] = contextvars.ContextVar('weighed'
 
 
 @contextlib.contextmanager
-def weighed() -> Iterator[list[tuple]]:
-    """Each call traced in the block that `launched` selects a template's launch for, in order, as the
-    template and the arguments it bound: what a pass weighing a region reads of the launches it would make
-    (`fused_gemm.analysis`), whether or not they are built."""
-    found: list = []
+def weighed() -> Iterator[list[tuple[base.Call, str]]]:
+    """Each call traced in the block that `launched` selects a template's launch for, in order, as its
+    templates' bindings (`base.Call`) and the launch's name: what a pass weighing a region reads of the
+    launches it would make (`fused_gemm.analysis`), whether or not they are built."""
+    found: list[tuple[base.Call, str]] = []
     token = _WEIGHED.set(found)
     try:
         yield found
@@ -2296,27 +2296,34 @@ def weighed() -> Iterator[list[tuple]]:
         _WEIGHED.reset(token)
 
 
-def resident(hooked: Sequence[tuple], bare: Sequence[tuple]) -> bool:
-    """Whether a product's launch with its hooks keeps the residency its launch takes without them, each the
-    last call `weighed` collected (kernel-templates §4: a neighbour joins the kernel where the kernel with it
-    still holds its residency and stays spill-free; KERNEL-TEMPLATES-13, row 9032): the programs a
-    multiprocessor of the tile the hooked call derives (`Template.derived`, its plan's: the residency
-    `mosaic.Family.kernel` launches at, its registers within the family's budget) at least those of the
-    product's own. A hooked launch that derives no tile holds none; a product either side of which no template
-    launch takes, or whose configs are no Mosaic tiles, is not judged. On an A100 an epilogue reading four
-    float32 arrays of the product's shape derived 64 x 64 at one program a multiprocessor, where the product
-    alone takes two (FS-HOOKED-RES)."""
-    if not hooked or not bare:
+def resident(hooked: Sequence[tuple[base.Call, str]],
+             unhooked: Callable[[], Sequence[tuple[base.Call, str]]]) -> bool:
+    """Whether a product's Mosaic launch with its hooks keeps the residency the same launch takes without
+    them, each the last call `weighed` collected, `unhooked`'s weighed only where `hooked`'s is a Mosaic
+    launch (kernel-templates §4: a neighbour joins the kernel where the kernel with it still holds its
+    residency and stays spill-free; KERNEL-TEMPLATES-13, row 9032): the programs a multiprocessor of the
+    tile it derives (`Template.derived`, its plan's: the residency `mosaic.Family.kernel` launches at, its
+    registers within the family's budget) at least those of the tile it derives for the product unhooked,
+    whatever launch that call selects. A hooked launch that derives no tile holds none; any other launch,
+    or no product unhooked, is not judged. On an A100 an epilogue reading four float32 arrays of the
+    product's shape derived 64 x 64 at one program a multiprocessor, where the product alone takes two
+    (FS-HOOKED-RES)."""
+    if not hooked:
+        return True
+    call, kernel = hooked[-1]
+    template, ba = call.bound[kernel]
+    if not isinstance(template, _Mosaic):
         return True
     target = generation.gpu_target()
-    (template, ba), (plain_template, plain_ba) = hooked[-1], bare[-1]
     config = template.derived(ba, target)
     if config is None:
         return False
-    plain = plain_template.derived(plain_ba, target)
-    if not isinstance(config, tiling.Tiles) or not isinstance(plain, tiling.Tiles):
+    bare = unhooked()
+    if not bare:
         return True
-    return config.programs >= plain.programs
+    plain_template, plain_ba = bare[-1][0].bound[kernel]
+    plain = plain_template.derived(plain_ba, target)
+    return plain is None or config.programs >= plain.programs
 
 
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),

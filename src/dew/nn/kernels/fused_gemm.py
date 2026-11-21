@@ -305,13 +305,22 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
                          precision=precision, interpret_on_cpu=interpret_on_cpu, **hooks)
 
     def weighed(call):
-        # `call()`'s value, and whether its launch keeps the bare product's residency, weighed beside it
-        # (its routes no program's) where `analysis` collects the region.
+        # `call()`'s value, and whether its launch keeps the residency of the same launch of the bare product
+        # (`grouped_matmul.resident`), where `analysis` collects the region.
         with grouped_matmul.weighed() as hooked:
             value = call()
-        with generation.routes(alone=True), grouped_matmul.weighed() as unhooked:
-            bare()
         return value, grouped_matmul.resident(hooked, unhooked)
+
+    def unhooked():
+        # The bare product's call as its unfused path makes it, weighed and its routes no program's; one the
+        # call's named kernel refuses unhooked has no launch to weigh (as `gemm._keeps_launch` reads a call a
+        # chosen kernel refuses).
+        try:
+            with generation.routes(alone=True), grouped_matmul.weighed() as found:
+                bare()
+        except KernelRefused:
+            return []
+        return found
 
     def plain():
         # The product with no consumer the launch takes: its prologue alone priced, where it takes one.
