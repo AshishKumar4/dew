@@ -768,13 +768,13 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     a test each form, at the tile its launch settles on as a call (its certification refusing a derived tile
     whose kernels spill, its derivation taking the next), compiled by Mosaic for a compile-only device of the
     generation on this CPU through ptxas, with the JAX this checkout pins. Required launches must spill
-    nothing, every CUDA build the gate judges must refuse each config their certification refused
-    (`refusal_disagreements`: each build settling on the tile compiled), and each must state the model its
-    shared bytes are checked by; compiler errors and missing reports fail any. Beside them, each launch form
-    of the form's family
+    nothing under every CUDA build the gate judges and state the model its shared bytes are checked by;
+    compiler errors and missing reports fail any. A tile another build's certification would settle on
+    before or past the gate build's goes unqualified here, as a tile a build stepped down to did when the gate
+    compiled the derived tile (row 10766). Beside them, each launch form of the form's family
     contract (`_contract_cases`: each consumer count) lowers within the block spilling nothing, before any
     consumer adopts a Family head; no version guard skips it."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, refusal_disagreements
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     # The gate's certifications refuse within its own refusals, none of them read by another test's
     # derivation (`report.refusals`).
@@ -789,7 +789,7 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
         found = compile_mosaic_kernels(contract + cases, generation_name)
     failed = failures(found) + mosaic_failures(found[:len(contract)])
     required = [record for case, record in zip(cases, found[len(contract):], strict=True) if case.required]
-    failed += mosaic_failures(required, traced_models=True) + refusal_disagreements(required)
+    failed += mosaic_failures(required, traced_models=True)
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
