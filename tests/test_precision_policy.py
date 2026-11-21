@@ -1916,12 +1916,12 @@ def _plain_sum(terms, axis=None):
 @pytest.mark.parametrize("order", ["forward over reverse", "reverse over reverse"])
 def test_an_aligned_sums_second_order_keeps_its_losss_curvature(order):
     """The Hessian along `d` of `sum(aligned_sum([(a, a, c)])^2)`, its loss nonlinear in the sum (`12 a^2 c^2
-    d`), and of a mixed-rank sum's `sum(aligned_sum([(x, y), (y,)], axis=0)^2)` its `y`-gradient's gradient
-    along `x` (`4 y (x + 1)`), by `jax.jvp` of the gradient and by the gradient of the gradient's product
-    with the direction, on par with the same losses' in plain float32 arithmetic against float64 (check 1),
-    over normal draws, where the sum's tangent rule formed its value from bits, which carry no tangent, and
-    both orders lost the loss's curvature (at `a` `[1, 2]`, `c` `[3, 4]`, `d` `[1, 0]`: `[36, 0]` and `[0,
-    0]` for `[108, 0]`; base review d2d45bd6f F2, row 8701)."""
+    d`), and of a mixed-rank sum's `sum(aligned_sum([(x, y), (y,)], axis=0)^2)` its cross curvature along
+    `d` in `x`, the `y`-gradient's (`4 y (x + 1) d`), each by `jax.jvp` of a gradient and by the gradient of
+    a gradient's product with the direction, on par with the same losses' in plain float32 arithmetic
+    against float64 (check 1), over normal draws, where the sum's tangent rule formed its value from bits,
+    which carry no tangent, and both orders lost the loss's curvature (at `a` `[1, 2]`, `c` `[3, 4]`, `d`
+    `[1, 0]`: `[36, 0]` and `[0, 0]` for `[108, 0]`; base review d2d45bd6f F2, row 8701)."""
     def draw(seed):
         rng = np.random.default_rng([2026_1120, seed])
         return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
@@ -1932,15 +1932,16 @@ def test_an_aligned_sums_second_order_keeps_its_losss_curvature(order):
             def loss(a):
                 return jnp.sum(summed([(a, a, c)]) ** 2)
 
+            def mixed(x, y):
+                return jnp.sum(summed([(x, y), (y,)], axis=0) ** 2)
+
             if order == "forward over reverse":
                 curvature = jax.jvp(jax.grad(loss), (a,), (direction,))[1]
+                crossed = jax.jvp(lambda x: jax.grad(mixed, argnums=1)(x, y), (a,), (direction,))[1]
             else:
                 curvature = jax.grad(lambda a: jnp.vdot(jax.grad(loss)(a), direction))(a)
-
-            def mixed(x):
-                return jnp.sum(jax.grad(lambda y: jnp.sum(summed([(x, y), (y,)], axis=0) ** 2))(y))
-
-            return {"curvature": curvature, "mixed": jax.grad(mixed)(a)}
+                crossed = jax.grad(lambda y: jnp.vdot(jax.grad(mixed)(a, y), direction))(y)
+            return {"curvature": curvature, "mixed": crossed}
 
         return run
 

@@ -480,20 +480,23 @@ def _host_folded(primitive: jcore.Primitive, operands: Sequence[jax.typing.Array
         return None
     with meshless():
         out, _ = primitive.abstract_eval(*types, **params)
-    # A stated output dtype is the output's (`out`), each operand cast to it first.
-    if params.get("out_dtype") is not None and (held := admitted(held, [out.dtype] * len(held))) is None:
-        return None
+    if params.get("out_dtype") is not None:
+        # A stated output dtype is the output's (`out`), each operand cast to it first; a float one declined
+        # before any cast.
+        if not _integral(out.dtype):
+            return None
+        held = [_converted(value, out.dtype) for value in held]
     folded = scalar_folded(primitive, held, params, out.dtype)
     return None if folded is None else TypedNdArray(np.asarray(folded, out.dtype), out)
 
 
 def admitted(values: Sequence, dtypes: Sequence[jax.typing.DTypeLike]) -> list[np.generic] | None:
     """`values` as the concrete integer and boolean scalars `scalar_folded` computes over, each at its
-    caller's canonical dtype in `dtypes` (a bind's operand's, a kernel's atom's), converted as JAX folds a
-    constant's conversion (`_converted`); None where one is not such a scalar (a traced value or an array of
-    a device, one with axes, a float, a complex value) or its dtype is neither integer nor boolean. The one
-    admission of a host fold's operands, a bind's (`_host_folded`) and a kernel's emission's
-    (`dew.nn.kernels.templates.emission`)."""
+    caller's canonical dtype in `dtypes` (a bind's operand's, a kernel's atom's), one held at another dtype
+    converted as JAX folds a constant's conversion (`_converted`); None where one is not such a scalar (a
+    traced value or an array of a device, one with axes, a float, a complex value) or its dtype is neither
+    integer nor boolean. The one admission of a host fold's operands, a bind's (`_host_folded`) and a
+    kernel's emission's (`dew.nn.kernels.templates.emission`)."""
     if not (all(map(integral_scalar, values)) and all(map(_integral, dtypes))):
         return None
     return [_converted(value, dtype) for value, dtype in zip(values, dtypes, strict=True)]
@@ -509,13 +512,15 @@ def integral_scalar(value) -> bool:
 
 
 def _converted(value, dtype: jax.typing.DTypeLike) -> np.generic:
-    """`value` as `dtype` holds it, converted as JAX folds a constant's conversion (`convert_element_type`'s
-    constant-folding rule, `partial_eval.const_fold_rules`: NumPy's cast, an integer wrapped at its width),
-    with no program traced."""
+    """`value` as `dtype` holds it, a scalar: as it is where it is held at `dtype`, else converted as JAX
+    folds a constant's conversion (`convert_element_type`'s constant-folding rule,
+    `partial_eval.const_fold_rules`: NumPy's cast, an integer wrapped at its width), no program traced."""
     kind = ShapedArray((), np.dtype(dtype))
+    if np.result_type(value) == kind.dtype:
+        return np.asarray(value).reshape(-1)[0]
     folded = partial_eval.const_fold_rules[jax.lax.convert_element_type_p](
         [np.asarray(value)], {"new_dtype": kind.dtype, "weak_type": False, "sharding": None}, [kind])
-    # JAX's rule folds every host scalar of a numeric dtype; it gives none for an extended one, admitted never.
+    # JAX's rule folds every host scalar of a numeric dtype, none of an extended one, which none admits.
     if folded is None:
         raise TypeError(f"JAX folds no conversion of {value!r} to {kind.dtype}")
     return np.asarray(folded[0]).reshape(-1)[0]

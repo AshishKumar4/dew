@@ -1363,10 +1363,12 @@ an operation flagged to contract, which no emitter but the CPU's sets (row 10135
 `test_no_contract.a_marked_multiply_add_rounds_each_step` fails should a later XLA contract one). ROCm's and
 a TPU's take the barrier."""
 
-TRACED_MARKED = ("cpu", "gpu")
-"""The platforms a call's code is chosen for (`dew.nn.kernels.generation.backend`) whose programs lower for
-a platform of `MARKED_BACKENDS`: a GPU's for CUDA's or, where ROCm runs, ROCm's, whose lowering keeps the
-barrier (`uncontracted`'s platform choice)."""
+TRACED_MARKED = ("cpu",)
+"""The platforms a call's code is chosen for (`dew.nn.kernels.generation.backend`) whose traces are marked
+(`rounding_alone`): a CPU's, which may lower for a platform of `MARKED_BACKENDS` or another (`uncontracted`'s
+platform choice). A GPU's trace keeps the barrier: a raw `pallas_call`'s body traced on a GPU outside Dew's
+launches would meet the platform choice, which Pallas's Triton and Mosaic GPU lowerings refuse, and no public
+JAX predicate states a Pallas trace yet (row 10138)."""
 
 def _as_they_are(values: tuple) -> tuple:
     """`values` unbarriered: a platform choice's branch where its compiler fences the mark
@@ -1398,14 +1400,14 @@ def no_contract() -> str | None:
 def rounding_alone():
     """Every float add, subtract and multiply traced in the block marked to round on its own, never
     contracted into a fused multiply-add, where the jaxlib marks so (`no_contract`, `set_xla_metadata`) and
-    the trace is for a platform whose programs lower for one that fences the mark (`TRACED_MARKED`, the
-    platform a call's code is chosen for, `dew.nn.kernels.generation.backend`): an error-free transform's
-    arithmetic, each step's rounded value the one every later step reads, its operands read without a
-    barrier where the platform the program lowers for fences the mark too (`uncontracted`). Elsewhere, and in
-    the body of a kernel Dew launches (`dew.nn.kernels.launches.interpreting`), nothing is marked and the
-    transforms hold their operands behind a barrier. A raw `pallas_call`'s GPU body outside Dew's launches
-    meets the platform choice, which Pallas's Triton and Mosaic GPU lowerings refuse by name, where Mosaic
-    TPU's takes its default: no public JAX predicate states a Pallas trace yet (row 10138)."""
+    the trace is for a platform `TRACED_MARKED` names (the platform a call's code is chosen for,
+    `dew.nn.kernels.generation.backend`): an error-free transform's arithmetic, each step's rounded value the
+    one every later step reads, its operands read without a barrier where the platform the program lowers for
+    fences the mark too (`uncontracted`). Elsewhere, and in the body of a kernel Dew launches
+    (`dew.nn.kernels.launches.interpreting`), nothing is marked and the transforms hold their operands behind
+    a barrier. A raw `pallas_call` outside Dew's launches, traced for a CPU and lowered for CUDA, meets the
+    platform choice, which Triton's lowering refuses by name: no public JAX predicate states a Pallas trace
+    yet (row 10138)."""
     from dew.nn.kernels.generation import backend
     from dew.nn.kernels.launches import interpreting
 

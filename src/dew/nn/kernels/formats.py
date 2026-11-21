@@ -237,8 +237,9 @@ class MxFp8:
         # Each E8M0 scale applied as its exponent (`precision.power2`, in normal powers of two): a scale
         # below float32's least normal (2**-128 for inputs near 2**-120) would read as zero where a device
         # flushes subnormals, though the value it scales to is normal; a subnormal value rounds once where
-        # the backend keeps subnormals (`jnp.ldexp` flushed it).
-        values = power2(self.codes.astype(dtype), exponents)
+        # the backend keeps subnormals (`jnp.ldexp` flushed it). Scaled at least in float32 (`power2`), then
+        # in `dtype` once, so a narrow one's range is its own.
+        values = power2(self.codes.astype(dtype), exponents).astype(dtype)
         return jnp.where(exponents == 0xFF - 127, jnp.asarray(jnp.nan, dtype), values)
 
 
