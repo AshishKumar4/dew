@@ -955,6 +955,21 @@ def _rmtrees(paths: Sequence[epath.Path], failures: list[OSError]) -> None:
             failures.append(error)
 
 
+EXPORTED = "exported"
+"""The Orbax item a step exported for readers without Dew holds (`Checkpoints.export_model`): the model's
+variables and EMA whole, in Orbax's standard layout."""
+
+
+def exported(state: TrainState, held_apart: bool) -> dict[str, object]:
+    """`state`'s model as `EXPORTED` holds it: its variables, every collection among them, and its EMA where
+    it keeps one, each its own arrays. Refused for a pipeline's rows each on its own stage's devices
+    (`held_apart`), which Orbax's standard layout writes no part-of-pool array of."""
+    if held_apart:
+        raise ValueError("export_model writes the model in Orbax's standard layout, which holds no array on "
+                         "part of the pool; this pipeline's stages each hold their own rows")
+    return {"variables": state.variables, **({} if state.ema is None else {"ema": state.ema})}
+
+
 class Checkpoints:
     """Manages the checkpoints of one run in one directory.
 
@@ -974,10 +989,17 @@ class Checkpoints:
     pool's local checkpoint restores onto the placement it was written with,
     because no process holds another process's shards (`_check_placement`);
     one process's, and the persistent checkpoint, restore onto any mesh.
+
+    `export_model` writes beside each persistent step of a train state its model whole (`EXPORTED`): its
+    variables, every collection the store dedups among them (a LoRA base), and its EMA as its own arrays,
+    not as the deltas the step keeps, in Orbax's standard layout, so stock Orbax reads it with no Dew
+    (`ocp.StandardCheckpointer().restore(<step>/exported)`), at the cost of one copy of the model a step. A
+    run that keeps only its final checkpoint exports only that one.
     """
 
     def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
-                 local_directory: str | None = None, local_every: int | str | None = None):
+                 local_directory: str | None = None, local_every: int | str | None = None,
+                 export_model: bool = False):
         if (local_directory is None) != (local_every is None):
             raise ValueError(
                 "local checkpoints take both local_directory and local_every: where "
@@ -1004,6 +1026,7 @@ class Checkpoints:
         self._deleting: tuple[threading.Thread, list[OSError], frozenset[int]] | None = None
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
+        self.export_model = export_model
         # Why the run these checkpoints keep has no record that rebuilds it (`python_run`).
         self._reasons: tuple[str, ...] = ()
         self._manager = None
@@ -1528,9 +1551,11 @@ class Checkpoints:
                               tuple(name for name in (*ROLES, ONE_ITEM) if name in payloads))
         try:
             with region("checkpoint.submit"):
-                persistent.save(step, args=ocp.args.Composite(**{
-                    name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
-                    for name, tree in payloads.items()}),
+                items = {name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
+                         for name, tree in payloads.items()}
+                if self.export_model and not mapping:
+                    items[EXPORTED] = ocp.args.StandardSave(exported(state, held_apart))
+                persistent.save(step, args=ocp.args.Composite(**items),
                                 metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
             self._staged.pop(step)

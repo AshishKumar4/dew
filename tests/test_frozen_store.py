@@ -315,3 +315,42 @@ def test_a_run_restores_in_a_new_process_onto_another_mesh_and_dtype(tmp_path):
     read = json.loads(done.stdout.strip().splitlines()[-1])
     outcomes = ("typed", "step", "values", "lacking", "frozen_shape", "step_shape")
     assert read == dict.fromkeys(outcomes, True), read
+
+
+def test_an_exported_step_restores_whole_in_stock_orbax_with_no_dew(tmp_path):
+    """A LoRA run with an EMA, its checkpoints exporting their model (`export_model`): stock Orbax in a
+    process that imports no Dew restores the step's `exported` item whole, its LoRA base, which the step
+    itself keeps in the store, and its EMA as its own arrays, not the deltas the step keeps, equal to the
+    run's (row 9070)."""
+    import json
+    import subprocess
+    import sys
+
+    from flax.traverse_util import flatten_dict
+
+    base = model()
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
+        base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
+    objective = LMObjective(adapter.model, seq_len=8, ema_decay=0.5, variables=adapter.variables)
+    rows = [{"text": (np.arange(9, dtype=np.int32) + index) % 16} for index in range(16)]
+    checkpoints = Checkpoints(str(tmp_path / "run"), export_model=True)
+    state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
+        records(rows), steps=2, checkpoint_every=1, log_every=100)
+    checkpoints.wait()
+    assert FROZEN in state.variables and state.ema is not None
+    program = ("import json, sys\\n"
+               "import numpy as np\\n"
+               "import orbax.checkpoint as ocp\\n"
+               "from flax.traverse_util import flatten_dict\\n"
+               "restored = ocp.StandardCheckpointer().restore(sys.argv[1])\\n"
+               "assert not any(name.startswith('dew') for name in sys.modules)\\n"
+               "print(json.dumps({'/'.join(map(str, path)): np.asarray(value).tolist()\\n"
+               "                  for path, value in flatten_dict(restored).items()}))\\n")
+    ran = subprocess.run([sys.executable, "-c", program, str(tmp_path / "run" / "2" / "exported")],
+                         capture_output=True, text=True, timeout=300, check=False)
+    assert ran.returncode == 0, ran.stderr[-3000:]
+    read = json.loads(ran.stdout.strip().splitlines()[-1])
+    expected = flatten_dict({"variables": jax.device_get(state.variables), "ema": jax.device_get(state.ema)})
+    assert set(read) == {"/".join(map(str, path)) for path in expected}
+    for path, value in expected.items():
+        np.testing.assert_array_equal(np.asarray(read["/".join(map(str, path))]), np.asarray(value))
