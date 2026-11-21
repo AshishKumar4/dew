@@ -1136,7 +1136,7 @@ class MosaicForward(_Mainloop[Tiles]):
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
-        score_pairs = 10 if (config.natural_form or self.scales_in_kernel(ba)) else 6
+        score_pairs = 12 if (config.natural_form or self.scales_in_kernel(ba)) else 6
         tpu_values = ({"keys": ((config.block_k, width), query.dtype),
                        "values": ((config.block_k, value_width), query.dtype)},
                       (((config.block_q, value_width), jnp.float32),
