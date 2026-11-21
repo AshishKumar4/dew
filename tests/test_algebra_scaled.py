@@ -417,13 +417,18 @@ def _batched(outputs, totals, anchors):
     return means.merged_output(outputs, totals, anchors, NATURAL, 1)
 
 
+@functools.cache
 def _state(axis: int):
-    """The merged state of states along `axis` (`means.merged_state`)."""
+    """The merged state of states along `axis` (`means.merged_state`), one function an axis, so a program of
+    it traced and compiled for one cell serves every other at its shapes (rows 9806 and on: the merged
+    state's cells compiled each draw's arms again)."""
     return lambda outputs, totals, anchors: means.merged_state(outputs, totals, anchors, NATURAL, axis)
 
 
+@functools.cache
 def _apart(axis: int):
-    """The merged output and the merged total and its landed anchor of states along `axis`, apart."""
+    """The merged output and the merged total and its landed anchor of states along `axis`, apart, one
+    function an axis (`_state`)."""
     return lambda outputs, totals, anchors: (means.merged_output(outputs, totals, anchors, NATURAL, axis),
                                              *means.merged_total(totals, anchors, NATURAL, axis))
 
@@ -454,6 +459,46 @@ def _with_directions(draw):
     return drawn
 
 
+@functools.cache
+def _value(form):
+    """`form`'s merged output and total at a draw's operands, its directions read by none; one function a
+    form, as `_state`'s are, so each cell's arms reuse another's programs."""
+    return lambda outputs, totals, anchors, *_: form(outputs, totals, anchors)[:2]
+
+
+@functools.cache
+def _moved(form, at: tuple[int, ...]):
+    """`form`'s merged output and total moved along its operands `at` by a draw's directions (a forward
+    derivative), one function a form and a choice of operands (`_value`)."""
+    def ran(*xs):
+        operands, along = xs[:3], xs[3:]
+
+        def partial(*ys):
+            placed = list(operands)
+            for index, y in zip(at, ys, strict=True):
+                placed[index] = y
+            return form(*placed)[:2]
+        return jax.jvp(partial, *(tuple(each[index] for index in at) for each in (operands, along)))[1]
+    return ran
+
+
+@functools.cache
+def _second(form):
+    """The forward derivative along the totals of the gradient of `form`'s output sum as to its totals, one
+    function a form (`_value`)."""
+    def ran(outputs, totals, anchors, _, along_totals, __):
+        def gradient(totals):
+            return jax.grad(lambda totals: jnp.sum(form(outputs, totals, anchors)[0]))(totals)
+        return jax.jvp(gradient, (totals,), (along_totals,))
+    return ran
+
+
+@functools.cache
+def _batched_form(made):
+    """`made(0)` mapped over a batch (`jax.vmap`), one function a form (`_value`)."""
+    return jax.vmap(made(0))
+
+
 @pytest.mark.parametrize("draw", [_batch, lambda seed: _zero_massed(_batch(seed))],
                          ids=["drawn", "a zero mass"])
 @pytest.mark.parametrize("way", WAYS)
@@ -465,35 +510,12 @@ def test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_deriva
     term would be a zero mass's factor past the format, row 7124). Its landed anchor, an exact contract, is
     theirs bit for bit."""
     drawn = _with_directions(draw)
-
-    def value(form):
-        return lambda outputs, totals, anchors, *_: form(outputs, totals, anchors)[:2]
-
-    def moved(form, at):
-        def ran(*xs):
-            operands, along = xs[:3], xs[3:]
-
-            def partial(*ys):
-                placed = list(operands)
-                for index, y in zip(at, ys, strict=True):
-                    placed[index] = y
-                return form(*placed)[:2]
-            return jax.jvp(partial, *(tuple(each[index] for index in at) for each in (operands, along)))[1]
-        return ran
-
-    def second(form):
-        def ran(outputs, totals, anchors, _, along_totals, __):
-            def gradient(totals):
-                return jax.grad(lambda totals: jnp.sum(form(outputs, totals, anchors)[0]))(totals)
-            return jax.jvp(gradient, (totals,), (along_totals,))
-        return ran
-
     label = "a merged state against its output and its total"
-    _on_par(value(_state(1)), value(_apart(1)), way, drawn, label)
+    _on_par(_value(_state(1)), _value(_apart(1)), way, drawn, label)
     for at in ((0, 1, 2), (0,), (1,), (2,)):
-        _on_par(moved(_state(1), at), moved(_apart(1), at), way, drawn, f"{label}, along {at}")
-    _on_par(second(_state(1)), second(_apart(1)), way, drawn, f"{label}, the gradient's derivative")
-    _on_par(value(jax.vmap(_state(0))), value(jax.vmap(_apart(0))), way, drawn, f"{label}, batched")
+        _on_par(_moved(_state(1), at), _moved(_apart(1), at), way, drawn, f"{label}, along {at}")
+    _on_par(_second(_state(1)), _second(_apart(1)), way, drawn, f"{label}, the gradient's derivative")
+    _on_par(_value(_batched_form(_state)), _value(_batched_form(_apart)), way, drawn, f"{label}, batched")
     operands = draw(0)
     np.testing.assert_array_equal(np.asarray(_ways(_state(1))[way](*operands)[2]),
                                   np.asarray(_ways(_apart(1))[way](*operands)[2]))
