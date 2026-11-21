@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import functools
 import importlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
+    from jax.extend.core import Jaxpr
+
     from dew.algebra import cost, derive, error, forms, program, rules, scan, terms
     from dew.algebra.derive import Reduction
     from dew.algebra.forms import Derived, Refused
@@ -32,8 +34,8 @@ if TYPE_CHECKING:
     from dew.algebra.scan import Scan
 
     SATURATION: Saturation
-    rewritten: Callable[..., Callable]
-    rewritten_program: Callable[..., Any]
+    rewritten: functools.partial[Callable]
+    rewritten_program: functools.partial[Jaxpr]
 
 _SUBMODULES = frozenset({"cost", "derive", "error", "forms", "program", "rules", "scan", "terms"})
 """The submodules the package names (`__all__`), each imported where it is first read."""
@@ -47,8 +49,8 @@ class _Limited(NamedTuple):
     """The engine's limits (§6.6) and the rewrite at them (`_limited`)."""
 
     SATURATION: Saturation
-    rewritten: Callable[..., Callable]
-    rewritten_program: Callable[..., Any]
+    rewritten: functools.partial[Callable]
+    rewritten_program: functools.partial[Jaxpr]
 
 
 @functools.cache
@@ -64,7 +66,7 @@ def _limited() -> _Limited:
                     functools.partial(program.rewritten_program, saturation=saturation))
 
 
-def __getattr__(name: str) -> ModuleType | type | Callable[..., Any] | Saturation:
+def __getattr__(name: str) -> ModuleType | type | Saturation | functools.partial | Callable[..., Iterator]:
     """`name` of the package, loaded where it is first read and held from then on, so each read after the
     first is the same object (the module's own attribute)."""
     if name in _SUBMODULES:
