@@ -384,8 +384,8 @@ def described(root: str, event: str | None = None, args: tuple = (), starting=No
             process = starting.f_locals.get("self")
             method = getattr(type(process), "_start_method", None)
             if method is None and (multiprocessing := sys.modules.get("multiprocessing")) is not None:
-                method = (multiprocessing.get_start_method(allow_none=True)
-                          or multiprocessing.get_all_start_methods()[0])
+                # The context set, else "default": resolving one would import and probe in the callback.
+                method = multiprocessing.get_start_method(allow_none=True) or "default"
             what = f"{type(process).__name__} ({method} start)"
         else:
             names = programs(event, args) if event else []
@@ -405,6 +405,11 @@ def described(root: str, event: str | None = None, args: tuple = (), starting=No
         said = f"{what} from {caller}"
     except Exception as error:  # noqa: BLE001 - evidence only: the start is counted whatever this says
         said = f"a start not described ({type(error).__name__})"
+    return one_line(said)
+
+
+def one_line(said: str) -> str:
+    """A reason as a log line holds it: one line, any text escaped, at most 240 characters."""
     return " ".join(said.encode("utf-8", "backslashreplace").decode().split())[:240]
 
 
@@ -641,7 +646,7 @@ def follow() -> None:
     atexit.register(closing)
     if holder is not None:
         write("unfollowed", 1)
-        write("why", f"its recorder's monitoring tool {FOLLOWER_TOOL} held by {holder}")
+        write("why", one_line(f"its recorder's monitoring tool {FOLLOWER_TOOL} held by {holder}"))
         return
     sys.meta_path.insert(0, imports(lambda item: write("file", item)))
     sys.meta_path.append(missed(lambda item: write("file", item), root))

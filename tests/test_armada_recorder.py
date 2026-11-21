@@ -473,3 +473,20 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
         ["0 child logs for at least 1 starts and launches"]]
     # Evidence and no input: led by a NUL, which no path a run reads can hold.
     assert followed.WHY.startswith("\x00") and followed.WHY in followed.EVIDENCE
+
+
+def test_a_file_whose_followed_child_opened_a_checkout_file_to_write_says_so(tmp_path):
+    """A followed child, closed and counted, that opened a checkout file to read and write leaves its file no
+    key, and its record says which file (review): the reason and the key read the same inputs."""
+    followed = load("followed", "tools/armada")
+    log = tmp_path / "lifetime.log"
+    log.write_text("tests/a.py\tvisit\ntests/a.py\tstart:followed\ntests/a.py\ttests/a.py\n\tclosed\n")
+    children = tmp_path / "lifetime.log.children"
+    children.mkdir()
+    (children / "1.log").write_text(
+        "owner\ttests/a.py\nbegan\t0\nfile\tsrc/b.py\nfile\treadwrite:tests/data.bin\nended\t1\nclosed\t1\n")
+    record = followed.recorded(log)["tests/a.py"]
+    assert record["depends"] is None and record["why"] == ["opened tests/data.bin to write"]
+    (children / "1.log").write_text("owner\ttests/a.py\nbegan\t0\nfile\tsrc/b.py\nended\t1\nclosed\t1\n")
+    record = followed.recorded(log)["tests/a.py"]
+    assert record["depends"] == ["src/b.py", "tests/a.py"] and record["why"] is None

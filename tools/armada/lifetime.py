@@ -110,7 +110,7 @@ def started(code, offset):
     backend; a multiprocessing child's start, whose child no event follows."""
     if code is CHILD_START:
         write(owner(), f"{STARTED}unfollowed")
-        write(owner(), f"{WHY}{followed.described(root, starting=sys._getframe(1))}")
+        noted(sys._getframe(1))
         return None
     if code.co_name == followed.OPENED[0] and code.co_filename.endswith(followed.OPENED[1]):
         # Registered after jax's own clean-up, so it reads the pool before the backend closes.
@@ -154,7 +154,16 @@ def audited(event, args):
     elif event in followed.SPAWNS and (kind := followed.start(event, args, children)) is not None:
         write(owner(), f"{STARTED}{kind}")
         if kind == "unfollowed":
-            write(owner(), f"{WHY}{followed.described(root, event, args)}")
+            noted(None, event, args)
+
+
+def noted(starting, event: str | None = None, args: tuple = ()) -> None:
+    """Why the start just counted unfollowed is (`followed.described`), its owner's evidence: nothing it does,
+    a frame read or a line written, fails the start, which its marker counted already."""
+    try:
+        write(owner(), f"{WHY}{followed.described(root, event, args, starting)}")
+    except Exception:  # noqa: BLE001, S110 - evidence only
+        pass
 
 
 def peaked() -> None:
