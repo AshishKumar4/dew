@@ -538,7 +538,7 @@ def _gradient(trainer, state) -> dict[str, NDArray]:
         for path, leaf in jax.tree_util.tree_flatten_with_path(stored.opt_state[0]["gradient"])[0]}
 
 
-def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = False,
+def compiled_step(case, fields: Layout, batch, *, one_device: bool = False,
                   devices: int | None = None):
     """The trainer's step and its inputs, reusable across exact parameter orders."""
     from dew.data.dataset import DataPartition
@@ -552,7 +552,7 @@ def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = Fal
     step = trainer.compile(state, data)
     compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
-                "replicated": replicated_share(case, trainer.objective, fields.get("stage", 1))}
+                "replicated": replicated_share(case, trainer.objective, sizes(fields).get("stage", 1))}
     return state, data, step, compiled, trainer
 
 
@@ -572,7 +572,7 @@ def replicated_share(case, objective, stages: int) -> float:
     return model.module.replicated_flops(stages, lengths) / model.module.model_flops(lengths)
 
 
-def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False,
+def trained(case, fields: Layout, batch, *, steps: int, one_device: bool = False,
             devices: int | None = None) -> tuple[list[float], dict[str, NDArray], dict[str, Any]]:
     """The losses of `steps` steps on the layout `fields` names (over the
     first `devices` devices, every device by default), step one's gradient

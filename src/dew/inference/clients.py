@@ -474,6 +474,9 @@ EngineProvider = Literal["sglang", "vllm"]
 """Provider names for SGLang and vLLM, which expose engine-specific token rollout controls."""
 
 ENGINE_PROVIDERS: tuple[EngineProvider, ...] = get_args(EngineProvider)
+_ENGINE_ONLY = f"provider={' or '.join(repr(provider) for provider in ENGINE_PROVIDERS)}"
+"""What a control an OpenAI server lacks requires: an engine's provider (`ENGINE_PROVIDERS`), each named once
+there (row 8647)."""
 """Each engine provider (`EngineProvider`), in its declared order."""
 
 
@@ -495,15 +498,15 @@ def _engine_stops(sampling: Sampling, provider: EngineProvider) -> Mapping[str, 
 
 @dataclass(frozen=True)
 class OpenAICompletion:
-    """Calls one model through an OpenAI client, including one pointed at a vLLM or SGLang `base_url`.
+    """Calls one model through an OpenAI client, including one pointed at an engine's `base_url`.
 
-    `provider` (`openai`, `vllm` or `sglang`) names the engine behind the
-    client. The SDK's own request options pass through to the completions
-    and chat resources. Engine-only controls that vLLM and SGLang both
-    accept, such as `top_k`, `min_p` and `stop_token_ids`, go in
+    `provider` (`openai`, or an engine of `ENGINE_PROVIDERS`) names the engine
+    behind the client. The SDK's own request options pass through to the
+    completions and chat resources. Engine-only controls that every engine
+    accepts, such as `top_k`, `min_p` and `stop_token_ids`, go in
     `extra_body`. A `Sampling` passed as `sampling=` becomes request fields,
-    and its top-k, min-p, repetition-penalty and EOS controls need
-    `provider="vllm"` or `"sglang"`. SDK responses and streaming chunks keep
+    and its top-k, min-p, repetition-penalty and EOS controls need an
+    engine's provider (`_ENGINE_ONLY`). SDK responses and streaming chunks keep
     the backend's logprobs, token ids and extensions, tool calls and
     structured output fields unchanged. Completion prompts are text or rows
     of token ids, and a row of ids reaches the engine as ids, without being
@@ -537,7 +540,7 @@ class OpenAICompletion:
             or sampling.repetition_penalty != 1.0
         ):
             raise ValueError("top-k, min-p, repetition-penalty and EOS-token controls require "
-                             "provider='vllm' or 'sglang'")
+                             f"{_ENGINE_ONLY}")
         # Presence and frequency penalties are OpenAI's own, which Dew's follow.
         native: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
                                      "frequency_penalty": sampling.frequency_penalty,
@@ -550,8 +553,7 @@ class OpenAICompletion:
         extra = {} if fields.get("extra_body") is None else dict(section(fields["extra_body"], "extra_body"))
         if self.provider == "openai" and controls.keys() & extra.keys():
             raise ValueError(
-                "top-k, min-p, repetition and EOS-token controls in extra_body require "
-                "provider='vllm' or 'sglang'"
+                f"top-k, min-p, repetition and EOS-token controls in extra_body require {_ENGINE_ONLY}"
             )
         # The SDK writes extra_body over the named parameters, so the policy
         # is checked against both namespaces of the final request body.

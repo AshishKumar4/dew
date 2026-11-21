@@ -939,14 +939,15 @@ def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoint
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     looping = ("--loop-steps", "2", "--loop-layers", "0", "1", "--loop-messages")
-    shaped = ("--trainer.steps", "2", "--max-new-tokens", "0", *looping, "--loop-message-block-size", "1",
-              "--loop-message-rank", "2", "--no-loop-message-additive")
+    shaped = ("--max-new-tokens", "0", *looping, "--loop-message-block-size", "1", "--loop-message-rank", "2",
+              "--no-loop-message-additive")
     config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), *shaped),
                          default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
     objective = config.prepare().train("messaged")
     assert objective.model.loop.messages == CrossPass(block_size=1, rank=2, additive=False)
     assert objective.fresh_modules() and all("cross_pass_" in path for path in objective.fresh_modules())
-    trained = pretrained_config(tokens, checkpoint, *shaped, "--trainer.name", "messaged").run()
+    trained = pretrained_config(tokens, checkpoint, "--trainer.steps", "2", *shaped,
+                                "--trainer.name", "messaged").run()
     named = {jax.tree_util.keystr(path): leaf
              for path, leaf in jax.tree_util.tree_leaves_with_path(trained.variables["params"])}
     gains = [leaf for name, leaf in named.items() if "cross_pass_" in name and name.endswith("['gain']")]
@@ -961,7 +962,15 @@ def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoint
     assert resumed.latest == 3
     again = {jax.tree_util.keystr(path): leaf
              for path, leaf in jax.tree_util.tree_leaves_with_path(resumed.variables(step=3)["params"])}
-    assert again.keys() == named.keys()
+    # It trains on from what it saved, its merges not drawn again: its third step is a run's that never
+    # stopped.
+    straight = pretrained_config(tokens, checkpoint, "--trainer.steps", "3", *shaped,
+                                 "--trainer.name", "straight").run()
+    unbroken = {jax.tree_util.keystr(path): leaf
+                for path, leaf in jax.tree_util.tree_leaves_with_path(straight.variables["params"])}
+    assert again.keys() == unbroken.keys() == named.keys()
+    for name, leaf in unbroken.items():
+        np.testing.assert_array_equal(np.asarray(again[name]), np.asarray(leaf), err_msg=name)
 
     held = CrossPass(block_size=1, rank=2, normalize_values=False, scale_by_input_rms=False)
     loaded = Pretrained.load(checkpoint, dtype="float32")

@@ -738,11 +738,14 @@ def test_decoding_a_loop_that_exits_through_each_passs_coda_matches_its_prefill(
     coda's two earlier passes over its one."""
     looped = _exiting()
     draw = _with_gate(model_draw(looped, (2, 12), looped.vocab_size), looped.emb_features, 0xE82)
-    assert_as_exact(lambda params, ids: decoded(looped, params, ids)[0], passes(looped), draw,
+    # A prompt of eight, then four tokens a step: each step's prefix a program of its own (`passes`), so
+    # four steps compile four where eight compiled eight (row 10827).
+    prompt = 8
+    assert_as_exact(lambda params, ids: decoded(looped, params, ids, prompt)[0], passes(looped, prompt), draw,
                     "an exiting loop's decode", seeds=EXITING_SEEDS["decode"],
                     truth_fn=whole_pass(looped.clone(dtype=jnp.float64)))
     variables, ids = draw(0)
-    _, cache = decoded(looped, variables, ids)
+    _, cache = decoded(looped, variables, ids, prompt)
     assert sorted(cache) == sorted(f"layers_{index}" for index in range(4 + 2 * 2 + 2 * 1))
 
 

@@ -35,7 +35,7 @@ def run_from(name: str, directory: str) -> Iterator[ModuleType]:
     is the script's while held alone: a cached namesake is set aside and put back after, and the sibling
     leaves the cache, so neither import reads the other's module (rows 7329 to 7333)."""
     path = REPO_ROOT / directory
-    shared = {script.stem for script in path.glob("*.py")} & _named_elsewhere(path)
+    shared = {script.stem for script in path.glob("*.py") if _named_elsewhere(script.stem, path)}
     aside = {module: sys.modules.pop(module) for module in shared if module in sys.modules}
     sys.path.insert(0, str(path))
     try:
@@ -47,15 +47,16 @@ def run_from(name: str, directory: str) -> Iterator[ModuleType]:
         sys.modules.update(aside)
 
 
-def _named_elsewhere(directory: Path) -> set[str]:
-    """The names of the repository's modules outside `directory` that an import reads: those cached, and
-    those in sys.path's other directories of the repository."""
+def _named_elsewhere(name: str, directory: Path) -> bool:
+    """Whether an import of `name` reads one of the repository's modules outside `directory`: one cached
+    under that name, or one in another of sys.path's directories of the repository."""
     def outside(location: Path) -> bool:
         return location.is_relative_to(REPO_ROOT) and not location.is_relative_to(directory)
-    cached = {name for name, module in list(sys.modules.items())
-              if getattr(module, "__file__", None) and outside(Path(module.__file__).resolve().parent)}
-    roots = {Path(entry).resolve() for entry in sys.path if entry}
-    return cached | {script.stem for root in roots if outside(root) for script in root.glob("*.py")}
+    cached = getattr(sys.modules.get(name), "__file__", None)
+    if cached is not None and outside(Path(cached).resolve().parent):
+        return True
+    return any(outside(root) and (root / f"{name}.py").is_file()
+               for root in {Path(entry).resolve() for entry in sys.path if entry})
 
 
 def git(root: Path, *arguments: str) -> str:
