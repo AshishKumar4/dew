@@ -60,9 +60,11 @@ compared with itself does not resolve within 512 seeds."""
 RUN_CONDITIONING = 8
 """The weighed check's declared seeds for the same site (`seeds_for(..., conditioning=True)` on armada):
 adamw's first step moves a weight by its rate times g / (|g| + eps), so at a gradient a few eps across the
-update turns on the gradient's last bits, and where the unweighted check stays undecided each element is
-weighed by the whole step's own rounding there (row 8752: a norm scale's element at seed 170, whose two
-float32 gradients were 1.98e-8 and 1.30e-8 from float64, the update apart on CUDA)."""
+update turns on the gradient's last bits; where the unweighted check stays undecided, or one element rules
+a worst row, each element is weighed by the whole step's own rounding there (row 8752: a norm scale's
+element at seed 170, whose two float32 gradients were 1.98e-8 and 1.30e-8 from float64, ruled its row's
+worst on CUDA, the reference's own arithmetic against itself deciding the same rule red in 3 of 8 runs,
+row 10145)."""
 
 
 def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
