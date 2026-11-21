@@ -1548,9 +1548,9 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     once a spilling launch steps down as a run's compile steps it (`stepped_down`,
     `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's shared
     memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
-    rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds for its
-    own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the newer targets are
-    the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
+    rule's 16-bit call and Kimi's, the production cells, derive tiles on every family. A GPU host's ptxas
+    builds for its own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the
+    newer targets are the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
     if jax.default_backend() == 'gpu':
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
@@ -1562,7 +1562,8 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     # apart fails launch by launch.
     failed = resource_failures(cases, found, plans, apart)
     failed += [f"{case}: no tiles derived" for case in refused
-               if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
+               if case.startswith(("qwen3.5-27b-gdn bfloat16", "kimi-linear-kda bfloat16"))
+               and "fast backward" not in case]
     if target == 'sm100':
         failed += [f"{case}: no tiles derived" for case in refused
                    if case.startswith("a write gate bfloat16")]

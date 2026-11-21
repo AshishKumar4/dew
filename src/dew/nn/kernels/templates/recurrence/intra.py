@@ -419,9 +419,11 @@ def _prefix_halves(g, taken, call: Call):
 
 
 def _prefix_keys(width: int) -> int:
-    """`_prefix_halves`' key block: the warpgroup's threads' worth where the width takes it, a column a
-    thread, else the width's largest block within it."""
-    return math.gcd(width, scan.THREADS)
+    """`_prefix_halves`' key block: half the warpgroup's threads' worth where the width takes it, a column a
+    thread (the rest idle in the running sum), else the width's largest block within it: a `[C, keys]` fp32
+    tile 32 registers a thread, its decays and two terms held at once; at the threads' whole width the model
+    held 256 (four 64-register tiles) and the call derived no tiles."""
+    return math.gcd(width, scan.THREADS // 2)
 
 
 def _running_prefix(call: Call, rows, decays: jax.Array, keys: int) -> tuple:
