@@ -813,16 +813,15 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 
 def _powered_in_kernel(family: mosaic.Family, dtype, hooks: Hooks, *, parts: int = 1) -> bool:
     """Whether a launch's consumers take its query's power of two in their stage (`_query_of`, its form's
-    `prescale`): under a query prologue, or for a single-part 16-bit query on an NVIDIA GPU family that
-    supports in-place SMEM scaling (`across.scale_smem`, using `query_swizzle` or `swizzling.swizzle_for`,
-    rows 5272, 5274: avoids a separate XLA `loop_multiply_fusion` pass over Q before the launch or before
-    an unwalked natural rewalk; not fp32 multipart, not `places_on_role`, not TPU `mxu`)."""
+    `prescale`): under a query prologue, or for a single-part 16-bit query on an NVIDIA GPU family whose
+    query stage carries an explicit swizzle (`query_swizzle`, `across.scale_smem`, row 5274, ~1.5 us at B1;
+    not fp32 multipart, not inferred-layout WGMMA/tcgen05.chunks, not `places_on_role`, not TPU `mxu`)."""
     if parts != 1:
         return False
     if hooks.query_mod is not None:
         return True
-    return jnp.dtype(dtype).itemsize == 2 and family.fixes_up and not family.places_on_role
-
+    return (jnp.dtype(dtype).itemsize == 2 and family.fixes_up
+            and not family.places_on_role and query_swizzle(family) is not None)
 
 def folded_form(form: str, keys: int, *, ids: bool, dtype, width: int, scale: float | None, natural: bool,
                 score_mod, subtracted: bool, **fields) -> tuple[algebra.Forward, float]:
@@ -1212,7 +1211,8 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
         if hooks.query_mod is not None:
             _prologued(family, hooks.query_mod, hooks, hooked.query, place, first, q_smem, spec.prescale)
         elif spec.prescale != 1.0 and _powered_in_kernel(family, q_smem.dtype, hooks, parts=program.parts):
-            swizzle = query_swizzle(family) or swizzling.swizzle_for(q_smem.dtype, q_smem.shape[-1])
+            swizzle = query_swizzle(family)
+            assert swizzle is not None
             across.scale_smem(q_smem, spec.prescale, swizzle=swizzle, interpret=interpret)
             family.published()
         return family.held(q_smem)
