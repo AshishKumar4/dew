@@ -1925,8 +1925,8 @@ class TokenTargeted(Targeted):
 def test_a_token_budget_reached_inside_a_split_step_ends_the_run_at_that_commit():
     """A step read in two microbatches whose first step's first part is rejected: the second step's first part
     commits the window its second part opened, reaching a budget of one token, and its second part opens the
-    next. The run ends at that commit: the state it returns, which its last checkpoint saves, holds no
-    window past it (training.md §4, row 6143: the later partial window was kept)."""
+    next. The run ends at that commit: the state it returns holds no window past it (training.md §4,
+    row 6143: the later partial window was kept)."""
     from dew.data.dataset import Loader
     from dew.state import occupied
 
