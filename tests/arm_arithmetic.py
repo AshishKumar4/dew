@@ -5,7 +5,7 @@ and its compiled program (`Truth`)."""
 
 import contextlib
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -134,9 +134,22 @@ def rounds_nothing(primitive) -> bool:
 FORMATTED = frozenset({jax.lax.bitcast_convert_type_p, jax.lax.nextafter_p, jax.lax.reduce_precision_p})
 """The operations whose meaning is a float format's own, whatever width a program computes in: a value's
 bits read as another type, its neighbour on its format's grid, its rounding to a format's digits. JAX states
-no such fact of a primitive, so they are named here, once, by their objects: the float64 replay runs them at
-the traced dtypes (tests/float64_replay.py), and a float64 truth may hold their narrow results
-(`reference_error._read_through_floats`)."""
+no such fact of a primitive, so they are named here, once, by their objects: the float64 replay and a
+rounding scale's walk run them at the traced dtypes (`as_traced`), and a float64 truth may hold their narrow
+results (`reference_error._read_through_floats`)."""
+
+
+def as_traced(equation, values: Sequence) -> list:
+    """`equation` bound on `values`, each floating one narrowed to the dtype its program traced it at, with
+    its own parameters: its results as that program computes them, which a float64 evaluation widens after.
+    The one rule a format's own operation (`FORMATTED`) and an operation over no floats run by in one: the
+    float64 replay's (`float64_replay.Replay`) and a rounding scale's walk (`rounding_bound.TapRule`; row
+    10888: its copy)."""
+    narrowed = [jnp.asarray(value).astype(variable.aval.dtype)
+                if hasattr(variable.aval, "dtype") and jnp.issubdtype(variable.aval.dtype, jnp.floating)
+                else value for value, variable in zip(values, equation.invars, strict=True)]
+    outputs = equation.primitive.bind(*narrowed, **equation.primitive.get_bind_params(equation.params))
+    return list(outputs) if equation.primitive.multiple_results else [outputs]
 
 
 def stored_as(value, dtype):

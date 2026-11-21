@@ -597,6 +597,27 @@ def test_a_region_whose_call_makes_other_types_is_reported_refused():
     assert all(route.site.split(":")[0] != fusion.__name__ for route in refused)
 
 
+def test_an_unwritten_regions_route_to_xla_is_reported_as_it_ran():
+    """A region its compile point does not write (its call making other types than its own) reports every
+    route its call took: one to a kernel of Dew's as refused (`fusion.UNWRITTEN`), and one its call took to
+    XLA already as it ran, which reaches no other report, where it was dropped (row 10879)."""
+    from dew.algebra import fusion, recognize
+
+    closed = jax.make_jaxpr(_norm_of)(jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                                      jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    with generation.assumed("sm90"):
+        (region,) = recognize.recognized(closed, fusion.Index(closed), recognize.NORMS)
+
+        def on_xla(*values):
+            with generation.chosen(rms_norm="xla"):
+                return jax.tree.map(lambda value: value.astype(jnp.float32), region.call(*values))
+
+        widened = region._replace(call=on_xla, key=(region.key, "on xla, widened"))
+        with generation.routes() as found:
+            fusion._spliced(closed.jaxpr, [widened])
+    assert any(route.choice == "rms_norm" and route.kernel == "xla" for route in found)
+
+
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
     """A start-like program (row 6783): a region that makes a parameter and computes a grouped product from
     it, as a flax init's block makes its parameters inside its forward (here a checkpointed one), the
