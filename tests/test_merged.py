@@ -386,11 +386,11 @@ def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
     trimmed = merged._trimmed(padded, stacked, queries=queries, width=width)
     ref = algebra.merged_state(spec, *trimmed, initial)
     for a, b in zip(got, ref[:3], strict=True):
-        np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-5, atol=1e-5)
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
     vmapped = jax.vmap(run)(padded[None], stacked[None], init_m[None], init_t[None], init_acc[None])
     for a, b in zip(vmapped, got, strict=True):
-        np.testing.assert_allclose(np.asarray(a[0]), np.asarray(b), rtol=1e-5, atol=1e-5)
+        np.testing.assert_array_equal(np.asarray(a[0]), np.asarray(b))
 
     with generation.assumed("sm90"):
         p_s = jax.ShapeDtypeStruct(padded.shape, padded.dtype)
