@@ -247,10 +247,14 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
 
 
 def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
-    """The digits `_nearest` walks: a kernel's every one, else the nonzero limbs' and a carry's room."""
+    """The digits `_nearest` walks: a kernel's every one, and every one where a limb is split across devices
+    (its type's sharding names a mesh axis: the extrema of independent sums' limbs would be a collective
+    across their shards, row 8841), else the nonzero limbs' and a carry's room."""
     from dew.nn.kernels.launches import interpreting
 
-    if interpreting() is not None:
+    split = any(entry is not None for product, _, _ in parts for limb in product.limbs
+                for entry in jax.typeof(limb).sharding.spec)
+    if interpreting() is not None or split:
         return 0, levels
     ints = jnp.dtype(f"int{limits.bits}")
     width = 2 * split_bits(limits.dtype)[2]
