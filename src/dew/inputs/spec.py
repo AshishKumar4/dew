@@ -261,8 +261,11 @@ class InputSpec:
             if not condition.encoder.reads_captions:
                 continue
             held = batch[condition.field]
-            widths = ({name: tuple(np.shape(value))[1:] for name, value in held.items()}
-                      if isinstance(held, Mapping) else None)
+            if not isinstance(held, Mapping):
+                # Token ids laid out by the run's own packer (a decision's context, its rows' contexts end to
+                # end), not captions an encoder tokenized: no tokenizer's width holds them.
+                continue
+            widths = {name: tuple(np.shape(value))[1:] for name, value in held.items()}
             declared = _token_widths(condition.encoder)
             if widths != declared:
                 raise ValueError(f"objective.inputs condition {keyword!r} reads {condition.field!r} as its "
