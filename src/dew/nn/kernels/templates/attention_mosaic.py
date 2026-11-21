@@ -117,9 +117,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     score_places,
     split_queries,
     stagings,
+    step_live_tiles,
     streams_operands,
-    tpu_backward_step_tiles,
-    tpu_forward_step_tiles,
     value_columns,
     varying_slopes,
     walked_extents,
@@ -1170,10 +1169,10 @@ class MosaicForward(_Mainloop[Tiles]):
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
         tpu_values = ({"keys": ((config.block_k, width), query.dtype),
                        "values": ((config.block_k, value_width), query.dtype)},
-                      (((config.block_q, value_width), jnp.float32),),
-                      tpu_forward_step_tiles(config.block_q, config.block_k,
-                                             natural_form=config.natural_form,
-                                             scaled=self.scales_in_kernel(ba)))
+                      (((config.block_q, value_width), jnp.float32),
+                       *step_live_tiles(config.block_q, config.block_k,
+                                        natural_form=config.natural_form,
+                                        scaled=self.scales_in_kernel(ba))))
         return launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
                             products=products, over_rings=True, values=tpu_values)
 
@@ -2120,9 +2119,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             reduces=reduces, values=(
                 {"queries": ((tiles.block_q, width), dtype), "keys": ((tiles.block_k, width), dtype),
                  "values": ((tiles.block_k, value_width), dtype)},
-                (((tiles.block_k, width), jnp.float32), ((tiles.block_k, value_width), jnp.float32),
-                 ((tiles.block_q, width), jnp.float32)),
-                tpu_backward_step_tiles(tiles.block_q, tiles.block_k))))
+                (((tiles.block_k, width), jnp.float32),
+                 ((tiles.block_k, value_width), jnp.float32),
+                 ((tiles.block_q, width), jnp.float32),
+                 *step_live_tiles(tiles.block_q, tiles.block_k, backward=True)))))
             for layout, tiles, allocations, reduces in launches]
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
