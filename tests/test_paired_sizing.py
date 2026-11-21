@@ -18,6 +18,17 @@ def heavy():
     return load("gate_null_runs").heavy_sums(rows=48, terms=128)[1]
 
 
+
+def test_the_row_controls_judge_rows_wider_than_two():
+    """The worst-row rule's null controls (tools/gate_null_runs.py's `row_controls`) judge rows of eight
+    values, their worst rows' shares held as check 1's draws hold them (`parity._Draws.shares`: seed, leaf,
+    kind, arm): each run's statistic, the least factor that would have failed it, finite and positive, where
+    the controls' shares of no kind axis raised past rows of two (row 10829)."""
+    from tool_support import load
+
+    verdicts, statistics = load("gate_null_runs").row_controls(width=8, rows=4, seeds=8, runs=2, chunk=0)
+    assert len(verdicts) == 2 and np.isfinite(statistics).all() and min(statistics) > 0
+
 def _summed(order):
     """The rows' float32 sums with their terms in `order`'s permutation, one rounding a term."""
     @as_given
