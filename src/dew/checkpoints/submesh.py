@@ -16,7 +16,7 @@ from __future__ import annotations
 import jax
 import orbax.checkpoint as ocp
 from orbax.checkpoint._src.futures import future
-from orbax.checkpoint._src.serialization import jax_array_handlers as handlers
+from orbax.checkpoint._src.serialization import jax_array_handlers as handlers, replica_slices
 
 from dew._coordination import from_every_process
 
@@ -60,6 +60,19 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
                     shardings=[values[index].sharding for index in parted],
                     infos=[infos[index] for index in parted], primary_host=self._primary_host),
                 name="serialize_submesh_shardings"))
+        absent = [index for index in parted if not values[index].addressable_shards]
+        if absent and self._primary_host is None:
+            # A local tier's process writes the metadata of each array it holds none of, and no shard, so its
+            # step's tree reads whole from its own directory, as Orbax reads a step's.
+            empty = [replica_slices.ReplicaSlices(
+                global_shape=values[index].shape, local_shape=values[index].sharding.shard_shape(
+                    values[index].shape), sharding=values[index].sharding, dtype=values[index].dtype,
+                is_on_host=True, replica_slices=[]) for index in absent]
+            futures.append(future.CommitFutureAwaitingContractedSignals(handlers._async_serialize_replica_slices(
+                empty, [infos[index] for index in absent], [args[index] for index in absent],
+                primary_host=None, metadata_key=self._metadata_key, array_metadata_store=None,
+                enable_replica_parallel_separate_folder=False, use_replica_parallel=False, ext_metadata={}),
+                name="serialize_submesh_metadata"))
         by_owner: dict[int, list[int]] = {}
         for index in parted:
             if values[index].addressable_shards:
