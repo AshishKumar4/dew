@@ -418,3 +418,37 @@ def test_a_cut_takes_the_longest_state_a_merge_lets_fit():
     tight = dataclasses.replace(empty, max_len=len(bare.tokens))
     [row] = tight.rows(laya, SPECIALS, "ta", {"team": TEAM})
     assert tight.fits(row) and row.state_kept >= 1
+
+
+class Merging(ByteTokenizer):
+    """The byte vocabulary, but for "xyz", which encoding takes as one token (id 2): a row encoded whole
+    can merge a state's last bytes with the text after it."""
+
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
+        ids, merged, at = super().encode(text, add_special_tokens=add_special_tokens), [], 0
+        while at < len(ids):
+            if ids[at:at + 3] == list(b"xyz"):
+                merged.append(2)
+                at += 3
+            else:
+                merged.append(ids[at])
+                at += 1
+        return merged
+
+
+def test_a_state_cut_in_a_row_encoded_whole_takes_a_longer_cut_whose_row_encodes_shorter():
+    """A question row encoded whole whose room holds the state "aaxy" whole only as its "xy" merges with
+    the "z" written after it: the cut its share counts ("a", the state's own tokens against the room)
+    grows past "aa" and "aax", whose rows overflow, to the whole state, whose row is the one the room
+    past all lays out (row 9060: the growth stopped at the first longer cut that overflowed)."""
+    _, _, _, *question = release().segments
+
+    def row(max_len: int):
+        layout = SegmentLayout.state_first_row(max_len=max_len, labels=release().labels, unit="whole",
+                                               segments=(Text("S:"), State(), Text("z\n"), *question))
+        [laid] = layout.rows(Merging(), SPECIALS, "aaxy", {"team": TEAM})
+        return laid
+
+    whole = row(1 << 16)
+    assert 2 in list(whole.tokens)
+    assert list(row(len(whole.tokens)).tokens) == list(whole.tokens)
