@@ -142,8 +142,9 @@ def sub_chunked(call: Call) -> Call:
     whole chunk's rows masked to its own, 2.3 times fla's inter-sub-chunk launch on a GH200 and 13 times
     Dew's port of it on a B200 (M-JS-144-gh200: 330 + 87 us against 142 with the solve; js106c: 712 + 664
     against 102)."""
-    family = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), algebra.SUB,
-                             scoped=True)[0]
+    # Off a GPU no bundle claims the target: the call's own, interpreted.
+    found = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), algebra.SUB, scoped=True)
+    family = found[0] if found else call.family
     if family.rows <= algebra.SUB:
         # Its warps along a sub-chunk's row of pairs' columns, its sums' layout `[SUB, C]`'s (`specialized`).
         family = family.specialized(algebra.SUB, call.chunk)
