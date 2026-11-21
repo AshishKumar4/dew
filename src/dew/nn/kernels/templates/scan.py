@@ -8,6 +8,7 @@ state `h_t = a_t h_{t+1} + b_t`. A chunked recurrence's backward walks its chunk
 scan's, mamba_ssm's selective_scan_bwd_kernel.cuh, a BlockScan a state forward and a reverse one back).
 Interpreted, the scan is XLA's (`lax.associative_scan`)."""
 
+import math
 from collections.abc import Callable
 
 import jax
@@ -20,6 +21,9 @@ from jax.experimental.mosaic.gpu import fragmented_array as fa, utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, vector
+
+from dew.nn.kernels.templates import emission
+from dew.nn.kernels.templates.cost import Work
 
 THREADS = 128
 """A warpgroup's threads, a block's positions spread over them."""
@@ -130,8 +134,11 @@ def compensated_columns(pairs) -> None:
     in one bank), and the warpgroup met once when done. The terms staged, and the threads met, before: a
     Pallas store a row at a time met the warpgroup at each, 44% of a running prefix's warp time an emulated
     GH200's (M-JS-145e). Additions alone, so no multiply contracts into them."""
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(
-        lambda ctx, ref: _compensated_columns(ref))(pairs)
+    elements = math.prod(pairs.shape[1:])
+    # Each element's two words read and written, and its compensated add's twelve additions.
+    body = emission.stating(lambda ref: Work(operations=12 * elements, shared_bytes=16 * elements))(
+        lambda ctx, ref: _compensated_columns(ref))
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(body)(pairs)
 
 
 def _compensated_columns(ref) -> None:
