@@ -352,7 +352,6 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                           smem=None if row_smem is None else row_smem.at[index])
         def producer():
             family.stream(streams, views, *streamed)
-
         scheduled_roles(family, consumers, consumer, producer, functools.partial(
             _queries_first_issued, streams, functools.partial(program.reach, pair_first, spans_of, row),
             first=streamed[0], resident=(q_smem, do_smem, q_loaded, do_loaded), share=share))
@@ -360,9 +359,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     scoped, rings, after = _dq_allocations(family, program.tiles, width, value_width, query.dtype,
                                            program.stages,
                                            params=param_types(map(Param, score_params, kinds)))
-
     products = placed_scratch(family, block_k, query.dtype, (), (share[1],))
-
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after),
                       **products)
