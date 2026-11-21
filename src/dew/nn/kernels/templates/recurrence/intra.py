@@ -375,20 +375,23 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
             def rows(name):
                 return intra_rows(call, name, operand, beta_ref.at[h, span])
 
-            def staged(value, s, r):
-                """The keys gated up to sub-chunk `s` in their tile, or row set `r`'s rows gated down."""
-                return operands.staged(family, value, raised[s - 1] if r is None else lefts[r])
-
             issuer = Issuer(call)
             summed = list(accumulators)
             scales = [shrinking if name == "scores" else 1.0 for name in products]
-            for j, formed in enumerate(algebra.key_block_pairs(
-                    [functools.partial(rows, name) for name in products], operand("keys"), whole, at_token,
-                    staged, chunk=chunk, scales=scales)):
+            gated, gated_up = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
+                                                      operand("keys"), whole, at_token, chunk=chunk,
+                                                      scales=scales)
+            held: list = []
+            for j in range(later):
+                first = (j + 1) * algebra.SUB
+                # A sub-chunk's keys staged and published once (`Family.staged_together`), the row sets' gated
+                # rows with the first's, its products issued then, running under the next sub-chunk's forming.
                 with family.staged_together():
-                    found = formed()
-                for r, pair in enumerate(found):
+                    keyed = operands.staged(family, gated_up(j + 1), raised[j]).T
+                    held = held or [operands.staged(family, value, lefts[r]) for r, value in enumerate(gated)]
+                for r, tile in enumerate(held):
                     at = _sum_index(call, r, j)
+                    pair = ("pairs", tile.rows(first, algebra.SUB), keyed)
                     summed[at] = issuer.summed([pair], into=summed[at])
             return carry, tuple(summed)
 

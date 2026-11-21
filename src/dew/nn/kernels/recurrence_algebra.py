@@ -410,8 +410,6 @@ class Tile(Protocol):
 
     def value(self) -> jax.Array: ...
 
-    def rows(self, start, count: int) -> "Tile": ...
-
 
 Load = Callable[..., jax.Array] | Callable[..., Tile]
 """A tile read where it is used: `load(i, c)` sub-chunk `i`'s column block `c`, or `load(c)` a chunk's; the
@@ -702,13 +700,15 @@ def gated_up(prefix: tuple, reference: tuple, index: jax.Array, place) -> jax.Ar
 
 
 def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, prefix: tuple,
-                    at: Callable[[int], tuple], staged: Callable[[jax.Array, int | None, int | None], Tile],
-                    *, chunk: int, scales: Sequence[float],
-                    sub: int = SUB) -> list[Callable[[], list[tuple]]]:
-    """A chunk's pairs under a decay a key dimension, one key block's, as the products whose sum they are, a
-    sub-chunk at a time: for each sub-chunk past the first a callable forming its products, one `(name, lhs,
-    rhs)` ('pairs') for each of `rows` (each forming its row when called: the queries, the write-gated keys;
-    fp32), summed into one accumulator a row set, its `[C, C]` pairs against the same `keys` (fp32), `sum_k
+                    at: Callable[[int], tuple], *, chunk: int, scales: Sequence[float],
+                    sub: int = SUB) -> tuple[list[jax.Array], Callable[[int], jax.Array]]:
+    """A chunk's pairs under a decay a key dimension, one key block's, as the operands of the products whose
+    sum they are: `(gated, raised)`, each of `rows`' gated rows `[C, BK]` (each forming its row when called:
+    the queries, the write-gated keys; fp32), and `raised(s)` sub-chunk `s`'s keys gated up `[C, BK]`; a
+    caller stages each row set's gated rows once and each sub-chunk's keys, and issues for each sub-chunk past
+    the first one product `(name, lhs, rhs)` ('pairs') a row set, its `sub` rows of the staged rows against
+    the staged keys read transposed, summed into one accumulator a row set and sub-chunk, its `[C, C]` pairs
+    against the same `keys` (fp32), `sum_k
     r_ik k_jk exp2(g_ik - g_jk)` for row `i` in sub-chunk `s` and key `j` in an earlier sub-chunk `t < s`,
     zero for `t >= s` (a sub-chunk's own pairs are `key_diagonal_bands`', each its own decay, as fla's
     token-parallel diagonal). `prefix` is the block's separated prefix (`separated`) and `at(token)` it at the
@@ -718,13 +718,11 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
     exponent at most zero (`decay`). For each sub-chunk `s` past the first, one product a row set: its rows of
     the row set gated down to `G_s` (`sub` of them, `[sub, C]` a row set and sub-chunk: fla_kda's
     inter-sub-chunk blocks, a sub-chunk's row of them a product, on an issuer whose products take `sub` rows,
-    mma.sync's) against every key before `s` gated up to `G_s` (`gated_up`), zero from `s` on, a whole chunk
-    of keys (read transposed): each row set's gated rows staged once (`staged(value, None, r)`, whichever
-    sub-chunk's products are formed first) and each sub-chunk's keys where `staged(value, s, None)` puts
-    them. A whole chunk of rows masked to a sub-chunk's took 3.7 times fla's inter-sub-chunk launch on an
-    A100's mma.sync (1508 us against chunk_kda_fwd_kernel_inter_solve_fused's 356, M-JS-144-a100). A row
-    set's products sum into one accumulator a sub-chunk, which a mainloop may hold across its key
-    blocks, read once; formed a sub-chunk at a time, a caller issues each sub-chunk's products once its
+    mma.sync's, a `Staged` tile's `rows`) against every key before `s` gated up to `G_s` (`gated_up`), zero
+    from `s` on, a whole chunk of keys (read transposed). A whole chunk of rows masked to a sub-chunk's took
+    3.7 times fla's inter-sub-chunk launch on an A100's mma.sync (1508 us against
+    chunk_kda_fwd_kernel_inter_solve_fused's 356, M-JS-144-a100). A row set's products sum into one
+    accumulator a sub-chunk, which a mainloop may hold across its key blocks, read once; formed a sub-chunk at a time, a caller issues each sub-chunk's products once its
     operands are staged, their MMAs running under the next sub-chunk's forming, where every operand staged
     before any product was issued, a B200's intra walk's compute warps waited on their products' commit at its
     end (11% of their stalls, an emulated B200 at b1a0fe4b98b). Factored instead at `t`'s last token, its
@@ -737,21 +735,11 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
     where `q . k` cancels, at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay
     (row 5194, M-JS-48w)."""
     index, _ = _grid(prefix[0].shape)
-    blocks = chunk // sub
     # Every row gated down to its own sub-chunk's first token.
     down = decay(prefix, _laid_references(lambda s: at(s * sub), index, chunk, sub))
     # Scaled once gated down, so a large row its decay attenuates stays finite.
     gated = [row() * down * scale for row, scale in zip(rows, scales, strict=True)]
-    whole: list[Tile] = []
-
-    def formed(s: int) -> list[tuple]:
-        raised = staged(keys * gated_up(prefix, at(s * sub), index, s * sub), s, None).T
-        # The gated rows staged with the first products formed, read a sub-chunk's rows at a time.
-        if not whole:
-            whole.extend(staged(value, None, r) for r, value in enumerate(gated))
-        return [("pairs", tile.rows(s * sub, sub), raised) for tile in whole]
-
-    return [functools.partial(formed, s) for s in range(1, blocks)]
+    return gated, lambda s: keys * gated_up(prefix, at(s * sub), index, s * sub)
 
 
 
