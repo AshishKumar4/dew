@@ -635,24 +635,22 @@ class Heads(NamedTuple):
     at: Mapping[int, int]
 
 
-def over_sequence(local, shards: int, tokens: tuple, whole: tuple, *, heads: Heads | None = None):
+def over_sequence(local, shards: int, tokens: tuple, whole: tuple, *, heads: Heads):
     """`local(*tokens, *whole)` on shards (`on_shards`) that split the rows and the sequence of each of
     `tokens` (`[B, S, ...]` or None) as the rule table places a `[batch, length, ...]` activation, `whole`
     on every shard, and each operand `heads` names by its heads (`sharding.sequence_heads`: over the axes
     the rows, the sequence and a pipeline stage leave the heads' rule, where the split divides their
-    groups), its output placed as the tokens are, its heads too: a recurrent mixer's conv and scan over its
-    shard's slice of whole training sequences (`sequence_conv`) and its share of the heads, its projections
-    and norms token by token outside with GSPMD."""
+    groups), its output `[B, S, H, ...]` placed as the tokens are, its heads too: a recurrent mixer's conv
+    and scan over its shard's slice of whole training sequences (`sequence_conv`) and its share of the heads,
+    its projections and norms token by token outside with GSPMD."""
     batch, length = tokens[0].shape[:2]
     if length % shards:
         raise LayoutRefused(f"the sequence of {length} tokens splits {shards} ways over the mesh's sequence "
                             f"axis, and it does not divide")
-    rows, sequence, split = (sequence_heads(batch, length, heads.number, heads.groups) if heads is not None
-                             else (*logical_spec(("activation_batch", "activation_length"), (batch, length)),
-                                   None))
+    rows, sequence, split = sequence_heads(batch, length, heads.number, heads.groups)
     operands = (*tokens, *whole)
     return on_shards(local, P(rows, sequence), operands, whole=range(len(tokens), len(operands)),
-                     heads={} if heads is None else heads.at, split=split, out_specs=P(rows, sequence, split))
+                     heads=heads.at, split=split, out_specs=P(rows, sequence, split))
 
 
 def sequence_entered(run, decay, starts):

@@ -426,7 +426,8 @@ class Mamba2(nn.Module):
                                                           else (None,) * 3), *heads)
             operands = (*jnp.split(mixed.astype(wide), edges, axis=-1), dt, tokens.segments, tokens.starts,
                         valid)
-            at = dict.fromkeys(range(4), 2) | dict.fromkeys(range(len(operands), len(operands) + 9), 0)
+            heads_at = range(len(operands), len(operands) + len(weights))
+            at = dict.fromkeys(range(4), 2) | dict.fromkeys(heads_at, 0)
             out = over_sequence(functools.partial(_sequence_mix, scan=scan, state_size=self.state_size,
                                                   dtype=compute), shards, operands, weights,
                                 heads=Heads(self.num_heads, self.n_groups, at))

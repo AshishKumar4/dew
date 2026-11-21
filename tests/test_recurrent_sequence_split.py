@@ -20,7 +20,7 @@ from sequence_split_support import (
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.linear import GatedDeltaNet, held_conv1d, over_sequence, sequence_conv, sequence_halo
+from dew.nn.linear import GatedDeltaNet, Heads, held_conv1d, over_sequence, sequence_conv, sequence_halo
 from dew.nn.mixers.lightning import LightningAttention
 from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2
@@ -330,8 +330,10 @@ def test_a_split_convs_bias_gradient_sums_its_shards_as_the_whole_conv_does(row)
         return jax.jit(run)
 
     def split_conv(taps, bias, mixed):
+        # Each channel its own, as Mamba-1's conv splits them (`Heads`).
         return over_sequence(lambda mixed, valid, segments, taps, bias: sequence_conv(
-            mixed, taps, bias, segments, valid), 4, (mixed, valid, segments), (taps, bias))
+            mixed, taps, bias, segments, valid), 4, (mixed, valid, segments), (taps, bias),
+                             heads=Heads(16, 16, {0: 2, 3: 0, 4: 0}))
 
     def whole_conv(taps, bias, mixed):
         return held_conv1d(mixed, taps, valid, bias=bias, segments=segments)[0]
@@ -348,7 +350,8 @@ def test_a_split_convs_bias_gradient_sums_its_shards_as_the_whole_conv_does(row)
         return jnp.broadcast_to(partial, (mixed.shape[0], 1, partial.shape[-1]))
 
     partials = jax.jit(lambda taps, bias, mixed, cotangent: over_sequence(
-        shard_partial, 4, (mixed, valid, segments, cotangent), (taps, bias)))
+        shard_partial, 4, (mixed, valid, segments, cotangent), (taps, bias),
+        heads=Heads(16, 16, {0: 2, 3: 2, 4: 0, 5: 0})))
 
     def draw(seed):
         generator = np.random.default_rng([0x2169, seed])
