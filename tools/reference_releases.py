@@ -9,6 +9,7 @@ family a later transformers added, a release's remote code, diffusers' own
 Transformers 4 pipelines.
 """
 
+import re
 import tomllib
 from collections.abc import Mapping
 from importlib.metadata import version
