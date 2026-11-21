@@ -54,7 +54,7 @@ from dew.nn.kernels import launches
 from dew.nn.precision import FP32_PRODUCTS, precision_names
 
 from . import tuning
-from .generation import INHERENT, gpu_target, triton_runs
+from .generation import INHERENT, GpuTarget, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
 from .templates.attention import Capped, kernel_dot, prescaled
@@ -93,8 +93,8 @@ def step_keys(dtype, width: int, keys: int | None = None) -> int:
         return most
     return next(step for step in range(most, BLOCK - 1, -BLOCK) if keys % step == 0)
 
-SPLITS = (1, 2, 4, 8, 16, 32)
-"""The slices a launch may cut each row's keys into (`Split`), each held to the float64 gate on the GPU."""
+MAX_SPLITS = 32
+"""The most slices a launch cuts a row's keys into (`Split`), held to the float64 gate on the GPU."""
 
 @dataclasses.dataclass(frozen=True)
 class Split:
@@ -298,42 +298,49 @@ def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, 
     return [sums, *[rows] * count], [summed, *[reduced] * count]
 
 
+def _resident(step_bytes: int, target: GpuTarget) -> int:
+    """Programs of `WARPS` warps staging two double-buffered key and value tiles (`4 * step_bytes`) a
+    multiprocessor of `target` holds at once (`GpuTarget.multiprocessor`, `GpuTarget.shared_limit`; row
+    1954): 7 on an H100, 5 on an A100 and 3 on a 99 KB sm86/sm89 block at `KEY_STEP_BYTES`."""
+    mp = target.multiprocessor
+    by_threads = min(mp.resident_threads // (WARPS * 32), mp.resident_blocks)
+    if not target.shared_limit or not step_bytes:
+        return max(1, by_threads)
+    return max(1, min(by_threads, target.shared_limit // (4 * step_bytes)))
+
+
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
     """The slices a launch of `programs` programs a slice over `steps` steps of the loop may take on a
     GPU of `processors` multiprocessors (`GpuTarget.multiprocessors`): one where the programs already
     fill most of them or none are known, as FlashAttention 2 rules (csrc/flash_attn/flash_api.cpp,
-    `num_splits_heuristic`), else any of `SPLITS` up to one a step."""
+    `num_splits_heuristic`), else the powers of two up to `min(steps, processors, MAX_SPLITS)` (row 1954)."""
     if not processors or programs >= 0.8 * processors:
         return {Split(1)}
-    return {Split(splits) for splits in SPLITS if splits <= min(steps, processors)}
+    limit = min(steps, processors, MAX_SPLITS)
+    return {Split(1 << shift) for shift in range(limit.bit_length())} if limit >= 1 else {Split(1)}
 
 
-RESIDENT = 6
-"""Programs a multiprocessor runs at once that a launch fills (`_heuristic`)."""
-
-
-def _variants(programs: int, steps: int, processors: int | None) -> tuple[Split, ...]:
+def _variants(programs: int, steps: int, step_bytes: int, target: GpuTarget) -> tuple[Split, ...]:
     """The rule's slices (`_heuristic`), then the counts of its space either side of them (`_space`): the
     configs an opt-in tuning run times beside it (`tuning.KernelOp.variants`)."""
-    chosen = _heuristic(programs, steps, processors)
-    counts = sorted(split.splits for split in _space(programs, steps, processors))
+    chosen = _heuristic(programs, steps, step_bytes, target)
+    counts = sorted(split.splits for split in _space(programs, steps, target.multiprocessors))
     at = counts.index(chosen.splits)
     return (chosen, *(Split(count) for count in counts[max(at - 1, 0):at + 2] if count != chosen.splits))
 
 
-def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
-    """The most slices a launch may take (`_space`) whose programs fill at most `RESIDENT` a
-    multiprocessor. A program of `WARPS` warps over `BLOCK` keys a step leaves a multiprocessor room
-    for several, which hide each other's reads. Over 60 shapes of Qwen3-0.6B's and Qwen3.5-0.8B's dense
-    and paged decode (1 to 32 rows, 8K to 128K keys) timed at every count of `SPLITS`, this rule's pick
-    ran within 1.010x of the fastest on an H100 (geometric mean; 1.22x at worst) and 1.037x on an A100
-    (1.83x), the same for any `RESIDENT` from 5 to 7; FlashAttention 2's rule (the fewest whose waves
-    run within 85% of the best count's) within 1.35x (2.44x) and 1.06x (1.83x). On the H100, Qwen3-0.6B
-    at 2 rows over 131072 keys took 0.220 ms at this rule's 32 slices against 0.527 at FA2's 8."""
+def _heuristic(programs: int, steps: int, step_bytes: int, target: GpuTarget) -> Split:
+    """The most slices a launch may take (`_space`) whose programs fill at most `_resident(step_bytes,
+    target)`
+    a multiprocessor (derived from `GpuTarget.multiprocessor` and `GpuTarget.shared_limit`, row 1954). Over
+    60 shapes of Qwen3-0.6B's and Qwen3.5-0.8B's dense and paged decode (1 to 32 rows, 8K to 128K keys), 5 to
+    7 resident programs a multiprocessor ran within 1.010x of the fastest on an H100 and 1.037x on an A100."""
+    processors = target.multiprocessors
     counts = sorted(split.splits for split in _space(programs, steps, processors))
     if processors is None:
         return Split(counts[0])
-    return Split(max((splits for splits in counts if programs * splits <= RESIDENT * processors),
+    resident = _resident(step_bytes, target)
+    return Split(max((splits for splits in counts if programs * splits <= resident * processors),
                      default=counts[0]))
 
 
@@ -397,15 +404,13 @@ class DecodeAttention(tuning.KernelOp):
         return _variants(*self._launch(ba))
 
     @staticmethod
-    def _launch(ba) -> tuple[int, int, int | None]:
-        """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop, and
-        the GPU's multiprocessors."""
-        query = ba.arguments['query']
-        return (_rows(query) * query.shape[2],
-                pl.cdiv(ba.arguments['key'].shape[1], step_keys(ba.arguments['value'].dtype,
-                                                                ba.arguments['key'].shape[-1],
-                                                                ba.arguments['key'].shape[1])),
-                gpu_target().multiprocessors)
+    def _launch(ba) -> tuple[int, int, int, GpuTarget]:
+        """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop, a step's
+        key-tile bytes, and the GPU target."""
+        query, key, value = ba.arguments['query'], ba.arguments['key'], ba.arguments['value']
+        step = step_keys(value.dtype, key.shape[-1], key.shape[1])
+        step_bytes = step * key.shape[-1] * jnp.dtype(value.dtype).itemsize
+        return _rows(query) * query.shape[2], pl.cdiv(key.shape[1], step), step_bytes, gpu_target()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -469,13 +474,14 @@ class PagedDecodeAttention(tuning.KernelOp):
         return _variants(*self._launch(ba))
 
     @staticmethod
-    def _launch(ba) -> tuple[int, int, int | None]:
+    def _launch(ba) -> tuple[int, int, int, GpuTarget]:
         """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop over
-        its table, `step_keys` a step, and the GPU's multiprocessors."""
+        its table, a step's key-tile bytes, and the GPU target."""
         query, pages = ba.arguments['query'], ba.arguments['value_pages']
-        steps = pl.cdiv(ba.arguments['table'].shape[1],
-                        max(step_keys(pages.dtype, query.shape[-1]) // pages.shape[2], 1))
-        return _rows(query) * query.shape[1], steps, gpu_target().multiprocessors
+        step = step_keys(pages.dtype, query.shape[-1])
+        steps = pl.cdiv(ba.arguments['table'].shape[1], max(step // pages.shape[2], 1))
+        step_bytes = step * query.shape[-1] * jnp.dtype(pages.dtype).itemsize
+        return _rows(query) * query.shape[1], steps, step_bytes, gpu_target()
 
 
 _DECODE = DecodeAttention()
