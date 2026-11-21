@@ -339,9 +339,9 @@ def test_a_recorded_test_that_grew_past_its_deadline_raises_its_record_and_the_n
 
 def test_a_cold_run_is_kept_as_its_tests_cold_times_and_every_cut_weighs_them(ci, tmp_path, monkeypatch):
     """A run whose test compiled a program the shared cache lacked (its row's `cold`) times that test cold:
-    the fold keeps a typical cold time beside the warm one in the one record (`session.entry`), a green
-    run moving it halfway to its own, a red run raising it, and no cold time moves a warm one under it; a
-    test first timed cold takes that as its warm
+    the fold keeps its newest green cold time beside the warm one in the one record (`session.entry`), a
+    red run raising it, and no cold time moves a warm one under it; a test first timed cold takes that as
+    its warm
     time too; a test the record drops loses both. Every cut and weight reads a test's cost, its cold time
     where one is recorded, so 14 cells recorded at 1 s warm and 60 s cold are no longer one group of 14 s
     (row 7939: such a group took 1,107 s cold)."""
@@ -361,8 +361,8 @@ def test_a_cold_run_is_kept_as_its_tests_cold_times_and_every_cut_weighs_them(ci
     assert ci.main() == 0
     folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
     a, b, c = (f"tests/test_cells.py::test_{name}" for name in "abc")
-    assert folded == {a: [1.0, 30.0], b: [2.0, 45.0], c: [20.0, 20.0]}
-    assert ci.durations_record() == {a: 30.0, b: 45.0, c: 20.0}
+    assert folded == {a: [1.0, 30.0], b: [2.0, 40.0], c: [20.0, 20.0]}
+    assert ci.durations_record() == {a: 30.0, b: 40.0, c: 20.0}
     # A red run past a cold time raises it; a green warm run moves only the warm time.
     rows = [{"name": "3.12:tests/test_cells.py", "exitCode": 1, "seconds": 60.0,
              "tests": {"tests/test_cells.py::test_a": 60.0}, "cold": ["tests/test_cells.py::test_a"]}]
@@ -380,24 +380,30 @@ def test_a_green_run_lowers_each_test_its_record_holds_well_past_what_it_took(ci
     well under it, test by test (fold.py's `entries`): past `session.KEPT` times what it took and by over an
     eighth of the target, though its file is no whole-file refresh's (one of its groups red) and though it
     compiles cold every run (a cold run bounds its warm time from above); a drift within either bound
-    lowers nothing, nor does a red run however fast (row 10787: test_compile_ahead's frontier test held
-    274.7 s against the 42 s each green run took). A green cold run moves a cold time halfway to its own."""
+    lowers nothing, nor does a red run however fast, a reused row (the times an earlier fold took) or one
+    armada ran alone after it failed beside other tasks (row 10787: test_compile_ahead's frontier test held
+    274.7 s against the 42 s each green run took). A cold time is the newest green cold run's, and the same
+    verdict folded again moves nothing."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
     name = "tests/test_slow.py"
-    (tmp_path / name).write_text("".join(f"def test_{x}(): pass\n" for x in "abcdef"))
-    a, b, c, d, e, f = (f"{name}::test_{x}" for x in "abcdef")
-    record = {a: 274.7, b: [274.7, 36.6], c: 50.0, d: 60.0, e: 200.0, f: [10.0, 33.8]}
+    (tmp_path / name).write_text("".join(f"def test_{x}(): pass\n" for x in "abcdefgh"))
+    a, b, c, d, e, f, g, h = (f"{name}::test_{x}" for x in "abcdefgh")
+    record = {a: 274.7, b: [274.7, 36.6], c: 50.0, d: 130.0, e: 200.0, f: [10.0, 33.8], g: 200.0, h: 200.0}
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
-    rows = [{"name": f"3.12:{name}#1/2", "exitCode": 0, "seconds": 300.0,
-             "tests": {a: 42.0, b: 42.0, c: 30.0, d: 50.0, f: 156.0}, "cold": [b, f]},
-            # The other group red: no whole-file refresh, and its fast test lowers nothing.
-            {"name": f"3.12:{name}#2/2", "exitCode": 1, "seconds": 20.0, "tests": {e: 20.0}}]
+    rows = [{"name": f"3.12:{name}#1/4", "exitCode": 0, "seconds": 300.0,
+             "tests": {a: 42.0, b: 42.0, c: 30.0, d: 90.0, f: 156.0}, "cold": [b, f]},
+            # Another group red: no whole-file refresh, and its fast test lowers nothing.
+            {"name": f"3.12:{name}#2/4", "exitCode": 1, "seconds": 20.0, "tests": {e: 20.0}},
+            {"name": f"3.12:{name}#3/4", "exitCode": 0, "seconds": 20.0, "tests": {g: 20.0}, "cached": "k"},
+            {"name": f"3.12:{name}#4/4", "exitCode": 0, "seconds": 20.0, "tests": {h: 20.0},
+             "aloneAfter": "timed out beside other tasks"}]
     verdict = tmp_path / "main.json"
     verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
     monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
-    assert ci.main() == 0
-    assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == {
-        a: 42.0, b: [42.0, 39.3], c: 50.0, d: 60.0, e: 200.0, f: [10.0, 94.9]}
+    lowered = {a: 42.0, b: [42.0, 42.0], c: 50.0, d: 130.0, e: 200.0, f: [10.0, 156.0], g: 200.0, h: 200.0}
+    for _ in range(2):
+        assert ci.main() == 0
+        assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == lowered
 
 
 def test_a_file_armada_has_not_timed_weighs_no_less_than_its_tests_recorded_costs(ci, tmp_path):
