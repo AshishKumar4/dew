@@ -682,9 +682,16 @@ def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> N
 
 
 def _named_fields(metrics: Sequence[Metric]) -> list[tuple[str, str]]:
-    """Each batch field a metric of `metrics` reads beside its artifact (`Metric`'s `fields`), by the
+    """Each batch field a metric of `metrics` reads beside its artifact (`_declared_fields`), by the
     metric's name."""
-    return [(metric.name, field) for metric in metrics for field in getattr(metric, "fields", ())]
+    return [(metric.name, field) for metric in metrics for field in _declared_fields(metric)]
+
+
+def _declared_fields(metric: Metric) -> tuple[str, ...]:
+    """The batch fields `metric` itself declares it reads beside its artifact (`fields`: a `Mean`'s, FID's
+    images), which the Metric protocol leaves optional, a metric of a package's own declaring none, so it
+    is read at this boundary."""
+    return tuple(getattr(metric, "fields", ()))
 
 
 def _metrics_read(metrics: Sequence[Metric], batch: Batch, split: str) -> None:
