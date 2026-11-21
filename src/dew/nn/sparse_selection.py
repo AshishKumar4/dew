@@ -18,16 +18,16 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import logical_spec
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.inputs import sequence_blocks
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
-from dew.mesh import logical_spec
 from dew.nn.precision import accumulated, at_least_fp32, exact_products, float32_einsum
 from dew.nn.scatter import DROPPED
-from dew.nn.sharding import HEADS, manual_map, shard_shapes
+from dew.nn.sharding import HEADS, explicit_placement, manual_map, shard_shapes
 
 
 def index_agreements(query, keys, precision=None):
@@ -295,7 +295,16 @@ def _template_forward(absorbed, query_rot, latent, rot, indices, *, scale: float
         return out.reshape(batch, length, heads, rank)
 
     in_specs, out_spec = _template_specs(absorbed.shape)
-    return manual_map(local, in_specs, out_spec)(absorbed, query_rot, latent, rot, indices), ()
+    explicit = explicit_placement(jax.typeof(absorbed))
+    operands = (absorbed, query_rot, latent, rot, indices)
+    if explicit is not None:
+        operands = tuple(
+            jax.sharding.reshard(x, jax.sharding.NamedSharding(explicit.mesh, spec))
+            for x, spec in zip(operands, in_specs, strict=True))
+    out = manual_map(local, in_specs, out_spec)(*operands)
+    if explicit is not None and explicit.spec != out_spec:
+        out = jax.sharding.reshard(out, explicit)
+    return out, ()
 
 
 @functools.cache

@@ -1098,8 +1098,8 @@ derived one replaced is deleted with it, check 1 holding the derived forms to XL
   already normalized, a merge of finished states (`finished_merged`), takes its sums as its output by hand,
   `finish`'s `normalized`.) The declaration covers
   natural and base-2 exponents, keys-first tiles, initial states, dropout and score hooks; its products sum
-  in fp32. Every forward step, dropping calls included, takes the derived forms (`attention_algebra.plain_step`).
-  A walk's merge and finish name
+  in fp32. Every forward step, dropping calls included, takes the derived forms
+  (`attention_algebra.plain_step`). A walk's merge and finish name
   the forms they read by the walk's tiles (`Derived.merge`, `finish`: a state's values alone name no walk, a
   bf16 walk's fp32 sums being an fp32 walk's too); the attention state's merge and finish read the same
   forms at any keys a tile or values' dtype, so the template names its base's walk at the state's rows and

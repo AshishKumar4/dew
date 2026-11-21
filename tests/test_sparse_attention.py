@@ -349,16 +349,18 @@ def test_a_querys_empty_selection_slots_leave_the_next_querys_keys_alone():
 
 
 def test_the_sparse_latent_template_shards_over_batch_and_heads():
-    """`_template_forward` maps over the active mesh's batch, length and head axes (`_template_specs`,
-    rows 10528, 10530): each shard builds its own local latent pool and local table offsets and launches
+    """`_template_forward` maps over the active mesh's batch, sequence and head axes (`_template_specs`,
+    rows 10528, 10530): each shard builds its own local latent pool and local table offsets, launches
     `attention_decode.attend` on its local query rows and local heads instead of replicating the global
-    batch."""
-    from jax.sharding import AbstractMesh, AxisType, PartitionSpec as P
+    batch, handles replicated operands on a fully Explicit mesh, and matches the unsharded call across
+    multiple local batch rows with distinct latent values."""
+    from jax.sharding import AbstractMesh, AxisType, NamedSharding, PartitionSpec as P
 
-    from dew.mesh import DATA_AXIS, TENSOR_AXIS
+    from dew.mesh import DATA_AXIS, SEQUENCE_AXIS, TENSOR_AXIS
     from dew.nn.sparse_selection import _template_forward
 
-    mesh = AbstractMesh((2, 2), (DATA_AXIS, TENSOR_AXIS), axis_types=(AxisType.Auto, AxisType.Auto))
+    mesh = AbstractMesh((2, 2, 2), (DATA_AXIS, SEQUENCE_AXIS, TENSOR_AXIS),
+                        axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto))
     batch, length, heads, rank, rope, keys, top_k = 4, 8, 4, 16, 16, 16, 4
     absorbed = jax.ShapeDtypeStruct((batch, length, heads, rank), jnp.bfloat16)
     query_rot = jax.ShapeDtypeStruct((batch, length, heads, rope), jnp.bfloat16)
@@ -370,12 +372,37 @@ def test_the_sparse_latent_template_shards_over_batch_and_heads():
             absorbed, query_rot, latent, rot, indices)
     (mapped,) = [eq for eq in traced.jaxpr.eqns if eq.primitive.name == "shard_map"]
     assert mapped.params["in_specs"] == (
-        P(DATA_AXIS, None, TENSOR_AXIS), P(DATA_AXIS, None, TENSOR_AXIS),
-        P(DATA_AXIS), P(DATA_AXIS), P(DATA_AXIS, None))
-    assert mapped.params["out_specs"] == (P(DATA_AXIS, None, TENSOR_AXIS),)
+        P(DATA_AXIS, SEQUENCE_AXIS, TENSOR_AXIS), P(DATA_AXIS, SEQUENCE_AXIS, TENSOR_AXIS),
+        P(DATA_AXIS), P(DATA_AXIS), P(DATA_AXIS, SEQUENCE_AXIS))
+    assert mapped.params["out_specs"] == (P(DATA_AXIS, SEQUENCE_AXIS, TENSOR_AXIS),)
     inner_shapes = produced_shapes(mapped.params["jaxpr"])
-    # Local batch is 2 (not 4), local heads is 2 (not 4): local pool has 2 * 16 = 32 keys, not 64.
+    # Local batch is 2 (not 4), local length is 4 (not 8), local heads is 2 (not 4): local pool has 32 keys.
     assert (1, 2 * keys, 1, rank + rope) in inner_shapes
     assert (1, batch * keys, 1, rank + rope) not in inner_shapes
-    assert (2 * length, 1, 2, rank + rope) in inner_shapes
+    assert (2 * (length // 2), 1, 2, rank + rope) in inner_shapes
     assert (batch * length, 1, heads, rank + rope) not in inner_shapes
+
+    # Replicated operands on a fully Explicit mesh reshard cleanly into the map and restore their placement.
+    explicit = AbstractMesh((2,), (DATA_AXIS,), axis_types=(AxisType.Explicit,))
+    rep = NamedSharding(explicit, P())
+    rep_args = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=rep)
+                     for x in (absorbed, query_rot, latent, rot, indices))
+    with jax.sharding.use_abstract_mesh(explicit), generation.assumed("sm90"):
+        explicit_traced = jax.make_jaxpr(lambda *args: _template_forward(*args, scale=1.0)[0])(*rep_args)
+    assert explicit_traced.out_avals[0].sharding.spec == P()
+
+    # Behavioral check: distinct per-batch-row latents across 2 rows per shard must match the unsharded call.
+    rng = jax.random.split(jax.random.key(10530), 4)
+    scale_rows = jnp.arange(1, batch + 1, dtype=jnp.bfloat16)[:, None, None]
+    a_val = jax.random.normal(rng[0], (batch, length, heads, rank), jnp.bfloat16)
+    qr_val = jax.random.normal(rng[1], (batch, length, heads, rope), jnp.bfloat16)
+    lat_val = jax.random.normal(rng[2], (batch, keys, rank), jnp.bfloat16) * scale_rows
+    rot_val = jax.random.normal(rng[3], (batch, keys, rope), jnp.bfloat16)
+    sel = jnp.broadcast_to(jnp.arange(top_k, dtype=jnp.int32), (batch, length, top_k))
+    with generation.assumed("sm90"):
+        full = _template_forward(a_val, qr_val, lat_val, rot_val, sel, scale=1.0)[0]
+        halves = jnp.concatenate([
+            _template_forward(a_val[s], qr_val[s], lat_val[s], rot_val[s], sel[s], scale=1.0)[0]
+            for s in (slice(0, 2), slice(2, 4))
+        ], axis=0)
+    np.testing.assert_array_equal(np.asarray(full), np.asarray(halves))

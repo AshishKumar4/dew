@@ -320,91 +320,149 @@ def test_a_padded_merge_compiles_as_one_launch(name):
         assert sorted(record["thunks"]) == expected, record
 
 
-def _emitted_device_bytes(body, *, rows: int, blocks: int) -> float:
+def _emitted_device_bytes(body, *, rows: int, blocks: int, slices: int, read_width: int,
+                          width: int) -> float:
     """Device bytes transferred on the common one-window path of a traced Pallas `merged_padded` body,
-    counted independently from its emitted `get` and `swap` equations (`body` is `kernel.params['jaxpr']`)."""
+    counted independently from its emitted `get` and `swap` equations (`body` is `kernel.params['jaxpr']`),
+    evaluating `program_id(3)` guards per channel block and clipping masked tail accesses to physical
+    ref bounds (`slices`, `read_width`, `width`)."""
+    from jax import lax
+
+    chunk = means.chunk_width(slices)
+    chunks = -(-slices // chunk)
+    channels = 1 << (width - 1).bit_length()
+    root_kinds = {
+        id(body.invars[0]): "out",
+        id(body.invars[1]): "stat",
+        id(body.invars[2]): "stat",
+        id(body.invars[3]): "merged",
+    }
+
+    def sub_kinds(parent_kinds: dict[int, str], sub_jaxpr, outer_invars) -> dict[int, str]:
+        return {id(inner): parent_kinds[id(outer)]
+                for inner, outer in zip(sub_jaxpr.invars, outer_invars, strict=False)
+                if id(outer) in parent_kinds}
+
     def has_load(jaxpr) -> bool:
         for eq in jaxpr.eqns:
             if eq.primitive.name == "get":
                 return True
-            if eq.primitive.name == "scan" and has_load(eq.params["jaxpr"].jaxpr):
+            if eq.primitive is lax.scan_p and has_load(eq.params["jaxpr"].jaxpr):
                 return True
-            if eq.primitive.name == "while" and has_load(eq.params["body_jaxpr"].jaxpr):
+            if eq.primitive is lax.while_p and has_load(eq.params["body_jaxpr"].jaxpr):
                 return True
-            if eq.primitive.name == "cond" and any(has_load(b.jaxpr) for b in eq.params["branches"]):
+            if eq.primitive is lax.cond_p and any(has_load(b.jaxpr) for b in eq.params["branches"]):
                 return True
         return False
+
+    def eval_block_predicate(jaxpr, pred_var, block_id: int) -> bool | None:
+        """Evaluate a scalar predicate depending on `program_id(axis=3)` at `block_id`, or None if dynamic."""
+        env: dict[int, int | bool] = {}
+        for eq in jaxpr.eqns:
+            if eq.primitive.name == "program_id" and eq.params.get("axis") == 3:
+                env[id(eq.outvars[0])] = block_id
+                continue
+            if eq.primitive in (lax.eq_p, lax.ne_p, lax.lt_p, lax.le_p, lax.gt_p, lax.ge_p):
+                vals = [int(v.val) if hasattr(v, "val") else env.get(id(v)) for v in eq.invars]
+                if all(val is not None for val in vals):
+                    a, b = vals
+                    ops = {lax.eq_p: a == b, lax.ne_p: a != b, lax.lt_p: a < b,
+                           lax.le_p: a <= b, lax.gt_p: a > b, lax.ge_p: a >= b}
+                    env[id(eq.outvars[0])] = ops[eq.primitive]
+            elif eq.primitive is lax.convert_element_type_p and len(eq.invars) == 1:
+                val = env.get(id(eq.invars[0]))
+                if val is not None:
+                    env[id(eq.outvars[0])] = int(val)
+            if id(pred_var) in env:
+                return bool(env[id(pred_var)])
+        return None
+
+    def valid_fraction(eq, kinds: dict[int, str]) -> float:
+        kind = kinds.get(id(eq.invars[0]))
+        slice_frac = slices / (chunks * chunk)
+        if eq.primitive.name == "get":
+            if kind == "out":
+                return slice_frac * (read_width / channels)
+            if kind == "stat":
+                return slice_frac
+        elif eq.primitive.name == "swap" and kind == "merged":
+            return width / channels
+        return 1.0
 
     def live_vars(jaxpr) -> set[int]:
         """Variable ids that reach a side-effecting store or control-flow input, ignoring `sub(v, v)`
         type-carrying zero probes (which LLVM folds to 0 and DCEs)."""
         needed = {id(v) for v in jaxpr.outvars}
         for eq in reversed(jaxpr.eqns):
-            name = eq.primitive.name
-            if name == "sub" and len(eq.invars) == 2 and eq.invars[0] is eq.invars[1]:
+            if eq.primitive is lax.sub_p and len(eq.invars) == 2 and eq.invars[0] is eq.invars[1]:
                 continue
-            if name in ("swap", "scan", "while", "cond") or any(id(v) in needed for v in eq.outvars):
+            if (eq.primitive.name == "swap" or eq.primitive in (lax.scan_p, lax.while_p, lax.cond_p)
+                    or any(id(v) in needed for v in eq.outvars)):
                 needed.update(id(v) for v in eq.invars)
         return needed
 
-    def walk(jaxpr) -> float:
+    def walk(jaxpr, kinds: dict[int, str]) -> float:
         live = live_vars(jaxpr)
         total = 0.0
         for eq in jaxpr.eqns:
-            name = eq.primitive.name
-            if name == "get":
+            if eq.primitive.name == "get":
                 if id(eq.outvars[0]) not in live:
                     continue
                 aval = eq.outvars[0].aval
-                total += math.prod(aval.shape) * aval.dtype.itemsize
-            elif name == "swap":
+                total += math.prod(aval.shape) * aval.dtype.itemsize * valid_fraction(eq, kinds)
+            elif eq.primitive.name == "swap":
                 aval = eq.invars[1].aval
-                total += math.prod(aval.shape) * aval.dtype.itemsize
-            elif name == "scan":
-                total += eq.params["length"] * walk(eq.params["jaxpr"].jaxpr)
-            elif name == "while":
-                # One window on the common path.
-                total += walk(eq.params["body_jaxpr"].jaxpr)
-            elif name == "cond":
-                b0, b1 = (walk(b.jaxpr) for b in eq.params["branches"])
-                if b0 == 0.0 and b1 > 0.0 and not has_load(eq.params["branches"][1].jaxpr):
-                    # `pl.when(program_id(3) == 0)`: row-stat stores execute on 1 of `blocks` programs.
-                    total += b1 / blocks
+                total += math.prod(aval.shape) * aval.dtype.itemsize * valid_fraction(eq, kinds)
+            elif eq.primitive is lax.scan_p:
+                sub = eq.params["jaxpr"].jaxpr
+                total += eq.params["length"] * walk(sub, sub_kinds(kinds, sub, eq.invars))
+            elif eq.primitive is lax.while_p:
+                sub = eq.params["body_jaxpr"].jaxpr
+                total += walk(sub, sub_kinds(kinds, sub, eq.invars))
+            elif eq.primitive is lax.cond_p:
+                b0, b1 = (walk(b.jaxpr, sub_kinds(kinds, b.jaxpr, eq.invars[1:]))
+                          for b in eq.params["branches"])
+                taken = [eval_block_predicate(jaxpr, eq.invars[0], block_id) for block_id in range(blocks)]
+                if all(flag is not None for flag in taken):
+                    true_count = sum(bool(flag) for flag in taken)
+                    total += (true_count * b1 + (blocks - true_count) * b0) / blocks
+                elif not has_load(eq.params["branches"][1].jaxpr):
+                    total += max(b0, b1)
                 else:
                     # Rare re-landing `lax.cond`: common path takes the branch with no extra loads.
                     total += min(b0, b1)
         return total
 
-    return walk(body) * rows * blocks
+    return walk(body, root_kinds) * rows * blocks
 
 
 def _traced_merge_bytes(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
                         queries: int, width: int, block: int) -> float:
     """Independent device-byte count for `merged._launch` at `block` from its emitted Pallas body."""
-    batch, _, _, heads, _ = padded.shape
+    batch, slices, _, heads, read_width = padded.shape
     channels = 1 << (width - 1).bit_length()
     launch = functools.partial(merged._launch, units=algebra.units_of(spec), queries=queries, width=width,
                                block=block)
     (kernel,) = (eq for eq in jax.make_jaxpr(launch)(padded, stacked).jaxpr.eqns if programs.opaque(eq))
     return _emitted_device_bytes(kernel.params["jaxpr"], rows=batch * queries * heads,
-                                 blocks=channels // block)
+                                 blocks=channels // block, slices=slices, read_width=read_width, width=width)
 
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
     """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (rows 8845,
-    10533): one kernel, span `3 * chunks`, exact agreement with the emitted Pallas `get`/`swap` byte count on
-    unmasked shapes (including multi-block row-stat stores charged once per row), and strictly less traffic
-    than padded loads on irregular masked tails."""
+    10533): one kernel, span `3 * chunks`, and exact agreement with the emitted Pallas `get`/`swap` byte
+    count across unmasked, multi-block (row-stat stores evaluated per `program_id(3)`), and irregular masked
+    tail shapes."""
     target = generation.gpu_target("sm90")
     spec = SPECS["fold"]
 
-    # Unmasked shapes (slices a multiple of chunk_width, power-of-two width): 1-chunk, 4-chunk, multi-block.
-    unmasked = [
+    cases = [
         (2, 8, 16, 8, 4, 128, 1),
         (2, 32, 16, 8, 4, 128, 4),
+        (2, 9, 16, 8, 4, 96, 2),
         (1, 8, 8, 1, 1, 128, 1),
     ]
-    for batch, slices, padded_q, heads, queries, width, chunks in unmasked:
+    for batch, slices, padded_q, heads, queries, width, chunks in cases:
         padded = jax.ShapeDtypeStruct((batch, slices, padded_q, heads, width), jnp.float32)
         stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, padded_q), jnp.float32)
         block = merged._channel_block(spec, padded, stacked, queries, width, target)
@@ -412,21 +470,6 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
         assert work.kernels == 1.0
         assert work.span == float(3 * chunks)
         assert work.device_bytes == _traced_merge_bytes(spec, padded, stacked, queries, width, block)
-
-    # Irregular masked tail (slices=9, width=96, chunks=2): valid traffic stays strictly below the unmasked
-    # emitted loads/stores of its padded tile (16 slices x 128 channels) and above an 8-slice 64-wide launch.
-    tail_p = jax.ShapeDtypeStruct((2, 9, 16, 8, 96), jnp.float32)
-    tail_s = jax.ShapeDtypeStruct((2, 2, 8, 9, 16), jnp.float32)
-    tail_block = merged._channel_block(spec, tail_p, tail_s, 4, 96, target)
-    tail_work = merged.launch_work(spec, tail_p, tail_s, 4, 96, target)
-    assert tail_work.kernels == 1.0
-    assert tail_work.span == float(3 * -(-9 // means.chunk_width(9)))
-    assert tail_work.device_bytes < _traced_merge_bytes(spec, tail_p, tail_s, 4, 96, tail_block)
-    small_tail_p = jax.ShapeDtypeStruct((2, 8, 16, 8, 64), jnp.float32)
-    small_tail_s = jax.ShapeDtypeStruct((2, 2, 8, 8, 16), jnp.float32)
-    small_tail_block = merged._channel_block(spec, small_tail_p, small_tail_s, 4, 64, target)
-    assert tail_work.device_bytes > _traced_merge_bytes(spec, small_tail_p, small_tail_s, 4, 64,
-                                                        small_tail_block)
     # The 1-row 128-wide case splits across multiple channel blocks on an H100 (row 8439), exercising the
     # single-stat-store-per-row accounting directly.
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
