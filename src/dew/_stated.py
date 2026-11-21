@@ -431,10 +431,13 @@ def reads(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
 
 
 def library_function(function: types.FunctionType) -> bool:
-    """Whether `function` is a library's: its module one of the user's own code is not (`own_source`: an
-    installed distribution's, the standard library's). A script's, a notebook's (`__main__` with no file)
-    and one no module holds are the user's."""
-    return function.__module__ not in (None, "__main__") and not _sources.own_source(function.__module__)
+    """Whether `function` is a library's: the module whose globals it was defined in one of the user's own
+    code is not (`own_source`: an installed distribution's, the standard library's). A script's, a
+    notebook's (`__main__` with no file) and one no module holds are the user's. By its globals, not the
+    module it names, which `functools.wraps` copies from the function it wraps (row 10554: a user's function
+    wrapping a library's was stated without the globals it reads), as `_sources.hand_written` decides."""
+    module = function.__globals__.get("__name__")
+    return module not in (None, "__main__") and not _sources.own_source(module)
 
 
 def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:

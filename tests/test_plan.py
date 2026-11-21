@@ -1712,6 +1712,28 @@ def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):
     assert first is not None and first == key(autotune_on, autotune_off) != key(autotune_off, autotune_on)
 
 
+SCALE = 2
+"""A module setting the wrapped function below reads."""
+
+
+def test_a_users_function_wrapped_as_a_librarys_states_the_globals_it_reads(monkeypatch):
+    """A user's function that names a library's as the one it wraps (`functools.wraps`, which copies the
+    library's module onto it) is the user's by the globals it was defined in, so its statement holds the
+    module setting it reads, and a change to that setting states another function (row 10554: taken as the
+    library's, its globals were dropped, and a rung record or truth store keyed a stale entry)."""
+    import json
+
+    from dew._stated import stated
+
+    @functools.wraps(json.dumps)
+    def scaled(value):
+        return value * SCALE
+
+    before = stated(scaled, "a wrapped function")
+    monkeypatch.setitem(globals(), "SCALE", 3)
+    assert stated(scaled, "a wrapped function") != before
+
+
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
     """float8 e4m3fn and e4m3fnuz, and int4 and uint4, share one byte layout (`dtype.str` '<V1'): an
     array of each holding the same bytes fingerprints apart, as the same values of one dtype do not."""
