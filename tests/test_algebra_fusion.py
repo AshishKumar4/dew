@@ -554,7 +554,7 @@ def test_a_product_mapped_per_shard_runs_the_template_and_computes_as_written():
         with generation.routes() as found:
             jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
         assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
-        assert_equal(rewritten(mapped, *operands), as_written(mapped, *operands))
+        assert_equal(under_the_pass(mapped, *operands), as_written(mapped, *operands))
 
 
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
@@ -1659,4 +1659,4 @@ def test_a_mapped_products_written_casts_are_replayed_as_written():
         with generation.routes() as found:
             jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
         assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
-        assert_equal(rewritten(mapped, *operands), as_written(mapped, *operands))
+        assert_equal(under_the_pass(mapped, *operands), as_written(mapped, *operands))
