@@ -24,13 +24,13 @@ import hashlib
 import json
 import logging
 import sys
-import types
-from collections.abc import Iterable
+from collections.abc import Sequence
 from pathlib import Path
 
 from dew._builds import dew_cache_dir
 from dew._cache import VERSION_FILE, package_digest
 from dew._files import write_atomically
+from dew._records import JSON
 
 _log = logging.getLogger(__name__)
 
@@ -66,6 +66,17 @@ REVIEWED = {
     "dew.registry:import_trusted:package": "a package the run trusts, as `dew.registry:imported:module`",
     "dew.registry:import_trusted:module": "a trusted package's module a record names, as its package",
     "dew.registry:module_from_file:<loader>": "a user's file a run names, the user's code",
+    **dict.fromkeys((
+        "dew._cache:unintercepted:sys.modules", "dew._devices:_seen:sys.modules",
+        "dew._devices:backend_open:sys.modules", "dew._devices:flags_hold:sys.modules",
+        "dew._sources:file_of:sys.modules", "dew._sources:function_reads:sys.modules",
+        "dew._sources:generated_fields:sys.modules", "dew._sources:own_source:sys.modules",
+        "dew._sources:recorded:sys.modules", "dew._sources:source_file:sys.modules",
+        "dew._stated:_coded:sys.modules", "dew._stated:_converter:sys.modules",
+        "dew._stated:_named:sys.modules", "dew.data.pipeline:_main_importable:sys.modules",
+        "dew.data.sources.memory:_table_records:sys.modules"),
+        "a module this process already imported, a library's, the user's or the one defining a value it "
+        "holds, read by its variables or the name that value states: it imports none of Dew's"),
 }
 """Each dynamic import site of Dew's (`module:function:expression`) whose code a closure need not follow,
 and why: a changed or added site is another site, unreviewed until it is."""
@@ -102,17 +113,12 @@ def code_digest(*roots: str) -> str:
     return digest.hexdigest()
 
 
-def defining_modules(values: Iterable[object]) -> frozenset[str]:
-    """The modules of Dew's that define `values`' code, by what each is: a function's or a class's module,
-    a partial's or a bound method's function's, any other object's class's; none for a library's value or
-    the user's own code, whose release or source states it."""
+def defining_modules(values: Sequence[object]) -> frozenset[str]:
+    """The modules of Dew's that define `values`' code: a class's own module, any other value's class's;
+    none for a library's value or the user's own, whose release or source states it."""
     found = set()
     for value in values:
-        while isinstance(value, functools.partial):
-            value = value.func
-        if isinstance(value, types.MethodType):
-            value = value.__func__
-        module = (value if isinstance(value, (types.FunctionType, type)) else type(value)).__module__
+        module = (value if isinstance(value, type) else type(value)).__module__
         if isinstance(module, str) and _path(module) is not None:
             found.add(module)
     return frozenset(found)
@@ -127,11 +133,11 @@ def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ..
     named = hashlib.sha256(json.dumps(roots).encode()).hexdigest()[:16]
     python = "{}.{}".format(*sys.version_info[:2])
     kept = Path(dew_cache_dir()) / "code" / f"{whole}-{python}-{named}.json"
+    unchanged = package_digest.__wrapped__() == whole
     with contextlib.suppress(FileNotFoundError, ValueError):
         found = json.loads(kept.read_text())
-        if _sound(found, roots):
+        if unchanged and _sound(found, roots):
             return frozenset(found["modules"]), tuple(found["sites"])
-    unchanged = package_digest.__wrapped__() == whole
     modules, sites = closure(*roots)
     if unchanged and package_digest.__wrapped__() == whole:
         kept.parent.mkdir(parents=True, exist_ok=True)
@@ -140,7 +146,7 @@ def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ..
     return modules, sites
 
 
-def _sound(found: object, roots: tuple[str, ...]) -> bool:
+def _sound(found: JSON, roots: tuple[str, ...]) -> bool:
     """Whether `found` is a closure of `roots` as `_kept_closure` keeps one."""
     if not isinstance(found, dict) or found.get("roots") != list(roots):
         return False
@@ -190,51 +196,90 @@ def _ours(module: str) -> set[str]:
             if _path(name) is not None}
 
 
-class _Running(ast.NodeTransformer):
-    """A module's tree without its `if TYPE_CHECKING:` blocks, which never run, their `else` kept: the guard
-    `typing.TYPE_CHECKING`, or the name `TYPE_CHECKING` where the module imports it from `typing`."""
-
-    def __init__(self, guards: set[str]):
-        self.guards = guards
-
-    def visit_If(self, node: ast.If) -> ast.AST | list[ast.stmt] | None:
-        test = node.test
-        guarded = isinstance(test, ast.Name) and test.id in self.guards
-        if guarded or ast.unparse(test) == "typing.TYPE_CHECKING":
-            kept: list[ast.stmt] = []
-            for statement in node.orelse:
-                visited = self.visit(statement)
-                kept.extend(visited if isinstance(visited, list) else [] if visited is None else [visited])
-            return kept or None
-        return self.generic_visit(node)
-
-
 @functools.cache
 def _tree(module: str) -> ast.Module:
     path = _path(module)
     if path is None:
         raise LookupError(f"no module of Dew's is named {module}")
     tree = ast.parse(path.read_bytes(), str(path))
-    guards = {alias.asname or alias.name for node in tree.body if isinstance(node, ast.ImportFrom)
-              and node.module == "typing" for alias in node.names if alias.name == "TYPE_CHECKING"}
-    _Running(guards).generic_visit(tree)
+    tree.body = [kept for node in tree.body
+                 for kept in (node.orelse if _guarded(tree, node) else [node])]
     return tree
 
 
-def _literal(node: ast.expr) -> object:
-    """The value a literal states: Python's literals, and a mapping's `**dict.fromkeys(names, value)`."""
-    if isinstance(node, ast.Dict) and None in node.keys:
-        held: dict = {}
-        for key, value in zip(node.keys, node.values, strict=True):
-            if key is not None:
-                held[ast.literal_eval(key)] = _literal(value)
-            elif (isinstance(value, ast.Call) and ast.unparse(value.func) == "dict.fromkeys"
-                  and len(value.args) == 2):
-                held.update(dict.fromkeys(ast.literal_eval(value.args[0]), ast.literal_eval(value.args[1])))
-            else:
-                held.update(_literal(value))
-        return held
-    return ast.literal_eval(node)
+def _guarded(tree: ast.Module, node: ast.stmt) -> bool:
+    """Whether `node`, a statement of a module's top level, is an `if TYPE_CHECKING:`, whose body never
+    runs: its test `TYPE_CHECKING` as the module imports it from `typing`, or `typing.TYPE_CHECKING` with
+    `typing` imported, each bound by that import alone. One nested deeper, or under any other binding, is
+    kept whole, both branches read."""
+    if not isinstance(node, ast.If):
+        return False
+    bindings = [target for each in ast.walk(tree) for target in _bound(each)]
+    if isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+        imported = any(isinstance(each, ast.ImportFrom) and each.module == "typing"
+                       and any(alias.name == "TYPE_CHECKING" and alias.asname is None for alias in each.names)
+                       for each in tree.body)
+        return imported and bindings.count("TYPE_CHECKING") == 1
+    if ast.unparse(node.test) == "typing.TYPE_CHECKING":
+        imported = any(isinstance(each, ast.Import) and any(alias.name == "typing" and alias.asname is None
+                                                            for alias in each.names) for each in tree.body)
+        return imported and bindings.count("typing") == 1
+    return False
+
+
+def _binds(statement: ast.stmt) -> list[str]:
+    """The names a module's top-level `statement` binds."""
+    if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        return [name.id for target in targets for name in ast.walk(target) if isinstance(name, ast.Name)]
+    return _bound(statement)
+
+
+def _bound(node: ast.AST) -> list[str]:
+    """The names `node` binds: an import's, an assignment's or a loop's targets, a function's arguments."""
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [alias.asname or alias.name.partition(".")[0] for alias in node.names]
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        return [node.id]
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    return []
+
+
+def _literal(node: ast.expr) -> dict[str, str] | list[str] | str | None:
+    """The strings, the collection of them or the mapping of names to them a literal states (a dict's
+    `**dict.fromkeys(names, value)` among them, a `frozenset({...})`); None for any other expression."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Call) and ast.unparse(node.func) in ("frozenset", "set", "tuple", "list") and len(
+            node.args) == 1 and not node.keywords:
+        return _literal(node.args[0])
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        items = [_literal(each) for each in node.elts]
+        strings = [item for item in items if isinstance(item, str)]
+        return strings if len(strings) == len(items) else None
+    if not isinstance(node, ast.Dict):
+        return None
+    held: dict[str, str] = {}
+    for key, value in zip(node.keys, node.values, strict=True):
+        if key is not None:
+            name, target = _literal(key), _literal(value)
+            if not isinstance(name, str) or not isinstance(target, str):
+                return None
+            held[name] = target
+        elif (isinstance(value, ast.Call) and ast.unparse(value.func) == "dict.fromkeys"
+              and len(value.args) == 2):
+            names, target = _literal(value.args[0]), _literal(value.args[1])
+            if not isinstance(names, list) or not isinstance(target, str):
+                return None
+            held.update(dict.fromkeys(names, target))
+        elif isinstance(inner := _literal(value), dict):
+            held.update(inner)
+        else:
+            return None
+    return held
 
 
 def _assigned(module: str, name: str) -> ast.expr | None:
@@ -262,17 +307,26 @@ def _table(package: str) -> dict[str, str] | None:
     if path is None or path.name != "__init__.py":
         return {}
     table: dict[str, str] = {}
-    try:
-        if (exports := _assigned(package, "_EXPORTS")) is not None:
-            table.update(_literal(exports))
-        if (named := _assigned(package, "_NAMED")) is not None:
-            table.update({name: f"{package}.{module}" for name, module in _literal(named).items()})
-        if (submodules := _assigned(package, "_SUBMODULES")) is not None:
-            called = isinstance(submodules, ast.Call) and submodules.args
-            members = submodules.args[0] if isinstance(submodules, ast.Call) and called else submodules
-            table.update({name: f"{package}.{name}" for name in _literal(members)})
-    except (ValueError, TypeError, AttributeError):
+    tree = _tree(package)
+    # A table the package's dispatcher reads by any other name, or a dispatcher of its own with no table
+    # named here, resolves nothing this walk reads: unreadable.
+    lookups = [node.args[1] for node in ast.walk(tree) if isinstance(node, ast.Call) and len(node.args) == 2
+               and ast.unparse(node.func).rpartition(".")[2].lstrip("_") == "lookup"]
+    top = {name for node in tree.body for name in _binds(node)}
+    if any(ast.unparse(table) != "_EXPORTS" for table in lookups) or (
+            "__getattr__" in top and not lookups and not {"_NAMED", "_SUBMODULES"} & top):
         return None
+    for name, read in (("_EXPORTS", lambda target: target), ("_NAMED", lambda target: f"{package}.{target}")):
+        value = _assigned(package, name)
+        found = None if value is None else _literal(value)
+        if value is not None and not isinstance(found, dict):
+            return None
+        table.update({key: read(target) for key, target in (found or {}).items()})
+    value = _assigned(package, "_SUBMODULES")
+    members = None if value is None else _literal(value)
+    if value is not None and not isinstance(members, list):
+        return None
+    table.update({member: f"{package}.{member}" for member in members or ()})
     return table
 
 
@@ -290,6 +344,7 @@ class _Imports(ast.NodeVisitor):
         self.importers = {"__import__"}
         self.within: list[str] = []
         self.read_whole: set[int] = set()
+        self.calling: set[int] = set()
 
     def read(self, module: str) -> None:
         self.modules |= _ours(module)
@@ -343,8 +398,10 @@ class _Imports(ast.NodeVisitor):
             if alias.name == "*":
                 self.whole(base)
                 continue
-            if base == "importlib" and alias.name in _IMPORTERS:
+            if base in ("importlib", "builtins") and alias.name in _IMPORTERS:
                 self.importers.add(alias.asname or alias.name)
+            if base == "sys" and alias.name == "modules":
+                self.site(ast.Name("sys.modules"))
             found = self.attribute(base, alias.name)
             if found is not None:
                 self.read(found)
@@ -357,6 +414,10 @@ class _Imports(ast.NodeVisitor):
         self.read_whole.add(id(node))
         if isinstance(node, ast.Name):
             return set(self.aliases.get(node.id, ()))
+        if isinstance(node, ast.Call) and self.importing(node):
+            self.calling.add(id(node))
+            found = self.imported(node)
+            return set() if found is None else {found}
         if not isinstance(node, ast.Attribute):
             return set()
         held = set()
@@ -369,22 +430,37 @@ class _Imports(ast.NodeVisitor):
         return held
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in _IMPORTERS and id(node) not in self.calling:
+            self.site(node)
+        if ast.unparse(node) == "sys.modules":
+            self.site(node)
         if id(node) not in self.read_whole:
             for module in self.resolved(node):
                 self.whole(module)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
+        if node.id in self.importers and id(node) not in self.calling:
+            self.site(node)
         if id(node) not in self.read_whole and isinstance(node.ctx, ast.Load):
             for module in self.aliases.get(node.id, ()):
                 self.whole(module)
+
+    def importing(self, node: ast.Call) -> bool:
+        """Whether `node` calls `import_module` or `__import__`, by any name the module binds them to."""
+        function = node.func
+        return ((isinstance(function, ast.Attribute) and function.attr in _IMPORTERS)
+                or (isinstance(function, ast.Name) and function.id in self.importers))
 
     def visit_Call(self, node: ast.Call) -> None:
         function = node.func
         called = (function.attr if isinstance(function, ast.Attribute)
                   else function.id if isinstance(function, ast.Name) else "")
-        if called in _IMPORTERS or (isinstance(function, ast.Name) and called in self.importers):
-            self.imported(node)
+        if self.importing(node):
+            self.calling.add(id(function))
+            if id(node) not in self.calling:
+                self.calling.add(id(node))
+                self.imported(node)
         elif called in _LOADERS:
             self.site(None)
         elif called == "getattr" and len(node.args) >= 2:
@@ -398,8 +474,9 @@ class _Imports(ast.NodeVisitor):
                     self.whole(module)
         self.generic_visit(node)
 
-    def imported(self, node: ast.Call) -> None:
-        """An `import_module` or `__import__` call: the module it names, or a site."""
+    def imported(self, node: ast.Call) -> str | None:
+        """An `import_module` or `__import__` call: the module it names, read, or a site (None)."""
+        self.calling.add(id(node.func))
         keywords = {keyword.arg: keyword.value for keyword in node.keywords}
         name = node.args[0] if node.args else keywords.get("name")
         package = node.args[1] if len(node.args) > 1 else keywords.get("package")
@@ -411,11 +488,23 @@ class _Imports(ast.NodeVisitor):
         site = f"{self.module}:{within}:{'' if name is None else ast.unparse(name)}"
         if found is not None:
             self.read(found)
-        elif site in SELECTED:
-            for dotted in _literal(_assigned(self.module, SELECTED[site]) or ast.Dict([], [])):
-                self.read(dotted.rpartition(".")[0])
-        else:
+            return found
+        selected = self.selected(SELECTED[site]) if site in SELECTED else None
+        if selected is None:
             self.site(name)
+        for dotted in selected or ():
+            self.read(dotted.rpartition(".")[0])
+        return None
+
+    def selected(self, table: str) -> list[str] | None:
+        """The dotted names (`module.function`) the literal table `table` of this module holds, None where
+        it holds none as a literal."""
+        value = _assigned(self.module, table)
+        found = None if value is None else _literal(value)
+        names = list(found) if isinstance(found, (dict, list)) else None
+        if names is None or not all("." in name for name in names):
+            return None
+        return names
 
     def stated(self, node: ast.expr) -> str | None:
         """The string `node` states without running: a constant, `__name__`, `__package__`, or an f-string

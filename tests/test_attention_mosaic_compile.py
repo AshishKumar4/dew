@@ -926,6 +926,12 @@ jax.monitoring.register_event_duration_secs_listener(heard)
     "for found in report.certifications()]))", "for found in report.certifications()]]))", 1)
 """`CERTIFIED_FORWARD`, first naming each certification program it lowered and each it compiled."""
 
+HOOKED_FORWARD = EDITED_FORWARD.replace("import jax\n", "import jax\n\n\ndef capped(s, q_pos, k_pos):\n"
+                                        "    return 30.0 * jax.numpy.tanh(s / 30.0)\n", 1).replace(
+    "attention_mosaic.forward(q, k, v, spans, None)",
+    "attention_mosaic.forward(q, k, v, spans, template.Hooks(score_mod=capped))", 1)
+"""`EDITED_FORWARD` of a launch with a score hook (a soft cap)."""
+
 
 @COMPILES_ON_CPU
 def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them(tmp_path):
@@ -934,7 +940,9 @@ def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_t
     traces, nothing lowered; in its op's module, outside its kernels (`report._lowered_verdict_key`), the
     launch lowered, its kernels the same, and their verdict read, compiling none. Keyed by Dew's whole code
     alone, every commit compiled every launch of a start again (row 8650: 23 of an edited tree's 51 seconds
-    certifying a hybrid decoder's step ahead, FS-8650-SPLIT), and lowered each (row 10743)."""
+    certifying a hybrid decoder's step ahead, FS-8650-SPLIT), and lowered each (row 10743). A launch with a
+    hook, which its identity traces at one tile alone, keys on all of Dew's code: an edit anywhere lowers it
+    again."""
     import shutil
 
     from process_support import REPO_ROOT, fresh, keeping_picks
@@ -943,8 +951,8 @@ def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_t
     for name in ("dew", "_dew_torch"):
         shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
 
-    def run() -> list:
-        return fresh(EDITED_FORWARD, cache_dir=tmp_path / "xla", flags=keeping_picks(), source=tree,
+    def run(script: str = EDITED_FORWARD) -> list:
+        return fresh(script, cache_dir=tmp_path / "xla", flags=keeping_picks(), source=tree,
                      variables={"XDG_CACHE_HOME": str(tmp_path / "cache")})
 
     def edited(*parts: str) -> None:
@@ -956,10 +964,13 @@ def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_t
 
     _, cold_compiled, *cold = run()
     assert cold and cold_compiled and not any(stored for _, stored, _ in cold), cold
+    assert run(HOOKED_FORWARD)[1]
     edited("training", "rungs.py")
     lowered, compiled, *elsewhere = run()
     assert all(stored for _, stored, _ in elsewhere) and certified(elsewhere) == certified(cold), elsewhere
     assert (lowered, compiled) == ([], [])
+    lowered, compiled, *hooked = run(HOOKED_FORWARD)
+    assert hooked and all(stored for _, stored, _ in hooked) and lowered and not compiled, (lowered, hooked)
     edited("nn", "kernels", "templates", "attention_mosaic.py")
     lowered, compiled, *op_edited = run()
     assert all(stored for _, stored, _ in op_edited) and certified(op_edited) == certified(cold), op_edited
