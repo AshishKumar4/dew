@@ -8,7 +8,11 @@ its data rather than at a user's first step.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import json
+import tempfile
+from pathlib import Path
 
 import jax
 from decision_support import decision_rows
@@ -64,11 +68,32 @@ def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfi
         objective=ObjectiveConfig(objective, {"solver": Euler(), "steps": 2, **fields}))
 
 
+@functools.cache
+def flux_pipeline() -> str:
+    """The committed tiny Flux pipeline's text towers, unpacked once a process (`guided`)."""
+    from interop_support import extract_fixture
+
+    root = Path(tempfile.mkdtemp(prefix="dew-flux-"))
+    extract_fixture(Path(__file__).resolve().parent / "fixtures" / "flux_source.tar.xz", root)
+    return str(root / "pipeline")
+
+
+def guided() -> DiffusionRunConfig:
+    """The diffusion recipe over a guidance-embedded denoiser, a tiny Flux reading the committed pipeline's
+    text towers, whose guidance input guidance distillation trains into (the recipe's DiT has none)."""
+    from test_guidance_distillation import FLUX
+
+    return dataclasses.replace(
+        diffusion(guidance=None, ema_decay=None),
+        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
+        text=TextCondition(encoder="diffusion_text", checkpoint=flux_pipeline()))
+
+
 def with_teacher(kind):
     """A distilled diffusion kind over the recipe's model, inputs and data, its teacher the recipe's own
-    objective at initialization, and the first batch it trains on: none for guidance distillation, whose
-    student the recipe's denoiser cannot be (it carries no guidance input)."""
-    config = diffusion(guidance=None, ema_decay=None)
+    objective at initialization, and the first batch it trains on: guidance distillation's over a
+    guidance-embedded denoiser (`guided`), the one owner of that case (row 10115)."""
+    config = guided() if kind == "guidance_distillation" else diffusion(guidance=None, ema_decay=None)
     base = config.build()
     drawn = nn.unbox(base.init(jax.random.key(0)))
     teacher = base.model_variables(drawn)
@@ -84,9 +109,7 @@ def with_teacher(kind):
         "guidance_distillation": lambda: GuidanceDistillationObjective(
             *shared, variables={TEACHER: drawn}, steps=2),
     }[kind]()
-    # The recipe's denoiser carries no guidance input, which guidance distillation trains into: that case is
-    # built for its key alone, no batch (`test_trace_keys.built_objectives`).
-    return built, None if kind == "guidance_distillation" else first(config.data, built)
+    return built, first(config.data, built)
 
 
 def preference_pairs():
