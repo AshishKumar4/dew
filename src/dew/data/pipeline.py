@@ -900,9 +900,12 @@ class Pack:
 
     A concatenating pack cuts documents where its windows end; `overlap` is
     how many tokens before a cut through a document the next window holds
-    again, so 1 keeps the next-token target at every cut. A fitting pack cuts
-    no document: one longer than a window is cut before it, into pieces that
-    overlap as `dew.data.text.Chunks` says.
+    again, so 1 keeps the next-token target at every cut. Each piece counts
+    against `segments` and holds its document's `along` entries whole, as
+    Grain's concatenating packer holds a feature it never cuts
+    (`dew.data.packing.ConcatPacked`). A fitting pack cuts no document:
+    one longer than a window is cut before it, into pieces that overlap as
+    `dew.data.text.Chunks` says.
     """
 
     seq_len: int
@@ -938,9 +941,6 @@ class Pack:
         return self.seq_len - 1
 
     def __post_init__(self) -> None:
-        if self.policy == "concat" and (self.segments is not None or self.along):
-            raise ValueError("concatenated packing cuts documents across windows; it takes no "
-                             "segment bound or fields along other axes")
         if self.policy != "concat" and self.overlap:
             raise ValueError(f"a {self.policy} pack cuts no document, so no cut overlaps; cut a long "
                              "document before it with Chunks(overlap=...)")

@@ -56,6 +56,17 @@ def test_a_concatenated_conversation_keeps_its_target_across_a_row_end():
     assert held == sum(length - 1 for length in rendered)
 
 
+def test_a_concatenating_lm_preset_lays_one_document_or_one_piece_of_one_a_row():
+    """`lm(pack="concat", segments=1)` (data.md's `lm` row; row 9059: the bound was refused): each row
+    holds one document or one piece of one, padded, and a document cut where a row ends starts the
+    next row on the cut's last token, so each of its next-token targets is in one row."""
+    documents = Memory([{"text": np.arange(length, dtype=np.int32) + 10 * index + 1}
+                        for index, length in enumerate((3, 7, 2))])
+    rows = list(documents.pipe(presets.lm, None, seq_len=3, batch=1, pack="concat", segments=1))
+    assert [np.asarray(row["text"])[0].tolist() for row in rows] == [
+        [1, 2, 3, 0], [11, 12, 13, 14], [14, 15, 16, 17], [21, 22, 0, 0]]
+
+
 def store_of_documents(directory) -> tuple[str, np.ndarray]:
     """A token store of 40 short documents, each ended by EOS (0): its url and the stream it holds."""
     stream = np.concatenate([np.asarray([*range(1, 4 + index % 5), 0], np.int64) for index in range(40)])
