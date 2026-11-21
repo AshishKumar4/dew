@@ -185,7 +185,7 @@ def with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: M
     layout reads as it stands (gpt-oss's experts, `[experts, in, out]`, which the expert layers read so,
     `dew.quantization.expert_matrix`) or a Linear's kernel its layout transposes from the source's
     `[out, in]` (a ModelOpt weight's, packed `[in, out]` already, which the layer reads so,
-    `dew.quantization.dense_matrix`); any other binding is refused, naming the weight, which a load
+    `dew.nn.dense.dense_matrix`); any other binding is refused, naming the weight, which a load
     without `packed_weights` decodes."""
     if not banks:
         return variables

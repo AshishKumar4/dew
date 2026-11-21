@@ -591,15 +591,11 @@ class Pretrained:
         (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
         loads natively, and "causal" turns a release's back off. A saved model states it in its own
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
-        `packed_weights` serves a quantized source's 4-bit weights as their codes
-        (`quantized_loads.packed_banks`), each an NVFP4 matrix (`dew.nn.kernels.formats.NvFp4`, exactly
-        the values its codes state) in the `QUANTIZATION` collection, which its layer multiplies as it is
-        and an export decodes, placed as its dense matrix: an MXFP4 source's routed experts, each bank one
-        tensor scale an expert holds (row 4516, scanned as its dense banks), and a ModelOpt source's
-        W4A16_NVFP4 Linears (row 8550, `dew.quantization.dense_matrix`); a weight that is not stays dense,
-        named in the load's log. A packed weight is frozen and multiplies its inputs rounded to bfloat16
-        (`gemm.nvfp4_product`); refused for a source of no quantized weights. A saved Dew run
-        loads as `dew export` writes it, at `step` with `ema` (`released_run`).
+        `packed_weights` serves a quantized source's 4-bit weights as their codes, frozen NVFP4 matrices
+        (`quantized_loads.packed_banks`, exactly its values) in `QUANTIZATION` that their layers multiply
+        (`gemm.nvfp4_product`) and an export decodes: an MXFP4 source's routed experts (row 4516) and a
+        ModelOpt source's W4A16_NVFP4 Linears (row 8550); one that is not stays dense, named in the log.
+        A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
         name_or_dir, trust_remote_code = released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
                                                          mesh=mesh, layout=layout)
@@ -2264,8 +2260,7 @@ def _translated(config: Mapping[str, object],
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
     if banks:
-        # The banks are the source's quantized weights too (`quantized_loads.packed_banks`), which an
-        # export writes back as it stored them: their stored tensors and the grid their codec encodes on.
+        # The banks are the source's quantized weights, written back as stored, on their codec's grid.
         codec = source_quantization(config)
         assert codec is not None, "packed banks are a quantized source's"
         specs = tensor_specs(given)

@@ -42,6 +42,21 @@ QWIX = importlib.util.find_spec("qwix") is not None
 """Whether Qwix is installed (`dew.quantization`'s extra), whose rules a layer's product may fall under."""
 
 
+QUANTIZATION = "quantization"
+"""The collection that holds a projection site's checkpoint quantization, at
+the site's own scope: every view of the variables (a scanned or staged
+stack, a packed group, a pipeline) carries it with the weights it scales."""
+
+
+def dense_matrix(module: nn.Module):
+    """A dense layer's packed kernel (`[in, out]`, `dew.nn.kernels.formats.NvFp4`: a checkpoint's 4-bit
+    weight served as its codes, row 8550) its `QUANTIZATION` collection holds under `kernel`, else None,
+    the layer's own parameter its kernel."""
+    if not module.has_variable(QUANTIZATION, "kernel"):
+        return None
+    return module.get_variable(QUANTIZATION, "kernel")
+
+
 def intercepted() -> bool:
     """Whether a wrapper owns the layer's product, which reaches it as a `jax.lax.dot_general` call: a Dew
     interception scope (`dew.quantization`, `dew.lora`: `dew._cache.INTERCEPTED`), or a Qwix rule matching
@@ -230,9 +245,6 @@ class Dense(_LinearEnvelope, nn.Dense):
         return intercepted()
 
     def _linear(self, inputs: Array) -> jax.Array:
-        # Imported here: dew.quantization imports the layers this module's callers build.
-        from dew.quantization import dense_matrix
-
         width = jnp.shape(inputs)[-1]
         axes = self.kernel_axes
         if (packed := dense_matrix(self)) is not None:
@@ -249,7 +261,7 @@ class Dense(_LinearEnvelope, nn.Dense):
 
     @nn.nowrap
     def _packed(self, inputs: Array, matrix) -> jax.Array:
-        """The layer over its packed kernel (`dew.quantization.dense_matrix`, a checkpoint's 4-bit weight
+        """The layer over its packed kernel (`dew.nn.dense.dense_matrix`, a checkpoint's 4-bit weight
         served as its codes, row 8550): its NVFP4 product (`gemm.nvfp4_product`: the inputs rounded to
         bfloat16, each code times its block's scale exact, the sums in fp32 and the matrix's tensor scale
         after), its fp32 sum plus its bias rounded once to the layer's dtype. Frozen, as the codes are a
