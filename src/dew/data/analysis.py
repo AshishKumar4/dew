@@ -124,8 +124,7 @@ class Measuring:
 
 
 def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
-            whole: Callable[[Source], Records] | None = None
-            ) -> tuple[Records | None, Mapping[str, object] | None]:
+            whole: Callable[[Source], Records] | None = None) -> tuple[Records | None, Mapping[str, object]]:
     """The records a memory read of `source` holds, then its metadata, with each fact `measuring`
     measures in place of any the store states, in a memory read: over the whole store's records,
     below any holdout (a generation's part's over the generation's rows for every input,
@@ -135,9 +134,6 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
     from dew.data.holdout import SelectedGeneration
     from dew.data.lowering import prepared_rows
 
-    if read != "memory" and not measuring:
-        # Its facts read where they are asked (`dew.data.compile._Facts.metadata`; row 9009).
-        return None, None
     if read != "memory":
         return None, source.metadata()
     store = _store(source)
@@ -177,8 +173,7 @@ def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Man
     consumed = _consumed(source, read)
     pipeline = Pipeline(consumed, tuple(prefix))
     if any(isinstance(stage, Configured) for stage in prefix):
-        held = _stated(consumed, read, _measures(prefix))[1]
-        stated = consumed.metadata() if held is None else held
+        stated = _stated(consumed, read, _measures(prefix))[1]
         pipeline = _configured(pipeline, stated, read, stated=stated)
     return _cache_manifest(consumed, pipeline.stages, read)
 
