@@ -105,7 +105,7 @@ def _merges(form):
     spec = SPECS[form]
     return (spec, lambda padded, stacked: tuple(merged.merged_padded(spec, padded, stacked, queries=QUERIES,
                                                                      width=WIDTH)),
-            functools.partial(merged._value, spec=spec, queries=QUERIES, width=WIDTH))
+            functools.partial(merged._value, units=algebra.units_of(spec), queries=QUERIES, width=WIDTH))
 
 
 @pytest.mark.parametrize("argnums", [0, 1], ids=["outputs", "states"])

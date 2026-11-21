@@ -951,6 +951,10 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
                                           heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
     assert priced is not None
     assert priced.device_bytes >= 2 * rows * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
+    # Non-deciding fallback target (sm80, row 8813 F2) also prices the common arm rather than returning None.
+    fallback = attention_decode.priced_step(generation.gpu_target("sm80"), rows=1, queries=1, keys=keys,
+                                            heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
+    assert fallback is not None and fallback.kernels >= 1 and fallback.device_bytes > 0
 
 
 @COMPILES_ON_CPU
