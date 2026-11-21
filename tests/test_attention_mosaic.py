@@ -2451,7 +2451,7 @@ def test_consumer_choice_persists_beside_verdicts_in_tuning_store(monkeypatch, t
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
         monkeypatch.setattr(attention_mosaic, "_choice_key", lambda *a, **kw: "choice-key")
-        monkeypatch.setattr(op, "_price_config",
+        monkeypatch.setattr(attention_mosaic.MosaicForward, "_price_config",
                             lambda *a, **kw: (_ for _ in ()).throw(AssertionError("warm start traced")))
         chosen = op.derived(ba, target)
         assert chosen is not None and chosen.consumers == 2

@@ -73,6 +73,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     certified_walk,
     column_slices,
     folded_form,
+    forward_block_plan,
     forward_products,
     logits_ahead,
 )
