@@ -1521,3 +1521,30 @@ def test_a_gated_product_across_a_barrier_is_never_fused(barred):
     assert fused and not crossed
     if barred is checkpointed_swiglu:
         assert any(equation.primitive is primitives.remat_p for equation in equations(made.jaxpr.jaxpr))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_mapped_products_written_casts_are_replayed_as_written():
+    """A manual mesh's product of row-split operands by a scale and a weight the program cast to vary itself
+    (`pcast`, JAX writing no cast of its own: `jax_auto_pcast` off) under the pass on an H100 whose template
+    a call names: the region's replay binds each cast as written (row 6578's review, F2: replayed as the
+    value it cast, the multiply's operands typed apart and refused), its product the template's launch per
+    shard, and the program computes as written."""
+    from jax._src import config as jax_config
+    from jax.sharding import Mesh, PartitionSpec
+
+    def scaled_product(x, w, scale):
+        scale, w = (jax.lax.pcast(value, ("data",), to="varying") for value in (scale, w))
+        return (x * scale) @ w
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows, whole = PartitionSpec("data"), PartitionSpec()
+    mapped = jax.shard_map(scaled_product, mesh=mesh, in_specs=(rows, whole, whole), out_specs=rows)
+    x, w, *_ = draw()
+    operands = (x, w, jnp.bfloat16(2))
+    with (jax_config.auto_pcast(new_val=False), generation.assumed("sm90"),
+          generation.chosen(grouped_matmul="mosaic")):
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(mapped, kernels=True)).trace(*operands)
+        assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+        assert_equal(rewritten(mapped, *operands), as_written(mapped, *operands))
