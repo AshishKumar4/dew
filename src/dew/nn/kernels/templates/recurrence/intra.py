@@ -450,7 +450,9 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
         def step(index, slots, carry, accumulators):
             del index
             slots.acquire_all()
-            whole = algebra.separated(*(stream_tile(slots, name, gates).value() for name in ("hi", "lo")))
+            # Each half laid in the family's layout (`Family.tile_of`), as the scan lays them.
+            whole = algebra.separated(*(family.tile_of(stream_tile(slots, name, gates).refs[0])
+                                        for name in ("hi", "lo")))
             mosaic.synced(call.interpret)
             for half, value in enumerate(whole):
                 plgpu.store(separated.at[half], value, optimized=False)
