@@ -258,6 +258,7 @@ class ScanCase:
 
         self.runs = {"scanned": self.measured(self.scanned, self.variables, self.training),
                      "plain": self.measured(self.plain, self.variables, self.training)}
+        self.scales: dict = {}
         self.drawn = drawn
         if selection_margins.selects(self.config):
             selected = selection_margins.capture(self.plain)
@@ -301,17 +302,24 @@ class ScanCase:
 
     def weighed(self, site: str):
         """The plain loop's rounding scale of `site`'s outputs at a draw (`rounding_bound.rounding_scale`),
-        which its weighed check reads (`assert_as_exact`'s `conditioning_scale`): the plain arm's own
-        program, its other outputs left unheld, replayed unrewritten. A site's walk alone: one over every
-        output held them all, past an armada worker's memory (row 9780), and a site pays it only where its
-        unweighted check stays undecided."""
-        run = self.computed(self.plain, self.variables, self.training)
-        written = unrewritten(lambda ids, cotangent: site_of(run(ids, cotangent), site))
+        which its weighed check reads (`assert_as_exact`'s `conditioning_scale`): its part (`site_of`) of
+        the scale of every output at that draw (`_scaled`), each element's scale the roundings upstream of
+        it alone, so a site's part is its own."""
+        return lambda inputs, seed: site_of(self._scaled(inputs, seed), site)
 
-        def scale(inputs, seed):
-            # Summed as the arms run it: the check's conditioning holds it under `summed_as_run`.
-            return rounding_scale(written, *inputs, seed=seed)[1]
-        return scale
+    def _scaled(self, inputs, seed: int):
+        """The plain loop's rounding scale of every output at a draw, its own program replayed unrewritten
+        (span-walked, `float64_terms.SPAN_STEPS`), walked once a draw for every site that asks it (row 9780,
+        the accuracy gate's ruling: a walk a site, twenty a draw, ran a conditioned map task past its
+        deadline; one a draw takes 128 s to compile and 1.3 s a draw after, 3.3 GiB at its peak), summed as
+        the check's conditioning holds its arms (`summed_as_run`)."""
+        key = (seed, *(np.asarray(value).tobytes() for value in jax.tree.leaves(inputs)))
+        if key not in self.scales:
+            if "written" not in self.runs:
+                run = self.computed(self.plain, self.variables, self.training)
+                self.runs["written"] = unrewritten(lambda ids, cotangent: run(ids, cotangent))
+            self.scales[key] = rounding_scale(self.runs["written"], *inputs, seed=seed)[1]
+        return self.scales[key]
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
