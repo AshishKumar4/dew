@@ -435,7 +435,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
            sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
-           bounds: jax.Array | None = None, finished: Literal[True] = True, in_key: bool = False
+           bounds: jax.Array | None = None, finished: bool = True, in_key: bool = False
            ) -> jax.Array | Initial:
     """A decode step's attention through the template: `query` `[B, T, H, D]` over `key` `[B, K, KV, D]` and
     `value` `[B, K, KV, Dv]` (`[R, K, KV, D]` with `sources`, batch row `b` reading key row `sources[b]`;
