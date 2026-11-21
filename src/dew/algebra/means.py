@@ -48,28 +48,8 @@ import numpy as np
 from jax.interpreters import ad
 
 from dew.algebra import scaled
-from dew.algebra.ratios import (
-    Ratio as Ratio,
-    Summed as Summed,
-    _ratio_sum,
-    ratio as ratio,
-    ratio_p as ratio_p,
-)
-from dew.algebra.windows import (
-    CEILING as CEILING,
-    CHUNK as CHUNK,
-    FLOOR as FLOOR,
-    Units as Units,
-    _arrays,
-    _factors_value as _factors_value,
-    _laid_to,
-    _landed,
-    _quotient,
-    _streamed,
-    _Sum,
-    _without_axis,
-    chunk_width as chunk_width,
-)
+from dew.algebra.ratios import Ratio, _ratio_sum, ratio
+from dew.algebra.windows import Units, _arrays, _laid_to, _landed, _quotient, _streamed, _Sum, _without_axis
 from dew.nn.derivatives import contracted
 from dew.nn.precision import two_product, two_sum
 

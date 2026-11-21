@@ -29,7 +29,7 @@ from op_certificates import (
     two_sum,
 )
 
-from dew.algebra import means, scaled
+from dew.algebra import ratios, scaled, windows
 from dew.nn.precision import correctly_rounded_divide_p
 from dew.nn.programs import dot_arithmetic
 
@@ -508,7 +508,7 @@ def _exactly(values) -> np.ndarray:
 
 
 def _plain_fold(anchors: np.ndarray, joined: np.ndarray, scale: float) -> np.ndarray:
-    """Plain units' base-2 exponent of each factor (`means.Units(compensated=False)`) as the law's
+    """Plain units' base-2 exponent of each factor (`windows.Units(compensated=False)`) as the law's
     specification folds it, each step rounded in float32 apart from the law's code: the anchors' difference
     (at half each where it passes the format, doubled after: exact powers of two), times the scale times
     `log2(e)` rounded to float32, the product rounded (the merge P0's base review 12, F3: the fold, 0.24% off
@@ -524,28 +524,28 @@ def _plain_fold(anchors: np.ndarray, joined: np.ndarray, scale: float) -> np.nda
 
 EXPONENT_ROUNDING = 4
 """The relative rounding, in units of the format's roundoff, of the base-2 exponent a ratio's factor compares
-with its cutoffs (`_factors_hold`, `means._factors_value`'s high part): plain units round the anchors'
+with its cutoffs (`_factors_hold`, `windows._factors_value`'s high part): plain units round the anchors'
 difference, the scale times `log2(e)` and their product once each, `3u + O(u^2)`; compensated units the
 exponent's high part once and leave the difference's error in its low part, `2u + O(u^2)`; four bounds
 both."""
 
 
 def _factors_hold(form, laid, fmt, formed=None) -> bool:
-    """Whether each exponential factor a ratio reads (`means.Ratio`'s `("e", i, j)`, its numerator's, its
-    denominator's and its products' sums') is, as the ratio forms it (`means._factors_value`, the factor it
+    """Whether each exponential factor a ratio reads (`ratios.Ratio`'s `("e", i, j)`, its numerator's, its
+    denominator's and its products' sums') is, as the ratio forms it (`windows._factors_value`, the factor it
     receives), the exponential `exp(s (a_i - a_j))` of its anchors as read within its own stated roundings,
     checked apart from the code that forms it: the exact exponent `s (a_i - a_j)` (`s` the units' scale in
     the format) and its exponential enclosed by mpmath at 80 bits (`interval_precision`), the received factor
     within `2 u reach + 0.85 u + 4 ln2 u^2 |v| + u^2` of it relatively (`reach` the lane's exp's, `v` the
     exponent in base 2: the exponential's one rounding, its argument's two, the base-2 exponent's residual),
-    finite and nonzero wherever `v` is within its cutoffs (`means.FLOOR`, `means.CEILING`), zero past the
+    finite and nonzero wherever `v` is within its cutoffs (`windows.FLOOR`, `windows.CEILING`), zero past the
     floor, NaN past the ceiling, either within `EXPONENT_ROUNDING u |v|` of a cutoff, where the exponent the
-    law compares (`means._factors_value`'s high part) may round across it; a binade either side passed a
+    law compares (`windows._factors_value`'s high part) may round across it; a binade either side passed a
     zero factor in range (the merge P0's base review 11, F4). The ratio is then certified on the
     factors it received (`_ratio_factor`); one that fails here fails the call, which a factor's own fault
     would otherwise pass on both sides (the merge P0's base review 10, F6). `formed` forms the factors it
-    checks, the law's (`means._factors_value`) unless given."""
-    formed = means._factors_value if formed is None else formed
+    checks, the law's (`windows._factors_value`) unless given."""
+    formed = windows._factors_value if formed is None else formed
     terms = [*form.numerator, *form.denominator,
              *(term for _, sums in form.products for each in sums for term in each.terms)]
     pairs = {factor[1:] for _, factors in terms for factor in factors if factor[0] == "e"}
@@ -580,15 +580,15 @@ def _factors_hold(form, laid, fmt, formed=None) -> bool:
                     continue
                 v = fractions.Fraction(fold)
                 x, slack, residual = None, 0, 0
-            if v < means.FLOOR - slack:
+            if v < windows.FLOOR - slack:
                 if got != 0:
                     return False
                 continue
-            if v > means.CEILING + slack:
+            if v > windows.CEILING + slack:
                 if not math.isnan(got):
                     return False
                 continue
-            near = abs(v - means.FLOOR) <= slack or abs(v - means.CEILING) <= slack
+            near = abs(v - windows.FLOOR) <= slack or abs(v - windows.CEILING) <= slack
             if near and (got == 0 or math.isnan(got)):
                 continue
             if not math.isfinite(got):
@@ -605,15 +605,15 @@ def _factors_hold(form, laid, fmt, formed=None) -> bool:
 
 
 def _ratio_factor(factor, laid, units) -> np.ndarray:
-    """A ratio's factor (`means.Ratio`) exactly, as the ratio forms it: an operand as it is (a subnormal's
+    """A ratio's factor (`ratios.Ratio`) exactly, as the ratio forms it: an operand as it is (a subnormal's
     value kept, read from its bits: `scaled`'s account), the units' scale in the format, an exponential its
     factor as formed
-    (`means._factors_value`, a stated input: its one rounding is the exponential's), None where it is NaN."""
+    (`windows._factors_value`, a stated input: its one rounding is the exponential's), None if NaN."""
     if factor[0] == "v":
         return _exactly(laid[factor[1]])
     if factor[0] == "s":
         return _exactly(np.float32(units.scale))
-    significand, exponent = means._factors_value(np.float32(laid[factor[1]]), np.float32(laid[factor[2]]),
+    significand, exponent = windows._factors_value(np.float32(laid[factor[1]]), np.float32(laid[factor[2]]),
                                                  units=units)
     made = _exactly(significand)
     for place, power in np.ndenumerate(np.asarray(exponent)):
@@ -623,7 +623,7 @@ def _ratio_factor(factor, laid, units) -> np.ndarray:
 
 
 def _ratio_sums(terms, laid, form, shape, axis, over=()):
-    """A ratio's sum of `terms` (`means.Ratio`) exactly and its terms' magnitudes' sum, over `axis` where
+    """A ratio's sum of `terms` (`ratios.Ratio`) exactly and its terms' magnitudes' sum, over `axis` where
     given, and whether a term of it is NaN (a factor past its reach), each of the result's shape. A term
     with an exactly zero factor is zero whatever its others (`means._product`: a state of no mass, its
     factor past its reach included); over `over` each term is summed across its own extent there, one of
@@ -660,7 +660,7 @@ def _ratio_sums(terms, laid, form, shape, axis, over=()):
 
 
 def _ratio_holds(params, operands, result, fmt):
-    """`means.ratio_p`'s contract (its compensated sum's bound, `means`'s account): each element of the
+    """`ratios.ratio_p`'s contract (its compensated sum's bound, `means`'s account): each element of the
     ratio `R = N / D` of its operands as read and its factors as formed (`_ratio_factor`), exact, within
     `u |R| + u gamma_(n(f+3)+4) (sum |N's terms| + |R| sum |D's terms|) / |D|` (`n` its summands, `f` a term's
     most factors: each term a double float within `(f+3) u^2` of itself, their sum compensated, the quotient's
@@ -736,7 +736,7 @@ def _ratio_holds(params, operands, result, fmt):
 
 
 def _products_hold(form, laid, shape, result, fmt):
-    """`_ratio_holds` of a numerator of products of sums (`means.Ratio.products`), `R = sum_t c_t prod_j
+    """`_ratio_holds` of a numerator of products of sums (`ratios.Ratio.products`), `R = sum_t c_t prod_j
     S_tj / D^q`: each sum exactly (`_ratio_sums`) and within `E_j = u gamma_(n(f+3)+4) sum |its terms|` of
     its compensated value (the classic numerator's bound, sum by sum), each product of them within
     `|c| (prod_j (|S_j| + E_j) - prod_j |S_j|)` of its exact one beside its double floats' products'
@@ -836,7 +836,7 @@ def _landed_hold(result, quotients, slack, undefined, none, fmt) -> np.ndarray:
             holds[place] = math.isnan(got)
             continue
         if got == 0 and math.copysign(1.0, got) < 0:
-            # A ratio lands a zero as +0 (`means.Ratio`), whatever sign its exact value has.
+            # A ratio lands a zero as +0 (`ratios.Ratio`), whatever sign its exact value has.
             continue
         if none[place]:
             holds[place] = got == 0
@@ -1813,7 +1813,7 @@ CONTRACTS = {
     jax.lax.square_p: _rounding(jax.lax.square_p, _wrapping(lambda a: a * a)),
     jax.lax.div_p: _rounding(jax.lax.div_p, _truncated),
     correctly_rounded_divide_p: _correctly_divided,
-    means.ratio_p: _ratio_holds,
+    ratios.ratio_p: _ratio_holds,
     # A float's significand and exponent (`scaled.split_p`), a value's alone: each result exact, bit for bit.
     scaled.split_p: _moved(lambda params, x, index: _split_part(x, int(index))),
     # A remainder (C's, the dividend's sign) is exact in IEEE arithmetic and in integers, and a sign is a

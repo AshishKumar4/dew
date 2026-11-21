@@ -1060,7 +1060,7 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
     from test_merged import _traced_merge_bytes
 
-    from dew.algebra import means
+    from dew.algebra import windows
     from dew.nn.kernels.templates import merged
 
     target = generation.gpu_target("sm90")
@@ -1084,7 +1084,7 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     emitted_bytes = _traced_merge_bytes(merge_eq.params["units"], padded_s, stacked_s, queries, width, block,
                                         out_dtype=out_dtype, out_heads=out_heads)
     slices = padded_s.shape[1]
-    merge_span = float(3 * -(-slices // means.chunk_width(slices)))
+    merge_span = float(3 * -(-slices // windows.chunk_width(slices)))
     walk_launches = [w for eq in programs.equations(traced.jaxpr)
                      if eq.primitive in programs.NATIVE_KERNELS
                      and (w := emission.work_of(eq)) is not None]
