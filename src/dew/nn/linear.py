@@ -623,14 +623,14 @@ def sequence_split(decode: bool, coordinates: Coordinates) -> int:
 
 
 class Heads(NamedTuple):
-    """How a recurrent mixer's operands hold its heads for a split over them (`over_sequence`): `count` its
+    """How a recurrent mixer's operands hold its heads for a split over them (`over_sequence`): `number` its
     heads (a token's `activation_heads`), `groups` what their split must divide (a delta rule's key heads,
     Mamba-2's B and C groups, the heads themselves where none group them), and `at` the dimension holding
     them of each operand that has them, by its index among the tokens then the whole (`on_shards`' `heads`):
     a token's at 2, `[B, S, H, ...]` or its channels `[B, S, H * D]` laid a head at a time, a weight's or a
     conv's taps' at 0."""
 
-    count: int
+    number: int
     groups: int
     at: Mapping[int, int]
 
@@ -647,7 +647,7 @@ def over_sequence(local, shards: int, tokens: tuple, whole: tuple, *, heads: Hea
     if length % shards:
         raise LayoutRefused(f"the sequence of {length} tokens splits {shards} ways over the mesh's sequence "
                             f"axis, and it does not divide")
-    rows, sequence, split = (sequence_heads(batch, length, heads.count, heads.groups) if heads is not None
+    rows, sequence, split = (sequence_heads(batch, length, heads.number, heads.groups) if heads is not None
                              else (*logical_spec(("activation_batch", "activation_length"), (batch, length)),
                                    None))
     operands = (*tokens, *whole)
