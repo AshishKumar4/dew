@@ -1694,8 +1694,10 @@ def test_sm90_and_sm80_d256_forward_fit_single_launch_without_spills():
                 cfg = op.derived(ba, target)
                 assert cfg is not None, (gen, label)
                 assert cfg.columns is None, (gen, label, cfg)
+                # Step to 1 consumer (255 regs/thread) as live certification does when 2-consumer 168-reg spills.
+                one = dataclasses.replace(cfg, consumers=1, relaunch_consumers=1)
                 cases.append(KernelCase(f"{gen}-d256-{label}",
-                                        lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)))
+                                        lambda op=op, ba=ba, cfg=one: op.lowering(ba, cfg)))
             found = compile_mosaic_kernels(cases, gen)
             main_failures = [f for f in mosaic_failures(found) if "attention_forward_natural" not in f]
             assert not main_failures, "\n".join(main_failures)
