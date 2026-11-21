@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from arm_arithmetic import float64_held
+from arm_arithmetic import float64_held, summed_as_run
 from flax import linen as nn
 from model_support import flat_tree, largest_difference, stepped_decode, steps_from
 from reference_error import (
@@ -32,6 +32,7 @@ from reference_error import (
     widened,
     without_ynn,
 )
+from rounding_bound import rounding_scale
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -209,6 +210,16 @@ shapes' bit for bit on a CPU), the most any platform gives: Gemma 3n's 128 on an
 the selection margin (8 on armada); the others' on armada, whose errors are heavy-tailed across draws: the
 four largest of 1024 draws hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek
 one's, which the plain loop against itself resolves within no 512 draws."""
+
+SCAN_CONDITIONING = {"gemma3n": 128}
+"""The weighed check's declared seeds of a shape whose draws admit near ties (`assert_as_exact`'s
+`conditioning`, sized by `seeds_for(..., conditioning=True)` on armada): Gemma 3n's, whose unit just above
+its cutoff holds an activation mostly float32's rounding (`SCAN_MARGIN`), so where its unweighted check stays
+undecided each element's error is weighed by the plain loop's own rounding there and a draw near that tie
+is judged at its own conditioning (an exact widening of float64 sums moved one admitted draw to such a tie,
+its kept unit's gradient row 4.1e-3 off float64 in the loop and 8.9e-3 scanned)."""
+
+
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
     """Every metric within `relative` of the other run's; perplexity is exp
     of the cross entropy, so an absolute bound would say nothing about it."""
@@ -267,9 +278,12 @@ class ScanCase:
             self.draw = drawn
 
     def measured(self, model, forward, trained):
+        """`computed`, compiled as both arms of a check between Dew's paths are (`without_ynn`)."""
+        return without_ynn(self.computed(model, forward, trained))
+
+    def computed(self, model, forward, trained):
         """The logits under `forward`, and the loss with its gradients under `trained` and the draw's
-        cotangent (as `with_gradients` gives them), compiled as both arms of a check between Dew's paths
-        are (`without_ynn`)."""
+        cotangent (as `with_gradients` gives them)."""
         def run(ids, cotangent):
             def loss(params):
                 logits = model.apply({**trained, "params": params}, ids)
@@ -279,7 +293,15 @@ class ScanCase:
             value, pull = jax.vjp(loss, trained["params"])
             gradients, = pull(cotangent)
             return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
-        return without_ynn(run)
+        return run
+
+    def scale(self, inputs, seed):
+        """The plain loop's rounding scale at a draw (`rounding_bound.rounding_scale`, as its arm sums:
+        `summed_as_run`), which the weighed check reads (`assert_as_exact`'s `conditioning_scale`): its
+        program traced here, where its arm runs compiled apart (`without_ynn`)."""
+        with summed_as_run():
+            return rounding_scale(self.computed(self.plain, self.variables, self.training), *inputs,
+                                  seed=seed)[1]
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
@@ -307,7 +329,7 @@ def scans_as_the_loop(shape: str) -> None:
     case = ScanCase(shape)
     scanned, plain, truth = case.arms()
     assert_as_exact(scanned, plain, case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
-                    truth_fn=truth)
+                    truth_fn=truth, conditioning=SCAN_CONDITIONING.get(shape), conditioning_scale=case.scale)
 
 
 @pytest.mark.parametrize("shape", sorted(set(SHAPES) - {"gemma3n"}))
@@ -317,7 +339,7 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     scans_as_the_loop(shape)
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=24)
+@pytest.mark.check1_shards(seeds=128, per_task=24, conditioning=128, conditioning_per_task=24)
 def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
     """`scans_as_the_loop` over Gemma 3n's shape, its 128 seeds and their redraws drawn by CI's map tasks
     (`check1_shards`), 24 a task: tasks of 32 took 79 to 115 s on armada's 25/17 workers (f1c0868b8),
@@ -804,23 +826,36 @@ def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches
     """The objective's loss, metrics and gradients on `spec`'s mesh over
     `devices` (every device by default), with the pipeline's schedule of
     `microbatches` in context the way the trainer's compiled step puts it
-    there."""
+    there (`stepping`'s, at one batch)."""
+    return stepping(objective, spec, variables, devices, microbatches)(batch)
+
+
+def stepping(objective, spec, variables, devices=None, microbatches=None):
+    """A batch's loss, metrics and gradients (`loss_and_grads`'), the objective's variables placed on `spec`'s
+    mesh once and its step compiled once for every batch of one shape, the batch its argument: a check's
+    draws each one call, where each draw placed, traced and compiled its step anew (rows 10147, 10162: a
+    pipelined arm's eight draws, 864 s of a CI task)."""
     mesh = spec.build(devices)
     layout = Layout(min_shard=TINY_SHARD)
     # The run's table of its parameters' axes, as the trainer holds it while it places and steps.
     with boxed(objective.parameter_axes):
         placed = jax.device_put(variables, layout.shardings(mesh, variables))
     assert_sharded(placed["params"], mesh)
-    batch = shard_batch(mesh, batch)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
-    def loss(params):
+    def loss(params, batch):
         return objective.scalar_loss({**variables, "params": params}, batch, step)
 
-    with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
-        (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
-    return (float(value), {name: float(number) for name, number in aux.metrics.items()},
-            jax.tree.map(np.asarray, grads))
+    program = jax.jit(jax.value_and_grad(loss, has_aux=True))
+
+    def run(batch):
+        batch = shard_batch(mesh, batch)
+        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
+            (value, aux), grads = program(placed["params"], batch)
+        return (float(value), {name: float(number) for name, number in aux.metrics.items()},
+                jax.tree.map(np.asarray, grads))
+
+    return run
 
 
 def layer_states(model, variables, ids):
@@ -1033,11 +1068,15 @@ def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_
         twin, wide = tiny(max_seq_len=16, dtype=jnp.float64, **FUSED_DELTA_STACK), float64_held(variables)
 
     def stepped(model, variables, spec, microbatches=None, devices=four):
-        # Each arm placed and compiled on its own mesh, called as given (`loss_and_grads` sets its mesh).
+        # Each arm placed and compiled on its own mesh at its first draw, in the context the check calls it
+        # in (the truth's x64), and called as given at every draw after (`stepping` sets its mesh).
+        held = []
+
         @as_given
         def step(text):
-            loss, _, grads = loss_and_grads(LMObjective(model, 16), spec, variables, {"text": text}, devices,
-                                            microbatches)
+            if not held:
+                held.append(stepping(LMObjective(model, 16), spec, variables, devices, microbatches))
+            loss, _, grads = held[0]({"text": text})
             return np.float32(loss) if model is not twin else np.float64(loss), grads
 
         return step

@@ -41,6 +41,7 @@ from dew.nn.precision import (
     compensated_add,
     compensated_difference,
     exact_products,
+    float64_sum,
     fp32_result_dot_general,
     two_product,
     two_sum,
@@ -1408,6 +1409,16 @@ def test_a_host_scalar_widens_at_its_destination():
     F2)."""
     found = widened_exactly(2 ** 40, jnp.float32)
     assert found.dtype == jnp.float32 and float(found) == 2.0 ** 40
+
+
+def test_a_float64_sum_widens_its_subnormal_operands_exactly():
+    """`float64_sum`, Dew's wide CPU arithmetic's sum, of fp32 operands below the least normal: `2^-149 2^127`
+    and `(2^-126 - 2^-149) 2^127` taken in float64 and rounded once to fp32, `2^-22` and `2 - 2^-22`, where
+    widened by a cast XLA:CPU flushed them and each product was 0 (rows 8966, 9780)."""
+    lhs = jnp.asarray(np.asarray([[1], [0x7FFFFF]], np.uint32).view(np.float32))
+    found = float64_sum(jnp.matmul, lhs, jnp.asarray([[2.0 ** 127]], jnp.float32), dtype=jnp.float32)
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), np.float32([[2.0 ** -22], [2.0 - 2.0 ** -22]]))
 
 
 def test_an_exact_widening_transposes_as_a_cast():
