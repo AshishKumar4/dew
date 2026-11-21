@@ -410,7 +410,7 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
             if external and not is_head:
                 continue
             claiming = args.claim and any(map(claimed, probe.rows))
-            if args.only and not claiming and not any(word in name for name in names for word in args.only):
+            if not claiming and not chosen(probe, args.only):
                 continue
             done = None
             try:
@@ -617,6 +617,12 @@ def compile_samples(name: str, seconds: float, parts: Mapping[str, float] | None
             **{f"{name} {part}": float(parts.get(part, 0.0)) for part in SHOWN_PARTS}}
 
 
+def chosen(probe: "Probe", only: list[str] | None) -> bool:
+    """Whether `--only`'s words (`only`, none: every probe) choose `probe`: any of them in any of its rows'
+    names, as `run` and `ahead_battery` both select it."""
+    return not only or any(word in row.name for row in probe.rows for word in only)
+
+
 def ahead_battery(args: argparse.Namespace) -> int:
     """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, for one
     compile-only GPU of the kind, `COMPILE_TARGETS`), in each tree's environment of `--lock`, into
@@ -631,9 +637,11 @@ def ahead_battery(args: argparse.Namespace) -> int:
     head_path = Path(trees[args.head.split("=", 1)[0]])
     pythons, unbuilt = environments(tuple((name, Path(path)) for name, path in trees.items()), args.lock,
                                     args.environments)
-    cases = [case for name, case in STEP_CASES.items()
-             if (not args.only or any(word in name for word in args.only))
-             and device in STEP_HARDWARE.get(name, (device,))]
+    # The step probes `run` would run (`chosen`, by any of its rows' names: its step's, its peak's, its
+    # MFU's), each compiled ahead, so a run handed this directory finds every step it measures (row 10796).
+    cases = [STEP_CASES[probe.rows[0].name] for probe in PROBES
+             if probe.tool == "benchmark_step.py" and probe.rows[0].name in STEP_CASES and chosen(probe, args.only)
+             and device in STEP_HARDWARE.get(probe.rows[0].name, (device,))]
     # What each tree's benchmark_step takes, asked first: every tree's steps are compiled ahead, or none is,
     # so no arm's GPU compiles (and autotunes) what another arm's prepare compiled offline (review: a base
     # that could not compile over the node's GPUs ran tuned on the GPU beside a head compiled at autotune 0).

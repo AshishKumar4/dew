@@ -235,13 +235,14 @@ class BenchmarkConfig:
     (`PEAK_STAGE`): the warm stage compiles and profiles nothing; the measure stage measures, its peak read
     by peak_memory as it exits. Its rows go to `json_out` with the stage's name after it."""
     ahead: str | None = None
-    """A directory of steps compiled ahead (`compile_ahead`, a case's file named by `ahead_name`): a case
-    that has one runs it as its first step where it is that program, so its GPU compiles none of it."""
+    """A directory of steps compiled ahead (`compile_ahead`, a case's file named by `ahead_name`): each case
+    runs its step as its first where it is that program, so its GPU compiles none of it; a case it lacks is
+    refused (`measure`)."""
     compile_ahead: str | None = None
     """Compile each case's step ahead of its run into this directory, for one compile-only GPU of
     `generation` holding `capacity_gib` (`benchmark_models.ahead_of`), and measure nothing: a GPU node's
     prepare, on its CPU, for its run's `ahead`. A step holding a kernel this host cannot lower is refused
-    (`selection.Unlowerable`), so none is saved and the run compiles its own on the GPU."""
+    (`selection.Unlowerable`): the rest saved, the prepare fails, and no run takes the directory as whole."""
     generation: str | None = None
     """The CUDA generation `compile_ahead` compiles for (sm80, sm90)."""
     capacity_gib: int | None = None
@@ -604,7 +605,11 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
     if config.steps < 1:
         raise ValueError(f"--steps must be at least 1, got {config.steps}")
     found = None if config.ahead is None else Path(config.ahead) / ahead_name(case)
-    ahead = AheadOfTime.load(found) if found is not None and found.is_file() else None
+    # A directory handed holds each case's step, its prepare failing any it could not compile: a case it
+    # lacks is refused, never compiled here in its place (row 10796).
+    if found is not None and not found.is_file():
+        raise SystemExit(f"{found}: no step compiled ahead for {case.architecture}, in the directory handed")
+    ahead = AheadOfTime.load(found) if found is not None else None
     # A step compiled for as many devices as this run's is its program; one for another count is not handed.
     handed = ahead if ahead is not None and ahead.devices == jax.device_count() else None
     trainer = build_trainer(case, config.attention_impl, ahead=handed)
@@ -811,13 +816,18 @@ def main(config: BenchmarkConfig) -> list[Row]:
         if config.generation is None or config.capacity_gib is None:
             raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and --capacity-gib")
         Path(config.compile_ahead).mkdir(parents=True, exist_ok=True)
+        refused = []
         for case in build_cases(config):
             try:
                 ahead = ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl)
-            except Unlowerable as refused:
-                print(f"{ahead_name(case)} ({case.architecture}): not compiled ahead: {refused}", flush=True)
+            except Unlowerable as refusal:
+                refused.append(f"{ahead_name(case)} ({case.architecture}): {refusal}")
                 continue
             ahead.save(Path(config.compile_ahead) / ahead_name(case))
+        # Each case this host compiled is kept, and a refused one fails the prepare: a run handed this
+        # directory takes each case's step from it, never its own compile in its place (row 10796).
+        if refused:
+            raise SystemExit(f"not compiled ahead, so this prepare fails: {'; '.join(refused)}")
         return []
     # Each case in processes of its own (`measured_row`), this one opening no backend, which would hold the
     # device they need; a pool's processes and a case's own measure in process.
