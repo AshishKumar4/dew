@@ -139,21 +139,23 @@ def _materialize(
     counts: dict[str, CorpusCounts],
     *,
     training: bool = True,
+    sealing: bool = False,
 ) -> Pipeline:
     if isinstance(pipeline.source, Phases):
         raise ValueError("materialize each phase before constructing its global order")
     if isinstance(pipeline.source, Concatenated):
         # Each member held as its own read holds it; the join reads them where it stands.
         return with_children(
-            pipeline, lambda child: _materialize(child, counts, training=training))
+            pipeline, lambda child: _materialize(child, counts, training=training, sealing=sealing))
     if isinstance(pipeline.source, Combined):
-        return _memory_mixture(pipeline, pipeline.source, counts, training=training)
+        return _memory_mixture(pipeline, pipeline.source, counts, training=training, sealing=sealing)
     source = pipeline.source
     stored = source.records("memory")
     counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline), _label(pipeline)))
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
-    lowering = _analyzed(pipeline, "memory", validation=not training)
+    # A sealing pass's draws stand as its records do (`compile._prepared`'s `sealing`).
+    lowering = _analyzed(pipeline, "memory", validation=not training and not sealing)
     # A cache among the eager stages fills over the whole source here; one after a view of the
     # inputs is the lowering's, which reads it by input (`_Build.indexed`).
     eager = lowering.cache if lowering.cache is not None and lowering.eager > lowering.cache else None
@@ -484,8 +486,9 @@ def _memory_mixture(
     counts: dict[str, CorpusCounts],
     *,
     training: bool,
+    sealing: bool = False,
 ) -> Pipeline:
-    children = tuple(_measured_targets(_materialize(child, counts, training=training),
+    children = tuple(_measured_targets(_materialize(child, counts, training=training, sealing=sealing),
                                        mixture)
                      for child in mixture.pipelines)
     # A mix ends at its first exhausted member, as an online read of it does (docs/design/data.md, combine):
