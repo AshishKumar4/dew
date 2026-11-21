@@ -184,16 +184,20 @@ def student_pullback(*, wide: bool):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("tiled", [False, True], ids=["whole", "tiled"])
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
-def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
+def test_the_loss_and_its_terms_match_the_maxtext_reference(kind, tiled):
     """Loss and every reported term on par with the reference's own float32
     run over drawn students, teachers and projections (check 1): the truth
     runs the reference in float64 on the student's float64 forward, the
     reference in float32 on its float32 one, both beside the teacher's
     forward that Dew runs (`teacher_outputs`). Padding sits in the batch, so
-    the mask is part of what agrees."""
+    the mask is part of what agrees. With the student's head tiled (row 9067), the full KL reads both
+    models' logits a tile of positions at a time, and the terms agree as they do whole."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
+    if tiled:
+        assert objective.tile_head((3, META["student"]["vocab_size"])) is not None
     ids = jnp.asarray(arrays["tokens"][:, :-1])
     named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss", "distill/kl": "kl_div_at_T",
              "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
@@ -714,3 +718,39 @@ def test_a_teacher_with_another_tokenizer_of_the_same_size_is_refused(tmp_path):
     DistillationObjective(student, teacher, tokenizers=(str(chat), str(chat)))
     with pytest.raises(ValueError):
         DistillationObjective(student, teacher, tokenizers=(str(chat), str(swapped)))
+
+
+def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
+    """A distillation whose student's head is tiled computes its full KL's gradient holding no
+    `[B, S, vocab]` logits of either model, where whole its program holds them (row 9067: both whole
+    logits tensors were materialized whatever the rung said)."""
+    arrays = fixture()
+    objective, params = fixture_objective(arrays)
+    batch = fixture_batch(arrays)
+    rows, positions = batch[TEXT_KEY].shape[0], batch[TEXT_KEY].shape[1] - 1
+    vocab = META["student"]["vocab_size"]
+
+    import jax.extend
+
+    whole = {(rows, positions, vocab), (rows * positions, vocab)}
+
+    def holds_whole(program) -> bool:
+        """Whether any value `program` computes, in any of its nested programs, is a whole logits tensor."""
+        def walk(jaxpr) -> bool:
+            for equation in jaxpr.eqns:
+                if any(tuple(getattr(var.aval, "shape", ())) in whole for var in equation.outvars):
+                    return True
+                inner = [value for held in equation.params.values()
+                         for value in (held if isinstance(held, tuple) else (held,))
+                         if isinstance(value, (jax.extend.core.Jaxpr, jax.extend.core.ClosedJaxpr))]
+                if any(walk(getattr(value, "jaxpr", value)) for value in inner):
+                    return True
+            return False
+        return walk(jax.make_jaxpr(program)(params).jaxpr)
+
+    def gradient(params):
+        return jax.grad(lambda held: objective.scalar_loss(held, batch, step_at())[0])(params)
+
+    assert holds_whole(gradient)
+    assert objective.tile_head((3, vocab)) is not None
+    assert not holds_whole(gradient)
