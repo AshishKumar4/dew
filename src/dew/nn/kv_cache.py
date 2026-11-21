@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
+PagedKernel = PagedKernel
 """The storage formats a quantized cache takes."""
 
 TABLE = "page_table"
@@ -1099,7 +1100,7 @@ class KVStore:
     def paged_kernel(
         self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
         windowed: bool = False, sinks: bool = False,
-    ) -> Literal["template", "triton", "tpu"] | None:
+    ) -> PagedKernel | None:
         """The paged kernel the selector gives a decode step's query over this pool (`PAGED`, over its one
         `case`), reported as the step's route, which `decode` runs; None where no paged kernel takes it and
         the layer reads the gathered rows itself."""
@@ -1119,7 +1120,7 @@ class KVStore:
             return self._get(TABLE).shape[1] * self.layout.page_size
         return self._get(self.payloads[0][0]).shape[1]
 
-    def decode(self, query: jax.Array, lengths: jax.Array, kernel: Literal["template", "triton", "tpu"],
+    def decode(self, query: jax.Array, lengths: jax.Array, kernel: PagedKernel,
                softcap: float | None, starts: jax.Array | None = None,
                sinks: jax.Array | None = None) -> jax.Array:
         """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row,

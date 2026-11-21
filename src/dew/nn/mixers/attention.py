@@ -66,6 +66,7 @@ from dew.nn.kv_cache import (
     TABLE,
     Append,
     KVCache,
+    PagedKernel,
     KVSpec,
     KVStore,
     Opened,
@@ -1764,7 +1765,7 @@ class CausalSelfAttention(nn.Module):
             key_value_seq_lengths=reads.astype(jnp.int32), key_value_seq_starts=starts)
         return checkpoint_name(attention, Residual.CONTEXT)
 
-    def _paged_kernel(self, store, query, windowed: bool, sunk: bool = False) -> str | None:
+    def _paged_kernel(self, store, query, windowed: bool, sunk: bool = False) -> PagedKernel | None:
         """The paged kernel a decode step's query `[rows, heads, head_dim]` reads the pool `store` through
         (`KVStore.decode`), as the paged selector chooses it (`PAGED`) for the step's one case
         (`KVStore.case`: the pool's widths, the layer's arithmetic and implementation), reported as the
@@ -1843,7 +1844,7 @@ class CausalSelfAttention(nn.Module):
                                        jnp.asarray(held & (kept == last), jnp.int32))
         return documents, True, None if window is None or window >= held.shape[-1] else window
 
-    def _paged(self, append: Append, kernel: str, query: jax.Array, positions: jax.Array, starts=None,
+    def _paged(self, append: Append, kernel: PagedKernel, query: jax.Array, positions: jax.Array, starts=None,
                sinks=None) -> jax.Array:
         """One decode step through the paged `kernel` the step's selection gave it (`_paged_kernel`), which
         reads the pool through the page table from each row's `starts` under a window; the gathered keys
