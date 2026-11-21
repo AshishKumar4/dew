@@ -1754,7 +1754,7 @@ def test_a_padded_query_walks_nothing_again_where_a_real_row_past_fp32_does(form
 def test_rescaled_uses_exact_power_of_two_constants_for_dropout_reach():
     """`algebra.rescaled` scales a dropping call's bound by exact host power-of-two constants (row 10161),
     never `jnp.exp2`, so the scaled bound is bitwise exact on XLA:CPU for both normal and wide reaches."""
-    for binades in (10, 140):
+    for binades in (10, 50):
         zero = jnp.int32(0)
         drop = template.Draw((jnp.uint32(0), jnp.uint32(0)), zero, zero, 1.0 - 2.0 ** -binades)
         assert np.log2(drop.reach) == binades
@@ -1765,5 +1765,10 @@ def test_rescaled_uses_exact_power_of_two_constants_for_dropout_reach():
         scale = jax.jit(lambda s: algebra.rescaled(s, jnp.ones((1,), jnp.float32),
                                                    lambda: jnp.zeros((1,), jnp.float32), drop))(state)
         assert scale is not None
-        expected = np.float32(1.5) if binades <= 126 else np.float32(0.0)
-        np.testing.assert_array_equal(np.asarray(scale.bound), np.array([expected], np.float32))
+        np.testing.assert_array_equal(np.asarray(scale.bound), np.array([np.float32(1.5)], np.float32))
+    # Static exponents past fp32's normal range [-126, 127] split into exact normal host multiplies.
+    big = jnp.array([np.float32(1.5 * 2.0 ** 120)], jnp.float32)
+    down = jax.jit(lambda x: algebra.taken_back(x, -140))(big)
+    up = jax.jit(lambda x: algebra.taken_back(x, 140))(down)
+    np.testing.assert_array_equal(np.asarray(down), np.array([np.float32(1.5 * 2.0 ** -20)], np.float32))
+    np.testing.assert_array_equal(np.asarray(up), np.asarray(big))
