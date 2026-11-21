@@ -1111,7 +1111,7 @@ def mode_stage_save(args) -> dict:
         staged.device_mesh = mesh.build(paired)
         stepped = int(staged.fit(stream(), steps=steps, checkpoint_every=2, log_every=1, resume=resume,
                                  checkpoint_final=False).step)
-        return stepped, persistent.latest()
+        return stepped, persistent.latest
 
     # Step 1 on the local tier alone (the persistent tier holds none), resumed from it to step 2, which the
     # persistent tier holds; then that resumed from the persistent tier alone to step 3, which it does not.
