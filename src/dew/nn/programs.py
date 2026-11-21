@@ -513,9 +513,12 @@ def _converted(value, dtype: jax.typing.DTypeLike) -> np.generic:
     constant-folding rule, `partial_eval.const_fold_rules`: NumPy's cast, an integer wrapped at its width),
     with no program traced."""
     kind = ShapedArray((), np.dtype(dtype))
-    (out,) = partial_eval.const_fold_rules[jax.lax.convert_element_type_p](
+    folded = partial_eval.const_fold_rules[jax.lax.convert_element_type_p](
         [np.asarray(value)], {"new_dtype": kind.dtype, "weak_type": False, "sharding": None}, [kind])
-    return np.asarray(out)[()]
+    # JAX's rule folds every host scalar of a numeric dtype; it gives none for an extended one, admitted never.
+    if folded is None:
+        raise TypeError(f"JAX folds no conversion of {value!r} to {kind.dtype}")
+    return np.asarray(folded[0]).reshape(-1)[0]
 
 
 def scalar_folded(primitive: jcore.Primitive, operands: Sequence[np.generic],
