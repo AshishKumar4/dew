@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from arm_arithmetic import float64_held, summed_as_run
+from arm_arithmetic import float64_held, summed_as_run, unrewritten
 from flax import linen as nn
 from model_support import flat_tree, largest_difference, stepped_decode, steps_from
 from reference_error import (
@@ -262,6 +262,9 @@ class ScanCase:
         # The plain loop's program, made once: its arm runs it compiled (`measured`'s), and the weighed check
         # replays it for each draw's rounding scale (`scale`), keyed by this one function.
         self.plain_run = self.computed(self.plain, self.variables, self.training)
+        # As the rounding scale traces a program, unrewritten (`arm_arithmetic.unrewritten`), held so each
+        # draw's scale traces the one function JAX keys its trace by.
+        self.plain_written = unrewritten(self.plain_run)
         self.runs = {"scanned": self.measured(self.scanned, self.variables, self.training),
                      "plain": without_ynn(self.plain_run)}
         self.drawn = drawn
@@ -303,7 +306,7 @@ class ScanCase:
         `summed_as_run`), which the weighed check reads (`assert_as_exact`'s `conditioning_scale`): the plain
         arm's own program (`plain_run`), replayed here, where its arm runs it compiled (`without_ynn`)."""
         with summed_as_run():
-            return rounding_scale(self.plain_run, *inputs, seed=seed)[1]
+            return rounding_scale(self.plain_written, *inputs, seed=seed)[1]
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
