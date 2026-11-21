@@ -59,7 +59,6 @@ from dew.objectives.base import (
     Ratio,
     Step,
 )
-from dew.objectives.lm.chunked import token_spec
 from dew.objectives.routing import RoutedStatistics
 
 Loss = TypeVar("Loss", bound=Ratio | RoutedStatistics, default=Ratio | RoutedStatistics)
@@ -423,6 +422,10 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
 
         if jax.sharding.get_abstract_mesh().empty:
             return local(student.final, teacher.final, finite)
+        # The language model's own token split, imported where a mesh asks for it: a distillation's
+        # domain imports no language model's.
+        from dew.objectives.lm.chunked import token_spec
+
         spec = token_spec(finite.shape)
         states = P(*spec, *[None] * (3 - len(spec)))
         return jax.shard_map(local, in_specs=(states, states, spec), out_specs=spec, check_vma=False)(
