@@ -162,7 +162,8 @@ def noted(event: str | None = None, args: tuple = (), starting: bool = False) ->
     """Why the start just counted unfollowed is (`followed.described`; where `starting`, the multiprocessing
     start whose frame called `started`), its owner's evidence: nothing it does, a frame read or a line
     written, fails the start, which its marker counted already."""
-    # A frame read the stack cannot give or an audit hook refuses, or a line the log cannot take, fails nothing.
+    # A frame read the stack cannot give or an audit hook refuses, or a line the log cannot take, fails
+    # nothing.
     with contextlib.suppress(OSError, ValueError, RuntimeError):
         frame = sys._getframe(2) if starting else None
         write(owner(), f"{WHY}{followed.described(root, event, args, frame)}")
