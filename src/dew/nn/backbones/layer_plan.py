@@ -181,6 +181,9 @@ class LayerSpec:
     """Whether the layer reads and writes the hyper-connection streams, as whether it enters them from
     the residual and whether it leaves them collapsed (`HyperConnections.hc_layers`); None for a layer
     outside them, or a model without them."""
+    messaged: bool = False
+    """Whether the layer is in a looped block that passes messages (`Loop.messages`): it merges the bank
+    the pass before left into its sublayers' inputs, through parameters the layers outside hold none of."""
 
 
 def scan_groups(specs: Sequence[Hashable], bank_layers: int | None = None, *,

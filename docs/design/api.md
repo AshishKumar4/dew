@@ -443,6 +443,10 @@ A new mixer drops into `DecoderBlock.mixer`, which already takes `(x, decode, po
 
 The mixer keeps its recurrent state in the `cache` collection, exactly as the KV cache does (`nn/attention.py:50-94`), so `generate`, `init_cache` and `decode=True` apply unchanged. `positions` is ignored; `segment_ids` becomes a reset mask in the scan. Sharding follows the `@logical_axes` declaration; the state is batch-sharded by construction.
 
+### 6.4.1 Looped decoders that pass messages
+
+A decoder gains passes over a block of its layers through `with_passes(steps, layers, messages=CrossPass(...))` (`nn/backbones/decoder_stack.py`'s `Loop`, `nn/cross_pass.py`). Every pass enters the block at the prelude's output; each pass banks one summary per `block_size` layers, and every sublayer input of the next pass merges that bank in before its norm through `CrossPassMerge`: one merge per input site, which a mixer declares (`protocols.InputSites`: attention's query, key and value, one site for any other mixer), plus one for the feed-forward. The merge's gates are drawn at zero, so `Pretrained.with_model` adds the merges as `fresh` parameters and the decoder computes what it computed before training moves them. The stack threads the bank as `prior_bank`, as it threads `attention_metadata`; a packed `qkv_proj` projects each site's input apart (`ProjectionGroup.apart`). `--loop-messages` and its `--loop-message-*` flags set it from the command line.
+
 ### 6.5 What the design does not do
 
 | Need | Boundary |
