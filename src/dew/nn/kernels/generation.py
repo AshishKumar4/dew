@@ -202,6 +202,7 @@ class Choice(enum.StrEnum):
     RMS_NORM = 'rms_norm'
     SELECTIVE_SCAN = 'selective_scan'
     SHORT_CONV = 'short_conv'
+    SPARSE_ATTENTION = 'sparse_attention'
     SSD = 'ssd'
     SWIGLU = 'swiglu'
 

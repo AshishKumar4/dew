@@ -123,8 +123,6 @@ class Forward:
     def reach(self) -> float:
         """The power of two a dropping call's kept weights are narrowed at (`Dropout.reach`)."""
         return dropped_reach(self.dropped)
-    whole: bool = False
-    """Whether a spans call's every query sees every key (`attention.KeySpans.whole`): priced as full."""
 
     @property
     def raw(self) -> bool:
@@ -638,21 +636,19 @@ def units_of(spec: Forward | means.Units) -> means.Units:
     return means.Units(scale=spec.scale, compensated=False)
 
 
-_units = units_of
-
 
 def finished_merged(spec: Forward | means.Units, stacked: Partial, axis: int) -> Partial:
     """Finished states over disjoint keys (`slice_state`'s, their outputs normalized, or merges of them)
     stacked on `axis` as one merge of them, the algebra's law of finished means (`dew.algebra.means`, its
     derivative the law's own): their outputs' convex combination, each weighed by its mass at the largest of
-    their maxima (in the walk's own factor's units, `_units`), its total the masses' sum at that maximum;
+    their maxima (in the walk's own factor's units, `units_of`), its total the masses' sum at that maximum;
     where that sum passes fp32's largest, the sum at the maximum the law lands it at instead
     (`means.merged_state`'s anchor, past the largest by at least the powers of two it moves, exactly at any
     maximum: moved by a power of two's log at a maximum of 2^30, whose spacing is 128, the maximum rounded
     back and half the mass went). Its output is its sums (`finish`'s `normalized`); a state of no key adds
     nothing; a row of no mass is at the law's anchor of its states (their largest finite maximum, chosen
     before its mass or tangent is taken, `means.merged_state`)."""
-    output, total, anchor = means.merged_state(stacked.acc, stacked.total, stacked.m, _units(spec), axis)
+    output, total, anchor = means.merged_state(stacked.acc, stacked.total, stacked.m, units_of(spec), axis)
     return Partial(output, anchor, total)
 
 
@@ -671,7 +667,7 @@ def finished_merged_chunked(spec: Forward | means.Units, load: Callable[[jax.Arr
         state = slice_state(spec, out, maximum, total)
         return state.acc, state.total, state.m, valid
 
-    output, total, anchor = means.merged_state_chunked(states, chunks, _units(spec), 0)
+    output, total, anchor = means.merged_state_chunked(states, chunks, units_of(spec), 0)
     return Partial(output, anchor, total)
 
 

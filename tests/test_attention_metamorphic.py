@@ -139,7 +139,9 @@ def _slices_merged(query, key, value, spans, *, slices: int = 8, subtracted: boo
                 merged_rows = walked[0]
             else:
                 # The slices merged where the launch wrote them, as `attention_decode.attend` merges them.
-                state = merged.merged_padded(spec, *walked[:2], queries=rows.shape[1], width=value.shape[-1])
+                assert isinstance(walked, attention_mosaic.SplitOutput)
+                state = merged.merged_padded(spec, walked.padded, walked.stacked,
+                                             queries=rows.shape[1], width=value.shape[-1])
                 merged_rows = algebra.finish(spec, state, initial=True, normalized=True)[0]
         return template.ungrouped_rows(merged_rows, DECODE_HEADS).astype(query.dtype)
 

@@ -10,7 +10,8 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import bodies, fed, mosaic, resources
+from dew.nn.kernels import launches
+from dew.nn.kernels.templates import fed, mosaic, resources, ring_family
 
 
 class WgmmaLayout:
@@ -81,13 +82,13 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         if interpret:
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         mosaic.committed()
         if interpret:
             fresh = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
@@ -118,7 +119,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return super().read(value, first=first, columns=columns)
 
     def register_products(self, acc, parts, rhs):
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         for formed in parts:
             part = mosaic.unscaled_part(formed)
             mosaic.committed()
@@ -135,7 +136,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         """`Family.summed` into a scoped warpgroup accumulator: reading it (`acc_ref[...]`) waits on the
         products `issue` issued into it, so the value is theirs once they are done."""
-        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
+        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         if interpret:
             return issue(self.zeros(shape))
 
@@ -184,9 +185,9 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
 
 
-class Wgmma(WgmmaIssuer, mosaic.RingFamily):
+class Wgmma(WgmmaIssuer, ring_family.RingFamily):
     """wgmma's bundle: its issuer and home (`WgmmaIssuer`) on TMA rings fed by a producer warpgroup
-    (`mosaic.RingFamily`), multicast across a pair of multiprocessors where a cluster shares a ring's
+    (`ring_family.RingFamily`), multicast across a pair of multiprocessors where a cluster shares a ring's
     blocks."""
 
     # Three consumers beside the producer, 504 of a lane's 512 registers raised (160 each, the producer's 24):

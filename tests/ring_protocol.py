@@ -64,6 +64,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src.state import discharge
+from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import core as jcore
 
 from dew.nn import derivatives
@@ -254,7 +255,7 @@ class _Interpreter:
         return []
 
 
-def _slot(ref, treedef, leaves) -> tuple:
+def _slot(ref, treedef, leaves) -> "tuple | frozenset[tuple]":
     """A transformed ref's location (`_located`), its transforms flattened (`treedef`, `leaves`)."""
     if ref is None:
         return ()
@@ -263,25 +264,31 @@ def _slot(ref, treedef, leaves) -> tuple:
     return _located(ref, jax.tree_util.tree_unflatten(treedef, list(leaves)))
 
 
-def _located(ref, transforms) -> tuple:
+def _located(ref, transforms) -> "tuple | frozenset[tuple]":
     """A ref's location through `transforms`: the ref and each leading index that is one value, in order (a
     ring's slot; a consumer's staging buffer and its chunk's buffer within it, `stores.staged_chunks`; a
     one-entry slice of an axis, which keeps it, last: a gathered ring's slot mbarrier, `gathered.Ring`), else
     the ref whole. Two locations share memory where one's indices are a prefix of the other's (`_overlaps`):
     a consumer's two chunk buffers, keyed by its own index alone, read as one buffer, so its double-buffered
-    stores raced (base review f86cb5b03's witness at 128 x 256)."""
+    stores raced (base review f86cb5b03's witness at 128 x 256). Through a gather (an indexer's array of
+    indices), the blocks of the ref it reaches (`_reached`)."""
+    transforms = list(transforms or ())
+    if any(_selects_none(transform) for transform in transforms):
+        return frozenset()
+    if any(_gathering(transform) for transform in transforms):
+        return _reached(ref, transforms)
     found = []
 
     def whole(index, extent) -> bool:
         return (hasattr(index, "start") and index.start is not None and int(np.asarray(index.start)) == 0
                 and index.size == extent)
 
-    for transform in transforms or ():
+    for transform in transforms:
         if getattr(transform, "indices", None) is None:
             # A transform that moves axes (a transpose, a reshape): later indices are not the base's
             # coordinates, so the location stops at the prefix known (base review 2e4651b2e F3). A tiling's,
             # a swizzle's or a bitcast's changes the trailing axes alone, the leading ones indexed as before.
-            if hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower():
+            if _moves_axes(transform):
                 return (ref.name, *found) if found else (ref.name, None)
             continue
         indices, shape = transform.indices, getattr(transform, "shape", None)
@@ -289,14 +296,7 @@ def _located(ref, transforms) -> tuple:
             if index is None:
                 return (ref.name, *found) if found else (ref.name, None)
             if not hasattr(index, "start"):
-                # An array index (advanced indexing, ndim > 0) introduces its own output axis, so later
-                # transforms do not index the base's next axis: keep the single base coordinate if constant
-                # and stop at the known base prefix (row 8978).
-                if (one := _one_value(index)) is None:
-                    return (ref.name, *found) if found else (ref.name, None)
-                found.append(one)
-                if np.asarray(index).ndim > 0:
-                    return (ref.name, *found)
+                found.append(int(np.asarray(index)))
                 continue
             # A slice: the axes from it on whole, the next transform indexes them; else its one entry, if it
             # takes one, the location's last.
@@ -309,14 +309,81 @@ def _located(ref, transforms) -> tuple:
     return (ref.name, *found) if found else (ref.name, None)
 
 
-def _one_value(index) -> int | None:
-    """An indexer's index where it names one entry of its axis (a value, an array of one value broadcast
-    beside a gathered index, or a one-entry slice), else None (a slice of more, or an array of several
-    indices: a gathered tile's rows)."""
+def _selects_none(transform) -> bool:
+    """Whether `transform` is an indexer of a static zero extent, a slice of no entry or a gather of no index:
+    an access through it touches nothing, whatever its other indices are (the base review of 369d0ad7b,
+    F2: `ref.at[[0, 1]].at[row, :0]`, at a row the checker does not evaluate, read the ref whole)."""
+    indices = getattr(transform, "indices", None)
+    if indices is None:
+        return False
+    return (any(hasattr(index, "start") and isinstance(index.size, int) and index.size == 0
+                for index in indices)
+            or any(isinstance(extent, int) and extent == 0 for extent in transform.int_indexer_shape))
+
+
+def _gathering(transform) -> bool:
+    """Whether `transform` is an indexer gathering along some axis (an array of indices, not one value)."""
+    return any(index is not None and not hasattr(index, "start") and np.ndim(index) > 0
+               for index in getattr(transform, "indices", None) or ())
+
+
+def _moves_axes(transform) -> bool:
+    """Whether a transform other than an indexer moves the axes its ref's later indices name (a transpose,
+    a reshape), where a tiling's, a swizzle's or a bitcast's changes the trailing axes alone."""
+    return hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower()
+
+
+def _reached(ref, transforms: list) -> "tuple | frozenset[tuple]":
+    """A gather's location (`_located`): the ref's elements its indexers reach, each indexer's indices
+    applied as NumPy indexes an array (JAX's `NDIndexer` lays a gather's axes out as NumPy's advanced
+    indexing does) to the places of the shape the first reads, so every view axis composes into the ref's
+    coordinates (`ref.at[[[0, 1], [2, 3]]].at[1, 0]`, a `(4,)` ref's element 2), as the blocks of them it
+    reaches whole (`_blocks`): one block's location, a set of several's, and an empty selection's no block,
+    which touches nothing (row 8978 and the base reviews of 2e043406d, 71686face, 8c1c9efca, 31b5fe85b,
+    8a5405c55 and 839bb19de: a gather crashed, lost an alias, located a cell at its row, flattened a
+    rank-two gather, raised on an empty one or on a pick the checker does not evaluate, or read an empty one
+    whole). A transform moving axes, or an indexer of an index or a slice's start the checker does not
+    evaluate (None to it; of 369d0ad7b, F1: `ref.at[[0, 1]].at[pl.ds(row, 1), 0]` raised), leaves the
+    elements reached before it, every one it could reach among them: the ref whole before the first
+    indexer."""
+    places, shape = None, None
+    for transform in transforms:
+        indices = getattr(transform, "indices", None)
+        if indices is None and places is None and not _moves_axes(transform):
+            continue
+        if indices is None or any(index is None or (hasattr(index, "start") and index.start is None)
+                                  for index in indices):
+            if places is None:
+                return (ref.name, None)
+            break
+        if places is None:
+            shape = tuple(transform.shape)
+            places = np.arange(int(np.prod(shape))).reshape(shape)
+        places = places[tuple(_numpy_index(index) for index in indices)]
+    reached = np.zeros(shape, bool)
+    reached.reshape(-1)[np.asarray(places).reshape(-1)] = True
+    blocks = [(ref.name, *block) if block else (ref.name, None) for block in _blocks(reached, ())]
+    return blocks[0] if len(blocks) == 1 else frozenset(blocks)
+
+
+def _numpy_index(index):
+    """An `NDIndexer`'s index as NumPy indexes by it: a `Slice`'s start, size and stride as a slice, a value
+    as an integer, an array of indices as itself."""
     if hasattr(index, "start"):
-        return int(np.asarray(index.start)) if index.size == 1 and index.start is not None else None
-    values = None if index is None else np.unique(np.asarray(index))
-    return None if values is None or values.size != 1 else int(values[0])
+        start, stride = int(np.asarray(index.start)), int(getattr(index, "stride", 1))
+        return slice(start, start + index.size * stride, stride)
+    return int(np.asarray(index)) if np.ndim(index) == 0 else np.asarray(index)
+
+
+def _blocks(reached: np.ndarray, prefix: tuple) -> Iterator[tuple]:
+    """The leading coordinates of each largest block of the elements `reached` marks (an array of the ref's
+    shape below `prefix`): a block reached whole is one, else its entries' blocks along its leading axis; a
+    block of no elements none."""
+    if reached.size and reached.all():
+        yield prefix
+    elif reached.any():
+        for entry, below in enumerate(reached):
+            yield from _blocks(below, (*prefix, entry))
 
 
 def _governing(value, what: str):
@@ -399,7 +466,10 @@ def _access(kind: str, indexed: int) -> Callable:
             tree = equation.params.get("tree")
             if tree is None:
                 tree = equation.params["transforms_treedef"]
-            self.emit(kind, _slot(ref, tree, values[indexed:]))
+            at = _slot(ref, tree, values[indexed:])
+            # An empty gather touches nothing: no access.
+            if at != frozenset():
+                self.emit(kind, at)
             if kind == "read" and ref.value is not None:
                 # A known operand's read, through its transforms as JAX's state discharge reads one.
                 transforms = jax.tree_util.tree_unflatten(tree, values[indexed:])
@@ -440,17 +510,26 @@ def _wgmma_product(self: _Interpreter, equation, values) -> list:
 
 def _tcgen05_product(self: _Interpreter, equation, values) -> list:
     """A tcgen05 product (`tcgen05_mma`): its operands, each at its slot, read asynchronously until the
-    completion of a commit of its thread after it (a `committed` event); its accumulator tensor memory's.
-    Refused where it arrives
-    at a barrier of its own once it completes (`arrive`), an asynchronous arrival the checker does not
-    order."""
+    completion of a commit of its thread after it (a `committed` event); its accumulator written in tensor
+    memory on that completion. A tensor-memory left operand (`WEIGHTS` over `LOGITS` or `QUERY`) is read as
+    filled, its latest overlapping writer before it not a product. Refused where it arrives at a barrier of
+    its own once it completes (`arrive`), an asynchronous arrival the checker does not order."""
     params = equation.params
     if params["arrive"]:
         raise ValueError("a tcgen05 product arriving at a barrier as it completes: the checker orders no "
                          "asynchronous arrival")
-    _, lhs, rhs, _ = values[:4]
+    acc, lhs, rhs, _ = values[:4]
     leaves = values[4 + 2 * int(params["scaled"]) + int(params["sparse"]):]
-    return self.emit("product", (), _operand_slots(params, lhs, rhs, leaves))
+    acc_tree = params["acc_transforms_tree"]
+    acc_count = acc_tree.num_leaves if acc_tree is not None else 0
+    destination = _slot(acc, acc_tree, leaves[:acc_count]) if isinstance(acc, Ref) else ()
+    slots = _operand_slots(params, lhs, rhs, leaves)
+    if isinstance(lhs, Ref) and equation.invars[1].aval.memory_space == plgpu.TMEM:
+        # Its left operand in tensor memory, its thread's or another's stores' (`_tmem_store`): a read of
+        # what a store or copy must have written last, landed before it (no store's, or overwritten since by
+        # an MMA through an aliased view, a read of nothing).
+        self.emit("read", slots[0], "tmem_filled")
+    return self.emit("product", destination, slots)
 
 
 _tcgen05_commit = _arrival("barrier_transforms_tree", "committed")
@@ -474,10 +553,43 @@ def _tmem_copy(self: _Interpreter, equation, values) -> list:
     return []
 
 
+def _tmem_store(self: _Interpreter, equation, values) -> list:
+    """`async_store_tmem`: registers written into tensor memory at its slot, visible to the tensor core's
+    products once its thread's next `commit_tmem` follows (`_tmem_commit`), where the write lands: a turn's
+    weights over their logits (`placed.Tcgen05Placed`), published by a commit and then an arrival
+    (`Tcgen05Issuer.published`)."""
+    ref = values[0]
+    if isinstance(ref, Ref):
+        self.emit("tmem_store", _slot(ref, equation.params["tree"], values[2:]))
+    return []
+
+
+def _tmem_load(self: _Interpreter, equation, values) -> list:
+    """`async_load_tmem`: tensor memory read into registers asynchronously at its slot until its thread's
+    next `wait_load_tmem` retires it (`_tmem_load_wait`)."""
+    ref = values[0]
+    if isinstance(ref, Ref):
+        self.emit("tmem_load", _slot(ref, equation.params["tree"], values[1:]))
+    return [None] * len(equation.outvars)
+
+
+def _tmem_load_wait(self: _Interpreter, equation, values) -> list:
+    """`wait_load_tmem`: retires every pending `async_load_tmem` read of its thread (`_tmem_load`)."""
+    del equation, values
+    return self.emit("tmem_load_wait")
+
+
+def _tmem_commit(self: _Interpreter, equation, values) -> list:
+    """`commit_tmem`: its thread's tensor-memory stores before it landed (`_tmem_store`)."""
+    del equation, values
+    return self.emit("tmem_commit")
+
+
 SYNC: dict[str, Callable] = {
     "barrier_wait": _wait, "barrier_arrive": _arrival("transforms_treedef"),
     "tcgen05_mma": _tcgen05_product, "tcgen05_commit_arrive": _tcgen05_commit,
-    "async_copy_smem_to_tmem": _tmem_copy, "copy_gmem_to_smem": _load,
+    "async_copy_smem_to_tmem": _tmem_copy, "async_store_tmem": _tmem_store, "async_load": _tmem_load,
+    "wait_load_tmem": _tmem_load_wait, "commit_tmem": _tmem_commit, "copy_gmem_to_smem": _load,
     "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
     "commit_smem": _commit,
     "get": _access("read", 1), "load": _access("read", 1), "swap": _access("write", 2),
@@ -1183,8 +1295,8 @@ class _Order:
     """An execution's happens-before order, built a move at a time: each thread's vector clock, each load's
     landing its own clock joined into its barrier's phase; each access of a location ordered after every
     write of it before (a read after the write lands) and each write after every read of it before (an
-    asynchronous read, a product's or a store's, until the wait that retires it); each store's source
-    fenced after its last generic write."""
+    asynchronous read, a product's, a store's or a tensor-memory load's, until the wait that retires it);
+    each store's source fenced after its last generic write."""
 
     def __init__(self, threads, arrivals):
         self.threads, self.arrivals = threads, arrivals
@@ -1200,6 +1312,8 @@ class _Order:
         self.committed: list = [[] for _ in threads]
         self.committing: dict = {}
         self.fills: dict = {}
+        self.stored: list = [[] for _ in threads]
+        self.product_threads: dict[int, int] = {}
 
     def arrived(self, at, clock, *, counted: bool, transaction: int) -> None:
         joined, count, flying = self.accumulating.get(at, ({}, 0, 0))
@@ -1220,24 +1334,45 @@ class _Order:
                 if not any(when != other and _before(when, other) for other, _ in prior)]
         return bool(last) and all(written.kind == "fill" and written.argument == step for written in last)
 
-    def ordered(self, at, clock, event, *, write: bool) -> None:
+    def ordered(self, at, clock, event, *, write: bool, thread: int | None = None) -> None:
+        # Two tcgen05 products issued by the same warp are serialized by the tensor core pipeline.
+        def same_pipeline(prior_event: Event, prior_thread: int | None) -> bool:
+            if event.kind != "product" or prior_event.kind != "product" or thread is None:
+                return False
+            issuer = prior_thread if prior_thread is not None else self.product_threads.get(id(prior_event))
+            return issuer == thread
+
         for where, prior, prior_event in self.writes:
             if _overlaps(where, at) and not _before(prior, clock):
+                if same_pipeline(prior_event, None):
+                    continue
                 raise Violation(
                     "unordered", f"{event.kind} of {at} unordered with the {prior_event.kind} of {where}",
                                 [(None, prior_event), (None, event)])
+        flying = [entry for entries in self.pending for entry in entries]
+        flying += [entry for products in self.committed for entry, done in products if done is None]
+        for entry_kind, _, prior_event, _, (prior_thread, _), _ in flying:
+            if entry_kind == "product" and prior_event.at and _overlaps(prior_event.at, at):
+                if same_pipeline(prior_event, prior_thread):
+                    continue
+                said = (f"{event.kind} of {at} while the {prior_event.kind} writing {prior_event.at} "
+                        "is in flight")
+                raise Violation("unordered", said, [(None, prior_event), (None, event)])
         if write:
             for where, prior, prior_event in self.reads:
                 if _overlaps(where, at) and not _before(prior, clock):
+                    if same_pipeline(prior_event, None):
+                        continue
                     raise Violation(
                         "unordered", f"write of {at} unordered with the read of {where} before it",
                                     [(None, prior_event), (None, event)])
-            # A read still in flight (a product's or a store's not retired, a tcgen05 product no commit's
-            # completion has ended) ends after this write, whatever orders the write.
-            flying = [entry for entries in self.pending for entry in entries]
-            flying += [entry for products in self.committed for entry, done in products if done is None]
-            for _, where, prior_event, *_ in flying:
+            # A read still in flight (a product's, a store's or a tensor-memory load's not retired, a
+            # tcgen05 product no commit's completion has ended) ends after this write, whatever orders the
+            # write.
+            for _, where, prior_event, _, (prior_thread, _), _ in flying:
                 if _overlaps(where, at):
+                    if same_pipeline(prior_event, prior_thread):
+                        continue
                     said = f"write of {at} while the {prior_event.kind} reading {where} is in flight"
                     raise Violation("unordered", said, [(None, prior_event), (None, event)])
 
@@ -1246,13 +1381,19 @@ class _Order:
         if event.kind == "committed":
             # A commit's completion, after every product its thread issued before it completes. A product's
             # completion is its own: after its issue and its token (`completed`), no later event of its
-            # thread's, its reads ending there, whichever covering commit lands first; each commit's arrival
-            # joins the completions it covers.
+            # thread's, its reads ending and its tensor-memory accumulator write landing there, whichever
+            # covering commit lands first; each commit's arrival joins the completions it covers.
+            written = set()
             for product in self.committing.pop((thread, position)):
                 if product[1] is None:
                     _, source, read, issued, key, _ = product[0]
                     product[1] = _joined(issued, {("completed", *key): 1})
+                    self.product_threads[id(read)] = key[0]
                     self.reads.append((source, product[1], read))
+                    if read.at and key not in written:
+                        written.add(key)
+                        self.ordered(read.at, product[1], read, write=True, thread=key[0])
+                        self.writes.append((read.at, product[1], read))
                 landing = _joined(landing, product[1])
             self.arrived(event.at, landing, counted=True, transaction=0)
             return
@@ -1262,6 +1403,16 @@ class _Order:
             self.fills.setdefault(thread, []).append((position, landing))
         elif event.argument:
             self.arrived(event.argument, landing, counted=False, transaction=-1)
+
+    def _check_tmem_filled(self, thread, event, clock) -> None:
+        prior_writes = [(prior, writer) for where, prior, writer in self.writes
+                        if _overlaps(where, event.at) and _before(prior, clock)]
+        latest = [writer for prior, writer in prior_writes
+                  if not any(_before(prior, other) and not _before(other, prior)
+                             for other, _ in prior_writes)]
+        if not latest or any(writer.kind == "product" for writer in latest):
+            raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
+                            [(thread, event)])
 
     def moved(self, thread, position, event) -> None:
         clock = self.clocks[thread]
@@ -1293,12 +1444,28 @@ class _Order:
             if kind == "read" and filled and not self.last_filled(event.at, clock, event.argument[1]):
                 raise Violation("unwritten", f"read of {event.at}, whose last write ordered before it is no "
                                 f"fill of its step ({event.argument[1]})", [(thread, event)])
+            if kind == "read" and event.argument == "tmem_filled":
+                self._check_tmem_filled(thread, event, clock)
             self.ordered(event.at, clock, event, write=kind == "write")
             (self.writes if kind == "write" else self.reads).append((event.at, dict(clock), event))
             if kind == "write":
                 self.unfenced[thread].add(event.at)
         elif kind == "commit":
             self.unfenced[thread].clear()
+        elif kind == "tmem_store":
+            # Check read/write races at issue (JAX requires `wait_load_tmem` before issuing an overlapping
+            # store); the write lands for other threads at this thread's next `tmem_commit` (`_tmem_store`).
+            self.ordered(event.at, clock, event, write=True)
+            self.stored[thread].append(event)
+        elif kind == "tmem_commit":
+            for store in self.stored[thread]:
+                self.ordered(store.at, clock, store, write=True)
+                self.writes.append((store.at, dict(clock), store))
+            self.stored[thread] = []
+        elif kind == "tmem_load":
+            self.asynchronous(thread, position, event, clock)
+        elif kind == "tmem_load_wait":
+            self.retired(thread, "tmem_load", 0, clock)
         elif kind == "committed":
             # Every product its thread issued before it, each a read and its completion (None until a commit
             # covering it lands, `landed`).
@@ -1318,10 +1485,10 @@ class _Order:
             self.retired_groups(thread, int(event.argument), clock)
 
     def asynchronous(self, thread, position, event, clock) -> None:
-        """An asynchronous read issued: a store's source, fenced, or a product's operands, each read until
-        the wait that retires it (`retired`) or, a tcgen05 product's, its completion (`landed`); each held
-        with its issue's clock and place."""
-        sources = (event.at,) if event.kind == "store" else event.argument
+        """An asynchronous read issued: a store's source, fenced, a tensor-memory load's source, or a
+        product's operands, each read until the wait that retires it (`retired`) or, a tcgen05 product's, its
+        completion (`landed`); each held with its issue's clock and place."""
+        sources = (event.at,) if event.kind in ("store", "tmem_load") else event.argument
         if event.kind == "store" and any(_overlaps(event.at, at) for at in self.unfenced[thread]):
             raise Violation("unfenced", f"a store reads {event.at} past a generic write no fence follows",
                             [(thread, event)])
@@ -1360,12 +1527,20 @@ def commits_group(event: Event) -> bool:
     return (event.kind == "store" and bool(event.argument)) or event.kind == "store_group"
 
 
-def _overlaps(one: tuple, other: tuple) -> bool:
+def _overlaps(one: "tuple | frozenset[tuple]", other: "tuple | frozenset[tuple]") -> bool:
     """Whether two locations share memory: one ref, one slot or the ref whole, and one part of the slot or
-    the slot whole (a gathered step's tile, `Event`)."""
+    the slot whole (a gathered step's tile, `Event`); a gather's set of blocks (`_reached`) where any of them
+    does, its empty set nowhere."""
+    if isinstance(one, frozenset) or isinstance(other, frozenset):
+        return any(_overlaps(mine, theirs) for mine in _each(one) for theirs in _each(other))
     return bool(one) and bool(other) and one[0] == other[0] and all(
         mine is None or theirs is None or mine == theirs
         for mine, theirs in itertools.zip_longest(one[1:], other[1:]))
+
+
+def _each(location: "tuple | frozenset[tuple]") -> "tuple | frozenset[tuple]":
+    """A location's blocks: a gather's set of them (`_reached`), any other one location."""
+    return location if isinstance(location, frozenset) else (location,)
 
 
 def configurations(**bounds) -> Iterator[dict]:
