@@ -171,6 +171,21 @@ def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
     assert programs.dot_arithmetic(eight, jnp.float8_e4m3fn, jnp.float8_e4m3fn).operand_bits == (8, 8)
 
 
+
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_a_tpus_product_precision_is_an_algorithm_xla_tpu_compiles(target_name):
+    """On a TPU, a product's dot algorithm chosen for fp32's accuracy (`product_precision`, row 5473) is one
+    XLA:TPU compiles, its bfloat16 passes priced (`product.TPU_ALGORITHMS`): of three TF32 passes and six
+    bfloat16 ones, both as exact, BF16_BF16_F32_X6, which XLA:TPU runs as HIGHEST. TF32_TF32_F32_X3, which it
+    refuses (UNIMPLEMENTED; measurement M-JS-160), was priced at TF32 FLOPs, a rate a TPU states none of, so
+    at no seconds beside the six passes' 1.1 us, and chosen (row 10845)."""
+    from dew.algebra import program
+
+    exact = {jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3, jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6}
+    with program.passes(target=target_name):
+        chosen = product_precision(256, 256, 256, jnp.float32, admits=lambda preset: preset in exact)
+    assert chosen == jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
+
 def cancelled(seed):
     """Terms near a hundred million, a term of unit size, and the first's negation: a sum whose large terms
     cancel exactly, leaving the small one, which float32 rounds away beside the large."""
