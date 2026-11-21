@@ -150,13 +150,18 @@ def _least_beyond(op, ba, generation_name: str):
     return derived(high)
 
 
-def _batched_gate(cases, key_of, item_of):
+def _batched_gate(cases, key_of, item_of, *, max_items: int | None = None):
     """Group flat gate tuples into `(key..., tuple_of_items)` batches so each pytest item compiles one
-    generation's batch in a single `compile_mosaic_kernels` process instead of one subprocess per hook."""
+    generation's batch in a single `compile_mosaic_kernels` process, capped at `max_items` so no single
+    task pushes train CI past the wall (rows 10838, 10840)."""
     grouped: dict = {}
     for case in cases:
         grouped.setdefault(key_of(case), []).append(item_of(case))
-    return [(*key, tuple(items)) for key, items in grouped.items()]
+    if max_items is None:
+        return [(*key, tuple(items)) for key, items in grouped.items()]
+    return [(*key, tuple(items[i:i + max_items]))
+            for key, items in grouped.items()
+            for i in range(0, len(items), max_items)]
 
 
 DROPPING = tuple(generation_name for generation_name in GATED
@@ -583,7 +588,8 @@ def test_a_short_training_calls_backward_compiles_spill_free_for_an_a100(tokens,
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-BACKWARD_GATE_BATCHES = _batched_gate(BACKWARD_GATE, lambda c: (c[0], c[1], c[2]), lambda c: c[3])
+BACKWARD_GATE_BATCHES = _batched_gate(BACKWARD_GATE, lambda c: (c[0], c[1], c[2]), lambda c: c[3],
+                                      max_items=2)
 
 
 def _check_backward_batch(generation_name: str, width: int, accurate: bool,
@@ -660,8 +666,8 @@ def _check_backward_batch(generation_name: str, width: int, accurate: bool,
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "accurate", "hooks_batch"), BACKWARD_GATE_BATCHES,
-                         ids=[f"{g}-{w}-{'acc' if a else 'fast'}"
-                              for g, w, a, _ in BACKWARD_GATE_BATCHES])
+                         ids=[f"{g}-{w}-{'acc' if a else 'fast'}-{'+'.join(h)}"
+                              for g, w, a, h in BACKWARD_GATE_BATCHES])
 def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, width, accurate,
                                                                hooks_batch):
     """The backward at its derived tiles of a causal call `width` wide in the form `accurate` names under
@@ -970,11 +976,24 @@ def loss(query, key, value):
     attended = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
     return jnp.sum(attended.astype(jnp.float32))
 
-with generation.assumed("sm90"), report.certifying(device), report.refusals():
-    owned_program(jax.grad(loss, argnums=(0, 1, 2))).compiled(query, key, key)
-print(json.dumps([[found.op, found.stored, bool(found.refused),
-                   {name: module for name, (module, _) in found.kernels.items()}]
-                  for found in report.certifications()]))
+import threading
+
+compiled_on = []
+
+def heard(event, seconds, **_):
+    if event == "/jax/core/compile/backend_compile_duration":
+        compiled_on.append(threading.current_thread().name)
+
+jax.monitoring.register_event_duration_secs_listener(heard)
+try:
+    with generation.assumed("sm90"), report.certifying(device), report.refusals():
+        owned_program(jax.grad(loss, argnums=(0, 1, 2))).compiled(query, key, key)
+finally:
+    jax.monitoring.unregister_event_duration_listener(heard)
+print(json.dumps({"certs": [[found.op, found.stored, bool(found.refused),
+                             {name: module for name, (module, _) in found.kernels.items()}]
+                            for found in report.certifications()],
+                  "compiled_on": compiled_on}))
 """
 """A training step compiled through Dew's compile point (`OuterProgram.compiled`) in a process of its own,
 each attention launch certified on a compile-only H100."""
@@ -983,8 +1002,9 @@ each attention launch certified on a compile-only H100."""
 @COMPILES_ON_CPU
 def test_a_programs_launches_compile_beside_its_trace(tmp_path):
     """A training step compiled through Dew's compile point (`OuterProgram.compiled`) certifies its
-    attention launches beside its trace (`report.certifying_aside`) on a cold isolated store and reads
-    stored verdicts on a warm repeat without refusing any launch (row 10802)."""
+    attention launches beside its trace on `dew-certify` threads (`report.certifying_aside`) on a cold
+    isolated store and reads stored verdicts on a warm repeat without refusing any launch (rows 10802,
+    10834)."""
     from process_support import fresh, keeping_picks
 
     def certified(found: list) -> list:
@@ -992,11 +1012,14 @@ def test_a_programs_launches_compile_beside_its_trace(tmp_path):
 
     cold = fresh(CERTIFIED_PROGRAM, cache_dir=tmp_path, flags=keeping_picks())
     warm = fresh(CERTIFIED_PROGRAM, cache_dir=tmp_path, flags=keeping_picks())
-    assert cold and not any(refused for _, _, refused, _ in cold), cold
-    assert not any(stored for _, stored, _, _ in cold), cold
-    assert warm and all(stored for _, stored, _, _ in warm), warm
-    assert not any(refused for _, _, refused, _ in warm), warm
-    assert certified(warm) == certified(cold)
+    cold_certs, warm_certs = cold["certs"], warm["certs"]
+    assert cold_certs and not any(refused for _, _, refused, _ in cold_certs), cold_certs
+    assert not any(stored for _, stored, _, _ in cold_certs), cold_certs
+    aside = [name for name in cold["compiled_on"] if name.startswith("dew-certify")]
+    assert len(aside) == len(cold_certs) > 0, cold["compiled_on"]
+    assert warm_certs and all(stored for _, stored, _, _ in warm_certs), warm_certs
+    assert not any(refused for _, _, refused, _ in warm_certs), warm_certs
+    assert certified(warm_certs) == certified(cold_certs)
 
 
 @COMPILES_ON_CPU
@@ -1719,17 +1742,10 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    spans = template.spans(512, 512, 1, causal=True)
     for gen in ("sm80", "sm100"):
+        op, ba, cfg = _gated_backward(gen, 64, accurate=False)
+        assert cfg is not None and cfg.fused, (gen, cfg)
         with generation.assumed(gen):
-            target = generation.gpu_target()
-            q = jax.ShapeDtypeStruct((1, 512, 4, 64), jnp.bfloat16)
-            m = jax.ShapeDtypeStruct((1, 4, 512), jnp.float32)
-            op, args = attention_mosaic._backward_call(q, q, q, spans, None, q, (q, m, m), scale=None,
-                                                       natural=attention_mosaic.NATURAL, accurate=False)
-            ba = op.bind(*args, interpret=False)
-            cfg = op.derived(ba, target)
-            assert cfg is not None and cfg.fused, (gen, cfg)
             found = compile_mosaic_kernels([
                 KernelCase(f"{gen}-fused-d64", lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)),
             ], gen)
