@@ -563,7 +563,7 @@ def finished_form(spec: Forward) -> Forward:
     return spec if spec.natural or spec.raw else unfolded(spec)
 
 
-def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
+def slice_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
     """A finished slice of a row's keys as a state of their merge (`finished_merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
     keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
@@ -598,17 +598,18 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
     return finish(spec, merged_state(spec, out, maximum, total, initial), initial=True, normalized=True)[0]
 
 
-def merged_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
+def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array, total: jax.Array,
                  initial: Initial | None = None) -> Partial:
     """A split walk's slices and the call's initial state merged into one finished state (`finished_merged`
     of `slice_state`s): their outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural
     `spec`'s units, `finished_rows`', a fold's `unfolded`, raw products where it keeps them) and denominators
     `[B, KV, S, Q]`, and the call's `initial` state `[B, KV, Q]` (its sums unnormalized): `[B, Q, KV]` rows,
     their output normalized."""
-    if finished_form(spec) is not spec:
+    if isinstance(spec, Forward) and finished_form(spec) is not spec:
         raise ValueError("a split walk's merge takes its finished form's states (`finished_form`)")
     state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
     if initial is not None:
+        assert isinstance(spec, Forward), "merging an initial state requires a Forward spec"
         own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
                                           jnp.swapaxes(initial.total, 1, 2)))
         acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
@@ -626,16 +627,21 @@ def resumable(spec: Forward, state: Partial) -> Partial:
                    state.total)
 
 
-def _units(spec: Forward) -> means.Units:
+def units_of(spec: Forward | means.Units) -> means.Units:
     """The units a finished form's states merge in (`means.Units`), its factor `carried`'s: the accurate
     form's exponential of the anchors' difference taken exactly, at its raw products' scale where it keeps
     them; a raw fold's of that difference times `scale log2(e)` rounded, as its walk weighs a key."""
+    if isinstance(spec, means.Units):
+        return spec
     if spec.natural:
         return means.Units(scale=spec.scale if spec.raw else 1.0)
     return means.Units(scale=spec.scale, compensated=False)
 
 
-def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
+_units = units_of
+
+
+def finished_merged(spec: Forward | means.Units, stacked: Partial, axis: int) -> Partial:
     """Finished states over disjoint keys (`slice_state`'s, their outputs normalized, or merges of them)
     stacked on `axis` as one merge of them, the algebra's law of finished means (`dew.algebra.means`, its
     derivative the law's own): their outputs' convex combination, each weighed by its mass at the largest of
@@ -652,7 +658,8 @@ def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
 
 
 
-def finished_merged_chunked(spec: Forward, load: Callable[[jax.Array], tuple], chunks: int) -> Partial:
+def finished_merged_chunked(spec: Forward | means.Units, load: Callable[[jax.Array], tuple],
+                            chunks: int) -> Partial:
     """`finished_merged` of a row's slices `load(c)` gives `means.CHUNK` at a time along axis 0 (a kernel's
     loads of its refs: the decode merge's, `merged`), `chunks` of them: each chunk's outputs, maxima,
     denominators and the slots it holds (`valid`, laid as the denominators are), its slices' states as

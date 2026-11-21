@@ -58,6 +58,7 @@ from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations, dq_h
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
     NATURAL_NAME,
+    SplitOutput,
     _codes_of,
     _forward_allocations,
     _plain_forward,
@@ -1198,7 +1199,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
             sources: jax.Array | None = None, subtracted: bool = False,
             scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False, bounded: bool = False,
-            in_key: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+            in_key: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split] | SplitOutput:
     ...
 
 

@@ -337,19 +337,24 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         queries, width = rows.shape[1], value.shape[-1]
         if at.slices == 1:
             # One slice's outputs `[B, Q, KV, Dv]` and rows `[B, KV, Q]`, a slice axis of one.
+            assert not isinstance(walked_out, attention_mosaic.SplitOutput)
             out, maximum, total = walked_out[:3]
             out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
             state = algebra.merged_state(spec, out, maximum, total, initial)
         else:
             # The slices merged where the launch wrote them (`merged.merged_split`).
-            state = merged.merged_split(spec, walked_out[0], walked_out[1], queries=queries, width=width,
-                                        initial=initial)
+            assert isinstance(walked_out, attention_mosaic.SplitOutput)
+            state = merged.merged_split(spec, walked_out.padded, walked_out.stacked, queries=queries,
+                                        width=width, initial=initial)
         if finished:
             merged_rows = algebra.finish(spec, state, initial=True, normalized=True)[0]
             return ungrouped_rows(merged_rows, heads).astype(query.dtype)
         return _unpacked_state(algebra.resumable(spec, state), heads)
 
 
+
+    def common() -> jax.Array | Initial:
+        return walked("plain" if "plain" in work else "bounded")
 
     def run() -> jax.Array | Initial:
         if "plain" in work:
@@ -358,7 +363,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         may = algebra.bounded_past(largest, keys_axis=-1, initial=None if initial is None else initial.acc)
         return jax.lax.cond(may, lambda: walked("scaled"), lambda: walked("bounded"))
 
-    return run, work
+    return run, common, work
 
 
 def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: int, heads: int,
@@ -378,30 +383,36 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     plans = []
 
     def step(q, k, v, t):
-        # The step planned once, as its trace forms it (`planned` packs its rows: operands, never shapes).
-        run, work = _planned_step(q, k, v, spans, None, scale=None, interpret=False, table=t, sources=None,
-                                  scales=None, bounds=None, finished=True, in_key=False)
+        # Price the common arm alone (never summing the exclusive scaled/bounded fallback arms, row 8813 F2).
+        _, common, work = _planned_step(q, k, v, spans, None, scale=None, interpret=False, table=t,
+                                        sources=None, scales=None, bounds=None, finished=True, in_key=False)
         plans.append(work)
-        return run()
+        return common()
 
     with generation.assumed(target):
         traced = jax.make_jaxpr(step)(query, key, key, table)
     # A step whose walks derive no config refuses as it traces (`_planned_step`).
     (work,) = plans
+    del work
     kernels = (equation for equation in programs.equations(traced.jaxpr)
                if equation.primitive in programs.NATIVE_KERNELS)
     found = [emission.work_of(kernel) for kernel in kernels]
-    launches = [work for work in found if work is not None]
+    launches = [each for each in found if each is not None]
     if not launches or len(launches) < len(found):
         # A launch whose work its emission does not count leaves the step's price unknown, never 0 (the base
         # review of 56a716c95, F3: a full step's spans launch priced none, and a step of no split Work()).
         return None
     priced = dataclasses.replace(sum(launches, Work()), span=sum(each.span for each in launches))
-    if max(plan.slices for plan in work.values()) > 1:
-        slices = max(plan.slices for plan in work.values())
-        states = slices * rows * queries * heads * (width + 2) * 4
-        written = rows * queries * heads * width * jnp.dtype(dtype).itemsize
-        priced = priced + Work(device_bytes=states + written, kernels=1)
+    for equation in programs.equations(traced.jaxpr):
+        if equation.primitive is merged.merged_padded_p:
+            padded_aval, stacked_aval = (var.aval for var in equation.invars)
+            params = equation.params
+            _, merge_cost = merged.merge_work(
+                params["units"],
+                jax.ShapeDtypeStruct(padded_aval.shape, padded_aval.dtype),
+                jax.ShapeDtypeStruct(stacked_aval.shape, stacked_aval.dtype),
+                params["queries"], params["width"], target)
+            priced = priced + merge_cost
     return priced
 
 

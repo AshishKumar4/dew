@@ -108,7 +108,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     transposed_swizzles,
     value_columns,
 )
-from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.rings import Ref
 from dew.nn.precision import power2
 
@@ -523,6 +522,15 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     return (out, *finished), maxima.reshape(*maxima.shape[:2], splits, -1) if splits > 1 else maxima, None
 
 
+class SplitOutput(NamedTuple):
+    """A split inference launch's outputs as its launch wrote them, padded (`_walked_outputs`, row 8775):
+    its slices' outputs `[B, S, Qp, H, Dvp]` and stacked maxima and denominators `[2, B, H, S, Qp]`,
+    which `merged.merged_split` merges where they lie."""
+
+    padded: jax.Array
+    stacked: jax.Array
+
+
 def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, splits: int):
     """The inference walk's outputs from its launches' (`_inference_walk`'s `finished`), unpadded to the
     call's `queries` and value `width`: the output, and with `rows` its finished maxima and denominators, an
@@ -533,8 +541,8 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     out, *rows_of = walked
     if splits > 1:
         stacked = rows_of[0]
-        return (out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
-                stacked.reshape(*stacked.shape[:3], splits, -1))
+        return SplitOutput(out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
+                           stacked.reshape(*stacked.shape[:3], splits, -1))
     out = out[:, :queries, :, :width]
     if not rows:
         return out
@@ -2251,10 +2259,10 @@ def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, valu
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
     streamed = (query, key) if in_key else (query, key, value)
-    cost = (stated(spec, batch, heads, *streamed,
-                   tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
-                                      common=family.feeds_itself)) if counted
-            else estimate(0))
+    # Emitted work is always stated for cost pricing (row 8813 F2); `counted` governs FLOP telemetry alone.
+    cost = stated(spec, batch, heads, *streamed,
+                  tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
+                                     common=family.feeds_itself))
     query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
     value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)
     model = (0 if not counted else None if query_share is None or value_share is None
