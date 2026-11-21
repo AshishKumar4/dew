@@ -63,19 +63,19 @@ def pinned(requirements: list[str], name: str) -> str:
 
 
 def builds_sentence(project: dict) -> list[str]:
-    """Which of Dew's builds of JAX's native packages each install takes, as pyproject.toml pins them: the CUDA
-    and PJRT plugins of the `cuda12` and `cuda13` extras and of `kernel-compile`, and jaxlib, Dew's on Linux
-    x86_64 and aarch64, the release's elsewhere (train 1111's review: the page named post114's and post111's
-    while the pins were post117's)."""
+    """Which of Dew's builds of JAX's native packages each install takes, as pyproject.toml pins them: the
+    CUDA and PJRT plugins of the `cuda12` and `cuda13` extras and of `kernel-compile`, and jaxlib, Dew's on
+    Linux x86_64 and aarch64, the release's elsewhere (train 1111's review: the page named post114's and
+    post111's while the pins were post117's)."""
     optional, dependencies = project["optional-dependencies"], project["dependencies"]
-    plugins, compiling = (pinned(optional[extra], "jax-cuda12-plugin") for extra in ("cuda12", "kernel-compile"))
+    plugins, compiling = (pinned(optional[extra], "jax-cuda12-plugin").rpartition(".")[2]
+                          for extra in ("cuda12", "kernel-compile"))
     dews = pinned([each for each in dependencies if "sys_platform == 'linux'" in each], "jaxlib")
     stock = pinned([each for each in dependencies if "sys_platform != 'linux'" in each], "jaxlib")
-    return [f"Dew's CUDA and PJRT plugins are {plugins.rpartition('.')[2]}'s on x86_64 and aarch64 (a GH200's "
-            f"Grace) alike, and the "
-            f"`kernel-compile` extra's (x86_64 only) are {compiling.rpartition('.')[2]}'s. On Linux x86_64 and "
-            f"aarch64 jaxlib is Dew's build too, `jaxlib=={dews}`, whose client of a plugin reads that metadata, "
-            f"and libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib=={stock}`."]
+    return [f"Dew's CUDA and PJRT plugins are {plugins}'s on x86_64 and aarch64 (a GH200's Grace) alike, "
+            f"and the `kernel-compile` extra's (x86_64 only) are {compiling}'s. On Linux x86_64 and aarch64 "
+            f"jaxlib is Dew's build too, `jaxlib=={dews}`, whose client of a plugin reads that metadata, and "
+            f"libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib=={stock}`."]
 
 
 def documented_extras(text: str) -> set[str]:
