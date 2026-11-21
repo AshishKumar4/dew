@@ -335,13 +335,16 @@ def _projected_components(direction, output):
     correction = (residual + residual_lo) / denominator
     parallel, parallel_lo = two_product(quotient, conditioned)
     parallel_lo = parallel_lo + correction * conditioned
-    # The orthogonal component the direction's remainder at its own scale, the parallel one's pair restored to
-    # it: a lane the row's scaling puts below the least normal is the direction's own there, on every device,
-    # where taken over the scaled row it was subnormal, flushed on a CPU and kept on a GPU, `+2^-7` against
-    # `-2^-7` at a lane of `2^-7` beside `2^120` (row 9710).
+    orthogonal, orthogonal_lo = compensated_add((vector, jnp.zeros_like(vector)), (-parallel, -parallel_lo))
+    orthogonal = power2(orthogonal + orthogonal_lo, vector_exponent)
+    # A lane the row's scaling put below the least normal takes its remainder at its own scale, the parallel
+    # pair restored to it, so the direction's lane is its own there on every device, where over the scaled
+    # row it was subnormal, flushed on a CPU and kept on a GPU (`+2^-7` against `-2^-7` at a lane of `2^-7`
+    # beside `2^120`, row 9710); every other lane over the scaled row, whose subtraction cannot overflow.
+    below = jnp.abs(vector) < jnp.finfo(dtype).tiny
     restored = (power2(parallel, vector_exponent), power2(parallel_lo, vector_exponent))
-    orthogonal, orthogonal_lo = compensated_add((whole, jnp.zeros_like(whole)), (-restored[0], -restored[1]))
-    orthogonal = (orthogonal + orthogonal_lo).astype(output.dtype)
+    own, own_lo = compensated_add((whole, jnp.zeros_like(whole)), (-restored[0], -restored[1]))
+    orthogonal = jnp.where(below, own + own_lo, orthogonal).astype(output.dtype)
     parallel = power2(parallel + parallel_lo, vector_exponent).astype(output.dtype)
     return orthogonal, parallel
 

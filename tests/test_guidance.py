@@ -130,34 +130,55 @@ def test_finite_predictions_guide_finitely(guidance, conditional, unconditional,
     np.testing.assert_array_equal(clean, np.full(clean.shape, guided, clean.dtype))
 
 
-def apg_keeps_a_lane_scaled_below_the_least_normal():
-    """APG at a scale of 2, eta 0 and no clipping over a conditional `[2^120, 0]` and an unconditional `[0,
-    -2^-7]`: its direction `[2^120, 2^-7]` has the orthogonal component `[0, 2^-7]`, so the guided row is
-    `[0, 2^-7]`, exactly (Diffusers' float64 projection rounds to it), on every device, where the
-    direction's row scaling put that lane at 2^-128, below float32's least normal, which a CPU flushed and
-    a GPU kept, guiding `-2^-7` on the one and `+2^-7` on the other (row 9710). Compiled as one program
-    (`ahead_arm`), a GPU numerics cell too (tests/test_gpu_numerics.py)."""
+APG_EDGES = {
+    "a lane scaled below the least normal": ([2.0 ** 120, 0.0], [0.0, -2.0 ** -7], 2.0),
+    "a parallel component at float32's largest": (
+        [1.0, 0.5, 0.5, 0.5, 0.5],
+        [-1.5 * 2.0 ** 104, *(-float(np.finfo(np.float32).max) + offset
+                              for offset in (0.0, 2.0 ** 104, 2.0 ** 104, 2.0 ** 104))],
+        0.5),
+}
+"""APG's projection at its range's edges: a direction `[2^120, 2^-7]`, whose row scaling puts its second
+lane at 2^-128, below float32's least normal (row 9710), and one whose parallel component is float32's
+largest, `M`, its orthogonal `1.5 2^104 - M` formed over the scaled row (an unscaled TwoSum's partial rounds
+to -inf there, the review of 36155cc41)."""
+
+
+def apg_holds_its_projection_at_its_ranges_edges():
+    """APG at eta 0 with no clipping over each of `APG_EDGES` (a conditional, an unconditional and a scale)
+    guides as Diffusers' float64 projection of the float32 direction does, its orthogonal component rounded
+    to float32 then scaled and added in float32, bit for bit, on every device: the lane of `2^-7` beside
+    `2^120` `+2^-7`, where a CPU flushed its scaled 2^-128 and guided `-2^-7` and a GPU kept it (row 9710),
+    and every lane of the second finite. Compiled as one program (`ahead_arm`), a GPU numerics cell too
+    (tests/test_gpu_numerics.py)."""
     from reference_error import ahead_arm
 
     process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
 
-    def guided(conditional, unconditional):
+    def guided(conditional, unconditional, scale):
         denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
                                    {"prediction": unconditional})
-        walk = APG(2.0, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
+        walk = APG(scale, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
         x = jnp.zeros_like(conditional)
         # At alpha=0 and sigma=1 DirectPredictionTransform's clean prediction is the raw one.
         return walk.step(x, jnp.ones(1), 0, walk.init(x))[0][0]
 
-    found = np.asarray(ahead_arm(jax.jit(guided), "APG over a lane scaled below the least normal")(
-        np.asarray([[2.0 ** 120, 0.0]], np.float32), np.asarray([[0.0, -2.0 ** -7]], np.float32)))
-    np.testing.assert_array_equal(found.view(np.uint32), np.asarray([[0.0, 2.0 ** -7]], np.float32).view(
-        np.uint32))
+    for name, (conditional, unconditional, scale) in APG_EDGES.items():
+        conditional, unconditional = (np.asarray([value], np.float32)
+                                      for value in (conditional, unconditional))
+        found = np.asarray(ahead_arm(jax.jit(functools.partial(guided, scale=scale)), f"APG at {name}")(
+            conditional, unconditional))
+        direction = (conditional - unconditional).astype(np.float64)
+        along = conditional.astype(np.float64)
+        orthogonal = (direction - (direction @ along.T) / (along @ along.T) * along).astype(np.float32)
+        expected = unconditional + np.float32(scale) * orthogonal
+        assert np.all(np.isfinite(expected)), name
+        np.testing.assert_array_equal(found.view(np.uint32), expected.view(np.uint32), err_msg=name)
 
 
-def test_apg_keeps_a_lane_scaled_below_the_least_normal():
-    """`apg_keeps_a_lane_scaled_below_the_least_normal` on the CPU."""
-    apg_keeps_a_lane_scaled_below_the_least_normal()
+def test_apg_holds_its_projection_at_its_ranges_edges():
+    """`apg_holds_its_projection_at_its_ranges_edges` on the CPU."""
+    apg_holds_its_projection_at_its_ranges_edges()
 
 
 def test_apg_momentum_carries_a_direction_past_half_precision():
