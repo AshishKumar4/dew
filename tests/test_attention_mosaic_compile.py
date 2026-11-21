@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
+from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from kernel_compile import gate_generations, lowered_for
 from test_attention_mosaic import (
@@ -1263,6 +1263,31 @@ def test_the_launches_lower_for_a_v5e(call):
             lowering_platforms=("tpu",))
 
 
+@COMPILES_FOR_TPU
+@pytest.mark.usefixtures("libtpu_shared")
+def test_bf16_template_compiles_for_a_v5e():
+    """Head-first `[B, H, S, D]` TPU layout lets the template's bf16 forward and training step compile on
+    v5e through `libtpu` without Mosaic's packed-sublane head-slice error (rows 6993, 10152)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_tpu_kernels, failures
+
+    query = jax.ShapeDtypeStruct((1, 256, 4, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 256, 2, 128), jnp.bfloat16)
+
+    def fwd(q, k, v):
+        with generation.chosen(attention_mainloop="mosaic"):
+            return scaled_dot_product_attention(q, k, v, causal=True, implementation="template")
+
+    def step(q, k, v, dout):
+        with generation.chosen(attention_mainloop="mosaic"):
+            out, pull = jax.vjp(fwd, q, k, v)
+            return out, *pull(dout)
+    cases = [KernelCase("v5e-bf16-fwd", lambda: (fwd, (query, key, key))),
+             KernelCase("v5e-bf16-step", lambda: (step, (query, key, key, query)))]
+    found = compile_tpu_kernels(cases, "v5e")
+    assert not failures(found), "\n".join(failures(found))
+
+
 APPROXIMATED_BY_MOSAIC = ("exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",
                           "rsqrt")
 """The unary operations whose Mosaic GPU lowering takes `approx_math` (jax's Pallas Mosaic GPU lowering rules
@@ -1487,3 +1512,21 @@ def test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free(stored):
         found = compile_mosaic_kernels(
             [KernelCase("fp8-sm80-decode", lambda: (decoded, (query, key, key, *scales)))], "sm80")
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_fused_keys_first_register_model_counts_dq_product():
+    """`_keys_first_registers` includes the fused `dQ = dS^T @ K` product fragments beside `step[0]` and
+    the dQ accumulator (row 6944): on `sm80` (`mma.sync`, `operands_in_registers=True`, `in_flight=0`),
+    at `128x64` width 128 (`split=True`), `fused=True` counts strictly more registers than `fused=False`."""
+    with generation.assumed("sm80"):
+        family = attention_mosaic_program.bundle("sm80", jnp.bfloat16)
+        fused = attention_mosaic.BackwardTiles(
+            128, 64, 2, 1, fused=True, family=family.name, dkv_family=family.name, dkv_consumers=2,
+            narrow=True)
+        unfused = dataclasses.replace(fused, fused=False)
+        dkv_family = attention_mosaic_program.bundle_of(fused.dkv, jnp.bfloat16)
+        reg_fused = attention_mosaic_program.backward_registers(
+            dkv_family, fused.dkv, 128, 128, jnp.bfloat16, accurate=False, dq=False, split=True)
+        reg_unfused = attention_mosaic_program.backward_registers(
+            dkv_family, unfused.dkv, 128, 128, jnp.bfloat16, accurate=False, dq=False, split=True)
+        assert reg_fused > reg_unfused, (reg_fused, reg_unfused)

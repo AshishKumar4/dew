@@ -22,9 +22,9 @@ import numpy as np
 from jax.experimental import pallas as pl
 
 from dew.batch import document_firsts
+from dew.nn.aligned import aligned_sum
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.tables import Column, column, packed, unpacked
-from dew.nn.precision import aligned_sum
 from dew.nn.sharding import rows_like
 
 
@@ -212,7 +212,7 @@ def entry_terms(key, value, weight, *, values_first: bool = False) -> list[tuple
 def entry_write(key, value, weight, *, values_first: bool = False) -> jax.Array:
     """A forked document's entry write `weight sum_r key_r value_r^T` (`recurrence_chunk.Chunk.entry_key`):
     the write `[..., Dk, Dv]`, or with `values_first` `[..., Dv, Dk]` (`entry_terms`' layouts); `weight`
-    broadcast against the write. Its terms summed aligned to the largest (`precision.aligned_sum`), so a sum
+    broadcast against the write. Its terms summed aligned to the largest (`aligned.aligned_sum`), so a sum
     in range is its value though its terms leave fp32's range: the one form the portable walk's opening, the
     template's chunks (`ForkedChunks.entries`) and the TPU forked scan take. Of rank zero it is zero, the
     memory it enters unchanged, as the einsum before it gave (row 8967: an aligned sum of no terms raised)."""

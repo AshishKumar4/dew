@@ -1624,13 +1624,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
             counts = {count: _held_ahead(each) for count, each in admitted.items()}
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
-    # The sampled step as the search compiled it, its program what it lowered then (the plan unreleased, its
-    # lowering held), digested as the step's is: a program no file can hold is refused by name.
-    sampled = None
-    if planned.sampled is not None:
-        if planned.sampled.lowered is None:
-            raise ValueError("the sampled step's plan was released before it was compiled ahead")
-        sampled = AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
+    # The sampled step as the search compiled it, as a count's is (`_sampled_ahead`).
+    sampled = _sampled_ahead(planned)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     held = [compiled, *starts.values(), *(each.executable for each in admitted.values()),
@@ -1669,13 +1664,22 @@ def _step_need(planned: Planned, counts: Iterable[Planned], starts: Mapping[str,
 
 def _held_ahead(planned: Planned) -> tuple[AheadProgram, AheadProgram | None]:
     """A sampled pass count's step admitted at its cap's plan (`StepCompiler.admitted_counts`), and its
-    sampled step where the run inspects, as programs compiled ahead (`AheadOfTime.counts`)."""
+    sampled step where the run inspects (`_sampled_ahead`), as programs compiled ahead
+    (`AheadOfTime.counts`)."""
     step = AheadProgram.of(program_digest(planned.candidate.lowered), planned.executable)
+    return step, _sampled_ahead(planned)
+
+
+def _sampled_ahead(planned: Planned) -> AheadProgram | None:
+    """A step's sampled step where the run inspects, as a program compiled ahead: the cap's
+    (`AheadOfTime.sampled`) and a count's (`_held_ahead`). Its program is what the search lowered (the plan
+    unreleased, its lowering held), digested as the step's is: a program no file can hold is refused by
+    name."""
     if planned.sampled is None:
-        return step, None
+        return None
     if planned.sampled.lowered is None:
-        raise ValueError("a count's sampled step was released before it was compiled ahead")
-    return step, AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
+        raise ValueError("a sampled step's plan was released before it was compiled ahead")
+    return AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
 
 
 def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> HostStartup:

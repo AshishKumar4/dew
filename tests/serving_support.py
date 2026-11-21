@@ -2,6 +2,7 @@
 
 import dataclasses
 import functools
+import hashlib
 import itertools
 from collections.abc import Callable, Mapping, Sequence
 
@@ -12,6 +13,7 @@ import numpy as np
 from flax import linen as nn
 from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
+from dew._hashing import array_fingerprint
 from dew.batch import Variables
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
@@ -148,7 +150,7 @@ def full_forward_scores(task: TextGeneration, requests: Sequence[Served], model:
             carried = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
             held = with_served_blocks(carried, np.ones(prompt.shape, bool), task.prefix)
             given = request.conditioned(np.asarray(row))
-            key = exactly((prompt, tokens, held, given))
+            key = fingerprint((prompt, tokens, held, given))
             if key not in made:
                 reading = functools.partial(forward, conditioning=widened(given) if wide else given)
                 made[key] = drawn_scores(reading, weights, prompt, tokens, held, per_step=not wide,
@@ -158,12 +160,14 @@ def full_forward_scores(task: TextGeneration, requests: Sequence[Served], model:
     return scored
 
 
-def exactly(tree) -> tuple:
-    """`tree`'s identity bit for bit: its structure and each leaf's dtype (the type itself, two float8 kinds
-    of one width apart), shape and bytes."""
+def fingerprint(tree) -> tuple:
+    """`tree`'s identity bit for bit: its structure and a digest of its leaves, each fingerprinted as Dew
+    fingerprints an array (`dew._hashing.array_fingerprint`: its dtype, shape and bytes)."""
     leaves, structure = jax.tree.flatten(tree)
-    held = [np.asarray(leaf) for leaf in leaves]
-    return (structure, *((leaf.dtype, leaf.shape, leaf.tobytes()) for leaf in held))
+    hasher = hashlib.sha256()
+    for leaf in leaves:
+        array_fingerprint(hasher, np.asarray(leaf))
+    return structure, hasher.digest()
 
 
 def served_row(seed: int, vocab: int, width: int) -> np.ndarray:

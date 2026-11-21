@@ -1726,11 +1726,24 @@ def _rows(family: mosaic.Family, ref, row, head, first, count: int):
     return family.rows_of(ref.at[row, head, pl.ds(first, count)])
 
 
-def _views_of(refs: dict, row, head) -> dict:
-    """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each `[B, S, H, D]`
-    operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
-    return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
+def head_slice(family: mosaic.Family, row, head, span) -> tuple:
+    """Index `(row, head, span)` for a head-first TPU ref (`Family.copies_tiled_rows`), where placing the
+    head axis before the sequence keeps every 16-bit slice tile-aligned on v5e (rows 6993, 10152), else
+    `(row, span, head)`."""
+    return (row, head, span) if family.copies_tiled_rows else (row, span, head)
 
+
+def head_layout(family: mosaic.Family, array: jax.Array) -> jax.Array:
+    """Swap sequence and head axes of `array` (`[B, S, H, D]` <-> `[B, H, S, D]`) for a head-first TPU
+    family (`Family.copies_tiled_rows`), leaving non-TPU arrays untouched."""
+    return jnp.swapaxes(array, 1, 2) if family.copies_tiled_rows else array
+
+def _views_of(family: mosaic.Family, refs: dict, row, head) -> dict:
+    """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each operand's `[S, D]`
+    at batch row `row` and head `head` in `family`'s axis order (`head_slice`), step `j` its `j`-th block
+    of rows."""
+    return {name: (ref.at[head_slice(family, row, head, slice(None))], lambda j: (j, 0))
+            for name, ref in refs.items()}
 
 def _fused_held(logits: tuple, dtype, *, dropped: bool) -> list:
     """The tiles a fused backward launch holds beside both products and its pullback (`backward_registers`):
@@ -2340,12 +2353,15 @@ def _keys_first_registers(family: mosaic.Family, config: BackwardTiles, width: i
     # and the score cotangents in registers, its share of their columns.
     weights = (block_k, queries, dtype)
     columns = config.columns
+    dq_product = (resources.Product(queries, block_k, width,
+                                    beside=[step[0], (queries, width, jnp.float32)]),) if config.fused else ()
     fragments = _products(
         family, dtype,
         resources.Product(block_k, width, queries, beside=step[:1], transposed=True),
         resources.Product(block_k, value_width, queries, beside=step, transposed=True),
         resources.Product(block_k, queries, value_width // columns, beside=[weights], held=True),
         resources.Product(block_k, queries, width // columns, beside=[weights], held=True),
+        *dq_product,
         narrow=config.narrow)
     if accurate and family.operands_in_registers:
         # The accurate form's dK parts issued against one right operand, the queries, held at its whole depth

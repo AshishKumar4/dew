@@ -1078,8 +1078,11 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     padded_s = jax.ShapeDtypeStruct(merge_eq.invars[0].aval.shape, merge_eq.invars[0].aval.dtype)
     stacked_s = jax.ShapeDtypeStruct(merge_eq.invars[1].aval.shape, merge_eq.invars[1].aval.dtype)
     queries, width = merge_eq.params["queries"], merge_eq.params["width"]
-    block = merged._channel_block(merge_eq.params["units"], padded_s, stacked_s, queries, width, target)
-    emitted_bytes = _traced_merge_bytes(merge_eq.params["units"], padded_s, stacked_s, queries, width, block)
+    out_dtype, out_heads = merge_eq.params.get("out_dtype"), merge_eq.params.get("out_heads")
+    block = merged._channel_block(merge_eq.params["units"], padded_s, stacked_s, queries, width, target,
+                                  out_dtype=out_dtype, out_heads=out_heads)
+    emitted_bytes = _traced_merge_bytes(merge_eq.params["units"], padded_s, stacked_s, queries, width, block,
+                                        out_dtype=out_dtype, out_heads=out_heads)
     slices = padded_s.shape[1]
     merge_span = float(3 * -(-slices // means.chunk_width(slices)))
     walk_launches = [w for eq in programs.equations(traced.jaxpr)

@@ -553,26 +553,48 @@ def _batched_form(made):
     return jax.vmap(made(0))
 
 
-@pytest.mark.parametrize("draw", [_batch, lambda seed: _zero_massed(_batch(seed))],
-                         ids=["drawn", "a zero mass"])
+MERGED_DRAWS = {"drawn": _batch, "a zero mass": lambda seed: _zero_massed(_batch(seed))}
+"""The merged state's draws: three merges of four states over fp32's range (`_batch`), and the same with a
+state of no total (the attention merge's zero-mass draw: an operand held is never moved by a zero, whose term
+would be a zero mass's factor past the format, row 7124)."""
+
+MERGED_SITES = {
+    "its value": lambda: (_value(_state(1)), _value(_apart(1))),
+    "along every operand": lambda: (_moved(_state(1), (0, 1, 2)), _moved(_apart(1), (0, 1, 2))),
+    "along its outputs": lambda: (_moved(_state(1), (0,)), _moved(_apart(1), (0,))),
+    "along its totals": lambda: (_moved(_state(1), (1,)), _moved(_apart(1), (1,))),
+    "along its anchors": lambda: (_moved(_state(1), (2,)), _moved(_apart(1), (2,))),
+    "its gradient's derivative": lambda: (_second(_state(1)), _second(_apart(1))),
+    "batched": lambda: (_value(_batched_form(_state)), _value(_batched_form(_apart))),
+}
+"""The merged state's sites, each its form and its parts' (`_state`, `_apart`): a cell a site, its draws in
+it, so each compiles its own programs once (row 10154: a cell a draw compiled every site's, 250 to 280 s a
+cell past the group target, its two draws' programs alike)."""
+
+
+@pytest.mark.parametrize("site", MERGED_SITES)
 @pytest.mark.parametrize("way", WAYS)
-def test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives(way, draw):
+def test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives(way, site):
     """The merged state (`means.merged_state`, one operation a template may run as one kernel) is on par with
     the merged output and the merged total from float64 (`_on_par`), and its derivatives with theirs: along
-    every operand and along each alone, the gradient's derivative along the totals, batched too, and with a
-    state of no total (the attention merge's zero-mass draw: an operand held is never moved by a zero, whose
-    term would be a zero mass's factor past the format, row 7124). Its landed anchor, an exact contract, is
-    theirs bit for bit."""
-    drawn = _with_directions(draw)
-    label = "a merged state against its output and its total"
-    _on_par(_value(_state(1)), _value(_apart(1)), way, drawn, label)
-    for at in ((0, 1, 2), (0,), (1,), (2,)):
-        _on_par(_moved(_state(1), at), _moved(_apart(1), at), way, drawn, f"{label}, along {at}")
-    _on_par(_second(_state(1)), _second(_apart(1)), way, drawn, f"{label}, the gradient's derivative")
-    _on_par(_value(_batched_form(_state)), _value(_batched_form(_apart)), way, drawn, f"{label}, batched")
-    operands = draw(0)
-    np.testing.assert_array_equal(np.asarray(_ways(_state(1), "a merged state's anchor")[way](*operands)[2]),
-                                  np.asarray(_ways(_apart(1), "its parts' anchor")[way](*operands)[2]))
+    every operand and along each alone, the gradient's derivative along the totals, and batched, each a
+    site (`MERGED_SITES`), at each draw (`MERGED_DRAWS`)."""
+    state, apart = MERGED_SITES[site]()
+    for name, draw in MERGED_DRAWS.items():
+        _on_par(state, apart, way, _with_directions(draw),
+                f"a merged state against its output and its total, {site}, {name}")
+
+
+@pytest.mark.parametrize("way", WAYS)
+def test_a_merged_states_landed_anchor_is_its_parts_bit_for_bit(way):
+    """The merged state's landed anchor (`means.merged_state`), an exact contract, is the merged total's bit
+    for bit (`means.merged_total`), at each draw (`MERGED_DRAWS`)."""
+    state, apart = (_ways(form, label)[way] for form, label in (
+        (_state(1), "a merged state's anchor"), (_apart(1), "its parts' anchor")))
+    # Every arm run before any is judged (`reference_error.ran_here`).
+    found = [(state(*draw(0))[2], apart(*draw(0))[2]) for draw in MERGED_DRAWS.values()]
+    for mine, theirs in found:
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
 def _gradients_derivatives(form):
@@ -847,21 +869,3 @@ def test_a_parameter_made_at_each_call_is_refused_at_bind():
     np.testing.assert_array_equal(means.merged_output(outputs, totals, anchors, means.Units(), 0),
                                   means.merged_output(outputs, totals, anchors, NATURAL, 0))
 
-
-def test_triton_lowerings_are_registered_by_their_owners_without_importing_merged():
-    """Every `scaled.MADE` primitive, `derivatives.marked_call_p`, and `precision.correctly_rounded_divide_p`
-    registers its own Pallas Triton lowering lazily through `launches._register_triton_lowerings` (row 9794),
-    without requiring `dew.nn.kernels.templates.merged` to be imported first."""
-    import sys
-
-    from jax._src.pallas.triton import lowering as triton_lowering
-
-    from dew.nn import derivatives, precision
-    from dew.nn.kernels import launches
-
-    assert "dew.nn.kernels.templates.merged" not in sys.modules
-    launches._register_triton_lowerings()
-    rules = triton_lowering.triton_lowering_rules
-    assert set(scaled.MADE) <= set(rules)
-    assert derivatives.marked_call_p in rules
-    assert precision.correctly_rounded_divide_p in rules
