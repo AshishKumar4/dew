@@ -173,8 +173,12 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     """Where the computation `checkpoints`' `step` trained and `trainer`'s differ (`differing_records`):
     their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
     a pass count's sampled law among it, row 10783)."""
-    return differing_records(checkpoints.artifact(step), trainer._artifact(), checkpoints.training(step),
-                             trainer.phase_passes.training_record(trainer.objective))
+    saved, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
+    # A law the checkpoint records binds a run that draws none: a fixed-pass resume would stop drawing (a
+    # checkpoint that records none, a fixed-pass run's, any run resumes).
+    dropped = (["training.sampled_passes"] if isinstance(saved, dict) and "sampled_passes" in saved
+               and "sampled_passes" not in now else [])
+    return differing_records(checkpoints.artifact(step), trainer._artifact(), saved, now) + dropped
 
 
 def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:

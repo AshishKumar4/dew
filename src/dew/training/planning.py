@@ -36,14 +36,7 @@ from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
-from dew.distributed.placement import (
-    Layout,
-    MeshSpec,
-    Placement,
-    allocated_bytes,
-    explicit_axes,
-    placed_bytes,
-)
+from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import (
     OuterProgram,
@@ -57,7 +50,6 @@ from dew.nn.kernels.options import (
     unhold,
 )
 from dew.nn.kernels.templates import report
-from dew.nn.protocols import StatesVocabulary
 from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import Ledger
@@ -68,12 +60,10 @@ from dew.training.distributed import batch_divisor
 from dew.training.interval import latest
 from dew.training.memory import (
     LIMIT_EXIT,
-    Head,
     LiveSet,
     MemoryMiss,
     compile_limit,
     compiled_if_it_fits,
-    defaults_free,
     head_fused_of,
     head_tile_of,
     local_devices,
@@ -85,7 +75,6 @@ from dew.training.memory import (
     remat_offloaded,
     rung_record,
     step_fits,
-    stopped,
     temporaries_factor,
 )
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
@@ -175,9 +164,6 @@ class Candidate:
     """The mesh axes a projection of its step spread over as it traced (`dew.nn.sharding.Link.spread`), which
     a step kept apart from its trace (`dew.training._candidates.candidate_for`) sets again on the links of
     the trace that reads it."""
-    footprint: Mapping = dataclasses.field(default_factory=dict)
-    """Each local device's bytes of the step before its compile states them (`Footprint`), from which its
-    GPU compile's limit is read (`compile_limit`): none for a step lowered for other devices."""
     joins: bool = False
     """Whether its updates join two or more Newton-Schulz stacks of one shape where its run states no group
     (`dew.newton_schulz.joining`): what its plan's release would part (`FitSearch.searched`)."""
@@ -773,27 +759,6 @@ def spending(candidate: Candidate | None = None) -> Iterator[dict[str, float]]:
         held[made.kind] = held.get(made.kind, 0.0) + made.seconds
 
 
-def named_as(asked: Sequence[tuple[Rung, str]], rung: Rung) -> str | None:
-    """The name a search's record gave `rung` where it asked it (`FitSearch.searched`), else None."""
-    return next((name for place, name in asked if place == rung), None)
-
-
-def head_of(objective, candidate: Candidate) -> Head | None:
-    """What marks a buffer of the head of `candidate`'s step (`Head`): the (argument, axis) pairs among its
-    arguments (`batch_rows`) of each axis of a leaf of its state as long as the vocabulary of a module its
-    objective runs states (`StatesVocabulary`), which a head's logits and their gradients descend from, and
-    the vocabulary's and the head's tile's lengths (`head_tile_of`); None where no module states one. An axis
-    or a buffer of another leaf as long counts too, the head's share of the step read no smaller."""
-    sizes = {entry.module.vocab_size for entry in objective.program_key()
-             if isinstance(entry.module, StatesVocabulary)}
-    if not sizes:
-        return None
-    leaves = jax.tree.leaves(apart(candidate.prepared))
-    return Head(frozenset((index, axis) for index, leaf in enumerate(leaves)
-                          for axis, size in enumerate(np.shape(leaf)) if size in sizes),
-                frozenset({*sizes, *(head_tile_of(objective) or ())}))
-
-
 def batch_rows(candidate: Candidate) -> frozenset[tuple[int, int]]:
     """The (argument, axis) pairs of the batch's rows among `candidate`'s step's arguments (its state's
     moving and frozen trees, its batch, its part, `step_program`): each batch leaf's leading axis, by its
@@ -814,23 +779,23 @@ class FitSearch[LossT, EffectsT]:
     splits walked as each miss's figures leave possible (`walked`): most runs fit there. Past it the
     Newton-Schulz stacks its updates join where its run states no group (`Candidate.joins`) are parted one
     at a time, before any recomputation, and joined again where that frees nothing (row 5889); then the
-    ladder, least recomputation first, each remat rung with its head's rungs under the step's options and
-    XLA's defaults where those can take other temporaries (`ladder`), every rung asked before the search
-    gives up, but one its misses' figures already rule out (`searched`): a head's tile or fusion where the
-    head's buffers at its remat rung's peak held less than the miss was short of. The narrow copies are
-    dropped after the first rung at the run's own head that missed by no more than they hold, judged by the
-    two misses (where the step without them fell less short, the rungs after keep them dropped; where it fell
-    no less short, a GPU's step casting its weights whole either way, they come back: `freed`). Each attempt
-    is one compile which, on a GPU, stops after buffer assignment where the step cannot fit (`LIMIT_EXIT`,
-    the fit check's own arithmetic, `compile_limit`), so a miss costs its assignment and no code
-    generation, and states its live set (`LiveSet`), from which the split asked next at that rung is
-    computed (`MemoryMiss`). The search climbs the ladder in its order and the plan is the first rung that
-    fits, at the coarsest split seen to fit there: every lighter rung was asked and missed in this start or
-    ruled out by a miss, so the plan's lightness is a result (docs/design/training.md, the cheapest
-    combination that fits). What a rung keeps orders its residuals, not XLA's allocated peak (a scanned
-    delta decoder at four microbatches needed 31.71 MB recomputing all but its scans and convolutions and
-    32.14 MB recomputing them too, a heavier rung needing more), so no rung is passed over for one above or
-    below it on a figure; the log names every rung asked with what it needed.
+    remat rungs, least recomputation first, each at the run's own head and options with the narrow copies
+    the start held (`recomputing`): a tight start settles in its second compile where the next remat rung
+    holds what its miss was short of (owner, 2026-11-21, BIBLE §6: two compiles a tight cold start). Past
+    those, where none fits, the narrow copies' drop, judged by the two misses (where the step without them
+    fell less short, the rungs after keep them dropped; where it fell no less short, a GPU's step casting its
+    weights whole either way, they come back: `freed`), then the whole ladder in its order, each remat rung
+    with its head's rungs under the step's options and XLA's defaults (`ladder`), every rung asked before
+    the search gives up. Each attempt is one compile which, on a GPU, stops after buffer assignment where
+    the step cannot fit (`LIMIT_EXIT`), so a miss costs its assignment and no code generation, and states its
+    live set (`LiveSet`), from which the split asked next at that rung is computed (`MemoryMiss`). The plan
+    is the first rung of that order that fits, at the coarsest split seen to fit there: a head's tile or
+    XLA's defaults, which recompute nothing, can fit below the remat rung settled, which a run states by
+    its rung (`--trainer.remat`, a head tile) or plans offline at each (`told`). What a rung keeps orders its
+    residuals, not XLA's allocated peak (a scanned delta decoder at four microbatches needed 31.71 MB
+    recomputing all but its scans and convolutions and 32.14 MB recomputing them too, a heavier rung needing
+    more), so no rung is passed over for one above or below it on a figure; the log names every rung asked
+    with what it needed.
     Each compile that misses names the split asked next (`after`); `resumed`, a checkpoint's rung, is
     warned of where it misses; where nothing fits it raises with the closest candidate's numbers. The
     objective is left at the plan's rung. A miss read from JAX's persistent cache states its live set as
@@ -1023,8 +988,7 @@ class FitSearch[LossT, EffectsT]:
         As given where a device states no limit or is no GPU."""
         devices = local_devices(self.mesh)
         # The fit check's own held and built bytes (`fitting`): the state's unplaced bytes count in both.
-        unplaced = self.unplaced or 0
-        limit = (compile_limit(devices, self.held(candidate), candidate.built + unplaced, candidate.footprint)
+        limit = (compile_limit(devices, candidate.held, candidate.built)
                  if all(device.platform == "gpu" for device in devices) else None)
         return options if limit is None else {**(options or {}), LIMIT_EXIT: limit}
 
@@ -1066,19 +1030,6 @@ class FitSearch[LossT, EffectsT]:
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
             fit, headroom = self.fitting(executable, candidate)
-            if fit and any(self.gather(executable is not None and stopped(executable, options))):
-                # Admitted, yet stopped past its limit after buffer assignment, its code not emitted: the
-                # limit read its new outputs short (`Footprint`: a donation XLA wrote over nothing), so it
-                # compiles again whole where it stopped, and every process judges the step again.
-                stopping, options = options, {name: value for name, value in (options or {}).items()
-                                             if name != LIMIT_EXIT} or None
-                if executable is not None and stopped(executable, stopping):
-                    relowered = relowered or Relowered(lambda: self.relowering(split))
-                    executable = compiled_if_it_fits(candidate.lowered, options, self.refusals,
-                                                     relower=relowered)
-                    candidate = relowered.candidate(candidate)
-                looked = self.compiled_key(candidate.lowered, options)
-                fit, headroom = self.fitting(executable, candidate)
             # Its lowering's own key, derived again only where a spill relowered it.
             key = looked if relowered is None or relowered.last is None else self.compiled_key(
                 candidate.lowered, options)
@@ -1135,13 +1086,11 @@ class FitSearch[LossT, EffectsT]:
         fit, headroom = probe.fits, probe.headroom
         self.probes.append(probe)
         if not fit and headroom is not None and probe.temp is not None:
-            live = None if executable is None else LiveSet.of(executable, batch_rows(candidate),
-                                                              head_of(self.objective, candidate))
+            live = None if executable is None else LiveSet.of(executable, batch_rows(candidate))
             # Its temporaries a microbatch's rows scale, as its live set states them, those it states no
             # provenance of among them (the most a split can free of them); every one where it states none.
             scaled = probe.temp if live is None else live.scaled + live.unknown
-            self.misses[(self.rung(), split)] = MemoryMiss(split, scaled, -headroom, self.factor,
-                                                           None if live is None else live.vocabulary)
+            self.misses[(self.rung(), split)] = MemoryMiss(split, scaled, -headroom, self.factor)
         if fit:
             assert executable is not None
             self.fits_at[self.rung()] = (split, (candidate, executable, self.chosen), self.sampled)
@@ -1176,18 +1125,17 @@ class FitSearch[LossT, EffectsT]:
         """The rungs above `start`, where the search began, by remat rung, least recomputation first: the
         places the one climb visits from `start` (`recompute_more`: at each remat rung its head's rungs,
         then the next remat rung with its head back at the run's tile), each under the step's options and
-        then under XLA's defaults where those can take other temporaries (`defaults_free`: the Triton GEMM
-        fusions they keep can take fewer, sm89), each reading the narrow copies where `narrow`
+        then under XLA's defaults where those are another program (`compiled_options`: the Triton GEMM
+        fusions they keep can take fewer temporaries, sm89), each reading the narrow copies where `narrow`
         and joining its Newton-Schulz stacks `ns_group` at a time.
         A run that states its remat has its head's rungs alone (docs/design/training.md, every choice can be
         overridden). The rungs at `start`'s remat and head are left out, asked already; the objective is
         read from `start` and left there, wherever the search stood before."""
         self.at(start)
         # The step's own options as its program reads them, the compile's stop past the limit no option of
-        # the program's (`limited`): where they differ from XLA's defaults in nothing that changes a step's
-        # temporaries, a rung under the defaults is asked for nothing (`defaults_free`).
+        # the program's (`limited`): where they are XLA's defaults, a rung under them is the same program.
         own = {name: value for name, value in (self.chosen or {}).items() if name != LIMIT_EXIT} or None
-        defaults = (False, True) if defaults_free(own, self.required) else (False,)
+        defaults = (False, True) if own != self.required else (False,)
         places = [Rung.of(self.objective, xla_defaults=False, narrow=narrow, ns_group=ns_group)]
         while recompute_more(self.objective, self.base):
             place = Rung.of(self.objective, xla_defaults=False, narrow=narrow, ns_group=ns_group)
@@ -1211,28 +1159,27 @@ class FitSearch[LossT, EffectsT]:
         where its updates join Newton-Schulz stacks its run states no group for (`Candidate.joins`), the same
         rung joining one at a time, its copies released (up to 11.3 GB at a 4B step's peak for 82 ms a step,
         row 5669, where a remat rung recomputes its forward; row 5889), kept only where that brought it nearer
-        (`freed`); then each rung of the ladder from the batch whole, in its order, cheapest first (`ladder`;
-        docs/design/training.md, the cheapest combination that fits), until one fits. Where its step reads
-        narrow copies, they are dropped next after the first rung at its own head that missed by no more than
-        they hold (`drops_copies`), and the rungs after read them only where that brought it no nearer
-        (`freed`). A rung is passed over only on what its misses read already (BIBLE §6, no compile the data
-        held makes unnecessary): a head's tile or fusion where each miss of its remat rung at the run's own
-        head was short of more than the head's buffers held at its peak (`frees_head`). A GH200's 4B step,
-        short of its stranded temporaries recomputing nothing, asked its head's four rungs, XLA's defaults
-        and the copies' drop, none freeing what it needed, before 'minimal' fitted (UB-6740-TWINS2: 8
-        compiles, 222 s). No rung is asked twice; every process asks the same."""
+        (`freed`); then each remat rung of the ladder at the run's own head and options, the narrow copies
+        as the start held them, least recomputation first (`recomputing`): a tight start's next compile is
+        the rung that recomputes the activations its miss was short of (owner, 2026-11-21: a GH200's 4B
+        step asked six head and options rungs and the copies' drop, none freeing its 0.47 GiB, before
+        'minimal' fitted, 8 compiles where two were the start's contract, BIBLE §6). Past them, where none
+        fits, the rest of the ladder in its order: where its step read narrow copies, the start's rung
+        without them, whose miss and the one before it decide whether the rungs after read them (`freed`),
+        then every rung of the ladder from the batch whole, its head's tiles and XLA's default options
+        among them, until one fits. No rung is asked twice; every process asks the same."""
         start = self.rung_now()
         after = functools.partial(self.after, candidates)
         split = walked(candidates, first, self.fits_here, after)
         if split is not None:
             return split
-        # The rungs walked already, all missed: none is asked again; each by the name its record gives it.
-        asked: list[tuple[Rung, str]] = [(start, self.rung())]
+        # The rungs walked already, all missed: none is asked again; and each as its record names it.
+        asked: list[Rung] = [start]
         named = [self.rung()]
 
         def ask(rung: Rung, said: str) -> int | None:
+            asked.append(rung)
             self.at(rung)
-            asked.append((rung, self.rung()))
             named.append(self.rung())
             _log.warning(said, json.dumps(self.current(), sort_keys=True))
             return walked(candidates, 0, self.fits_here, after)
@@ -1249,67 +1196,46 @@ class FitSearch[LossT, EffectsT]:
             if ns_group is None:
                 _log.warning("the step's joined Newton-Schulz stacks free nothing it needs: it keeps them "
                              "joined and climbs on")
-        # The narrow copies, two bytes a parameter held all run for 1-2% of a step: their drop still to judge.
-        judging = narrow and any(candidate.copies for candidate in self.lowered.values())
-        for place in [start, *(rung for group in self.ladder(start, narrow, ns_group) for rung in group)]:
-            rung = dataclasses.replace(place, narrow=narrow, ns_group=ns_group)
-            if named_as(asked, rung) is None:
-                if not self.frees_head(rung, start, asked):
-                    continue
-                split = ask(rung, "the step does not fit the devices; compiling it again at %s")
-                if split is not None:
-                    self.said(named)
-                    return split
-            own = (rung.tile, rung.fused) == (start.tile, start.fused) and (place is start
-                                                                            or not rung.xla_defaults)
-            kept = named_as(asked, rung)
-            if judging and own and kept is not None and self.drops_copies(kept):
-                judging = False
-                split = ask(dataclasses.replace(rung, narrow=False), "the step does not fit the devices with "
-                            "its narrow copies; compiling it again without them (%s)")
-                if split is not None:
-                    self.said(named)
-                    return split
-                narrow = not self.freed(kept, self.rung())
-                if narrow:
-                    # Dropped, the step fell no less short at the split both missed at: on a GPU the step
-                    # casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB
-                    # with them), so the copies come back, their 1-2% of a step kept, and the ladder climbs
-                    # with them.
-                    _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs "
-                                 "on")
+        for rung in self.recomputing(start, narrow, ns_group):
+            if rung in asked:
+                continue
+            split = ask(rung, "the step does not fit the devices; compiling it again recomputing more at %s")
+            if split is not None:
+                self.said(named)
+                return split
+        if narrow and any(candidate.copies for candidate in self.lowered.values()):
+            # The narrow copies, two bytes a parameter held all run for 1-2% of a step, dropped at the start's
+            # rung where no recomputation fits with them.
+            self.at(dataclasses.replace(start, ns_group=ns_group))
+            kept = self.rung()
+            split = ask(dataclasses.replace(start, narrow=False, ns_group=ns_group), "the step does not fit "
+                        "the devices with its narrow copies; compiling it again without them (%s)")
+            if split is not None:
+                self.said(named)
+                return split
+            narrow = not self.freed(kept, self.rung())
+            if narrow:
+                # Dropped, the step fell no less short at the split both missed at: on a GPU the step casts
+                # its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them),
+                # so the copies come back, their 1-2% of a step kept, and the ladder climbs with them.
+                _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
+        for rung in (rung for group in self.ladder(start, narrow, ns_group) for rung in group):
+            if rung in asked:
+                continue
+            split = ask(rung, "the step does not fit the devices; compiling it again at %s")
+            if split is not None:
+                self.said(named)
+                return split
         self.said(named)
         return None
 
-    def frees_head(self, rung: Rung, start: Rung, asked: Sequence[tuple[Rung, str]]) -> bool:
-        """Whether `rung` can fit by what the misses read so far: not a head's tile or fusion other than the
-        run's (`start`'s) where each miss of its remat rung at the run's head, under the step's own options
-        and with the copies the rung reads (`asked` names it), was short of more than the buffers at its
-        peak a head's tile or fusion can change (`LiveSet.vocabulary`), stranding counted
-        (`MemoryMiss.closes`): they change those alone. Every other rung can, and one whose remat rung read
-        no such figure."""
-        if (rung.tile, rung.fused) == (start.tile, start.fused):
-            return True
-        own = named_as(asked, dataclasses.replace(rung, tile=start.tile, fused=start.fused,
-                                                  xla_defaults=False))
-        misses = [miss for (name, _), miss in self.misses.items() if name == own]
-        if misses and all(miss.vocabulary is not None and not miss.closes(miss.vocabulary)
-                          for miss in misses):
-            _log.info("the head tiled %s (fused: %s) at %s holds less than its misses were short of: not "
-                      "compiled", rung.tile, rung.fused, own)
-            return False
-        return True
-
-    def drops_copies(self, name: str) -> bool:
-        """Whether dropping the narrow copies can close a miss of the rung `name`: one short of no more than
-        the copies its step reads hold, counted as a temporary its stranding doubles (`MemoryMiss.closes`), or
-        one it read no figure of. A step short of more recomputes before it drops them: a GH200's 4B step,
-        some 35 GiB short
-        with 6.77 GiB of copies, freed none dropping them (UB-6740-TWINS2)."""
-        reads = [(miss, self.lowered.get((miss.split, name))) for (rung, _), miss in self.misses.items()
-                 if rung == name]
-        return not reads or any(candidate is None or miss.closes(allocated_bytes(candidate.prepared.compute))
-                                for miss, candidate in reads)
+    def recomputing(self, start: Rung, narrow: bool, ns_group: int | None) -> list[Rung]:
+        """The ladder's remat rungs above `start`'s, each at the run's own head and the step's own options
+        (each remat place's first, `ladder`), least recomputation first, reading the narrow copies where
+        `narrow` and joining the Newton-Schulz stacks `ns_group` at a time: none for a run that states its
+        remat, whose ladder is its head's rungs alone."""
+        return [group[0] for group in self.ladder(start, narrow, ns_group)
+                if group[0].modules != start.modules and not group[0].xla_defaults]
 
     def said(self, named: list[str]) -> None:
         """Log every rung the search asked (`named`, as `rung` names each), in the ladder's order, with the

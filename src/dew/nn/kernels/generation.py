@@ -588,12 +588,6 @@ class GpuTarget:
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
-    triton_gemm_temporaries: bool = True
-    """Whether a step compiled with XLA's Triton GEMM fusions on can take other temporaries than with them
-    off on this GPU (`dew.training.memory.defaults_free`), so a fit compiles a step under XLA's defaults
-    where it misses under its own options: not on an H100, whose autotuner kept cuBLAS for a 4B decoder's
-    every GEMM, the step under XLA's defaults taking its 36.624 GiB of temporaries and 88.337 GiB peak to the
-    byte (UB-6740-TWINS2-gh200, 2026-11-21)."""
     step_seconds: float | None = None
     """The least one step of a form's dependent chain costs on XLA's path (the work-span model's step,
     `templates.cost.Work.span`), each step reading the last: the slope over its iterations of a loop XLA
@@ -869,7 +863,7 @@ TARGETS = {target.generation: target for target in (
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
               clock_hz=1830e6, memory_bandwidth=3350e9, memory=80 * 10 ** 9, triton_gemm_fusions=False,
-              triton_gemm_temporaries=False, step_seconds=4.93e-6,
+              step_seconds=4.93e-6,
               # The Hopper Tuning Guide's "Increased L2 Capacity": H100's 50 MB.
               l2_bytes=50 * 2 ** 20,
               # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for

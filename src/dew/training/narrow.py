@@ -161,7 +161,10 @@ def program_reads(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] =
             dtype = _cast_once(var, live, weights)
             if dtype is not None:
                 casts[path] = dtype
-    return Reads(casts, frozenset(path for path, _, var in held if var in live.outvars or _uses(var, live)))
+    # Every variable the live equations read, in one pass over them.
+    used = {id(operand) for eqn in live.eqns for operand in eqn.invars}
+    returned = {id(var) for var in live.outvars}
+    return Reads(casts, frozenset(path for path, _, var in held if id(var) in used | returned))
 
 
 def narrowed(variables: Variables, paths: dict[tuple[str, ...], jnp.dtype]) -> Variables:
