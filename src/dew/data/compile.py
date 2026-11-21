@@ -1997,10 +1997,15 @@ def iterate(
                                                  for stage in _steps(pipeline)):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat; a snapshot "
                          "seals a random step's draws (`snapshot(url, seed=...)`)")
-    (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
-                        training=False)
+    # A sealing pass draws as its records stand in the one order it seals them in, wherever its steps reorder
+    # or drop them before a draw (a filter, a shuffle): validation's rule, a draw keyed by the record's
+    # canonical index, is a scored split's, which a later pass must draw alike (row 10567).
+    sealing = seed is not None
+    (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, training=sealing, counts=({},)),
+                        read, ({},), training=False)
     # Publication reads records, unbatched.
-    build = _build(pipeline, read, loading, batch=1, training=False, seed=0 if seed is None else seed)
+    build = _build(pipeline, read, loading, batch=1, training=False, seed=0 if seed is None else seed,
+                   lowering=_analyzed(pipeline, read) if sealing else None)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 
