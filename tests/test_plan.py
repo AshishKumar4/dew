@@ -303,8 +303,8 @@ class Counted(LMObjective):
         return super().loss(variables, batch, step)
 
 
-def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, **fields):
-    model = CausalTransformer(vocab_size=64, emb_features=width, num_layers=layers, num_heads=2,
+def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, vocab=64, **fields):
+    model = CausalTransformer(vocab_size=vocab, emb_features=width, num_layers=layers, num_heads=2,
                               mlp_features=2 * width, max_seq_len=seq, **fields)
     return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
