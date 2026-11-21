@@ -34,6 +34,8 @@ The gradients are the cast's on split meshes as partitioned for the CPU
 its first should compare a few steps against copies off.
 """
 
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 from jax._src.interpreters import partial_eval
@@ -126,16 +128,24 @@ def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.
     """The paths under `params` (relative to it) whose one use in
     `loss(params, *rest)` is a cast to a narrower float dtype, with that
     dtype. The arguments may be shapes alone."""
-    return cast_paths(jax.make_jaxpr(loss)(params, *rest), params)
+    return program_reads(jax.make_jaxpr(loss)(params, *rest), params).casts
 
 
-def cast_paths(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] = ()
-               ) -> dict[tuple[str, ...], jnp.dtype]:
-    """The paths of `tree`'s leaves under `within` (relative to it) whose one use in `closed`, a program
-    whose first inputs are `tree`'s leaves, is a cast to a narrower float dtype, with that dtype: those
-    leaves' casts alone, the program's other inputs read as it reads them. Uses are counted in its live
-    equations alone (`partial_eval.dce_jaxpr`): a read whose value nothing takes (a selector's probe that
-    declined its cast) is none, the program as it runs reading the weight once."""
+class Reads(NamedTuple):
+    """How a program reads the leaves of a tree it takes first (`program_reads`), each by its path: those
+    whose one use is a cast to a narrower float dtype, with that dtype (`casts`), and every one it reads at
+    all (`read`), in its live equations alone."""
+
+    casts: dict[tuple[str, ...], jnp.dtype]
+    read: frozenset[tuple[str, ...]]
+
+
+def program_reads(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] = ()) -> Reads:
+    """How `closed`, a program whose first inputs are `tree`'s leaves, reads those under `within` (relative
+    to it), its other inputs read as it reads them (`Reads`). Uses are counted in its live equations alone
+    (`partial_eval.dce_jaxpr`): a read whose value nothing takes (a selector's probe that declined its cast)
+    is none, the program as it runs reading the weight once, and a leaf it reads nowhere is no part of what
+    it computes."""
     leaves = jax.tree_util.tree_flatten_with_path(tree)[0]
     # The program its uses are counted in, its dead equations dropped; JAX's dead-code elimination keeps an
     # effectful equation whatever reads it. Only the counting reads it: the step runs `closed` as traced.
@@ -145,27 +155,13 @@ def cast_paths(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] = ()
             for (path, leaf), var in zip(leaves, live.invars[:len(leaves)], strict=True)
             if tuple(key.key for key in path)[:len(within)] == within]
     weights = frozenset(var for _, _, var in held)
-    paths = {}
+    casts = {}
     for path, leaf, var in held:
         if isinstance(var, core.Var) and jnp.issubdtype(leaf.dtype, jnp.floating):
             dtype = _cast_once(var, live, weights)
             if dtype is not None:
-                paths[path] = dtype
-    return paths
-
-
-def read_paths(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] = ()
-               ) -> frozenset[tuple[str, ...]]:
-    """The paths of `tree`'s leaves under `within` (relative to it) that `closed`, a program whose first
-    inputs are `tree`'s leaves, reads in its live equations (`cast_paths`' count): a leaf it reads nowhere
-    is none, its value no part of what the program computes."""
-    leaves = jax.tree_util.tree_flatten_with_path(tree)[0]
-    live, _ = partial_eval.dce_jaxpr(closed.jaxpr, used_outputs=[True] * len(closed.jaxpr.outvars),
-                                     instantiate=True)
-    return frozenset(tuple(key.key for key in path)[len(within):]
-                     for (path, _), var in zip(leaves, live.invars[:len(leaves)], strict=True)
-                     if tuple(key.key for key in path)[:len(within)] == within
-                     and (var in live.outvars or _uses(var, live)))
+                casts[path] = dtype
+    return Reads(casts, frozenset(path for path, _, var in held if var in live.outvars or _uses(var, live)))
 
 
 def narrowed(variables: Variables, paths: dict[tuple[str, ...], jnp.dtype]) -> Variables:
@@ -181,22 +177,28 @@ def forward_variables(variables: Variables, compute: Variables | None) -> Variab
     return variables if compute is None else merge(variables, compute)
 
 
-def narrow_copies(state, traced: core.Jaxpr) -> dict:
+def narrow_copies(state, reads: Reads) -> dict:
     """The parameters a step the trainer composes reads through narrow copies, by path under `params`
-    (`cast_paths`): on every GPU but one whose row measured them off, for a state that holds no frozen
-    collection. `traced` is the loss its first attempt reads as the trainer traced it for its shapes
-    (`dew.training.transaction.traced_loss`: its update a window of microbatches, each step read in its
-    split, its committed updates among its inputs, the state's variables its first inputs), whose casts are
-    read in place of a trace of its own, so a parameter the step computes on before its cast (a DEX
-    lambda's anneal) is not copied: a trace of a Qwen3.5-4B step's loss is seconds of its compile (row
-    4260)."""
+    (`Reads.casts`): on every GPU but one whose row measured them off, for a state that holds no frozen
+    collection. `reads` are those of the loss its first attempt reads as the trainer traced it for its
+    shapes (`dew.training.transaction.traced_loss`: its update a window of microbatches, each step read in
+    its split, its committed updates among its inputs, the state's variables its first inputs,
+    `state_reads`), read in place of a trace of its own, so a parameter the step computes on before its
+    cast (a DEX lambda's anneal) is not copied: a trace of a Qwen3.5-4B step's loss is seconds of its
+    compile (row 4260)."""
     from dew.nn.kernels.generation import Choice, backend, chosen_kernel
 
     if (chosen_kernel(Choice.NARROW_COPIES, 'on' if backend() == 'gpu' else 'off') == 'off'
             or FROZEN in state.variables):
         return {}
+    return reads.casts
+
+
+def state_reads(state, traced: core.Jaxpr) -> Reads:
+    """How `traced`, a step's loss whose first inputs are `state`'s variables, reads its parameters
+    (`program_reads` under `params`): once, for its narrow copies and for those its window holds."""
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
-    return cast_paths(traced, variables, ("params",))
+    return program_reads(traced, variables, ("params",))
 
 
 def held_copies(compute: Variables | None) -> dict[tuple[str, ...], jnp.dtype]:

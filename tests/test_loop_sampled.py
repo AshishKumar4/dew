@@ -347,6 +347,7 @@ def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path, caplog):
     from test_pass_weights import phased_draw, phased_loader
 
     from dew.training import Checkpoints
+    from dew.training.startup import computation_differs
 
     tokens, _ = phased_draw(0)
 
@@ -373,6 +374,11 @@ def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path, caplog):
     assert noted() == 1 and int(taken.step) == 4
     assert int(resumed.step) == 4
     assert_same(parameters(whole), parameters(resumed), "the resumed sampled run is not the run unstopped")
+    # A resume drawing by another law would draw another schedule of passes from the same key and positions:
+    # its checkpoint's sampled law is the computation it trained (row 10783).
+    other = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=dataclasses.replace(TRAINED, mean=2.5),
+                           checkpoints=Checkpoints(str(tmp_path / "resumed"), keep=8))
+    assert computation_differs(other, other.checkpoints, 4) == ["training.sampled_passes.mean"]
 
 
 def unnormed() -> CausalTransformer:

@@ -1096,6 +1096,13 @@ class CompiledMemory(NamedTuple):
     allocation its temporaries are packed into, that packing's room included. None where the backend states
     none (a TPU's, an older plugin's), never zero."""
 
+    @property
+    def summed(self) -> int:
+        """The bytes one device holds while the program runs, as XLA sums them (its memory limit's sum,
+        `dew.training.memory.LIMIT_EXIT`): its arguments, its outputs not written over them and its
+        temporaries; native workspaces (cuBLAS, cuDNN, a kernel's scratch) lie outside it."""
+        return self.argument + self.output - self.alias + self.temp
+
 
 _ANALYSED: weakref.WeakKeyDictionary[jax.stages.Compiled, CompiledMemory | None] = (
     weakref.WeakKeyDictionary())

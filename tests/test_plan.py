@@ -183,29 +183,6 @@ def test_a_start_whose_head_alone_fits_tiled_settles_it_at_no_recomputation(monk
     assert trainer.plan["head_tile"] is not None and trainer.plan["remat"] is None, probes
 
 
-def test_a_start_short_of_more_than_its_heads_buffers_recomputes_without_compiling_its_heads_tiles(
-        monkeypatch):
-    """A decoder whose step recomputing nothing is short of far more than its 64-word head holds at its
-    peak, given room for it recomputing 'minimal': the search compiles no head tile or fusion, each ruled
-    out by the misses at its remat rung (`LiveSet.vocabulary`: the head's tile and fusion change its
-    buffers alone), and settles a recomputing rung (row 6740: a GH200's 4B step compiled its head's four
-    rungs at no recomputation, none freeing what it needed, before 'minimal' fitted)."""
-    from dew.nn.kernels.generation import chosen
-
-    def decoder(remat=None):
-        return lm(split=1, width=128, layers=4, **({} if remat is None else {"remat": REMAT_POLICIES[remat]}))
-
-    with chosen(narrow_copies="off"):
-        room = needs(monkeypatch, decoder("minimal"))
-        free(monkeypatch, room)
-        trainer = decoder()
-        state, _, _ = trainer.place()
-        trainer.compile(state, BATCH, Trials(state, BATCH))
-    probes = trainer.plan["probes"]
-    assert all(probe["head_tile"] is None for probe in probes), probes
-    assert trainer.plan["remat"] is not None, probes
-
-
 def test_a_miss_computes_the_split_its_temporaries_leave_room_at():
     """A compile that missed by its `shortfall`, its stranding counted: a split above it holds what its
     rows scale at their share (`MemoryMiss.fits_at`)."""
@@ -675,27 +652,17 @@ def test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle(tmp_path, s
         np.testing.assert_array_equal(np.asarray(guided_leaf), np.asarray(unguided_leaf))
 
 
-def test_the_executable_a_profile_replaces_goes_with_its_program():
+@pytest.mark.parametrize("earlier", [False, True])
+def test_the_executable_a_profile_replaces_goes_with_its_program(earlier):
     """Under AutoPGLE a profile of the admitted step's runs compiles its program again, and the run keeps
     the guided executable alone: once the compile returns, the one the plan was admitted with is freed
     and the backend holds as many executables as it did with that one alive, though JAX keeps every
     executable it compiled of a program while the program's lowering lives. A handoff that kept the
-    admitted executable, or kept both, would hold one more."""
-    with autopgle(2):
-        trainer = lm()
-        state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
-    assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
-    assert trials.unguided is not None and trials.unguided() is None
-    live = live_executables()
-    assert live == trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
-                                                            holding(live - trials.live))
-
-
-def test_a_guided_compile_releases_an_earlier_trainers_unguided_executable():
-    """A trainer under AutoPGLE whose unguided step an earlier trainer of the same program compiled takes
-    that step, compiles the guided one, and lets the unguided go: no lowering the earlier trainer kept holds
-    it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
-    trained(lm(), steps=0)
+    admitted executable, or kept both, would hold one more. Where an `earlier` trainer of the same program
+    compiled the unguided step, the trainer takes it and lets it go too: no lowering the earlier trainer kept
+    holds it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
+    if earlier:
+        trained(lm(), steps=0)
     with autopgle(2):
         trainer = lm()
         state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
@@ -1722,6 +1689,27 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
     # A typed PRNG key by its key data, its key type beside it (train 1019's review, F1).
     first, second = (key(Displayed(4, held=jax.random.key(seed))) for seed in (0, 1))
     assert first is not None and first == key(Displayed(4, held=jax.random.key(0))) != second
+
+
+def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):
+    """A flag given twice is read by its last value, so a rung record's key states the flags in their order:
+    two orders of one flag's two values compute apart and key apart (row 10797: sorted, they were one key),
+    and the same order keys alike."""
+    import os
+
+    from dew.training.rungs import rung_key
+
+    trainer = lm()
+    state, _, _ = trainer.place()
+    flags = os.environ.get("XLA_FLAGS", "")
+
+    def key(*settings):
+        monkeypatch.setenv("XLA_FLAGS", " ".join((flags, *settings)))
+        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)
+
+    autotune_on, autotune_off = "--xla_gpu_autotune_level=4", "--xla_gpu_autotune_level=0"
+    first = key(autotune_on, autotune_off)
+    assert first is not None and first == key(autotune_on, autotune_off) != key(autotune_off, autotune_on)
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():

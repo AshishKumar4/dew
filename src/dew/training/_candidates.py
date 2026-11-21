@@ -36,7 +36,7 @@ from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
 from dew.training.memory import step_footprint
 from dew.training.model_flops import batch_consumed, batch_tokens
-from dew.training.narrow import holds_copies, narrow_copies, narrowed, read_paths
+from dew.training.narrow import holds_copies, narrow_copies, narrowed, state_reads
 from dew.training.planning import Candidate, splits
 from dew.training.stages import StageLocal
 from dew.training.transaction import COMMIT_FIELDS, outcome
@@ -344,15 +344,15 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
     # None), and a scaled loss's copies none.
     narrows = narrow and not settings.dynamic_scale and settings.diloco is None
-    own = narrow_copies(state, traced) if narrows and traced is not None else {}
+    reads = state_reads(state, traced) if traced is not None and (narrows or copies is not None) else None
+    own = narrow_copies(state, reads) if narrows and reads is not None else {}
     if copies is not None:
         # The window's copies, its cap's, are read by every step of it: a step reads a copy only of a
         # parameter whose one use in it is that cast, which the copy is (row 10770: a sampled count below an
         # implicit loop's cap narrows the loop's layers, whose cap sums their cotangents over its passes and
         # reads them whole). A parameter it would narrow and the window does not it reads whole and casts.
         # A copy of a parameter the step reads nowhere is no part of it (a later pass's θ, at one pass).
-        shaped = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
-        read = read_paths(traced, shaped, ("params",)) if traced is not None else frozenset()
+        read = frozenset() if reads is None else reads.read
         unread = sorted(".".join(path) for path, dtype in copies.items()
                         if (path in own and jnp.dtype(own[path]) != jnp.dtype(dtype))
                         or (path not in own and path in read))

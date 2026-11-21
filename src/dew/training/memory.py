@@ -734,8 +734,7 @@ def stopped(executable: jax.stages.Compiled, options: jax.stages.CompilerOptions
     its arguments, its new outputs and its temporaries past the limit they state."""
     limit = (options or {}).get(LIMIT_EXIT)
     stats = compiled_memory(executable)
-    return (limit is not None and stats is not None
-            and stats.argument + stats.output - stats.alias + stats.temp > int(limit))
+    return limit is not None and stats is not None and stats.summed > int(limit)
 
 
 INERT_OPTIONS = frozenset({'xla_gpu_dot_merger_threshold_mb'})
@@ -769,9 +768,10 @@ class LiveSet:
     unknown: int
     vocabulary: int | None = None
     """The bytes of its buffers a dimension of which descends from a vocabulary table's (`tables`), with
-    those it states no provenance of: the most a head's tile or fusion can change, the head's logits and
-    their gradients, those of its table among them, the rest of the step left as it is. None where no
-    table's axes were given."""
+    those it states no provenance of and those whose size descends from no argument (a GEMM's workspace):
+    the most a head's tile or fusion can change, the head's logits and their gradients, those of its table
+    among them, and the workspaces of the calls computing them, the rest of the step left as it is. None
+    where no table's axes were given."""
 
     @staticmethod
     def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]],
@@ -792,7 +792,10 @@ class LiveSet:
                 continue
             if any(dimension & rows for dimension in buffer.dims):
                 scaled += buffer.bytes
-            if tables and any(dimension & tables for dimension in buffer.dims):
+            # A buffer whose size descends from no argument (a GEMM's workspace, sized by its call) can
+            # change with the head's tile as well.
+            if tables is not None and not any(buffer.dims) or tables and any(
+                    dimension & tables for dimension in buffer.dims):
                 vocabulary += buffer.bytes
         return LiveSet(scaled, unknown, None if tables is None else vocabulary)
 

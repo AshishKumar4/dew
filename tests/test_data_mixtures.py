@@ -2111,23 +2111,33 @@ def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states
 def test_a_streamed_token_mix_of_stated_counts_draws_as_its_indexed_read(tmp_path):
     """A mix by tokens of two published generations, each stating its rows and valid targets, its members
     read as streams (prefetched), draws them as its indexed read does, each weighed by the counts its member
-    states (row 9010: the streams kept a deficit of the targets they read, whatever their members stated)."""
+    states (row 9010: the streams kept a deficit of the targets they read, whatever their members stated),
+    and logs the valid targets it delivered of each (`data/weighed_tokens/<member>`, row 10784: the stated
+    mix's streams counted none)."""
+    from dew.data.text import Tokenize
+
     members = [published_tokens(tmp_path, "short", 1), published_tokens(tmp_path, "long", 2)]
 
     from dew.data.analysis import STATED_SHARES
 
-    def read(how: str, chains: list[Pipeline]) -> tuple[list[int], str]:
+    def read(how: str, chains: list[Pipeline]) -> tuple[list[int], str, dict]:
         loader = compile(mix(chains, weights=[1, 3], by="tokens").repeat().batch(1), read=how, loading=READ)
         reader = loader.train(DataPartition())
         try:
             ids = [int(identity) for batch in itertools.islice(reader, 40) for identity in batch["id"]]
+            statistics = loader.statistics()
         finally:
             reader.close()
         assert loader.plan is not None
-        return ids, str(loader.plan.order["shares"])
+        return ids, str(loader.plan.order["shares"]), statistics
 
-    streamed, shares = read("streamed", [member.prefetch() for member in members])
+    streamed, shares, statistics = read("streamed", [member.prefetch() for member in members])
     assert shares == STATED_SHARES and streamed == read("indexed", members)[0]
+    # Each member's targets a row, its tokens less the one no target follows, times the rows it delivered.
+    for name, tag in (("short", 1), ("long", 2)):
+        targets = len(Tokenize().map({"text": TEXTS[name]})["text"]) - 1
+        assert statistics[f"data/weighed_tokens/{name}"] == targets * sum(
+            identity // 1000 == tag for identity in streamed), statistics
 
 
 TEXTS = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}
