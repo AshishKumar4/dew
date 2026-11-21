@@ -450,6 +450,20 @@ traced again (row 10762: precision's error-free transforms traced afresh at ever
 padded merge's grad of grad)."""
 
 
+SPAN_CONSTANTS_HELD = 1 << 20
+"""The most bytes of constants a held span's program may keep (`_holdable`): a span closing over a larger
+array (a model's weights) is traced at each call rather than pinning its buffers."""
+
+
+def _holdable(closed) -> bool:
+    """Whether a marked span's traced program may be held for its next call (`_SPANS`): none that closes over
+    the enclosing trace's values (that trace's alone), none with effects (a callback's function is the one
+    its first trace made), and none whose constants pass `SPAN_CONSTANTS_HELD` bytes."""
+    if closed.effects or any(isinstance(const, Tracer) for const in closed.consts):
+        return False
+    return sum(getattr(const, "nbytes", 0) for const in closed.consts) <= SPAN_CONSTANTS_HELD
+
+
 def release_spans() -> None:
     """Forget every marked span's program held (`_SPANS`) and the arrays they hold: where a process releases
     its compiled programs (tests/conftest.py's `release`)."""
@@ -505,8 +519,7 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
             closed, returned["structure"], returned["zeros"] = _SPANS[key]
         else:
             closed = jax.make_jaxpr(span)(*flat)
-            # A program closing over the enclosing trace's values is that trace's alone.
-            if key is not None and not any(isinstance(const, Tracer) for const in closed.consts):
+            if key is not None and _holdable(closed):
                 _SPANS[key] = (closed, returned["structure"], returned["zeros"])
                 while len(_SPANS) > SPANS_HELD:
                     _SPANS.popitem(last=False)
