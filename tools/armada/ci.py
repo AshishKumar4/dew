@@ -780,7 +780,7 @@ def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
     """Each file's seconds on armada under `python`: its median, which armada sums over a split file's groups
     (`task`), or its tests' sum in tests/test_durations.json where that is more: each test's record is its
-    least time (`durations`), so a sum past the median may mean the measured runs predate the file's current
+    recorded time (`durations`), so a sum past the median may mean the measured runs predate the file's current
     tests, and the sum is a floor on what it takes. base/kernels' route census, 1,576 tests recorded at 2,654
     s in a file main ran in 6 s, was packed by that median with six other files into one task, which ran past
     its deadline (train 18). Else the recorded sum, scaled by how much slower armada ran the files measured
@@ -1285,7 +1285,7 @@ def stale_row(python: str, name: str, group: str, why: str) -> dict:
 def stale_cost(name: str, group: str, reading: Reading) -> float:
     """What a kept row of test file `name` (in `group`'s group) costs a task that runs it, its record not
     found: its tests' recorded seconds, its check-1 sites' aside, which run apart (`own_tests`; a group's,
-    `members`), each its least time, and what a run cold adds to them (`COLD_SECONDS`), as the plan weighs a
+    `members`), each its recorded cost, and what a run cold adds to them (`COLD_SECONDS`), as the plan weighs a
     cold row; a file the record does not name, that alone."""
     reading.cut(name, 1)
     own = own_tests(name, (reading.durations or {}).get(name, {}))
