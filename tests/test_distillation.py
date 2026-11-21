@@ -760,14 +760,13 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
 def test_a_tiled_full_kl_over_a_batch_split_across_devices_gathers_no_states():
     """The tiled full KL (`_tiled_divergence`) over final states whose rows are split across four devices
     compiles with no all-gather of either model's states: each slice of positions keeps every row on its
-    own device, and the KL agrees with the whole logits' (row 9067: a slice of the flattened token axis
-    gathered `[B*S, D]` onto every device)."""
+    own device (row 9067: a slice of the flattened token axis gathered `[B*S, D]` onto every device). The
+    KL's agreement with the whole logits' is the reference test's, tiled."""
     import math
-    import re
 
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from sharded import collectives
 
-    from dew.nn import categorical
     from dew.objectives.base import Prediction
 
     arrays = fixture()
@@ -786,9 +785,6 @@ def test_a_tiled_full_kl_over_a_batch_split_across_devices_gathers_no_states():
         finite = jnp.ones((rows, positions), bool)
         return objective._tiled_divergence(student, teacher, finite, jnp.asarray(2.0))
 
-    program = jax.jit(divergence, in_shardings=(split, split)).lower(*states).compile().as_text()
-    gathered = [tuple(map(int, shape.split(",")))
-                for shape in re.findall(r"\[([\d,]+)\][^ ]* all-gather\(", program)]
+    compiled = jax.jit(divergence, in_shardings=(split, split)).lower(*states).compile()
+    gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
     assert not any(math.prod(shape) >= rows * positions * width for shape in gathered), gathered
-    whole = categorical.kl_divergence((states[0] @ student_table) / 2.0, (states[1] @ teacher_table) / 2.0)
-    np.testing.assert_allclose(divergence(*states), whole, rtol=1e-5, atol=1e-6)
