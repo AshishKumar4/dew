@@ -17,11 +17,22 @@ from dew.nn.kernels.templates import outputs
 from dew.nn.sharding import per_shard
 
 
+def _register_triton_lowerings() -> None:
+    """Register Dew's primitive owners' Pallas Triton lowerings on first `pallas_call` (row 9794)."""
+    from dew.algebra import scaled
+    from dew.nn import derivatives, precision
+
+    derivatives.triton_lowerings()
+    precision.triton_lowerings()
+    scaled.triton_lowerings()
+
+
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
     its `name`, which its profile names it by, its body traced as a launch's (`_traced`); an `out_shape`
     stating its outputs as its operands' axes (`outputs.Output`) its shapes, its call declaring their
     dimensions (`outputs.declared`)."""
+    _register_triton_lowerings()
     out_shape = params.get("out_shape")
     held = _held(pl.pallas_call(_traced(kernel, params.get("interpret")), name=name,
                                 **{**params, "out_shape": outputs.structs(out_shape)}), name)

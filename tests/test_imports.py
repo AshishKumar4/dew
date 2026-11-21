@@ -168,7 +168,10 @@ FOREIGN |= {"dew.registry": (
 # read no release's storage, the encoders that bind a released checkpoint dew.interop's (row 5996).
 FOREIGN |= {"dew.quantization": ("dew.training",),
             **dict.fromkeys(("dew.inputs.condition", "dew.inputs.diffusion", "dew.inputs.encoders",
-                             "dew.inputs.spec"), ("dew.interop",))}
+                             "dew.inputs.spec"), ("dew.interop",)),
+            # Primitive owners register Pallas Triton lowerings lazily on first pallas_call (row 9794).
+            **dict.fromkeys(("dew.nn.precision", "dew.nn.derivatives", "dew.algebra.scaled"),
+                            ("jax._src.pallas",))}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))

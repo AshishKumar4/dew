@@ -35,7 +35,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax._src import dispatch
-from jax._src.pallas.triton import lowering as triton_lowering
 from jax.extend import core
 from jax.interpreters import batching, mlir
 
@@ -183,6 +182,22 @@ MADE: dict[core.Primitive, tuple[Callable, bool]] = {}
 value, the function its default lowering runs, and whether it returns several values, by the primitive,
 so a lowering of a launch that runs the construct's functions (a kernel template's) holds each as it is
 made."""
+_TRITON_REGISTERED: set[core.Primitive] = set()
+
+
+def triton_lowerings() -> None:
+    """Register Pallas Triton lowerings for every primitive in `MADE` not yet registered (row 9794).
+    Called lazily on Pallas launch (`dew.nn.kernels.launches.pallas_call`) so importing `scaled` loads no
+    Pallas Triton lowering machinery."""
+    if len(_TRITON_REGISTERED) == len(MADE):
+        return
+    from jax._src.pallas.triton import lowering as triton_lowering
+
+    for made, (value, several) in MADE.items():
+        if made not in _TRITON_REGISTERED:
+            triton_lowering.register_lowering(made)(triton_lowering.lower_fun(value,
+                                                                              multiple_results=several))
+            _TRITON_REGISTERED.add(made)
 
 
 def _alike(value: Callable) -> Callable:
@@ -214,7 +229,6 @@ def primitive(name: str, value: Callable, typed: Callable, batched: Callable | N
     made.def_impl(partial(dispatch.apply_primitive, made))
     made.def_abstract_eval(typed)
     mlir.register_lowering(made, mlir.lower_fun(_alike(value), multiple_results=several))
-    triton_lowering.register_lowering(made)(triton_lowering.lower_fun(value, multiple_results=several))
     if batched is None:
         batching.defbroadcasting(made)
         made.elementwise = True
