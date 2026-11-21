@@ -1103,11 +1103,11 @@ def test_a_decode_step_resuming_an_initial_state_near_fp32s_largest_keeps_its_ma
             return attention_decode.attend(q, k, v, spans, hooks, interpret=True)
 
     def reference(q, k, v, im, it, ia):
-        return jnp.ones_like(q)
+        return template.reference(q, k, v, spans, template.Hooks(initial=template.Initial(im, it, ia)))
 
     def draw(seed: int):
         q, k, v, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(seed)
         return q, k, v, m, total, acc
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
-                    "decode step resuming initial state near fp32s largest", seeds=1)
+                    "decode step resuming initial state near fp32s largest", seeds=SEEDS)
