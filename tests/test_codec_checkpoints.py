@@ -202,10 +202,9 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
     wide = ModelConfig.from_model(packed.model).with_dtype("float64").build()
 
     def truth(tokens):
-        with jax.enable_x64(new_val=True):
-            variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(
-                jnp.asarray(leaf).dtype, jnp.floating) else leaf, dense)
-            return np.asarray(wide.apply(variables, jnp.asarray(tokens)))
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(
+            jnp.asarray(leaf).dtype, jnp.floating) else leaf, dense)
+        return wide.apply(variables, tokens)
 
     assert_as_exact(jax.jit(lambda tokens: packed.model.apply(packed.variables, tokens)),
                     jax.jit(lambda tokens: packed.model.apply(dense, tokens)), draw,
