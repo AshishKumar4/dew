@@ -610,9 +610,8 @@ def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array
         raise ValueError("a split walk's merge takes its finished form's states (`finished_form`)")
     state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
     if initial is not None:
-        own = initial_state(spec, Partial(*(jnp.swapaxes(a, 1, 2)
-                                            for a in (initial.acc, initial.m, initial.total))),
-                            raw_scale=raw_scale)
+        own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
+                                          jnp.swapaxes(initial.total, 1, 2)), raw_scale=raw_scale)
         acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
                          for mine, theirs in zip(state[:3], own[:3], strict=True))
         state = Partial(acc, m, total)
