@@ -332,6 +332,11 @@ class GroupedRollout:
         """`(generated, decoded samples in [-1, 1], spatial inputs)` of one sample per row."""
         raise NotImplementedError
 
+    def _program_name(self) -> str:
+        """The name the objective holds the rollout's generation by (`Objective.program`): everything
+        `_generate_impl` computes by beside its inputs, its count of time points by default."""
+        return f"{type(self).__name__} over {self.steps} time points"
+
     def _training_rows(self, generated, context: Batch, spatial: Mapping[str, np.ndarray],
                        rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
         """This process's training rows of a generation and its float64 rewards."""
@@ -412,9 +417,8 @@ class GroupedRollout:
             jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(
                 host, is_leaf=lambda column: not isinstance(column, Mapping))))
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
-        # The objective owns the program; the rollout fixes only its count of time points.
-        generate = self.objective.program(f"{type(self).__name__} over {self.steps} time points",
-                                          self._generate_impl)
+        # The objective owns the program; the rollout fixes what it generates (`_program_name`).
+        generate = self.objective.program(self._program_name(), self._generate_impl)
         generated = agreed("flow rollout generation", lambda: generate(self._policy(state), expanded, key))
         source = _source(self.objective.inputs, batch)
         # In a pool the source is placed across processes (`_expanded`), and each source row's origin rides
@@ -524,6 +528,10 @@ class FlowRollout(GroupedRollout):
     def _selected(self) -> int:
         """How many of the walk's transitions train: its first `train_steps`, every one where None."""
         return self.steps - 1 if self.train_steps is None else self.train_steps
+
+    def _program_name(self) -> str:
+        """`GroupedRollout`'s, and the trained prefix its generation hands on (`_selected`, row 10821)."""
+        return f"{super()._program_name()}, its first {self._selected()} trained"
 
     def _training_rows(self, generated: FlowTrajectory, context: Batch, spatial: Mapping[str, np.ndarray],
                        rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
