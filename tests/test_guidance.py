@@ -146,7 +146,8 @@ def apg_flushes_a_lane_scaled_below_the_least_normal():
                                    {"prediction": unconditional})
         walk = APG(2.0, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
         x = jnp.zeros_like(conditional)
-        return walk.step(x, jnp.ones(1), 0, walk.init(x))[0]
+        # At alpha=0 and sigma=1 DirectPredictionTransform's clean prediction is the raw one.
+        return walk.step(x, jnp.ones(1), 0, walk.init(x))[0][0]
 
     found = np.asarray(ahead_arm(jax.jit(guided), "APG over a lane scaled below the least normal")(
         np.asarray([[2.0 ** 120, 0.0]], np.float32), np.asarray([[0.0, -2.0 ** -7]], np.float32)))
