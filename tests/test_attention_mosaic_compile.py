@@ -1491,16 +1491,19 @@ def test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free(stored):
 
 def test_fused_keys_first_register_model_counts_dq_product():
     """`_keys_first_registers` includes the fused `dQ = dS^T @ K` product fragments beside `step[0]` and
-    the dQ accumulator (row 6944): at `q192` width 64 on `sm80` (`mma.sync.fed`, 2 consumers splitting
-    queries), `fused=True` counts strictly more registers than `fused=False`."""
-    with generation.assumed("sm80"):
-        family = attention_mosaic_program.bundle("sm80", jnp.bfloat16)
-        fused = attention_mosaic.BackwardTiles(192, 64, 2, 1, fused=True, family=family.name,
-                                               dkv_family="mma.sync.fed", dkv_consumers=2)
-        unfused = dataclasses.replace(fused, fused=False)
-        dkv_family = attention_mosaic_program.bundle_of(fused.dkv, jnp.bfloat16)
-        reg_fused = attention_mosaic_program.backward_registers(
-            dkv_family, fused.dkv, 64, 64, jnp.bfloat16, accurate=False, dq=False, split=True)
-        reg_unfused = attention_mosaic_program.backward_registers(
-            dkv_family, unfused.dkv, 64, 64, jnp.bfloat16, accurate=False, dq=False, split=True)
-        assert reg_fused > reg_unfused, (reg_fused, reg_unfused)
+    the dQ accumulator (row 6944): at `q192` width 64 on `sm80` (`mma.sync`, keys-first) and `sm90`
+    (`wgmma.fed`, 2 consumers splitting queries), `fused=True` counts strictly more registers than
+    `fused=False`."""
+    for gen, dkv_name, consumers, split in (("sm80", None, 1, False), ("sm90", "wgmma.fed", 2, True)):
+        with generation.assumed(gen):
+            family = attention_mosaic_program.bundle(gen, jnp.bfloat16)
+            fused = attention_mosaic.BackwardTiles(
+                192, 64, 2, 1, fused=True, family=family.name,
+                dkv_family=dkv_name, dkv_consumers=consumers if dkv_name else None)
+            unfused = dataclasses.replace(fused, fused=False)
+            dkv_family = attention_mosaic_program.bundle_of(fused.dkv, jnp.bfloat16)
+            reg_fused = attention_mosaic_program.backward_registers(
+                dkv_family, fused.dkv, 64, 64, jnp.bfloat16, accurate=False, dq=False, split=split)
+            reg_unfused = attention_mosaic_program.backward_registers(
+                dkv_family, unfused.dkv, 64, 64, jnp.bfloat16, accurate=False, dq=False, split=split)
+            assert reg_fused > reg_unfused, (gen, reg_fused, reg_unfused)
