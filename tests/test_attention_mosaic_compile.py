@@ -1600,3 +1600,29 @@ def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
         assert algebra.bf16_part_count(accurate=False) == 1
         assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
         assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
+
+
+@COMPILES_ON_CPU
+def test_sm90_and_sm100_forward_scale_prescaled_query_in_smem_without_spills():
+    """Row 5272: sm90 wgmma and sm100 tcgen05.chunks forwards with a power-of-two query prescale (e.g.
+    the natural rewalk launch) scale `q_smem` in place via `across.scale_smem` instead of emitting a
+    host-wide XLA `by_power` multiply pass, and compile without spills."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    spans = template.spans(512, 512, 1, causal=True)
+    q = jnp.zeros((2, 512, 8, 128), jnp.bfloat16)
+    k = jnp.zeros((2, 512, 2, 128), jnp.bfloat16)
+    for gen in ("sm90", "sm100"):
+        with generation.assumed(gen):
+            target = generation.gpu_target()
+            op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+            ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+            cfg = op.derived(ba, target)
+            assert cfg is not None
+            found = compile_mosaic_kernels([
+                KernelCase(f"{gen}-d128-in-kernel-prescale",
+                           lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)),
+            ], gen)
+            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
