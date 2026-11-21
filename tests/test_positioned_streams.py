@@ -73,7 +73,7 @@ def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_s
     (two readers): the cache publishes the store's generation once the read has filled every positioned
     shard, so the next streamed read reads it back, numbering and running nothing (row 9051's confirm
     review: the fill counted the store's byte ranges, and no seal reached its publication)."""
-    from dew.data import Cache
+    from dew.data.cache import Cache
     from dew.data.compile import iterate
     from dew.data.dataset import Loading
     from dew.data.pipeline import Pipeline
