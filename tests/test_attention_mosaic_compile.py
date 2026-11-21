@@ -1607,7 +1607,8 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
     """Row 5272: sm90 fused (d64, d128) and cooperative (d256) backward kernels stage P/dS under one
     proxy fence and pipeline dQ/dV/dK WGMMAs via `product(..., pending=2)` with zero register spills, while
     synchronous issuers (`MmaIssuer`) refuse nonzero `pending`."""
-    from kernel_compile import KernelCase, compile_mosaic_kernels, mosaic_failures
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates import bundles
 
