@@ -1909,6 +1909,11 @@ class Transport[Allocated, Opened](abc.ABC):
         through its consumers' own loads (mma.sync's) has nothing to publish."""
         plgpu.commit_smem()
 
+    def stage_output(self, value: jax.Array, smem) -> None:
+        """Write an epilogue tile `value` into `smem` in its dtype (unoptimized on cp.async where
+        layout inference rejects narrow decode tiles, row 5272)."""
+        smem[...] = value.astype(smem.dtype)
+
     @abc.abstractmethod
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so.

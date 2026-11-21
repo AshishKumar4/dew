@@ -113,6 +113,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     refused,
     scaled_drop,
+    scopes_products,
     score_places,
     split_queries,
     stagings,
@@ -756,7 +757,8 @@ class MosaicForward(_Mainloop[Tiles]):
         value_width = value_columns(_width(ba.arguments["value"].shape[-1], family, query.dtype),
                                     config.columns)
         if (config.consumers > 1 and value_width > 128 and family.budgets_registers
-                and not family.places_on_role and not family.operands_in_registers):
+                and not family.places_on_role and not family.operands_in_registers
+                and not scopes_products(family)):
             return False
         # A tile of fewer rows than a role's lays its warps along its keys, a whole 16-key product's columns
         # each (Mosaic's layouts take whole such tiles a warp: a 96-key tile's 24 refused, dd-q5p4; 64-key

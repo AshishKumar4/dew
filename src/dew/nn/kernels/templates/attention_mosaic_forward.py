@@ -1590,17 +1590,15 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
 
             def write_chunks(smem):
-                with family.staged_together():
-                    for col in range(0, width, chunk):
-                        sl = pl.ds(col, chunk)
-                        piece = state._replace(acc=state.acc[:, col:col + chunk])
-                        out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
-                                                   held=program.parts > 1)[0]
-                        if smem is None:
-                            out_view[:, sl] = out_chunk.astype(out_view.dtype)
-                        else:
-                            family.staged(out_chunk, smem.at[:, sl])
-
+                for col in range(0, width, chunk):
+                    sl = pl.ds(col, chunk)
+                    piece = state._replace(acc=state.acc[:, col:col + chunk])
+                    out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
+                                               held=program.parts > 1)[0]
+                    if smem is None:
+                        out_view[:, sl] = out_chunk.astype(out_view.dtype)
+                    else:
+                        family.stage_output(out_chunk, smem.at[:, sl])
             out_stage(lambda stage: write_chunks(None) if stage is None
                       else family.stored((write_chunks,), (out_view,), smem=stage))
         else:
