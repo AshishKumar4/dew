@@ -622,7 +622,12 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             ba = launch.bind(*args, **options)
             if not launch.eligible(ba, target):
                 continue
-            config = launch.taken(ba) if settled else launch.derived(ba, target)
+            if settled:
+                # Certified for the generation's compile-only GPU, as a run's own certifies it.
+                with report.certifying(generation.compile_only_gpus(generation_name)[0]):
+                    config = launch.taken(ba)
+            else:
+                config = launch.derived(ba, target)
             if config is None:
                 continue
             configs = {(f"{name} {config}", None): config}
