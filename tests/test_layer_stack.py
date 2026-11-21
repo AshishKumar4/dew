@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from arm_arithmetic import float64_held, unrewritten
+from arm_arithmetic import float64_held, summed_as_run, unrewritten
 from flax import linen as nn
 from model_support import flat_tree, largest_difference, stepped_decode, steps_from
 from reference_error import (
@@ -309,7 +309,10 @@ class ScanCase:
         written = unrewritten(lambda ids, cotangent: site_of(run(ids, cotangent), site))
 
         def scale(inputs, seed):
-            return rounding_scale(written, *inputs, seed=seed)[1]
+            # Summed as the arms run it (`summed_as_run`, as `assert_as_exact` holds them): the walk weighs
+            # the float32 sums the plain loop computes, not the float64 ones a wide CPU run would trace.
+            with summed_as_run():
+                return rounding_scale(written, *inputs, seed=seed)[1]
         return scale
 
     def arms(self):
