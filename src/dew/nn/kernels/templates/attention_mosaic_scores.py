@@ -4,7 +4,6 @@ forward's statistics (`_scores`)."""
 
 import dataclasses
 import functools
-from collections.abc import Callable
 
 import jax
 from jax import lax
@@ -146,7 +145,7 @@ def _read(value):
     """Resolve a deferred reader (`functools.partial`), or return an eager value unchanged."""
     return value() if isinstance(value, functools.partial) else value
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
-                 coords: algebra.Coords | Callable[[], algebra.Coords], whole,
+                 coords: algebra.Coords | functools.partial[algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
                  ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
