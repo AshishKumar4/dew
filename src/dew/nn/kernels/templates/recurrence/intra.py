@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import recurrence_algebra as algebra
+from dew.nn.kernels import generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import bundles, mosaic, operands, product, resources, scan, swizzling
 from dew.nn.kernels.templates.operands import Issuer
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -384,13 +384,13 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
 @lowered_once
 def _prefix_halves(g, taken, call: Call):
     """`(hi, lo) [R, HV * Dk]` fp32: the laid decay `g`'s prefix halves within each chunk (`algebra.prefix`'s
-    pair, `call.gates`), a program a chunk, value head and key block (`_prefix_keys`), each its block's one
+    pair, `call.gates`), a program a chunk, value head and key block (`_running`), each its block's one
     load, scan and store: a running compensated sum down each column where the block fills the warpgroup's
     threads (`_running_prefix`), else the doubling scan (`_intra_prefix`). fla_kda's chunk_local_cumsum, a
     launch the sub-chunk walk and every later launch read (`_sub_chunk_walk`)."""
     chunk, width, gates, family = call.chunk, call.width, call.gates, call.family
-    keys = _prefix_keys(width)
-    running = keys == scan.THREADS
+    running = _running(call)
+    keys = scan.THREADS if running else math.gcd(width, 2 * algebra.SUB)
 
     def program(at, g_ref, taken_ref, hi_ref, lo_ref, *, streams, staging, landing):
         del taken_ref
@@ -431,10 +431,13 @@ def _prefix_halves(g, taken, call: Call):
                          landing=landing)(g, taken)
 
 
-def _prefix_keys(width: int) -> int:
-    """`_prefix_halves`' key block: the warpgroup's threads' worth where the width takes it, a column a thread
-    (`_running_prefix`), else two sub-chunks' worth or the width where narrower (the doubling scan's)."""
-    return scan.THREADS if width % scan.THREADS == 0 else math.gcd(width, 2 * algebra.SUB)
+def _running(call: Call) -> bool:
+    """Whether `_prefix_halves` sums a key block a column a thread (`_running_prefix`): where the width takes
+    the warpgroup's threads' worth of keys and the program's four `[C, keys]` fp32 tiles (its decays' ring
+    slot, the two halves' rows and a landing) fit the target's shared memory, else the doubling scan at two
+    sub-chunks' worth of keys: an sm120's 99 KB holds no 128 KB program, and the call derived no tiles."""
+    tiles = 4 * call.chunk * scan.THREADS * jnp.dtype(jnp.float32).itemsize
+    return call.width % scan.THREADS == 0 and tiles <= generation.shared_budget(call.target)
 
 
 def _running_prefix(call: Call, rows, decays: jax.Array, keys: int) -> tuple:
