@@ -105,9 +105,7 @@ ASSEMBLER_NOTES = 13
 (`assembler_notes`, Dew's JAX build's mosaic-gpu-kernel-facts), each note a message of its code (1) and its
 message (2) (`AssemblerNote`)."""
 SPILLED_BYTES = 100
-"""The `MosaicGpuKernelProto` field of the bytes ptxas spilled as it assembled the kernel, its functions'
-spill stores and loads (the proto's `spilled_bytes`, Dew's JAX build's mosaic-gpu-kernel-spills), present
-where ptxas measured them, a zero among them (`Binary.spilled`)."""
+"""The `MosaicGpuKernelProto` field of the bytes ptxas spilled, where measured (`Binary.spilled`)."""
 CUSTOM_KERNEL_THUNK = 36
 """The `ThunkProto` field of a custom kernel's thunk, a Pallas-Triton launch's (`CustomKernelThunkProto`): its
 kernel (3, `CustomKernelProto`), whose loader spec (2) holds its cubin (2, `CudaCubinProto`; 1) and which
@@ -116,8 +114,7 @@ ELF = b"\x7fELF"
 """A cubin's first bytes."""
 REGISTER_COUNT, FRAME_SIZE, MAX_THREADS = 0x2F, 0x11, 0x05
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
-(EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill beside
-its own locals (libdevice's sinf range reduction's 32-byte array, row 9649)."""
+(EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds its spills and its locals."""
 
 _log = logging.getLogger("dew.kernels")
 
@@ -2049,16 +2046,14 @@ class AssemblerNote:
 
 
 def spilled_bytes(frame: int, spilled: int | None) -> int:
-    """The bytes a kernel spills a thread: ptxas's measure where its record states one (`spilled`,
-    `SPILLED_BYTES`), else its `frame`-byte stack frame, which holds every byte it spills beside its locals'
-    bytes."""
+    """A kernel's spilled bytes: ptxas's measure (`spilled`), else its `frame`, which bounds it (row 9649)."""
     return frame if spilled is None else spilled
 
 
 def refuses(spilled: int, codes: Collection[str]) -> bool:
-    """Whether a kernel the assembler built spilling `spilled` bytes (`Binary.spills`), noting `codes`
-    (`ASSEMBLER_NOTES`' codes), is refused for its config: it spills, or its warpgroup MMAs were serialized
-    (`SERIALIZED`). Certification's verdict (`Binary.refused`) and the compile gate's alike."""
+    """Whether a kernel spilling `spilled` bytes (`Binary.spills`), noting `codes` (`ASSEMBLER_NOTES`'),
+    is refused for its config: it spills, or its warpgroup MMAs were serialized (`SERIALIZED`).
+    Certification's verdict (`Binary.refused`) and the compile gate's alike."""
     return bool(spilled) or bool(SERIALIZED & set(codes))
 
 @dataclasses.dataclass(frozen=True)
@@ -2099,13 +2094,10 @@ class Binary:
     index: str | None = None
     """XLA uniquification suffix (`__1`) where a second cubin shares `(kernel, launch)`; None otherwise."""
     spilled: int | None = None
-    """The bytes ptxas spilled as it assembled it, as its record states them (`SPILLED_BYTES`, a Mosaic GPU
-    kernel's); None where its record states none (a Pallas-Triton kernel's)."""
+    """The bytes ptxas spilled for it (`SPILLED_BYTES`); None where its record states none."""
 
-    @property
-    def spills(self) -> int:
-        """The bytes it spills a thread (`spilled_bytes`)."""
-        return spilled_bytes(self.frame, self.spilled)
+    spills = property(lambda self: spilled_bytes(self.frame, self.spilled))
+    """The bytes it spills a thread (`spilled_bytes`)."""
 
     @property
     def launched(self) -> str | None:
@@ -2267,10 +2259,8 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
         stated_caller = caller[0].decode() if len(caller) == 1 and isinstance(caller[0], bytes) else None
         notes = tuple(AssemblerNote(*(part[0].decode() for part in (note.get(1, [b""]), note.get(2, [b""]))))
                       for note in map(proto_fields, fields.get(ASSEMBLER_NOTES, [])))
-        spilled = fields.get(SPILLED_BYTES, [])
-        measured = spilled[0] if len(spilled) == 1 and isinstance(spilled[0], int) else None
-        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills, kind="mosaic_gpu",
-                                            spilled=measured),
+        measured = next(iter(fields.get(SPILLED_BYTES, [])), None)
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills, spilled=measured),
                                     shared=stated,
                                     caller=stated_caller, notes=notes)], 0
     found, calls = [], 0
@@ -2287,12 +2277,11 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
 
 def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False, *,
             kind: str = "mosaic_gpu", spilled: int | None = None) -> Binary:
-    """The `Binary` of the kernel `function` from its cubin `elf` and the bytes its record states ptxas
-    spilled (`spilled`, None where it states none): its `.nv.info` attributes' registers, frame and threads
-    (`REGISTER_COUNT`, `FRAME_SIZE`, `MAX_THREADS`; a Mosaic module compiles one kernel function), `decoded`
-    its SASS findings (`sass_findings_of`), and its register reconfiguration (`reconfigured`) and, where it
-    spills (`Binary.spills`), the roles its spill stands in (`spilled_roles`) wherever its one listing is
-    read (`sass_listing`: `decoded`, or `spills` where it spills)."""
+    """The `Binary` of the kernel `function` from its cubin `elf` and ptxas's `spilled` bytes: its `.nv.info`
+    attributes' registers, frame and threads (`REGISTER_COUNT`, `FRAME_SIZE`, `MAX_THREADS`; a Mosaic module
+    compiles one kernel function), `decoded` its SASS findings (`sass_findings_of`), and its register
+    reconfiguration (`reconfigured`) and, where it spills, the roles its spill stands in (`spilled_roles`)
+    wherever its one listing is read (`sass_listing`: `decoded`, or `spills` where it spills)."""
     (sections_at,) = struct.unpack_from("<Q", elf, 0x28)
     entry, count, names = struct.unpack_from("<HHH", elf, 0x3A)
     headers = [struct.unpack_from("<IIQQQQIIQQ", elf, sections_at + index * entry) for index in range(count)]
