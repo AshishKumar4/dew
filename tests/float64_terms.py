@@ -21,7 +21,6 @@ from store_wire import COMPILED as STORE, running
 from dew.nn import programs
 from dew.nn.precision import correctly_rounded_divide_p
 
-
 __accuracy_gate__ = True
 """The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 

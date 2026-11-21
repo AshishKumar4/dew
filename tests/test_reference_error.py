@@ -39,7 +39,6 @@ from reference_error import (
 from dew.nn.precision import accumulated
 from dew.parity import MOST_SEEDS
 
-
 __accuracy_gate__ = True
 """The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 

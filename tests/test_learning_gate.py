@@ -17,7 +17,6 @@ from learning_gate import (
 )
 from scipy import stats
 
-
 __accuracy_gate__ = True
 """The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 
