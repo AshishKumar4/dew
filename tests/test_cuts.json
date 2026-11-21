@@ -21,17 +21,28 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
+"tests/test_algebra_laws.py": [
+"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[False-True-True]",
+"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-True-False]"
+],
 "tests/test_algebra_scaled.py": [
+"tests/test_algebra_scaled.py::test_a_merge_under_shard_map_and_under_a_sharded_jit_is_each_shards_own",
 "tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-a zero mass]",
 "tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-drawn]",
 "tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[on a gpu-a zero mass]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-drawn]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_the_same_on_whichever_axis_its_states_lie[jitted]",
 "tests/test_algebra_scaled.py::test_a_merged_state_of_broadcast_anchors_is_its_output_and_its_total[a common scalar]",
-"tests/test_algebra_scaled.py::test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts[op by op-a zero mass]",
-"tests/test_algebra_scaled.py::test_a_zero_total_merged_moves_the_next_merge_along_its_total[jitted]"
+"tests/test_algebra_scaled.py::test_a_merged_state_under_an_explicit_mesh_drops_its_states_axis_from_its_shardings",
+"tests/test_algebra_scaled.py::test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts[jitted-a zero mass]",
+"tests/test_algebra_scaled.py::test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts[jitted-two masses]",
+"tests/test_algebra_scaled.py::test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts[op by op-two masses]",
+"tests/test_algebra_scaled.py::test_a_vmapped_merge_and_its_gradient_are_each_merges_own",
+"tests/test_algebra_scaled.py::test_the_derivatives_of_the_merges_gradient_are_the_laws[jitted-a zero gap]"
 ],
 "tests/test_algebra_scaled_edges.py": [
-"tests/test_algebra_scaled_edges.py::test_a_merge_at_degenerate_states_holds_its_contract[the largest total beside three of 2^102-totals-d1]",
-"tests/test_algebra_scaled_edges.py::test_a_merged_total_at_degenerate_states_holds_its_contract[2^100-outputs an ulp apart]"
+"tests/test_algebra_scaled_edges.py::test_a_merge_at_degenerate_states_holds_its_contract[the largest total beside three of 2^102-anchors-d2^-100]",
+"tests/test_algebra_scaled_edges.py::test_a_merged_total_at_degenerate_states_holds_its_contract[2^-100-mixed scales]"
 ],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_large_write_through_gates_past_the_least_normal_is_kept[keys-sm86]",
@@ -1196,9 +1207,6 @@
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-second orders, staged]"
 ],
-"tests/test_contracts_sampling.py": [
-"tests/test_contracts_sampling.py::test_a_transitions_quadratic_term_holds_every_order[near the least normal]"
-],
 "tests/test_counted_passes.py": [
 "tests/test_counted_passes.py::test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one_steps_its_batches"
 ],
@@ -1355,9 +1363,6 @@
 "tests/test_decision_state_once.py::test_each_question_reads_the_shared_part_and_itself",
 "tests/test_decision_state_once.py::test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores",
 "tests/test_decision_state_once.py::test_sibling_questions_packed_a_window_read_each_their_own_requests_context"
-],
-"tests/test_decision_streams.py": [
-"tests/test_decision_streams.py::test_each_token_reads_exactly_what_its_streams_record_says_in_a_packed_window[joint]"
 ],
 "tests/test_decision_task.py": [
 "tests/test_decision_task.py::test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in",
@@ -2896,9 +2901,6 @@
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
 ],
-"tests/test_pipeline_core.py": [
-"tests/test_pipeline_core.py::test_memory_rejections_are_dense_before_global_order"
-],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_hf-workers=2,shares=1]",
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[prompts-workers=0,shares=1]",
@@ -3122,8 +3124,8 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-nemotron-h-4b-ssd-float32-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-qwen3.5-27b-gdn-bfloat16-training]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-kimi-linear-kda-bfloat16-forward-packed]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-kimi-linear-kda-bfloat16-forward]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-nemotron-h-4b-ssd-bfloat16-forward]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-kimi-linear-kda-bfloat16-forward-variant-2]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-nemotron-h-4b-ssd-bfloat16-forward-variant-1]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-qwen3.5-27b-gdn-bfloat16-training]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-a 192-wide value head-bfloat16-training]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-a write gate-bfloat16-forward-variant-0]",
@@ -3893,9 +3895,6 @@
 "tests/test_wan_source.py": [
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
-],
-"tests/test_wan_vae.py": [
-"tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
