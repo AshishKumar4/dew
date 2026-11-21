@@ -144,13 +144,15 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     # dQ's and the keyed sums' places stay empty: their products go to the accumulators.
     sums = gradient.DqSums(empty, residual, mass, grads, weighed, empty, keyed_mass, keyed_shift)
 
-    def issued(*, masked: bool):
-        # A tile every query sees whole (`masked` False) takes no mask; the row sums and the parts are taken
-        # where the mask is read (`gradient.pulled`).
-        # Its places tiles: vector broadcasts took dQ 1.77 to 2.06 ms under sinks at width 64 (ET-HELD-h100,
-        # the config unchanged), its registers no fewer.
-        coords = coords_of(k_first, read=walk.places_read(masked=masked))
-        scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen, masked=masked)
+    def issued(*, masked_step: bool):
+        # A tile every query sees whole (`masked_step` False) takes no mask; the row sums and the parts are
+        # taken where the mask is read (`gradient.pulled`).
+        # Its places tiles on register-budgeted GPUs (`masked is None`): vector broadcasts took dQ 1.77 to
+        # 2.06 ms under sinks at width 64 (ET-HELD-h100, the config unchanged), its registers no fewer.
+        # Only the segmented TPU walk (`masked is not None`) passes `read` to skip unneeded coordinate tiles.
+        coords = (coords_of(k_first) if masked is None
+                  else coords_of(k_first, read=walk.places_read(masked=masked_step)))
+        scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen, masked=masked_step)
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = gradient.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
                                                 prior, scale=walk.grad_scale, kinds=walk.kinds,
@@ -162,10 +164,10 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     # One walk, its tiles' masks chosen a tile at a time on register-budgeted GPUs (a walk of two loops into
     # one warpgroup accumulator, the first empty, faults on an H100 under jax 0.11.2); segmented on TPU mxu.
     if masked is None:
-        rows, scaled, keyed = lax.cond(whole(index), functools.partial(issued, masked=False),
-                                       functools.partial(issued, masked=True))
+        rows, scaled, keyed = lax.cond(whole(index), functools.partial(issued, masked_step=False),
+                                       functools.partial(issued, masked_step=True))
     else:
-        rows, scaled, keyed = issued(masked=masked)
+        rows, scaled, keyed = issued(masked_step=masked)
     dq_acc, *keyed_accs = accumulators
     # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's
     # branches yield the scaled cotangents alone, not every part.
