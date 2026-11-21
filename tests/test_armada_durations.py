@@ -381,7 +381,7 @@ def test_a_green_run_lowers_each_test_its_record_holds_well_past_what_it_took(ci
     eighth of the target, though its file is no whole-file refresh's (one of its groups red) and though it
     compiles cold every run (a cold run bounds its warm time from above); a drift within either bound
     lowers nothing, nor does a red run however fast, a reused row (the times an earlier fold took) or one
-    armada ran alone after it failed beside other tasks (row 10787: test_compile_ahead's frontier test held
+    armada ran alone after it failed beside other tasks (row 10776: test_compile_ahead's frontier test held
     274.7 s against the 42 s each green run took). A cold time is the newest green cold run's, and the same
     verdict folded again moves nothing."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))

@@ -141,7 +141,7 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
     file run whole within its bound, or cut into a group that holds none of its recorded tests, stores none; a
     file it did not run keeps its own. A file whose run's `groups` (`held`) show another cut of the same count
     ran stores that one, never its stored cut it did not run, which a plan reweighed since would take up
-    again and rename every group of it (review, row 10787). The fold is the one place a cut changes (Main,
+    again and rename every group of it (review, row 10776). The fold is the one place a cut changes (Main,
     2026-11-13: a group's name means the same tests from run to run, so its record is found again)."""
     kept = dict(stored)
     for name, seconds in runs.items():

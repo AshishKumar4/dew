@@ -43,7 +43,7 @@ def lowered(session, warm: Mapping[str, float], rows: Mapping[str, list[dict]], 
     as ci.py's `verdict_rows`, each file's sites `marks`) where it holds the test past that by `session.KEPT`
     and by over an eighth of the `target`: a warm run's time is its own and a cold run's bounds it from above,
     so a time a red, cut-off or contended run once raised comes down test by test, a test that compiles cold
-    every run included, where the whole-file fold never finds its file stale (row 10787:
+    every run included, where the whole-file fold never finds its file stale (row 10776:
     test_compile_ahead's frontier test held 274.7 s against the 42 s each green run took); a site's entries
     stay as they are (`raised`). ci.py folds each file whole from what this returns, so one verdict folded
     again moves nothing: a lowered time is past no green run's by both bounds."""
