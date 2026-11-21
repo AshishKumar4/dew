@@ -1460,14 +1460,13 @@ def uncontracted(*values):
     program lowers for fences the mark (`MARKED_BACKENDS`, `jax.lax.platform_dependent`): no step reading
     them contracts, and no barrier splits the fusions around them (row 8378); the barrier on any other.
 
-    In a kernel's body (`launches.interpreting` not None), whose platform is its launch's, the barrier: a
-    compiled Pallas TPU kernel's lowers it to its operands as they are, Mosaic keeping a kernel's multiply
-    and add apart (the fork's lowering rule from post111, row 7954); every other body's to XLA's own."""
+    In a kernel's body (`launches.interpreting` not None), whose platform is its launch's, the barrier, as
+    the body's lowering takes it: a compiled Pallas TPU kernel's to its operands as they are, Mosaic keeping
+    a kernel's multiply and add apart (the fork's lowering rule from post111, row 7954), Mosaic GPU's and
+    Triton's by their own rules, an interpreted body's as XLA's programs do."""
     from dew.nn.kernels.launches import interpreting
 
-    if interpreting() is not None:
-        return jax.lax.optimization_barrier(values)
-    if not _MARKING.get():
+    if interpreting() is not None or not _MARKING.get():
         return jax.lax.optimization_barrier(values)
     return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
 

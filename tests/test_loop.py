@@ -597,7 +597,7 @@ def _unrolled_passes(module, ids):
 
 
 @pytest.mark.parametrize("name, layers, loop, z_loss, shift, spread, rows", [
-    ("whole stack", (0, 4), {}, 0.0, 0.0, 4.0, 4),
+    pytest.param("whole stack", (0, 4), {}, 0.0, 0.0, 4.0, 4, id="whole stack"),
     # Each block-before-a-coda case's 256 seeds (131 to 161 s whole in each of nine trains' CI, row 10754)
     # drawn as map tasks of 128 (`check1_shards`).
     pytest.param("a block before a coda", (1, 3), {}, 0.0, 0.0, 4.0, 4, id="coda",
@@ -607,11 +607,10 @@ def _unrolled_passes(module, ids):
     pytest.param("a block before a coda exiting at a threshold", (1, 3), {"exit_threshold": 0.5}, 0.0, 0.0,
                  4.0, 4, id="threshold", marks=pytest.mark.check1_shards(seeds=256, per_task=128)),
     pytest.param("the last pass trained", (1, 3), {"backprop_steps": 1}, 0.0, 0.0, 4.0, 4,
-                 id="the last trained", marks=pytest.mark.check1_shards(seeds=256, per_task=128)),
+                 id="the-last-trained", marks=pytest.mark.check1_shards(seeds=256, per_task=128)),
     # Its 512 seeds at 32 rows (184 s whole on armada) drawn as map tasks of 64 (`check1_shards`).
     pytest.param("a saturated gate", (1, 3), {}, 0.0, 30.0, 0.5, 32, id="saturated",
-                 marks=pytest.mark.check1_shards(seeds=512, per_task=64))],
-    ids=["whole stack", "coda", "z-loss", "threshold", "the last trained", "saturated"])
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64))])
 def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name, layers, loop, z_loss, shift,
                                                                            spread, rows, request):
     """A two-pass Qwen 3.5 with an exit gate (`Loop.exit_gate`, its block the whole stack or one before a
