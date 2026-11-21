@@ -294,41 +294,29 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     assert lacking.microbatches == 16
 
 
-def test_a_sampled_step_admits_each_count_on_its_loop_as_its_draws_first_ask_it(monkeypatch):
+def test_a_sampled_step_admits_each_count_on_its_loop_as_its_draws_first_ask_it():
     """A run that draws its pass count per microbatch builds its step with no count below its cap admitted:
-    each call admits on the loop the counts it draws that none admitted yet, each once, while every count
-    below the cap compiles off the loop in one process from the first draw, the next draws' first
-    (`LaterCounts`), waited for as the run ends (rows 7959, 8067: every count compiled on the loop before
-    the first step)."""
-    import threading
-
-    from dew.training.compiler import StepCompiler
-
-    admitted = []
-    admit = StepCompiler.admitted_at
-
-    def recorded(self, stepping, state, batch, cap, passes, ahead=None):
-        admitted.append((threading.current_thread() is threading.main_thread(), passes))
-        return admit(self, stepping, state, batch, cap, passes, ahead=ahead)
-
-    monkeypatch.setattr(StepCompiler, "admitted_at", recorded)
+    each call admits on the loop the counts it draws that none admitted yet (`DrawingStep.plans`), while
+    every count below the cap compiles off the loop in one process from the first draw (`LaterCounts`, the
+    run's `_later`), each drawn one's waited for before it is admitted, the rest as the run ends (rows 7959,
+    8067: every count compiled on the loop before the first step)."""
     batch = token_batch()
     sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, accumulation=2)
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
-    assert isinstance(step, DrawingStep) and admitted == [] and set(step.plans) == {CAP}
+    assert isinstance(step, DrawingStep) and set(step.plans) == {CAP} and sampled._later is None
     interval = Interval(time.time(), None, microbatches=0)
     drawn = []
     for index in range(4):
         step.drawn(interval, index)
         drawn += step.counts
         state, *_ = step(state, batch)
-    on_loop = [count for loop, count in admitted if loop]
-    assert set(step.plans) == {CAP, *drawn}
-    assert sorted(on_loop) == sorted({count for count in drawn if count < CAP})
-    assert sampled._later is not None
-    sampled._later.stopped()
-    assert {count for loop, count in admitted if not loop} == set(range(1, CAP))
+    below = {count for count in drawn if count < CAP}
+    assert set(step.plans) == {CAP, *drawn} and below
+    later = sampled._later
+    assert later is not None and not below & set(later.futures)
+    assert below | set(later.futures) == set(range(1, CAP))
+    later.stopped()
 
 
 def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
