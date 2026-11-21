@@ -1011,8 +1011,8 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
     fallback = attention_decode.priced_step(sm80, rows=1, queries=1, keys=keys, heads=8, kv_heads=kv_heads,
                                             width=width, dtype=jnp.bfloat16)
     with generation.assumed(sm80):
-        q80 = jax.ShapeDtypeStruct((1, 1, 8, width), jnp.bfloat16)
-        k80 = jax.ShapeDtypeStruct((1, keys, kv_heads, width), jnp.bfloat16)
+        q80 = jnp.zeros((1, 1, 8, width), jnp.bfloat16)
+        k80 = jnp.zeros((1, keys, kv_heads, width), jnp.bfloat16)
         plan80, *_ = attention_decode.planned(q80, k80, k80, attention_decode.key_spans(1, keys, 1),
                                               template.Hooks())
     assert plan80 is not None and "bounded" in plan80 and "scaled" in plan80
@@ -1065,7 +1065,7 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
             scales=None, bounds=None, finished=True, in_key=False))(query, key, key)
     (merge_eq,) = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive is merged.merged_padded_p]
     merge_work = merged.launch_work(
-        merge_eq.params["spec"],
+        merge_eq.params["units"],
         jax.ShapeDtypeStruct(merge_eq.invars[0].aval.shape, merge_eq.invars[0].aval.dtype),
         jax.ShapeDtypeStruct(merge_eq.invars[1].aval.shape, merge_eq.invars[1].aval.dtype),
         merge_eq.params["queries"], merge_eq.params["width"], target)
