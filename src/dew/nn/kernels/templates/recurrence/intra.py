@@ -144,6 +144,9 @@ def sub_chunked(call: Call) -> Call:
     against 102)."""
     family = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), algebra.SUB,
                              scoped=True)[0]
+    if family.rows <= algebra.SUB:
+        # Its warps along a sub-chunk's row of pairs' columns, its sums' layout `[SUB, C]`'s (`specialized`).
+        family = family.specialized(algebra.SUB, call.chunk)
     return call if family == call.family else dataclasses.replace(call, family=family)
 
 
