@@ -23,13 +23,16 @@ Each lane moves its sites onto them (rows 4026 to 4030); then the slop check ref
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import functools
 import inspect
-from collections.abc import Callable, Collection, Sequence
+import json
+from collections.abc import Callable, Collection, Hashable, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.core import Tracer, eval_context, eval_jaxpr
 from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
@@ -434,11 +437,48 @@ def _evaluating() -> bool:
         return here is jax_core.find_top_trace(())
 
 
+SPANS_HELD = 4096
+"""The most marked spans' programs a process holds (`_SPANS`), the least recently used dropped first."""
+
+_SPANS: collections.OrderedDict[Hashable, tuple] = collections.OrderedDict()
+"""Each marked span's program as `marked` traced it, with its outputs' structure and the known zeros among
+them, by what a trace of it reads (`_span_key`): a span called again in that state is that program, never
+traced again (row 10762: precision's error-free transforms traced afresh at every call, 7.5 percent of a
+padded merge's grad of grad)."""
+
+
+def release_spans() -> None:
+    """Forget every marked span's program held (`_SPANS`) and the arrays they hold: where a process releases
+    its compiled programs (tests/conftest.py's `release`)."""
+    _SPANS.clear()
+
+
+def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hashable | None:
+    """What a trace of `function` as a marked span of `kind` over `flat` (its arguments' leaves, of tree
+    `structure`) reads: its function as an identity states it (`dew._stated.stated`: its code and every value
+    it reads, a module global, a closure's dict or array, by value), its arguments' types as the trace takes
+    them (`jax.typeof`: shape, dtype, weak type, sharding, the manual axes they vary over), the context a
+    trace reads (`options.trace_context`: JAX's traced configuration, its compute_on and XLA metadata among
+    it, the meshes, Dew's contexts, the logical axis rules and Dew's environment) and NumPy's error policy,
+    which a host split reads. None for a function no statement holds (a value of the enclosing trace among its
+    reads), whose span is traced at every call."""
+    from dew._stated import Unestablished, stated
+    from dew.nn.kernels import options
+
+    try:
+        statement = json.dumps(stated(function, f"a marked span of {kind!r}"), sort_keys=True)
+    except Unestablished:
+        return None
+    return (kind, structure, statement, tuple(jax.typeof(leaf) for leaf in flat), options.trace_context(),
+            tuple(sorted(np.geterr().items())))
+
+
 def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked_call_p`) over its arguments, a tree of arrays: it
     computes what `function` does, and every transform of it keeps a marked call of `kind`. An eager call
     (`_evaluating`), which no program records, is `function`'s own: traced, every such call traced a program
-    a step's steady state paid each step (a decision task's eager scores, train 586)."""
+    a step's steady state paid each step (a decision task's eager scores, train 586). A traced call takes
+    the program a call in the same state traced (`_SPANS`, `_span_key`)."""
     def call(*arguments):
         if _evaluating():
             return function(*arguments)
@@ -455,7 +495,17 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
                                  if isinstance(leaf, SymbolicZero)}
             return [leaf for leaf in produced if not isinstance(leaf, SymbolicZero)]
 
-        closed = jax.make_jaxpr(span)(*flat)
+        key = _span_key(kind, function, structure, flat)
+        if key is not None and key in _SPANS:
+            _SPANS.move_to_end(key)
+            closed, returned["structure"], returned["zeros"] = _SPANS[key]
+        else:
+            closed = jax.make_jaxpr(span)(*flat)
+            # A program closing over the enclosing trace's values is that trace's alone.
+            if key is not None and not any(isinstance(const, Tracer) for const in closed.consts):
+                _SPANS[key] = (closed, returned["structure"], returned["zeros"])
+                while len(_SPANS) > SPANS_HELD:
+                    _SPANS.popitem(last=False)
         # A value of the enclosing trace the function closes over (a kernel's mask, a reference's operand) is
         # one of the call's operands, leading its arguments, as a closed-over value is no constant there.
         held = [isinstance(const, Tracer) for const in closed.consts]
