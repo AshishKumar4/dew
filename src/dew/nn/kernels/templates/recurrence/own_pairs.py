@@ -38,23 +38,26 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 )
 
 
-def own_staging(call: Call, keys: int) -> tuple:
+def own_staging(call: Call, keys: int, *, padded: bool = True) -> tuple:
     """The plain tile a key block's keys and its tokens' own decays are staged in for their shifted reads
     (`shifted_keys`): `[2, SUB + C, keys]` fp32, each's block below `SUB` rows a shifted read takes in place
-    of the tokens before the chunk (masked). Its rows are the block's own width apart: the accumulator's
+    of the tokens before the chunk (masked); `[2, C, keys]` where not `padded`, for reads that stay in their
+    row's sub-chunk (`own_bands`': its pad held an H100's intra_own at three programs a multiprocessor,
+    one under its four, M-JS-145k). Its rows are the block's own width apart: the accumulator's
     layout reads a plain tile only at strides whole tiles of 16 columns divide (a stride of 24 does not lower,
     jsf-own-smem). At a 16-column block a warp's rows alternate two runs of banks, two of its four rows a
     wavefront on one; at 32 or 64 columns every row starts on the same bank, its four rows a wavefront's
     conflict, which `key_block`'s choice (by registers and residency) does not weigh."""
-    return (swizzling.plain((2, algebra.SUB + call.chunk, keys), jnp.float32),)
+    return (swizzling.plain((2, (algebra.SUB if padded else 0) + call.chunk, keys), jnp.float32),)
 
 
 def own_zeroed(call: Call, staged) -> None:
     """`staged`'s (`own_staging`'s) rows below the chunk zeroed, which a shifted read takes for the tokens
     before it and nothing writes: once a program, before its walk, so a row's reads before its sub-chunk are
     finite (`algebra.key_diagonal_pairs_back` masks its strips, not its terms)."""
-    for index in range(2):
-        below = staged.at[index, pl.ds(0, algebra.SUB)]
+    pad = staged.shape[1] - call.chunk
+    for index in range(2 if pad else 0):
+        below = staged.at[index, pl.ds(0, pad)]
         plgpu.store(below, call.family.zeros(below.shape), optimized=False)
 
 
@@ -67,7 +70,7 @@ def shifted_keys(call: Call, staged, keys: jax.Array, prefix: tuple):
     select a register for each), the B200's own pairs ran 350 M warp instructions against fla's whole
     intra's 532 M (M-JS-118)."""
     chunk, family = call.chunk, call.family
-    width = keys.shape[1]
+    width, pad = keys.shape[1], staged.shape[1] - call.chunk
     whole = algebra.separated(*prefix)
     earlier = tuple(family.row_shifted(half, 1, period=algebra.SUB, interpret=call.interpret)
                     for half in whole)
@@ -75,9 +78,9 @@ def shifted_keys(call: Call, staged, keys: jax.Array, prefix: tuple):
     # this block's reads (`mosaic.synced`).
     mosaic.synced(call.interpret)
     for index, value in enumerate((keys, algebra.token_decays(whole, earlier))):
-        plgpu.store(staged.at[index, pl.ds(algebra.SUB, chunk), pl.ds(0, width)], value, optimized=False)
+        plgpu.store(staged.at[index, pl.ds(pad, chunk), pl.ds(0, width)], value, optimized=False)
     mosaic.synced(call.interpret)
-    return lambda e: tuple(family.tile_of(staged.at[index, pl.ds(algebra.SUB - e, chunk), pl.ds(0, width)])
+    return lambda e: tuple(family.tile_of(staged.at[index, pl.ds(pad - e, chunk), pl.ds(0, width)])
                            for index in range(2))
 
 
@@ -99,7 +102,7 @@ def own_bands(rows, staged, bands, *, unit_keys: bool) -> None:
     """Each output's sub-chunks' own pairs of one key block added into `bands`, a plain fp32 shared tile
     `[outputs, C, SUB]` (`algebra.key_diagonal_bands`' form, a row's column `e` its pair `e` tokens back, an
     entry no thread writes zero), from the outputs' rows `rows` `[outputs, C, keys]` and the keys and the
-    tokens' own decays `staged` (`own_staging`'s, a chunk's row `r` at `SUB + r`), a thread's own words:
+    tokens' own decays `staged` (`own_staging`'s, unpadded: a chunk's row `r` at `r`), a thread's own words:
     each quad of the warpgroup's threads a sub-chunk's rows `p` and `SUB - 1 - p` and a quarter of the
     columns each, one loop of `SUB + 1` steps over both rows' pairs at or before them alone (`p + 1` and
     `SUB - p`, so every thread steps alike), its pair's decay the product of its tokens' own formed back from
@@ -148,39 +151,55 @@ def _own_bands(rows_ref, staged_ref, bands_ref, *, unit_keys: bool) -> None:
         first_row = arith.addi(arith.muli(arith.divui(quad, const(pair_rows)), const(sub)), const(span))
         short, long = arith.addi(first_row, p), arith.subi(arith.addi(first_row, const(sub - 1)), p)
         _own_span(rows_ref, staged_ref, bands_ref, short, long, p, columns, leader, one, at, const,
-                  outputs=outputs, unit_keys=unit_keys)
+                  outputs=outputs, unit_keys=unit_keys, pad=ir.MemRefType(staged_ref.type).shape[1] - chunk)
     utils.warpgroup_barrier()
 
 
 def _own_span(rows_ref, staged_ref, bands_ref, short, long, p, columns, leader, one, at, const, *,
-              outputs: int, unit_keys: bool) -> None:
-    """`_own_bands`' steps over one span's rows `short` and `long` of each quad (`own_bands`')."""
+              outputs: int, unit_keys: bool, pad: int) -> None:
+    """`_own_bands`' steps over one span's rows `short` and `long` of each quad (`own_bands`'), `pad` the
+    staged tile's rows before the chunk's."""
     i32, sub, run = ir.IntegerType.get_signless(32), algebra.SUB, len(columns)
-    # The steps a loop, carrying the pair's decay (or each output's decayed row, `unit_keys`) alone: unrolled,
-    # ptxas held later steps' reads across earlier ones and spilled an H100's 80 registers (jsf-gate-steps3).
-    carried = [one] * (run * (outputs if unit_keys else 1))
-    lower, upper, stride = at(0, sub + 1, 1)
-    loop = scf.ForOp(lower, upper, stride, carried)
-    with ir.InsertionPoint(loop.body):
-        step = arith.index_cast(i32, loop.induction_variable)
-        before = list(loop.inner_iter_args)
+
+    def placed(step):
+        """A step's row, its pair's lag `e`, whether it is the row's own pair, and its reads' rows: token
+        `i - e`'s keys and token `i - e + 1`'s own decay (any of the chunk's at a row's own pair)."""
         on_short = arith.cmpi(arith.CmpIPredicate.sle, step, p)
         row = arith.select(on_short, short, long)
         e = arith.select(on_short, step, arith.subi(arith.subi(step, const(1)), p))
         first = arith.cmpi(arith.CmpIPredicate.eq, e, const(0))
-        # Token `i - e`'s keys, and token `i - e + 1`'s own decay (any of the chunk's at a row's own pair).
-        source = arith.subi(arith.addi(row, const(sub)), e)
-        own = arith.select(first, source, arith.addi(source, const(1)))
-        key = [memref.load(staged_ref, at(0, source, column)) for column in columns]
-        factor = [memref.load(staged_ref, at(1, own, column)) for column in columns]
+        source = arith.subi(arith.addi(row, const(pad)), e)
+        return row, e, first, source, arith.select(first, source, arith.addi(source, const(1)))
+
+    def read(step) -> list:
+        """A step's words: its keys, its factors and each output's row, a run of the quad's columns each."""
+        row, _, _, source, own = placed(step)
+        return ([memref.load(staged_ref, at(0, source, column)) for column in columns]
+                + [memref.load(staged_ref, at(1, own, column)) for column in columns]
+                + [memref.load(rows_ref, at(o, row, column)) for o in range(outputs) for column in columns])
+
+    # The steps a loop, carrying the pair's decay (or each output's decayed row, `unit_keys`) and the next
+    # step's words, read a step ahead of the terms that take them: unrolled, ptxas held later steps' reads
+    # across earlier ones and spilled an H100's 80 registers (jsf-gate-steps3); read in the step, each step's
+    # adds waited on its reads, 42% of an emulated GH200's warp time a long scoreboard (M-JS-145k).
+    state = run * (outputs if unit_keys else 1)
+    lower, upper, stride = at(0, sub + 1, 1)
+    loop = scf.ForOp(lower, upper, stride, [one] * state + read(const(0)))
+    with ir.InsertionPoint(loop.body):
+        step = arith.index_cast(i32, loop.induction_variable)
+        carried = list(loop.inner_iter_args)
+        before, words = carried[:state], carried[state:]
+        # The next step's words, the last step reading its own again.
+        ahead = read(arith.minsi(arith.addi(step, const(1)), const(sub)))
+        row, e, first, _, _ = placed(step)
+        key, factor = words[:run], words[run:2 * run]
         after, decays = [], []
         if not unit_keys:
             # The pair's decay, one for every output, restarting at a row's own pair.
             decays = [arith.select(first, one, arith.mulf(b, a)) for b, a in zip(before, factor, strict=True)]
             after = decays
         for o in range(outputs):
-            # The row's own values read at each step, none held across them.
-            values = [memref.load(rows_ref, at(o, row, column)) for column in columns]
+            values = words[(2 + o) * run:(3 + o) * run]
             if unit_keys:
                 decayed = [arith.select(first, value, arith.mulf(b, a))
                            for value, b, a in zip(values, before[o * run:(o + 1) * run], factor, strict=True)]
@@ -196,7 +215,7 @@ def _own_span(rows_ref, staged_ref, bands_ref, short, long, p, columns, leader, 
             with utils.when(leader):
                 place = at(o, row, e)
                 memref.store(arith.addf(memref.load(bands_ref, place), total), bands_ref, place)
-        scf.yield_(after)
+        scf.yield_(after + ahead)
 
 
 def shifted_up(call: Call, e, value: jax.Array) -> jax.Array:
@@ -307,7 +326,7 @@ def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     and their bands summed (`own_bands`'), plain fp32, and each output's bands' landing."""
     outputs, chunk = len(products), call.chunk
     # The rows and bands where a thread forms its own pairs (`by_thread`) alone.
-    staging = (*own_staging(call, keys),
+    staging = (*own_staging(call, keys, padded=not by_thread(call)),
                *((swizzling.plain((outputs, chunk, keys), jnp.float32),
                   swizzling.plain((outputs, chunk, algebra.SUB), jnp.float32)) if by_thread(call) else ()))
     return staging, {name: _band_form(call, name).landing(chunk, algebra.SUB) for name in products}
