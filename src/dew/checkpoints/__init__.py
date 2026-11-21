@@ -523,6 +523,8 @@ def _packed_checked(tree) -> None:
               for path, leaf in jax.tree_util.tree_flatten_with_path(
                   tree, is_leaf=lambda node: isinstance(node, NvFp4))[0]
               if isinstance(leaf, NvFp4)]
+    if not packed:
+        return
     forms = collective_host([leaf.form for _, leaf in packed], phase="packed forms")
     for (name, leaf), form in zip(packed, forms, strict=True):
         try:

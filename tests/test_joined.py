@@ -588,6 +588,22 @@ def test_a_named_side_by_side_product_keeps_its_callers_grouped_choice_and_refus
     assert refused.value.first.code == "grouped", refused.value.first
 
 
+def test_a_side_by_side_forward_runs_the_route_its_admission_decided():
+    """An attention layer's query, key and value admitted side by side on an assumed H100, the GEMM template
+    named: their forward runs and reports the grouped route `gemm.side_by_side` decided as it admitted them
+    (its site), once, where the call bound and selected its launch a second time (base review b68fc2382
+    F5)."""
+    layer, x, params, under = _watched_layer()
+    with contextlib.ExitStack() as stack:
+        for context in under():
+            stack.enter_context(context)
+        routes = stack.enter_context(generation.routes())
+        jax.eval_shape(layer.apply, params, x)
+    assert [route.kernel for route in routes if route.choice == "qkv"] == ["joined"]
+    sites = [route.site for route in routes if route.choice == "grouped_matmul"]
+    assert sites.count("dew.nn.kernels.gemm:side_by_side") == 1, sites
+
+
 def _watched_layer():
     """`_attention`'s layer, its abstract input and parameters, and the contexts its watch cells trace under,
     made afresh at each call (a context is entered once): an assumed H100, the GEMM template named."""

@@ -451,13 +451,20 @@ def summarized(manifest: dict, out: Path) -> None:
 
 WINDOW_MINUTES = 15
 """A window's minutes past its cases' own: its workers' start and its arms' builds."""
+PROFILED_MINUTES = 2
+"""A window's minutes for each cell and arm a case profiles (`profiled`): a process of its own, its compile
+and Nsight Compute's replays (M-EM-38's on an A100, 79-85 s each; LF-HSNCU's and LF-GDN-NCU's on a GH200,
+23-56 s)."""
 
 
 def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
     """One measurement window a GPU kind, as `dewops.node` takes them (`node submit`): each a timing
-    (`"kind"`), packed beside the node's other jobs and alone on its GPU around its rounds, at `ref`, running
-    this harness over that kind's manifest (beside the jobs' file, which stages it as $SESSION/extra/<its
-    name>), its minutes a minute for each 60 timed calls past `WINDOW_MINUTES` (the measurement lane batches
+    (`"kind"`), or a profile where any of its cases profiles, which a node runs with its GPU's performance
+    counters open (`dewops.node.dispatch`'s `"counters"`; row 4557: a profiling window submitted as a
+    timing ran Nsight Compute with them closed), packed beside the node's other jobs and alone on its GPU
+    around its rounds, at `ref`, running this harness over that kind's manifest (beside the jobs' file,
+    which stages it as $SESSION/extra/<its name>), its minutes a minute for each 60 timed calls and
+    `PROFILED_MINUTES` for each profiled cell and arm past `WINDOW_MINUTES` (the measurement lane batches
     every pending measurement of a kind into its window, bible §6)."""
     windows = []
     for kind, path in manifests.items():
@@ -465,8 +472,12 @@ def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
         calls = sum(len(case["cells"]) * (len(case["arms"]) + 1)
                     * (case.get("warmup", WARMUP) + case.get("rounds", ROUNDS)) * case.get("repeats", 5)
                     for case in manifest["cases"])
-        windows.append({"name": f"{name}-{kind}", "ref": ref, "gpu": kind, "kind": "timing",
-                        "minutes": WINDOW_MINUTES + math.ceil(calls / 60), "keep": [],
+        profiled = sum(len(case["cells"]) * len(case["arms"])
+                       for case in manifest["cases"] if "profile" in case)
+        windows.append({"name": f"{name}-{kind}", "ref": ref, "gpu": kind,
+                        "kind": "profile" if profiled else "timing",
+                        "minutes": WINDOW_MINUTES + math.ceil(calls / 60) + PROFILED_MINUTES * profiled,
+                        "keep": [],
                         "run": f'python tools/timing.py run "$SESSION/extra/{path.name}" --out "$OUT"'})
     return {"jobs": windows}
 

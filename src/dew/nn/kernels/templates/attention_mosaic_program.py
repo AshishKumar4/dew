@@ -1815,11 +1815,13 @@ def _mask_places(family: mosaic.Family, block_q: int, block_k: int) -> list:
 
 
 def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
-    """A quantized call's phases converting a slot of codes beside its sums (`Family.converted`): its codes
-    read in the accumulator's layout, biased to int32 and taken to fp32, a tile of each live at once, the
-    keys' `[bk, D]` and then the values' `[bk, Dv]` (an A100's int8 decode at width 128, 64-key tiles:
-    priced 108 without them, ptxas held it at 160, FS undercount gate4)."""
-    return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in dict.fromkeys(widths)]
+    """A quantized call's phases converting a slot of codes beside its sums (`Family.converted`, chunked to
+    an 8-bit swizzle width `swizzling.swizzle_columns(jnp.int8, swizzling.SWIZZLE_BYTES)`, rows 5449,
+    10141): its codes read in the accumulator's layout, biased to int32 and taken to fp32, a tile of each
+    live at once."""
+    limit = swizzling.swizzle_columns(jnp.int8, swizzling.SWIZZLE_BYTES)
+    chunked = dict.fromkeys(min(width, limit) for width in widths)
+    return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in chunked]
 
 
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,

@@ -39,6 +39,7 @@ from jax.extend import core
 from jax.interpreters import batching, mlir
 
 from dew.algebra.forms import Refused
+from dew.nn import float_bits
 from dew.nn.derivatives import contracted
 from dew.nn.float_bits import exact_power2
 from dew.nn.precision import correctly_rounded_divide, power2, two_product, two_sum
@@ -54,8 +55,6 @@ class Format:
     """Its largest exponent."""
     mantissa: int
     """Its stored significand bits."""
-    word: type
-    """The unsigned integer of its width, its bits'."""
     reach: int
     """The bound a value's own exponent is within as a scaled value's (`scaled`): a normal's from `least` to
     `largest`, a subnormal's down to `least - mantissa`, one past for the significand's place (float32's
@@ -72,8 +71,7 @@ def format_of(dtype) -> Format:
     """`dtype`'s constants (`Format`), from its `finfo`."""
     limits = jnp.finfo(dtype)
     return Format(least=limits.minexp, largest=limits.maxexp - 1, mantissa=limits.nmant,
-                  word=jnp.dtype(f"uint{limits.bits}").type, reach=-limits.minexp + limits.nmant + 1,
-                  shift=2 * (limits.nmant + 1) + 16)
+                  reach=-limits.minexp + limits.nmant + 1, shift=2 * (limits.nmant + 1) + 16)
 
 
 REACH = 1 << 24
@@ -126,18 +124,18 @@ def _held(reach: int) -> int:
 
 def _split_value(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`x`'s significand in [1, 2), its sign kept, and its exponent (`jnp.frexp`'s, one less): a subnormal's
-    read from its bits, its fraction field (a normal float of the format, exactly) times the least
-    subnormal's power, so its exponent lies beneath the least normal's (within its format's `reach`) and a
-    process whose float arithmetic flushes a subnormal operand (XLA's CPU) keeps its value (outputs `2^-127`
-    and `2^-125` merged to `2^-126`, the first dropped, the merge P0's head review, F2); a zero's +0 at
-    exponent 0, and a non-finite value its own significand. Only `frexp`, a bitcast and an integer's
-    conversion, which every lowering of the construct's operations takes (a Triton kernel's, `merged`)."""
+    read from its bits (`float_bits.raw_fields`), its fraction field (a normal float of the format, exactly)
+    times the least subnormal's power, so its exponent lies beneath the least normal's (within its format's
+    `reach`) and a process whose float arithmetic flushes a subnormal operand (XLA's CPU) keeps its value
+    (outputs `2^-127` and `2^-125` merged to `2^-126`, the first dropped, the merge P0's head review, F2); a
+    zero's +0 at exponent 0, and a non-finite value its own significand. Only `frexp`, a bitcast and integer
+    shifts and masks, which every lowering of the construct's operations takes (a Triton kernel's,
+    `merged`)."""
     form = format_of(x.dtype)
-    bits = lax.bitcast_convert_type(x, jnp.dtype(f"int{jnp.finfo(x.dtype).bits}"))
-    field = bits & ((1 << form.mantissa) - 1)
-    subnormal = ((bits >> form.mantissa) & (2 * form.largest + 1) == 0) & (field != 0)
+    _, sign, biased, field = float_bits.raw_fields(x)
+    subnormal = (biased == 0) & (field != 0)
     fraction, exponent = jnp.frexp(jnp.where(subnormal, field.astype(x.dtype), x))
-    fraction = jnp.where(subnormal & (bits < 0), -fraction, fraction)
+    fraction = jnp.where(subnormal & (sign != 0), -fraction, fraction)
     exponent = jnp.where(subnormal, exponent + form.least - form.mantissa, exponent)
     return (jnp.where(fraction == 0, jnp.zeros_like(x), 2 * fraction),
             jnp.where(fraction == 0, 0, exponent - 1).astype(jnp.int32))
@@ -365,11 +363,13 @@ def landed(a: Scaled) -> jax.Array:
 def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array, reach: int) -> jax.Array:
     """`applied`'s product: the factors of one direction (`applied`'s account), the powers of two first and
     the significand last, so its transpose takes a cotangent by the significand first: a zero coefficient's
-    cotangent is zero before any power reaches it."""
+    cotangent is zero before any power reaches it. Uses `precision.power2`'s default saturating
+    single-rounding form (never the two-factor half-split), so a gradual-underflow backend rounds once."""
+    del reach
     growing = exponent >= 0
     last = jnp.where(growing, significand, 0.5 * significand)
     rest = jnp.where(growing, exponent, exponent + 1)
-    product = power2(x, rest, reach=reach + 1) * last
+    product = power2(x, rest) * last
     # A zero +0, its sign none (the module's account): a flushed landing's or a zero factor's alike.
     return jnp.where(product == 0, jnp.zeros_like(product), product)
 

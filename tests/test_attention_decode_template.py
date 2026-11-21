@@ -590,11 +590,10 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
 
 QUANTIZED = [(device, page, stored) for stored in ("int8", "float8_e4m3fn")
              for device, page in (("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 16),
-                                  ("sm80", 128))
-             if stored == "int8" or device == "sm90"]
+                                  ("sm80", 128))]
 """The quantized decode's devices, layouts and codes: dense, pages of 16 keys several to a key tile, their
-rows gathered (`Transport.gathers_rows`), and on an A100 of whole key tiles; FP8 codes where the device
-converts them (`mosaic.converts`, sm_89 on)."""
+rows gathered (`Transport.gathers_rows`), and on an A100 of whole key tiles; both int8 and FP8 on every GPU
+(`mosaic.converts`, row 8549)."""
 
 
 @INTERPRETS
@@ -1030,3 +1029,35 @@ def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(gene
         found = compile_mosaic_kernels([KernelCase("inference", lambda: (forward, (query, key, key)))],
                                        generation_name)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+@COMPILES_ON_CPU
+def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
+    """A split decode step on an H100 (`attention_decode.priced_step`: 1 row, 1 query, 8 heads over 2 key
+    heads 128 wide over 8192 keys) prices its native `merged_padded` launch from `merged.launch_work`
+    (row 8845): both the merge kernel's device bytes and its two-pass span add to the split walk's."""
+    from dew.nn.kernels.templates import merged
+
+    target = generation.gpu_target("sm90")
+    priced = attention_decode.priced_step(target, rows=1, queries=1, keys=8192, heads=8, kv_heads=2,
+                                          width=128, dtype=jnp.bfloat16)
+    assert priced is not None and priced.kernels >= 2.0
+    query = jax.ShapeDtypeStruct((1, 1, 8, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 8192, 2, 128), jnp.bfloat16)
+    spans = template.spans(1, 8192, 1, causal=False)
+    with generation.assumed(target):
+        traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(
+            q, k, v, spans, None, scale=None, interpret=False, table=None, sources=None,
+            scales=None, bounds=None, finished=True, in_key=False))(query, key, key)
+    (merge_eq,) = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive is merged.merged_padded_p]
+    merge_work = merged.launch_work(
+        merge_eq.params["spec"],
+        jax.ShapeDtypeStruct(merge_eq.invars[0].aval.shape, merge_eq.invars[0].aval.dtype),
+        jax.ShapeDtypeStruct(merge_eq.invars[1].aval.shape, merge_eq.invars[1].aval.dtype),
+        merge_eq.params["queries"], merge_eq.params["width"], target)
+    walk_launches = [w for eq in programs.equations(traced.jaxpr)
+                     if eq.primitive in programs.NATIVE_KERNELS
+                     and (w := emission.work_of(eq)) is not None]
+    assert merge_work.span >= 3.0 and merge_work.device_bytes > 0
+    assert priced.span == sum(w.span for w in walk_launches) + merge_work.span
+    assert priced.device_bytes == sum(w.device_bytes for w in walk_launches) + merge_work.device_bytes
