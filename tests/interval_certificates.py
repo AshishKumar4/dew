@@ -15,7 +15,7 @@ from typing import Literal, NamedTuple
 
 import numpy as np
 import tier_wire
-from certified import allowance
+from certified import allowance, underflow
 from native_certificates import TRUNCATING, truncating_underflow
 from op_certificates import (
     BFLOAT16,
@@ -153,19 +153,14 @@ PART_BOUNDS = (1 + 2.0 ** -8, 2.0 ** -8 * (1 + 2.0 ** -8), 2.0 ** -16 * (1 + 2.0
 within half a bf16 unit, 2^-8 of it; each later the remainder rounded, within 2^-8 of the last."""
 
 
-PART_SUBNORMAL = 2.0 ** (BFLOAT16.emin - BFLOAT16.precision)
-"""Half bf16's least subnormal step, 2^-134: what a part rounded below bf16's normals may drop absolutely,
-however small the value (`two_parts_reach`)."""
-
-
 def two_parts_reach(magnitude, lane: Lane):
     """How far two bf16 parts' sum lies from the fp32 value of `magnitude` they split: the second part the
     remainder rounded, within 2^-16 of the value, or within half bf16's least subnormal step where the
-    remainder lies below bf16's normals (`PART_SUBNORMAL`), or, on a lane that flushes, the whole of a
-    remainder or value below fp32's normals: a value near 1e-40 split into parts dropped 2^-134, whose
+    remainder lies below bf16's normals, or, on a lane that flushes, the whole of a remainder or value below
+    its normals, fp32's (`certified.underflow`): a value near 1e-40 split into parts dropped 2^-134, whose
     relative reach was none, and Kimi's steep inverse lay one bf16 step outside its enclosure natively on a
     GH200 (row 10007, M-JS-156: 68 of 24576 entries, each 2^-133 out)."""
-    return 2.0 ** -16 * magnitude + (2.0 ** FLOAT32.emin if lane.flushes else PART_SUBNORMAL)
+    return 2.0 ** -16 * magnitude + underflow(BFLOAT16, lane.flushes)
 
 
 def staged(iv: Iv, lane: Lane) -> Iv:

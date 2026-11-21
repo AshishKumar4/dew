@@ -159,9 +159,9 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     past or failed within the programs its prepare holds, and is recorded deferred (`truths_ahead.DEFERRED`,
     where it raised and why), its run computing and judging it with the flow's other cells served by the store
     and naming the test unprepared (tests/conftest.py); one whose every site it began its prepare finished,
-    and then raised, checked what its prepare gives in their place (an `ahead_arm`'s zeros: a later failure in
-    its prepare judges nothing) and passes its prepare unrecorded, its run judging it (row 8555: every such
-    cell was named unprepared, falsely)."""
+    and then raised, checked what its prepare gives in their place (`CompiledTruths.judged_its_zeros`, a
+    test's rule too) and passes its prepare unrecorded, its run judging it (row 8555: every such cell was
+    named unprepared, falsely)."""
     if tried_before is None:
         return False
     import os
@@ -170,8 +170,7 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     import truths_ahead
 
     store = store_wire.COMPILED.get()
-    new = store.tried - tried_before
-    if not new or not new <= store.done:
+    if not store.judged_its_zeros(error, tried_before):
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {_raised(error)[:400]}",
                                 truths_ahead.DEFERRED)
