@@ -493,8 +493,10 @@ maximum underflows to 0 as -inf's did, onto another such state's is 1 over zero 
 
 def no_keys(total: jax.Array) -> jax.Array:
     """Whether each row of a state's denominator `total` saw no key: none of its sums, as any key's weight
-    at the row's maximum is 1 (a scaled walk's at its row's scale, never to 0)."""
-    return total == 0
+    at the row's maximum is 1 (a scaled walk's at its row's scale, never to 0; `means.holding` preserves
+    subnormal totals on flushing lanes while non-flushing GPU kernels avoid `stop_gradient`, row 10849)."""
+    return bodies.subnormals(lambda *, flushing: ~means.holding(total) if flushing else total == 0,
+                             total.dtype)
 
 
 def empty(rows: int, width: int, *, scaled: bool = False) -> Partial:
@@ -623,7 +625,7 @@ def resumable(spec: Forward, state: Partial) -> Partial:
     """A finished state (`finished_merged`'s: its output normalized, its maximum in `spec`'s units) as a
     call's initial state takes it (`initial_state`'s inverse): its sums unnormalized at its natural maximum,
     a state of no mass the walk's start, which adds nothing to a merge."""
-    held = state.total > 0
+    held = means.holding(state.total)
     return Partial(means.resumed(state.acc, state.total), jnp.where(held, spec.naturalized(state.m), LEAST),
                    state.total)
 
@@ -1397,7 +1399,10 @@ def small_parts(small: jax.Array, dtype) -> tuple[product.Scaled, ...]:
     exactly (`product.formed`), each's product exact in fp32, so none loses its bits."""
     if jnp.dtype(dtype) == jnp.dtype(jnp.float32):
         return (product.Scaled(small, float(-SMALL_SHIFT)),)
-    return tuple(product.Scaled(part, float(-SMALL_SHIFT)) for part in product.formed(small, 3))
+    return tuple(
+        product.Scaled(part, float(-SMALL_SHIFT))
+        for part in product.formed(small, bf16_part_count(accurate=True))
+    )
 
 
 def taken_back(value: jax.Array, exponent: jax.Array | float) -> jax.Array:
@@ -1909,7 +1914,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     largest (`Forward.largest`), or at fp32's where `held` (an fp32 call's walk, `quotient`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
-        out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
+        out = jnp.where(expand(means.holding(state.total), state.acc), state.acc, 0.0)
     else:
         acc, total = dropped_total(spec, state.acc, state.total)
         state = state._replace(acc=acc, total=total)
@@ -1975,8 +1980,11 @@ def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Ar
 
 
 def inverse(total: jax.Array) -> jax.Array:
-    """Each query's `1 / total`, zero where it saw nothing (total 0)."""
-    return jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
+    """Each query's `1 / total`, zero where it saw nothing (`means.holding` on flushing lanes, `total > 0`
+    in non-flushing GPU kernels where `stop_gradient` does not lower, row 10849)."""
+    held = bodies.subnormals(lambda *, flushing: means.holding(total) if flushing else total > 0,
+                             total.dtype)
+    return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), 0.0)
 
 
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
@@ -2115,32 +2123,26 @@ def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool, rows: bool = F
     yield product.Scaled(low, low_exponent + high_exponent)
 
 
-@functools.cache
-def _bf16_parts_for(target_name: str | None, accurate: bool) -> int:
-    del target_name
+_BF16_PARTS: dict[tuple[str | None, bool], int] = {}
+
+def bf16_part_count(*, accurate: bool) -> int:
+    """bf16 parts for fp32 attention products from `dew.algebra.error.product_precision` (row 5473)."""
     from dew.algebra.error import product_precision
     from dew.nn import programs
-
-    need = 6 if accurate else 1
-
-    def admits(preset: jax.lax.DotAlgorithmPreset) -> bool:
-        arith = programs.dot_arithmetic(preset, jnp.float32, jnp.float32)
-        return (arith is not None and arith.operand_bits == (16, 16) and not arith.tf32
-                and arith.accumulation_bits == 32 and not arith.imprecise
-                and arith.operations >= need)
-
-    chosen = product_precision(64, 64, 64, jnp.float32, admits=admits)
-    arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
-    assert arith is not None
-    return math.isqrt(2 * arith.operations)
-
-
-def bf16_part_count(*, accurate: bool = True) -> int:
-    """Number of bf16 parts for fp32-exact (`accurate=True`) or fast (`accurate=False`) products, derived
-    from `dew.algebra.error.product_precision` (row 5473)."""
     from dew.nn.kernels import generation
 
-    return _bf16_parts_for(generation.gpu_target().generation, accurate)
+    target = generation.gpu_target()
+    key = (target.generation if target is not None else generation.placed_platform(), accurate)
+    if key not in _BF16_PARTS:
+        chosen = product_precision(
+            64, 64, 64, jnp.float32,
+            admits=lambda p: (a := programs.dot_arithmetic(p, jnp.float32, jnp.float32)) is not None
+            and a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
+            and not a.imprecise and a.operations >= (6 if accurate else 1))
+        arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
+        _BF16_PARTS[key] = max(1, (math.isqrt(1 + 8 * arith.operations) - 1) // 2) if arith else 1
+    return _BF16_PARTS[key]
+
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
                       dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool) -> jax.Array:

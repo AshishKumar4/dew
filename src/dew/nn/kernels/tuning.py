@@ -1435,18 +1435,14 @@ def _verdicts_path(target: str) -> str:
 
 
 def _stored_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, value_field: str,
-                  target: str, key: str, label: str, *, path: str | None = None) -> Rebuilt | None:
-    """Read `key` from `path` (or `_verdicts_path(target)`, cached in `cache`) and decode it."""
-    if path is not None:
-        found = next((entry[value_field] for entry in _stored(path)
-                      if isinstance(entry, dict) and entry.get(key_field) == key), None)
-    else:
-        with _LOADING:
-            if target not in cache:
-                cache[target] = {entry[key_field]: entry[value_field]
-                                 for entry in _stored(_verdicts_path(target))
-                                 if isinstance(entry, dict) and key_field in entry}
-            found = cache[target].get(key)
+                  target: str, key: str, label: str) -> Rebuilt | None:
+    """Read `key` from `_verdicts_path(target)` (cached in `cache`) and decode it."""
+    with _LOADING:
+        if target not in cache:
+            cache[target] = {entry[key_field]: entry[value_field]
+                             for entry in _stored(_verdicts_path(target))
+                             if isinstance(entry, dict) and key_field in entry}
+        found = cache[target].get(key)
     try:
         return None if found is None else decoded(found)
     except Unreadable as unread:
@@ -1456,34 +1452,31 @@ def _stored_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, va
 
 
 def _store_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, value_field: str,
-                 target: str, key: str, value: Hashable | dict[str, tuple[str, report.Binary]], *,
-                 path: str | None = None) -> None:
-    """Atomically write `{key_field: key, value_field: encoded(value)}` to `path` (or `_verdicts_path`)."""
+                 target: str, key: str, value: Hashable | dict[str, tuple[str, report.Binary]]) -> None:
+    """Atomically write `{key_field: key, value_field: encoded(value)}` to `_verdicts_path(target)`."""
     written = encoded(value)
-    dest = _verdicts_path(target) if path is None else path
+    dest = _verdicts_path(target)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with filelock.FileLock(dest + '.lock'):
         kept = [entry for entry in _stored(dest)
                 if not (isinstance(entry, dict) and entry.get(key_field) == key)]
         write_atomically(dest, json.dumps({"target": target,
                                            "data": [*kept, {key_field: key, value_field: written}]}))
-    if path is None:
-        with _LOADING:
-            cache.setdefault(target, {})[key] = written
+    with _LOADING:
+        cache.setdefault(target, {})[key] = written
 
 
-def stored_verdict(target: str, key: str, *, path: str | None = None) -> Rebuilt | None:
+def stored_verdict(target: str, key: str) -> Rebuilt | None:
     """Certification's verdict of the launch `key` names, its kernels assembled for `target`
     (`report.certified`), an accepted config's or a refused one's, as stored (`_verdicts_path`) and rebuilt
     (`decoded`), read once a process; none where none is stored, or this checkout cannot rebuild it."""
-    return _stored_entry(_VERDICTS, "certified", "verdict", target, key, "certification verdict", path=path)
+    return _stored_entry(_VERDICTS, "certified", "verdict", target, key, "certification verdict")
 
 
-def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, report.Binary]], *,
-                  path: str | None = None) -> None:
+def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
     """`verdict` stored for the launch `key` names, its kernels assembled for `target` (`_verdicts_path`), as
     the picks are (`encoded`), one writer at a time, the file replaced whole."""
-    _store_entry(_VERDICTS, "certified", "verdict", target, key, verdict, path=path)
+    _store_entry(_VERDICTS, "certified", "verdict", target, key, verdict)
 
 
 _CHOICES: dict[str, dict[str, _records.JSON]] = {}
@@ -1491,16 +1484,16 @@ _CHOICES: dict[str, dict[str, _records.JSON]] = {}
 (`stored_choice`), by key, beside its certification verdicts (`_verdicts_path`)."""
 
 
-def stored_choice(target: str, key: str, *, path: str | None = None) -> Rebuilt | None:
+def stored_choice(target: str, key: str) -> Rebuilt | None:
     """A derived choice stored for `key` on `target` (`store_choice`), beside its certification verdicts
     (`_verdicts_path`), read once a process; none where none is stored or this checkout cannot rebuild it."""
-    return _stored_entry(_CHOICES, "priced", "choice", target, key, "derived choice", path=path)
+    return _stored_entry(_CHOICES, "priced", "choice", target, key, "derived choice")
 
 
-def store_choice(target: str, key: str, choice: Hashable, *, path: str | None = None) -> None:
+def store_choice(target: str, key: str, choice: Hashable) -> None:
     """`choice` stored for `key` on `target` beside its certification verdicts (`_verdicts_path`), one writer
     at a time, the file replaced whole."""
-    _store_entry(_CHOICES, "priced", "choice", target, key, choice, path=path)
+    _store_entry(_CHOICES, "priced", "choice", target, key, choice)
 
 
 def shapes(value):
