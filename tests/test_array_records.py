@@ -443,3 +443,31 @@ def test_a_trim_asked_for_while_another_trims_is_made_before_the_trimmer_lets_go
         released.set()
         for readers in sources:
             readers.close()
+
+
+def test_an_indexed_read_of_shards_declared_off_gcs_reads_each_from_its_checked_copy(arrayrecord_paths):
+    """ArrayRecord shards held in a store ArrayRecord's reader cannot open (here memory://, as an S3 or
+    HTTP store), read by index: refused where nothing states them, and read from a checked copy on this
+    host where their producer declared each one's bytes and checksum (row 9052: an indexed read was refused
+    off GCS unless the shards belonged to a committed directory)."""
+    from dew.data import Files
+
+    root = f"memory://declared-{uuid4().hex}"
+    urls, declared = [], {}
+    for at, path in enumerate(arrayrecord_paths):
+        data = Path(path).read_bytes()
+        url = f"{root}/part-{at}.array_record"
+        fs, held = Store(url).resolve()
+        with fs.open(held, "wb") as written:
+            written.write(data)
+        urls.append(url)
+        declared[url] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    assert not Files(tuple(urls), format="array_record").supports("indexed")
+    files = Files(tuple(urls), format="array_record", file_info=declared)
+    assert files.supports("indexed")
+    from dew.data.sources.records import ArrayRecords
+
+    expected = [ArrayRecords((path,))[index] for path in arrayrecord_paths
+                for index in range(len(ArrayRecords((path,))))]
+    rows = files.records("indexed")
+    assert [rows[index] for index in range(len(rows))] == expected
