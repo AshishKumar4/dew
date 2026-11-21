@@ -7,7 +7,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED, on_float64_device, on_float64_host, rounds_nothing
+from arm_arithmetic import FORMATTED, as_traced, on_float64_device, on_float64_host, rounds_nothing
 from float64_terms import evaluated_on, lowered, walked
 from jax.extend.core import primitives
 from reference_error import _floating, as_given, equations
@@ -51,19 +51,21 @@ def float64_replay(fn, *, compiled: bool = False):
     or, where a GPU holds the draw, float64 JAX arrays: `_without_x64`), and
     rounds each argument to its traced dtype before widening it, as the program would read it. It runs
     eagerly, each operation its own float64 dispatch, so its bits are each operation's own, and the
-    gate runs it as given. `fn` is traced once a signature of its arguments (their tree, shapes and
-    dtypes), its program the same at every call of one signature, as a pure function's is: a draw over
-    many seeds replays one trace. `compiled` compiles that replay once a signature instead, for a
+    gate runs it as given. `fn` is traced once a trace key (its arguments as a lowering reads them and the
+    context a trace reads), its program the same at every call of one key, as a pure function's is: a draw
+    over many seeds replays one trace. `compiled` compiles that replay once a key instead, for a
     program whose eager replay costs a draw seconds (a model's initializer): XLA's fusions move its
     float64 results by float64 roundings, which a float32 program's error dwarfs, and its formatted
     operations stay the program's own."""
     traced: dict[tuple, tuple] = {}
 
     def run(*arguments):
-        leaves, tree = jax.tree.flatten(arguments)
-        # A key array has a shape and a dtype, but no NumPy dtype.
-        signature = (tree, tuple((jnp.shape(value), str(value.dtype if hasattr(value, "dtype")
-                                                         else np.result_type(value))) for value in leaves))
+        from dew.nn.kernels import options
+
+        # Held by the one trace key: the arguments as a lowering reads them and the context a trace reads
+        # beside them (`options.abstract_signature`, `options.trace_context`; row 10893: a hand-picked
+        # signature missed precision, meshes, Dew's contexts and environment).
+        signature = (options.abstract_signature(arguments), options.trace_context())
         if signature not in traced:
             with jax.enable_x64(new_val=False):
                 closed, made = jax.make_jaxpr(fn, return_shape=True)(*jax.tree.map(_without_x64, arguments))
@@ -148,12 +150,8 @@ class Replay:
             # A call the walk does not open may hold float arithmetic its integer boundary hides.
             raise NotImplementedError(f"float64_replay does not replay inside {name}")
         if equation.primitive in FORMATTED or not any(_floating(dtype) for dtype in dtypes):
-            traced = [jnp.asarray(value).astype(variable.aval.dtype) if hasattr(variable.aval, "dtype")
-                      and _floating(variable.aval.dtype) else value
-                      for value, variable in zip(values, equation.invars, strict=True)]
-            outputs = equation.primitive.bind(*traced, **equation.primitive.get_bind_params(params))
-            outputs = outputs if equation.primitive.multiple_results else [outputs]
-            return [_widened(output) if _floating(output.dtype) else output for output in outputs]
+            return [_widened(output) if _floating(output.dtype) else output
+                    for output in as_traced(equation, values)]
         unrounded = programs.UNROUNDED.get(equation.primitive)
         if unrounded is not None:
             # A primitive that rounds to a format of its own: the operation it rounds, at float64.

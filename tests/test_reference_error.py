@@ -317,7 +317,7 @@ def test_a_row_both_arms_hold_exactly_is_not_carried_and_the_site_judges_as_befo
         x, w = a_product_draw(seed)
         return x.at[:4].set(0.0), w
 
-    [draws] = _drawn(jnp.matmul, jnp.matmul, zeroed_draw, range(2))
+    [draws] = _drawn(jnp.matmul, jnp.matmul, zeroed_draw, range(2), repeats=True)
     for rows, mine, theirs in (seed[0] for seed in draws.zero_rows):
         assert not np.any((mine == 0) & (theirs == 0)) and not np.isin(np.arange(4), rows).any()
     assert_as_exact(jnp.matmul, jnp.matmul, zeroed_draw, "rows held exactly", seeds=8)
@@ -684,7 +684,7 @@ def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
     from dew.parity import SIZING_FROM, seeds_resolving
 
     count = seeds_for(_product, _draw, "product")
-    [draws] = _drawn(_product, _product, _draw, range(SIZING_FROM, SIZING_FROM + 4 * count))
+    [draws] = _drawn(_product, _product, _draw, range(SIZING_FROM, SIZING_FROM + 4 * count), repeats=True)
     assert seeds_resolving(draws.theirs, draws.names, "product") == count
     with pytest.raises(AssertionError):
         seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)

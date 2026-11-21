@@ -63,3 +63,47 @@ def test_a_program_traced_under_one_context_is_not_served_under_another():
     finally:
         factor.reset(token)
     np.testing.assert_array_equal(after, 2.0 * before)
+
+
+def test_a_program_of_more_steps_than_a_span_is_scaled_as_compiled_whole(monkeypatch):
+    """A static program of more steps than a compiled span holds (`float64_terms.SPAN_STEPS`) is walked a
+    span at a time (row 9780: a Gemma 3n site compiled whole peaked at 9.1 GiB), its values and its rounding
+    scale each element's as the program compiled whole gives them: each rounding's sign keyed by its place
+    in the program, not by the span it falls in. Here spans of 8 steps over a program of 40."""
+    import float64_terms
+    import rounding_bound
+
+    def chained(x):
+        for step in range(20):
+            x = x * np.float32(1.0 + 1e-3 * (step % 7)) + np.float32(0.25)
+        return x
+
+    x = jnp.asarray([1.0, -2.0, 3.5], jnp.float32)
+    whole = rounding_scale(chained, x)
+    rounding_bound.released_scales()
+    monkeypatch.setattr(float64_terms, "SPAN_STEPS", 8)
+    monkeypatch.setattr(rounding_bound, "SPAN_STEPS", 8)
+    spanned = rounding_scale(chained, x)
+    rounding_bound.released_scales()
+    np.testing.assert_array_equal(spanned[0], whole[0])
+    np.testing.assert_array_equal(spanned[1], whole[1])
+
+
+def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypatch):
+    """A call whose body holds more steps than a compiled span (`float64_terms.SPAN_STEPS`; a jit-wrapped
+    reference, the gate's common arm, is one such step) is a span of its own, walked as its body's spans,
+    and the steps beside it compiled apart: counted as one step, it was compiled whole with its neighbours
+    however large its body (row 10950)."""
+    import float64_terms
+
+    monkeypatch.setattr(float64_terms, "SPAN_STEPS", 8)
+
+    @jax.jit
+    def body(x):
+        for _ in range(10):
+            x = x * np.float32(1.5) + np.float32(0.25)
+        return x
+
+    closed = jax.make_jaxpr(lambda x: body(x + np.float32(1.0)) * np.float32(2.0))(
+        jnp.ones(3, jnp.float32))
+    assert float64_terms._runs(closed.jaxpr) == [(0, 1), (1, 2), (2, 3)]

@@ -495,17 +495,43 @@ def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
     return all(static(body) for body in programs.bodies(equation))
 
 
+SPAN_STEPS = 1024
+"""The most steps one compiled span holds (`_runs`), a call's body's steps counted among them (`steps`): a run
+of static steps past it is compiled in parts, and a call whose body is past it walked as its own body's
+spans, so no one compile holds a model's whole walk (row 9780: a Gemma 3n site's tapped walk, 6534 steps,
+compiled whole peaked at 9.1 GiB; in parts of 1024, 4.5 GiB, in the same 176 s; row 10950: a jit-wrapped
+reference is one step whose body is the program)."""
+
+
+def steps(jaxpr) -> int:
+    """`jaxpr`'s steps, every program's within it at any depth counted (`programs.equations`): what a compile
+    of its walk holds."""
+    return sum(1 for _ in programs.equations(jaxpr))
+
+
+def _steps(equation) -> int:
+    """`equation` and its bodies' steps (`steps`)."""
+    return 1 + sum(steps(getattr(body, "jaxpr", body)) for body in programs.bodies(equation))
+
+
 def _runs(jaxpr) -> list[tuple[int, int]]:
-    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, each branch
-    or loop a span of its own."""
-    spans, start = [], 0
+    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, holding at
+    most `SPAN_STEPS` steps, its calls' bodies' counted; each branch or loop a span of its own, and so each
+    call of more steps than a span holds, which the walk then walks as its body's spans."""
+    spans, start, held = [], 0, 0
     picked = _platform_picked(jaxpr)
     for index, equation in enumerate(jaxpr.eqns):
-        if not _static_equation(equation, picked):
+        size = _steps(equation)
+        if not _static_equation(equation, picked) or size > SPAN_STEPS:
             if start < index:
                 spans.append((start, index))
             spans.append((index, index + 1))
-            start = index + 1
+            start, held = index + 1, 0
+        elif held + size > SPAN_STEPS:
+            spans.append((start, index))
+            start, held = index, size
+        else:
+            held += size
     if start < len(jaxpr.eqns):
         spans.append((start, len(jaxpr.eqns)))
     return spans
