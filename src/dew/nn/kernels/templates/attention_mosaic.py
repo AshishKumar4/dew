@@ -1146,9 +1146,13 @@ class MosaicForward(_Mainloop[Tiles]):
         reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
         # On TPU (`not family.budgets_registers`), live score-tile VMEM intermediates (`S`, mask, `exp2`, `P`,
-        # softmax temps: ~12 fp32 tiles of `block_q x block_k`) bound tile size against `shared_budget`
+        # softmax temps: ~12 fp32 tiles plain, ~20 in natural/scaled walks matching v5e's 22 MiB measurement)
+        # plus the fp32 accumulator (`4 * block_q * value_width`) bound tile size against `shared_budget`
         # instead of repurposing `copy_extent` (row 10715).
-        score_vmem = 0 if family.budgets_registers else 12 * config.block_q * config.block_k * 4
+        score_tiles = 20 if (config.natural_form or self.scales_in_kernel(ba)) else 12
+        score_vmem = (0 if family.budgets_registers
+                      else (score_tiles * config.block_q * config.block_k
+                            + 4 * config.block_q * value_width) * 4)
         return score_vmem + resources.shared_bytes(
             family, launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
                                  products=products, over_rings=True))
