@@ -114,6 +114,9 @@ MODELS = {
                                                   kinds={"windowed": LayerKind(window=4)}),
     **{f"{mixer} hybrid": lambda mixer=mixer: hybrid_model(mixer) for mixer in RECURRENT},
     "kimi linear": lambda: hybrid_model("kimi_delta_attention", {"class": "mla", "fields": MLA}),
+    "indexed mla": lambda: attention_model(
+        mixer={"class": "mla", "fields": {**MLA, "index_n_heads": 2, "index_head_dim": 12,
+                                          "index_topk": 4}}),
     "mixture": lambda: attention_model(mixture=Mixture(experts=4, top_k=2, expert_features=16)),
     "looped": lambda: attention_model(loop=Loop(2, exit_gate=True)),
     "engram": engram_model,

@@ -804,7 +804,7 @@ def test_the_primitives_result_types_keep_weak_types():
     exponent = jax.ShapeDtypeStruct((), jnp.int32)
 
     def product(x, significand, exponent):
-        return scaled.applied_p.bind(x, significand, exponent, reach=0)
+        return scaled.applied_p.bind(x, significand, exponent)
 
     assert jax.eval_shape(product, weak, weak, exponent).weak_type
     assert not jax.eval_shape(product, weak, strong, exponent).weak_type
