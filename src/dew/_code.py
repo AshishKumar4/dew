@@ -8,7 +8,7 @@ any other, or a lazy table no literal states, is keyed by the whole package inst
 logged, so a site added unreviewed costs warm records, never a stale one.
 
 Every read is of one snapshot of the tree a process takes once (`_snapshot`: each file's digest), so a
-closure and its digest state one revision; a process whose files changed since keeps no record. A closure
+closure and its digest state one revision, the one its imports read. A closure
 is walked once a tree and kept in Dew's cache, so a start reads its files' bytes, not their syntax: a walk
 parses an op's 153 files in about a second."""
 
@@ -62,6 +62,11 @@ REVIEWED = {
     "dew.registry:import_trusted:package": "a package the run trusts, as `dew.registry:imported:module`",
     "dew.registry:import_trusted:module": "a trusted package's module a record names, as its package",
     "dew.registry:module_from_file:<loader>": "a user's file a run names, the user's code",
+    "dew.data.sources.codec:_dataclass_decoded:module":
+        "a dataclass a stored artifact names, rebuilt as data from its fields, as "
+        "`dew.registry:imported:module`",
+    "dew.interop.parts:_known_class:module":
+        "a library's class a checkpoint's parts name (transformers'), its release stating its code",
     **dict.fromkeys((
         "dew.registry:_importable:sys.modules", "dew.registry:declared_type:sys.modules",
         "dew.registry:imported:sys.modules", "dew.registry:module_from_file:sys.modules",
@@ -88,35 +93,31 @@ SELECTED = {"dew.quantization:_complex_in_float.get_intercept_map:module": "UNQU
 (`module.function` keys), which a closure follows as it follows a stated import."""
 
 @functools.cache
-def code_digest(*roots: str) -> str | None:
+def code_digest(*roots: str) -> str:
     """The digest of the modules `roots` name and every module of Dew's their code can import (`closure`),
-    each by its path and contents (`_snapshot`), the release's version (`dew._version`) not read: what a
-    record of what those modules computed keys on. The whole package's (`whole_digest`) where the closure
-    holds a dynamic import site not `REVIEWED`, which is logged: its code could import any module. None
-    where Dew's source is not the one this process first read (`_current`). Read once a process: a process
-    takes its source as it first read it, as its imports do."""
-    if any(root not in _snapshot() and root in _listed() for root in roots):
-        return _declined(roots)
+    each by its path and contents as this process's snapshot of the tree holds them (`_snapshot`), the
+    release's version (`dew._version`) not read: what a record of what those modules computed keys on. The
+    whole package's (`whole_digest`) where the closure holds a dynamic import site not `REVIEWED`, which is
+    logged (its code could import any module), or where a file the walk reads is no longer the snapshot's
+    (`_Changed`): keyed by the snapshot, as the process's imports are by the tree they read."""
     try:
         modules, sites = _kept_closure(roots)
     except _Changed:
-        return _declined(roots)
-    if not _current():
-        return _declined(roots)
+        return whole_digest()
     unreviewed = sorted(set(sites) - REVIEWED.keys())
     if unreviewed:
         _log.warning("the code of %s imports by computed names at %s, none reviewed (dew._code.REVIEWED): "
                      "its records are keyed by all of Dew's code", ", ".join(roots), ", ".join(unreviewed))
-        return _digest(_snapshot())
+        return whole_digest()
     return _digest(modules)
 
 
 @functools.cache
-def whole_digest() -> str | None:
-    """The digest of every module of Dew's (`_snapshot`), the release's version not read: what a record of
-    code no closure bounds keys on (a launch with a hook, `report.launch_code`). None, as `code_digest`,
-    where Dew's source is not the one this process first read."""
-    return _digest(_snapshot()) if _current() else _declined(("dew",))
+def whole_digest() -> str:
+    """The digest of every module of Dew's as this process's snapshot holds them (`_snapshot`), the release's
+    version not read: what a record of code no closure bounds keys on (a launch with a hook,
+    `provenance_code`; a rung, a verified mapping, a saved source's export)."""
+    return _digest(_snapshot())
 
 
 def _digest(modules: Collection[str]) -> str:
@@ -127,19 +128,6 @@ def _digest(modules: Collection[str]) -> str:
         relative, contents = files[module]
         digest.update(f"{relative}\0{contents}\0".encode())
     return digest.hexdigest()
-
-
-def _declined(roots: tuple[str, ...]) -> None:
-    _log.warning("Dew's source changed while this process ran: it keeps no record of %s", ", ".join(roots))
-
-
-@functools.cache
-def _current() -> bool:
-    """Whether Dew's source is the one this process first read (`_snapshot`)."""
-    try:
-        return _listed() == _snapshot()
-    except FileNotFoundError:
-        return False
 
 
 def provenance(values: Sequence[object]) -> frozenset[str] | None:
@@ -163,14 +151,13 @@ def op_provenance(op, arguments: Mapping[str, object]) -> frozenset[str] | None:
     return provenance([type(op), *fields, *(value for name, value in arguments.items() if name in op.HOOKS)])
 
 
-def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str] | None:
+def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str]:
     """The digests (`code_digest`) of the code a record of `root`'s, of values whose `provenance` it names,
     keys on: `root`'s and each module's of `provenance`, or the whole package's (`whole_digest`) where it
-    is None; None where Dew's source changed while this process ran, which keeps no record."""
-    found = [whole_digest()] if provenance is None else [code_digest(module)
-                                                          for module in (root, *sorted(provenance))]
-    digests = [digest for digest in found if digest is not None]
-    return digests if len(digests) == len(found) else None
+    is None."""
+    if provenance is None:
+        return [whole_digest()]
+    return [code_digest(module) for module in (root, *sorted(provenance))]
 
 
 def _held(value) -> Sequence[object]:

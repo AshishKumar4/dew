@@ -157,19 +157,17 @@ def _launch_programs(kernel) -> int:
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
     """What decides `op`'s priced consumer count on `target` (`tuning.stored_choice`), keyed as
-    `report._verdict_key` is; None where the installation has no seal or Dew's source changed while the
-    process ran."""
+    `report._verdict_key` is; None where the installation has no seal."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
     installed = seal().digest
-    provenance = op_provenance(op, ba.arguments)
-    if installed is None or (code := provenance_code(report.__name__, provenance)) is None:
+    if installed is None:
         return None
     rates = cost.rates(target, device=False)
-    stated = [code, installed.hex(), report._identity(op, ba), target.generation, target.device_kind,
-              target.multiprocessors, target.launch_seconds, rates._asdict(), tuning.encoded(candidates),
-              _keyed_environment()]
+    stated = [provenance_code(report.__name__, op_provenance(op, ba.arguments)), installed.hex(),
+              report._identity(op, ba), target.generation, target.device_kind, target.multiprocessors,
+              target.launch_seconds, rates._asdict(), tuning.encoded(candidates), _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 
