@@ -2195,21 +2195,24 @@ def verdict_rows(verdict: dict) -> dict[str, list[dict]]:
     return rows
 
 
-def folded_entries(record: dict[str, "Entry"], verdict: dict, target: float) -> dict:
-    """The durations `record`'s entries with main's CI `verdict` folded in: each file whole (`folded`), each
-    cold-timed test seen at its warm record where it has one, a cold run moving no warm time (a test no warm
-    run has timed takes its cold time as its warm one, which a warm run lowers), then each test by itself
-    (fold.py's `entries`: its warm time lowered to what its green runs take, its cold time and its peak)."""
+def folded_entries(record: dict[str, "Entry"], verdict: dict, target: float,
+                   rows: dict[str, list[dict]]) -> dict:
+    """The durations `record`'s entries with main's CI `verdict` folded in, its `rows` (`verdict_rows`): each
+    file whole (`folded`), each cold-timed test seen at its warm record where it has one, a cold run moving
+    no warm time (a test no warm run has timed takes its cold time as its warm one, which a warm run lowers),
+    then each test by itself (fold.py's `entries`: its warm time lowered to what its green runs take, its
+    cold time and its peak); each file's sites read once for both."""
     warm = {node: session.warm_cold(held)[0] for node, held in record.items()}
-    calm = {**verdict, "rows": [
-        {**row_, "tests": {node: warm[node] if node in row_.get("cold", ()) and node in warm else seconds
-                           for node, seconds in row_.get("tests", {}).items()}}
-        for row_ in verdict["rows"]]}
-    return fold.entries(session, record, folded(warm, calm, target), verdict_rows(verdict), sites,
+    calm = {name: [{**row_, "tests": {node: warm[node] if node in row_.get("cold", ()) and node in warm
+                                      else seconds for node, seconds in row_.get("tests", {}).items()}}
+                   for row_ in held] for name, held in rows.items()}
+    marks = {name: sites(name) for name in rows}
+    return fold.entries(session, record, folded(warm, verdict, target, calm, marks), rows, marks,
                         grading.owning, target)
 
 
-def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
+def folded(record: dict[str, float], verdict: dict, target: float, rows: dict[str, list[dict]] | None = None,
+           marks: dict[str, dict] | None = None) -> dict[str, float]:
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
     complete (its whole row, or every group of its cut) takes the times they observed where its record is
@@ -2227,15 +2230,16 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     that recorded it. Each train folds main's CI so (the land queue), and nothing else writes the record. A
     site its file's marks shard (`sites`) keeps its entries: its judge's row times its pooling, no measure of
     its draws, so its map tasks are weighed by armada's measures of them, never by the record
-    (`site_entries`), and a judge armada did not run is a row of its task's name."""
-    rows = verdict_rows(verdict)
+    (`site_entries`), and a judge armada did not run is a row of its task's name. Its `rows` and each file's
+    sites (`marks`) are read where not handed in."""
+    rows = verdict_rows(verdict) if rows is None else rows
     kept = {node: seconds for node, seconds in record.items() if Path(grading.owning(node)).is_file()}
     for name, held in rows.items():
         splits = {parsed_row(row_["name"])[2] for row_ in held}
         counts = {int(split_.split("/")[1]) for split_ in splits if split_}
         complete = splits == {""} or (len(counts) == 1 and splits == {f"{group}/{count}" for count in counts
                                                                       for group in range(1, count + 1)})
-        marked = sites(name)
+        marked = marks[name] if marks is not None else sites(name)
         if not complete or any(row_["exitCode"] != 0 or "tests" not in row_ for row_ in held):
             kept.update(fold.raised(session, kept, held, marked))
             continue
@@ -2376,11 +2380,12 @@ def main() -> int:
         before, verdict = session.entries(), json.loads(args.verdict.read_text())
         # The record main's CI cut its files by, read before its times change it (`cuts.refolded`).
         cut_by = {name: own_tests(name, tests) for name, tests in parted_record().items()}
-        recorded = folded_entries(before, verdict, target)
+        rows_of = verdict_rows(verdict)
+        recorded = folded_entries(before, verdict, target, rows_of)
         if recorded != before:
             session.DURATIONS.write_text(json.dumps(recorded, indent=0) + "\n")
         after = {name: own_tests(name, tests) for name, tests in parted_record().items()}
-        runs = cuts.ran(verdict_rows(verdict))
+        runs = cuts.ran(rows_of)
         stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after)
         if stored != session.stored_cuts():
             session.CUTS.write_text(json.dumps(stored, indent=0, sort_keys=True) + "\n")
