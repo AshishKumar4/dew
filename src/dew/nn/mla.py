@@ -351,8 +351,8 @@ class MultiHeadLatentAttention(LinearProducts):
     runs, the key positions they are read at, its keys' validity and a position bias, on an uncached call,
     as the standard attention reads them, and its pairwise mask or key runs over its cache on a cached one,
     and its forks' runs on either (`call_visibility`, `_cached_visibility`); an indexed layer
-    narrows its keys by the documents, the rows' validity and its own selection alone, and refuses them
-    (`_check_call`)."""
+    reads its forks' runs (`call_visibility`, `_cached_visibility`), narrowing its candidates beside the
+    documents and the rows' validity before selection, and refuses the others (`_check_call`)."""
 
     emb_features: int
     num_heads: int
@@ -883,9 +883,10 @@ class MultiHeadLatentAttention(LinearProducts):
             raise ValueError("an indexed mla layer selects its candidates among every key before it; "
                              "a window or chunk narrows a dense layer's keys")
         own = call.given(self.reads)
-        if own and selecting:
-            raise ValueError(f"an indexed mla layer selects among every key before each query, and reads "
-                             f"none of {', '.join(own)}")
+        disallowed = [name for name in own if name != "forks"]
+        if disallowed and selecting:
+            raise ValueError(f"an indexed mla layer selects among each query's visible keys, and reads "
+                             f"none of {', '.join(disallowed)}")
         # A cached call's keys are its cache's, whose validity it holds (`cached_validity`).
         uncached = [name for name in own if name in ("position_bias", "key_valid")]
         if uncached and call.decode:
@@ -953,12 +954,14 @@ class MultiHeadLatentAttention(LinearProducts):
             if index_keys is not None:
                 index_keys = self._rotated_index_keys(index_keys, freqs_cos, freqs_sin)
             key, value, index_full = append(key, value, index_keys)
-            keep = self._visible(positions, key.shape[1])[:, 0]
+            own = self._cached_visibility(call.metadata, positions if logical_positions is None
+                                          else logical_positions, x.shape[:2], key.shape[1], positions)
+            keep = (self._visible(positions, key.shape[1]) if own is None else own)[:, 0]
             selection, _ = self._selection(
                 x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
                 committed=committed, prediction_phase=prediction_phase)
             mask = selection_mask(selection, key.shape[1])[:, None]
-            query_basis, own = basis.query, None
+            query_basis = basis.query
         else:
             # The latent and its rotary part, one head each, as the attention cache's keys and values,
             # the latents read back in their own basis, which the expansion reads.
@@ -1143,14 +1146,8 @@ class MLAMixer(MixerBase):
     """
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
-    # A dense layer reads each token's ancestors' keys and its own (`call_visibility`).
+    # Dense and indexed layers alike read each token's ancestors' keys and its own (`call_visibility`).
     reads_forks = True
-
-    def fork_refusal(self) -> str | None:
-        """An indexed layer's: it selects among every key before each query in the row's order, which a
-        fork's prefix and branches hold apart (`MultiHeadLatentAttention._check_call`)."""
-        return ("an indexed mla layer selects among every key before each query in the row's order"
-                if self.indexed else None)
     reads_phase = True
 
     q_lora_rank: int | None = None

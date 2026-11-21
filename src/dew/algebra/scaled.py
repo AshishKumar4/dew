@@ -368,7 +368,7 @@ def applied(x: jax.typing.ArrayLike, a: Scaled) -> jax.Array:
     through it, the same chain."""
     x, significand, exponent = jnp.broadcast_arrays(jnp.asarray(x, a.significand.dtype), a.significand,
                                                     a.exponent)
-    return applied_p.bind(x, significand, exponent, reach=a.reach)
+    return applied_p.bind(x, significand, exponent)
 
 
 def landed(a: Scaled) -> jax.Array:
@@ -376,12 +376,11 @@ def landed(a: Scaled) -> jax.Array:
     return applied(jnp.ones_like(a.significand), a)
 
 
-def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array, reach: int) -> jax.Array:
+def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array) -> jax.Array:
     """`applied`'s product: the factors of one direction (`applied`'s account), the powers of two first and
     the significand last, so its transpose takes a cotangent by the significand first: a zero coefficient's
     cotangent is zero before any power reaches it. Uses `precision.power2`'s default saturating
     single-rounding form (never the two-factor half-split), so a gradual-underflow backend rounds once."""
-    del reach
     growing = exponent >= 0
     last = jnp.where(growing, significand, 0.5 * significand)
     rest = jnp.where(growing, exponent, exponent + 1)
@@ -392,9 +391,9 @@ def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array, reach: int
 
 applied_p = primitive(
     "scaled_applied", _chain,
-    lambda x, significand, exponent, *, reach: entrywise(x, significand, integers=(exponent,)))
-"""`x * significand * 2^exponent` entrywise (`_chain`, `reach` the exponent's bound), an operation of its own,
-a value's alone (the module's account)."""
+    lambda x, significand, exponent: entrywise(x, significand, integers=(exponent,)))
+"""`x * significand * 2^exponent` entrywise (`_chain`), an operation of its own, a value's alone (the
+module's account)."""
 
 
 def entrywise(x, *others, integers=()):

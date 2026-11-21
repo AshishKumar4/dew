@@ -58,6 +58,7 @@ from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations, dq_h
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
     NATURAL_NAME,
+    SplitOutput,
     _codes_of,
     _forward_allocations,
     _plain_forward,
@@ -647,10 +648,8 @@ class MosaicForward(_Mainloop[Tiles]):
         # A family that places its products on a role issues its logits ahead (`_ahead`: tcgen05's rows,
         # whose issuer warp is a step ahead of its consumer), which past its tensor memory it does not: its
         # products' scratch then none it takes (`Issuer.product_scratch`).
-        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and (
-                not self._ahead(ba, config, target)
-                or scaled_drop(ba.arguments["query"].dtype, ba.arguments.get("drop"),
-                               ba.arguments.get("initial"))):
+        if (bundle_of(config, ba.arguments["query"].dtype).places_on_role
+                and not self._ahead(ba, config, target)):
             return False
         if not super().legal(ba, config, target):
             return False
@@ -988,18 +987,20 @@ class MosaicForward(_Mainloop[Tiles]):
                                           scaled=scaled, ahead=ahead, training=training,
                                           query_width=query_width, tmem_columns=target.tmem_columns)
             if with_query != base:
-                staged = (self._staged_bytes(ba, config, target, products=base)
-                          if target.shared_limit else None)
+                base_staged = (self._staged_bytes(ba, config, target, products=base)
+                               if target.shared_limit else None)
+                with_staged = (self._staged_bytes(ba, config, target, products=with_query)
+                               if target.shared_limit else None)
                 regs = self.registers(ba, config)
                 tmem_limit = target.tmem_columns or 0
                 base_tmem = family.product_columns(base)
                 with_tmem = family.product_columns(with_query)
                 base_joined = placed.correction_roles(family, config.consumers, base_tmem, tmem_limit)
                 with_joined = placed.correction_roles(family, config.consumers, with_tmem, tmem_limit)
-                base_most = resources.register_model(family, config.consumers, regs, shared=staged,
+                base_most = resources.register_model(family, config.consumers, regs, shared=base_staged,
                                                      target=target, tmem=base_tmem,
                                                      joined=base_joined).most
-                with_most = resources.register_model(family, config.consumers, regs, shared=staged,
+                with_most = resources.register_model(family, config.consumers, regs, shared=with_staged,
                                                      target=target, tmem=with_tmem,
                                                      joined=with_joined).most
                 if with_most >= base_most:
@@ -1199,7 +1200,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
             sources: jax.Array | None = None, subtracted: bool = False,
             scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False, bounded: bool = False,
-            in_key: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+            in_key: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split] | SplitOutput:
     ...
 
 

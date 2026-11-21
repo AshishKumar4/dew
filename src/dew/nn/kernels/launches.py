@@ -93,7 +93,9 @@ None outside any launch's body."""
 
 def interpreting() -> bool | None:
     """Whether the launch whose body is tracing runs in Pallas's interpreter (`pallas_call`, `kernel`): None
-    outside any launch's body."""
+    outside any launch's body. A family's products read it so they issue no instruction the interpreter lacks
+    (mma.sync's sums, `mosaic_sm80.Mma.products`), whatever a caller states (row 5209's A100 backward:
+    products called with no interpret flag issued mma.sync's)."""
     return _INTERPRETING.get()
 
 
