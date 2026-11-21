@@ -166,16 +166,18 @@ def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, expon
     operands, own, mine, q_first = _share_scores(walk, share, resident, rows_of, coords_of, whole, index,
                                                  slots, masked=masked, whole_operands=True)
     exchange.claim()
-    for operand, left in enumerate(operands):
-        exponent = jnp.full((tiles.block_q,), algebra.tile_exponent(left), jnp.float32)
-        family.staged(family.as_row(exponent), exponents.at[operand, share])
+    with family.staged_together():
+        for operand, left in enumerate(operands):
+            exponent = jnp.full((tiles.block_q,), algebra.tile_exponent(left), jnp.float32)
+            family.staged(family.as_row(exponent), exponents.at[operand, share])
     exchange.publish()
     joined = tuple(functools.reduce(jnp.maximum, (jnp.max(family.rows_of(exponents.at[operand, other]))
                                                   for other in range(consumers)), last)
                    for operand, last in enumerate(carry))
-    for operand, left in enumerate(operands):
-        for offset, part in enumerate(algebra.parts_at(left, joined[operand])):
-            family.staged(part, exchanged.at[2 * operand + offset, :, own])
+    with family.staged_together():
+        for operand, left in enumerate(operands):
+            for offset, part in enumerate(algebra.parts_at(left, joined[operand])):
+                family.staged(part, exchanged.at[2 * operand + offset, :, own])
     exchange.publish()
     dk_acc, dv_acc = accumulators
     issued = [_rescaled_parts(walk, acc, algebra.running_shift(carry[operand], joined[operand]), rhs,

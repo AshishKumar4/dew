@@ -1127,9 +1127,12 @@ class Issuer[Accumulator](abc.ABC):
         return vector
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum)."""
+        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum).
+        `pending` is the count of this warpgroup's later product groups left in flight when `product` reads
+        its value (issued by `then()` before the read); synchronous issuers take `pending=0` only and raise
+        `ValueError` otherwise."""
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
@@ -1901,6 +1904,13 @@ class Transport[Allocated, Opened](abc.ABC):
         (warpgroup MMA, TMA), before any of them reads it: a family whose products read shared memory
         through its consumers' own loads (mma.sync's) has nothing to publish."""
         plgpu.commit_smem()
+
+    def store_staged(self, smem, view, *, wait: bool = True) -> None:
+        """Flush an already-populated shared-memory tile `smem` to `view` (row 5272)."""
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(smem, view)
+        if wait:
+            plgpu.wait_smem_to_gmem(0)
 
     @abc.abstractmethod
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:

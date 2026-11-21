@@ -312,3 +312,22 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     launch = target.launch_seconds or 0.0
     worked = max(*units(work, rates(target, device=True))[0], path(work, target))
     return worked + work.kernels * launch
+
+
+def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
+                   resident: int = 1) -> float:
+    """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
+    multiprocessor: the longer of the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs
+    sharing one multiprocessor's units), its overlapped latency waves (`ceil(n / (SMs * resident))` waves of
+    `path`), plus launch latency, against the whole launch's device bound (`seconds`). Co-resident programs
+    share one multiprocessor's throughput units rather than multiplying its peak by `resident`, while
+    overlapping their dependent paths (rows 6216, 10809, 10810)."""
+    count = max(programs, 1)
+    shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
+    per_program = dataclasses.replace(work, **shared, kernels=0)
+    processors = target.multiprocessors or 1
+    per_sm = math.ceil(count / processors)
+    waves = math.ceil(count / (processors * max(resident, 1)))
+    unit_seconds = max(units(per_program, rates(target, device=False))[0])
+    wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
+    return max(wave_seconds + (target.launch_seconds or 0.0), seconds(work, target))

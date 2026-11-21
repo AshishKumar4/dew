@@ -65,11 +65,8 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     NATURAL_NAME,
     SplitOutput,
     _codes_of,
-    _copy_costs_more,
     _forward_allocations,
-    _inference_walk,
-    _plain_forward,
-    _trained_forward,
+    _plain_walk,
     _training_walk,
     certified_walk,
     column_slices,
@@ -149,19 +146,6 @@ def _launch_programs(kernel) -> int:
     return math.prod(kernel.params["grid_mapping"].grid)
 
 
-def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget, *,
-                    resident: int = 1) -> float:
-    """A launch's seconds on `target`: the longer of its quantized waves (`ceil(programs / (SMs * resident))`
-    times one program's `cost.walked`, plus launch latency) and the whole launch across the device
-    (`cost.seconds`), no constant (rows 6216, 6710)."""
-    count = max(programs, 1)
-    shared = {unit: getattr(work, unit) / count for unit in (*cost.ISSUED_UNITS, "device_bytes")}
-    per_program = dataclasses.replace(work, **shared, kernels=0)
-    processors = target.multiprocessors or 1
-    waves = math.ceil(count / (processors * max(resident, 1)))
-    return max(waves * cost.walked(per_program, target) + (target.launch_seconds or 0.0),
-               cost.seconds(work, target))
-
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
     """What decides `op`'s priced consumer count on `target` (`tuning.stored_choice`), keyed as
@@ -187,7 +171,8 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                                              rows: int | None = None,
                                              least_walked: Callable[[int], int] = lambda rows: 1,
                                              least_held: Callable[..., int] = query_rows,
-                                             choose: Callable[[list[Config]], Config] | None = None
+                                             choose: Callable[[list[Config]], Config] | None = None,
+                                             residency: Callable[[Config], int] | None = None
                                              ) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7): its
     consumers up to the family's count (`Family.consumers`, at most a launch's `most_consumers`)
@@ -238,17 +223,20 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                 # count's (a 192-row tile of three consumers over a 256-row shard pads it by half, where two
                 # consumers' 128 pad none): the call's padding is a copy and its last tile's work wasted.
                 continue
+            best_programs = 0
             for extent in walks(family, dtype, max(walked, least_walked(rows))):
                 for narrow in stagings(family):
                     config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
                     if fits(config):
-                        picked.append(config)
                         if choose is None:
                             return config
+                        held_programs = residency(config) if residency is not None else 1
+                        if not best_programs or held_programs > best_programs:
+                            picked.append(config)
+                            best_programs = held_programs
                         break
-                else:
-                    continue
-                break
+                if best_programs and residency is None:
+                    break
         if not picked:
             return None
         return picked[0] if len(picked) == 1 or choose is None else choose(picked)
@@ -639,31 +627,36 @@ class MosaicForward(_Mainloop[Tiles]):
         scaled = (self.scaled or (self.cached(table, sources, scales) and not self.bounded)) and not decides
         return hooks, spans, decides, family, products, form, scaled
 
-    def _main_launch(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params,
-                     initial, drop=None, table=None, sources=None, scales=None, query_params=(), *,
-                     residuals: Kept, interpret: bool, config: Tiles, pricing: bool = False):
-        """The main forward launch at `config` without its guarded rewalk (`_inference_walk` /
-        `_training_walk`): traced by `_price_config` through `tuning.lowered_once` so the winning count's
-        trace is held and reused by `_fwd`."""
-        hooks, spans, decides, family, products, form, scaled = self._walk_setup(
-            query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial, drop,
-            table, sources, scales, query_params, residuals=residuals, interpret=interpret, config=config,
-            pricing=pricing)
+    def _walk_dispatch(self, query, key, value, spans, hooks, *, residuals: Kept, family, products, form,
+                       scaled: bool, decides: bool, table, sources, scales):
+        """Single residual-dispatch owner returning `(spec, launch, finished, in_place)` for both
+        `_main_launch` and `_fwd` (row 10677)."""
         match residuals:
             case Kept.SPLIT:
                 if scales is not None:
                     raise NotImplementedError("a quantized cache's keys are read by inference alone")
-                spec, launch, _ = _training_walk(query, key, value, spans, hooks, scaled=scaled, **form)
+                spec, launch, finished = _training_walk(query, key, value, spans, hooks,
+                                                        scaled=scaled, **form)
+                return spec, launch, finished, False
             case Kept.NONE | Kept.OUTPUT:
-                in_key = self.reads_key_slot(family)
-                in_place = family.rewalks and not in_key and (
-                    self.masked or (hooks.output_mod is None and _copy_costs_more(query, value)))
-                spec, launch, _ = _inference_walk(
-                    query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
-                    out_dtype=self.out_dtype, masked=self.masked, splits=self.splits, table=table,
-                    sources=sources, subtracted=self.subtracted, scales=scales, parts=self.parts,
-                    scaled=scaled, decides=decides, in_key=in_key, products=products, flagged=in_place,
-                    **form)
+                return _plain_walk(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
+                                   out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
+                                   table=table, sources=sources, subtracted=self.subtracted, scales=scales,
+                                   parts=self.parts, scaled=scaled, decides=decides,
+                                   in_key=self.reads_key_slot(family), products=products, **form)
+
+    def _main_launch(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params,
+                     initial, drop=None, table=None, sources=None, scales=None, query_params=(), *,
+                     residuals: Kept, interpret: bool, config: Tiles, pricing: bool = False):
+        """The main forward launch at `config` without its guarded rewalk (`_walk_dispatch`): traced by
+        `_price_config` through `tuning.lowered_once` so the winning count's trace is held and reused."""
+        hooks, spans, decides, family, products, form, scaled = self._walk_setup(
+            query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial, drop,
+            table, sources, scales, query_params, residuals=residuals, interpret=interpret, config=config,
+            pricing=pricing)
+        spec, launch, _, _ = self._walk_dispatch(query, key, value, spans, hooks, residuals=residuals,
+                                                 family=family, products=products, form=form, scaled=scaled,
+                                                 decides=decides, table=table, sources=sources, scales=scales)
         return launch(spec, None)
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
@@ -678,18 +671,10 @@ class MosaicForward(_Mainloop[Tiles]):
             raise NotImplementedError(reason)
 
         def launched():
-            match residuals:
-                case Kept.SPLIT:
-                    if scales is not None:
-                        raise NotImplementedError("a quantized cache's keys are read by inference alone")
-                    return _trained_forward(query, key, value, spans, hooks, scaled=scaled, **form)
-                case Kept.NONE | Kept.OUTPUT:
-                    # The inference walk, its rows beside the output where it keeps them.
-                    return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
-                                          out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
-                                          table=table, sources=sources, subtracted=self.subtracted,
-                                          scales=scales, parts=self.parts, scaled=scaled, decides=decides,
-                                          in_key=self.reads_key_slot(family), products=products, **form)
+            spec, launch, finished, in_place = self._walk_dispatch(
+                query, key, value, spans, hooks, residuals=residuals, family=family, products=products,
+                form=form, scaled=scaled, decides=decides, table=table, sources=sources, scales=scales)
+            return finished(algebra.walked_launches(spec, launch, in_place=in_place))
 
         if scaled or decides or self.bounded or hooks.rounds is not None or not algebra.headroom(value.dtype):
             return launched(), None
@@ -824,14 +809,15 @@ class MosaicForward(_Mainloop[Tiles]):
                 return self._launchable(ba, config, target) not in (None, *refused)
 
             choose = functools.partial(self._choose_consumers, ba, target=target)
-            config = self._searched(ba, family, fits, choose=choose)
+            residency = functools.partial(self.resident, ba, target=target)
+            config = self._searched(ba, family, fits, choose=choose, residency=residency)
             if config is not None:
                 return self._launchable(ba, config, target)
         return None
 
     def _price_config(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
                       ) -> float | None:
-        """Price `config`'s main launch on `target` (`_launch_seconds` over `emission.work_of`), traced
+        """Price `config`'s main launch on `target` (`cost.launch_seconds` over `emission.work_of`), traced
         through `tuning.lowered_once` under `report.launching` so the winning count's trace is held."""
         names = ("query", "key", "value", "start", "end", "query_ids", "key_ids", "score_params",
                  "output_params", "initial", "drop", "table", "sources", "scales", "query_params")
@@ -856,7 +842,7 @@ class MosaicForward(_Mainloop[Tiles]):
             work = emission.work_of(kernel)
             if work is None:
                 return None
-            total += _launch_seconds(work, _launch_programs(kernel), target, resident=resident)
+            total += cost.launch_seconds(work, _launch_programs(kernel), target, resident=resident)
         return total
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget) -> Tiles:
@@ -868,7 +854,12 @@ class MosaicForward(_Mainloop[Tiles]):
         launched = [self._launchable(ba, config, target) or config for config in candidates]
         key = _choice_key(self, ba, tuple(launched), target)
         stored = None if key is None else tuning.stored_choice(target.generation, key)
-        if isinstance(stored, int):
+        if isinstance(stored, (tuple, list)) and len(stored) == 2:
+            pair = tuple(stored)
+            matched = next((c for c in candidates if (c.consumers, c.block_k) == pair), None)
+            if matched is not None:
+                return matched
+        elif isinstance(stored, int):
             matched = next((config for config in candidates if config.consumers == stored), None)
             if matched is not None:
                 return matched
@@ -880,7 +871,7 @@ class MosaicForward(_Mainloop[Tiles]):
             prices[config] = price
         best = min(candidates, key=prices.__getitem__)
         if key is not None:
-            tuning.store_choice(target.generation, key, best.consumers)
+            tuning.store_choice(target.generation, key, (best.consumers, best.block_k))
         return best
 
     def offered(self, ba: tokamax.BoundArguments, family: mosaic.Family, target: generation.GpuTarget
@@ -901,7 +892,8 @@ class MosaicForward(_Mainloop[Tiles]):
         return tuple(found)
 
     def _searched(self, ba: tokamax.BoundArguments, family: mosaic.Family, fits: Callable[[Tiles], bool], *,
-                  choose: Callable[[list[Tiles]], Tiles] | None = None) -> Tiles | None:
+                  choose: Callable[[list[Tiles]], Tiles] | None = None,
+                  residency: Callable[[Tiles], int] | None = None) -> Tiles | None:
         """The derivation's search of `family`'s configs for the call of `ba` (`_derived`, over the value
         columns whole and then in blocks, `_column_blocks_of`): the first `fits` takes, or None."""
         query = ba.arguments["query"]
@@ -911,7 +903,8 @@ class MosaicForward(_Mainloop[Tiles]):
 
             config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits, overlapped=True,
                               walks=functools.partial(walked_extents, parts=self.parts),
-                              least_walked=functools.partial(_least_keys, family), choose=choose)
+                              least_walked=functools.partial(_least_keys, family), choose=choose,
+                              residency=residency)
             if config is not None:
                 return config
         return None
@@ -1509,7 +1502,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     if hooks.score_mod is None and hooks.score_params:
         hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
-    parts = algebra.bf16_part_count(accurate=True) if fp32 else 1
+    parts = product.EXACT_PARTS if fp32 else 1
     if hooks.query_mod is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
         # program before the launch takes it.
