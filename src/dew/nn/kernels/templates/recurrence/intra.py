@@ -246,8 +246,9 @@ def _prefix_halves(g, taken, call: Call):
             slot = tile.refs[0] if not family.stores_through_registers else landing["prefix0"]
             for i, ref in enumerate((hi_ref, lo_ref)):
                 # A running sum's halves read as each is stored, one tile held at a time: both at once
-                # spilled the program's 128 registers at two programs a multiprocessor (M-JS-145g).
-                half = family.tile_of(rows.at[i]) if found is None else found[i]
+                # spilled the program's 128 registers at two programs a multiprocessor (M-JS-145g). Row-major,
+                # as a step's rows are fewer than a warpgroup accumulator's tile takes.
+                half = _rows_of(rows.at[i], keys) if found is None else found[i]
                 gates.store(ref, half, row + index * rows_a_step, rows_a_step, column, keys, family=family,
                             smem=slot if running else landing[f"prefix{i}"])
             return carry, accumulators
