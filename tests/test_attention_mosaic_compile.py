@@ -365,12 +365,13 @@ cache of a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 infe
 serves the call as the work list (`_served`)."""
 
 
-DECODE_GATE_BATCHES = _batched_gate(DECODE_GATE, lambda c: (c[0], c[2]), lambda c: (c[1], c[3]))
+DECODE_GATE_BATCHES = _batched_gate(DECODE_GATE, lambda c: (c[0], c[2]), lambda c: (c[1], c[3]),
+                                    max_items=3)
 
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "stored", "items"), DECODE_GATE_BATCHES,
-                         ids=[f"{g}-{s}" for g, s, _ in DECODE_GATE_BATCHES])
+                         ids=[f"{g}-{s}-{i}" for i, (g, s, _) in enumerate(DECODE_GATE_BATCHES)])
 def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, stored, items):
     """A decode step (`attention_decode.attend`: its plain launch at the plan's streaming key tile and
     slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
@@ -1951,4 +1952,28 @@ def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
             return backward, (q, k, k, q, shapes)
 
         found = compile_mosaic_kernels([KernelCase(f"sm90-overlapped-fused-d{width}", _make)], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
+    """Row 5272: sm90 overlapped shared-keys backward (`attention_dkv_shared`, qwen3.5-0.8b d256) compiles
+    spill-free with S/dP overlap and dead `chosen` excluded."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+
+        def _make():
+            def backward(query, key, value, dout, residuals):
+                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                                  residuals=residuals, accurate=False)
+                return grads.query, grads.key, grads.value
+            return backward, (q, k, k, q, shapes)
+
+        found = compile_mosaic_kernels([KernelCase("sm90-overlapped-coop-d256", _make)], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
