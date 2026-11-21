@@ -200,6 +200,12 @@ FOREIGN |= dict.fromkeys(
 )
 
 
+# The bundles a GPU launch composes load no TPU toolkit: Mosaic TPU's bundle loads where a TPU launch composes
+# it, so a TPU template's edit re-keys none of the GPU and CPU tests that compose a GPU bundle (2,592 of them
+# in train 1126's cache keys).
+FOREIGN |= {"dew.nn.kernels.templates.bundles": ("dew.nn.kernels.templates.mosaic_tpu",)}
+
+
 @pytest.mark.parametrize("module", sorted(FOREIGN))
 def test_a_module_imports_its_own_domain_alone(module):
     """A run configuration's or a shared module's module imports, in a fresh interpreter, none of the
