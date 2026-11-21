@@ -594,6 +594,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     for name, started in starts.items():
         assert any(reason.startswith(f"{started} from tests/{name}:") for reason in why[name]), why[name]
     assert any(reason.startswith("os.fork ? from tests/test_shell.py:") for reason in why["test_shell.py"])
+    # A program run by its descriptor (`os.execve` of an open file) is named so, its exec run (review).
+    assert any(reason.startswith("os.exec descriptor ") for reason in why["test_shell.py"])
     # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
     # --evidence prints each beside its reads.
     tier = functools.partial(named_tier, ci, monkeypatch, capsys)

@@ -89,9 +89,10 @@ BOTH = "readwrite:"
 """What an open of a checkout file to read and write ('r+', O_RDWR) is logged as: the file is its run's input,
 which the run may have changed in place where no stamp of it shows (a mapped page on a filesystem that stamps
 none), so its record keeps no key (`recorded`, row 2559)."""
-WHY = "why:"
+WHY = "\x00why:"
 """What an unfollowed start is logged beside as: what it started and from where (`described`), the reason its
-file keeps no key, evidence and no input."""
+file keeps no key, evidence and no input; led by a NUL, which no path a run reads holds, so no input is taken
+for it (review: `why:` was a name a checkout file could have)."""
 EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT, UNOPENED, WHY)
 """What a log holds beside the record's inputs."""
 decided: dict[types.CodeType, bool] = {}
@@ -372,35 +373,51 @@ def start(event: str, args: tuple, directory: str) -> str | None:
     return "unfollowed"
 
 
-def described(root: str, event: str | None = None, args: tuple = (), process: object = None) -> str:
-    """A start no record follows, as its file's record names it (`WHY`): the multiprocessing `process` and its
-    start method, or the program the audit `event` names (this Python, started without the recorder's
-    environment, said so), and the first caller outside the standard library's process modules and the
-    recorder, by its checkout path or its installed package's."""
-    if process is not None:
-        import multiprocessing
+def described(root: str, event: str | None = None, args: tuple = (), starting=None) -> str:
+    """A start no record follows, as its file's record names it (`WHY`): the multiprocessing process starting
+    in the frame `starting` and its start method, or the program the audit `event` names (a descriptor by
+    its number), and the first caller outside the standard library's process modules and the recorder, by
+    its checkout path or its installed package's. Formatting alone, never failing: no file is probed, and
+    anything it cannot read is said so, the start itself counted as before."""
+    try:
+        if starting is not None:
+            process = starting.f_locals.get("self")
+            method = getattr(type(process), "_start_method", None)
+            if method is None and (multiprocessing := sys.modules.get("multiprocessing")) is not None:
+                method = (multiprocessing.get_start_method(allow_none=True)
+                          or multiprocessing.get_all_start_methods()[0])
+            what = f"{type(process).__name__} ({method} start)"
+        else:
+            names = programs(event, args) if event else []
+            name = names[0] if names else None
+            program = (f"descriptor {name}" if isinstance(name, int)
+                       else os.path.basename(os.fsdecode(name)) if name is not None else "?")
+            what = f"{event} {program}"
+        frame, caller = sys._getframe(1), "?"
+        while frame is not None:
+            name = frame.f_code.co_filename
+            if not _recorders_or_process_modules(name):
+                place = (name[len(root):].lstrip("/") if name.startswith(root)
+                         else name.rpartition("site-packages/")[2])
+                caller = f"{place}:{frame.f_lineno} {frame.f_code.co_name}"
+                break
+            frame = frame.f_back
+        said = f"{what} from {caller}"
+    except Exception as error:  # noqa: BLE001 - evidence only: the start is counted whatever this says
+        said = f"a start not described ({type(error).__name__})"
+    return " ".join(said.encode("utf-8", "backslashreplace").decode().split())[:240]
 
-        method = (getattr(type(process), "_start_method", None)
-                  or multiprocessing.get_start_method(allow_none=True) or "default")
-        what = f"{type(process).__name__} ({method} start)"
-    else:
-        names = programs(event, args) if event else []
-        program = os.path.basename(os.fsdecode(names[0])) if names else "?"
-        what = f"{event} {program}"
-        if event == "subprocess.Popen" and _this_python(args[0]):
-            what += " (this Python, without the recorder's environment)"
-    frame, caller = sys._getframe(1), "?"
-    skipped = ("/multiprocessing/", "/concurrent/", "subprocess.py", "threading.py", "/followed.py",
-               "/lifetime.py", "/os.py")
-    while frame is not None:
-        name = frame.f_code.co_filename
-        if not any(part in name for part in skipped):
-            place = (name[len(root):].lstrip("/") if name.startswith(root)
-                     else name.rpartition("site-packages/")[2])
-            caller = f"{place}:{frame.f_lineno} {frame.f_code.co_name}"
-            break
-        frame = frame.f_back
-    return " ".join(f"{what} from {caller}".split())[:240]
+
+def _recorders_or_process_modules(filename: str) -> bool:
+    """Whether code of `filename` is the recorder's or the standard library's that starts a process for its
+    caller (multiprocessing, concurrent.futures, subprocess, threading, os), by the modules' own files."""
+    for package in ("multiprocessing", "concurrent.futures"):
+        module = sys.modules.get(package)
+        if module is not None and filename.startswith(os.path.dirname(module.__file__) + os.sep):
+            return True
+    files = {getattr(sys.modules.get(name), "__file__", None) for name in ("subprocess", "threading", "os")}
+    recorder = {__file__, os.path.join(os.path.dirname(__file__), "lifetime.py")}
+    return filename in files | recorder | {"<frozen os>"}
 
 
 def _launched_here(argv) -> bool:
@@ -624,6 +641,7 @@ def follow() -> None:
     atexit.register(closing)
     if holder is not None:
         write("unfollowed", 1)
+        write("why", f"its recorder's monitoring tool {FOLLOWER_TOOL} held by {holder}")
         return
     sys.meta_path.insert(0, imports(lambda item: write("file", item)))
     sys.meta_path.append(missed(lambda item: write("file", item), root))
@@ -704,6 +722,7 @@ def gathered(directory: Path, expected: dict[str, int],
         whole = [record for record in own if record["closed"]]
         pooled = [record for record in whole if record["pool"]]
         inherited = [record for record in pooled if record["inherited"]]
+        required = f"at least {starts + launches} starts and launches" if launches else f"{starts} starts"
         found[name] = {
             "files": {path for record in own for path in record["files"]},
             "reads": {site for record in own for site in record["reads"]},
@@ -712,7 +731,7 @@ def gathered(directory: Path, expected: dict[str, int],
             "why": sorted({reason for record in own for reason in record["why"]}
                           | ({f"{len(own) - len(whole)} of {len(own)} child logs unclosed"}
                              if len(whole) < len(own) else set())
-                          | (set() if counted else {f"{len(own)} child logs for {starts} starts"})),
+                          | (set() if counted else {f"{len(own)} child logs for {required}"})),
             "peak": max((record["peak"] for record in inherited if record["peak"] is not None), default=None),
             "shares": _most_at_once(inherited, lambda record: 1),
             "pools": _most_at_once([r for r in pooled if not r["inherited"]], lambda record: record["pool"])}
@@ -775,22 +794,20 @@ def recorded(path: Path) -> dict[str, dict]:
         inputs = {item for _, item in before if not item.startswith(EVIDENCE)} | {
             item for item in shared if not item.startswith(EVIDENCE)}
         held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
+        combined = inputs | child["files"] | shared_child["files"]
+        written = {item for item in combined if item.startswith(BOTH)}
         out[file] = {
-            "depends": (sorted(inputs | child["files"] | shared_child["files"])
-                        if whole and not any(item.startswith(BOTH)
-                                             for item in inputs | child["files"] | shared_child["files"])
-                        else None),
+            "depends": sorted(combined) if whole and not written else None,
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
             "peak": max(held) if len(files) == 1 and whole and held else None,
             # Why a file keeps no key: what it or a child started that no record follows, a log unclosed or
             # uncounted, a checkout file opened to write (no part of whether it keeps one).
-            "why": None if whole and not any(item.startswith(BOTH) for item in inputs) else sorted(
+            "why": None if whole and not written else sorted(
                 {item[len(WHY):] for _, item in before if item.startswith(WHY)}
                 | {item[len(WHY):] for item in shared if item.startswith(WHY)}
-                | {*child["why"], *shared_child["why"]}
-                | (set() if closed else {"its log unclosed"})
-                | {f"opened {item[len(BOTH):]} to write" for item in inputs if item.startswith(BOTH)})[:12],
+                | {*child["why"], *shared_child["why"]} | (set() if closed else {"its log unclosed"})
+                | {f"opened {item[len(BOTH):]} to write" for item in written})[:12],
             # The shared children may run beside the file's own: their counts together bound both.
             "shares": child["shares"] + shared_child["shares"],
             "pools": child["pools"] + shared_child["pools"]}

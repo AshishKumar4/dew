@@ -459,12 +459,17 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     child(7, "tests/c.py", 0, 1)
     child(8, "tests/c.py", 0, 1, closed=False)
     child(9, "tests/d.py", 0, 1, unfollowed="subprocess.Popen sh from tests/d.py:3 test_d")
-    found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
+    found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1},
+                              {"tests/e.py": 1})
     assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
                                    "followed": True, "why": [], "peak": 5 * gib, "shares": 2,
                                    "pools": 5 * gib}
     assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [False] * 3
     # Each says why: its logs and its starts counted apart, a log unclosed, what a child started unfollowed.
-    assert [found[name]["why"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [
+    assert [found[name]["why"] for name in ("tests/b.py", "tests/c.py", "tests/d.py", "tests/e.py")] == [
         ["1 child logs for 2 starts"], ["1 of 2 child logs unclosed"],
-        ["subprocess.Popen sh from tests/d.py:3 test_d"]]
+        ["subprocess.Popen sh from tests/d.py:3 test_d"],
+        # A launch (uv's run) that left no log: at least one, counted as eligibility counts it.
+        ["0 child logs for at least 1 starts and launches"]]
+    # Evidence and no input: led by a NUL, which no path a run reads can hold.
+    assert followed.WHY.startswith("\x00") and followed.WHY in followed.EVIDENCE

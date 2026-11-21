@@ -110,7 +110,7 @@ def started(code, offset):
     backend; a multiprocessing child's start, whose child no event follows."""
     if code is CHILD_START:
         write(owner(), f"{STARTED}unfollowed")
-        write(owner(), f"{WHY}{followed.described(root, process=sys._getframe(1).f_locals.get('self'))}")
+        write(owner(), f"{WHY}{followed.described(root, starting=sys._getframe(1))}")
         return None
     if code.co_name == followed.OPENED[0] and code.co_filename.endswith(followed.OPENED[1]):
         # Registered after jax's own clean-up, so it reads the pool before the backend closes.
