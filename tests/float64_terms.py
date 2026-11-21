@@ -492,9 +492,15 @@ def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
     return all(static(body) for body in programs.bodies(equation))
 
 
+SPAN_STEPS = 1024
+"""The most steps one compiled span holds (`_runs`): a run of static steps past it is compiled in parts, so
+no one compile holds a model's whole walk (row 9780: a Gemma 3n site's tapped walk, 6534 steps, compiled
+whole peaked at 9.1 GiB; in parts of 1024, 4.5 GiB, in the same 176 s)."""
+
+
 def _runs(jaxpr) -> list[tuple[int, int]]:
-    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, each branch
-    or loop a span of its own."""
+    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, at most
+    `SPAN_STEPS` steps a span, each branch or loop a span of its own."""
     spans, start = [], 0
     picked = _platform_picked(jaxpr)
     for index, equation in enumerate(jaxpr.eqns):
@@ -505,7 +511,8 @@ def _runs(jaxpr) -> list[tuple[int, int]]:
             start = index + 1
     if start < len(jaxpr.eqns):
         spans.append((start, len(jaxpr.eqns)))
-    return spans
+    return [(begin, min(begin + SPAN_STEPS, end)) for start, end in spans
+            for begin in range(start, end, SPAN_STEPS)]
 
 
 RUNS: dict = {}

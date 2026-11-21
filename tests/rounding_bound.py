@@ -31,8 +31,15 @@ from collections.abc import Hashable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED, on_float64_device, on_float64_host, rounds_nothing, unrewritten
-from float64_terms import SUMS, _target, evaluated_on, static, walked
+from arm_arithmetic import (
+    FORMATTED,
+    as_traced,
+    on_float64_device,
+    on_float64_host,
+    rounds_nothing,
+    unrewritten,
+)
+from float64_terms import SPAN_STEPS, SUMS, _target, evaluated_on, released, static, walked
 from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
@@ -80,6 +87,15 @@ while the function lives: a weighed site's recording asks its reference's scale 
 program, which traced it again at each (tests/test_weighed_recording.py 77.3 s, 70.8 s held; row 5864)."""
 
 
+def released_scales() -> None:
+    """Forget every program `rounding_scale` holds (`TRACED`, `SCALES`) and the walk's traces and compiled
+    runs (`float64_terms.released`): a conditioned site's weighing's, once it is done (`reference_error`'s
+    `_deferred`), so a process weighing many sites holds one site's at a time (row 9780)."""
+    TRACED.clear()
+    SCALES.clear()
+    released()
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class TapRule:
@@ -110,15 +126,13 @@ class TapRule:
         operands = [_widened(value) for value in inputs]
         # A reduce_precision's float64 evaluation keeps its value, the rounding it is weighed; any other
         # operation whose meaning is its format's (`FORMATTED`: a bit cast, a step to a neighbour) runs at the
-        # dtypes it was traced at, its parameters its own, as the float64 replay runs it, its float results
-        # widened after (bound on float64, a float32 read as uint32 was two words an element).
+        # dtypes it was traced at (`as_traced`, the float64 replay's rule), its float results widened after
+        # (bound on float64, a float32 read as uint32 was two words an element).
         rounded_to = primitive is jax.lax.reduce_precision_p
         if rounded_to:
             outputs = list(operands)
         elif primitive in FORMATTED:
-            outputs = [_widened(value) for value in _bound(equation, equation.params, [
-                jnp.asarray(value).astype(variable.aval.dtype)
-                for value, variable in zip(operands, equation.invars, strict=True)])]
+            outputs = [_widened(value) for value in as_traced(equation, operands)]
         else:
             outputs = _bound(equation, params, operands)
         if rounds_nothing(primitive):
@@ -182,7 +196,8 @@ def rounding_scale(fn, *args, seed: int = 0):
     sign times its bound, over `DRAWS` draws keyed by `seed`, so the same draw of the same program
     weighs alike for every arm. The program is traced at `args` as given, its roundings those formats', and
     evaluated in float64; a non-floating output's scale is None. A static program (no branch or loop its
-    values pick) evaluates compiled, once a signature and matmul precision; any other walks eagerly."""
+    values pick) of at most `SPAN_STEPS` steps evaluates compiled whole, once a trace key; any other walks
+    its static runs compiled, a span at a time."""
     key = _key(args)
     closed, tree = _traced(fn, args, key)
     moved = on_float64_host(jax.tree.leaves(args))
@@ -191,7 +206,8 @@ def rounding_scale(fn, *args, seed: int = 0):
         leaves = [jnp.asarray(_widened(leaf)) for leaf in moved]
         consts = [_widened(value) for value in on_float64_host(closed.consts)]
         keys = _keys(seed)
-        if static(closed.jaxpr):
+        # A static program compiles whole, one of more than a span's steps in spans (`float64_terms._runs`).
+        if static(closed.jaxpr) and len(closed.jaxpr.eqns) <= SPAN_STEPS:
             held = SCALES.setdefault(fn, {})
             # Compiled for the device it evaluates on (`float64_terms.evaluated_on`), which its trace is not.
             compiled = (key, _target())

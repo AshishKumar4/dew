@@ -70,10 +70,10 @@ def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
     assert raised.type is GateFailure
     assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds,
                     orders=_swapped)
-    [over] = _drawn(_left_to_right, _outer_first, _cancelling_draw, range(8), orders=_swapped)
+    [over] = _drawn(_left_to_right, _outer_first, _cancelling_draw, range(8), orders=_swapped, repeats=True)
     # Each order alone, its truth the same sums in float64 (exact: three float32 terms).
     at = [_drawn(_left_to_right, _outer_first, lambda seed, k=k: _swapped(_cancelling_draw(seed))[k],
-                 range(8))[0] for k in range(2)]
+                 range(8), repeats=True)[0] for k in range(2)]
     np.testing.assert_array_equal(over.worst, np.maximum(at[0].worst, at[1].worst))
     np.testing.assert_array_equal(over.mine, at[0].mine)
     np.testing.assert_array_equal(over.theirs, at[0].theirs)
@@ -159,11 +159,13 @@ def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
         return _outer_first(terms)
 
     with pytest.raises(ValueError):
-        _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped)
+        _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped, repeats=True)
     with pytest.raises(ValueError):
-        _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=_swapped, also=[recorded])
+        _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=_swapped, also=[recorded],
+               repeats=True)
     with pytest.raises(ValueError):
-        _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs])
+        _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs],
+               repeats=True)
 
 
 def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():

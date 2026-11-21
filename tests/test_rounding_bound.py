@@ -63,3 +63,27 @@ def test_a_program_traced_under_one_context_is_not_served_under_another():
     finally:
         factor.reset(token)
     np.testing.assert_array_equal(after, 2.0 * before)
+
+
+def test_a_program_of_more_steps_than_a_span_is_scaled_as_compiled_whole(monkeypatch):
+    """A static program of more steps than a compiled span holds (`float64_terms.SPAN_STEPS`) is walked a
+    span at a time (row 9780: a Gemma 3n site compiled whole peaked at 9.1 GiB), its values and its rounding
+    scale each element's as the program compiled whole gives them: each rounding's sign keyed by its place
+    in the program, not by the span it falls in. Here spans of 8 steps over a program of 40."""
+    import float64_terms
+    import rounding_bound
+
+    def chained(x):
+        for step in range(20):
+            x = x * np.float32(1.0 + 1e-3 * (step % 7)) + np.float32(0.25)
+        return x
+
+    x = jnp.asarray([1.0, -2.0, 3.5], jnp.float32)
+    whole = rounding_scale(chained, x)
+    rounding_bound.released_scales()
+    monkeypatch.setattr(float64_terms, "SPAN_STEPS", 8)
+    monkeypatch.setattr(rounding_bound, "SPAN_STEPS", 8)
+    spanned = rounding_scale(chained, x)
+    rounding_bound.released_scales()
+    np.testing.assert_array_equal(spanned[0], whole[0])
+    np.testing.assert_array_equal(spanned[1], whole[1])
