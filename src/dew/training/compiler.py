@@ -1097,7 +1097,8 @@ class StepCompiler[L, E]:
             from dew.training._candidates import _shapes
             from dew.training.ahead import LaterCounts
 
-            shapes = _shapes(fresh(state))
+            # The state's shapes as the step was built over it, which its counts are admitted over.
+            shapes = _shapes(state)
 
             def admit(count: int) -> tuple[Planned, StepFlops | None]:
                 step.waited(count)
