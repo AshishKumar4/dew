@@ -26,6 +26,7 @@ import jax
 from jax.sharding import Mesh
 
 from dew import _cache
+from dew._code import whole_digest
 from dew._devices import device_memory
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
@@ -60,12 +61,13 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`, as an identity states them
     (`dew._stated.stated`), the code that builds them
-    (`dew._cache.package_digest`), the step's `arguments` (their tree's structure and each leaf's
+    (`dew._code.whole_digest`), the step's `arguments` (their tree's structure and each leaf's
     abstract value and placement, stated alike), the `splits` its plan chooses among (one where the run
     pins it), the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
     (`trace_context`), the libraries that compile it and the allocator and
-    XLA_FLAGS settings it compiles under. None where an identity states none of the step (a module holding
+    XLA_FLAGS settings it compiles under. None where Dew's source changed while the process ran, or where an
+    identity states none of the step (a module holding
     a class made inside a function, or an array this process holds only part of): such a run keeps no
     record and decides its rung as it compiles."""
     leaves, structure = jax.tree.flatten(arguments)
@@ -89,7 +91,9 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     # builds for two GPUs of a generation (their multiprocessors) never share a record.
     target = (repr(gpu_target()) if jax.default_backend() == 'gpu' or assumption() is not None
               else jax.default_backend())
-    program = json.dumps([RECORD_VERSION, traced, _cache.package_digest(), list(splits), dict(mesh.shape),
+    if (code := whole_digest()) is None:
+        return None
+    program = json.dumps([RECORD_VERSION, traced, code, list(splits), dict(mesh.shape),
                           target, jax.__version__, importlib.metadata.version('jaxlib'), allocator])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
             'xla_flags': ' '.join(settings)}

@@ -110,76 +110,21 @@ class Source(NamedTuple):
 
 
 def read(root: Path) -> Source:
-    """The `dew` package under `root` (`Source`)."""
+    """The `dew` package under `root` (`Source`): the modules each module's run imports in turn read by Dew's
+    one reader of them (`dew._imports.Walk`: every import a run may execute, a function's included, but those
+    under a top-level TYPE_CHECKING, which a type checker alone reads; each package above a module, whose
+    initializer runs first; and a lazy package's export it names, followed as `dew._exports.lookup` follows
+    it)."""
     paths = {".".join(path.relative_to(root).with_suffix("").parts).removesuffix(".__init__"): path
              for path in sorted((root / "dew").rglob("*.py"))}
     trees = {module: ast.parse(path.read_text()) for module, path in paths.items()}
     parents = {module: scopes.package_of(module, path.name == "__init__.py")
                for module, path in paths.items()}
     named = {module: scopes.modules_imported(tree, parents[module]) for module, tree in trees.items()}
-    exported = {module: gen_exports.exported(tree) for module, tree in trees.items()}
-    runs = {module: frozenset(_run(_executed(tree), parents[module], paths, exported))
-            for module, tree in trees.items()}
+    walk = gen_exports.walker().Walk({module: str(path) for module, path in paths.items()},
+                                     lambda module: paths[module].read_bytes())
+    runs = {module: walk.imports(module)[0] for module in paths}
     return Source(paths, named, runs)
-
-
-def _executed(tree: ast.Module) -> list[ast.Import | ast.ImportFrom]:
-    """The imports a module's run may execute: every one, a function's included, but those under
-    TYPE_CHECKING, which a type checker alone reads."""
-    checking = {id(inner) for node in ast.walk(tree) if isinstance(node, ast.If) and _type_checking(node.test)
-                for statement in node.body for inner in ast.walk(statement)}
-    return [node for node in ast.walk(tree)
-            if isinstance(node, ast.Import | ast.ImportFrom) and id(node) not in checking]
-
-
-def _type_checking(test: ast.expr) -> bool:
-    return ((isinstance(test, ast.Name) and test.id == "TYPE_CHECKING")
-            or (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"))
-
-
-def _run(imports: Sequence[ast.Import | ast.ImportFrom], parent: Sequence[str], paths: Mapping[str, Path],
-         exported: Mapping[str, Mapping[str, str]]) -> Iterator[str]:
-    """The `dew` modules `imports` run: each module an import names and every package above it (whose
-    initializer runs first), and of a `from` import's names, each a module of its package or a lazy
-    package's export (`_exported`); a star import of a lazy package reads every name it exports (its
-    generated `__all__`, tools/gen_exports.py)."""
-    for node in imports:
-        if isinstance(node, ast.Import):
-            named, taken = [alias.name for alias in node.names], []
-        else:
-            base = scopes.imported_from(node, parent)
-            named = [base]
-            taken = [(base, name) for alias in node.names
-                     for name in (exported.get(base, {}) if alias.name == "*" else (alias.name,))]
-        for name in named:
-            yield from _prefixes(name, paths)
-        for base, name in taken:
-            if f"{base}.{name}" in paths:
-                yield f"{base}.{name}"
-            else:
-                yield from _exported(base, name, paths, exported)
-
-
-def _prefixes(name: str, paths: Mapping[str, Path]) -> Iterator[str]:
-    """Module `name` and every package above it, as importing it runs them, those under the root alone."""
-    parts = name.split(".")
-    return (prefix for prefix in (".".join(parts[:at]) for at in range(1, len(parts) + 1)) if prefix in paths)
-
-
-def _exported(package: str, name: str, paths: Mapping[str, Path],
-              exported: Mapping[str, Mapping[str, str]]) -> Iterator[str]:
-    """The modules reading `name` off `package` runs where `package` exports it lazily
-    (`gen_exports.exported`, read by `dew._exports.lookup`): the module that defines it, with every package
-    above it, and where that module is the package's own module of that name, nothing more; else the name
-    read off that module in turn, a lazy package's export of it followed as its lookup's `getattr` follows
-    it."""
-    seen = set()
-    while (package, name) not in seen and (target := exported.get(package, {}).get(name)) is not None:
-        seen.add((package, name))
-        yield from _prefixes(target, paths)
-        if target == f"{package}.{name}":
-            return
-        package = target
 
 
 def _chains(source: Source, start: str) -> Mapping[str, tuple[str, ...]]:

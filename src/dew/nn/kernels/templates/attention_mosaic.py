@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import tokamax
 from jax._src.pallas import mpmd
 
+from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
@@ -156,20 +157,21 @@ def _launch_programs(kernel) -> int:
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
     """What decides `op`'s priced consumer count on `target` (`tuning.stored_choice`), keyed as
-    `report._verdict_key` is; None where the installation has no seal."""
+    `report._verdict_key` is; None where the installation has no seal or Dew's source changed while the
+    process ran."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
-    from dew._cache import package_digest
-
     installed = seal().digest
-    if installed is None:
+    provenance = op_provenance(op, ba.arguments)
+    if installed is None or (code := provenance_code(report.__name__, provenance)) is None:
         return None
     rates = cost.rates(target, device=False)
-    stated = [package_digest(), installed.hex(), report._identity(op, ba), target.generation,
-              target.device_kind, target.multiprocessors, target.launch_seconds, rates._asdict(),
-              tuning.encoded(candidates), _keyed_environment()]
+    stated = [code, installed.hex(), report._identity(op, ba), target.generation, target.device_kind,
+              target.multiprocessors, target.launch_seconds, rates._asdict(), tuning.encoded(candidates),
+              _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                              tiles: Callable[[int, int, int], Config],

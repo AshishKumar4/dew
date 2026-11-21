@@ -47,7 +47,7 @@ from jaxlib.xla_client import LoadedExecutable
 
 from dew import _pool
 from dew._builds import dew_cache_dir
-from dew._cache import package_digest
+from dew._code import code_digest
 from dew._devices import (
     backend_open,
     cuda_driver_version,
@@ -470,13 +470,17 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
                      program: Callable[[], str | jax.stages.Compiled]) -> Collectives:
     """The communicators an executable makes on `gpus` (`collectives_of`), read from its `program` once per
     executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, below
-    the digest of Dew's own code (`dew._cache.package_digest`), so a warm start that loads it from the
-    compilation cache reads no module, and another Dew's are read again."""
-    kept = Path(dew_cache_dir()) / "communicators" / "programs" / package_digest()
-    path = kept / f"{fingerprint.hex()}.json"
-    if path.exists():
+    the digest of the code that reads it (`dew._code.code_digest`), so a warm start that loads it from the
+    compilation cache reads no module, and those another code of it kept are read again; none kept or
+    read where Dew's source changed while the process ran."""
+    code = code_digest(__name__)
+    path = None if code is None else Path(dew_cache_dir()) / "communicators" / "programs" / code / (
+        f"{fingerprint.hex()}.json")
+    if path is not None and path.exists():
         return Collectives.of(json.loads(path.read_text()), gpus)
     positions = collectives_of(program(), tuple(range(len(gpus))))
+    if path is None:
+        return Collectives.of(positions.to_json(), gpus)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_atomically(path, json.dumps(positions.to_json()))
     return Collectives.of(positions.to_json(), gpus)
