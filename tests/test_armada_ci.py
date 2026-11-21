@@ -583,6 +583,17 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
                          "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
+    # Each such file's record says what it started that no record follows, and from where (`followed.WHY`);
+    # a file that keeps its key says nothing.
+    names = ("test_machine.py", "test_spawn.py", "test_forkserver.py", "test_fork.py", "test_shell.py")
+    why = {name: json.loads(stored["/" + ci.record_key("3.12", f"3.12:tests/{name}", ci.cpu_class())])["why"]
+           for name in names}
+    assert why.pop("test_machine.py") is None
+    starts = {"test_spawn.py": "SpawnProcess (spawn start)", "test_fork.py": "ForkProcess (fork start)",
+              "test_forkserver.py": "ForkServerProcess (forkserver start)", "test_shell.py": "subprocess.Popen sh"}
+    for name, started in starts.items():
+        assert any(reason.startswith(f"{started} from tests/{name}:") for reason in why[name]), why[name]
+    assert any(reason.startswith("os.fork ? from tests/test_shell.py:") for reason in why["test_shell.py"])
     # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
     # --evidence prints each beside its reads.
     tier = functools.partial(named_tier, ci, monkeypatch, capsys)

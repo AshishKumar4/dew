@@ -89,7 +89,10 @@ BOTH = "readwrite:"
 """What an open of a checkout file to read and write ('r+', O_RDWR) is logged as: the file is its run's input,
 which the run may have changed in place where no stamp of it shows (a mapped page on a filesystem that stamps
 none), so its record keeps no key (`recorded`, row 2559)."""
-EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT, UNOPENED)
+WHY = "why:"
+"""What an unfollowed start is logged beside as: what it started and from where (`described`), the reason its
+file keeps no key, evidence and no input."""
+EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT, UNOPENED, WHY)
 """What a log holds beside the record's inputs."""
 decided: dict[types.CodeType, bool] = {}
 placing = threading.local()
@@ -369,6 +372,37 @@ def start(event: str, args: tuple, directory: str) -> str | None:
     return "unfollowed"
 
 
+def described(root: str, event: str | None = None, args: tuple = (), process: object = None) -> str:
+    """A start no record follows, as its file's record names it (`WHY`): the multiprocessing `process` and its
+    start method, or the program the audit `event` names (this Python, started without the recorder's
+    environment, said so), and the first caller outside the standard library's process modules and the
+    recorder, by its checkout path or its installed package's."""
+    if process is not None:
+        import multiprocessing
+
+        method = (getattr(type(process), "_start_method", None)
+                  or multiprocessing.get_start_method(allow_none=True) or "default")
+        what = f"{type(process).__name__} ({method} start)"
+    else:
+        names = programs(event, args) if event else []
+        program = os.path.basename(os.fsdecode(names[0])) if names else "?"
+        what = f"{event} {program}"
+        if event == "subprocess.Popen" and _this_python(args[0]):
+            what += " (this Python, without the recorder's environment)"
+    frame, caller = sys._getframe(1), "?"
+    skipped = ("/multiprocessing/", "/concurrent/", "subprocess.py", "threading.py", "/followed.py",
+               "/lifetime.py", "/os.py")
+    while frame is not None:
+        name = frame.f_code.co_filename
+        if not any(part in name for part in skipped):
+            place = (name[len(root):].lstrip("/") if name.startswith(root)
+                     else name.rpartition("site-packages/")[2])
+            caller = f"{place}:{frame.f_lineno} {frame.f_code.co_name}"
+            break
+        frame = frame.f_back
+    return " ".join(f"{what} from {caller}".split())[:240]
+
+
 def _launched_here(argv) -> bool:
     """Whether `argv` is uv's run of this very interpreter (`uv run ... --python <this interpreter> ...`),
     which layers a requirement over this environment and runs its Python with it, the `.pth` among its paths,
@@ -580,6 +614,7 @@ def follow() -> None:
                 log.write(f"start\t{kind}\n")
             elif kind == "unfollowed":
                 write("unfollowed", 1)
+                write("why", described(root, event, args))
 
     def closing() -> None:
         write("ended", time.time())
@@ -621,7 +656,7 @@ def logged(path: Path) -> dict:
     reads of the backend, how many children it followed in turn, whether it started one no event sees or
     was not followed itself, its life, its GPU pool, and whether it closed."""
     record = {"file": "", "files": set(), "reads": set(), "expected": 0, "launched": 0, "unfollowed": False,
-              "began": 0.0,
+              "why": [], "began": 0.0,
               "ended": None, "pool": None, "peak": None, "inherited": False, "closed": False}
     for line in path.read_text().splitlines():
         kind, _, value = line.partition("\t")
@@ -635,6 +670,8 @@ def logged(path: Path) -> dict:
             record["launched" if value == "launched" else "expected"] += 1
         elif kind == "unfollowed":
             record["unfollowed"] = True
+        elif kind == "why":
+            record["why"].append(value)
         elif kind in ("began", "ended"):
             record[kind] = float(value)
         elif kind in ("pool", "peak"):
@@ -671,6 +708,11 @@ def gathered(directory: Path, expected: dict[str, int],
             "files": {path for record in own for path in record["files"]},
             "reads": {site for record in own for site in record["reads"]},
             "followed": len(whole) == len(own) and counted and not any(r["unfollowed"] for r in own),
+            # Why not, as its file's record says (`recorded`): no part of whether.
+            "why": sorted({reason for record in own for reason in record["why"]}
+                          | ({f"{len(own) - len(whole)} of {len(own)} child logs unclosed"}
+                             if len(whole) < len(own) else set())
+                          | (set() if counted else {f"{len(own)} child logs for {starts} starts"})),
             "peak": max((record["peak"] for record in inherited if record["peak"] is not None), default=None),
             "shares": _most_at_once(inherited, lambda record: 1),
             "pools": _most_at_once([r for r in pooled if not r["inherited"]], lambda record: record["pool"])}
@@ -713,7 +755,8 @@ def recorded(path: Path) -> dict[str, dict]:
     starts = Counter(name for name, item in lines if item == f"{STARTED}followed")
     launches = Counter(name for name, item in lines if item == f"{STARTED}launched")
     children = gathered(path.with_name(f"{path.name}.children"), dict(starts), dict(launches))
-    blank = {"files": set(), "reads": set(), "followed": True, "peak": None, "shares": 0, "pools": 0}
+    blank = {"files": set(), "reads": set(), "followed": True, "why": [], "peak": None, "shares": 0,
+             "pools": 0}
     shared_child = children.get(SHARED, blank)
     visits = [(index, name) for index, (name, item) in enumerate(lines) if item == VISIT]
     files = list(dict.fromkeys(visited(lines)))
@@ -740,6 +783,14 @@ def recorded(path: Path) -> dict[str, dict]:
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
             "peak": max(held) if len(files) == 1 and whole and held else None,
+            # Why a file keeps no key: what it or a child started that no record follows, a log unclosed or
+            # uncounted, a checkout file opened to write (no part of whether it keeps one).
+            "why": None if whole and not any(item.startswith(BOTH) for item in inputs) else sorted(
+                {item[len(WHY):] for _, item in before if item.startswith(WHY)}
+                | {item[len(WHY):] for item in shared if item.startswith(WHY)}
+                | {*child["why"], *shared_child["why"]}
+                | (set() if closed else {"its log unclosed"})
+                | {f"opened {item[len(BOTH):]} to write" for item in inputs if item.startswith(BOTH)})[:12],
             # The shared children may run beside the file's own: their counts together bound both.
             "shares": child["shares"] + shared_child["shares"],
             "pools": child["pools"] + shared_child["pools"]}

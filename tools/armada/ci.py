@@ -1832,7 +1832,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             current = None
         elif current is None:
             current = begun(python, row_["name"], held, common, token, fresh_only=True)
-        body = json.dumps({"key": key,
+        body = json.dumps({"key": key, "why": ran.get("why"),
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            **({"read": read} if ran["depends"] is None and read is not None else {}),
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],

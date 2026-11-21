@@ -22,7 +22,7 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import followed
-from followed import CLOSED, EVIDENCE, PEAK, READ, SHARED, STARTED, UNOPENED, VISIT
+from followed import CLOSED, EVIDENCE, PEAK, READ, SHARED, STARTED, UNOPENED, VISIT, WHY
 from session import CUTS, DURATIONS
 
 LOG = "DEW_EXECUTED_LOG"
@@ -110,6 +110,7 @@ def started(code, offset):
     backend; a multiprocessing child's start, whose child no event follows."""
     if code is CHILD_START:
         write(owner(), f"{STARTED}unfollowed")
+        write(owner(), f"{WHY}{followed.described(root, process=sys._getframe(1).f_locals.get('self'))}")
         return None
     if code.co_name == followed.OPENED[0] and code.co_filename.endswith(followed.OPENED[1]):
         # Registered after jax's own clean-up, so it reads the pool before the backend closes.
@@ -152,6 +153,8 @@ def audited(event, args):
             write(owner(), taken)
     elif event in followed.SPAWNS and (kind := followed.start(event, args, children)) is not None:
         write(owner(), f"{STARTED}{kind}")
+        if kind == "unfollowed":
+            write(owner(), f"{WHY}{followed.described(root, event, args)}")
 
 
 def peaked() -> None:

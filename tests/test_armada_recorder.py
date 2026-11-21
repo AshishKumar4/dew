@@ -444,7 +444,8 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False, peak=None,
               closed=True):
         lines = [f"owner\t{file}", f"inherited\t{int(inherited)}", f"began\t{began}", f"file\tsrc/{index}.py",
-                 *["start\tfollowed"] * expected, *(["unfollowed\t1"] if unfollowed else []),
+                 *["start\tfollowed"] * expected,
+                 *([f"unfollowed\t1", f"why\t{unfollowed}"] if unfollowed else []),
                  *([f"pool\t{pool}"] if pool else []), *([f"peak\t{peak}"] if peak is not None else []),
                  *([f"ended\t{ended}", "closed\t1"] if closed else [])]
         (tmp_path / f"{index}.log").write_text("\n".join(lines) + "\n")
@@ -457,8 +458,13 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     child(6, "tests/b.py", 0, 1)
     child(7, "tests/c.py", 0, 1)
     child(8, "tests/c.py", 0, 1, closed=False)
-    child(9, "tests/d.py", 0, 1, unfollowed=True)
+    child(9, "tests/d.py", 0, 1, unfollowed="subprocess.Popen sh from tests/d.py:3 test_d")
     found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
     assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
-                                   "followed": True, "peak": 5 * gib, "shares": 2, "pools": 5 * gib}
+                                   "followed": True, "why": [], "peak": 5 * gib, "shares": 2,
+                                   "pools": 5 * gib}
     assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [False] * 3
+    # Each says why: its logs and its starts counted apart, a log unclosed, what a child started unfollowed.
+    assert [found[name]["why"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [
+        ["1 child logs for 2 starts"], ["1 of 2 child logs unclosed"],
+        ["subprocess.Popen sh from tests/d.py:3 test_d"]]
