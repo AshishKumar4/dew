@@ -1604,13 +1604,13 @@ class Checkpoints:
                 root = epath.Path(self.path(step))
                 kept = [name for name in ROLES if name in needed and name in payloads]
                 # A step's exported model is its model's: kept with it, else cut with it (`EXPORTED`).
-                own, items = [*kept, *([EXPORTED] if MODEL in kept else [])], (*ROLES, EXPORTED)
-                leftover = not self._swept and any((root / name).exists() for name in items
+                own, written = [*kept, *([EXPORTED] if MODEL in kept else [])], (*ROLES, EXPORTED)
+                leftover = not self._swept and any((root / name).exists() for name in written
                                                    if name not in own)
                 if len(kept) == len(payloads) and not leftover:
                     continue
                 write_atomically(root / PROJECTED, json.dumps(kept))
-                doomed += [root / name for name in items if name not in own and (root / name).exists()]
+                doomed += [root / name for name in written if name not in own and (root / name).exists()]
                 cuts[str(step)] = kept
         cuts = broadcast_from_process_zero(cuts)
         if doomed:
