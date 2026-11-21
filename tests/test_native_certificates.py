@@ -689,14 +689,6 @@ def the_recurrence_witness_holds_values_passed_in_parts_natively(generation_name
         rw.assert_parts_witnessed(mosaic_lane(), heads=2)
 
 
-def the_recurrence_witness_holds_the_fused_inference_walk_natively(generation_name):
-    """The native step witness of the fused inference walk (`recurrence_witness.assert_walk_witnessed`): a
-    native bf16 call of two value heads no gradient follows, every record inside its step's enclosure, and the
-    walk from a memory rounded to bf16 refused."""
-    with generation.assumed(generation_name):
-        rw.assert_walk_witnessed(mosaic_lane(), heads=2)
-
-
 def the_recurrence_witness_holds_the_delta_rules_fast_backward_natively(generation_name):
     """The native step witness of the delta rule's fast backward
     (`recurrence_witness.assert_backward_witnessed`): every record each launch keeps, for a native bf16 call
@@ -788,7 +780,6 @@ def test_the_native_kernels_certify_on_this_gpu():
         *(cell(the_recurrence_witness_holds_a_decay_a_key_dimension_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_a_write_gate_on_the_keys_side_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_values_passed_in_parts_natively, g) for g in GENERATIONS),
-        *(cell(the_recurrence_witness_holds_the_fused_inference_walk_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_the_delta_rules_fast_backward_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively, g)
           for g in GENERATIONS),
