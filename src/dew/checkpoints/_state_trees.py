@@ -23,6 +23,7 @@ import orbax.checkpoint as ocp
 from dew import _records
 from dew._records import JSON, record
 from dew.batch import Variables
+from dew.mesh import held_apart, is_held_apart
 from dew.nn.kernels import options
 from dew.nn.kernels.options import program
 from dew.nn.kernels.selection import Unlowerable
@@ -334,7 +335,8 @@ def _with_ema_deltas(state_tree: Mapping[str, object]) -> tuple[Mapping[str, obj
             encoded = encode([leaves[index] for index in indices], [lives[index] for index in indices])
             for index, planes in zip(indices, encoded, strict=True):
                 decoded_ahead(planes, lives[index], leaves[index].dtype)
-                leaves[index] = planes
+                # A stage's row's planes are its checkpoint's on that stage's devices too (`held_apart`).
+                leaves[index] = held_apart(planes) if is_held_apart(leaves[index]) else planes
         state_tree = _with(state_tree, path, jax.tree.unflatten(structure, leaves))
         recorded[_named(path)] = [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen]
     return state_tree, recorded
