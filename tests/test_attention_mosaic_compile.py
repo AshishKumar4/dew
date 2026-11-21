@@ -1619,13 +1619,14 @@ def test_launch_seconds_prices_wave_quantization_and_residency():
 
 
 def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
-    """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) and default 16-bit dot preset
-    (`_jax_nn_algorithm`) through `dew.algebra.error.product_precision` (row 5473)."""
-    from dew.nn import attention
+    """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) through
+    `dew.algebra.error.product_precision` (row 5473), and its default 16-bit dot preset
+    (`_jax_nn_algorithm`) from JAX's own algorithms (`dew.nn.programs.own_preset`, row 10808)."""
+    from dew.nn import programs
     from dew.nn.kernels.templates import attention_algebra as algebra
 
     with generation.assumed("sm90"):
         assert algebra.bf16_part_count(accurate=True) == 3
         assert algebra.bf16_part_count(accurate=False) == 1
-        assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-        assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
+        assert programs.own_preset(jnp.bfloat16) == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+        assert programs.own_preset(jnp.float16) == jax.lax.DotAlgorithmPreset.F16_F16_F32
