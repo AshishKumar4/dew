@@ -174,6 +174,24 @@ FOREIGN |= {"dew.quantization": ("dew.training",),
 # (`dew.nn.activations.gated_product`), so a toolkit edit re-keys none of its tests (row 6740's cache warmth).
 FOREIGN |= {"dew.nn.activations": ("dew.nn.kernels",)}
 
+# Attention routing and linear layers load no GPU template mainloop or ring machinery on import: the
+# mainloops import inside the functions that derive or launch them (FS-IMPORT-CHAIN).
+_ATTENTION_MAINLOOPS = (
+    "dew.nn.kernels.templates.mosaic",
+    "dew.nn.kernels.templates.bundles",
+    "dew.nn.kernels.templates.rings",
+    "dew.nn.kernels.templates.bodies",
+    "dew.nn.kernels.templates.attention_mosaic",
+    "dew.nn.kernels.templates.attention_decode",
+    "dew.nn.kernels.templates.attention_triton",
+    "dew.nn.kernels.templates.attention_portable",
+)
+FOREIGN |= dict.fromkeys(
+    ("dew.nn.attention", "dew.nn.attention_kernels", "dew.nn.kernels.templates.attention_route",
+     "dew.nn.kv_cache"),
+    _ATTENTION_MAINLOOPS,
+)
+
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
 def test_a_module_imports_its_own_domain_alone(module):
