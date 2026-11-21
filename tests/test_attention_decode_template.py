@@ -1055,8 +1055,12 @@ def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(gene
 @COMPILES_ON_CPU
 def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     """A split decode step on an H100 (`attention_decode.priced_step`: 1 row, 1 query, 8 heads over 2 key
-    heads 128 wide over 8192 keys) prices its native `merged_padded` launch from `merged.launch_work`
-    (row 8845): both the merge kernel's device bytes and its two-pass span add to the split walk's."""
+    heads 128 wide over 8192 keys) prices its native `merged_padded` launch independently of
+    `merged.launch_work` (rows 8845, 10533): its kernel count, span (`3 * chunks`) and device bytes equal the
+    split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
+    from test_merged import _traced_merge_bytes
+
+    from dew.algebra import means
     from dew.nn.kernels.templates import merged
 
     target = generation.gpu_target("sm90")
@@ -1071,17 +1075,20 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
             q, k, v, spans, None, scale=None, interpret=False, table=None, sources=None,
             scales=None, bounds=None, finished=True, in_key=False))(query, key, key)
     (merge_eq,) = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive is merged.merged_padded_p]
-    merge_work = merged.launch_work(
-        merge_eq.params["units"],
-        jax.ShapeDtypeStruct(merge_eq.invars[0].aval.shape, merge_eq.invars[0].aval.dtype),
-        jax.ShapeDtypeStruct(merge_eq.invars[1].aval.shape, merge_eq.invars[1].aval.dtype),
-        merge_eq.params["queries"], merge_eq.params["width"], target)
+    padded_s = jax.ShapeDtypeStruct(merge_eq.invars[0].aval.shape, merge_eq.invars[0].aval.dtype)
+    stacked_s = jax.ShapeDtypeStruct(merge_eq.invars[1].aval.shape, merge_eq.invars[1].aval.dtype)
+    queries, width = merge_eq.params["queries"], merge_eq.params["width"]
+    block = merged._channel_block(merge_eq.params["units"], padded_s, stacked_s, queries, width, target)
+    emitted_bytes = _traced_merge_bytes(merge_eq.params["units"], padded_s, stacked_s, queries, width, block)
+    slices = padded_s.shape[1]
+    merge_span = float(3 * -(-slices // means.chunk_width(slices)))
     walk_launches = [w for eq in programs.equations(traced.jaxpr)
                      if eq.primitive in programs.NATIVE_KERNELS
                      and (w := emission.work_of(eq)) is not None]
-    assert merge_work.span >= 3.0 and merge_work.device_bytes > 0
-    assert priced.span == sum(w.span for w in walk_launches) + merge_work.span
-    assert priced.device_bytes == sum(w.device_bytes for w in walk_launches) + merge_work.device_bytes
+    assert merge_span >= 3.0 and emitted_bytes > 0
+    assert priced.kernels == len(walk_launches) + 1.0
+    assert priced.span == sum(w.span for w in walk_launches) + merge_span
+    assert priced.device_bytes == sum(w.device_bytes for w in walk_launches) + emitted_bytes
 
 
 @INTERPRETS

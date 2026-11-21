@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import logical_spec
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.inputs import sequence_blocks
@@ -26,7 +27,7 @@ from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.precision import accumulated, at_least_fp32, exact_products, float32_einsum
 from dew.nn.scatter import DROPPED
-from dew.nn.sharding import manual_map
+from dew.nn.sharding import HEADS, explicit_placement, manual_map, shard_shapes
 
 
 def index_agreements(query, keys, precision=None):
@@ -136,10 +137,12 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
     """
     absorbed = float32_einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
                               precision=precision)
-    batch, length, heads, rank = absorbed.shape
+    specs, _ = _template_specs(absorbed.shape)
+    local_absorbed, local_latent = shard_shapes((absorbed, latent), (specs[0], specs[2]))
+    batch, length, heads, rank = local_absorbed.shape
     dtypes = tuple(jnp.dtype(x.dtype) for x in (absorbed, query_rot, latent, rot))
     case = SparseCase(heads, rank, query_rot.shape[-1], indices.shape[-1], dtypes, batch * length,
-                      batch * latent.shape[1], scale, precision)
+                      batch * local_latent.shape[1], scale, precision)
     if select(SPARSE, case).kernel == 'template':
         context = templated_context(scale, precision, block)(absorbed, query_rot, latent, rot, indices)
     else:
@@ -253,32 +256,55 @@ selected latents into its key tiles (`templated_context`), where its requirement
 (`TEMPLATE_SPARSE_SUPPORTS`); else the blocked XLA path (`blocked_context`), which gathers them."""
 
 
+def _template_specs(shape: tuple[int, ...]) -> tuple[tuple[P, ...], P]:
+    """The per-shard specs (`manual_map`) for `_template_forward`'s operands
+    `(absorbed, query_rot, latent, rot, indices)` and output: queries and output by `HEADS` (batch, length,
+    heads), `latent` and `rot` by batch (each shard attends its local queries against the full sequence of
+    its local batch rows), and `indices` by batch and length."""
+    queries = logical_spec(HEADS, shape)
+    rows, length_axis, _ = (*queries, None, None, None)[:3]
+    return (queries, queries, P(rows), P(rows), P(rows, length_axis)), queries
+
+
 def _template_forward(absorbed, query_rot, latent, rot, indices, *, scale: float):
     """`templated_context`'s value: a row a query, its heads its rows (`attention_decode.packed`), over its
-    selection's latents as one-key pages of the pool of every row's latents and rope heads side by side
-    (`[1, B * T, 1, r + p]`, its values the latents' `r` columns), loaded into the walk's key tiles by the
+    selection's latents as one-key pages of the pool of every local row's latents and rope heads side by side
+    (`[1, b * T, 1, r + p]`, its values the latents' `r` columns), loaded into the walk's key tiles by the
     page table of its selection's slots (`attention_mosaic_forward.paged_reads`), the slots that name a key
     first, in order, and its keys spanning them; a query naming none reads its first slot, an output
-    nothing reads. Interpreted where the arrays lie off a GPU, whatever GPU the call is chosen for."""
+    nothing reads. Sharded per device over batch, length and head axes (`_template_specs`), never gathering
+    the global batch. Interpreted where the arrays lie off a GPU, whatever GPU the call is chosen for."""
     from dew.nn.kernels.templates import attention as template, attention_decode
 
-    batch, length, heads, rank = absorbed.shape
-    keys = latent.shape[1]
-    query = jnp.concatenate([absorbed.astype(latent.dtype), query_rot.astype(latent.dtype)], axis=-1)
-    pool = jnp.concatenate([latent, rot.astype(latent.dtype)], axis=-1).reshape(1, batch * keys, 1, -1)
-    named = indices >= 0
-    taken = jnp.take_along_axis(indices, jnp.argsort(~named, axis=-1, stable=True), axis=-1)
-    table = (jnp.maximum(taken, 0) + keys * jnp.arange(batch)[:, None, None]).astype(jnp.int32)
-    lengths = jnp.maximum(jnp.sum(named, axis=-1), 1).reshape(-1)
-    def local(query, pool, table, lengths):
-        spans = template.spans(1, indices.shape[-1], query.shape[0], lengths=lengths)
-        return attention_decode.attend(query, pool, pool[..., :rank], spans, template.Hooks(),
-                                       scale=scale, table=table,
-                                       interpret=generation.placed_platform() != "gpu")
+    def local(local_absorbed, local_query_rot, local_latent, local_rot, local_indices):
+        batch, length, heads, rank = local_absorbed.shape
+        keys = local_latent.shape[1]
+        query = jnp.concatenate(
+            [local_absorbed.astype(local_latent.dtype), local_query_rot.astype(local_latent.dtype)], axis=-1)
+        pool = jnp.concatenate([local_latent, local_rot.astype(local_latent.dtype)], axis=-1).reshape(
+            1, batch * keys, 1, -1)
+        named = local_indices >= 0
+        taken = jnp.take_along_axis(local_indices, jnp.argsort(~named, axis=-1, stable=True), axis=-1)
+        table = (jnp.maximum(taken, 0) + keys * jnp.arange(batch)[:, None, None]).astype(jnp.int32)
+        lengths = jnp.maximum(jnp.sum(named, axis=-1), 1).reshape(-1)
+        spans = template.spans(1, local_indices.shape[-1], batch * length, lengths=lengths)
+        out = attention_decode.attend(
+            query.reshape(batch * length, 1, heads, -1), pool, pool[..., :rank], spans, template.Hooks(),
+            scale=scale, table=table.reshape(batch * length, -1),
+            interpret=generation.placed_platform() != "gpu")
+        return out.reshape(batch, length, heads, rank)
 
-    out = manual_map(local, (P(), P(), P(), P()), P())(
-        query.reshape(batch * length, 1, heads, -1), pool, table.reshape(batch * length, -1), lengths)
-    return out.reshape(batch, length, heads, rank), ()
+    in_specs, out_spec = _template_specs(absorbed.shape)
+    explicit = explicit_placement(jax.typeof(absorbed))
+    operands = (absorbed, query_rot, latent, rot, indices)
+    if explicit is not None:
+        operands = tuple(
+            jax.sharding.reshard(x, jax.sharding.NamedSharding(explicit.mesh, spec))
+            for x, spec in zip(operands, in_specs, strict=True))
+    out = manual_map(local, in_specs, out_spec)(*operands)
+    if explicit is not None and explicit.spec != out_spec:
+        out = jax.sharding.reshard(out, explicit)
+    return out, ()
 
 
 @functools.cache

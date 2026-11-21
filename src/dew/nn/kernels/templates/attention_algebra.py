@@ -2373,9 +2373,8 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
 
         def step(held: Scaled | None) -> Partial:
             if plain and held_by is not None:
-                # The denominator from the forms' terms before the product, as `plain_step` takes it, so the
-                # tile's fp32 weights die at their narrowing (FS-4324-PEAK1); the weighted values' sums the
-                # mainloop's accumulators hold.
+                # The denominator from the forms' terms before the product so the tile's fp32 weights die
+                # when narrowed (FS-4324-PEAK1); the weighted values' sums the mainloop's accumulators hold.
                 weighed = added.terms.sum(axis=axis)
                 total = (states[fields.index("total")] * added.factor + weighed if held is None
                          else denominator_after(states[fields.index("total")], added.factor, weighed, held))
