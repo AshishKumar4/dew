@@ -491,7 +491,9 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
             overflows times a zero factor is a NaN past them), the scores scaled past one."""
             del carry
             for r, name in enumerate(products):
-                blocks = [family.zeros((algebra.SUB, chunk))]
+                # The first sub-chunk's zero laid as the sums are (`Family.as_tile`): a splat lands strided,
+                # where the store's landing takes the sums' tiled layout.
+                blocks = [family.as_tile(family.zeros((algebra.SUB, chunk)))]
                 for j in range(later):
                     total = totals[_sum_index(call, r, j)]
                     blocks.append(algebra.columns_before(total, (j + 1) * algebra.SUB) if name == "system"
