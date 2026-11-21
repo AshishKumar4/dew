@@ -1069,11 +1069,16 @@ def test_each_norm_and_swiglu_launch_states_its_outputs_dimensions():
     """Every RMSNorm and SwiGLU Triton launch (forward, backward, packed) lowered for an H100 declares
     its outputs' dimensions (`outputs.OUTPUT_DIMS`, rows 10816, 10817), so `Compiled.peak_live` reads
     which operand axes each buffer scales with."""
+    from jax.sharding import NamedSharding
     from kernel_compile import stated_outputs
 
-    x = jax.ShapeDtypeStruct((2, 32, 64), jnp.bfloat16)
-    scale = jax.ShapeDtypeStruct((64,), jnp.bfloat16)
-    gate_up = jax.ShapeDtypeStruct((2, 32, 2, 64), jnp.bfloat16)
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    devices = Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    sharding = NamedSharding(devices, PartitionSpec())
+    x = jax.ShapeDtypeStruct((2, 32, 64), jnp.bfloat16, sharding=sharding)
+    scale = jax.ShapeDtypeStruct((64,), jnp.bfloat16, sharding=sharding)
+    gate_up = jax.ShapeDtypeStruct((2, 32, 2, 64), jnp.bfloat16, sharding=sharding)
 
     def step(x, scale, gate_up):
         def loss(x, scale, gate_up):
@@ -1085,8 +1090,9 @@ def test_each_norm_and_swiglu_launch_states_its_outputs_dimensions():
             return g.astype(jnp.float32).sum() + p.astype(jnp.float32).sum()
         return jax.value_and_grad(loss, argnums=(0, 1, 2))(x, scale, gate_up)
 
-    with generation.assumed("sm90"):
-        lowered = jax.jit(step).trace(x, scale, gate_up).lower(lowering_platforms=("cuda",))
+    with (generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        lowered = jax.jit(step).trace(x, scale, gate_up).lower()
     returning = [stated for count, stated in stated_outputs(lowered) if count]
     assert len(returning) >= 6, f"expected 6 norm/swiglu Triton launches, got {len(returning)}"
     for stated in returning:
