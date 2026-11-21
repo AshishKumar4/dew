@@ -301,7 +301,7 @@
 "tests/test_attention_mosaic_compile.py::test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block[accurate]",
 "tests/test_attention_mosaic_compile.py::test_an_fp16_backward_compiles_spill_free_as_its_model_decides[128]",
 "tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm100]",
-"tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm90]",
+"tests/test_attention_mosaic_compile.py::test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free[e4m3fn]",
 "tests/test_attention_mosaic_compile.py::test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free[sm80]",
 "tests/test_attention_mosaic_compile.py::test_each_attention_launch_states_its_outputs_dimensions_for_an_h100[accurate]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[decision-inference]",
@@ -1921,9 +1921,6 @@
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
 ],
-"tests/test_level_stacking.py": [
-"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
-],
 "tests/test_lfm3.py": [
 "tests/test_lfm3.py::test_plain_and_looped_lfm3_train_through_a_decision_run[looped]"
 ],
@@ -2399,9 +2396,6 @@
 "tests/test_norm_swiglu.py::test_rms_variants_and_every_gradient[True-False-float16-bfloat16]",
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float16-repeated]",
 "tests/test_norm_swiglu.py::test_stream_seam_takes_the_add_and_the_stream_cotangent[shape0-float32-False]"
-],
-"tests/test_online_loader.py": [
-"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-processes-map]"
 ],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
