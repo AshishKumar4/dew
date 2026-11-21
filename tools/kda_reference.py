@@ -30,16 +30,19 @@ exceeds what git holds."""
 
 
 def rule_inputs(seed: int) -> dict[str, np.ndarray]:
-    """A seed's fp32 operands and cotangents, the same bits on every platform: ROWS rows of seven tokens of
-    two heads, keys of three and values of four, queries and keys of norms in [0.5, 2], decays below zero,
-    gates in (0, 1) and a small initial state. Each value an integer of the seed's stream over a power of
-    two (`_exactly`), each norm summed in a fixed order in float64 and its root IEEE's, correctly rounded:
-    no libm function, whose last bit differs between an x86 host's and an aarch64 one's (a GH200 drew other
-    gates and norms than the recording's, row 5012)."""
+    """A seed's fp32 operands and cotangents, the same bits on every host: ROWS rows of seven tokens of two
+    heads, keys of three and values of four, queries and keys of norms in [0.5, 2], decays below zero,
+    gates in (0, 1) and a small initial state. Its normals `recorded_inputs.normals`' (testing.md: a
+    recorded site's draw), its uniforms the seed's integers over a power of two, each norm a fixed-order
+    float64 sum under IEEE's root: no libm function, whose last bit differs between an x86 host and an
+    aarch64 one (a GH200 drew other gates and norms than the recording's, rows 5012 and 6030)."""
+    from recorded_inputs import normals
+
     rng = np.random.default_rng([713, seed])
-    arrays = {name: _exactly(rng, shape) for name, shape in (
-        ("query", (ROWS, 7, 2, 3)), ("key", (ROWS, 7, 2, 3)), ("value", (ROWS, 7, 2, 4)),
-        ("g", (ROWS, 7, 2, 3)), ("state", (ROWS, 2, 3, 4)))}
+    shapes = {"query": (ROWS, 7, 2, 3), "key": (ROWS, 7, 2, 3), "value": (ROWS, 7, 2, 4),
+              "g": (ROWS, 7, 2, 3), "state": (ROWS, 2, 3, 4), "output_cotangent": (ROWS, 7, 2, 4),
+              "state_cotangent": (ROWS, 2, 3, 4)}
+    arrays = {name: normals([713, seed, index], shape) for index, (name, shape) in enumerate(shapes.items())}
     # Queries and keys of norms in [0.5, 2]: the rules normalize them, and a near-zero one's gradient
     # through the norm is its reciprocal, a tail no count of seeds resolves.
     for name in ("query", "key"):
@@ -50,15 +53,7 @@ def rule_inputs(seed: int) -> dict[str, np.ndarray]:
     arrays["g"] = -np.abs(arrays["g"]) * np.float32(.7)
     arrays["beta"] = (rng.integers(1, 2 ** 16, size=(ROWS, 7, 2)) / 2 ** 16).astype(np.float32)
     arrays["state"] *= np.float32(.3)
-    arrays["output_cotangent"] = _exactly(rng, (ROWS, 7, 2, 4))
-    arrays["state_cotangent"] = _exactly(rng, (ROWS, 2, 3, 4))
     return arrays
-
-
-def _exactly(rng, shape) -> np.ndarray:
-    """`shape` integers in [-2**15, 2**15) from `rng`'s stream over 2**13, float32: uniform in [-4, 4),
-    every bit its integer's on any platform."""
-    return (rng.integers(-2 ** 15, 2 ** 15, size=shape) / 2 ** 13).astype(np.float32)
 
 
 def l2norm(x, eps=1e-6):
