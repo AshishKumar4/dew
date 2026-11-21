@@ -93,15 +93,19 @@ def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values:
     weights of another, each document's signed by the memory it enters (`_entered_signs`), so every memory
     is zero, one or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`)
     of one power of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds
-    once, as float64's."""
+    once, as float64's. Every other column's draws reach float32's largest itself (row 9074, the endpoint the
+    scaled draws stay below): unscaled, each write's levels summing to it, and weights of a half, so a memory
+    of two writes is it or its negative, their randomness spent as the scaled draws'."""
     rows, documents = len(FORKED), len(FORKED[0][0])
     rng = np.random.default_rng([8840, seed])
     factors, levels = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
     key = np.zeros((rows, documents, len(factors), key_heads, keys), np.float32)
     key[..., 0] = factors[:, None]
     group, columns = heads // key_heads, np.zeros((heads, values))
-    columns[np.arange(key_heads) * group + seed % group, seed // group % values] = (
-        rng.choice([-1.0, 1.0], key_heads) * 2.0 ** -int(rng.integers(28, 34)))
+    column = seed // group % values
+    largest = column % 2 == 1
+    columns[np.arange(key_heads) * group + seed % group, column] = (
+        rng.choice([-1.0, 1.0], key_heads) * 2.0 ** -(0 if largest else int(rng.integers(28, 34))))
     value = np.broadcast_to(levels[:, None, None] * columns, (rows, documents, len(levels), heads, values))
     signs = _entered_signs(rng.choice([-1.0, 1.0], (rows, heads)))
     scale = 2.0 ** -int(rng.integers(10, 15))
@@ -109,7 +113,7 @@ def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values:
     def signed(shape):
         return (rng.choice([-1.0, 1.0], shape) * scale).astype(np.float32)
 
-    weight = signs * 2.0 ** -int(rng.integers(0, 4))
+    weight = signs * 2.0 ** -(1 if largest else int(rng.integers(0, 4)))
     return Entries(key, value.astype(np.float32), weight.astype(np.float32), signed)
 
 
