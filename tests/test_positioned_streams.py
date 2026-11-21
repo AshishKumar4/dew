@@ -90,8 +90,8 @@ def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_s
         return {**row, "at": np.int64(index)}
 
     def values() -> list[tuple[int, int]]:
-        rows = iterate(Pipeline(files).map_with_index(at).cache(cache), read="streamed",
-                       loading=Loading(workers=0, threads=2, read_buffer=1))
+        chain = Pipeline(files).map_with_index(at, identity="numbered@1").cache(cache)
+        rows = iterate(chain, read="streamed", loading=Loading(workers=0, threads=2, read_buffer=1))
         return sorted((int(row["at"]), int(row["id"])) for row in rows)
 
     first = values()
