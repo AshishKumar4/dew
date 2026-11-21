@@ -611,7 +611,8 @@ def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array
         raw = spec.scale if isinstance(spec, Forward) and spec.raw else raw_scale
         held = means.holding(jnp.swapaxes(initial.total, 1, 2))
         init_total = jnp.swapaxes(initial.total, 1, 2)
-        init_out = jnp.where(held[..., None], means.finished(jnp.swapaxes(initial.acc, 1, 2), init_total), 0.0)
+        init_acc = jnp.swapaxes(initial.acc, 1, 2)
+        init_out = jnp.where(held[..., None], means.finished(init_acc, init_total), 0.0)
         init_m = jnp.swapaxes(initial.m, 1, 2)
         init_m = raw_maximum(init_m, raw) if raw is not None else init_m
         own = slice_state(spec, init_out, init_m, init_total)
