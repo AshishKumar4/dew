@@ -991,7 +991,7 @@ class CausalSelfAttention(nn.Module):
         # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         logical_positions = positions
-        query, gate, projected_kv = self._query(x)
+        query, gate, projected_kv = self._query(x, sites=call.site_inputs)
         held = None
         if self.ctx.kv_shared:
             key, value, positions, *held = self._shared_kv(kv_store, decode)
@@ -1067,20 +1067,47 @@ class CausalSelfAttention(nn.Module):
         which the reference marks "unlike olmo, only on the head dim" (modeling_qwen3_moe.py:147)."""
         return self.ctx.qk_norm and self.ctx.qk_norm_scope == 'projection'
 
-    def _query(self, x, keys: bool = True):
+    @property
+    def input_sites(self) -> tuple[str, ...]:
+        """`InputSites`: the query's input, and the keys' and values' where it projects them of its own
+        (a keys-are-values layer's one input for both, a sharing layer's none)."""
+        if self.ctx.kv_shared:
+            return ('q',)
+        return ('q', 'k') if self.ctx.k_eq_v else ('q', 'k', 'v')
+
+    def _site_kv(self, sites: Mapping[str, jax.Array]):
+        """The keys and values projected from their own sites' inputs (`MixerCall.site_inputs`), each
+        projection reading its own."""
+        keys = sites['k']
+        values = sites.get('v', keys)
+        key = self.k_proj(keys)
+        value = (key if self.ctx.k_eq_v else self.experts(values) if self.ctx.value_experts is not None
+                 else self.v_proj(values))
+        return key, value
+
+    def _query(self, x, keys: bool = True, sites: Mapping[str, jax.Array] | None = None):
         """The query heads of `x` `[B, S, E]`, `[B, S, heads, head_dim]`, normed as the layer norms
         them and column-parallel under a tensor axis (each shard a run of whole heads); the output gate
         where it gates, else None; and the keys and values projected with the query, else None: those
         `qkv_proj` packs beside it, or, where `keys` asks for them, its own three projections' side by
         side (`joined.side_by_side`: one launch, their input gradient chained, where its selector takes
         them). The projections carry the names a remat policy saves or offloads
-        (residuals.RESIDUALS)."""
+        (residuals.RESIDUALS). With `sites` (`MixerCall.site_inputs`) the keys and values read their own
+        sites' inputs: a packed `qkv_proj` projects each input apart (`ProjectionGroup.apart`), and their
+        own projections read theirs (`_site_kv`)."""
         B, S, _ = x.shape
         projected_kv = None
         group = self._group()
         if group is not None and self._packed():
-            projected, key, value = group.split(self.qkv_proj(x))
+            if sites is None:
+                projected, key, value = group.split(self.qkv_proj(x))
+            else:
+                projected, key, value = group.apart(self.qkv_proj, (x, sites['k'], sites['v']))
             projected_kv = (key, value)
+        elif sites is not None:
+            projected = self.q_proj(x)
+            if not self.ctx.kv_shared:
+                projected_kv = self._site_kv(sites)
         elif keys and group is not None and (
                 plan := side_by_side((self.q_proj, self.k_proj, self.v_proj), x)) is not None:
             projected, key, value = plan()

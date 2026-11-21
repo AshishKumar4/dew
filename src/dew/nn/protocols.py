@@ -37,7 +37,7 @@ callers add flags and absent values.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, runtime_checkable
 
 import jax
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from dew.nn.backbones.decoder_stack import DecoderBank, Loop, StackView
     from dew.nn.continuum import HeadTerms, LevelTerms
     from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.cross_pass import CrossPass
     from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
@@ -296,6 +297,17 @@ def computes_in(stated: DTypeLike | None, params) -> jnp.dtype:
     floats = [leaf.dtype for leaf in jax.tree.leaves(params)
               if jnp.issubdtype(leaf.dtype, jnp.floating) and jnp.dtype(leaf.dtype).itemsize > 1]
     return jnp.dtype(jnp.result_type(*floats)) if floats else jnp.dtype(jnp.float32)
+
+
+@runtime_checkable
+class InputSites(Protocol):
+    """A token mixer whose projections read its input at more than one site (attention's query, key and
+    value), each of which a looped pass's message merges into apart (`dew.nn.cross_pass`): its
+    `input_sites`, the first the input its call reads as `x`, the rest the call's `site_inputs`
+    (`MixerCall`). A mixer that is no `InputSites` reads one site."""
+
+    @property
+    def input_sites(self) -> tuple[str, ...]: ...
 
 
 @runtime_checkable
@@ -779,15 +791,16 @@ class Looping(Protocol):
     `layers`, [first, end), which gives a model with no loop one; None where they cannot.
     `backprop_steps` trains through the final passes, `remat` checkpoints each pass, `implicit`
     takes each later pass by the θ-method, `exit_gate` weighs each pass's exit, `exit_threshold`
-    exits each token where they reach it, `exits` gives every pass its exit and `theta_passes` gives an
-    implicit loop a θ row for each later pass of that many (`Loop.theta_passes`); None keeps an existing
-    loop's value, or a fresh loop's default."""
+    exits each token where they reach it, `exits` gives every pass its exit, `theta_passes` gives an
+    implicit loop a θ row for each later pass of that many (`Loop.theta_passes`) and `messages` couples
+    the passes through their block summaries (`Loop.messages`); None keeps an existing loop's value, or a
+    fresh loop's default."""
 
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
                     backprop_steps: int | None = None, remat: bool | None = None,
                     implicit: bool | None = None, exit_gate: bool | None = None,
                     exit_threshold: float | None = None, exits: bool | None = None,
-                    theta_passes: int | None = None) -> Self | None: ...
+                    theta_passes: int | None = None, messages: CrossPass | None = None) -> Self | None: ...
 
 
 @runtime_checkable
@@ -939,6 +952,20 @@ class ProjectionGroup:
     def held(self, params: Mapping) -> bool:
         """Whether `params`, the parameters at `path`, hold the group packed or every member."""
         return self.packed in params or all(member in params for member in self.members)
+
+    def apart(self, projection: Callable[[jax.Array], jax.Array],
+              inputs: Sequence[jax.Array]) -> tuple[jax.Array, ...]:
+        """Each member's output of its own input, `inputs` in member order, through the packed
+        `projection`: the projection run once on each distinct input, keeping that member's columns of it
+        (`split`). Exact under whatever wraps the projection (a bias, an adapter, a quantization), as one
+        product's columns are the members' own products, where slicing its kernel would read the wrapper's
+        parameters by hand."""
+        outputs: list[tuple[jax.Array, ...]] = []
+        for index, each in enumerate(inputs):
+            # An input an earlier member reads too is projected once.
+            same = next((at for at, before in enumerate(inputs[:index]) if before is each), None)
+            outputs.append(self.split(projection(each)) if same is None else outputs[same])
+        return tuple(output[index] for index, output in enumerate(outputs))
 
 
 type Routes = tuple[jax.Array, jax.Array | None]

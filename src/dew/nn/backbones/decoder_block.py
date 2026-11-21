@@ -24,6 +24,7 @@ from dew.nn.dropout import Dropout
 from ..activations import GatedActivation, gated_product
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..cross_attention import NAME as CROSS_ATTENTION, AttendsContext, LayerReads
+from ..cross_pass import CrossPass, CrossPassMerge
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -58,7 +59,14 @@ from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, Sparse
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, NormSite, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, projection_role, scaled
-from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
+from ..protocols import (
+    InputSites,
+    ProjectionGroup,
+    ReadsTrain,
+    declared_groups,
+    partitioned_routes,
+    routed_children,
+)
 from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS, Residual, recomputing
 from ..sharding import RESIDUAL, constrain, declared
 
@@ -744,6 +752,10 @@ class DecoderBlock(nn.Module):
     hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
     residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
+    cross_pass: CrossPass | None = None
+    """The messages a looped pass merges into the block's sublayer inputs (`Loop.messages`): a merge for
+    each of its mixer's input sites and its feed-forward's (`CrossPassMerge`), which a call reads given the
+    bank the pass before left (`prior_bank`); None for a block outside such a loop."""
     routed: bool = False  # the feed-forward, or the parallel branch, routes over experts
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
@@ -972,10 +984,31 @@ class DecoderBlock(nn.Module):
         if self.cross is not None:
             self.cross_attention = self.cross(name=CROSS_ATTENTION)
         self.dropout = Dropout(rate=self.dropout_rate)
+        if self.cross_pass is not None:
+            self.cross_pass_merges = self._cross_pass_merges(self.cross_pass)
+
+    @nn.nowrap
+    def _cross_pass_merges(self, spec: CrossPass) -> dict[str, CrossPassMerge]:
+        """A message merge for each of its mixer's input sites and its feed-forward's (`cross_pass`)."""
+        if self.hyper_connections is not None or self.altup is not None or self.wiring.normed_residual:
+            raise ValueError("a looped pass merges its message into a sublayer's input and leaves the one "
+                             "residual stream as it is: no hyper-connections, AltUp or normed residual")
+        eps = spec.norm_eps if spec.norm_eps is not None else self._stated_eps('cross-pass messages')
+        return {site: CrossPassMerge(spec, self.emb_features, eps, name=f'cross_pass_{site}')
+                for site in (*self._mixer_sites(), *(('mlp',) if self.feedforward is not None else ()))}
+
+    @nn.nowrap
+    def _mixer_sites(self) -> tuple[str, ...]:
+        """The sites its mixer reads its input at (`InputSites`), one where it declares none."""
+        return self.self_attn.input_sites if isinstance(self.self_attn, InputSites) else ('mixer',)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
-        """The packed groups its mixer and its feed-forward declare (`ProjectionSites`)."""
-        return declared_groups(self.self_attn, *([self.mlp] if self.feedforward is not None else []))
+        """The packed groups its mixer and its feed-forward declare (`ProjectionSites`): a mixer whose sites
+        read inputs of their own in a looped pass (`cross_pass`) packs none, its pass after the first
+        projecting each apart."""
+        sited = self.cross_pass is not None and len(self._mixer_sites()) > 1
+        return declared_groups(*(() if sited else (self.self_attn,)),
+                               *([self.mlp] if self.feedforward is not None else []))
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> CacheSpec:
@@ -991,38 +1024,40 @@ class DecoderBlock(nn.Module):
     @overload
     def __call__(self, x: jax.Array, train: bool = False, decode: bool = False, kv_store=None,
                  per_layer_input=None, attention_metadata=None,
-                 prediction_phase: PredictionPhase = "ordinary") -> jax.Array: ...
+                 prediction_phase: PredictionPhase = "ordinary", prior_bank=None) -> jax.Array: ...
 
     @overload
     def __call__(self, x: Carried, train: bool = False, decode: bool = False, kv_store=None,
                  per_layer_input=None, attention_metadata=None,
-                 prediction_phase: PredictionPhase = "ordinary") -> Carried: ...
+                 prediction_phase: PredictionPhase = "ordinary", prior_bank=None) -> Carried: ...
 
     def __call__(self, x: jax.Array | Carried, train: bool = False, decode: bool = False, kv_store=None,
                  per_layer_input=None, attention_metadata=None,
-                 prediction_phase: PredictionPhase = "ordinary") -> jax.Array | Carried:
+                 prediction_phase: PredictionPhase = "ordinary", prior_bank=None) -> jax.Array | Carried:
         """The residual the next block reads, in the form `x` came in: an array (the plain stream,
-        AltUp's copies, mHC's streams, the depth state), or single-pass mHC's `Carried`."""
+        AltUp's copies, mHC's streams, the depth state), or single-pass mHC's `Carried`. `prior_bank` is
+        the bank of block summaries the looped pass before left (`cross_pass`), None in a first pass."""
         with recomputing(recomputed_inside(self.remat)):
             if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
                 return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
-                                     prediction_phase)
+                                     prediction_phase, prior_bank)
             return self._rematted(self.remat, x, train, kv_store, per_layer_input, attention_metadata,
-                                  prediction_phase)
+                                  prediction_phase, prior_bank)
 
     def _rematted(self, remat: RematPolicy, x, train: bool, kv_store, per_layer_input, attention_metadata,
-                  prediction_phase: PredictionPhase):
+                  prediction_phase: PredictionPhase, prior_bank=None):
         """`__call__` under a rung that keeps named residuals (`RematPolicy.save`, `offload`): the block's
         forward recomputed in its backward but for those."""
 
-        def run(module, x, kv_store, per_layer_input, attention_metadata):
+        def run(module, x, kv_store, per_layer_input, attention_metadata, prior_bank):
             # Providers write K/V into a dict; scanned consumers only read it.
             # Return writes explicitly, keeping consumer values out of the
             # scan result so its tracers cannot replace the outer store.
             store = None if kv_store is None else dict(kv_store)
             out = module._forward(
                 x, train, decode=False, kv_store=store, per_layer_input=per_layer_input,
-                attention_metadata=attention_metadata, prediction_phase=prediction_phase)
+                attention_metadata=attention_metadata, prediction_phase=prediction_phase,
+                prior_bank=prior_bank)
             changed = {} if kv_store is None or store is None else {
                 name: value for name, value in store.items()
                 if value is not kv_store.get(name)}
@@ -1032,7 +1067,7 @@ class DecoderBlock(nn.Module):
         # back instead of recomputing; train stays a static closure value and
         # Linen lifts variables and RNGs with the call.
         out, store = nn.remat(run, policy=remat.checkpoint_policy())(
-            self, x, kv_store, per_layer_input, attention_metadata)
+            self, x, kv_store, per_layer_input, attention_metadata, prior_bank)
         if kv_store is not None:
             kv_store.update(store)
         return out
@@ -1046,13 +1081,15 @@ class DecoderBlock(nn.Module):
         per_layer_input,
         attention_metadata,
         prediction_phase: PredictionPhase = "ordinary",
+        prior_bank=None,
     ):
         """The block's one forward over whichever residual form it runs.
 
         `_enter` turns the received residual into the form's state, each sublayer
         `_read`s its input and `_write`s its output back, and `_leave` hands the
         next block its residual; the sublayers, norms and branches are the same for
-        every form.
+        every form. Given `prior_bank` (`cross_pass`), each sublayer's input at each of its sites merges
+        the bank in before its norm (`CrossPassMerge`), the stream itself left as it is.
         """
         state = self._enter(x, train, attention_metadata, decode)
         if self.cross is not None:
@@ -1060,7 +1097,21 @@ class DecoderBlock(nn.Module):
             state = self._crossed(state, held.context, decode, train, held.progress,
                                   CrossContext.queries_of(held.coordinates))
         state, read, site = self._read(state, "attention")
-        if not (self.wiring.pre_norms and self.attention_norm):
+        messaged = self.cross_pass is not None and prior_bank is not None
+        if self.cross_pass is not None and not messaged and self.is_initializing():
+            # A first pass reads no bank; its merges' parameters are declared all the same, so a decoder
+            # initialized at one pass resumes at more.
+            for merge in self.cross_pass_merges.values():
+                merge.declare()
+        site_inputs = None
+        if messaged:
+            # Each site's input its own merge of the bank, normed as the block norms its attention's input;
+            # a seam norm's fused stream would norm the stream, which no merge reads.
+            sites = self._mixer_sites()
+            normed, *rest = (self._attention_input(self.cross_pass_merges[name](read, prior_bank))
+                             for name in sites)
+            site_inputs = dict(zip(sites[1:], rest, strict=True)) or None
+        elif not (self.wiring.pre_norms and self.attention_norm):
             normed = read
         elif isinstance(state, _Plain) and isinstance(self.input_layernorm, SeamNorm):
             state, normed = self._stream_normed(self.input_layernorm, state, None)
@@ -1071,11 +1122,12 @@ class DecoderBlock(nn.Module):
         mixer_routes, routes = self._routes(per_layer_input)
         mixed = self._mix(
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
-            mixer_routes, None if per_layer_input is None else per_layer_input.depth)
+            mixer_routes, None if per_layer_input is None else per_layer_input.depth, site_inputs)
         if self.wiring.output_norms:
             mixed = residual_normed(self.attention_output_norm, mixed)
         attention_branch = self._branch(mixed, train, "attention")
-        joined = self._joined(state)
+        # The MLP's merged input is normed apart from the stream (`messaged`), which a seam norm would join.
+        joined = None if messaged else self._joined(state)
         if not (self.wiring.parallel_residual or joined):
             state = self._write(state, "attention", attention_branch, site)
         if self.laurel_rank is not None:
@@ -1090,7 +1142,11 @@ class DecoderBlock(nn.Module):
                 state, read, site = self._read(state, "mlp")
             else:
                 state, read, site = self._read(state, "mlp")
-                mlp_input = (normed if self.wiring.shared_parallel_norm else
+                if messaged:
+                    # The feed-forward's site (and a parallel branch's, which reads it unnormed).
+                    read = self.cross_pass_merges['mlp'](read, prior_bank)
+                shared = self.input_layernorm(read) if messaged else normed
+                mlp_input = (shared if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
                 if self.wiring.normed_residual:
                     state = state._replace(x=mlp_input)
@@ -1354,14 +1410,15 @@ class DecoderBlock(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
     def _mix(self, x, decode: bool, kv_store, attention_metadata, prediction_phase: PredictionPhase,
-             train: bool, routes: dict, depth=None):
+             train: bool, routes: dict, depth=None, site_inputs=None):
         """The token mixer over `x`, called with one `MixerCall`. It is never
         called with a `MIXING` field set that it does not read (`ReadsMixing`),
         which it would compute as if unset. The train flag, a prediction phase
         other than ordinary and the layer's replayed experts reach it only
         when the call carries them, since a mixer with no use for one does not
-        take it."""
-        call = MixerCall(attention_metadata, decode, kv_store, depth)
+        take it. `site_inputs` are its sites' past the first (`InputSites`) where a looped pass merged
+        its message into each apart."""
+        call = MixerCall(attention_metadata, decode, kv_store, depth, site_inputs)
         unread = call.unread(self.self_attn.reads if isinstance(self.self_attn, ReadsMixing) else frozenset())
         if unread:
             raise ValueError(f"{type(self.self_attn).__name__} does not read the call's {', '.join(unread)}, "
