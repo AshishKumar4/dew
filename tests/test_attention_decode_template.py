@@ -121,7 +121,7 @@ def test_a_decode_step_over_a_value_it_reads_not_a_number_is_the_references_inte
     never made finite; the second row, its values ordinary, bit for bit its own without the NaN beside it."""
     positions, heads, kv_heads = CALLS["one-query"]
     spans = _spans(positions)
-    query, _, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
     poisoned = value.at[0, 5, 0, 3].set(jnp.nan)
     ours = np.asarray(_assumed_attend(device, query, key, poisoned, spans), np.float32)
     theirs = np.asarray(template.reference(query, key, poisoned, spans), np.float32)
@@ -1092,7 +1092,7 @@ def test_a_decode_step_resuming_an_initial_state_near_fp32s_largest_keeps_its_ma
     XLA:CPU reciprocal underflow so the resumed state's value is preserved instead of flushing to zero."""
     positions, heads, kv_heads = CALLS["one-query"]
     spans = _spans(positions)
-    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    query, _, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
     total = jnp.full((query.shape[0], heads, positions), np.float32(1.5 * 2.0 ** 126), jnp.float32)
     m = jnp.full((query.shape[0], heads, positions), np.float32(20.0), jnp.float32)
     acc = total[..., None] * jnp.ones((query.shape[0], heads, positions, value.shape[-1]), jnp.float32)
