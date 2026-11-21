@@ -583,7 +583,7 @@ def slice_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Arra
     return Partial(out, jnp.where(jnp.isfinite(maximum), maximum, LEAST), jnp.where(total >= 0, total, 0.0))
 
 
-def initial_state(spec: Forward | means.Units, initial: Partial, *,
+def initial_state(spec: Forward | windows.Units, initial: Partial, *,
                   raw_scale: float | None = None) -> Partial:
     """A call's initial state (its sums unnormalized, its maximum natural) as a finished slice's
     (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units, saturated where a raw

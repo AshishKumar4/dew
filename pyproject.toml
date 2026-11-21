@@ -23,17 +23,17 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post117; a release sorts below it, so an
+    # first build with every fix is post118; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). Its jaxlib, and the CUDA and
     # PJRT plugins the cuda12 and cuda13 extras name, are Dew's builds of its
-    # native code, post117's on Linux x86_64 and aarch64: a GPU program's buffer
+    # native code, post118's on Linux x86_64 and aarch64: a GPU program's buffer
     # assignment reaches jaxlib's client of the plugin through them alone
     # (Compiled.peak_live). Elsewhere jaxlib is the release's own. A bump runs
     # the GPU checks docs/installation.md lists under "Bumping JAX" first: CI
     # is CPU-only.
-    "jax>=0.12.0.1.post117,<0.12.1",
-    "jaxlib==0.12.0.1.post117; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "jax>=0.12.0.1.post118,<0.12.1",
+    "jaxlib==0.12.0.1.post118; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
     "jaxlib==0.12.0.1; sys_platform != 'linux' or (platform_machine != 'x86_64' and platform_machine != 'aarch64')",
     # optax 0.2.8's Muon: the preconditionings Dew's Muon iterates by (`preconditioning`, its AOL and Schatten
     # first steps, whose clamp dew.newton_schulz reads) and the iteration, layout and shape scalings it calls.
@@ -123,12 +123,12 @@ dew = "dew._cli.main:main"
 # release jax posts, with Mosaic GPU's fixes (docs/installation.md), which only Dew's package index serves,
 # beside its jaxlib (the dependencies above), which reads a program's buffer assignment from them. Named
 # here, not through jax's own `cuda12` extra, which pins the release's plugins (jaxlib's version). They are
-# post117's on every machine, x86_64 and aarch64 alike. Each GPU lock resolves for every machine at once,
+# post118's on every machine, x86_64 and aarch64 alike. Each GPU lock resolves for every machine at once,
 # carrying each machine's pins under its markers (tools/lock_environment.sh).
-cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post117", "jax-cuda12-pjrt==0.12.0.1.post117",
+cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post118", "jax-cuda12-pjrt==0.12.0.1.post118",
           "dew-flash-attn-cu12~=0.3.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu12~=0.2.3; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
-cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post117", "jax-cuda13-pjrt==0.12.0.1.post117",
+cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post118", "jax-cuda13-pjrt==0.12.0.1.post118",
           "dew-flash-attn-cu13~=0.3.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu13~=0.2.3; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 tpu = ["libtpu==0.0.50.*", "requests"]
@@ -296,8 +296,8 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922", "accelerate>=1.15
 # host with no accelerator, with Dew's kernel wheels, whose FFI targets a GPU program's lowering reads
 # (dew-cutlass's .so links the CUDA runtime alone, so it loads with no GPU): locks/cpu.txt takes this extra,
 # and a GPU host's lock has its own CUDA plugin already (tools/lock_environment.sh).
-kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post117; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "jax-cuda12-pjrt==0.12.0.1.post117; sys_platform == 'linux' and platform_machine == 'x86_64'",
+kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post118; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "jax-cuda12-pjrt==0.12.0.1.post118; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.0.88; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'",

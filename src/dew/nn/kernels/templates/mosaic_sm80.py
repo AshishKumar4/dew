@@ -772,14 +772,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # one has no strided layout, which wants a multiple of 128), where its registers keep their own.
         del wait
         for part, view in zip(parts, views, strict=True):
-            if smem is None:
+            if smem is None or len(smem.shape) == 1:
                 if len(view.shape) == 1 and not launches.interpreting():
                     plgpu.store(view, part.astype(view.dtype), optimized=False)
                 else:
                     view[...] = part.astype(view.dtype)
-                continue
-            if len(smem.shape) == 1:
-                plgpu.store(view, part.astype(view.dtype), optimized=False)
                 continue
             plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]
