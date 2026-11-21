@@ -588,6 +588,14 @@ class TokenGeometry(Protocol):
     def max_length(self) -> int: ...
 
 
+@runtime_checkable
+class PackedLayout(Protocol):
+    """A source that reads windows packed by a plan (`dew.data.packing.PackedSource`): its pack and the most
+    documents a window it reads holds, which a batch's coordinates declare (`compile._coordinated`)."""
+
+    def packed_layout(self) -> tuple[Pack, int]: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenBudget:
     """A batch of `tokens` tokens: as many rows as the pipeline's fixed row

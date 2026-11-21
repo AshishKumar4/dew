@@ -18,7 +18,6 @@ import dataclasses
 import functools
 import itertools
 import os
-import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -136,6 +135,7 @@ from dew.data.pipeline import (
     Native,
     ObjectiveData,
     Pack,
+    PackedLayout,
     Phases,
     Pipeline,
     Prefetch,
@@ -1280,13 +1280,9 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
                 declare(stage, stage.segments if documents is None else documents, not itself)
                 packed = True
         *_, source = beneath(source, ("read", "materialized"))
-        # A packed source exists only where the packer was imported, which no chain that packs nothing does.
-        if "dew.data.packing" in sys.modules:
-            from dew.data.packing import PackedSource
-
-            if isinstance(source, PackedSource):
-                declare(source.plan.pack, source.plan.most_documents, not itself)
-                packed = True
+        if isinstance(source, PackedLayout):
+            declare(*source.packed_layout(), not itself)
+            packed = True
         unseen = unseen or not packed
 
     for pipeline in pipelines:

@@ -135,6 +135,36 @@ print(json.dumps({"storage": imported, "class": fsspec.get_filesystem_class("dew
     assert run("before") == {"storage": True, "class": "BoundedFileCache"}
 
 
+def test_a_chain_that_packs_nothing_compiles_and_reads_importing_no_packer(tmp_path):
+    """A chain that packs nothing, read from its store and from a generation it published, compiles and
+    reads without importing the packer or its placements, whose changes then reach none of its tests (the
+    test cache keys the modules a test imports)."""
+    script = r"""
+import json, sys
+import numpy as np
+from dew.data.cache import Cache
+from dew.data.compile import compile, publish
+from dew.data.dataset import DataPartition, Loading
+from dew.data.pipeline import Pipeline
+from dew.data.sources import Memory
+loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+prefix = Pipeline(Memory([{"id": np.int32(i)} for i in range(8)]))
+generation = publish(prefix, Cache(sys.argv[1]), read="indexed", loading=loading)
+read = []
+for chain in (prefix, prefix.cache(generation)):
+    reader = compile(chain.batch(2), read="indexed", loading=loading, epochs=1).train(DataPartition())
+    read.append(sorted(int(value) for batch in reader for value in batch["id"]))
+    reader.close()
+print(json.dumps({"read": read, "imported": sorted(name for name in ("dew.data.packing", "dew.data.placement")
+                                                   if name in sys.modules)}))
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path / "cache")], capture_output=True,
+                            text=True, timeout=600, env={**os.environ, "PYTHONPATH": str(SOURCE),
+                                                         "JAX_PLATFORMS": "cpu"})
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert json.loads(result.stdout.splitlines()[-1]) == {"read": [list(range(8))] * 2, "imported": []}
+
+
 @pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])
 def test_a_config_or_a_package_imports_no_trainer_until_a_run_trains(module):
     """A run's configuration reads its dataclasses' types and none of the trainer, which a run reads

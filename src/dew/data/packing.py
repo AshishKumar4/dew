@@ -473,6 +473,10 @@ class PackedSource(View[Source]):
         into rows (`dew.data.pipeline.TokenGeometry`)."""
         return self.plan.pack.max_length
 
+    def packed_layout(self) -> tuple[Pack, int]:
+        """Its pack and the most documents a window it reads holds (`dew.data.pipeline.PackedLayout`)."""
+        return self.plan.pack, self.plan.most_documents
+
     def consumed(self, read: Read) -> PackedSource:
         documents = _consumed(self.source, "indexed" if read == "streamed" else read)
         plan = dataclasses.replace(self.plan, source=documents) if isinstance(self.plan, _Held) else self.plan

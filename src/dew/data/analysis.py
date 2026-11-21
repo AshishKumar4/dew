@@ -295,20 +295,21 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             source = _standing_in(stage.cache, pipeline, source, stages[:index])
             stages = (*views, *stages[index + 1 :])
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-            from dew.data.packing import PackedSource, plan_name
-
             overlap = cutting(stages)
             at = int(overlap is not None)
             packing = stages[at] if len(stages) > at else None
             # A published plan cuts a document as a window-long chunk step without overlap does; a best-fit
             # plan places documents whole, an empty one too, which a chunk step after the generation drops,
             # so that step runs as written (row 9053).
-            if (isinstance(source, _GenerationSource) and isinstance(packing, Pack)
-                    and plan_name(packing, "accepted") in plans and overlap in (None, 0)
-                    and not (packing.policy == "best-fit" and overlap is not None)
-                    and not _ruled(source)):
-                source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
-                stages = stages[at + 1 :]
+            if isinstance(source, _GenerationSource) and isinstance(packing, Pack):
+                # The packer imported where a published generation is packed.
+                from dew.data.packing import PackedSource, plan_name
+
+                if (plan_name(packing, "accepted") in plans and overlap in (None, 0)
+                        and not (packing.policy == "best-fit" and overlap is not None)
+                        and not _ruled(source)):
+                    source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
+                    stages = stages[at + 1 :]
             break
     overlap = cutting(stages)
     at = int(overlap is not None)
