@@ -39,7 +39,6 @@ from dew.nn.kernels.templates.attention import (
     DQ_GRADS,
     DTYPES,
     NATURAL,
-    ROWS,
     TRACED_TILE,
     WARPS,
     AttentionLaunch,

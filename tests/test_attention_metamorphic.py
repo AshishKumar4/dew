@@ -76,8 +76,8 @@ def _causal_cut_masked(query, key, value, prefix):
 
 
 def _heads_permuted(query, key, value, order, kv_order, back):
-    return _portable(query[:, :, order], key[:, :, kv_order], value[:, :, kv_order], _CAUSAL_SPANS)[:, :, back]
-
+    out = _portable(query[:, :, order], key[:, :, kv_order], value[:, :, kv_order], _CAUSAL_SPANS)
+    return out[:, :, back]
 
 def _causal_reference(query, key, value, _order, _kv_order, _back):
     return template.reference(query, key, value, _CAUSAL_SPANS)
