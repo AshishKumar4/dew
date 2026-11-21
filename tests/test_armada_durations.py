@@ -438,6 +438,29 @@ def test_one_verdict_folded_again_moves_nothing_and_a_cold_time_follows_only_run
         assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == folded
 
 
+def test_a_file_refreshed_whole_takes_no_time_from_a_row_that_is_no_planning_evidence(
+        ci, tmp_path, monkeypatch):
+    """A row armada ran alone after a failure beside other tasks counts for whether its file is whole and
+    which tests it holds, never as their time: lowering its other tests can make the file stale and refresh
+    it whole, which keeps the isolated test's record (review: it wrote the isolated run's 40 s)."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 120}))
+    name = "tests/test_three.py"
+    (tmp_path / name).write_text("def test_a(): pass\ndef test_b(): pass\ndef test_c(): pass\n")
+    a, b, c = (f"{name}::test_{x}" for x in "abc")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps({a: 160.0, b: 100.0, c: 20.0}) + "\n")
+    rows = [{"name": f"3.12:{name}#1/3", "exitCode": 0, "seconds": 40.0, "tests": {a: 40.0}},
+            {"name": f"3.12:{name}#2/3", "exitCode": 0, "seconds": 40.0, "tests": {b: 40.0},
+             "aloneAfter": "timed out beside other tasks"},
+            {"name": f"3.12:{name}#3/3", "exitCode": 0, "seconds": 175.0, "tests": {c: 175.0}}]
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    for _ in range(2):
+        assert ci.main() == 0
+        folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
+        assert folded == {a: 40.0, b: 100.0, c: 175.0}
+
+
 def test_a_file_armada_has_not_timed_weighs_no_less_than_its_tests_recorded_costs(ci, tmp_path):
     """Scaled by how armada ran the files it timed, a file it has not is never weighed below its own tests'
     recorded costs: here a timed file ran in a tenth of its tests' cold costs, as a warm run does, and the

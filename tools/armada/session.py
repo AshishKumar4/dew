@@ -56,11 +56,11 @@ def peak(held: Entry) -> int | None:
 
 
 def cost(held: Entry) -> float:
-    """What a test costs a task that runs it, by its entry: its cold time where one is recorded, else its
-    warm one. Cuts and weights read this whatever the cache holds, so a cut is one function of the
-    record, the same in the plan and in the task that recomputes its group (split.py), and a group runs
-    within its share cold as warm (Main, 2026-11-18, row 7939: 14 cells recorded at 0.2-18.8 s warm,
-    packed in one group, took 25-100 s each cold and set a run's 1,107 s wall; a cut by the cache's
+    """What a test costs a task that runs it, by its entry: the greater of its warm and cold times where a
+    cold one is recorded, else its warm one. Cuts and weights read this whatever the cache holds, so a cut is
+    one function of the record, the same in the plan and in the task that recomputes its group (split.py), and
+    a group runs within its share cold as warm (Main, 2026-11-18, row 7939: 14 cells recorded at 0.2-18.8 s
+    warm, packed in one group, took 25-100 s each cold and set a run's 1,107 s wall; a cut by the cache's
     state would change its groups' bundles each run)."""
     warm, cold = warm_cold(held)
     return warm if cold is None else max(warm, cold)
