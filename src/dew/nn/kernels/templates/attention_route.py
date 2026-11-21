@@ -23,7 +23,8 @@ import jax.numpy as jnp
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates.attention import (
-    ACCURATE,
+    BLOCK,
+    DTYPES,
     NATURAL,
     Gradients,
     Hooks,
@@ -38,17 +39,13 @@ from dew.nn.kernels.templates.attention import (
     takes_output_residuals,
 )
 
-_PLAIN_BLOCK = 128
-"""The plain-JAX mainloop's block size: the Triton mainloop's largest tile (`attention_triton.BLOCK`)."""
-
 
 def _plain():
     """The plain-JAX mainloop's config (`attention_portable.Tiles`) and module, imported only when the
     portable fallback runs."""
     from dew.nn.kernels.templates import attention_portable
 
-    return attention_portable, attention_portable.Tiles(_PLAIN_BLOCK, _PLAIN_BLOCK, _PLAIN_BLOCK)
-
+    return attention_portable, attention_portable.Tiles(BLOCK, BLOCK, BLOCK)
 
 def _unfitted_none(**_kw) -> None:
     return None
