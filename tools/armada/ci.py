@@ -1817,7 +1817,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
         file = grading.owning(name)
         ran = executed.get(file, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
-        why = list(ran.get("why") or ())  # Each reason the row keeps no key, as its record says it.
+        why: list[str] = [*(ran.get("why") or ())]  # Each reason the row keeps no key, as its record says.
         site = session.SITE.fullmatch(parsed_row(row_["name"])[2])  # a check-1 judge reads not as its site
         read = (None if ran["depends"] is None or (site is not None and site["start"] is None) else
                 sorted({*ran["depends"], *(opened or ())}))
