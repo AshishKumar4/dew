@@ -21,7 +21,7 @@ from .conv import Conv
 from .flops import projection_flops
 from .kernels.generation import linear_tangent
 from .norms import GroupNorm, RMSNorm
-from .precision import at_least_fp32, float32_dot_general, float32_einsum
+from .precision import at_least_fp32, float32_dot_general, float32_einsum, uncontracted
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import LogicalAxes, constrain, explicit_spec, rows_taken, whole_spec
 
@@ -252,7 +252,7 @@ class FourierEmbedding(nn.Module):
         # was a trace-time constant. Without the barrier XLA folds the 2 pi
         # into whatever scalar the caller scaled `x` by (EDM's 1/4) and the
         # sin/cos arguments round differently.
-        angular = jax.lax.optimization_barrier(2 * jnp.pi * self.frequencies.value)
+        (angular,) = uncontracted(2 * jnp.pi * self.frequencies.value)
         return sinusoids(x[:, None] * angular[None, :])
 
 
