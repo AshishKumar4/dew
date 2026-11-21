@@ -229,25 +229,21 @@ def _prefix_halves(g, taken, call: Call):
             slots.acquire_all()
             tile = stream_tile(slots, "decays", gates)
             decays = tile.value()
+            found = None
             if running:
                 _running_prefix(call, rows, decays, keys)
-
-                def half(i):
-                    # Each half read as it is stored, one tile held at a time: both at once spilled the
-                    # program's 128 registers at two programs a multiprocessor (M-JS-145g).
-                    return family.tile_of(rows.at[i])
             else:
                 _scan_zeroed(call, rows, keys)
                 found = _intra_prefix(call, rows, decays, keys)
-
-                def half(i):
-                    return found[i]
             # A running sum's halves through its decays' slot in turn where a TMA store lands them, read and
             # staged before (each store waited; the operand's form and tile, a landing's own), else through
             # one landing in turn; the doubling's through their own.
             slot = tile.refs[0] if not family.stores_through_registers else landing["prefix0"]
             for i, ref in enumerate((hi_ref, lo_ref)):
-                gates.store(ref, half(i), row, chunk, column, keys, family=family,
+                # A running sum's halves read as each is stored, one tile held at a time: both at once
+                # spilled the program's 128 registers at two programs a multiprocessor (M-JS-145g).
+                half = family.tile_of(rows.at[i]) if found is None else found[i]
+                gates.store(ref, half, row, chunk, column, keys, family=family,
                             smem=slot if running else landing[f"prefix{i}"])
             return carry, accumulators
 
@@ -337,7 +333,7 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
     scored, outputs, later = "scores" in products, len(products), _later(call)
     keys = key_block(call, functools.partial(_sub_chunk_held, call, outputs=outputs),
                      functools.partial(_sub_chunk_staged, call, products=products),
-                     functools.partial(_sub_chunk_streamed, call, queries=scored), contracted=True)
+                     functools.partial(pair_streams, call, queries=scored), contracted=True)
     steps = width // keys
     shrinking = min(abs(scale), 1.0)
     growing = math.copysign(max(abs(scale), 1.0), scale)
@@ -348,8 +344,8 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = h // call.group * width
         views = stream_views(lambda i: (0, i), keys=call.given.views(k_ref, row, chunk, keyed, width),
-                             hi=gates.views(hi_ref, row, chunk, h * width, width),
-                             lo=gates.views(lo_ref, row, chunk, h * width, width),
+                             highs=gates.views(hi_ref, row, chunk, h * width, width),
+                             lows=gates.views(lo_ref, row, chunk, h * width, width),
                              **({"queries": call.given.views(q_ref, row, chunk, keyed, width)} if scored
                                 else {}))
         lefts, raised, separated = staging
@@ -359,7 +355,7 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
             slots.acquire_all()
             # Each half laid in the family's layout (`Family.tile_of`), as the scan lays them.
             whole = algebra.separated(*(family.tile_of(stream_tile(slots, name, gates).refs[0])
-                                        for name in ("hi", "lo")))
+                                        for name in ("highs", "lows")))
             mosaic.synced(call.interpret)
             for half, value in enumerate(whole):
                 plgpu.store(separated.at[half], value, optimized=False)
@@ -415,7 +411,7 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
         return mosaic.Walk(views, step, steps=steps, sums=((algebra.SUB, chunk),) * (outputs * later),
                            read=read)
 
-    blocks = _sub_chunk_streamed(call, keys, queries=scored)
+    blocks = pair_streams(call, keys, queries=scored)
     formed = [dataclasses.replace(call.held, rows=call.rows) if name == "scores" else systems(call)
               for name in products]
     staging, landing = _sub_chunk_staged(call, keys, products=products)
@@ -444,12 +440,13 @@ def _sub_chunk_held(call: Call, block: int, outputs: int = 1) -> Held:
         [f32(chunk, block)] * 3 + masks(chunk, block) + held_tile(pairing, chunk, block) + paired))
 
 
-def _sub_chunk_streamed(call: Call, keys: int, *, queries: bool) -> dict:
-    """`_sub_chunk_walk`'s walked streams at key block `keys`: the keys and both prefix halves a block at a
-    time, and the queries where it forms the scores."""
+def pair_streams(call: Call, keys: int, *, queries: bool) -> dict:
+    """The walked streams of a launch forming a chunk's pairs at key block `keys` (`_sub_chunk_walk`'s,
+    `own_pairs.intra_own`'s): the keys and both prefix halves a block at a time, and the queries where it
+    forms the scores."""
     chunk = call.chunk
-    return stream_blocks(keys=((chunk, keys), call.given), hi=((chunk, keys), call.gates),
-                         lo=((chunk, keys), call.gates),
+    return stream_blocks(keys=((chunk, keys), call.given), highs=((chunk, keys), call.gates),
+                         lows=((chunk, keys), call.gates),
                          **({"queries": ((chunk, keys), call.given)} if queries else {}))
 
 

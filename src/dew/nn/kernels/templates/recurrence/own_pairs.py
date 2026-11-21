@@ -21,7 +21,7 @@ from jax.extend.mlir.dialects import arith, memref, scf
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import emission, mosaic, resources, scan, swizzling
 from dew.nn.kernels.templates.cost import Work
-from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, systems
+from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, pair_streams, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
@@ -159,7 +159,8 @@ def _own_span(rows_ref, staged_ref, bands_ref, short, long, p, columns, leader, 
     # The steps a loop, carrying the pair's decay (or each output's decayed row, `unit_keys`) alone: unrolled,
     # ptxas held later steps' reads across earlier ones and spilled an H100's 80 registers (jsf-gate-steps3).
     carried = [one] * (run * (outputs if unit_keys else 1))
-    loop = scf.ForOp(*at(0, sub + 1, 1), carried)
+    lower, upper, stride = at(0, sub + 1, 1)
+    loop = scf.ForOp(lower, upper, stride, carried)
     with ir.InsertionPoint(loop.body):
         step = arith.index_cast(i32, loop.induction_variable)
         before = list(loop.inner_iter_args)
@@ -172,7 +173,7 @@ def _own_span(rows_ref, staged_ref, bands_ref, short, long, p, columns, leader, 
         own = arith.select(first, source, arith.addi(source, const(1)))
         key = [memref.load(staged_ref, at(0, source, column)) for column in columns]
         factor = [memref.load(staged_ref, at(1, own, column)) for column in columns]
-        after = []
+        after, decays = [], []
         if not unit_keys:
             # The pair's decay, one for every output, restarting at a row's own pair.
             decays = [arith.select(first, one, arith.mulf(b, a)) for b, a in zip(before, factor, strict=True)]
@@ -220,7 +221,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
     scored = "scores" in products
     keys = key_block(call, functools.partial(_own_held, call, outputs=len(products)),
                      functools.partial(_own_staged, call, products=products),
-                     functools.partial(_own_streamed, call, queries=scored), contracted=True)
+                     functools.partial(pair_streams, call, queries=scored), contracted=True)
     steps = width // keys
 
     def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, taken_ref, *sums, streams, staging, landing):
@@ -234,7 +235,6 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
                              **halves, **({"queries": call.given.views(q_ref, row, chunk, keyed, width)}
                                           if scored else {}))
         shifts, *threaded = staging
-        rows, summed = threaded if threaded else (None, None)
 
         def step(index, slots, bands, accumulators):
             slots.acquire_all()
@@ -253,6 +253,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
                 # Natively, each output's rows formed and stored in turn, after the keys' and decays' (no
                 # tile of them live across another's forming), then each thread its own pairs' words
                 # (`own_bands`), the bands summed in shared memory.
+                rows, summed = threaded
                 for o, name in enumerate(products):
                     plgpu.store(rows.at[o], intra_rows(call, name, operand, beta_ref.at[h, span]),
                                 optimized=False)
@@ -262,7 +263,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
             @pl.when(index == steps - 1)
             def _():
                 for o, (name, ref) in enumerate(zip(products, sums, strict=True)):
-                    band = family.tile_of(summed.at[o]) if by_thread(call) else bands[o]
+                    band = family.tile_of(threaded[1].at[o]) if threaded else bands[o]
                     _band_form(call, name).store(
                         ref, algebra.band_masked(band, strict=name == "system", scale=scale), row, chunk,
                         h * algebra.SUB, algebra.SUB, family=family, smem=landing[name])
@@ -271,7 +272,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
 
         def prologue():
             own_zeroed(call, shifts)
-            if by_thread(call):
+            for summed in threaded[1:]:
                 for o in range(len(products)):
                     plgpu.store(summed.at[o], family.as_tile(family.zeros((chunk, algebra.SUB))),
                                 optimized=False)
@@ -280,7 +281,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
                  else tuple(family.as_tile(family.zeros((chunk, algebra.SUB))) for _ in products))
         return mosaic.Walk(views, step, steps=steps, carry=carry, prologue=prologue)
 
-    blocks = _own_streamed(call, keys, queries=scored)
+    blocks = pair_streams(call, keys, queries=scored)
     out_type = tuple(_band_form(call, name).shape(call.heads * algebra.SUB) for name in products)
     # Each output's pairs a key a term, a sub-chunk's offsets: the model's.
     model = len(products) * 3 * chunk * algebra.SUB * width
@@ -293,15 +294,6 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
                          issues=False,
                          swizzles={name: resources.widest_swizzle(dtype, keys)
                                    for name, (_, dtype) in blocks.items()})(q, k, hi, lo, beta, taken)
-
-
-def _own_streamed(call: Call, keys: int, *, queries: bool) -> dict:
-    """`intra_own`'s walked streams at key block `keys`: the keys and the prefix halves a block at a time,
-    and the queries where it forms the scores."""
-    chunk = call.chunk
-    return stream_blocks(keys=((chunk, keys), call.given), highs=((chunk, keys), call.gates),
-                         lows=((chunk, keys), call.gates),
-                         **({"queries": ((chunk, keys), call.given)} if queries else {}))
 
 
 def _band_form(call: Call, name: str):
@@ -390,7 +382,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
     # registers alone, an sm86's 99 KB held none of its 32-key block's 106 KB (row 5282). It issues no
     # products, so a product's depth steps it (`key_block`'s `contracted`), as the forward's.
     keys = key_block(call, functools.partial(_key_own_held, call), functools.partial(_key_own_staged, call),
-                     functools.partial(_key_own_streamed, call), contracted=True)
+                     functools.partial(_keypair_streams, call), contracted=True)
     steps = width // keys
 
     def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
@@ -446,7 +438,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
         return mosaic.Walk(views, step, steps=steps, carry=family.as_row(family.zeros((chunk,))),
                            prologue=lambda: own_zeroed(call, shifts))
 
-    tiles = _key_own_streamed(call, keys)
+    tiles = _keypair_streams(call, keys)
     staging, landing = _key_own_staged(call, keys)
     fp32_rows = square.shape(call.heads * width)
     out_type = (fp32_rows, fp32_rows, fp32_rows, jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
@@ -463,7 +455,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
         q, k, hi, lo, beta, *(algebra.own_bands(d, chunk=chunk) for d in (d_scores, d_system)), taken)
 
 
-def _key_own_streamed(call: Call, keys: int) -> dict:
+def _keypair_streams(call: Call, keys: int) -> dict:
     """`key_pairs_own`'s streams at key block `keys`: the pairs' gradients' own bands once, an offset a row
     (`algebra.own_bands`), the queries, keys and prefix halves a block at a time."""
     chunk, given, gates, square = call.chunk, call.given, call.gates, fp32_operand(call)
