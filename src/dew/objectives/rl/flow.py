@@ -412,9 +412,11 @@ class GroupedRollout:
             jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(
                 host, is_leaf=lambda column: not isinstance(column, Mapping))))
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
-        # The objective owns the program; the rollout fixes only its count of time points.
-        generate = self.objective.program(f"{type(self).__name__} over {self.steps} time points",
-                                          self._generate_impl)
+        # The objective owns the program; the rollout fixes its count of time points and the transitions it
+        # trains, whose prefix of the walk the program hands on (`_generate_impl`).
+        generate = self.objective.program(
+            f"{type(self).__name__} over {self.steps} time points, its first {self._selected()} trained",
+            self._generate_impl)
         generated = agreed("flow rollout generation", lambda: generate(self._policy(state), expanded, key))
         source = _source(self.objective.inputs, batch)
         # In a pool the source is placed across processes (`_expanded`), and each source row's origin rides
