@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import interprets
+from generation_support import COMPILES_ON_CPU, interprets
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import (
     CASES,
@@ -906,6 +906,7 @@ def _staged_takes(generation_name: str, dtype, width: int, hooks: tuple, config:
     return all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches)
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("config", STAGED_TILES, ids=lambda t: f"{t.block_q}x{t.block_k}")
 @pytest.mark.parametrize("step", [False, True], ids=["forward", "step"])
 @pytest.mark.parametrize(("generation_name", "dtype", "width", "hooks"), STAGED_CALLS.values(),
@@ -939,6 +940,7 @@ def _trained(spans: template.KeySpans):
     return backward
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("phase", ["forward", "backward"])
 @pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
 def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, phase):
@@ -991,6 +993,7 @@ def test_a_scaled_triton_forward_derives_wherever_its_common_one_does(generation
         assert scaled.legal(bound, config, target)
 
 
+@COMPILES_ON_CPU
 def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
     """A training step's backward at width 256 derived for an RTX PRO 6000 (sm120) said to hold an A100's
     block, and compiled for the GPU's own (a compile-only device on this CPU): XLA refuses the program,
@@ -1040,6 +1043,7 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
         (report.kernel_of(name)[0], asked) for name, asked in alone.items()}, (misses, alone)
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
 def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(target):
     """The softcap through a `jax.custom_vjp`, whose forward rule calls the hook itself as JAX's
@@ -1105,6 +1109,7 @@ def test_tritons_compiler_rounds_a_product_and_the_sum_it_feeds_apart():
         np.testing.assert_array_equal(np.asarray(error), np.zeros_like(a), err_msg=kernel.__name__)
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
 def test_a_calls_runs_lower_and_compile_on_tritons_compiler(target):
     """A call's runs (`test_attention_template.RUN_CASES`' decision row's), fp32, its forward with residuals
@@ -1136,6 +1141,7 @@ def test_a_calls_runs_lower_and_compile_on_tritons_compiler(target):
     assert not failures(found), "\n".join(failures(found))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("sinks", [False, True], ids=["raw", "sinks"])
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
@@ -1171,6 +1177,7 @@ def test_the_accurate_form_lowers_and_compiles_on_tritons_compiler(target, sinks
     assert not failures(found), "\n".join(failures(found))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
 def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block(width):
     """An fp32 call's forward and backward at the configs the launches take themselves (no pin), compiled by
@@ -1193,6 +1200,7 @@ def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block
     assert not failures(found), "\n".join(failures(found))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("width, packed", [(256, False), (256, True), (512, False)],
                          ids=["256 a row", "256 packed rows", "512 a row"])
 def test_a_float32_call_compiles_spill_free_for_an_h100(width, packed):
@@ -1229,6 +1237,7 @@ def test_a_float32_call_compiles_spill_free_for_an_h100(width, packed):
     assert not spilled, spilled
 
 
+@COMPILES_ON_CPU
 def test_a_triton_forward_every_config_of_which_spills_hands_its_call_to_the_next_mainloop():
     """The Triton forward's certified refusal (`attention_triton._holding`): an fp32 call 512 wide on a
     compile-only A100, every config its derivation offers spilling as the assembler builds it, makes the route
@@ -1251,6 +1260,7 @@ def test_a_triton_forward_every_config_of_which_spills_hands_its_call_to_the_nex
         lowered_for(forward, (query, key, key), "sm80")
 
 
+@COMPILES_ON_CPU
 def test_a_forward_at_its_own_config_compiles_within_an_a100s_block():
     """A bf16 call's forward 128 wide, its plain walk, the training walk that keeps its output for D and the
     one of split sums (whose anchor value row holds 128 more registers a thread), each at the config the

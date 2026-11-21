@@ -14,7 +14,7 @@ import pytest
 from arm_arithmetic import float64_held
 from attention_oracle import attention_on_par, exact_attention, float64_weights
 from contract_support import normal_drawn
-from generation_support import here, interprets
+from generation_support import COMPILES_ON_CPU, here, interprets
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 from scenario_contract import covering
@@ -847,6 +847,7 @@ bytes, registers and 0 spills, e.g. sm90 dense bf16: 44032 B / 167 regs / 0 B fr
 vs 168 regs at split 1), cutting 108 to 36 cells."""
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize(("kernel", "variant", "splits"), COMPILED)
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
 def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, kernel, variant,
