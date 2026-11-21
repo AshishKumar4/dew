@@ -1875,6 +1875,7 @@ def _epilogue_phase(family: mosaic.Family, block_q: int, value_width: int, dtype
 
 
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
+                      natural: bool = False, params: tuple = (), width: int | None = None,
                       parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
                       per_span: int = 1, merged: bool = False, started: bool = False,
                       dropped: bool = False, weight_parts: int = 1, scaled_products: bool = False) -> int:
@@ -1959,6 +1960,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     phases = [step + ([(block_q, value_width, jnp.float32)] if scaled_products and not scaled else []),
               *_epilogue_phase(family, block_q, value_width, dtype, residuals=residuals)]
     if family.operands_in_registers:
+        # Its weights relaid as the values' product's left operand (`MmaIssuer._left`), a copy in each warp
         # along the columns (`Family.lhs_copies`), beside the step's logits, where `_products` holds a
         # register left operand no fragment: unpriced, three of an sm103's narrow bounded walks priced 225
         # and 241 spilled 12 and 444 bytes at 255; priced, 257 (narrow-replication-grid).
