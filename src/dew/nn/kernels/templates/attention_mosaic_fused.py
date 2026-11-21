@@ -159,11 +159,11 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
                                   whole(index), shape, masked=masked)
     cotangents_staged = staged.at[1]
     if not family.operands_in_registers:
-        # Issue dQ first with P staging overlapped under it, then fire dV and dK asynchronously so add_dq
-        # (register->SMEM copy + TMA reduceAdd) runs concurrently with dV and dK wgmma execution (row 5272).
+        # Stage P and dS before dQ so narrowed frees before dQ allocates, then fire dV and dK asynchronously
+        # so add_dq (register->SMEM copy + TMA reduceAdd) runs concurrently with dV and dK wgmma (row 5272).
+        family.staged(narrowed, staged.at[0])
         family.staged(part, cotangents_staged)
-        dq = family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]),
-                                   then=lambda: family.staged(narrowed, staged.at[0]))
+        dq = family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]))
         dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
         dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
         add_dq(q_first, dq)
