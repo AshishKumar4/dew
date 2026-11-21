@@ -39,7 +39,6 @@ from dew.nn import derivatives
 from dew.nn.aligned import aligned_cotangents
 from dew.nn.kernels import launches
 
-from ..precision import exact_float32
 from . import generation
 
 MIN_WIDTH = 8
@@ -56,12 +55,26 @@ TPU_PROGRAM_WORDS = 1 << 20
 128 MiB of it per core, so what bounds the window here is the double buffering
 the pipeline runs around it rather than the window itself."""
 
-EXACT = jax.lax.Precision.HIGHEST
-"""The precision of the two matmuls that build and unbuild the segment sums.
-Their operands are the chunk's `A dt` against a 0/1 matrix, so a pass in
-bf16 or tf32 would round the exponent itself, and `exp` would carry that
-rounding into every decay the chunk applies. The matmuls over the operands
-take their dtype's precision (`_mm`)."""
+MOSAIC_TPU_ALGORITHMS = {jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3: jax.lax.Precision.HIGH,
+                         jax.lax.DotAlgorithmPreset.F32_F32_F32: jax.lax.Precision.HIGHEST}
+"""The dot algorithms Pallas's Mosaic TPU lowering runs, each by the precision that names it
+(`_dot_general_lowering_rule`: `HIGH` its `contract_precision<bf16x3>`, `HIGHEST` its `<fp32>`); it takes
+no algorithm itself, and the default precision names none."""
+
+
+def _exact() -> jax.lax.Precision:
+    """The precision of the two matmuls that build and unbuild the segment sums, and of the chunk's fp32
+    products (`_mm`): of those Mosaic TPU runs (`MOSAIC_TPU_ALGORITHMS`), the cheapest at least as exact as
+    IEEE fp32 (`dew.algebra.error.at_least`, `product_precision`, row 5473). The segment sums' operands are
+    the chunk's `A dt` against a 0/1 matrix, so a pass in bf16 or tf32 would round the exponent itself, and
+    `exp` would carry that rounding into every decay the chunk applies."""
+    from dew.algebra import error
+
+    wide = jnp.dtype(jnp.float32)
+    chosen = error.product_precision(64, 64, 64, wide,
+                                     admits=error.at_least(jax.lax.DotAlgorithmPreset.F32_F32_F32, wide),
+                                     stated=MOSAIC_TPU_ALGORITHMS)
+    return MOSAIC_TPU_ALGORITHMS[chosen]
 
 
 def _program_words(chunk_size: int, head_dim: int, state_size: int) -> int:
@@ -121,7 +134,7 @@ def _segment_sums(a, below, above):
     """
     spread = jnp.where(below, a[None, :], 0.0)
     return spread, jax.lax.dot_general(spread, above.astype(spread.dtype),
-                                       (((1,), (0,)), ((), ())), precision=EXACT)
+                                       (((1,), (0,)), ((), ())), precision=_exact())
 
 
 def _bottom(size: int):
@@ -138,11 +151,11 @@ def _last_row(matrix):
 
 
 def _mm(lhs, rhs):
-    """`lhs @ rhs`, the chunk's fp32 operands multiplied in fp32 where nothing states a precision
-    (`precision.exact_float32`), where a TPU's Pallas matmul at JAX's default takes one bf16 pass, since a
-    chunk's products carry the recurrent state, whose rounding every later chunk reads compounded
-    (template numerics review 2026-10-26 follow-up, P1-1: every Mamba-2 layer's scan on a TPU)."""
-    return jnp.matmul(lhs, rhs, precision=exact_float32(None))
+    """`lhs @ rhs`, the chunk's fp32 operands multiplied at least as exactly as IEEE fp32 (`_exact`), where a
+    TPU's Pallas matmul at JAX's default takes one bf16 pass, since a chunk's products carry the recurrent
+    state, whose rounding every later chunk reads compounded (template numerics review 2026-10-26
+    follow-up, P1-1: every Mamba-2 layer's scan on a TPU)."""
+    return jnp.matmul(lhs, rhs, precision=_exact())
 
 
 def _chunk_forward(x, b, c, a, state):
@@ -179,7 +192,7 @@ def _chunk_backward(x, b, c, a, state, dy, dnext):
     dsegments = (jnp.where(below, outer * gram * decay, 0.0)
                  + jnp.where(_bottom(below.shape[0]), dleaving[None, :], 0.0))
     dspread = jax.lax.dot_general(dsegments, above.astype(dy.dtype), (((1,), (1,)), ((), ())),
-                                  precision=EXACT)
+                                  precision=_exact())
     # Every step of the chunk feeds `acs` and the chunk's total alike, so what
     # reaches those two spreads back over the whole of `a` rather than a step.
     dspread = dspread + (jnp.sum(dy * _mm(c, state.T), axis=1) * entered)[:, None]
