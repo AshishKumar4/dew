@@ -1,7 +1,7 @@
-"""The digest of a producer's code (`dew._code.code_digest`), which a kernel's stored verdicts and choices and a
-program's kept communicators key on (row 10743): an edit outside a store's code keeps its records, one inside
-it computes them again, and a closure holding an import by a computed name no review covers is keyed by the
-whole package."""
+"""The digest of a producer's code (`dew._code.code_digest`), which a kernel's stored verdicts and choices
+and a program's kept communicators key on (row 10743): an edit outside a store's code keeps its records, one
+inside it computes them again, and a closure holding an import by a computed name no review covers is keyed
+by the whole package."""
 
 import json
 import os

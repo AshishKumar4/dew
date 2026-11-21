@@ -880,8 +880,9 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
 def kernels_code() -> str:
     """The digest of the code a launch's certification and its choices are a function of
     (`dew._code.code_digest`): every module of `dew.nn.kernels`, each op's, each template's and each GPU
-    family's (`mosaic_sm80`, `mosaic_sm90`, ...) among them, and every module their code can import, so an
-    edit of Dew's code elsewhere (a model's, a trainer's) keeps every stored verdict and choice (row 10743)."""
+    family's (`mosaic_sm80`, `mosaic_sm90`, ...) among them, and every module their code can import, so
+    an edit of Dew's code elsewhere (a model's, a trainer's) keeps every stored verdict and choice (row
+    10743)."""
     from dew._code import code_digest, every_module
 
     return code_digest(*every_module("dew.nn.kernels"))
