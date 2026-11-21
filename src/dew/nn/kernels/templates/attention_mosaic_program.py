@@ -1862,6 +1862,17 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
     return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in chunked]
 
 
+def _wide_wgmma_extra(family: mosaic.Family, block_q: int, value_width: int, *,
+                      residuals: bool) -> list[tuple]:
+    """Wide (>128) register-home Wgmma forward accumulator/staging pressure across the softmax step
+    (spilling 16-32B on cuda12 ptxas at consumers=2's 240-reg cap): 64 f32 cols in training and 112 in
+    inference shifts consumers=2 past 240 while consumers=1 fits 255 with 3 TMA stages (rows 5272, 10890)."""
+    if (not family.operands_in_registers and not family.places_on_role and not scopes_products(family)
+            and value_width > 128):
+        return [(block_q, 64 if residuals else 112, jnp.float32)]
+    return []
+
+
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                       natural: bool = False, params: tuple = (), width: int | None = None,
                       parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
@@ -1936,13 +1947,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
             step.append((block_k, value_width * family.rhs_copies, dtype))
     masks = _mask_places(family, block_q, block_k)
     step += masks
-    if (not family.operands_in_registers and not family.places_on_role and not scopes_products(family)
-            and value_width > 128):
-        # Wide (>128) register-home Wgmma forward holds extra accumulator/staging pressure across the
-        # softmax step (spilling 16-32B on cuda12 ptxas at consumers=2's 240-reg cap); pricing 64 f32 cols
-        # in training and 112 in inference shifts consumers=2 past its 240-reg cap (248 regs) while
-        # consumers=1's 255 regs fits spill-free with 3 TMA stages (rows 5272, 10890).
-        step.append((block_q, 64 if residuals else 112, jnp.float32))
+    step += _wide_wgmma_extra(family, block_q, value_width, residuals=residuals)
     # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
