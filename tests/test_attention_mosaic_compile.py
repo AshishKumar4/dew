@@ -1759,6 +1759,12 @@ def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compi
             ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
             cfg = op.derived(ba, target)
             assert cfg is not None and cfg.stages >= 3, (label, cfg)
-            cases.append(KernelCase(label, lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)))
+            def _make(q=q, k=k):
+                def forward(query, key, value):
+                    return attention_mosaic.forward(query, key, value, spans, None,
+                                                    residuals=template.Kept.NONE)
+                return forward, (q, k, k)
+
+            cases.append(KernelCase(label, _make))
         found = compile_mosaic_kernels(cases, "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
