@@ -247,13 +247,11 @@ def _prefix_halves(g, taken, call: Call):
             for i, ref in enumerate((hi_ref, lo_ref)):
                 # A running sum's halves read as each is stored, one tile held at a time: both at once
                 # spilled the program's 128 registers at two programs a multiprocessor (M-JS-145g). Row-major,
-                # as a step's rows are fewer than a warpgroup accumulator's tile takes, and through their own
-                # plain rows where a TMA store lands them (fp32, the gates' form: a family's swizzled slot
-                # took no row-major tile, an sm100's), else through the landing in turn; the doubling's
-                # through their own.
+                # as a step's rows are fewer than a warpgroup accumulator's tile takes, and stored through
+                # their own plain rows (fp32, the gates' form: a family's swizzled slot took no row-major
+                # tile, an sm100's); the doubling's through their own landings.
                 half = _rows_of(rows.at[i], keys) if found is None else found[i]
-                smem = (landing[f"prefix{i}"] if not running
-                        else landing["prefix0"] if family.stores_through_registers else rows.at[i])
+                smem = rows.at[i] if running else landing[f"prefix{i}"]
                 gates.store(ref, half, row + index * rows_a_step, rows_a_step, column, keys, family=family,
                             smem=smem)
             return carry, accumulators
@@ -261,7 +259,7 @@ def _prefix_halves(g, taken, call: Call):
         return mosaic.Walk(views, step, steps=steps, prologue=zeroed if running else None)
 
     blocks = stream_blocks(decays=((rows_a_step, keys), gates))
-    landings = (0, 1) if not running else (0,) if family.stores_through_registers else ()
+    landings = () if running else (0, 1)
     landing = {f"prefix{i}": gates.landing(rows_a_step, keys) for i in landings}
     # The running sum's tiles: a block's decays, then a sub-chunk's rows of them and their terms; the
     # doubling's five.
@@ -293,9 +291,8 @@ def _running(call: Call) -> bool:
         return False
     chunk, keys, gates = call.chunk, scan.THREADS, call.gates
     rows = _running_rows(chunk)
-    landing = {"prefix0": gates.landing(rows, keys)} if call.family.stores_through_registers else {}
     _, scope, _, _ = shared_allocation(call, stream_blocks(decays=((rows, keys), gates)),
-                                       _prefix_staging(chunk, keys, running=True), landing, issues=False)
+                                       _prefix_staging(chunk, keys, running=True), {}, issues=False)
     return resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
 
 
