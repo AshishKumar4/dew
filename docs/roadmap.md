@@ -91,8 +91,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
-- Rounding walk formatted primitives. [10876]
-- Rounding walk dead platform branches. [10877]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
@@ -108,7 +106,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## CI and tooling
 
-- Dew's CI, test cache and compile-ahead tests. [5491, 5670]
+- Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
 - Shared XLA cache (tests/remote_cache.py). [9797]
 - The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
 - The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]

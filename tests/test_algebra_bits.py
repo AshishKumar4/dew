@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from arm_arithmetic import drawn_on_the_host
 from low_precision_support import spread
 from map_judge import sharded
 from reference_error import ahead_arm, ran_here
@@ -480,7 +481,8 @@ def _quantized_values() -> np.ndarray:
     """An NVFP4 tile's values (each code times its block's scale and the tensor scale, rounded to fp32):
     quotients on and beside e2m1's midpoints and e4m3's values, where an inexact division lands across (XLA's
     took 186 of its 1024 scales a step and 2760 of its codes across a midpoint)."""
-    drawn = np.asarray(spread(0, (256, 64), 16), np.float32)
+    # Drawn on the host: a GPU tier part's prepare computes nothing on its compile-only GPU (row 8617).
+    drawn = drawn_on_the_host(lambda seed: np.asarray(spread(seed, (256, 64), 16), np.float32), 0)
     words, scales, tensor = ahead_arm(jax.jit(bits.nvfp4_quantized), "an NVFP4 tile's values, quantized")(
         drawn)
     owed = np.float32(bits.NVFP4_OWED) * np.asarray(tensor)
