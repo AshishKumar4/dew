@@ -624,10 +624,14 @@ class OuterProgram:
         §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
         a rule changes lowers from its rewritten program, never traced again (`program.traced_as`). Its
         switch is in JAX's trace context, so a held program traces afresh as it changes. A program called
-        within the trace is part of this one, which the pass reads whole (`_nested`)."""
+        within the trace is part of this one, which the pass reads whole (`_nested`). Within a block
+        certifying aside, the launches it reaches settle before it is lowered, the program traced afresh past
+        a refused config (`report.settled_trace`), so it lowers once."""
+        from dew.nn.kernels.templates import report
+
         token = _PASSING.set(True)
         try:
-            traced = jitted.trace(*args, **kwargs)
+            traced = report.settled_trace(lambda: jitted.trace(*args, **kwargs))
             rewritten = algebra.rewritten_program(traced.jaxpr)
             if rewritten is traced.jaxpr:
                 return traced

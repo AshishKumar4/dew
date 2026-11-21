@@ -695,18 +695,21 @@ def certifying_aside() -> Iterator[Aside]:
             _ASIDE.reset(token)
 
 
-def settled_aside(aside: Aside) -> None:
-    """Each launch `aside` certified, kept as `certified` keeps one: a launch whose kernels the assembler
-    refuses refused (`refuse_launch`) and its misses recorded, stepped where its derivation offers another
-    config now, so the program lowered within the block holds a refused config (`refused_in`) and is lowered
-    afresh."""
-    for key, each in aside.pending.items():
+def settled_aside(aside: Aside) -> frozenset[tuple]:
+    """Each launch `aside` certified, kept as `certified` keeps one and dropped from the block's pending: a
+    launch whose kernels the assembler refuses refused (`refuse_launch`) and its misses recorded, stepped
+    where its derivation offers another config now, so a trace that took its config is traced afresh
+    (`settled_trace`) and a program lowered at it lowered afresh (`refused_in`). The keys of those refused."""
+    refused = set()
+    for key, each in list(aside.pending.items()):
         # A launch a derivation certified (a route's eligibility) and no trace called: no program holds it.
         # One certified in turn meanwhile (a refusal's ladder, `tuning.KernelOp._certified`) is certified.
         with _GUARD:
             done = key in _CERTIFIED
         if each.kernels is None or done:
             continue
+        with _GUARD:
+            aside.pending.pop(key, None)
         try:
             kernels, lowered, read = each.kernels.result()
         except jax.errors.JaxRuntimeError as error:
@@ -717,24 +720,47 @@ def settled_aside(aside: Aside) -> None:
         spilling = _kept_certification(key, each.op, each.config, each.reverse, kernels, stored, each.device,
                                        read=read).refused
         if spilling:
+            refused.add(key)
             refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
                           {binary.kernel: binary.spilled_in for binary in spilling})
             missed(each.op, each.arguments, each.config, spilling,
                    stepped=each.op.remaining(each.arguments) is not None)
+    return frozenset(refused)
+
+
+def settled_trace[T](trace: Callable[[], T]) -> T:
+    """`trace()`'s value, within a block certifying aside (`certifying_aside`) the launches it reached settled
+    before it is lowered (`settled_aside`) and the program traced afresh for as long as they refuse a config
+    it took, each refused launch's derivation stepping past it (a trace's key holds the refusals,
+    `options.held_context`): a program lowers once, at the configs its certification settled, as one
+    certified in turn does, where lowering at a refused rung lowered the step twice (a B200's recurrent
+    reverse launch spilling at its first rung, FS-ASIDE-SM100). A trace that takes a config refused before
+    again (a derivation reading no refusal, a pin's) is its compile's to read (`settled`). Outside such a
+    block, `trace()`'s."""
+    aside = _ASIDE.get()
+    value = trace()
+    if aside is None:
+        return value
+    seen: set = set()
+    while (refused := settled_aside(aside)) and not refused <= seen:
+        seen |= refused
+        value = trace()
+    return value
 
 
 def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
                      program: Callable[[T], jax.stages.Lowered | None]) -> T:
-    """`lower()`'s value, the launches its trace reaches certified aside (`certifying_aside`, settled as it
-    ends: `settled_aside`), and `relower()`'s afresh for as long as its program (`program`, None where it
-    holds none) launches a refused config (`refused_in`), each refused launch's derivation stepping past its
-    config and certifying the next in turn: its own certifications' refusals, or another caller's committed
-    after its trace took the config (row 8603: another thread's drain left a program compiling at it). A
-    relowering that launches a config refused before again (a derivation reading no refusal, a pin's) is its
-    compile's to read (`settled`). Every lowering a compile point settles lowers through it: a program's own
-    (`options.OuterProgram`) and a step's planner's and fit check's (`planning.FitSearch.lowering`), whose
-    launches certified in turn took 64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324); a program's
-    trace alone certifies aside too (`OuterProgram.trace`)."""
+    """`lower()`'s value, the launches its trace reaches certified aside (`certifying_aside`, settled before
+    it lowers where it traces through `settled_trace`, else as it ends: `settled_aside`), and `relower()`'s
+    afresh for as long as its program (`program`, None where it holds none) launches a refused config
+    (`refused_in`), each refused launch's derivation stepping past its config and certifying the next in
+    turn: its own certifications' refusals, or another caller's committed after its trace took the config
+    (row 8603: another thread's drain left a program compiling at it). A relowering that launches a config
+    refused before again (a derivation reading no refusal, a pin's) is its compile's to read (`settled`).
+    Every lowering a compile point settles lowers through it: a program's own (`options.OuterProgram`) and a
+    step's planner's and fit check's (`planning.FitSearch.lowering`), whose launches certified in turn took
+    64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324); a program's trace alone certifies aside too
+    (`OuterProgram.trace`)."""
     with certifying_aside() as aside:
         value = lower()
     settled_aside(aside)
