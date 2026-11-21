@@ -3116,7 +3116,7 @@ On a GPU, Dew refused (at jax 0.11.2) to quantize the activations of a grouped
 convolution, because XLA:GPU computed those convolutions wrongly or not at
 all. So the GPU rows with quantized activations keep the spatial fusion's
 depthwise convolutions in float (`--float spatial_fusion`), and
-`TextToImage.quantized` raises without that option. On the RTX 4080, an int8
+`TextToImage.quantized` raised without that option. On the RTX 4080, an int8
 convolution with one or two input channels per group returns wrong values
 without an error; before the refusal, the whole-model int8 row ran in
 42.3 ms and scored CLIP 0.1391. In fp8 the same convolutions fail to compile
