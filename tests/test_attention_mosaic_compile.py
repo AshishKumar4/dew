@@ -1496,7 +1496,8 @@ def test_fused_keys_first_register_model_counts_dq_product():
     with generation.assumed("sm80"):
         family = attention_mosaic_program.bundle("sm80", jnp.bfloat16)
         fused = attention_mosaic.BackwardTiles(
-            128, 64, 2, 1, fused=True, family=family.name, dkv_family=family.name, dkv_consumers=2)
+            128, 64, 2, 1, fused=True, family=family.name, dkv_family=family.name, dkv_consumers=2,
+            narrow=True)
         unfused = dataclasses.replace(fused, fused=False)
         dkv_family = attention_mosaic_program.bundle_of(fused.dkv, jnp.bfloat16)
         reg_fused = attention_mosaic_program.backward_registers(
