@@ -582,7 +582,8 @@ def slice_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array,
     return Partial(out, jnp.where(jnp.isfinite(maximum), maximum, LEAST), jnp.where(total >= 0, total, 0.0))
 
 
-def initial_state(spec: Forward, initial: Partial) -> Partial:
+def initial_state(spec: Forward | means.Units, initial: Partial, *,
+                  raw_scale: float | None = None) -> Partial:
     """A call's initial state (its sums unnormalized, its maximum natural) as a finished slice's
     (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units, saturated where a raw
     fold's passes fp32's largest (`raw_maximum`, as `resumed` takes it: a finite maximum of 1e38 at a scale
@@ -593,7 +594,8 @@ def initial_state(spec: Forward, initial: Partial) -> Partial:
     # The law's finish (`means.finished`): a division by a broadcast total flushed past 2^126 (a total of
     # 1.5 x 2^126 left its output 0, train 931's review).
     out = jnp.where(held[..., None], means.finished(initial.acc, initial.total), 0.0)
-    maximum = raw_maximum(initial.m, spec.scale) if spec.raw else initial.m
+    raw = spec.scale if isinstance(spec, Forward) and spec.raw else raw_scale
+    maximum = raw_maximum(initial.m, raw) if raw is not None else initial.m
     return slice_state(spec, out, maximum, initial.total)
 
 
@@ -608,14 +610,9 @@ def merged_state(spec: Forward | means.Units, out: jax.Array, maximum: jax.Array
         raise ValueError("a split walk's merge takes its finished form's states (`finished_form`)")
     state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
     if initial is not None:
-        raw = spec.scale if isinstance(spec, Forward) and spec.raw else raw_scale
-        held = means.holding(jnp.swapaxes(initial.total, 1, 2))
-        init_total = jnp.swapaxes(initial.total, 1, 2)
-        init_acc = jnp.swapaxes(initial.acc, 1, 2)
-        init_out = jnp.where(held[..., None], means.finished(init_acc, init_total), 0.0)
-        init_m = jnp.swapaxes(initial.m, 1, 2)
-        init_m = raw_maximum(init_m, raw) if raw is not None else init_m
-        own = slice_state(spec, init_out, init_m, init_total)
+        own = initial_state(spec, Partial(*(jnp.swapaxes(a, 1, 2)
+                                            for a in (initial.acc, initial.m, initial.total))),
+                            raw_scale=raw_scale)
         acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
                          for mine, theirs in zip(state[:3], own[:3], strict=True))
         state = Partial(acc, m, total)
