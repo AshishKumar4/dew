@@ -130,8 +130,6 @@ def _own_bands(rows_ref, staged_ref, bands_ref, *, unit_keys: bool) -> None:
     p = arith.remui(quad, const(pair_rows))
     short, long = arith.addi(first_row, p), arith.subi(arith.addi(first_row, const(sub - 1)), p)
     columns = [arith.addi(arith.muli(quarter, const(run)), const(m)) for m in range(run)]
-    loaded = [[[memref.load(rows_ref, at(o, row, column)) for column in columns] for row in (short, long)]
-              for o in range(outputs)]
     one = arith.constant(f32_type, 1.0)
     decays = [one] * run
     decayed = [[one] * run for _ in range(outputs)]
@@ -151,8 +149,9 @@ def _own_bands(rows_ref, staged_ref, bands_ref, *, unit_keys: bool) -> None:
             decays = [arith.select(first, one, arith.mulf(before, a)) for before, a in zip(decays, factor,
                                                                                             strict=True)]
         for o in range(outputs):
-            values = [arith.select(on_short, short_value, long_value)
-                      for short_value, long_value in zip(*loaded[o], strict=True)]
+            # The row's own values read at each step, none held across them (both rows' runs of every output
+            # held spilled an H100's 80 registers, jsf-gate-steps).
+            values = [memref.load(rows_ref, at(o, row, column)) for column in columns]
             if unit_keys:
                 decayed[o] = [arith.select(first, value, arith.mulf(before, a))
                               for value, before, a in zip(values, decayed[o], factor, strict=True)]
