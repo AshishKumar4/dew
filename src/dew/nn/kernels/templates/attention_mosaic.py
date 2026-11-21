@@ -248,19 +248,19 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                 # count's (a 192-row tile of three consumers over a 256-row shard pads it by half, where two
                 # consumers' 128 pad none): the call's padding is a copy and its last tile's work wasted.
                 continue
-            best_res = 0
+            best_programs = 0
             for extent in walks(family, dtype, max(walked, least_walked(rows))):
                 for narrow in stagings(family):
                     config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
                     if fits(config):
                         if choose is None:
                             return config
-                        res = residency(config) if residency is not None else 1
-                        if not best_res or res > best_res:
+                        held_programs = residency(config) if residency is not None else 1
+                        if not best_programs or held_programs > best_programs:
                             picked.append(config)
-                            best_res = res
+                            best_programs = held_programs
                         break
-                if best_res and residency is None:
+                if best_programs and residency is None:
                     break
         if not picked:
             return None
