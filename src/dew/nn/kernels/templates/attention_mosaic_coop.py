@@ -13,15 +13,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import (
-    attention_algebra as algebra,
-    mosaic,
-    resources,
-    stacked,
-    stores,
-    swizzling,
-)
+from dew.nn.kernels import launches, tuning
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stacked, stores, swizzling
 from dew.nn.kernels.templates.attention_mosaic_fused import (
     _STREAM_ORDER,
     _statistics,
@@ -37,7 +30,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
-    launch_scope,
     modelled,
     reducing,
     stated,

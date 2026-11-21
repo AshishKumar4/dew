@@ -11,14 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import (
-    attention_algebra as algebra,
-    mosaic,
-    outputs,
-    resources,
-    stacked,
-    stores,
-)
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked, stores
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
@@ -44,7 +37,6 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _rescaled_parts,
     _tile_scores,
 )
-
 
 _STREAM_ORDER: tuple[str, ...] = ("peak", "total", "delta", "anchor", "chosen")
 """Priority order for TMA-streaming query statistics beside query tiles: `peak`, `total`, and `delta` are
