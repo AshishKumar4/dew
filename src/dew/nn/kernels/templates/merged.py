@@ -219,8 +219,7 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
     if len(role.walks) == 3:
         joining_walk, mean_walk, _ = role.walks
     else:
-        joining_walk = cost.Work()
-        mean_walk, _ = role.walks
+        joining_walk, mean_walk = cost.Work(), role.walks[0]
     walk_work = emission.repeated(joining_walk, chunks - 1) + emission.repeated(mean_walk, 2 * chunks)
     passes = 3 * chunks
     padded_item, stacked_item = padded.dtype.itemsize, stacked.dtype.itemsize

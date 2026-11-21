@@ -590,7 +590,7 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
     normalized output `1.0` instead of flushing `state.total > 0` to `0.0`, while truly empty rows stay
     `0.0`."""
     batch, slices, rows, kv_heads, width, queries, out_heads = 1, 2, 4, 1, 16, 2, 2
-    spec = algebra.Forward(scale=1.0, keys=16)
+    spec = algebra.Forward("full", False, 1.0, keys=16)
     padded = jnp.zeros((batch, slices, rows, kv_heads, width), jnp.float32)
     maxima = jnp.full((batch, kv_heads, slices, rows), -jnp.inf, jnp.float32)
     totals = jnp.zeros((batch, kv_heads, slices, rows), jnp.float32)
