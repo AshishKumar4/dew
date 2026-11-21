@@ -308,8 +308,13 @@ def test_a_padded_merge_compiles_as_one_launch(name):
     batched_stacked = jax.ShapeDtypeStruct((3, 2, 2, 8, 16, 16), jnp.float32)
     batched = jax.vmap(lambda padded, stacked: tuple(merged.merged_padded(SPECS["natural"], padded, stacked,
                                                                           queries=4, width=64)))
+    finished_padded = jax.ShapeDtypeStruct((1, 16, 16, 8, 128), jnp.float32)
+    finished_stacked = jax.ShapeDtypeStruct((2, 1, 8, 16, 16), jnp.float32)
+    finished = functools.partial(merged.merged_finished, SPECS["natural"], queries=4, width=128,
+                                 out_dtype=jnp.bfloat16, out_heads=32)
     cases = [*(one_case(f"width-{width}", slices=16, width=width) for width in (80, 96, 100, 128, 192)),
              KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
+             KernelCase("finished", lambda: (finished, (finished_padded, finished_stacked))),
              *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256))]
     with generation.assumed(name):
         records = compile_kernels(cases, name)
@@ -318,7 +323,6 @@ def test_a_padded_merge_compiles_as_one_launch(name):
         expected = (["merged_padded", "wrapped_transpose"] if record["name"] == "batched"
                     else ["merged_padded"])
         assert sorted(record["thunks"]) == expected, record
-
 
 def _jaxpr_has_load(jaxpr) -> bool:
     """Whether `jaxpr` or any nested scan/while/cond executes a Pallas `get` load."""
@@ -533,3 +537,48 @@ def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
         empty_out = merged._kernel(empty_p, empty_s, units=algebra.units_of(spec), queries=queries,
                                    width=width)
     assert empty_out[0].shape == (0, queries, heads, width)
+
+
+def test_a_finished_split_merge_ungroups_and_casts_in_one_launch():
+    """`merged.merged_finished` (row 7926) finishes, ungroups `[B, T*G, KV, Dv] -> [B, T, KV*G, Dv]` and
+    casts to `out_dtype` inside the `merged_padded` launch, matching `algebra.finish` + `ungrouped_rows`
+    bitwise with and without `initial` and under `vmap`, with fewer output device bytes priced."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
+    batch, slices, rows, kv_heads, group, tokens, width = 2, 4, 16, 2, 4, 2, 16
+    queries, out_heads = tokens * group, kv_heads * group
+    key = jax.random.key(7926)
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+    padded = jax.random.normal(k1, (batch, slices, rows, kv_heads, width), jnp.float32)
+    totals = jax.random.uniform(k3, (batch, kv_heads, slices, rows), jnp.float32, minval=0.1, maxval=2.0)
+    # Force query 0 on batch 0, kv_head 0 to have zero total across slices to exercise empty-row zeroing.
+    totals = totals.at[0, 0, :, 0].set(0.0)
+    stacked = jnp.stack([jax.random.normal(k2, (batch, kv_heads, slices, rows), jnp.float32), totals])
+    init_m = jax.random.normal(k4, (batch, kv_heads, queries), jnp.float32)
+    init_t = jax.random.uniform(k5, (batch, kv_heads, queries), jnp.float32, minval=0.1, maxval=2.0)
+    init_acc = jax.random.normal(k1, (batch, kv_heads, queries, width), jnp.float32)
+    initial = template.Initial(init_m, init_t, init_acc)
+
+    for init in (None, initial):
+        got = merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
+                                     out_dtype=jnp.bfloat16, out_heads=out_heads, initial=init)
+        state = merged.merged_split(spec, padded, stacked, queries=queries, width=width, initial=init)
+        ref = template.ungrouped_rows(
+            algebra.finish(spec, state, initial=True, normalized=True)[0], out_heads).astype(jnp.bfloat16)
+        assert got.shape == (batch, tokens, out_heads, width) and got.dtype == jnp.bfloat16
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+    vmapped = jax.vmap(lambda p, s: merged.merged_finished(
+        spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads))(
+        padded[None], stacked[None])
+    ref_no_init = merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
+                                         out_dtype=jnp.bfloat16, out_heads=out_heads)
+    np.testing.assert_array_equal(np.asarray(vmapped[0]), np.asarray(ref_no_init))
+
+    with generation.assumed("sm90"):
+        p_s = jax.ShapeDtypeStruct(padded.shape, padded.dtype)
+        s_s = jax.ShapeDtypeStruct(stacked.shape, stacked.dtype)
+        target = generation.gpu_target("sm90")
+        work_plain = merged.launch_work(spec, p_s, s_s, queries, width, target)
+        work_fin = merged.launch_work(spec, p_s, s_s, queries, width, target,
+                                      out_dtype=jnp.bfloat16, out_heads=out_heads)
+    assert work_fin.kernels == 1 and work_fin.device_bytes < work_plain.device_bytes
