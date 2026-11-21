@@ -826,7 +826,7 @@ def test_a_backward_certification_refuses_every_config_of_takes_another_route():
     query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
     temperature = jax.ShapeDtypeStruct((1, heads, tokens), jnp.float32)
-    with report.certifying(compile_only_gpus("sm80")[0]):
+    with report.certifying(compile_only_gpus("sm80")[0]), report.refusals():
         lowered_for(jax.grad(loss, argnums=(0, 1, 2, 3)), (query, key, key, temperature), "sm80")
 
 
@@ -981,7 +981,7 @@ def test_a_programs_launches_compile_beside_its_trace():
     before = len(report.certifications())
     jax.monitoring.register_event_duration_secs_listener(heard)
     try:
-        with generation.assumed("sm90"), report.certifying(device):
+        with generation.assumed("sm90"), report.certifying(device), report.refusals():
             owned_program(jax.grad(loss, argnums=(0, 1, 2))).compiled(query, key, key)
     finally:
         jax.monitoring.unregister_event_duration_listener(heard)
@@ -1028,7 +1028,7 @@ def test_a_ladder_that_spills_throughout_certifies_its_ends_alone():
 
     op, ba, derived = _gated_backward("sm90", 64, accurate=True, hooks="alibi")
     assert derived is not None
-    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]):
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.refusals():
         before = len(report.certifications())
         taken = op._certified(ba, derived)
         certified = {certification.config for certification in report.certifications()[before:]
