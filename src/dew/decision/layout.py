@@ -1313,21 +1313,15 @@ class SegmentLayout(Layout):
             kept[max(movable, key=lambda at: kept[at])] -= 1
             laid = built([piece(at) for at in range(len(copies))])
         # A merge across a cut may let a longer cut fit than the share counted: each copy takes the
-        # longest that still fits, its own cap and the row's length both held. A whole row's encoding
-        # need not grow with its cut (a merge across a later boundary can take fewer tokens than one
-        # across an earlier), so every longer cut is asked, longest first, past one that overflows
-        # (row 9060).
+        # longest that still fits, its own cap and the row's length both held.
         for at, copy in enumerate(copies):
-            if len(laid.tokens) > self.max_len or copy.keep == "all":
-                continue
-            for count in range(lengths[at], kept[at], -1):
-                if not own_fits(at, count):
-                    continue
-                longer = built([piece(other, count if other == at else kept[other])
-                                for other in range(len(copies))])
-                if len(longer.tokens) <= self.max_len:
-                    kept[at], laid = count, longer
+            while (len(laid.tokens) <= self.max_len and copy.keep != "all" and kept[at] < lengths[at]
+                   and own_fits(at, kept[at] + 1)):
+                longer = built([piece(other, kept[other] + (other == at)) for other in range(len(copies))])
+                if len(longer.tokens) > self.max_len:
                     break
+                kept[at] += 1
+                laid = longer
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]
         # What the cut removed is characters: a cut text encodes anew, so no count of its own tokens

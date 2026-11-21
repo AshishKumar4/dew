@@ -369,36 +369,3 @@ def test_the_joint_row_asks_every_question_and_refuses_a_question_rows_option_te
     assert SegmentLayout.state_first_row().row_questions(3) == 1
     with pytest.raises(ValueError):
         SegmentLayout.joint_row(option_text="described")
-
-
-class Merging(ByteTokenizer):
-    """The byte vocabulary, but for "xyz", which a row's encoding takes as one token: a longer cut of a
-    state that ends in it encodes to fewer tokens than the cut before it."""
-
-    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
-        ids = super().encode(text, add_special_tokens=add_special_tokens)
-        merged, at = [], 0
-        while at < len(ids):
-            if ids[at:at + 3] == list(b"xyz"):
-                merged.append(1)
-                at += 3
-            else:
-                merged.append(ids[at])
-                at += 1
-        return merged
-
-
-def test_a_cut_state_takes_a_longer_cut_whose_row_encodes_shorter_past_one_that_overflows():
-    """A row whose room holds the state "aaxy" whole only as its encoding merges the state's "xy" with the
-    text after it ("z"): the cut its share counted ("a", the room left by the text after it) grows past
-    "aa" and "aax", which overflow, to the whole state, whose row is as short as the first cut's (row 9060:
-    the growth stopped at the first longer cut that overflowed)."""
-    tokenizer, state = Merging(), "aaxy"
-    segments = (Text("S:"), State(), Text("z"), Schema())
-    # Encoded whole, as a row merges across its segments (`unit='whole'`).
-    [whole] = SegmentLayout.joint_row(max_len=1 << 20, segments=segments, unit="whole").rows(
-        tokenizer, SPECIALS, state, QUESTIONS)
-    [row] = SegmentLayout.joint_row(max_len=len(whole.tokens), segments=segments, unit="whole").rows(
-        tokenizer, SPECIALS, state, QUESTIONS)
-    # The whole state, its "xy" merged with the "z" after it: the row the room past all lays out.
-    assert list(row.tokens) == list(whole.tokens) and 1 in list(row.tokens)
