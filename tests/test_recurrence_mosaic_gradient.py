@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_forms import ROUNDED
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, runs
 from reference_error import assert_as_exact, with_gradients
@@ -298,6 +299,54 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
         the_template_is_as_exact_as_fla(walked, site, ('out', 'final'), f'a two-role walk, {case}')
         return
     the_template_is_as_exact_as_fla(walked, site, label=f'a two-role walk\'s gradient, {case}')
+
+
+def _cancelling_group(seed: int, group: int = 16, length: int = 64, width: int = 16) -> tuple:
+    """A draw whose key head's `group` value heads' own scores' gradients cancel across it exactly: each
+    token's values one-hot at a column the seed draws, shared by the group, and its output's gradient there
+    a dyadic a head, `+-A` (of order 128, alternating) with a fine remainder between, so each head's
+    `ds = dO . v` is exact and their sum is the remainders' (about 1e-3, of terms of order 128), which an
+    fp32 sum in any order rounds at `A`'s ulp; decays near zero (`log a = -40` a token), so a token's own pair
+    alone reaches its query's and key's gradients, and no memory entering. `(operands, cotangents)`, fp32."""
+    rng = np.random.default_rng([seed, 10551])
+    query = rng.standard_normal((1, length, 1, width)).astype(np.float32)
+    key = rng.standard_normal((1, length, 1, width)).astype(np.float32)
+    column = rng.integers(0, width, length)
+    value = np.zeros((1, length, group, width), np.float32)
+    value[0, np.arange(length), :, column] = 1.0
+    big = 128.0 * (1.0 + rng.integers(1, 2 ** 7, (length, 1)) / 2 ** 7)
+    fine = rng.integers(-2 ** 12, 2 ** 12, (length, group)) / 2 ** 22
+    signs = np.where(np.arange(group) % 4 == 0, 1.0, np.where(np.arange(group) % 4 == 2, -1.0, 0.0))
+    terms = (big * signs + fine).astype(np.float32)
+    d_out = 0.5 * rng.standard_normal((1, length, group, width)).astype(np.float32)
+    d_out[0, np.arange(length), :, column] = terms
+    log_decay = np.full((1, length, group), -40.0, np.float32)
+    operands = Chunk(jnp.asarray(query), jnp.asarray(key), jnp.asarray(value),
+                     log_decay=jnp.asarray(log_decay), state=jnp.zeros((1, group, width, width), jnp.float32))
+    return operands, (jnp.asarray(d_out), jnp.zeros((1, group, width, width), jnp.float32))
+
+
+def test_a_groups_cancelling_scores_gradient_is_rounded_once_on_the_template_interpreted():
+    """The template's gradient of a call without the delta rule (a decay a head) at sixteen value heads a key
+    head, fp32 under the accurate forms, interpreted off a GPU: where the group's own scores' gradients
+    cancel to about 1e-3 from terms of order 128 (`_cancelling_group`), its queries' and keys' gradients
+    are the float64 truth's rounded once (check 1, `ROUNDED`): the group summed compensated
+    (`mainloop_backward._grouped_scores`), which a plain fp32 sum, rounding each partial at the large terms'
+    ulp, misses by percent (row 10551; row 2066's seed 117 lost a quarter of dq and dk)."""
+    hooks = recurrence.Hooks(decay='scalar', delta=False)
+
+    def gradients(kernel):
+        def run(operands, cotangent):
+            _, pulled = with_gradients(functools.partial(chunk_on, kernel, hooks, chunk_size=64))(operands,
+                                                                                                 cotangent)
+            return {'queries': pulled.query, 'keys': pulled.key}
+        return run
+
+    accurate = dataclasses.replace(generation.numerics(), forms='accurate')
+    with generation.run_precision(accurate):
+        assert_as_exact(jax.jit(gradients('mosaic_gpu')), ROUNDED, _cancelling_group,
+                        "a key head's sixteen value heads' cancelling scores' gradient",
+                        seeds=8, truth_fn=jax.jit(gradients('xla')))
 
 
 ROUNDED_EXACTLY = {

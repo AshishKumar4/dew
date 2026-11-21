@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import pytest
 import tier_wire
 from flax.linen.dtypes import canonicalize_dtype
@@ -189,3 +190,35 @@ def cublas_compiled(fn, inputs, call: str):
         assert not any(each.op == "dot" or "dot" in each.fused for each in instructions), \
             "the library arm runs a dot of XLA's own"
     return compiled
+
+
+PRODUCTION = ("qwen3.5-27b-gdn", "kimi-linear-kda")
+"""The geometries whose 16-bit calls the recurrence resource gate requires to derive tiles on every family,
+Dew's production cells (tests/test_recurrence_mosaic.py's `production_refusals`)."""
+
+FAST_BACKWARD_REFUSED = {("kimi-linear-kda", "sm86"): 10153, ("kimi-linear-kda", "sm89"): 10153,
+                         ("kimi-linear-kda", "sm120"): 10153, ("qwen3.5-27b-gdn", "sm120"): 10153}
+"""The production geometries' 16-bit training whose fast backward does not hold at its derived tiles on a
+target (`template.backward_holds`), its gradient the port's or the portable math's there, each by the open
+row tracking it. The gate fails a refusal not declared here and a declared one that holds again, so a
+declaration retires with its row (`production_refusals`)."""
+
+
+def production_refusals(target, group: tuple, refused: list[str]) -> list[str]:
+    """The recurrence resource gate's failures of `group` (`GATE_GROUPS`') on `target` over the calls it
+    refused (`refused`): a production geometry's 16-bit call that derived no tiles, or whose fast backward
+    was refused where `FAST_BACKWARD_REFUSED` declares none; and, where it declares one, a training group at
+    its derived tiles whose fast backward holds."""
+    name, dtype, training, _, variant = group
+    if name not in PRODUCTION or dtype != jnp.bfloat16:
+        return []
+    backward = [case for case in refused if "fast backward" in case]
+    failed = [f"{case}: no tiles derived" for case in refused if case not in backward]
+    declared = FAST_BACKWARD_REFUSED.get((name, str(target)))
+    if declared is None:
+        failed += [f"{case}: its fast backward does not hold, no open row declaring it" for case in backward]
+    elif training and not isinstance(variant, int) and not backward:
+        failed.append(f"{name} on {target}: its fast backward holds; strike it from FAST_BACKWARD_REFUSED "
+                      f"(row {declared})")
+    return failed
+

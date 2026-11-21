@@ -67,7 +67,14 @@ def assert_kernel_on_par(kernel, reference, draw, label: str) -> None:
     """A kernel against its expression in XLA with the same roundings (`fla_gdn_support`'s reference): the
     same shapes and dtypes, and every output on par with the reference's from float64 over the site's
     declared draws (check 1, `KERNEL_SEEDS`), the reference's expression on the inputs widened its truth
-    (`support.computed_at`)."""
+    (`support.computed_at`). An fp32 call's (its label's dtype, `site_label`) interpreted alone, where the
+    kernel's products are exact as the reference's are: natively the port takes fla's own, one TF32, about
+    2000 times an exact product's error (row 10860, M-JS-164-gh200), and the GPU tier holds it to fla's own
+    outputs instead (`the_port_is_as_exact_as_fla`). A 16-bit call's products are exact either way, and its
+    kernel is held here natively too: the GPU tier's fla cells run in fp32 alone (`FLA_DTYPES`)."""
+    if not INTERPRETED and jnp.dtype(label.split()[2]) == jnp.float32:
+        pytest.skip("an fp32 kernel's XLA expression holds the same roundings as the interpreted port alone")
+
     def laid(arm):
         return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), jax.eval_shape(arm, *draw(0)))
 

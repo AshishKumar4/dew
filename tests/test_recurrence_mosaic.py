@@ -25,7 +25,7 @@ import kernel_matrix
 import numpy as np
 import pytest
 from fla_sites import RECORDED, the_template_is_as_exact_as_fla
-from generation_support import COMPILES_ON_CPU, lowers
+from generation_support import COMPILES_ON_CPU, lowers, production_refusals
 from identity_cover import COVER_PRECISION, IDENTITY_COVER
 from kernel_compile import gate_generations
 from reference_error import assert_as_exact, declared_seeds
@@ -1551,9 +1551,11 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     once a spilling launch steps down as a run's compile steps it (`stepped_down`,
     `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's shared
     memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
-    rule's 16-bit call and Kimi's, the production cells, derive tiles on every family. A GPU host's ptxas
-    builds for its own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the
-    newer targets are the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
+    rule's 16-bit call and Kimi's, the production cells, derive tiles on every family, their fast backward
+    holding wherever no open row declares it refused (`production_refusals`: a blanket pass on its refusal
+    left a GPU's training cell compiling nothing). A GPU host's ptxas builds for its own GPU and those
+    before it, not a newer one's (an A100's refuses sm_90a), so there the newer targets are the CPU suite's
+    alone. A test a group of cases (`GATE_GROUPS`)."""
     if jax.default_backend() == 'gpu':
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
@@ -1563,10 +1565,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
         cases, found = stepped_down(target, group, plans, refused, apart)
     # Every case compiles and reports; a required case's spill fails, and a case whose launches are held
     # apart fails launch by launch.
-    failed = resource_failures(cases, found, plans, apart)
-    failed += [f"{case}: no tiles derived" for case in refused
-               if case.startswith(("qwen3.5-27b-gdn bfloat16", "kimi-linear-kda bfloat16"))
-               and "fast backward" not in case]
+    failed = resource_failures(cases, found, plans, apart) + production_refusals(target, group, refused)
     if target == 'sm100':
         failed += [f"{case}: no tiles derived" for case in refused
                    if case.startswith("a write gate bfloat16")]
