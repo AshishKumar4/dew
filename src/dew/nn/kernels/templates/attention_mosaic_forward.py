@@ -70,7 +70,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     ForwardRegisters,
     Tiles,
     TileWalk,
-    estimate,
     _block,
     _columns,
     _coords,
@@ -109,6 +108,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     transposed_swizzles,
     value_columns,
 )
+from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.rings import Ref
 from dew.nn.precision import power2
 
