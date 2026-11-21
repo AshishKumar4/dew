@@ -414,14 +414,13 @@ def _halves(x: jax.Array, axis: int):
 
 
 def _halved_compensated(x: jax.Array, axes: tuple[int, ...]):
-    """`x` summed over `axes` in halves (`_halved`), each pair's sum exact (`two_sum`) and its error kept, the
-    errors summed plainly: `(sum, error)`, a cascade compensated as the compensated sum is."""
+    """`x` summed over `axes` in halves (`_halved`), each pair a compensated sum's step
+    (`scaled.compensated_pair`): `(sum, error)`, a cascade compensated as the compensated sum is."""
     error = x - x
     for axis in axes:
         while x.shape[axis] > 1:
             (a, b, rest), (ea, eb, error_rest) = _halves(x, axis), _halves(error, axis)
-            pair, made = two_sum(a, b)
-            made = made + ea + eb
+            pair, made = scaled.compensated_pair(a, ea, b, eb)
             # An odd extent's last element, the sum's and its error's alike (one shape, so both or neither).
             if rest is not None and error_rest is not None:
                 pair = jnp.concatenate([pair, rest], axis=axis)
