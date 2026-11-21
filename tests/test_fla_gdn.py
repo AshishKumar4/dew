@@ -947,10 +947,13 @@ FLA_SHAPE = (1, 1024, 2, 4, 128)
 """The port's cell against fla's own: a row of 1024 tokens, two key heads each serving two value heads, 128
 wide (Qwen3.5's gated delta net's head)."""
 
-FLA_DTYPES = {"float32": (jnp.float32,) * 3, "mixed dtypes": (jnp.bfloat16, jnp.float32, jnp.bfloat16)}
-"""The queries', keys' and values' dtypes of the port's cells against fla's own: fp32, whose products the port
-takes in BF16x6 (six bf16 products, `fla_gdn`'s BF16_BF16_F32_X6) and fla in one TF32, and mixed, which each
-runs in their common dtype."""
+FLA_DTYPES = {"float32": (jnp.float32,) * 3, "mixed dtypes": (jnp.bfloat16, jnp.float32, jnp.bfloat16),
+              "bfloat16": (jnp.bfloat16,) * 3}
+"""The queries', keys' and values' dtypes of the port's cells against fla's own: fp32, whose products each
+takes at least as exact as fla's one TF32 (`fla_gdn._precision`); mixed, which each runs in their common
+dtype, fp32; and bf16, a 16-bit call as models train it, each product exact and summed in fp32 on both
+sides, its exponentials each kernel's own (Triton's `exp2`), which no expression in XLA states (row
+10947: the port's `chunk_bwd_dqkwg` 1.7 times its XLA expression's distance natively)."""
 
 
 def the_port_is_as_exact_as_fla(per_key: bool, dtypes: str):
