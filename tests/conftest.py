@@ -335,16 +335,17 @@ def pytest_runtest_setup(item):
 
 def judged_on_zeros(excinfo) -> bool:
     """Whether a test's failure (`excinfo`, None where it passed) is a check of what its GPU tier part's
-    prepare gave, in a prepare whose every site and arm the test began finished (`truths_ahead.COMPILED`'s
+    prepare gave, in a prepare whose every site and arm the test began finished (`store_wire.COMPILED`'s
     `tried` and `done`): an assertion, its programs all compiled, over the zeros a prepared arm gives in a
     prepare (`reference_error.ahead_arm`), which judges nothing, its run judging it (rows 10169 on: a cell
     asserting a product's value failed its file's prepare). A missing program (`truths_ahead.MissingTruth`) is
     no such check, nor a failure before any site or arm (`pytest_runtest_makereport`'s unprepared)."""
     if excinfo is None or not tier_wire.preparing() or not excinfo.errisinstance(AssertionError):
         return False
+    import store_wire
     import truths_ahead
 
-    store = truths_ahead.COMPILED.get()
+    store = store_wire.COMPILED.get()
     return (not excinfo.errisinstance(truths_ahead.MissingTruth) and store is not None and store.prepare
             and bool(store.tried) and store.tried <= store.done)
 

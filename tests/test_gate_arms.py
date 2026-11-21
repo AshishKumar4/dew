@@ -328,6 +328,7 @@ def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch):
     import types
 
     import conftest
+    import store_wire
     import tier_wire
     import truths_ahead
 
@@ -337,14 +338,14 @@ def test_a_prepares_check_of_its_own_zeros_judges_nothing(monkeypatch):
         raise truths_ahead.MissingTruth
     store = types.SimpleNamespace(prepare=True, tried={"an arm"}, done={"an arm"})
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    token = truths_ahead.COMPILED.set(store)
+    token = store_wire.COMPILED.set(store)
     try:
         assert conftest.judged_on_zeros(checked)
         assert not conftest.judged_on_zeros(missing)
         store.done = set()
         assert not conftest.judged_on_zeros(checked)
     finally:
-        truths_ahead.COMPILED.reset(token)
+        store_wire.COMPILED.reset(token)
     monkeypatch.delenv(tier_wire.PREPARE)
     assert not conftest.judged_on_zeros(checked)
 
