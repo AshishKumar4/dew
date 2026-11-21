@@ -592,7 +592,8 @@ class MosaicForward(_Mainloop[Tiles]):
             return decides, model, count
         computed = query.dtype if scales is not None else value.dtype
         if (not config.natural_form and residuals is not Kept.SPLIT and not self.scaled
-                and self.rounds is None and algebra.headroom(computed) and not family.places_on_role):
+                and self.rounds is None and algebra.headroom(computed)
+                and family.budgets_registers and not family.places_on_role):
             scaled_model = dataclasses.replace(base, scaled=True)
             scaled_price = scaled_model.at(family, config)
             if scaled_price is None or scaled_price <= self.register_budget(config):
