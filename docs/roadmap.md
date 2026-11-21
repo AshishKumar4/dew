@@ -40,8 +40,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
-- Emission prices every operation Mosaic GPU can approximate (emission.APPROXIMATED: exp, exp2, log, log2, log1p, tanh, logistic, sin, cos, sqrt, rsqrt, pow) as…. [10824]
-- Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
