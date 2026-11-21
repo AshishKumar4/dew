@@ -1661,16 +1661,12 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         def transposed(residuals, cotangent):
             operands, saved = residuals
-            if live_cotangents:
-                cotangents = list(jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live))))
-            else:
-                pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, None))
-                cotangents = [pulled_back[index] for index in live]
-            # Each operand's cotangent typed as the operand varies (`summed_to_operand`): a kernel computes
-            # each device's partial from its own operands, varying where any of them does.
+            pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live) if live_cotangents
+                                                 else None))
+            cotangents = pulled_back if live_cotangents else [pulled_back[index] for index in live]
+            # Each typed as its operand varies (`varying_as`).
             leaves = jax.tree.leaves(operands)
-            return [summed_to_operand(each, leaves[index])
-                    for each, index in zip(cotangents, live, strict=True)]
+            return [varying_as(each, leaves[index]) for each, index in zip(cotangents, live, strict=True)]
 
         moving = [directions[index] for index in live]
         # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s
@@ -1697,20 +1693,25 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
 
 
-def summed_to_operand(cotangent, operand):
-    """`cotangent` summed over each manual axis it varies over that `operand` does not: the cotangent of an
-    operand every device of a checked manual map holds the same of (`dew.nn.sharding.checked`), from a kernel
-    whose result varies over every axis an operand varies over (`launches._typed`, row 9808), is each device's
-    partial, and the operand's whole cotangent their sum over those devices, typed as the operand varies, as
-    JAX's own transposes give a replicated operand's (row 10526: a GEMM template's kernel gradient for a
-    replicated matrix reached `ad.ct_check` varying over the map's axis). Outside a checked map, and for an
-    operand varying as its cotangent does, `cotangent` as it is."""
+def varying_as(cotangent, operand):
+    """`cotangent` typed as `operand` varies over a checked manual map's axes (`dew.nn.sharding.checked`):
+    summed over each axis it varies over that `operand` does not, and cast to varying over each `operand`
+    varies over that it does not, as JAX's own transposes type an operand's cotangent. A kernel's result
+    varies over every axis an operand varies over (`launches._typed`, row 9808), so its gradient of an
+    operand every device holds the same of is each device's partial, which sums to the operand's (row 10526:
+    a GEMM template's kernel gradient for a replicated matrix reached `ad.ct_check` varying over the map's
+    axis), and a cotangent the backward formed from values the same on every device is cast to an operand
+    each device holds its own of. `cotangent` as it is outside a checked map or where typed as `operand`."""
     import jax
 
     if cotangent is None or operand is None:
         return cotangent
-    axes = tuple(sorted(jax.typeof(cotangent).mat.varying - jax.typeof(operand).mat.varying))
-    return jax.lax.psum(cotangent, axes) if axes else cotangent
+    have, want = jax.typeof(cotangent).mat.varying, jax.typeof(operand).mat.varying
+    if extra := tuple(sorted(have - want)):
+        cotangent = jax.lax.psum(cotangent, extra)
+    if missing := tuple(sorted(want - have)):
+        cotangent = jax.lax.pcast(cotangent, missing, to="varying")
+    return cotangent
 
 
 def unbroadcast(cotangent, shape: tuple[int, ...]):

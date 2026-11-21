@@ -993,7 +993,7 @@ def _typed(backward, parameters: int = 0):
             inputs, formed = with_gradients_formed(local[:-parameters], local[-parameters:])
             local = (*inputs, *formed)
         return tuple(gradient if gradient is None or operand is None
-                     else generation.summed_to_operand(gradient, operand).astype(jax.typeof(operand).dtype)
+                     else generation.varying_as(gradient, operand).astype(jax.typeof(operand).dtype)
                      for gradient, operand in zip(local, operands, strict=True))
     return typed
 

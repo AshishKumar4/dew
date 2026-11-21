@@ -51,21 +51,23 @@ def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generat
     assert np.any(np.asarray(once.astype(jnp.bfloat16), np.float32) != expected)
 
 
-@INTERPRETS
-@pytest.mark.parametrize("target", ["sm90", "cpu"])
-def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_its_own_of(target):
-    """A region fused through `fused_gemm.fused` in a shard_map over two CPU devices that checks the axes its
-    values vary over (`check_vma`): each device's rows and its own bias (both varying over the map's axis), a
-    feature scale and the matrix the same on every device, the rows scaled before the product (its producer,
-    the template's prologue) and the bias added after (its epilogue). On an assumed, interpreted H100 the
-    template's launch, named, takes both, its product typed as its operands vary (row 9808); on the CPU, XLA's
-    products run them whole, checked. Each device's region computes the scaled rows' dot rounded to bf16 plus
-    its bias, bitwise, over integers whose sums pass bf16's 256."""
-    keys = jax.random.split(jax.random.key(9808), 4)
-    x = jax.random.randint(keys[0], (2, 64, 128), -7, 8).astype(jnp.bfloat16)
-    scale = jax.random.randint(keys[1], (128,), -3, 4).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[2], (128, 256), -7, 8).astype(jnp.bfloat16)
-    bias = jax.random.randint(keys[3], (2, 256), -3, 4).astype(jnp.bfloat16)
+def _checked_draws(seed: int, wide: int, narrow: int) -> tuple:
+    """Two devices' rows (2 x 64 x 128) and biases (2 x 256), a feature scale (128) and a matrix (128 x
+    256), integers in bf16: the rows and the matrix within `wide` of zero, the scale and the bias within
+    `narrow`."""
+    keys = jax.random.split(jax.random.key(seed), 4)
+    x = jax.random.randint(keys[0], (2, 64, 128), -wide, wide + 1).astype(jnp.bfloat16)
+    scale = jax.random.randint(keys[1], (128,), -narrow, narrow + 1).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[2], (128, 256), -wide, wide + 1).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[3], (2, 256), -narrow, narrow + 1).astype(jnp.bfloat16)
+    return x, scale, w, bias
+
+
+def _checked_map(target: str):
+    """A region fused through `fused_gemm.fused` (the rows scaled before the product, its producer, and a bias
+    added after, its epilogue) in a shard_map over two CPU devices that checks the axes its values vary over
+    (`check_vma`): each device's rows and bias its own, the scale and the matrix the same on every device;
+    the product interpreted where `target` is a GPU's."""
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
     data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
 
@@ -76,8 +78,22 @@ def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_i
     def each_device(x, scale, w, bias):
         return fused_gemm.fused(region, x[0], scale, w, bias[0])[None]
 
-    mapped = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, data),
-                                   out_specs=data, check_vma=True))
+    return jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, data), out_specs=data,
+                         check_vma=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("target", ["sm90", "cpu"])
+def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_its_own_of(target):
+    """A region fused through `fused_gemm.fused` in a shard_map over two CPU devices that checks the axes its
+    values vary over (`check_vma`): each device's rows and its own bias (both varying over the map's axis), a
+    feature scale and the matrix the same on every device, the rows scaled before the product (its producer,
+    the template's prologue) and the bias added after (its epilogue). On an assumed, interpreted H100 the
+    template's launch, named, takes both, its product typed as its operands vary (row 9808); on the CPU, XLA's
+    products run them whole, checked. Each device's region computes the scaled rows' dot rounded to bf16 plus
+    its bias, bitwise, over integers whose sums pass bf16's 256."""
+    x, scale, w, bias = _checked_draws(9808, 7, 3)
+    mapped = jax.jit(_checked_map(target))
     if target == "cpu":
         got = mapped(x, scale, w, bias)
     else:
@@ -102,23 +118,8 @@ def test_a_replicated_operands_gradient_in_a_checked_manual_map_is_summed_over_i
     kernel gradient typed as its operands vary (row 9808), which reverse mode then sums over the devices (row
     10526: `ad.ct_check` refused a varying cotangent for the unvarying matrix); on the CPU, XLA's products,
     checked. The gradients equal the whole program's, bitwise, over integers whose sums stay exact."""
-    keys = jax.random.split(jax.random.key(10526), 4)
-    x = jax.random.randint(keys[0], (2, 64, 128), -3, 4).astype(jnp.bfloat16)
-    scale = jax.random.randint(keys[1], (128,), -2, 3).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[2], (128, 256), -3, 4).astype(jnp.bfloat16)
-    bias = jax.random.randint(keys[3], (2, 256), -2, 3).astype(jnp.bfloat16)
-    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
-    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
-
-    def region(x, scale, w, bias):
-        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16,
-                                  interpret_on_cpu=target != "cpu") + bias
-
-    def each_device(x, scale, w, bias):
-        return fused_gemm.fused(region, x[0], scale, w, bias[0])[None]
-
-    mapped = jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, data),
-                           out_specs=data, check_vma=True)
+    x, scale, w, bias = _checked_draws(10526, 3, 2)
+    mapped = _checked_map(target)
 
     def loss(scale, w):
         return jnp.sum(mapped(x, scale, w, bias).astype(jnp.float32))
