@@ -468,26 +468,20 @@ def _running_prefix(call: Call, rows, decays: jax.Array, keys: int) -> tuple:
         for ref, value in zip(refs, pair, strict=True):
             plgpu.store(ref, value, optimized=False)
 
-    def summed(t, running):
-        found = compensated_add(running, loaded(slab(t)))
-        stored(slab(t), found)
-        return found
-
+    # Unrolled: a slab's rows strided at a static start (Mosaic GPU slices no stride from a traced one).
     zero = plgpu.layout_cast(jnp.zeros((runs, keys), jnp.float32), layout)
-    jax.lax.fori_loop(0, length, summed, (zero, zero))
+    running = (zero, zero)
+    for t in range(length):
+        running = compensated_add(running, loaded(slab(t)))
+        stored(slab(t), running)
     mosaic.synced(call.interpret)
     # Each run's carry: the runs before it, each's last row, the zero rows where there are fewer.
     carry = (zero, zero)
     for back in range(1, runs):
         carry = compensated_add(carry, loaded(slab(length - 1 - back * length)))
     mosaic.synced(call.interpret)
-
-    def carried(t, carry):
+    for t in range(length if runs > 1 else 0):
         stored(slab(t), compensated_add(loaded(slab(t)), carry))
-        return carry
-
-    if runs > 1:
-        jax.lax.fori_loop(0, length, carried, carry)
     mosaic.synced(call.interpret)
     return tuple(call.family.tile_of(rows.at[half, pl.ds(pad, chunk)]) for half in (0, 1))
 
