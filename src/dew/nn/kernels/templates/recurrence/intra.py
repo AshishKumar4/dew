@@ -439,9 +439,8 @@ def _running(call: Call) -> bool:
     """Whether `_prefix_halves` sums a key block a column a thread (`_running_prefix`): where the width takes
     the warpgroup's threads' worth of keys and the program's `[C, keys]` fp32 tiles (its decays' ring slot,
     which a TMA store lands through, else a landing of its own, and the two halves' rows) fit the target's
-    shared memory, else the
-    doubling scan at two sub-chunks' worth of keys: an sm120's 99 KB holds no 128 KB program, and the call
-    derived no tiles."""
+    shared memory, else the doubling scan at two sub-chunks' worth of keys: an sm120's 99 KB holds no 128 KB
+    program, and the call derived no tiles."""
     tiles = ((4 if call.family.stores_through_registers else 3) * call.chunk * scan.THREADS
              * jnp.dtype(jnp.float32).itemsize)
     return call.width % scan.THREADS == 0 and tiles <= generation.shared_budget(call.target)
