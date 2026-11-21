@@ -51,6 +51,7 @@ from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
     DepthwiseConv1d,
+    Heads,
     held_scan,
     over_sequence,
     scan_cache,
@@ -287,12 +288,16 @@ class Mamba(nn.Module):
             # Each shard convolves its slice reading the real tokens before it from the earlier ones
             # (`sequence_conv`); the step, B and C come token by token outside; each shard scans from
             # zero, then from the state the earlier ones leave it (`_sequence_scan`, `sequence_entered`).
+            # Each channel its own conv and state, split as heads are (`Heads`); B and C every channel's.
+            channels = self.intermediate_size
             convolved = over_sequence(functools.partial(_sequence_conv, dtype=wide), shards,
-                                      (mixed.astype(wide), tokens.segments, valid), (taps, bias))
+                                      (mixed.astype(wide), tokens.segments, valid), (taps, bias),
+                                      heads=Heads(channels, channels, {0: 2, 3: 0, 4: 0}))
             xs, step, B, C = self._projected(convolved, valid)
             out = over_sequence(functools.partial(_sequence_scan, chunk_size=self.chunk_size), shards,
                                 (xs, step, B, C, tokens.starts),
-                                (-accurate_exp(jnp.asarray(self.A_log, wide)), jnp.asarray(self.D, wide)))
+                                (-accurate_exp(jnp.asarray(self.A_log, wide)), jnp.asarray(self.D, wide)),
+                                heads=Heads(channels, channels, {0: 2, 1: 2, 5: 0, 6: 0}))
             # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'.
             out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         else:

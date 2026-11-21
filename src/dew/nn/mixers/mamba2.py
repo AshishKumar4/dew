@@ -72,6 +72,7 @@ from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
     DepthwiseConv1d,
+    Heads,
     decode_kernel,
     decode_step,
     fused_token,
@@ -417,9 +418,18 @@ class Mamba2(nn.Module):
         shards = sequence_split(decode, tokens)
         if shards > 1:
             # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
-            out = over_sequence(functools.partial(_sequence_mix, scan=scan, dtype=compute), shards,
-                                (mixed.astype(wide), dt, tokens.segments, tokens.starts, valid),
-                                ((taps, bias, *heads),))
+            # Its x, B and C channels apart, each split by its heads (B and C by their groups, `Heads`), as
+            # are the conv's taps and bias and the heads' parameters.
+            width = self.num_heads * self.head_dim
+            edges = [width, width + self.n_groups * self.state_size]
+            weights = (*jnp.split(taps, edges, axis=0), *(jnp.split(bias, edges) if bias is not None
+                                                          else (None,) * 3), *heads)
+            operands = (*jnp.split(mixed.astype(wide), edges, axis=-1), dt, tokens.segments, tokens.starts,
+                        valid)
+            at = dict.fromkeys(range(4), 2) | dict.fromkeys(range(len(operands), len(operands) + 9), 0)
+            out = over_sequence(functools.partial(_sequence_mix, scan=scan, state_size=self.state_size,
+                                                  dtype=compute), shards, operands, weights,
+                                heads=Heads(self.num_heads, self.n_groups, at))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
             return self.out_proj(self._gated(out, gate).astype(gate.dtype))
@@ -483,21 +493,25 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     return out.reshape(batch, length, intermediate), final
 
 
-def _sequence_mix(mixed, dt, segments, starts, valid, weights, *, scan, dtype):
+def _sequence_mix(xs, B, C, dt, segments, starts, valid, *weights, scan, state_size: int, dtype):
     """The conv and the scan over this shard's slice of whole training
-    sequences, inside a `shard_map` that holds the sequence axis manual
+    sequences and its share of the heads, inside a `shard_map` that holds the sequence axis manual
     (`over_sequence`); a single shard runs `held_scan` instead.
 
-    `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32
-    and handed to the scan in `dtype`, the model's compute dtype, `dt`
+    `xs`, `B` and `C` `[B, S, ...]` the projection's channels, its heads' and their groups', convolved in at
+    least fp32 and handed to the scan in `dtype`, the model's compute dtype, `dt`
     `[B, S, H]` in fp32, `segments` `[B, S]` and their documents' `starts` or None, `valid` `[B, S]`
-    the real tokens or None, `weights` the conv's taps and bias and the heads' `dt_bias`, `A` and
-    `D`. The conv reads the real tokens before each shard's first from the earlier shards
-    (`sequence_conv`) and the scan is corrected for the earlier shards' state (`_ssd`). A segment change
-    resets both wherever it falls; a padded slot's step is zero."""
-    taps, bias, dt_bias, A, D = weights
-    convolved = sequence_conv(mixed, taps, bias, segments, valid, dtype=dtype)
-    out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, valid=valid, axis=SEQUENCE_AXIS)
+    the real tokens or None, `weights` the conv's taps and bias, each of the three's, and the heads'
+    `dt_bias`, `A` and `D`. The conv reads the real tokens before each shard's first from the earlier shards
+    (`sequence_conv`) and the scan is corrected for the earlier shards' state (`_ssd`), at the shard's heads
+    and groups (`state_size` a group's B and C width). A segment change resets both wherever it falls; a
+    padded slot's step is zero."""
+    taps, bias, (dt_bias, A, D) = weights[:3], weights[3:6], weights[6:]
+    bias = None if bias[0] is None else jnp.concatenate(bias)
+    convolved = sequence_conv(jnp.concatenate((xs, B, C), axis=-1), jnp.concatenate(taps, axis=0), bias,
+                              segments, valid, dtype=dtype)
+    out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, valid=valid, axis=SEQUENCE_AXIS,
+                  num_heads=dt.shape[2], n_groups=B.shape[-1] // state_size)
     # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'
     # (a remat policy's `RESIDUALS`).
     return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
