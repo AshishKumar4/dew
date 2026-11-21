@@ -451,8 +451,7 @@ class Trainer(Generic[Loss, Effects]):
             # step donates the state.
             scale=None if self._loss_scale is None else jax.tree.map(transferred_copy, self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
-            variables=params,
-            opt_state=opt_state,
+            variables=params, opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
             # step donates the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(transferred_copy, select(params, ema.select)),
@@ -2138,6 +2137,7 @@ class Trainer(Generic[Loss, Effects]):
         ends on, ranked by them: a budget's last step, a stream's that ran out and a
         plateau's (`_between_steps`)."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
+        state = plan.closed_at_budget(state, run.clock.read)
         self._take(plan, run, interval, state, unlogged=True)
         self._read_taken(run)
         if run.notice is not None and run.cooling is None:

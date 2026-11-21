@@ -1913,6 +1913,51 @@ def test_a_split_step_whose_window_commits_before_its_last_part_logs_that_update
     assert int(committed.count) == 1
     assert float(loss) == 5.0
 
+class TokenTargeted(Targeted):
+    """`Targeted`, each row one valid target token."""
+
+    counts_tokens = True
+
+    def scored_tokens(self, batch):
+        return jnp.ones(jnp.shape(batch["target"]), jnp.int32)
+
+
+def test_a_token_budget_reached_inside_a_split_step_ends_the_run_at_that_commit():
+    """A step read in two microbatches whose first step's first part is rejected: the second step's first part
+    commits the window its second part opened, reaching a budget of one token, and its second part opens the
+    next. The run ends at that commit: the state it returns, which its last checkpoint saves, holds no
+    window past it (training.md §4, row 6143: the later partial window was kept)."""
+    from dew.data.dataset import Loader
+    from dew.state import occupied
+
+    rows = 2 * jax.device_count()
+    targets = [(1e20, 1.0), (3.0, 5.0), (7.0, 9.0)]
+
+    class Stream:
+        def __init__(self):
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            first, second = targets[min(self.index, len(targets) - 1)]
+            self.index += 1
+            return {"target": np.asarray([first, second] * (rows // 2), np.float32)}
+
+        def get_state(self):
+            return json.dumps({"index": self.index}).encode()
+
+        def set_state(self, state):
+            self.index = json.loads(state)["index"]
+
+    trainer = Trainer(TokenTargeted(), optax.sgd(0.0), key=jax.random.key(0), split=2, dynamic_scale=True)
+    state = trainer.fit(Loader(train=lambda partition: Stream(), batch=rows, records=None), tokens=1,
+                        log_every=1)
+    assert int(state.step) == 2
+    assert state.window is None or occupied(state.window) == 0
+
+
 # --------------------------------------------------------------------------
 # The collections an objective writes back
 # --------------------------------------------------------------------------

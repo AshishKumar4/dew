@@ -177,6 +177,14 @@ class FitPlan:
                 or (self.tokens is not None and real >= self.tokens)
                 or (bound is not None and consumed >= bound))
 
+    def closed_at_budget(self, state: TrainState, real: int) -> TrainState:
+        """`state` as a run that reached its token budget (`tokens`) at `real` committed tokens ends: at the
+        commit that reached it, the window a split step's later microbatches opened past that commit
+        dropped (training.md §4, row 6143); as it is otherwise."""
+        if self.tokens is None or real < self.tokens or state.window is None:
+            return state
+        return state.with_window(None)
+
     def paused(self, step: int, real: int, consumed: int = 0) -> bool:
         """Whether the run has reached where its `Pause` ends it, after `real` tokens and `consumed`
         examples."""
