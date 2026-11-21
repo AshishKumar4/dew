@@ -31,7 +31,7 @@ COMPOSED = [
                          ids=lambda value: "on" if value else "off")
 def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copies, gated):
     """A bf16 decoder of three layers whose middle one loops `CAP` passes, its features composed: it plans
-    and takes four steps, two microbatches an update, committing two updates, each loss finite; it holds
+    and takes four steps, two microbatches an update, committing two updates (`updates`), each loss finite; it holds
     narrow copies where they are on and none where off; and a drawn pass count steps more than one count,
     each microbatch's loss, with every feature on, that of the program a run fixed at its count compiles
     from the same state (its copies or its weights read whole the same values)."""
@@ -62,7 +62,7 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
                 own_loss = fixed[count](jax.device_put(*given), batch)[1]
                 np.testing.assert_array_equal(np.asarray(loss), np.asarray(own_loss), err_msg=f"{index}")
     assert isinstance(step, DrawingStep) == drawn and (not drawn or len(set(counts)) > 1), counts
-    assert int(state.step) == 2, int(state.step)
+    assert int(state.step) == 4 and int(state.updates) == 2, (int(state.step), int(state.updates))
     held = [] if state.compute is None else jax.tree.leaves(state.compute)
     assert bool(held) == copies, (drawn, implicit, copies, gated)
 
