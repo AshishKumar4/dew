@@ -111,7 +111,10 @@ def _digest(tree) -> str:
         every = from_every_process(held)
         held = [next(read for read in (rank[at] for rank in every) if read is not None)
                 for at in range(len(held))]
-    marks = {index: np.asarray(mark, np.uint32) for (_, indices, _), read in zip(plan, held, strict=True)
+    # Every part is held by some process, so each part's marks are read once the round is taken.
+    reads = [read for read in held if read is not None]
+    assert len(reads) == len(plan), (len(reads), len(plan))
+    marks = {index: np.asarray(mark, np.uint32) for (_, indices, _), read in zip(plan, reads, strict=True)
              for index, mark in zip(indices, read, strict=True)}
     digest = hashlib.sha256()
     for index, (path, leaf) in enumerate(flat):

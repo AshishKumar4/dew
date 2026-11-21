@@ -81,10 +81,11 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
                 await handlers._async_serialize_replica_slices(
                     empty, [infos[index] for index in absent], [args[index] for index in absent],
                     primary_host=None, metadata_key=self._metadata_key, array_metadata_store=None,
-                    enable_replica_parallel_separate_folder=False, use_replica_parallel=False, ext_metadata={})
+                    enable_replica_parallel_separate_folder=False, use_replica_parallel=False,
+                    ext_metadata={})
 
-            futures.append(future.CommitFutureAwaitingContractedSignals(metadata_written(),
-                                                                       name="serialize_submesh_metadata"))
+            futures.append(future.CommitFutureAwaitingContractedSignals(
+                metadata_written(), name="serialize_submesh_metadata"))
         by_owner: dict[int, list[int]] = {}
         for index in parted:
             if values[index].addressable_shards:
