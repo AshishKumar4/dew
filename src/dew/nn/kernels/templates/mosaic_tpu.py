@@ -279,12 +279,15 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 return named(*given, *made[:len(outputs)])
 
             spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(values))]
+            # Programs with no in-place aliased refs (`places`) have independent grid outputs (`parallel`);
+            # launches with `added` refs stay `arbitrary` so read-modify-writes never race.
+            semantics = ("arbitrary" if places else "parallel",) * len(grid)
             written = launches.pallas_call(
                 program, name=name or self.name, out_shape=(*outputs, *aliased), grid=grid,
                 in_specs=[pl.BlockSpec(memory_space=space) for space in spaces],
                 out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (len(outputs) + len(aliased)),
                 input_output_aliases={at: len(outputs) + k for k, at in enumerate(places)},
-                compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",) * len(grid)),
+                compiler_params=pltpu.CompilerParams(dimension_semantics=semantics),
                 interpret=pltpu.InterpretParams() if interpret else False,
                 cost_estimate=emission.built_with(cost))(*values)
             for at, added in zip(places, written[len(outputs):], strict=True):
