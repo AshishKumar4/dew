@@ -82,7 +82,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
-- Prelude-anchored cross-pass message passing on Loop. [10806]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - An NVFP4 source's weights served packed, algebra.md §7.4's prepare step. [8550]
 - Dory: the release qualified and its tests' oracles. [596]
@@ -93,6 +92,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
+- Product mode on a TPU (src/dew/nn/kernels/templates/product.py product_mode). [10845]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]

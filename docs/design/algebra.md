@@ -805,12 +805,16 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   added to `GpuTarget` or its `Architecture`, never to the engine. Prices are checked against measured profiles,
   never fitted to them; a form whose price and profile disagree is a finding against the cost model.
 - One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`,
-  whose units kernel-templates.md §6 states. The algebra's terms price through it (`cost.work`: a product's FLOPs in
-  its mode, from its operands' dtypes and its precision as the product declaration reads them, a dot
-  algorithm's passes counted, and its operand bytes; a reduction's operations; a special function's
-  exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing;
-  a leaf's bytes, read once). Today `cost.work` states that by hand, a primitive at a time; the per-primitive
-  rules that are to read a kernel's body are to read each term as its equation too (row 5901). A template
+  whose units kernel-templates.md §6 states. A term's arithmetic is priced by the rule the kernels' counter
+  prices a kernel body's equation by (`emission.operation_work`, row 5901), its primitive's over its operands'
+  shapes: a product's FLOPs in the mode and passes it multiplies in on the price's target
+  (`product.product_mode`, from its operands' dtypes and its precision as the product declaration reads them, a
+  dot algorithm's passes counted, a TPU's fp32 product its bfloat16 passes); a reduction's operations; a special
+  function's exponentials, a conversion's conversions, any other elementwise operation's operations (a clamp's
+  two), a layout change nothing; and a primitive no rule prices (an atan2, an erf_inv) its elements as work no
+  rate prices (`Work.unpriced_operations`), so no form is cheaper for taking more of it. `cost.work` adds XLA's
+  fusion's own accounting beside it: a leaf's bytes, read once, a product's staged operand bytes, each
+  reduction's and product's kernel and what its result keeps on chip, a contracted multiply nothing. A template
   kernel's issued work is read from its body into the same record (docs/design/kernel-templates.md §6; today
   stated by hand, row 5895). The one other per-operation price, a bit form's own, is kernel-templates.md §6's gap (row 5386).
 - A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts, each
