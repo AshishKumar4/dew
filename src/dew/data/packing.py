@@ -24,17 +24,10 @@ from dew.batch import Batch
 from dew.data.dataset import Records, restore_parent
 from dew.data.generation import Generation
 from dew.data.pipeline import ACCOUNTS, DOCUMENT, ExpandStep, Pack
+from dew.data.placement import FirstFit, first_fit
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
-from dew.data.tokens import (
-    FirstFit,
-    PackedWindows,
-    chunk_lengths,
-    chunk_table,
-    entries,
-    first_fit,
-    packed_window,
-)
+from dew.data.tokens import PackedWindows, chunk_lengths, chunk_table, entries, packed_window
 
 
 def plan_name(pack: Pack, field: str) -> str:

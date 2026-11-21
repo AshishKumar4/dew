@@ -103,7 +103,6 @@ from dew.data.mixing import (
     rewound,
 )
 from dew.data.ordering import Skipping, place_of
-from dew.data.packing import packed_documents
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -936,8 +935,13 @@ class _Ruled(pygrain.IterDataset):
             documents = documents.map(_ConsumedAt(stage.fields[0], held))
             laid = (*ACCOUNTS, *(() if held is None else (DOCUMENT,)))
             stage = dataclasses.replace(stage, fields=(*stage.fields, *laid))
-        windows = (packed_documents(documents.map(stage.document), stage, consumed=self._consumed)
-                   if isinstance(stage, Pack) else CausalWindows(documents, stage, held))
+        if isinstance(stage, Pack):
+            # Imported where a pack lowers, so a chain that packs nothing imports no packer.
+            from dew.data.packing import packed_documents
+
+            windows = packed_documents(documents.map(stage.document), stage, consumed=self._consumed)
+        else:
+            windows = CausalWindows(documents, stage, held)
         return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed, documents=held,
                               drawn=self._drawn)
 

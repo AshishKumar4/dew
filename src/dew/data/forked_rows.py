@@ -25,7 +25,7 @@ import numpy as np
 from flax import struct
 
 from dew.batch import BLOCKS_FIELD, Coordinates, Forks, coordinates
-from dew.data.tokens import FirstFit, common_prefix
+from dew.data.tokens import common_prefix
 
 
 @struct.dataclass
@@ -281,6 +281,8 @@ def _windows(groups: Sequence[list[int]], lengths: Sequence[int], keys: Sequence
     """`groups` of rows of `lengths` packed first-fit, longest first, into windows of `width` slots and
     at most `documents` documents where given (`laid_documents`): each window its groups in order, each as
     its prefix's length (`_prefix`, by `keys`) and its rows."""
+    from dew.data.placement import FirstFit
+
     planned = [(_prefix(group, lengths, keys), group) for group in groups]
     sizes = np.asarray([prefix + sum(lengths[number] - prefix for number in group)
                         for prefix, group in planned], np.int64)
