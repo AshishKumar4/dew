@@ -281,7 +281,7 @@
 "tests/test_attention_mosaic_compile.py::test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100[1]",
 "tests/test_attention_mosaic_compile.py::test_a_ladder_that_spills_throughout_certifies_its_ends_alone",
 "tests/test_attention_mosaic_compile.py::test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them",
-"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[sm100]",
+"tests/test_attention_mosaic_compile.py::test_a_launchs_stored_verdict_is_not_read_where_another_nvcc_wheel_is_installed",
 "tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[sm80]",
 "tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[sm90]",
 "tests/test_attention_mosaic_compile.py::test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources[sm100-256]",
@@ -507,7 +507,7 @@
 "tests/test_attention_triton.py::test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler[sm80]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-64x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp16-forward-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp32-step-32x32]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-softcap-step-128x64]",
@@ -844,6 +844,17 @@
 "tests/test_cross_attention.py::test_every_residual_form_takes_the_blocks[single-pass-mhc]",
 "tests/test_cross_attention.py::test_freeze_keeps_what_a_split_tree_trains",
 "tests/test_cross_attention.py::test_the_blocks_train_beside_an_adapter_with_the_source_frozen"
+],
+"tests/test_cross_pass.py": [
+"tests/test_cross_pass.py::test_a_loop_passing_messages_computes_its_passes_unrolled[scanned layers]",
+"tests/test_cross_pass.py::test_a_loop_passing_messages_computes_its_passes_unrolled[the last trained]",
+"tests/test_cross_pass.py::test_a_loop_passing_messages_computes_its_passes_unrolled[two]",
+"tests/test_cross_pass.py::test_a_loop_passing_messages_decodes_as_it_prefills",
+"tests/test_cross_pass.py::test_a_loop_passing_messages_resumes_as_it_never_stopped",
+"tests/test_cross_pass.py::test_a_packed_attention_projects_each_site_apart_as_its_own_projections_do",
+"tests/test_cross_pass.py::test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repeats[2-attention]",
+"tests/test_cross_pass.py::test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repeats[2-one pass gaining messages]",
+"tests/test_cross_pass.py::test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repeats[3-hybrid]"
 ],
 "tests/test_data.py": [
 "tests/test_data.py::test_a_read_cut_per_share_expands_and_draws_in_its_workers_alike_in_any_count",
@@ -2744,9 +2755,9 @@
 "tests/test_recurrence_stability.py::test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences[turned-decays near one]"
 ],
 "tests/test_recurrence_template_stability.py": [
-"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-decays near one-accurate]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[vector_delta-aligned_keys]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-resets on chunk edges-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-saturated gates-accurate]",
-"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-spread gates-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-the decay bound-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-spread gates-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-steep then mild-fast]",
@@ -3462,6 +3473,9 @@
 "tests/test_wan_source.py": [
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
+],
+"tests/test_weighed_check.py": [
+"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
