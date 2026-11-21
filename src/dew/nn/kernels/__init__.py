@@ -13,13 +13,12 @@ here pulled `ssd`, `algebra.scan`, and `templates.report` into 3,856 test
 tasks (Train 1123 `keydiff`).
 """
 
-from __future__ import annotations
-
-import importlib
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from .generation import (
+from dew._exports import lookup as _lookup
+
+if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew.nn.kernels.generation import (
         PALLAS_CHOICES,
         TARGETS,
         GpuTarget,
@@ -33,30 +32,40 @@ if TYPE_CHECKING:
         gpu_target,
         triton_runs,
     )
-    from .ssd import ssd_kernel_platform, ssd_kernel_runs
+    from dew.nn.kernels.ssd import ssd_kernel_platform, ssd_kernel_runs
 
-_NAMED = {
-    **dict.fromkeys((
-        "PALLAS_CHOICES", "TARGETS", "GpuTarget", "assumed", "backend", "bf16_dot_runs",
-        "chosen_kernel", "compile_only_gpus", "device_generation", "gpu_mesh", "gpu_target",
-        "triton_runs",
-    ), "generation"),
-    "ssd_kernel_platform": "ssd",
-    "ssd_kernel_runs": "ssd",
+_EXPORTS = {
+    "PALLAS_CHOICES": "dew.nn.kernels.generation",
+    "TARGETS": "dew.nn.kernels.generation",
+    "GpuTarget": "dew.nn.kernels.generation",
+    "assumed": "dew.nn.kernels.generation",
+    "backend": "dew.nn.kernels.generation",
+    "bf16_dot_runs": "dew.nn.kernels.generation",
+    "chosen_kernel": "dew.nn.kernels.generation",
+    "compile_only_gpus": "dew.nn.kernels.generation",
+    "device_generation": "dew.nn.kernels.generation",
+    "gpu_mesh": "dew.nn.kernels.generation",
+    "gpu_target": "dew.nn.kernels.generation",
+    "triton_runs": "dew.nn.kernels.generation",
+    "ssd_kernel_platform": "dew.nn.kernels.ssd",
+    "ssd_kernel_runs": "dew.nn.kernels.ssd",
 }
-"""Each name the package re-exports, by the submodule that defines it."""
 
+__getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
-def __getattr__(name: str):
-    """`name` of the package, loaded where it is first read and held from then on."""
-    module = _NAMED.get(name)
-    if module is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    found = getattr(importlib.import_module(f"{__name__}.{module}"), name)
-    globals()[name] = found
-    return found
-
-
-__all__ = ["PALLAS_CHOICES", "TARGETS", "GpuTarget", "assumed", "backend", "bf16_dot_runs", "chosen_kernel",
-           "compile_only_gpus", "device_generation", "gpu_mesh", "gpu_target", "ssd_kernel_platform",
-           "ssd_kernel_runs", "triton_runs"]
+__all__ = [
+    "PALLAS_CHOICES",
+    "TARGETS",
+    "GpuTarget",
+    "assumed",
+    "backend",
+    "bf16_dot_runs",
+    "chosen_kernel",
+    "compile_only_gpus",
+    "device_generation",
+    "gpu_mesh",
+    "gpu_target",
+    "ssd_kernel_platform",
+    "ssd_kernel_runs",
+    "triton_runs",
+]

@@ -174,10 +174,11 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
     installed = seal().digest
     if installed is None:
         return None
+    rates = cost.rates(target, device=False)
     stated = [package_digest(), installed.hex(), report._identity(op, ba), target.generation,
-              target.multiprocessors, tuning.encoded(candidates), _keyed_environment()]
+              target.device_kind, target.multiprocessors, target.launch_seconds, rates._asdict(),
+              tuning.encoded(candidates), _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
-
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                              tiles: Callable[[int, int, int], Config],
