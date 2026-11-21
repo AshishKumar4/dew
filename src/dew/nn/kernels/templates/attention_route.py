@@ -23,8 +23,8 @@ import jax.numpy as jnp
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates.attention import (
+    ACCURATE,
     BLOCK,
-    DTYPES,
     NATURAL,
     Gradients,
     Hooks,
@@ -46,6 +46,7 @@ def _plain():
     from dew.nn.kernels.templates import attention_portable
 
     return attention_portable, attention_portable.Tiles(BLOCK, BLOCK, BLOCK)
+
 
 def _unfitted_none(**_kw) -> None:
     return None
