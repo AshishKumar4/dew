@@ -423,12 +423,14 @@ the kernel's limit, leaving the next test the other half to compile in; None whe
 def release() -> None:
     """Release every compiled executable JAX holds, and the code XLA mapped for it, the float64 terms
     walk's traces and compiled runs among them (`float64_terms.released`, where a test loaded the walk),
-    and those Dew's own programs keep past jit's caches (`dew.nn.kernels.options.release`)."""
-    from dew.nn.kernels import options
-
+    and those Dew's own programs keep past jit's caches (`dew.nn.kernels.options.release`, where a test
+    loaded the kernels: importing them here would make every file's run execute the kernel toolkit's
+    modules, each file's cache key then moving with every edit to them; trains 1107 and 1108 kept 0 of
+    4,324 rows so)."""
     if (terms := sys.modules.get("float64_terms")) is not None:
         terms.released()
-    options.release()
+    if (options := sys.modules.get("dew.nn.kernels.options")) is not None:
+        options.release()
     jax.clear_caches()
     gc.collect()
 
@@ -452,10 +454,10 @@ def release_compilations():
 def fresh_held_steps():
     """Each test plans its steps as a fresh process does: the step executables an earlier test's trainers
     compiled, which the process holds across trainers (`dew.nn.kernels.options.hold`), are dropped as it
-    begins, so what a test's start compiles is its own."""
-    from dew.nn.kernels import options
-
-    options.unhold()
+    begins, so what a test's start compiles is its own. None is held before a test loaded the kernels, and
+    importing them here would make every test's run execute the kernel toolkit (`release`)."""
+    if (options := sys.modules.get("dew.nn.kernels.options")) is not None:
+        options.unhold()
 
 
 @pytest.fixture(autouse=True)
