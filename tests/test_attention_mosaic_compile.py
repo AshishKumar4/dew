@@ -1273,6 +1273,8 @@ def test_bf16_template_compiles_for_a_v5e():
 
     query = jax.ShapeDtypeStruct((1, 256, 4, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 256, 2, 128), jnp.bfloat16)
+    long_q = jax.ShapeDtypeStruct((1, 8192, 32, 128), jnp.bfloat16)
+    long_k = jax.ShapeDtypeStruct((1, 8192, 8, 128), jnp.bfloat16)
 
     def fwd(q, k, v):
         with generation.chosen(attention_mainloop="mosaic"):
@@ -1282,8 +1284,11 @@ def test_bf16_template_compiles_for_a_v5e():
         with generation.chosen(attention_mainloop="mosaic"):
             out, pull = jax.vjp(fwd, q, k, v)
             return out, *pull(dout)
+
     cases = [KernelCase("v5e-bf16-fwd", lambda: (fwd, (query, key, key))),
-             KernelCase("v5e-bf16-step", lambda: (step, (query, key, key, query)))]
+             KernelCase("v5e-bf16-step", lambda: (step, (query, key, key, query))),
+             KernelCase("v5e-bf16-fwd-8192", lambda: (fwd, (long_q, long_k, long_k))),
+             KernelCase("v5e-bf16-step-8192", lambda: (step, (long_q, long_k, long_k, long_q)))]
     found = compile_tpu_kernels(cases, "v5e")
     assert not failures(found), "\n".join(failures(found))
 

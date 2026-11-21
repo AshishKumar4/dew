@@ -204,8 +204,13 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     ring_slots = STAGES
 
-    copies_tiled_rows = True
+    copy_extent = 512
+    """Maximum rows per tile copy on TPU VMEM: caps attention's walked key/query tiles at 512 so live
+    intermediate score tiles (`S`, `P`, `dP`, `dS`) stay within v5e's 16 MiB scoped VMEM at long sequences
+    (e.g. 8192 tokens) and causal walks skip masked tiles instead of forming one whole-sequence tile
+    (row 10152)."""
 
+    copies_tiled_rows = True
     def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
                   joined: tuple = ()) -> int:
         raise NotImplementedError("a TPU core budgets no registers: its values spill to VMEM")
