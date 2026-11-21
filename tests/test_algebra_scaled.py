@@ -749,3 +749,22 @@ def test_a_parameter_made_at_each_call_is_refused_at_bind():
             means.merged_output(outputs, totals, anchors, made, 0)
     np.testing.assert_array_equal(means.merged_output(outputs, totals, anchors, means.Units(), 0),
                                   means.merged_output(outputs, totals, anchors, NATURAL, 0))
+
+
+def test_triton_lowerings_are_registered_by_their_owners_without_importing_merged():
+    """Every `scaled.MADE` primitive, `derivatives.marked_call_p`, and `precision.correctly_rounded_divide_p`
+    registers its own Pallas Triton lowering lazily through `launches._register_triton_lowerings` (row 9794),
+    without requiring `dew.nn.kernels.templates.merged` to be imported first."""
+    import sys
+
+    from jax._src.pallas.triton import lowering as triton_lowering
+
+    from dew.nn import derivatives, precision
+    from dew.nn.kernels import launches
+
+    assert "dew.nn.kernels.templates.merged" not in sys.modules
+    launches._register_triton_lowerings()
+    rules = triton_lowering.triton_lowering_rules
+    assert set(scaled.MADE) <= set(rules)
+    assert derivatives.marked_call_p in rules
+    assert precision.correctly_rounded_divide_p in rules
