@@ -100,6 +100,7 @@ class LinearProbe:
 
     Each batch's representations are scored with `linear_probe_accuracy`.
     """
+    fields = ()
     num_classes: int
     steps: int = 100
     learning_rate: float = 1e-2
@@ -127,6 +128,7 @@ class KnnProbe:
 
     Each batch's representations are scored with `knn_probe_accuracy`.
     """
+    fields = ()
     num_classes: int
     k: int = 20
 

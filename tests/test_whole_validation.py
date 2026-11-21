@@ -305,6 +305,7 @@ def named_records(mesh=None) -> list[tuple[str, int, int]]:
                    loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     class Names:
+        fields = ()
         name, reads = "names", Representations
 
         def __init__(self):

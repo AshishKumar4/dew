@@ -135,6 +135,7 @@ class Features(Regression):
 
 
 class Spread:
+    fields = ()
     name = "spread"
     reads = Representations
 
