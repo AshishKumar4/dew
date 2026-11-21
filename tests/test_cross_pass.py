@@ -249,7 +249,7 @@ def _without_merges(params):
     pytest.param(("attention", {"steps": 3}), UNROLLED_SEEDS["attention"], id="attention",
                  marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
     pytest.param(("depth", {"steps": 3}), UNROLLED_SEEDS["depth residuals"], id="depth residuals"),
-    pytest.param(("scanned", {"steps": 3}), UNROLLED_SEEDS["scanned layers"], id="scanned layers",
+    pytest.param(("scanned", {"steps": 3}), UNROLLED_SEEDS["scanned layers"], id="scanned-layers",
                  marks=pytest.mark.check1_shards(seeds=128, per_task=32))])
 def test_a_loop_passing_messages_computes_its_passes_unrolled(case, seeds, request):
     """At gates drawn off zero, a loop passing messages computes its passes unrolled pass by pass from the
