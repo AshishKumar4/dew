@@ -837,7 +837,7 @@ class MosaicForward(_Mainloop[Tiles]):
         consecutive steps, a third stage keeps the producer prefetching instead of stalling on both slots."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if (config.consumers < 2 or not family.streams_operands or not family.budgets_registers
+        if (config.consumers < 2 or family.feeds_itself or not family.budgets_registers
                 or streams(query, target)):
             return config
         want = min(config.consumers + 1, -(-_keys(ba) // config.block_k))
