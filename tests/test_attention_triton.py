@@ -50,7 +50,7 @@ config, 128-key tiles among them, with the real dot. (Interpreted, XLA:CPU's fp3
 def _interpreted_as_an_a100():
     """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the
     Pallas-Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
-    if jax.default_backend() != "cpu":
+    if ON_GPU:
         yield
         return
     with generation.assumed("sm80"):
@@ -112,7 +112,8 @@ def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> te
     return template.Hooks(
         score_mod if scoring else None,
         (template.Param(slopes, template.Kind.HEAD),) if "alibi" in names else (),
-        template.sinks(SINKS, ROWS, queries, value_width) if "sinks" in names else None,
+        template.sinks(jnp.asarray(SINKS, jnp.float32), ROWS, queries, value_width) if "sinks" in names
+        else None,
         output_mod if "gate" in names else None,
         (template.Param(jnp.asarray(gate), template.Kind.OUTPUT),) if "gate" in names else ())
 
@@ -333,12 +334,10 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
                                      ("tile", template.Kind.TILE))
              if name in names]
 
-    def score_mod(s, q_pos, k_pos, *values):
+    def base_score_mod(s, q_pos, k_pos, *values):
         values = list(values)
         if "softcap" in names:
             s = SOFTCAP * jnp.tanh(s / SOFTCAP)
-        if "custom" in names:
-            s = custom_softcap(s)
         if "indexed" in names:
             s = s + 0.01 * q_pos[:, :1].astype(s.dtype)
         if "alibi" in names:
@@ -348,6 +347,12 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
         for _ in range(("query" in names) + ("key" in names) + ("tile" in names)):
             s = s + values.pop(0).astype(s.dtype)
         return s
+
+    if "custom" in names:
+        def score_mod(s, q_pos, k_pos, *values):
+            return base_score_mod(custom_softcap(s), q_pos, k_pos, *values)
+    else:
+        score_mod = base_score_mod
 
     def draw(seed: int):
         streams = jax.random.split(jax.random.fold_in(jax.random.key(77), seed), 6)
@@ -364,7 +369,7 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             params.append(jax.random.normal(streams[2], (rows, heads, queries, keys)))
         initial = None
         if "sinks" in names:
-            initial = template.sinks(SINKS[:heads], rows, queries, value_width)
+            initial = template.sinks(jnp.asarray(SINKS[:heads], jnp.float32), rows, queries, value_width)
         if "resumed" in names:
             total = jnp.exp(0.5 * jax.random.normal(streams[3], (rows, heads, queries)))
             acc = jax.random.normal(streams[4], (rows, heads, queries, value_width)) * total[..., None]
@@ -551,7 +556,6 @@ def test_a_triton_walk_over_values_near_fp32s_largest_walks_scaled_on_par(beside
     (row 8842). Beside a second head one of whose values is NaN (`nan head`), the first head's still is: the
     host's bound takes finite magnitudes alone, where the NaN left the whole call unscaled and the first head
     infinite (the base review of a648b3279, F5)."""
-    spans = template.spans(128, 128, 1)
     pins = {attention_triton.TritonForward: PINNED[1]}
     heads = 1 if beside == "alone" else 2
 
@@ -570,11 +574,12 @@ def test_a_triton_walk_over_values_near_fp32s_largest_walks_scaled_on_par(beside
         return query, key, value.astype(jnp.bfloat16)
 
     def ours(query, key, value):
+        spans = template.spans(128, 128, 1)
         with tuning.pinned(pins):
             return attention_triton.forward(query, key, value, spans, None, interpret=not ON_GPU)[:, :, :1]
 
     def xla(query, key, value):
-        return template.reference(query, key, value, spans)[:, :, :1]
+        return template.reference(query, key, value, template.spans(128, 128, 1))[:, :, :1]
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw, f"triton walk's bound, {beside}", seeds=SEEDS)
 
@@ -1258,3 +1263,37 @@ def test_a_forward_at_its_own_config_compiles_within_an_a100s_block(kept):
 
     found = compile_kernels([KernelCase("forward", lambda: (forward, (query, key, key)))], "sm80")
     assert not failures(found), "\n".join(failures(found))
+
+
+def test_triton_arms_state_without_device_bound_arrays():
+    """The forward and backward check-1 arms (`arguments`, `hooks_for`, `score_hooks`) state cleanly
+    (`truths_ahead.arm_role`) with no device-bound JAX array in their closure: a CPU prepare and a GPU run
+    then name the same program instead of diverging on `SingleDeviceSharding` (rows 9811-10006), and
+    non-custom `score_hooks` stay statable instead of closing over `custom_softcap`."""
+    import json
+
+    from truths_ahead import arm_role
+
+    from dew._stated import stated
+
+    case = CASES["causal-documents-window"]
+    queries, keys = geometry(case)
+
+    def forward_arm(query, key, value):
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
+        return attention_triton.forward(query, key, value, spans, hooks_for(HOOKS["sinks"], queries, 32),
+                                        interpret=not ON_GPU)
+
+    for hook_name in ("none", "softcap", "alibi", "row-indexed", "sinks", "softcap-sinks-alibi"):
+        score_mod, kinds, _ = score_hooks(SCORE_HOOKS[hook_name], queries, keys, 32)
+
+        def backward_arm(query, key, value, dout, params, initial, _mod=score_mod, _kinds=kinds):
+            spans = template.spans(queries, keys, ROWS, **arguments(case))
+            hooks = template.Hooks(_mod, tuple(template.Param(val, kind)
+                                               for val, kind in zip(params, _kinds, strict=True)), initial)
+            return attention_triton.backward(query, key, value, spans, hooks, dout, interpret=not ON_GPU)
+
+        for arm in (forward_arm, backward_arm):
+            assert arm_role("dew", jax.jit(arm), f"triton-arm-{hook_name}") is not None
+            encoded = json.dumps(stated(jax.jit(arm), f"triton-arm-{hook_name}"))
+            assert '"jax array"' not in encoded, hook_name
