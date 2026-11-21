@@ -523,12 +523,15 @@ def test_a_certification_compiles_alike_on_this_gpu_and_a_compile_only_one_of_it
     its key (`xla_gpu_deviceless_cub_mode`) and the build's did not, and a GH200 run of a step built on a
     compile-only H100 compiled five of its certifications again (row 8372, M-MC-27-3e). Each side certifies
     in a process of its own: in one, the second reads the first's certification, keyed by its generation
-    alone, and compiles none (row 9608)."""
+    alone, and compiles none (row 9608). Each reads and writes a compilation cache of its own too, beside
+    which its verdicts are stored (`tuning.store_verdict`, by generation, `report.verdict_target`): in one
+    they share, the second reads the first's verdict and compiles nothing to compare (row 10104)."""
     (tmp_path / "certified.py").write_text(CERTIFIED)
     environment = environment_of(tmp_path)
 
     def options(where: str) -> set[str]:
-        ran = subprocess.run([sys.executable, str(tmp_path / "certified.py"), where], env=environment,
+        ran = subprocess.run([sys.executable, str(tmp_path / "certified.py"), where],
+                             env={**environment, "JAX_COMPILATION_CACHE_DIR": str(tmp_path / where)},
                              check=True, capture_output=True, text=True)
         return set(json.loads(ran.stdout.strip().splitlines()[-1]))
 
@@ -580,3 +583,68 @@ def test_a_program_compiled_ahead_for_compile_only_gpus_of_no_stated_memory_comp
         got = jax.device_get(Executable.of(ahead).loaded(jax.devices()[:1])(*leaves))
     for value, wanted in zip(jax.tree.leaves(got), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(np.asarray(value), np.asarray(wanted))
+
+
+SERVED_KEPT = """
+import json
+import sys
+
+import jax
+import numpy as np
+from jax.experimental import pallas as pl
+
+from dew.nn.kernels.options import owned_program
+from dew.telemetry.compiles import Compiles
+from dew.training.ahead import kept, keeping
+
+# The persistent cache's reads: each program served from it, and each it had none of.
+events = []
+jax.monitoring.register_event_listener(lambda event, **_: events.append(event))
+
+
+def kernel(x_ref, o_ref):
+    o_ref[...] = x_ref[...] * 2.0 + 1.0
+
+
+def doubled(x):
+    return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
+
+
+# Drawn on the host, so the only program a process needs is `doubled`'s.
+x = np.arange(128 * 128, dtype=np.float32).reshape(128, 128)
+mode, path = sys.argv[1], sys.argv[2]
+with Compiles(None) as compiles:
+    if mode == "cache":
+        out = owned_program(doubled)(x)
+    elif mode == "keep":
+        with keeping() as programs:
+            out = owned_program(doubled)(x)
+        programs.save(path)
+    else:
+        with kept(path):
+            out = owned_program(doubled)(x)
+print(json.dumps({"ok": bool(np.array_equal(np.asarray(out), x * 2 + 1)),
+                  "hits": sum(event == "/jax/compilation_cache/cache_hits" for event in events),
+                  "misses": sum(event == "/jax/compilation_cache/cache_misses" for event in events),
+                  "compiled": len(compiles.seconds)}))
+"""
+"""A Pallas program on this GPU, in a process of its own sharing one cache: compiled into the persistent cache
+(`cache`), kept by `keeping` and saved to `path` (`keep`), or run from the file (`run`); whether it answered
+exactly, how many programs its cache served and had none of, and how many it compiled (`Compiles`, which
+hears a compile whether or not the cache keeps it)."""
+
+
+def test_a_gpu_process_keeps_a_program_its_cache_serves_and_another_runs_it_compiling_nothing(tmp_path):
+    """On a GPU a block keeping its programs (`ahead.keeping`) reads JAX's persistent cache as any compile
+    does: a Pallas program the cache serves is kept and saved whole, its kernel among it, and a third
+    process handed the file runs it exactly, compiling nothing (row 6641; a CPU's served executable loses its
+    kernels, so a CPU block compiles each again)."""
+    from process_support import fresh
+
+    path = str(tmp_path / "served.dew-aot")
+    assert fresh(SERVED_KEPT, "cache", path, cache_dir=tmp_path / "cache")["ok"]
+    keep = fresh(SERVED_KEPT, "keep", path, cache_dir=tmp_path / "cache")
+    run = fresh(SERVED_KEPT, "run", path, cache_dir=tmp_path / "other")
+    assert keep["ok"] and keep["hits"] and not keep["misses"], keep
+    assert run["ok"] and not run["hits"] and not run["misses"] and not run["compiled"], run
+

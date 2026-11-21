@@ -254,9 +254,10 @@ def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
     return files
 
 
-def passed(values: Source | Dataset) -> Iterator[Batch]:
+def passed(values: Source | Dataset, seed: int | None = None) -> Iterator[Batch]:
     """One pass over a store's or a chain's records, in their one order, as `export` writes them: a
-    store as a chain of it, by a read it supports, physical shards or none. Close it when done."""
+    store as a chain of it, by a read it supports, physical shards or none; a chain's random steps drawn
+    under `seed` where one is given (`compile.iterate`). Close it when done."""
     from dew.data.analysis import _preferred_read
     from dew.data.compile import iterate
     from dew.data.dataset import Loading
@@ -264,7 +265,7 @@ def passed(values: Source | Dataset) -> Iterator[Batch]:
 
     chain = values._chain() if isinstance(values, Dataset) else Pipeline(values)
     read = chain.mode or _preferred_read((chain,), provision=True)
-    return iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading()))
+    return iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading(), seed=seed))
 
 
 def export(

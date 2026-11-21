@@ -59,6 +59,7 @@ from dew.data.analysis import (
     _until,
     _volatile,
     _written,
+    draws,
     reach,
     written,
 )
@@ -1982,18 +1983,24 @@ def iterate(
     read: Read = "streamed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
+    seed: int | None = None,
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, in the process:
     automatic workers (`Loading.unsized`) and those the chain names (row 5735), whose turns would
-    interleave the records out of the order the pass publishes."""
+    interleave the records out of the order the pass publishes. A pass that seals what it makes (a
+    snapshot's, `seed` given) draws its random steps' values under `seed`, which the rows it seals keep
+    (row 9056: a video's clips drawn once and sealed); publication, whose cache a later pass writes
+    through, holds no draw."""
     loading = loading.unsized()
     pipeline = _in_process(pipeline)
-    if any(isinstance(stage, (RandomMap, BatchStage, MapBatch, Repeat)) for stage in _steps(pipeline)):
-        raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
+    if (seed is None and draws(pipeline)) or any(isinstance(stage, (BatchStage, MapBatch, Repeat))
+                                                 for stage in _steps(pipeline)):
+        raise ValueError("publication needs deterministic, unbatched pipelines without repeat; a snapshot "
+                         "seals a random step's draws (`snapshot(url, seed=...)`)")
     (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
                         training=False)
     # Publication reads records, unbatched.
-    build = _build(pipeline, read, loading, batch=1, training=False)
+    build = _build(pipeline, read, loading, batch=1, training=False, seed=0 if seed is None else seed)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 

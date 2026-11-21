@@ -745,6 +745,12 @@ def _random(stage: Stage) -> bool:
     return isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random)
 
 
+def draws(pipeline: Pipeline) -> bool:
+    """Whether a pass of `pipeline` draws from its records' rngs: a random step anywhere in its tree, a
+    mixed chain's or a configured one's (`_random`)."""
+    return any(_random(stage) for stage in _steps(pipeline))
+
+
 def _external(stage: Stage) -> bool:
     """Whether `stage` reads storage its record names by path (a step that says it is `External`), which
     the record's content does not key, so no automatic cache stands for it."""
