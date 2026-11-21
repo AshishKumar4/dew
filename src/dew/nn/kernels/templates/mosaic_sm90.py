@@ -195,13 +195,6 @@ class Wgmma(WgmmaIssuer, ring_family.RingFamily):
     consumers = 3
     cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
 
-    @property
-    def derived_consumers(self) -> int:
-        # Two first: the forward's two consumers (128-row programs) ran every causal cell measured faster
-        # than its three at equal peak, 1.29x to 1.57x, at widths 64 and 128, eight heads to 128 (M-ET-79, a
-        # GH200).
-        return 2
-
 
 WGMMA = Wgmma()
 """The wgmma family's bundle."""

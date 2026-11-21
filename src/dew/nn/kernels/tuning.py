@@ -1461,6 +1461,43 @@ def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, report.Bi
         _VERDICTS.setdefault(target, {})[key] = written
 
 
+_CHOICES: dict[str, dict[str, _records.JSON]] = {}
+"""Each compile target's derived choices this process read from its store or stored there
+(`stored_choice`), by key, beside its certification verdicts (`_verdicts_path`)."""
+
+
+def stored_choice(target: str, key: str) -> Rebuilt | None:
+    """A derived choice stored for `key` on `target` (`store_choice`), beside its certification verdicts
+    (`_verdicts_path`), read once a process; none where none is stored or this checkout cannot rebuild it."""
+    with _LOADING:
+        if target not in _CHOICES:
+            _CHOICES[target] = {entry["priced"]: entry["choice"]
+                                for entry in _stored(_verdicts_path(target))
+                                if isinstance(entry, dict) and "priced" in entry}
+        found = _CHOICES[target].get(key)
+    try:
+        return None if found is None else decoded(found)
+    except Unreadable as unread:
+        _log.warning("a derived choice stored for %s is not this checkout's, so its launch prices "
+                     "again: %s", target, unread)
+        return None
+
+
+def store_choice(target: str, key: str, choice: object) -> None:
+    """`choice` stored for `key` on `target` beside its certification verdicts (`_verdicts_path`), one writer
+    at a time, the file replaced whole."""
+    written = encoded(choice)
+    path = _verdicts_path(target)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with filelock.FileLock(path + '.lock'):
+        kept = [entry for entry in _stored(path)
+                if not (isinstance(entry, dict) and entry.get("priced") == key)]
+        write_atomically(path, json.dumps({"target": target,
+                                           "data": [*kept, {"priced": key, "choice": written}]}))
+    with _LOADING:
+        _CHOICES.setdefault(target, {})[key] = written
+
+
 def _shapes(value):
     """`value`'s arrays as their shapes and dtypes, its other parts as they are: NumPy operands (an unpacked
     delta rule's chunk and span descriptors) as JAX's, a tracer as the value it stands for."""

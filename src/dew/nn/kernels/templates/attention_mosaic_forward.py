@@ -622,11 +622,10 @@ def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
     return output_hooked(out, hooks.output_mod, params)
 
 
-def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                     scale: float, natural: bool, tiles: Tiles, interpret: bool, scaled: bool = False,
-                     counts: bool = True, registered: ForwardRegisters | None = None,
-                     tmem_columns: int | None = None
-                     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+def _training_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                   scale: float, natural: bool, tiles: Tiles, interpret: bool, scaled: bool = False,
+                   counts: bool = True, registered: ForwardRegisters | None = None,
+                   tmem_columns: int | None = None):
     """`MosaicForward`'s training launches at `tiles`, two a form: a walk of the logits alone for each row's
     anchor, its first key at the keys' largest logit (`_peak_consumer`), then the algebra's training step
     at that anchor and maximum (`algebra.anchored_step`) taken in place, the split sums `B` and the rows'
@@ -634,15 +633,12 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     denominator (`algebra.split_output`, `output_of`), its value row gathered in XLA. A `scaled` walk's
     sums are at each row's scale (`algebra.SCALED_WALK`, the op a call some row of which can be scaled
     launches, `MosaicForward.scaled`), the split sums and rows' weights of its column blocks joined at the
-    largest of their rows' shifts. The fold's guard composes over whole launches (`algebra.walked_launches`):
-    its rewalk is this kernel's natural launch. Its launches state their work to Dew's FLOP count where it
-    `counts`, the rewalk's none (`_inference_walk`'s), and their registers by `registered` (`_launch`'s)."""
+    largest of their rows' shifts. Returns `(spec, launch, finished)` as `_inference_walk` does."""
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken, hooks = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
         scaled=scaled)
     value_width = value.shape[3]
-
     def launch(form: algebra.Forward, live: jax.Array | None, into=None):
         del live, into
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
@@ -699,12 +695,28 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
-    out, maximum, total, anchors, split = algebra.walked_launches(spec, launch)
-    queries = call.queries
-    split = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
-                  split.others_total[:, :, :queries], split.shift[:, :, :queries])
-    return (out[:, :queries, :, :value_width], maximum[:, :, :queries], total[:, :, :queries],
-            anchors[:, :, :queries], split)
+    def finished(walked):
+        out, maximum, total, anchors, split = walked
+        queries = call.queries
+        split = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
+                      split.others_total[:, :, :queries], split.shift[:, :, :queries])
+        return (out[:, :queries, :, :value_width], maximum[:, :, :queries], total[:, :, :queries],
+                anchors[:, :, :queries], split)
+
+    return spec, launch, finished
+
+
+def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                     scale: float, natural: bool, tiles: Tiles, interpret: bool, scaled: bool = False,
+                     counts: bool = True, registered: ForwardRegisters | None = None,
+                     tmem_columns: int | None = None
+                     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+    """`MosaicForward`'s training launches at `tiles` (`_training_walk`), its launches walked by the fold's
+    guard (`algebra.walked_launches`): its rewalk is this kernel's natural launch."""
+    spec, launch, finished = _training_walk(query, key, value, spans, hooks, scale=scale, natural=natural,
+                                            tiles=tiles, interpret=interpret, scaled=scaled, counts=counts,
+                                            registered=registered, tmem_columns=tmem_columns)
+    return finished(algebra.walked_launches(spec, launch))
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
