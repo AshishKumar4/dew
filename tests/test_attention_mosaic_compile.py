@@ -472,14 +472,15 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
     assert not failed, "\n".join(failed)
 
 
-FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3])
+FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3],
+                                     max_items=3)
 
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "training", "dtype", "hooks_batch"),
                          FORWARD_GATE_BATCHES,
-                         ids=[f"{g}-{w}-{t.name}-{jnp.dtype(d).name}"
-                              for g, w, t, d, _ in FORWARD_GATE_BATCHES])
+                         ids=[f"{g}-{w}-{t.name}-{jnp.dtype(d).name}-{'+'.join(h)}"
+                              for g, w, t, d, h in FORWARD_GATE_BATCHES])
 def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, dtype,
                                                               hooks_batch):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
@@ -914,6 +915,7 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert all(stored for _, stored, _ in warm), warm
     assert certified(warm) == certified(cold)
 
+@COMPILES_ON_CPU
 def test_a_launchs_stored_verdict_is_not_read_where_another_nvcc_wheel_is_installed(tmp_path):
     """A launch certified by one process is certified again by the next where the installed CUDA nvcc wheels
     differ (another wheel's metadata on its path, its kernels' IR the same): the wheels name the ptxas that

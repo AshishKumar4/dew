@@ -153,6 +153,17 @@ def _launch_programs(kernel) -> int:
         return math.prod(mesh.grid)
     return math.prod(kernel.params["grid_mapping"].grid)
 
+def _planned_stages(family: mosaic.Family, scope_of: Callable[[int], resources.Scope],
+                    target: generation.GpuTarget, *, consumers: int, floor: int, most: int,
+                    resident: int) -> int:
+    """Deepest ring in `[floor, most]` whose `scope_of(stages)` fits `target`'s share at `resident`
+    programs per SM via `resources.plan` (rows 10948, 10962)."""
+    if most <= floor or not family.budgets_registers:
+        return floor
+    launch = resources.Launch(scope=scope_of, consumers=consumers, registers=None, floor=floor, most=most)
+    planned = resources.plan((launch,), family, target, programs=resident)
+    return floor if planned is None else planned[0].stages
+
 
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
@@ -831,9 +842,8 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def _deepened(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
                   refused: Set[Tiles] = frozenset()) -> Tiles:
-        """Deepen a compute-bound TMA forward's ring up to `max(consumers, 2) + 1` stages where the block
-        holds them without reducing resident programs per SM (rows 5272, 4839): a third stage keeps the TMA
-        producer prefetching ahead of the consumer(s) instead of stalling on two slots."""
+        """Deepen a compute-bound TMA forward's ring up to `max(consumers, 2) + 1` stages at its residency
+        via `resources.plan` (rows 5272, 4839, 10948, 10962)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
         if family.feeds_itself or not family.budgets_registers or streams(query, target):
@@ -842,8 +852,13 @@ class MosaicForward(_Mainloop[Tiles]):
         if want <= config.stages:
             return config
         base_resident = self.resident(ba, config, target)
-        for stage_count in range(want, config.stages, -1):
-            candidate = self._launchable(ba, dataclasses.replace(config, stages=stage_count), target)
+        products = self._products(ba, config, target)
+        stages = _planned_stages(
+            family, lambda s: self._scope(ba, dataclasses.replace(config, stages=s), target,
+                                          products=products),
+            target, consumers=config.consumers, floor=config.stages, most=want, resident=base_resident)
+        if stages > config.stages:
+            candidate = self._launchable(ba, dataclasses.replace(config, stages=stages), target)
             if (candidate is not None and candidate not in refused
                     and self.resident(ba, candidate, target) == base_resident):
                 return candidate
@@ -1125,8 +1140,9 @@ class MosaicForward(_Mainloop[Tiles]):
         return self._staged_bytes(ba, config, target, products=self._products(ba, config, target),
                                   decides=decides)
 
-    def _staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
-                      products: tuple, decides: bool | None = None) -> int:
+    def _scope(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+               products: tuple, decides: bool | None = None) -> resources.Scope:
+        del target
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         width, full_v = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
@@ -1158,9 +1174,14 @@ class MosaicForward(_Mainloop[Tiles]):
                       tpu_forward_step_tiles(config.block_q, config.block_k,
                                              natural_form=config.natural_form,
                                              scaled=self.scales_in_kernel(ba)))
-        return resources.shared_bytes(
-            family, launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
-                                 products=products, over_rings=True, values=tpu_values))
+        return launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
+                            products=products, over_rings=True, values=tpu_values)
+
+    def _staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+                      products: tuple, decides: bool | None = None) -> int:
+        family = bundle_of(config, ba.arguments["query"].dtype)
+        return resources.shared_bytes(family, self._scope(ba, config, target, products=products,
+                                                          decides=decides))
     def _products(self, ba: tokamax.BoundArguments, config: Tiles,
                   target: generation.GpuTarget) -> tuple:
         """The launch's products at `config` as its program scopes them (`forward_products`): its logits a
@@ -1839,20 +1860,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                           family=queries.name, columns=columns)
                for columns in (1, 2, 4) for walked in walked_extents(queries, query.dtype, key.shape[1])
                for step in steps] if queries is not None else []
-        config = next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
-        if config is None or config.dkv_blocks is None:
-            return config
-        # Deepen sm100 tcgen05 walked backward's TMA ring up to 3 stages (`TURNS + 1`) where SMEM holds it
-        # without reducing SM residency so TMA prefetches ahead of tcgen05 MMA (row 4839).
-        q_steps = -(-query.shape[1] // config.dkv_blocks[0])
-        steps_count = q_steps if config.fused else min(q_steps, -(-key.shape[1] // config.block_k))
-        want = min(3, steps_count)
-        base_resident = self.resident(ba, config, target)
-        for stage_count in range(want, config.stages, -1):
-            candidate = dataclasses.replace(config, stages=stage_count)
-            if self.takes(ba, candidate, target) and self.resident(ba, candidate, target) == base_resident:
-                return candidate
-        return config
+        return next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
 
     def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
         # The query blocks its derivation walks below `config`'s for its consumer's rows (`_query_walk`) on
@@ -1913,7 +1921,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if family is None:
             return None
         if (walked := self.walked(ba, target)) is not None:
-            return walked
+            return self._deepened(ba, walked, target)
         query = ba.arguments["query"]
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
@@ -1926,40 +1934,51 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def _deepened(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                   target: generation.GpuTarget) -> BackwardTiles:
-        """Deepen a TMA backward's ring up to `max(consumers, 2) + 1` stages where SMEM holds it without
-        reducing SM residency or (for fused launches) dropping streamed `peak`/`total`/`delta` statistics
-        (row 5272)."""
+        """Deepen a backward launch's ring up to `max(consumers, 2) + 1` stages at its residency via
+        `resources.plan`, preserving streamed `peak`/`total`/`delta` statistics on fused launches
+        (rows 4839, 5272, 10948, 10962)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
         if not family.budgets_registers:
             return config
-        q_steps = -(-query.shape[1] // config.block_q)
+        q_block = config.dkv_blocks[0] if config.dkv_blocks is not None else config.block_q
+        q_steps = -(-query.shape[1] // q_block)
         steps = q_steps if config.fused else min(q_steps, -(-ba.arguments["key"].shape[1] // config.block_k))
-        want = min(max(config.consumers, 2) + 1, steps)
+        cap = 3 if config.dkv_blocks is not None else max(config.consumers, 2) + 1
+        want = min(cap, steps)
         if want <= config.stages:
             return config
         base_resident = self.resident(ba, config, target)
-        allocator = _coop_allocations if config.shared_keys else None
-        reduced = reducing(family, config.consumers, self.score_reduces,
-                           scaled=staged_parts(query.dtype) > 1)
-        base_stats = (streamed_statistics(family, config, query.shape[3], query.dtype, config.stages,
-                                          reduced=reduced, allocations_of=allocator)
-                      if config.fused else 0)
-        for stage_count in range(want, config.stages, -1):
-            candidate = dataclasses.replace(config, stages=stage_count)
-            if not (self.takes(ba, candidate, target)
-                    and self.resident(ba, candidate, target) == base_resident):
-                continue
-            if (not config.fused
-                    or streamed_statistics(family, candidate, query.shape[3], query.dtype, stage_count,
-                                           reduced=reduced, allocations_of=allocator) >= min(3, base_stats)):
+        if config.fused and config.dkv_blocks is None:
+            allocator = _coop_allocations if config.shared_keys else None
+            reduced = reducing(family, config.consumers, self.score_reduces,
+                               scaled=staged_parts(query.dtype) > 1)
+            base_stats = streamed_statistics(family, config, query.shape[3], query.dtype, config.stages,
+                                             reduced=reduced, allocations_of=allocator)
+            while (want > config.stages
+                   and streamed_statistics(family, dataclasses.replace(config, stages=want), query.shape[3],
+                                           query.dtype, want, reduced=reduced,
+                                           allocations_of=allocator) < min(3, base_stats)):
+                want -= 1
+        base_scopes = self._scopes(ba, config, target)
+        stages = min(
+            _planned_stages(layout, lambda s, i=i: self._scopes(
+                ba, dataclasses.replace(config, stages=s), target)[i][2],
+                target, consumers=consumers, floor=config.stages, most=want, resident=base_resident)
+            for i, (layout, consumers, _) in enumerate(base_scopes))
+        if stages > config.stages:
+            candidate = dataclasses.replace(config, stages=stages)
+            if self.takes(ba, candidate, target) and self.resident(ba, candidate, target) == base_resident:
                 return candidate
         return config
 
     def _one_launch(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, family: mosaic.Family,
                     fed: list, dkv: dict) -> BackwardTiles | None:
         """`derived`'s one launch: on the fed layout with its consumers (FlashAttention 3's CTA), keys first
-        on the dQ launch's layout, or a key block its consumers share; None where none holds."""
+        on the dQ launch's layout, or a key block its consumers share; None where none holds or the family
+        lacks hardware atomics (`Transport.adds_atomically`, TPU VMEM)."""
+        if not family.adds_atomically:
+            return None
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:
@@ -2059,10 +2078,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                             return config
         return None
 
-    def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
-                     target: generation.GpuTarget) -> int:
-        """The larger of its launches' programs' shared memory (`_dq_allocations`, `_dkv_allocations`,
-        `resources.shared_bytes`); a fused backward's dK/dV program's alone."""
+    def _scopes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
+                target: generation.GpuTarget) -> list[tuple[mosaic.Family, int, resources.Scope]]:
+        del target
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         dtype = query.dtype
@@ -2078,8 +2096,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             # et-fused80).
             # The fused launch's dK and dV in the operands' dtype where it stores them so (`stores_typed`).
             reduced = reducing(family, config.consumers, self.score_reduces, scaled=staged_parts(dtype) > 1)
-            allocations = (_coop_allocations if config.shared_keys
-                           else functools.partial(_fused_allocations, reduced=reduced))
+            allocations = functools.partial(_coop_allocations if config.shared_keys else _fused_allocations,
+                                            reduced=reduced)
             typed = {} if config.shared_keys else {"typed": stores_typed(
                 family, config, width, dtype, q_stages, grouped=query.shape[2] != key.shape[2],
                 reduced=reduced, rounded=self.rounded)}
@@ -2097,7 +2115,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The fused launch's warpgroups reserve fp16's running scale's reduction scratch too, as it launches
         # (`reducing`'s `scaled`: `_fused_launch`'s and `_coop_launch`'s).
         scaled = config.fused and staged_parts(dtype) > 1
-        return max(resources.shared_bytes(layout, launch_scope(
+        return [(layout, tiles.consumers, launch_scope(
             layout, allocations, reducing(layout, tiles.consumers, self.score_reduces, scaled=scaled),
             reduces=reduces, values=(
                 {"queries": ((tiles.block_q, width), dtype), "keys": ((tiles.block_k, width), dtype),
@@ -2105,7 +2123,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 (((tiles.block_k, width), jnp.float32), ((tiles.block_k, value_width), jnp.float32),
                  ((tiles.block_q, width), jnp.float32)),
                 tpu_backward_step_tiles(tiles.block_q, tiles.block_k))))
-            for layout, tiles, allocations, reduces in launches)
+            for layout, tiles, allocations, reduces in launches]
+
+    def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
+                     target: generation.GpuTarget) -> int:
+        """The larger of its launches' programs' shared memory (`_dq_allocations`, `_dkv_allocations`,
+        `resources.shared_bytes`); a fused backward's dK/dV program's alone."""
+        return max(resources.shared_bytes(layout, scope)
+                   for layout, _, scope in self._scopes(ba, config, target))
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
         # None on a family that budgets none (`Family.budgets_registers`), which holds every config.
         if not bundle_of(config, ba.arguments["query"].dtype).budgets_registers:
