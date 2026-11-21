@@ -1063,3 +1063,32 @@ def test_a_context_choice_of_the_norm_forces_it_over_a_calls_own():
     norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True, epilogue=jax.nn.softmax)
     with generation.chosen(rms_norm='pallas'), pytest.raises(selection.KernelRefused):
         norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True, epilogue=jax.nn.softmax)
+
+
+def test_each_norm_and_swiglu_launch_states_its_outputs_dimensions():
+    """Every RMSNorm and SwiGLU Triton launch (forward, backward, packed) lowered for an H100 declares
+    its outputs' dimensions (`outputs.OUTPUT_DIMS`, rows 10816, 10817), so `Compiled.peak_live` reads
+    which operand axes each buffer scales with."""
+    from kernel_compile import stated_outputs
+
+    x = jax.ShapeDtypeStruct((2, 32, 64), jnp.bfloat16)
+    scale = jax.ShapeDtypeStruct((64,), jnp.bfloat16)
+    gate_up = jax.ShapeDtypeStruct((2, 32, 2, 64), jnp.bfloat16)
+
+    def step(x, scale, gate_up):
+        def loss(x, scale, gate_up):
+            y = rms_normalized(x, scale, 1e-6, jnp.bfloat16, scale_offset=False,
+                               scale_after_cast=True, fp32_statistics=True,
+                               implementation="pallas")
+            g = gated_product("swiglu", implementation="pallas")(y, y)
+            p = packed_gated_product("swiglu", implementation="pallas")(gate_up)
+            return g.astype(jnp.float32).sum() + p.astype(jnp.float32).sum()
+        return jax.value_and_grad(loss, argnums=(0, 1, 2))(x, scale, gate_up)
+
+    with generation.assumed("sm90"):
+        lowered = jax.jit(step).trace(x, scale, gate_up).lower(lowering_platforms=("cuda",))
+    returning = [stated for count, stated in stated_outputs(lowered) if count]
+    assert len(returning) >= 6, f"expected 6 norm/swiglu Triton launches, got {len(returning)}"
+    for stated in returning:
+        assert stated is not None, "a norm/swiglu launch returning arrays states no output_dims"
+        assert all(dims is not None for dims in stated), stated
