@@ -16,7 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
-from jax.extend.mlir.dialects import arith, memref
+from jax.extend.mlir.dialects import arith, memref, scf
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import emission, mosaic, resources, scan, swizzling
@@ -131,31 +131,36 @@ def _own_bands(rows_ref, staged_ref, bands_ref, *, unit_keys: bool) -> None:
     short, long = arith.addi(first_row, p), arith.subi(arith.addi(first_row, const(sub - 1)), p)
     columns = [arith.addi(arith.muli(quarter, const(run)), const(m)) for m in range(run)]
     one = arith.constant(f32_type, 1.0)
-    decays = [one] * run
-    decayed = [[one] * run for _ in range(outputs)]
     leader = arith.cmpi(arith.CmpIPredicate.eq, quarter, const(0))
-    for step in range(sub + 1):
-        on_short = arith.cmpi(arith.CmpIPredicate.sle, const(step), p)
+    # The steps a loop, carrying the pair's decay (or each output's decayed row, `unit_keys`) alone: unrolled,
+    # ptxas held later steps' reads across earlier ones and spilled an H100's 80 registers (jsf-gate-steps3).
+    carried = [one] * (run * (outputs if unit_keys else 1))
+    loop = scf.ForOp(*at(0, sub + 1, 1), carried)
+    with ir.InsertionPoint(loop.body):
+        step = arith.index_cast(i32, loop.induction_variable)
+        before = list(loop.inner_iter_args)
+        on_short = arith.cmpi(arith.CmpIPredicate.sle, step, p)
         row = arith.select(on_short, short, long)
-        e = arith.select(on_short, const(step), arith.subi(const(step - 1), p))
+        e = arith.select(on_short, step, arith.subi(arith.subi(step, const(1)), p))
         first = arith.cmpi(arith.CmpIPredicate.eq, e, const(0))
         # Token `i - e`'s keys, and token `i - e + 1`'s own decay (any of the chunk's at a row's own pair).
         source = arith.subi(arith.addi(row, const(sub)), e)
         own = arith.select(first, source, arith.addi(source, const(1)))
         key = [memref.load(staged_ref, at(0, source, column)) for column in columns]
         factor = [memref.load(staged_ref, at(1, own, column)) for column in columns]
+        after = []
         if not unit_keys:
             # The pair's decay, one for every output, restarting at a row's own pair.
-            decays = [arith.select(first, one, arith.mulf(before, a)) for before, a in zip(decays, factor,
-                                                                                            strict=True)]
+            decays = [arith.select(first, one, arith.mulf(b, a)) for b, a in zip(before, factor, strict=True)]
+            after = decays
         for o in range(outputs):
-            # The row's own values read at each step, none held across them (both rows' runs of every output
-            # held spilled an H100's 80 registers, jsf-gate-steps).
+            # The row's own values read at each step, none held across them.
             values = [memref.load(rows_ref, at(o, row, column)) for column in columns]
             if unit_keys:
-                decayed[o] = [arith.select(first, value, arith.mulf(before, a))
-                              for value, before, a in zip(values, decayed[o], factor, strict=True)]
-                terms = [arith.mulf(d, k) for d, k in zip(decayed[o], key, strict=True)]
+                decayed = [arith.select(first, value, arith.mulf(b, a))
+                           for value, b, a in zip(values, before[o * run:(o + 1) * run], factor, strict=True)]
+                after += decayed
+                terms = [arith.mulf(d, k) for d, k in zip(decayed, key, strict=True)]
             else:
                 terms = [arith.mulf(arith.mulf(v, k), d) for v, k, d in zip(values, key, decays, strict=True)]
             total = terms[0]
@@ -166,6 +171,7 @@ def _own_bands(rows_ref, staged_ref, bands_ref, *, unit_keys: bool) -> None:
             with utils.when(leader):
                 place = at(o, row, e)
                 memref.store(arith.addf(memref.load(bands_ref, place), total), bands_ref, place)
+        scf.yield_(after)
     utils.warpgroup_barrier()
 
 
