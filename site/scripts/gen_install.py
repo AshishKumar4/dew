@@ -75,7 +75,8 @@ def builds_sentence(project: dict) -> list[str]:
     return [f"Dew's CUDA and PJRT plugins are {plugins}'s on x86_64 and aarch64 (a GH200's Grace) alike, "
             f"and the `kernel-compile` extra's (x86_64 only) are {compiling}'s. On Linux x86_64 and aarch64 "
             f"jaxlib is Dew's build too, `jaxlib=={dews}`, whose client of a plugin reads that metadata, and "
-            f"libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib=={stock}`."]
+            f"libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock "
+            f"`jaxlib=={stock}`."]
 
 
 def documented_extras(text: str) -> set[str]:
