@@ -2206,9 +2206,12 @@ def folded_entries(record: dict[str, "Entry"], verdict: dict, target: float,
     marks = {name: sites(name) for name in rows}
     warm = fold.lowered(session, {node: session.warm_cold(held)[0] for node, held in record.items()}, rows,
                         marks, target)
-    calm = {name: [{**row_, "tests": {node: warm[node] if node in row_.get("cold", ()) and node in warm
-                                      else seconds for node, seconds in row_.get("tests", {}).items()}}
-                   for row_ in held] for name, held in rows.items()}
+    # A row that is no planning evidence (fold.py's `evidence`: reused, or run alone after a failure beside
+    # other tasks) and each test a row timed cold keep its record's time: they count for whether a file is
+    # whole, never as its time (review).
+    calm = {name: [{**row_, "tests": {node: warm[node] if node in warm and (
+        node in row_.get("cold", ()) or not fold.evidence(row_)) else seconds
+        for node, seconds in row_.get("tests", {}).items()}} for row_ in held] for name, held in rows.items()}
     return fold.entries(session, record, folded(warm, verdict, target, calm, marks), rows, grading.owning)
 
 
