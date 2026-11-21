@@ -40,12 +40,17 @@ from dew.nn.kernels.templates import (
 class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
     """mma.sync's issuer and register home (`mosaic_sm80.MmaIssuer`) on TMA rings its consumer feeds
     (`fed.ConsumerFed`), on every device that moves its blocks by TMA (`legal`), composed from the two and no
-    template's. One consumer a program, as mma.sync's on an
-    A100, where two programs a multiprocessor ran faster than two consumers (CONSUMERS1, CONSUMERS3);
-    unmeasured on sm120."""
+    template's. Up to two consumers a program, the derivations choosing among them: two warpgroups each at
+    the most registers a thread takes fill a multiprocessor's register file (`resources.entry_registers`,
+    2 x 128 x 255 of 64K), and neither its issuer nor its rings bound them, the first consumer issuing
+    every load (`fed.Feed`). cp.async's one (`mosaic_sm80.Mma`, whose pipeline hung at two) held an RTX
+    PRO 6000's dense products to one consumer's 128 x 64 tiles, its consumers stalled on their full
+    barriers (wait 30.9% and sleeping 19.1% of samples, HMMA 12.4%, EM-THEME-G4-NCU; the wait's suspend
+    no part of it, M-EM-33) at 1.79-2.25x cuBLASLt's time (row 5634); its two consumers ran 21-39% faster
+    there (M-EM-70c-g4), a config whose kernels spill refused by certification (`report.certified`)."""
 
     name = "mma.sync.fed"
-    consumers = 1
+    consumers = 2
     held_registers = 65
     """mma.sync's measured whole (`MmaIssuer`'s 40) and the 25 its consumer-fed launches held past it on a
     B200: ptxas's least register cap less the model over every recurrence gate launch at base e346aa4af72
