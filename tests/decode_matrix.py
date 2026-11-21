@@ -114,7 +114,12 @@ class _Paged(nn.Module):
         store.write(key, value, jnp.broadcast_to(jnp.arange(CAPACITY), (rows, CAPACITY)))
         kernel = store.paged_kernel(query, softcap=self.softcap, arithmetic=False, named="auto",
                                     sinks=sinks is not None)
-        return store.decode(query, lengths, kernel, self.softcap, sinks=sinks)
+        if kernel is not None:
+            return store.decode(query, lengths, kernel, self.softcap, sinks=sinks)
+        gathered_k, gathered_v = store.read()
+        return scaled_dot_product_attention(
+            query[:, None], gathered_k, gathered_v, key_value_seq_lengths=lengths,
+            implementation="auto", softcap=self.softcap, sinks=sinks)[:, 0]
 
 
 def _step(case: dict[str, str], *, reference: bool):

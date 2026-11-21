@@ -2236,7 +2236,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
                                 in_key=value_columns is not None, splits=splits)
-    grid = (heads, queries // pair * splits, batch)
+    grid = (heads, batch, queries // pair * splits)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
                        magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None,
@@ -2250,7 +2250,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     if page is None:
         key, value = head_layout(family, key), head_layout(family, value)
     return family.kernel(entry, out_type=out_type, grid=grid,
-                         grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
+                         grid_names=("heads", "batch", "q_tiles"), consumers=consumers,
                          interpret=interpret,
                          approx_math=spec.approximate, name=name, cost=cost, model_flops=model,
                          registers=registers, shared=shared, tmem=tmem, reducing_warpgroups=reduced,

@@ -28,13 +28,28 @@ if TYPE_CHECKING:
 def model_flops(decoder: CausalTransformer, lengths) -> float:
     """Real-row hidden-state work, summing the same block factories as setup."""
     return (_layer_flops(decoder, lengths, counted_flops)
-            + _root_flops(decoder, lengths, DepthAttention.depth_flops))
+            + _root_flops(decoder, lengths, DepthAttention.depth_flops)
+            + _message_flops(decoder, lengths, trained=False))
 
 
 def trained_flops(decoder: CausalTransformer, lengths) -> float:
     """Learned matrices' work, apart from attention's and a state's that no parameter does."""
     return (_layer_flops(decoder, lengths, parameter_flops)
-            + _root_flops(decoder, lengths, DepthAttention.depth_parameter_flops))
+            + _root_flops(decoder, lengths, DepthAttention.depth_parameter_flops)
+            + _message_flops(decoder, lengths, trained=True))
+
+
+def _message_flops(decoder: CausalTransformer, lengths, *, trained: bool) -> float:
+    """A loop's cross-pass messages' work (`Loop.messages`): each later pass's, each layer of its block
+    reading the bank of its blocks (`DecoderBlock.message_flops`); the first pass reads no bank."""
+    loop = decoder.loop
+    if loop is None or loop.messages is None:
+        return 0.0
+    first, end = loop.layers or (0, decoder.num_layers)
+    banked = len(loop.messages.blocks(first, end))
+    blocks = decoder.counted_blocks()
+    return (loop.steps - 1) * sum(blocks[index].message_flops(lengths, banked, trained=trained)
+                                  for index in range(first, end))
 
 
 def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:

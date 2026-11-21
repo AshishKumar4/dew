@@ -20,13 +20,12 @@ from egglog import DagCostModel, EGraph, get_callable_args
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
-from dew.algebra.terms import OPERATIONS, RESCALE, Region, Term, integer, key, text
+from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
 from dew.nn.kernels.templates.cost import Work
-from dew.nn.kernels.templates.product import eight, half
-from dew.nn.precision import asks_default_precision, effective_precision, precision_names
+from dew.nn.kernels.templates.product import product_mode
 
 
 def target(named: str | None = None) -> generation.GpuTarget:
@@ -56,33 +55,78 @@ def shape_of(graph: EGraph, term, held: dict | None = None) -> tuple[int, ...] |
     return found
 
 
-def made(graph: EGraph, operands, held: dict | None = None) -> int:
-    """The elements an elementwise node makes of `operands` (e-classes the extractor supplied), their shapes
-    (`shape_of`, kept in `held`) broadcast together; 0 where one has none known."""
+VALUE = jnp.dtype(jnp.float32)
+"""The dtype a term's value is priced at where the e-graph holds none (a leaf's and a product's are their
+own): a vector lane's fp32, as `LANE_BYTES` keeps it."""
+
+
+def _shapes(graph: EGraph, operands, held: dict | None) -> list[tuple[int, ...]] | None:
+    """The shapes of `operands`, e-classes the extractor supplied (`shape_of`, kept in `held`); None where one
+    is unknown."""
     shapes = [shape_of(graph, operand, held) for operand in operands]
-    if any(known is None for known in shapes):
-        return 0
-    return math.prod(np.broadcast_shapes(*(known for known in shapes if known is not None)))
+    known = [shape for shape in shapes if shape is not None]
+    return known if len(known) == len(shapes) else None
+
+
+def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget | None = None) -> Work:
+    """`emission.operation_work`, the kernels' counter's one rule, imported where a price first asks: the
+    emission's module loads the templates' resources, which no process reading the algebra alone imports (the
+    test cache keys a row on each module it loads)."""
+    from dew.nn.kernels.templates import emission
+
+    return emission.operation_work(primitive, inputs, outputs, params, on)
+
+
+def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...]) -> Work:
+    """An equation's arithmetic as the kernels' counter prices its primitive (`_operation_work`), its
+    operands of `shapes` and the value it makes of `made` at `VALUE`."""
+    return _operation_work(primitive, [jax.ShapeDtypeStruct(known, VALUE) for known in shapes],
+                           [jax.ShapeDtypeStruct(made, VALUE)], params)
+
+
+def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None) -> Work:
+    """An elementwise node's arithmetic (`_priced`), its result its operands' shapes broadcast; nothing where
+    one is unknown."""
+    shapes = _shapes(graph, operands, held)
+    return Work() if shapes is None else _priced(primitive, params, shapes, np.broadcast_shapes(*shapes))
+
+
+def _product(left: tuple[int, ...], right: tuple[int, ...], params, product) -> tuple[Work, int]:
+    """A product's arithmetic as the kernels' counter prices it (`_operation_work`: its FLOPs in
+    the mode and passes it multiplies in on the price's target, `target`), and its result's elements: the
+    batch, the left's free axes, the right's free axes, its operands at their dtypes and its result at the
+    one it makes (`terms.Product.made`, JAX's own rule: a bfloat16 by a float16 product is bfloat16, which
+    NumPy's promotion refused, base review 0b8b7ed98 F1)."""
+    (contracted, right_contracted), (batch, right_batch) = params["dimension_numbers"]
+    extents = (*(left[axis] for axis in batch),
+               *(size for axis, size in enumerate(left) if axis not in (*contracted, *batch)),
+               *(size for axis, size in enumerate(right) if axis not in (*right_contracted, *right_batch)))
+    inputs = [jax.ShapeDtypeStruct(extent, jnp.dtype(dtype))
+              for extent, dtype in zip((left, right), product.operands, strict=True)]
+    outputs = [jax.ShapeDtypeStruct(extents, product.made)]
+    done = _operation_work(jax.lax.dot_general_p, inputs, outputs, params, target())
+    return done, math.prod(extents)
 
 
 def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
-    """`node`'s work alone (the cost vocabulary, the module's account): an operand's (a leaf's) bytes, at its
-    dtype's element size, read from device memory once however many values read it (extraction prices a
-    shared node once), and nothing else of device memory, as XLA's fusion reads a program's inputs once (a
-    sibling reduction's too) and keeps its fused intermediates on chip; a product's tensor-core FLOPs (its
-    result's elements by its contraction's length, twice) and the bytes its operands are staged in (the tile
-    walk's, at their dtypes' sizes); a reduction's
-    CUDA-core operations, one an element of its operand; a reduction and a product each a kernel of XLA's
-    fusion, its root (elementwise work fuses into it); a conversion's conversions and a special
-    function's exponentials, one an element of their result; any other elementwise node's CUDA-core
-    operations, an entrywise equation's outside the language (a derivative's `add_any`, a leaf of the region,
-    `terms.OPERATIONS`) among them, one an element as the template's emission prices it, where it was work no
-    comparison read (the audit of 2026-11-19pm, 8964); a layout change none. What XLA's fusion keeps on chip
-    (`Work.kept_bytes`, a TPU's VMEM
-    traffic, row 7283): a leaf's bytes read once into the vector registers, a reduction's and a product's
-    result written once and read once by its reader (a product's at its result's dtype, a reduction's at a
-    vector lane's four bytes an element, as the e-graph holds no dtype), and elementwise work fused into a
-    kernel none, its values in the registers."""
+    """`node`'s work alone (the cost vocabulary, the module's account): its arithmetic the kernels' counter's
+    for its primitive (`_operation_work`, the one rule: a product's FLOPs in its mode and passes, a
+    reduction's operations an operand element, a special function's exponentials and a conversion's
+    conversions, any other elementwise operation's operations, a clamp's two, a layout change none, a
+    primitive no rule prices its elements unpriced, `Work.unpriced_operations`), an equation outside the
+    language a leaf of the region reads (a derivative's `add_any`, `terms.OPERATIONS`) priced so where it is
+    entrywise, where it was work no comparison read (the audit of 2026-11-19pm, 8964); and XLA's fusion's
+    accounting beside it: an operand's (a leaf's) bytes, at its dtype's element size, read from device memory
+    once however many values read it (extraction prices a shared node once), and nothing else of device
+    memory, as XLA's fusion reads a program's inputs once (a sibling reduction's too) and keeps its fused
+    intermediates on chip; the bytes a product's operands are staged in (the tile walk's, at their dtypes'
+    sizes); a reduction and a product each a kernel of XLA's fusion, its root (elementwise work fuses into
+    it); a contracted multiply nothing, its reader's fused multiply-add computing it (`rules._contracted`);
+    a declaration's own rescale an exponential an element. What XLA's fusion keeps on chip
+    (`Work.kept_bytes`, a TPU's VMEM traffic, row 7283): a leaf's bytes read once into the vector registers,
+    a reduction's and a product's result written once and read once by its reader (a product's at its
+    result's dtype, a reduction's at a vector lane's four bytes an element, as the e-graph holds no dtype),
+    and elementwise work fused into a kernel none, its values in the registers."""
     if (args := get_callable_args(node, Term.leaf)) is not None:
         # The leaf's own shape from its region (a callback may read no table at a node it was not given).
         leaf = key(Term.leaf(args[0]))
@@ -90,69 +134,54 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         if extent is None:
             return Work()
         stored = math.prod(extent) * region.dtypes[leaf].itemsize
+        read = Work(device_bytes=stored, kept_bytes=stored)
         outside = region.made_by.get(integer(args[0]))
-        entrywise = outside is not None and programs.entrywise(outside.equation.primitive)
-        computed = math.prod(extent) if entrywise else 0
-        return Work(device_bytes=stored, kept_bytes=stored, operations=computed)
+        if outside is None or not programs.entrywise(outside.equation.primitive):
+            return read
+        equation = outside.equation
+        return read + _operation_work(equation.primitive, [atom.aval for atom in equation.invars],
+                                      [variable.aval for variable in equation.outvars], equation.params)
     if (args := get_callable_args(node, Term.reduce)) is not None:
         operand = shape_of(graph, args[0], held)
-        _, params = region.params[integer(args[3])]
-        # Its result's elements: its operand's unreduced extents (an empty reduction's too).
-        moved = 0 if operand is None else kept(math.prod(
-            size for axis, size in enumerate(operand) if axis not in params["axes"]))
-        return Work(operations=made(graph, args[:1], held), kernels=1.0, kept_bytes=moved)
+        if operand is None:
+            return Work(kernels=1.0)
+        primitive, params = region.params[integer(args[3])]
+        # Its value: its operand's unreduced extents (an empty reduction's too).
+        unreduced = tuple(size for axis, size in enumerate(operand) if axis not in params["axes"])
+        return (_priced(primitive, params, [operand], unreduced)
+                + Work(kernels=1.0, kept_bytes=kept(math.prod(unreduced))))
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand, held) for operand in args[:2])
         if left is None or right is None:
             return Work()
         index = integer(args[2])
         _, params = region.params[index]
-        (contracted, right_contracted), (batch, right_batch) = params["dimension_numbers"]
-        length = math.prod(left[axis] for axis in contracted)
-        # The result's elements: the batch, the left's free axes, the right's free axes.
-        free = (math.prod(size for axis, size in enumerate(left) if axis not in (*contracted, *batch))
-                * math.prod(size for axis, size in enumerate(right)
-                            if axis not in (*right_contracted, *right_batch)))
         product = region.products[index]
         read = sum(math.prod(extent) * np.dtype(dtype).itemsize
                    for extent, dtype in zip((left, right), product.operands, strict=True))
-        elements = math.prod(left[axis] for axis in batch) * free
-        # Its result at the dtype the product makes (`terms.Product.made`, JAX's own rule: a bfloat16 by a
-        # float16 product is bfloat16, which NumPy's promotion refused, base review 0b8b7ed98 F1).
-        mode, passes = _mode(params.get("precision"), *product.operands)
-        moving = Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize))
-        return moving + _moded(mode, 2.0 * elements * length * passes)
-    if (args := get_callable_args(node, Term.convert)) is not None:
-        return Work(conversions=made(graph, args[:1], held))
-    if (args := get_callable_args(node, Term.unary)) is not None:
-        elements = made(graph, args[:1], held)
-        special = text(args[1]) in _special_functions()
-        return Work(exponentials=elements) if special else Work(operations=elements)
+        done, elements = _product(left, right, params, product)
+        return done + Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize))
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == RESCALE:
         # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an element.
-        return Work(exponentials=made(graph, (args[0], args[2]), held))
+        shapes = _shapes(graph, (args[0], args[2]), held)
+        return Work() if shapes is None else Work(exponentials=math.prod(np.broadcast_shapes(*shapes)))
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == CONTRACTED["mul"]:
         # Its reader's fused multiply-add computes it (`rules._contracted`).
         return Work()
-    # Each elementwise constructor's operands and its operations an element (a clamp's a maximum and a
-    # minimum).
-    for constructor, operands, each in ((Term.binary, (0, 2), 1), (Term.compare, (0, 2), 1),
-                                        (Term.select, (0, 1, 2), 1), (Term.clamp, (0, 1, 2), 2)):
+    # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
+    # selection's and a clamp's their own. A layout change computes nothing.
+    if (args := get_callable_args(node, Term.unary)) is not None:
+        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held)
+    if (args := get_callable_args(node, Term.convert)) is not None:
+        return _elementwise(graph, *region.params[integer(args[1])], args[:1], held)
+    for constructor in (Term.binary, Term.compare):
         if (args := get_callable_args(node, constructor)) is not None:
-            return Work(operations=each * made(graph, [args[index] for index in operands], held))
+            return _elementwise(graph, *region.params[integer(args[3])], (args[0], args[2]), held)
+    for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
+        if (args := get_callable_args(node, constructor)) is not None:
+            return _elementwise(graph, primitive, {}, args[:3], held)
     return Work()
 
-
-@functools.cache
-def _special_functions() -> frozenset[str]:
-    """The symbols of the operations the special-function units evaluate, by the kernels' counter's one rule
-    (`emission.SPECIAL_FUNCTIONS`), read where a price first asks: the emission's module loads the templates'
-    resources, which no process reading the algebra alone imports (the test cache keys a row on each module
-    it loads)."""
-    from dew.nn.kernels.templates import emission
-
-    return frozenset(operation.symbol for primitive, operation in OPERATIONS.items()
-                     if primitive in emission.SPECIAL_FUNCTIONS)
 
 LANE_BYTES = 4
 """The bytes a reduction's result element takes in what XLA's fusion keeps on chip (`work`): a vector lane's,
@@ -165,56 +194,16 @@ def kept(elements: float, itemsize: float = LANE_BYTES) -> float:
     forms (`dew.algebra.linear_scan`) price."""
     return 2.0 * elements * itemsize
 
-_MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "operations"}
-"""The `Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes; IEEE fp32 is
-the CUDA cores')."""
-
-
-def _moded(mode: str, flops: float) -> Work:
-    """`flops` of a product's `mode`, in the `Work` field its mode's are told in (`_MODES`)."""
-    return dataclasses.replace(Work(), **{_MODES[mode]: flops})
-
-TPU_PASSES = {"DEFAULT": 1, "HIGH": 3, "HIGHEST": 6}
-"""The bfloat16 passes a TPU's matrix units multiply fp32 operands in, by precision (`jax.lax.Precision`'s own
-statement: "On TPU: performs float32 computations in bfloat16", "in 3 bfloat16 passes", "in 6 bfloat16")."""
-
-
-def _mode(precision, lhs_dtype, rhs_dtype) -> tuple[str, int]:
-    """The mode a product of operands of those dtypes at `precision` multiplies in, and its passes: where
-    `precision` names a dot algorithm, that algorithm's as JAX lowers it (`programs.dot_arithmetic`: TF32's,
-    a 16-bit or an 8-bit precision's whatever the operands' storage, each over its primitive operations, an
-    X3's three; any other on the CUDA cores); else the operands': 16-bit operands' 16-bit mode, FP8
-    operands' 8-bit mode (`product.eight`), fp32 operands' on a TPU priced for (`target`) its matrix units'
-    bfloat16 passes (`TPU_PASSES`, a pair of precisions at its higher's), elsewhere TF32 at the default
-    precision (the product declaration's, `product.declared`) and IEEE fp32 above it; any other operand's
-    on the CUDA cores."""
-    arithmetic = programs.dot_arithmetic(precision, lhs_dtype, rhs_dtype)
-    if arithmetic is not None:
-        bits = set(arithmetic.operand_bits)
-        mode = "tf32" if arithmetic.tf32 else "16bit" if bits == {16} else "8bit" if bits == {8} else "fp32"
-        return mode, arithmetic.operations
-    dtypes = {jnp.dtype(lhs_dtype), jnp.dtype(rhs_dtype)}
-    if all(half(dtype) for dtype in dtypes):
-        return "16bit", 1
-    if all(eight(dtype) for dtype in dtypes):
-        return "8bit", 1
-    if dtypes == {jnp.dtype(jnp.float32)} and generation.tpu(target()):
-        named = precision_names(effective_precision(precision)) or {"DEFAULT"}
-        return "16bit", max(TPU_PASSES[name] for name in named)
-    if dtypes == {jnp.dtype(jnp.float32)} and asks_default_precision(precision, configured=True):
-        return "tf32", 1
-    return "fp32", 1
-
-
 def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=jnp.float32,
-                 precision: jax.lax.PrecisionLike = None) -> Work:
+                 precision: jax.lax.PrecisionLike = None, on: generation.GpuTarget | None = None) -> Work:
     """`count` products of `[rows, depth] @ [depth, columns]` operands of `dtype` at `precision` (the default
-    where unstated), in their mode (`_mode`), each a kernel of XLA's fusion, its root, its result of `dtype`
-    kept on chip, written and read (`work`'s products): a chunk form's products (`dew.algebra.linear_scan`, at
-    the precision they run at), Dew's fp32 products."""
-    mode, passes = _mode(precision, dtype, dtype)
+    where unstated), in the mode and passes they multiply in on `on` (the price's `target` where None;
+    `product.product_mode`, the kernels' counter's and `work`'s one rule), each a kernel of XLA's fusion, its
+    root, its result of `dtype` kept on chip, written and read (`work`'s products): a chunk form's products
+    (`dew.algebra.linear_scan`, at the precision they run at), Dew's fp32 products."""
+    field, passes = product_mode(precision, dtype, dtype, on or target())
     held = Work(kernels=float(count), kept_bytes=kept(rows * columns * count, np.dtype(dtype).itemsize))
-    return held + _moded(mode, 2.0 * rows * depth * columns * count * passes)
+    return dataclasses.replace(held, **{field: 2.0 * rows * depth * columns * count * passes})
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

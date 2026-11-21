@@ -817,8 +817,30 @@ class MosaicForward(_Mainloop[Tiles]):
             residency = functools.partial(self.resident, ba, target=target)
             config = self._searched(ba, family, fits, choose=choose, residency=residency)
             if config is not None:
-                return self._launchable(ba, config, target)
+                launched = self._launchable(ba, config, target)
+                return None if launched is None else self._deepened(ba, launched, target, refused=refused)
         return None
+
+    def _deepened(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+                  refused: Set[Tiles] = frozenset()) -> Tiles:
+        """Deepen a compute-bound multi-consumer forward's TMA ring up to `consumers + 1` stages where the
+        block holds them without reducing resident programs per SM (row 5272): with two consumers straddling
+        consecutive steps, a third stage keeps the producer prefetching instead of stalling on both slots."""
+        query = ba.arguments["query"]
+        family = bundle_of(config, query.dtype)
+        if (config.consumers < 2 or family.feeds_itself or not family.budgets_registers
+                or streams(query, target)):
+            return config
+        want = min(config.consumers + 1, -(-_keys(ba) // config.block_k))
+        if want <= config.stages:
+            return config
+        base_resident = self.resident(ba, config, target)
+        for stage_count in range(want, config.stages, -1):
+            candidate = self._launchable(ba, dataclasses.replace(config, stages=stage_count), target)
+            if (candidate is not None and candidate not in refused
+                    and self.resident(ba, candidate, target) == base_resident):
+                return candidate
+        return config
 
     def _price_config(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
                       ) -> float | None:
