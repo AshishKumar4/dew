@@ -484,11 +484,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
         return lax.fori_loop(0, int(rhs.shape[0]) // step, issue, acc, unroll=False)
 
-    def looped_product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
-        out = self.looped_products(self.zeros(shape), lhs, rhs)
-        if then is not None:
-            then()
-        return out
+    def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
+        return self.looped_products(self.zeros(shape), lhs, rhs)
 
     def _mma(self, acc, left, right):
         """`acc + left @ right` by one mma.sync product of its operands' fragments: fp32's as TF32 through
