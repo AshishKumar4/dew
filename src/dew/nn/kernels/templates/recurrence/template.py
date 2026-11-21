@@ -28,7 +28,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew import _cache
 from dew.nn import derivatives
 from dew.nn.kernels import chunked_launch, generation
-from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
+from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources, sass
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
 from dew.nn.residuals import Residual
 
@@ -777,7 +777,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         ladder compiled a hundred rungs from the top down, each spilling more, before the program fewer)."""
         roles = report.spilled_in(self, ba, joined) | (
             report.spilled_in(self, ba, joined.forward) if joined.forward else {})
-        if any(roles.get(kernel) != (report.CONSUMERS,) for kernel in spilled):
+        if any(roles.get(kernel) != (sass.CONSUMERS,) for kernel in spilled):
             return False
         family = bundle(target, _dtype(ba))
         assert family is not None

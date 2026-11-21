@@ -52,7 +52,7 @@ from test_recurrence_chunk import (
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
+from dew.nn.kernels.templates import bundles, mosaic, product, report, resources, sass
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
@@ -1505,7 +1505,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
     bound = template.MOSAIC.bind(*resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256), None, bound=1.0)
     tiles, kernel = mainloop.Tiles(32, 3, 128, 2, chunk=64), 'recurrence_output'
     keys = []
-    for roles in ((report.CONSUMERS,), (report.PRODUCER,)):
+    for roles in ((sass.CONSUMERS,), (sass.PRODUCER,)):
         with report.refusals(), generation.assumed('sm90'):
             report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
             keys.append(report.derivation_inputs(template.MOSAIC, bound, template.Mosaic.launched()))

@@ -94,7 +94,7 @@ class Report:
     compiles a module once a process, so a later compile of it prints no PTX of its own; the digest its name
     carries, its kernel's identity within the launch that traced it (`report.named`), or None; ptxas's notes
     of a performance loss it fails for (`ptxas_read`, `LOSSES`); and what its machine code breaks of the SASS
-    rules (`report.sass_findings_of`, read where nvdisasm is installed)."""
+    rules (`sass.sass_findings_of`, read where nvdisasm is installed)."""
     kernel: str
     shared: int | None
     tmem: int | None

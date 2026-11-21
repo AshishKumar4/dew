@@ -29,7 +29,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import Fetched, compiled_with, owned_program, program
-from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates import report, sass
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
@@ -1145,14 +1145,14 @@ def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
     a loop writing a register-A MMA's operand while its group is pending is undefined behaviour (row 5416);
     each is one finding the gate fails, and a loop's conversion with none is none, as is the register-A loop
     that retires its group before the back edge."""
-    (finding,) = report.sass_findings_of(listing)
+    (finding,) = sass.sass_findings_of(listing)
     assert found in finding
-    assert report.sass_findings_of(CONVERTING_LISTING) == ()
-    assert report.sass_findings_of(REGISTER_A_LISTING.replace("gsb0, 0x1", "gsb0, 0x0")) == ()
+    assert sass.sass_findings_of(CONVERTING_LISTING) == ()
+    assert sass.sass_findings_of(REGISTER_A_LISTING.replace("gsb0, 0x1", "gsb0, 0x0")) == ()
     # A retire only some trips take (a predicated wait) retires nothing the walk can count on.
     conditional = REGISTER_A_LISTING.replace("WARPGROUP.DEPBAR.LE gsb0, 0x1",
                                              "@P0 WARPGROUP.DEPBAR.LE gsb0, 0x0")
-    (finding,) = report.sass_findings_of(conditional)
+    (finding,) = sass.sass_findings_of(conditional)
     assert "register operand A before its group retired" in finding
 
 
@@ -1200,10 +1200,10 @@ def test_a_spills_roles_are_read_from_where_its_setmaxnreg_places_it():
     spill = ("        /*27c0*/                   STL [R1], R173 ;\n"
              "        /*3950*/                   LDL.LU R203, [R1] ;\n")
     after_drop = CONSUMERS_SPILL_LISTING.replace(spill, "") + spill
-    assert report.spilled_roles(CONSUMERS_SPILL_LISTING) == (report.CONSUMERS,)
-    assert report.spilled_roles(after_drop) == (report.PRODUCER,)
-    assert report.spilled_roles(CONSUMERS_SPILL_LISTING + spill) == (report.CONSUMERS, report.PRODUCER)
-    assert report.spilled_roles(spill + CONSUMERS_SPILL_LISTING.replace(spill, "")) == ()
+    assert sass.spilled_roles(CONSUMERS_SPILL_LISTING) == (sass.CONSUMERS,)
+    assert sass.spilled_roles(after_drop) == (sass.PRODUCER,)
+    assert sass.spilled_roles(CONSUMERS_SPILL_LISTING + spill) == (sass.CONSUMERS, sass.PRODUCER)
+    assert sass.spilled_roles(spill + CONSUMERS_SPILL_LISTING.replace(spill, "")) == ()
 
 
 def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read():
@@ -1213,7 +1213,7 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     4071; train 591)."""
     import kernel_compile as kc
 
-    assert report.disassembler() is not None
+    assert sass.disassembler() is not None
     unread = report.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, "mosaic_gpu", 1024, sass=None)
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
