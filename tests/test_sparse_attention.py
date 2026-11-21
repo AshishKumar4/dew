@@ -372,7 +372,7 @@ def test_the_sparse_latent_template_shards_over_batch_and_heads():
     assert mapped.params["in_specs"] == (
         P(DATA_AXIS, None, TENSOR_AXIS), P(DATA_AXIS, None, TENSOR_AXIS),
         P(DATA_AXIS), P(DATA_AXIS), P(DATA_AXIS, None))
-    assert mapped.params["out_specs"] == P(DATA_AXIS, None, TENSOR_AXIS)
+    assert mapped.params["out_specs"] == (P(DATA_AXIS, None, TENSOR_AXIS),)
     inner_shapes = produced_shapes(mapped.params["jaxpr"])
     # Local batch is 2 (not 4), local heads is 2 (not 4): local pool has 2 * 16 = 32 keys, not 64.
     assert (1, 2 * keys, 1, rank + rope) in inner_shapes
