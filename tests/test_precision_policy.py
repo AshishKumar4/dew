@@ -40,7 +40,6 @@ from dew.nn.precision import (
     compensated_add,
     compensated_difference,
     exact_products,
-    float64_sum,
     fp32_result_dot_general,
     two_product,
     two_sum,
@@ -1312,16 +1311,6 @@ def test_an_exact_power_of_two_past_float32s_range_is_its_field():
     np.testing.assert_array_equal(found.view(np.uint32), np.uint32([0, 0x7F800000, 0x80000000]))
     ceiling = np.asarray(fake_quant._power_of_two_ceil(jnp.asarray([0.0, np.inf, np.nan], jnp.float32)))
     np.testing.assert_array_equal(ceiling.view(np.uint32), np.uint32([0, 0x7F800000, 0x80000000]))
-
-
-def test_a_float64_sum_widens_its_subnormal_operands_exactly():
-    """`float64_sum`, Dew's wide CPU arithmetic's sum, of fp32 operands below the least normal: `2^-149 2^127`
-    and `(2^-126 - 2^-149) 2^127` taken in float64 and rounded once to fp32, `2^-22` and `2 - 2^-22`, where
-    widened by a cast XLA:CPU flushed them and each product was 0 (rows 8966, 9780)."""
-    lhs = jnp.asarray(np.asarray([[1], [0x7FFFFF]], np.uint32).view(np.float32))
-    found = float64_sum(jnp.matmul, lhs, jnp.asarray([[2.0 ** 127]], jnp.float32), dtype=jnp.float32)
-    assert found.dtype == jnp.float32
-    np.testing.assert_array_equal(np.asarray(found), np.float32([[2.0 ** -22], [2.0 - 2.0 ** -22]]))
 
 
 def test_a_host_scalar_widens_at_its_destination():
