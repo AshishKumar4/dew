@@ -837,11 +837,13 @@ def _lowered_verdict_key(calls) -> str | None:
     """What decides a lowered launch's certification on a GPU model, as its stored verdict's key once it has
     lowered (`tuning.stored_verdict`): each Mosaic GPU and Pallas-Triton kernel it compiles, by its name, its
     IR's digest and its config, the installed JAX, jaxlib and CUDA plugins, whose compiler assembles them (the
-    Pallas lowering cache's seal), and the environment a kernel's compile reads (that cache's policy); the
-    store's file names the GPU model. Its kernels decide its verdict, not the Dew tree that lowered them: a
-    tree whose own key (`_verdict_key`) finds none, an edit's anywhere outside them, lowers the launch and
-    reads its verdict, compiling nothing (row 8650: 23 of an edited tree's 51 seconds certifying a hybrid
-    decoder's step ahead, FS-8650-SPLIT). None where the installation has no seal."""
+    Pallas lowering cache's seal), the ptxas that assembles them (`_assemblers`, as `_verdict_key` names it:
+    another ptxas's spills and serialized products are another verdict, row 10782), and the environment a
+    kernel's compile reads (that cache's policy); the store's file names the GPU model. Its kernels decide its
+    verdict, not the Dew tree that lowered them: a tree whose own key (`_verdict_key`) finds none, an edit's
+    anywhere outside them, lowers the launch and reads its verdict, compiling nothing (row 8650: 23 of an
+    edited tree's 51 seconds certifying a hybrid decoder's step ahead, FS-8650-SPLIT). None where the
+    installation has no seal."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
@@ -850,7 +852,7 @@ def _lowered_verdict_key(calls) -> str | None:
         return None
     kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
                      for call in calls if call.kind in ("mosaic_gpu", "triton"))
-    stated = ["lowered", installed.hex(), kernels, _keyed_environment()]
+    stated = ["lowered", installed.hex(), _assemblers(), kernels, _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 
