@@ -42,6 +42,7 @@ routes and launches where each program is written as it did when it traced.
 from __future__ import annotations
 
 import collections
+import dataclasses
 from collections.abc import Callable, Hashable, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -653,16 +654,20 @@ the region's own (`_unwritten`)."""
 
 
 def _unwritten(region: Written, trace: _Trace) -> None:
-    """Each route `trace` took reported again as XLA's, its kernel the one preferred and refused for it
-    (`UNWRITTEN`, the two outputs' types named): the region is not written, its equations kept as traced, and
-    a kernel report says so (row 10719: the choice was dropped with no report)."""
+    """Each route `trace` took to a kernel of Dew's reported again as XLA's, its kernel the one preferred and
+    refused for it (`UNWRITTEN`, the two outputs' types named), its site, target and forcing its own: the
+    region is not written, its equations kept as traced, and a kernel report says so (row 10719: the choice
+    was dropped with no report; row 10856: reported anew, it took the reporting frame's site and lost its
+    forcing). A route its call took to XLA already is as it ran, its own refusal kept."""
     from dew.nn.kernels.selection import Refusal
 
     made = [str(var.aval) for var in trace.equation.outvars]
     own = [str(var.aval) for var in region.outputs]
     refusal = Refusal(UNWRITTEN, f"its written call makes {made}, not the region's own {own}")
     for taken in trace.record.routes:
-        generation.route(taken.choice, kernel="xla", preferred=taken.kernel, refusal=refusal)
+        if taken.kernel != "xla":
+            generation.published(dataclasses.replace(taken, kernel="xla", preferred=taken.kernel,
+                                                      refusal=refusal))
 
 
 def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:
