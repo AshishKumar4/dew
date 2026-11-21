@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -28,7 +29,7 @@ from etils import epath
 from jax.sharding import Mesh
 
 from dew._builds import dew_cache_dir
-from dew._cache import package_digest
+from dew._code import whole_digest
 from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
 from dew._files import staged, write_atomically
 from dew._records import JSON, json_value, mapped_strings, strings_of
@@ -153,12 +154,14 @@ def step_records(artifact: dict[str, JSON] | list[JSON] | str | int | float | bo
 
 def _fingerprint(run: SavedRun, ema: bool | None) -> str:
     """What an export of `run`'s pinned step with `ema` is a function of: the run's location, its step,
-    the EMA choice, the code that writes it (`package_digest`, ledger 2775), the contents of the run's
+    the EMA choice, the code that writes it (`dew._code.whole_digest`, ledger 2775; a process whose source
+    changed while it ran keys an export of its own, which no other reads), the contents of the run's
     own records beside its checkpoints (its run record and a task's assets, a decision task's
     calibration among them) and those its task keeps by the step (`SavedRunTask.step_records`), and the
     step's metadata files, by size and write time, which a new save of the step rewrites."""
     root = epath.Path(run.directory)
-    digest = hashlib.sha256(json.dumps([str(root), run.step, ema, package_digest()]).encode())
+    code = whole_digest() or f"changed source, process {os.getpid()} at {time.time_ns()}"
+    digest = hashlib.sha256(json.dumps([str(root), run.step, ema, code]).encode())
     for path in sorted((path for path in root.iterdir() if path.is_file()), key=str):
         digest.update(f"{path.name}\0".encode() + path.read_bytes())
     for path in step_records(json_value(run.record, "artifact"), run.directory, run.step):

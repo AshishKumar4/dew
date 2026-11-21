@@ -12,9 +12,11 @@ passes."""
 
 import argparse
 import ast
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -39,16 +41,23 @@ def imports(package: str, exports: dict[str, str]) -> list[str]:
             *(f"    from {module} import {', '.join(names)}" for module, names in named.items())]
 
 
+def walker() -> ModuleType:
+    """Dew's reader of the imports a module's run executes and of a lazy package's `_EXPORTS`
+    (src/dew/_imports.py), loaded by its path: it reads the standard library alone, Dew not imported."""
+    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "_imports.py"
+    if "_dew_imports" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("_dew_imports", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"{path} is no Python source file; is its checkout there?")
+        sys.modules["_dew_imports"] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sys.modules["_dew_imports"])
+    return sys.modules["_dew_imports"]
+
+
 def exported(tree: ast.Module) -> dict[str, str]:
-    """A lazy package's `_EXPORTS` read from its `__init__.py`'s tree, the literal dict of each name to the
-    absolute module that defines it (`dew._exports.lookup`), or to the package's own module of that name;
-    empty where it assigns none. The one reader of the declaration: this tool writes the package's blocks from
-    it, and tools/lint_layers.py follows the imports a lookup of each name runs."""
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "_EXPORTS"
-                                                for target in node.targets):
-            return ast.literal_eval(node.value)
-    return {}
+    """A lazy package's `_EXPORTS` read from its `__init__.py`'s tree (`dew._imports.exported`, the one reader
+    of the declaration): this tool writes the package's blocks from it."""
+    return walker().exported(tree)
 
 
 def written(path: Path, root: Path) -> str:
