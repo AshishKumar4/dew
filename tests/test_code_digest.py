@@ -119,7 +119,8 @@ from pathlib import Path
 import dew.nn.kernels
 from dew._code import REVIEWED, closure
 root = Path(dew.nn.kernels.__file__).parent
-parts = [("dew", "nn", "kernels", *path.relative_to(root).with_suffix("").parts) for path in root.rglob("*.py")]
+parts = [("dew", "nn", "kernels", *path.relative_to(root).with_suffix("").parts)
+         for path in root.rglob("*.py")]
 modules = sorted(".".join(each).removesuffix(".__init__") for each in parts)
 print(json.dumps({module: sorted(set(closure(module)[1]) - REVIEWED.keys()) for module in modules}))
 """
