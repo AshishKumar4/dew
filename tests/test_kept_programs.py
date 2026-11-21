@@ -616,3 +616,15 @@ def test_a_custom_derivative_is_stated_by_its_function_and_its_rules():
     undefined, defined = jax.custom_vjp(_identity), jax.custom_vjp(_identity)
     defined.defvjp(_forward, _backward)
     assert stated(undefined, "no rules yet") != stated(defined, "its rules")
+
+
+def test_a_librarys_sentinel_in_its_closure_is_stated_by_its_cell():
+    """A library's function closing over its module's sentinel (`jax.vmap`'s axis name when none is given, a
+    bare `object()`) is stated by that cell's name (`dew._stated.reads`): the batched form of one function
+    states alike made twice and apart from another's or one naming its axis (row 10169's batched arms had no
+    statement and ran unprepared)."""
+    from dew._stated import stated
+
+    assert stated(jax.vmap(_doubled), "a batch") == stated(jax.vmap(_doubled), "a batch made again")
+    assert stated(jax.vmap(_doubled), "a batch") != stated(jax.vmap(_halved), "another's batch")
+    assert stated(jax.vmap(_doubled), "a batch") != stated(jax.vmap(_doubled, axis_name="i"), "a named axis")
