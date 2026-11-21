@@ -92,7 +92,7 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
 
 def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, tmp_path, monkeypatch,
                                                                             cache_worker):
-    """A job holding a whole GPU, to which a node sets no XLA_PYTHON_CLIENT_MEM_FRACTION (dew-ops' session
+    """A job holding a whole GPU, to which a node sets no XLA_PYTHON_CLIENT_MEM_FRACTION (a GPU node's session
     gives one only to a part of a GPU), runs its lane: a file no run measured is given the lane's whole share,
     JAX's own default for a process (`WHOLE_GPU`), rather than the lane failing before any file runs (row
     2570)."""

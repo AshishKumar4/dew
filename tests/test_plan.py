@@ -159,6 +159,30 @@ def test_every_process_keeps_or_drops_the_narrow_copies_together():
     assert FitSearch.freed(search(60, others=False), "with", "without") is False
 
 
+def test_a_start_whose_head_alone_fits_tiled_settles_it_at_no_recomputation(monkeypatch):
+    """A decoder whose 4,096-word head's logits are most of its step, read whole and without narrow copies,
+    given room for its step with that head tiled and recomputing nothing: no remat rung at its whole head
+    fits, so past them the search climbs the whole ladder from its own rung and settles the tiled head at no
+    recomputation, not a recomputing rung's (row 6740's order: the ladder read from the start's rung, not
+    from the last remat rung asked)."""
+    from dew.nn.kernels.generation import chosen
+
+    def decoder():
+        return lm(split=1, vocab=4096)
+
+    with chosen(narrow_copies="off"):
+        tiled = decoder()
+        assert tiled.objective.tile_head() is not None
+        room = needs(monkeypatch, tiled)
+        free(monkeypatch, room)
+        trainer = decoder()
+        state, _, _ = trainer.place()
+        trainer.compile(state, BATCH, Trials(state, BATCH))
+    probes = trainer.plan["probes"]
+    assert any(probe["remat"] is not None for probe in probes), probes
+    assert trainer.plan["head_tile"] is not None and trainer.plan["remat"] is None, probes
+
+
 def test_a_miss_computes_the_split_its_temporaries_leave_room_at():
     """A compile that missed by its `shortfall`, its stranding counted: a split above it holds what its
     rows scale at their share (`MemoryMiss.fits_at`)."""
@@ -279,8 +303,8 @@ class Counted(LMObjective):
         return super().loss(variables, batch, step)
 
 
-def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, **fields):
-    model = CausalTransformer(vocab_size=64, emb_features=width, num_layers=layers, num_heads=2,
+def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, vocab=64, **fields):
+    model = CausalTransformer(vocab_size=vocab, emb_features=width, num_layers=layers, num_heads=2,
                               mlp_features=2 * width, max_seq_len=seq, **fields)
     return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
@@ -1330,7 +1354,7 @@ H100 = 2 ** 40
 
 
 def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, request
-            ) -> tuple[list, int, tuple, tuple] | None:
+            ) -> tuple[list, int, tuple, tuple | None, tuple | None, list[tuple]] | None:
     """A census shape's step at four microbatches on `target` ('cpu', its devices' memory stated through
     `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): the places of the fit
     ladder in its order (`recompute_more`: at each remat rung its head's rungs, then the next), as the
@@ -1398,15 +1422,29 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
             return refused.probes[0].fits
 
     if request.node.get_closest_marker("shards") is None:
-        lightest = next((place for moves, place in enumerate(places) if fits(moves)), None)
+        # Each place's fit compiled where it is asked, once (no place past the one sought is compiled).
+        fitted = functools.cache(fits)
     else:
         walked = sharded(f"{request.node.name} walk", lambda start, stop: [fits(moves) for moves in
                                                                             range(start, stop)], len(places))
         if walked is None:
             return None
         found = [fit for part in walked for fit in part]
-        lightest = next((place for place, fit in zip(places, found, strict=True) if fit), None)
-    return places, room, placed(planned(0, room)), lightest
+        fitted = found.__getitem__
+    # The remat rungs past the start's at the run's own head, in order: what a tight start asks next.
+    preferred = [moves for moves, place in enumerate(places)
+                 if moves and place[0] is None and place[2] != places[0][2]]
+    settled = next((at for at, moves in enumerate(preferred) if fitted(moves)), None)
+    recomputing = None if settled is None else places[preferred[settled]]
+    # What a tight start asks, a probe a place at its fixed split: its own rung, then each remat rung at its
+    # own head and options up to the first that fits.
+    asks = None if settled is None else [places[0], *(places[moves] for moves in preferred[:settled + 1])]
+    lightest = None if recomputing is not None else next(
+        (place for moves, place in enumerate(places) if fitted(moves)), None)
+    trainer = planned(0, room)
+    probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
+              for probe in trainer.plan["probes"]]
+    return places, room, placed(trainer), lightest, asks, probes
 
 
 CENSUS = {
@@ -1428,12 +1466,11 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request):
-    """A start whose step does not fit at its own rung climbs the ladder in its order, each rung asked, and
-    settles the first that fits: no later than the first place of the ladder an exhaustive walk compiles
-    under the step's own options and finds fits in the same room, and that place where the plan is no rung
-    of XLA's default options, which the walk does not compile (a GPU's step under them can fit a place
-    earlier: its Triton GEMM fusions hold fewer temporaries), the decoder on the CPU and for a compile-only
-    H100, the scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
+    """A start whose step does not fit at its own rung asks the remat rungs at its own head first and
+    settles the first of them that fits (row 6740: a tight cold start's second compile), where an
+    exhaustive walk compiling each place of the ladder in the same room finds one fits, and the lightest
+    place it finds fits where none of them does, the decoder on the CPU and for a compile-only H100, the
+    scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
     in 418 s of a train's call time past the train's bound (row 7414), and the CPU's walk is the decoder's.
     What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder needed more recomputing
     its scans and convolutions too than not), so a search that passed over a rung for one seen to miss
@@ -1445,10 +1482,18 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
         climb = climbed(monkeypatch, target, fields, batch, room_of, request)
     if climb is None:
         return
-    ladder, room, plan, lightest = climb
-    places = [place[:3] for place in ladder]
-    assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (ladder, room, plan)
-    assert plan[3] or plan == lightest, (ladder, room, plan, lightest)
+    ladder, room, plan, lightest, asks, probes = climb
+    if asks is not None:
+        # A tight start asks its own rung, then the remat rungs at its own head and options in order, and
+        # settles the first of them that fits: no head or options rung compiled on the way (row 6740).
+        assert probes == [(*place[:3], False) for place in asks], (probes, asks)
+        assert plan == probes[-1], (plan, probes)
+    else:
+        # Where no remat rung at its own head fits, the whole ladder: no later than the lightest place the
+        # walk (under the step's own options alone) finds fits, a rung of XLA's defaults maybe earlier.
+        places = [place[:3] for place in ladder]
+        assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (
+            ladder, room, plan, probes)
 
 
 def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss(

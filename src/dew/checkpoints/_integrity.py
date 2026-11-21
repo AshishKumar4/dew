@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew._coordination import from_every_process
 from dew._hashing import fmix32
 from dew.nn.kernels.options import program
 
@@ -74,6 +75,15 @@ def _host_marks(leaf: np.ndarray, chunk: int = 1 << 24) -> np.ndarray:
     return marks
 
 
+def _held_marks(leaves: list[jax.Array], pinned: bool) -> np.ndarray:
+    """`_marks` of `leaves`, read from a device this process holds; a leaf in host memory brought to its
+    devices' memory first, one at a time, so no more than one is copied off the host at once."""
+    if pinned:
+        (leaf,) = leaves
+        leaves = [jax.device_put(leaf, leaf.sharding.with_memory_kind("device"))]
+    return np.asarray(jax.device_get(_marks(leaves).addressable_data(0)))
+
+
 def _digest(tree) -> str:
     """The SHA-256 of `tree`'s paths, shapes, dtypes and each leaf's marks (`_marks`), taken of the bytes as
     stored, whatever dtypes JAX allows now. The device leaves are marked in one call a set of devices they
@@ -82,20 +92,34 @@ def _digest(tree) -> str:
     leaf in host memory is marked on the devices one leaf at a time, so no more than one is copied off the
     host at once."""
     flat = jax.tree_util.tree_flatten_with_path(tree)[0]
+    # The plan: each set of devices' device-memory leaves marked in one call, each host-memory leaf alone.
+    plan: list[tuple[frozenset, list[int], bool]] = []
     on_device: dict[frozenset, list[int]] = {}
     for index, (_, leaf) in enumerate(flat):
         if isinstance(leaf, jax.Array) and leaf.sharding.memory_kind in (None, "device"):
             on_device.setdefault(frozenset(leaf.sharding.device_set), []).append(index)
-    marks = {index: mark for indices in on_device.values() for index, mark in zip(
-        indices, np.asarray(jax.device_get(_marks([flat[index][1] for index in indices]))), strict=True)}
+        elif isinstance(leaf, jax.Array):
+            plan.append((frozenset(leaf.sharding.device_set), [index], True))
+    plan = [(devices, indices, False) for devices, indices in on_device.items()] + plan
+    # Each part's marks where its leaves are held, every process taking those it holds none of from one that
+    # holds them, in one round where some part spans fewer than every process (a stage of one process's
+    # devices, `dew.training.stages`): every process digests the tree alike.
+    held = [_held_marks([flat[index][1] for index in indices], pinned).tolist()
+            if flat[indices[0]][1].sharding.addressable_devices else None for _, indices, pinned in plan]
+    if any({device.process_index for device in devices} != set(range(jax.process_count()))
+           for devices, _, _ in plan):
+        every = from_every_process(held)
+        held = [next(read for read in (rank[at] for rank in every) if read is not None)
+                for at in range(len(held))]
+    # Every part is held by some process, so each part's marks are read once the round is taken.
+    reads = [read for read in held if read is not None]
+    assert len(reads) == len(plan), (len(reads), len(plan))
+    marks = {index: np.asarray(mark, np.uint32) for (_, indices, _), read in zip(plan, reads, strict=True)
+             for index, mark in zip(indices, read, strict=True)}
     digest = hashlib.sha256()
     for index, (path, leaf) in enumerate(flat):
         if index not in marks:
-            if isinstance(leaf, jax.Array):
-                array = jax.device_put(leaf, leaf.sharding.with_memory_kind("device"))
-                marks[index] = np.asarray(jax.device_get(_marks([array])))[0]
-            else:
-                marks[index] = _host_marks(np.asarray(leaf))
+            marks[index] = _host_marks(np.asarray(leaf))
         digest.update(f"{jax.tree_util.keystr(path)}|{np.shape(leaf)}|{np.dtype(leaf.dtype)}|".encode())
         digest.update(marks[index].astype("<u4").tobytes())
     return digest.hexdigest()

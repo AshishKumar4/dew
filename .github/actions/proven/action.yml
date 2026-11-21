@@ -17,8 +17,8 @@ runs:
         GH_TOKEN: ${{ github.token }}
         WORKFLOW: ${{ inputs.workflow }}
       run: |
-        # A pull request's run tested a merge, not this commit; a push to base/kernels ran no gangs, which proves the
-        # commit for no other run.
+        # A pull request's run tested a merge, not this commit; a push to base/kernels (retired, row 10798) ran no
+        # gangs, so a historical run of it proves the commit for no other run.
         run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$GITHUB_SHA&status=success" \
           --jq '[.workflow_runs[] | select(.event != "pull_request" and .head_branch != "base/kernels")][0].id // empty')
         if [ -n "$run" ]; then

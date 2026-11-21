@@ -1,6 +1,7 @@
 """The arithmetic a check's arms and truths run in (tests/reference_error.py): the scope each arm runs in
-(`summed_as_run`), the programs a reference and a truth run (`unrewritten`), the device a float64 truth
-computes on (`float64_host`), its inputs (`widened`) and its compiled program (`Truth`)."""
+(`summed_as_run`), the programs a reference and a truth run (`unrewritten`), the device a draw makes its
+arrays on (`drawn_on_the_host`) and a float64 truth computes on (`float64_host`), its inputs (`widened`)
+and its compiled program (`Truth`)."""
 
 import contextlib
 import functools
@@ -15,6 +16,9 @@ from jax.extend.core import primitives
 
 from dew.nn import programs
 from dew.nn.precision import FP32_SUMS
+
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 
 
 def float64_host() -> jax.Device | None:
@@ -45,6 +49,21 @@ def on_float64_host(tree):
             return jax.device_put(leaf, host) if isinstance(leaf, (jax.Array, np.ndarray)) else leaf
 
         return jax.tree.map(put, tree)
+
+
+def drawn_on_the_host[S, R](inputs_of: Callable[[S], R], seed: S, *, held: bool = False) -> R:
+    """`inputs_of(seed)` drawn on the host's CPU, as a recording's inputs were, whatever device the test runs
+    on: jax.random's draws are the same bits on every device but its normal's float transform is not (a
+    recorded site's seed drawn on an H100 had another digest than on the CPU, the recording's, in 157 of the
+    recurrence GPU flow's cells, draw-digest at 996fa29f1), so a draw on the test's device would not be the
+    recorded inputs; and a GPU tier part's prepare, whose default device is a compile-only GPU, computes
+    nothing there (a draw or a weight load made there left its cell unprepared, rows 8074, 8635, 10552). The
+    arrays, committed to no device, then go where the run reads them; with `held`, fetched to the host as
+    NumPy's (`jax.device_get`), as a matrix a cell's every program closes over or a flow's prepare pickles
+    is held (row 10831: its inline copies)."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        made = inputs_of(seed)
+    return jax.device_get(made) if held else made
 
 
 def widened(tree):

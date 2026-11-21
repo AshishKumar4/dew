@@ -34,11 +34,13 @@ if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
 
 def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer_input,
-          attention_metadata=None, span: tuple[int, int] | None = None):
+          attention_metadata=None, span: tuple[int, int] | None = None, prior_bank=None):
     """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages.
 
     `span` runs layers [first, end) alone, as a `Loop` over a block runs its
     prelude, its block and its coda; on one stage, with no banked store.
+    `prior_bank` is a looped pass's bank of its pass before's block summaries
+    (`dew.nn.cross_pass`), which every layer reads alike; a pipeline takes none.
 
     `init` draws like runs under the scan and then unstacks them, so the
     tree is the plain loop's; under a stage mesh or with `decode`, init
@@ -56,7 +58,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
     stored = off_stages(decoder, type(decoder).stack, functools.partial(stage_view, decoder))
     if stored is not None:
         return stored(decoder, x, train=train, decode=decode, per_layer_input=per_layer_input,
-                      attention_metadata=attention_metadata, span=span)
+                      attention_metadata=attention_metadata, span=span, prior_bank=prior_bank)
     if decoder.residual_in_fp32 and isinstance(x, Carried):
         x = x._replace(streams=x.streams.astype(at_least_fp32(x.streams.dtype)))
     elif decoder.residual_in_fp32:
@@ -77,13 +79,13 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             view = StackView(groups)
             run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
                                    trans_out_fn=view.unstack, init=True, mutable=True)
-            return run(decoder, view, x, train, decode, per_layer_input, attention_metadata)
+            return run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank)
     if decoder.is_initializing() or (stages == 1 and not decoder.scan_layers):
         return run_stack(
             decoder.layers, decoder.block, decoder.specs,
             tuple((index, 1) for index in range(first, end)), x,
             train=train, decode=decode, kv_store={} if decoder.provides else None,
-            per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+            per_layer_input=per_layer_input, attention_metadata=attention_metadata, prior_bank=prior_bank)
     staged = stored_by_stage(decoder.variables)
     banked = () if staged else decoder.banked_collections()
     held = decoder.variables.get('cache', {})
@@ -107,6 +109,9 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         view, split = (StackView(groups, banked=banked, periods=periods),
                        StageSplit(0, decoder.num_layers, 0))
     else:
+        if prior_bank is not None:
+            raise LayoutRefused("a looped pass reads the bank its pass before left in every layer, which "
+                                "a pipeline over the stage axis does not carry: run the loop on one stage")
         view, split = pipelined(decoder, x, stages, decode=decode, banked=banked, span=span)
     dtype = decoder.residual_dtype(
         x, train=train, decode=decode, per_layer_input=per_layer_input,
@@ -128,13 +133,13 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             attention_metadata=attention_metadata)
 
     x = outside(x, 0, split.prefix)
-    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata)
+    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank)
     return outside(x, decoder.num_layers - split.suffix, decoder.num_layers)
 
 
 @nn.compact
 def stacked(decoder: CausalTransformer, view: StackView, x, train: bool, decode: bool, per_layer_input,
-            attention_metadata=None):
+            attention_metadata=None, prior_bank=None):
     """The stack inside `view`: scanned runs, or the pipeline over stages; compact, so the stages it builds
     are the decoder's own."""
     if view.stages == 1:
@@ -142,7 +147,7 @@ def stacked(decoder: CausalTransformer, view: StackView, x, train: bool, decode:
             decoder.layers, decoder.block, decoder.specs, view.groups, x,
             train=train, decode=decode, kv_store={} if decoder.provides else None,
             per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-            banked='params' in view.banked, periods=view.periods)
+            banked='params' in view.banked, periods=view.periods, prior_bank=prior_bank)
     return run_pipeline(
         decoder,
         view,

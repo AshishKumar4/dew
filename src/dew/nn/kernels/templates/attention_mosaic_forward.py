@@ -1347,12 +1347,11 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
 
         def walked(streams, lo, hi, counted):
             if not training:
-                whole_end = (jnp.minimum(jnp.maximum(jnp.where(program.padded(first), 0,
-                                                               program.whole(first, hi)), lo), hi)
-                             if (spans is None and program.causal and not program.ahead
-                                 and certified is None and not family.budgets_registers) else None)
+                run = (program.forward_whole_run(first, spans)
+                       if not program.ahead and certified is None and not family.budgets_registers else None)
                 return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret,
-                                          products=program.products, whole_end=whole_end))
+                                          products=program.products,
+                                          segment=lambda step, lo, hi: program.segmented(step, run, lo, hi)))
             assert anchors is not None
             known = algebra.Argmax(family.rows_of(anchors[0].at[state_rows]),
                                    family.rows_of(anchors[1].at[state_rows]))
@@ -1628,15 +1627,13 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
 
 def _walk_of(family: mosaic.Family, streams, lo, hi, counted, *, interpret: bool,
-             products: Sequence[mosaic.Product] = (), whole_end=None) -> Callable:
+             products: Sequence[mosaic.Product] = (), segment: Callable | None = None) -> Callable:
     """A consumer's walk of its key tiles `lo` to `hi` over its program's `streams` from the program's
     `counted`-th step (`Family.walk`, which places its declared `products`), as `walk(step, start, shapes,
-    initial=)` takes it. Where `whole_end` is given, splits `[lo, whole_end)` (static `masked=False`) from
-    `[whole_end, hi)` (`masked=True`) so unmasked causal tiles skip mask coordinates and selects."""
+    initial=)` takes it. Where `segment` is given (`_Program.segmented`), delegates masked/unmasked segment
+    construction to it (row 10790)."""
     def walk(step, start, shapes, initial=None):
-        segments = (((step, lo, hi),) if whole_end is None
-                    else ((functools.partial(step, masked=False), lo, whole_end),
-                          (functools.partial(step, masked=True), whole_end, hi)))
+        segments = ((step, lo, hi),) if segment is None else segment(step, lo, hi)
         return family.walk(streams, segments, start, shapes, interpret, first=counted,
                            initial=initial, products=products)
 

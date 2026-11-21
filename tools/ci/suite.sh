@@ -20,7 +20,6 @@
 #   PRIORITY         the jobs' armada priority (none: armada's default)
 #   DEW_TEST_CACHE   the test cache's policy (tools/armada/ci.py policy; `off` runs every file, `cold` every file
 #                    no record holds, as cold)
-#   GANGLESS         1 to run no gangs (a base/kernels push and a base/<producer> promote: main's trains run them)
 #   POOL             the suite's pool (none: .armada.json's): a staged train's containers (the land queue's gates)
 #   PROVEN           non-empty where the commit was proven green already: nothing runs
 #   OUT              where the clients' logs, the jobs' ids (jobs.txt) and the gangs' outcome (gangs.outcome,
@@ -30,7 +29,7 @@ sha=$1
 armada=${ARMADA:-armada}
 out=${OUT:-$(mktemp -d)}
 mkdir -p "$out"
-# The gangs' outcome is this run's alone, and none where no gang runs (GANGLESS, PROVEN).
+# The gangs' outcome is this run's alone, and none where no gang runs (PROVEN).
 rm -f "$out/gangs.outcome"
 priority=${PRIORITY:+--priority=$PRIORITY}
 # The CPUs .armada.json pins its tasks to (task.cpu), which every map here runs on too: a CPU's arithmetic is its own
@@ -45,7 +44,7 @@ jobs() {  # every armada job the clients named, kept for whoever cancels this ru
   cat "$out"/gangs.log "$out"/suite.log "$out"/suite.err 2>/dev/null |
     grep -oE '\bjob [0-9]{14}-[0-9a-f]{8}' | cut -d' ' -f2 | sort -u > "$out/jobs.txt"
 }
-if [ -z "${PROVEN:-}" ] && [ -z "${GANGLESS:-}" ]; then
+if [ -z "${PROVEN:-}" ]; then
   # A gang member lost before the start fails it within 300 s (armada#22).
   items=$(python3 tools/armada/ci.py gangs)
   echo "$items" | setsid $armada map --commit="$sha" --items=- --size=medium \

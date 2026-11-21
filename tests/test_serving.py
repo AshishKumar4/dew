@@ -485,7 +485,8 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
 
 
 def test_reload_normalizes_source_precision_before_concatenating_projections():
-    """A float64 value just above an FP16 midpoint must not double-round through FP32."""
+    """A float64 value just above an FP16 midpoint must not double-round through FP32; the host weights are
+    placed once, by the reload's own placement, no implicit transfer among it (row 10822)."""
     from dew.nn.projections import inference_projections
 
     bound = task(Sampling(temperature=0, eos_token_ids=None))
@@ -496,7 +497,8 @@ def test_reload_normalizes_source_precision_before_concatenating_projections():
     incoming = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), source)
     kernel = incoming["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     kernel[0, 0] = np.nextafter(1.00048828125, np.inf)
-    server.reload(incoming)
+    with jax.transfer_guard_host_to_device("disallow"):
+        server.reload(incoming)
     packed = server.variables["params"]["layers_0"]["self_attn"]["qkv_proj"]["kernel"]
     assert float(np.asarray(packed)[0, 0]) == 1.0009765625
     normalized = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), incoming)

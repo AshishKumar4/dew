@@ -56,7 +56,7 @@ import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.algebra.terms import parameter_key, parameters_key
-from dew.mesh import STAGE_AXIS, LayoutRefused
+from dew.mesh import STAGE_AXIS, LayoutRefused, held_apart
 from dew.nn import programs
 from dew.nn.kernels.options import owned_program, program
 from dew.nn.kernels.templates.layout import entrywise
@@ -383,12 +383,15 @@ class StageLocal:
             for stage in range(self.stages):
                 devices = stage_mesh(self.mesh, stage)
                 held = set(devices.devices.flat)
+                # A process outside the stage holds none of its piece, whose dtype it states (row 10780).
                 piece = jax.make_array_from_single_device_arrays(
                     (1, *leaf.shape[1:]), _sharded(sharding, devices, (None, *sharding.spec[1:])),
-                    [shard.data for shard in leaf.addressable_shards if shard.device in held])
+                    [shard.data for shard in leaf.addressable_shards if shard.device in held],
+                    dtype=leaf.dtype)
                 row = _sharded(sharding, devices, sharding.spec[len(shape):])
-                rows.extend(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
-                    math.prod(shape) // self.stages))(piece, stacked=len(shape)))
+                # Each row a checkpoint holds on its own stage's devices, on part of a pool (`held_apart`).
+                rows.extend(held_apart(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
+                    math.prod(shape) // self.stages))(piece, stacked=len(shape))))
             return rows
         return self.state(state, lambda tree: self.layered(tree, cut))
 
@@ -410,7 +413,7 @@ class StageLocal:
                                       out_shardings=piece)(held, within=shape[1:]))
             return jax.make_array_from_single_device_arrays(
                 (*shape, *rows[0].shape), self._stacked_sharding(row, len(shape)),
-                [shard.data for piece in pieces for shard in piece.addressable_shards])
+                [shard.data for piece in pieces for shard in piece.addressable_shards], dtype=rows[0].dtype)
         return self.staged(tree, stack)
 
     def whole(self, variables, *, consumed: bool = False):

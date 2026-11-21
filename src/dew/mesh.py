@@ -9,6 +9,7 @@ models' layout (`dew.nn.sharding`) constrains and maps their arrays by these, an
 from __future__ import annotations
 
 import math
+import weakref
 
 import jax
 from flax import linen as nn
@@ -239,3 +240,22 @@ def batch_axes(mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh) -> tuple[str
 __all__ = ["BATCH_AXES", "DATA_AXIS", "DEFAULT_RULES", "DILOCO_AXIS", "EXPERT_AXIS", "FSDP_AXIS", "MESH_AXES",
            "SEQUENCE_AXIS", "STAGE_AXIS", "TENSOR_AXIS", "LayoutRefused", "LogicalAxes", "LogicalAxisRules",
            "MeshAxes", "axis_rules", "batch_axes", "logical_spec", "mesh_axes", "row_axes"]
+
+
+_HELD_APART: weakref.WeakValueDictionary[int, jax.Array] = weakref.WeakValueDictionary()
+"""The arrays a checkpoint holds on part of a pool, by identity, each as long as it lives (`held_apart`)."""
+
+
+def held_apart[T](tree: T) -> T:
+    """`tree`, a pipeline's rows as a checkpoint holds them (`dew.training.stages.StageLocal.saved`), each of
+    its arrays named one a checkpoint holds on part of the pool (`dew.checkpoints.submesh`); any other array
+    on part of a pool, a `pmap`'s host-local output above all, is refused as Orbax refuses it."""
+    for leaf in jax.tree.leaves(tree):
+        if isinstance(leaf, jax.Array):
+            _HELD_APART[id(leaf)] = leaf
+    return tree
+
+
+def is_held_apart(value: jax.Array) -> bool:
+    """Whether `value` is an array `held_apart` named, itself and not another at its address."""
+    return _HELD_APART.get(id(value)) is value

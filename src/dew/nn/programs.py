@@ -137,14 +137,33 @@ class RaggedLayout(enum.Enum):
 
 class DotArithmetic(NamedTuple):
     """What a dot algorithm states of its arithmetic, as JAX lowers it (`dot_arithmetic`): each operand's
-    precision in bits, whether those are TF32's, its accumulation's bits, the primitive products it sums (an
-    X3's three) and whether its accumulation may be imprecise."""
+    precision in bits and its significand's digits (the implicit one counted), whether those are TF32's,
+    its accumulation's bits, the primitive products it sums (an X3's three) and whether its accumulation
+    may be imprecise."""
 
     operand_bits: tuple[int, int]
+    significands: tuple[int, int]
     tf32: bool
     accumulation_bits: int
     operations: int
     imprecise: bool
+
+    @property
+    def digits(self) -> int:
+        """The significand digits a product in this algorithm keeps of each operand: the narrower side's
+        once per part it splits an operand into, as its primitive products count them (`_PARTS`). Any
+        other count states no split this reads, and is refused."""
+        parts = _PARTS.get(self.operations)
+        if parts is None:
+            raise ValueError(f"a dot algorithm of {self.operations} primitive products states no split of "
+                             "its operands into parts")
+        return parts * min(self.significands)
+
+
+# The parts a split dot algorithm takes each operand in, by its primitive products: one product of one
+# part; three of two parts' four, the low parts' product dropped (TF32x3, BF16x3); six of three parts'
+# nine, the three lowest dropped (BF16x6); all nine (BF16x9).
+_PARTS = {1: 1, 3: 2, 6: 3, 9: 3}
 
 
 @functools.cache
@@ -170,10 +189,19 @@ def algorithm_arithmetic(algorithm) -> DotArithmetic:
     # Each a float type of the bindings (`ir.FloatType`'s cast holds it to one), whose width is its bits.
     left, right = (ir.FloatType(side).width for side in sides)
     return DotArithmetic(operand_bits=(left, right),
+                         significands=(_significand(sides[0]), _significand(sides[1])),
                          tf32=all(isinstance(side, ir.FloatTF32Type) for side in sides),
                          accumulation_bits=ir.FloatType(algorithm.accumulation_type).width,
                          operations=algorithm.num_primitive_operations,
                          imprecise=algorithm.allow_imprecise_accumulation)
+
+
+def canonical_precision(precision: jax.lax.PrecisionLike):
+    """`precision` as JAX reads it (its own canonicalization: a name, an enum, a pair of them, a dot
+    algorithm or a preset), the one place Dew reads it so."""
+    from jax._src.lax import lax as lax_internal
+
+    return lax_internal.canonicalize_precision(precision)
 
 
 def dot_arithmetic(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype) -> DotArithmetic | None:
@@ -183,12 +211,11 @@ def dot_arithmetic(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype) -> Do
     them, the default preset), the backend's choice by the operands. The one reading of a preset: the
     algebra's cost prices a product's mode by it (`dew.algebra.cost`) and its rounding bound admits a
     contraction by it (`dew.algebra.terms`), no list of preset names beside JAX's."""
-    from jax._src.lax import lax as lax_internal
-
-    named = lax_internal.canonicalize_precision(precision)
+    named = canonical_precision(precision)
     if isinstance(named, jax.lax.DotAlgorithm):
         sides = (named.lhs_precision_type, named.rhs_precision_type)
-        return DotArithmetic(operand_bits=(_bits(sides[0]), _bits(sides[1])), tf32=False,
+        return DotArithmetic(operand_bits=(_bits(sides[0]), _bits(sides[1])),
+                             significands=(_digits(sides[0]), _digits(sides[1])), tf32=False,
                              accumulation_bits=_bits(named.accumulation_type),
                              operations=named.num_primitive_operations,
                              imprecise=named.allow_imprecise_accumulation)
@@ -223,6 +250,30 @@ def dot_algorithms(dtype) -> tuple[jax.lax.DotAlgorithmPreset, ...]:
 def _bits(dtype) -> int:
     """A dtype's width in bits."""
     return 8 * jnp.dtype(dtype).itemsize
+
+
+def _digits(dtype) -> int:
+    """A float dtype's significand digits, its implicit one counted."""
+    return jnp.finfo(dtype).nmant + 1
+
+
+def _significand(side) -> int:
+    """The significand digits of a lowered dot algorithm's precision type `side`, its implicit one counted:
+    TF32's ten stored and its one, the one such type no dtype lowers to; any other's by the float dtype JAX
+    lowers to it (`mlir.dtype_to_ir_type`), no list of types' digits beside the dtypes' own. JAX's float
+    dtypes are read from its internal `jax._src.dtypes._float_types`, which a bump of JAX's pin checks."""
+    from jax.extend.mlir import ir
+    from jax.interpreters import mlir
+
+    if isinstance(side, ir.FloatTF32Type):
+        return 11
+    # In the type's own context: a compile's checks read a program's dots outside any of theirs
+    # (`report.triton_wrong`, a GPU target's compile).
+    with side.context:
+        for dtype in map(np.dtype, dtypes._float_types):
+            if mlir.dtype_to_ir_type(dtype) == side:
+                return _digits(dtype)
+    raise ValueError(f"no float dtype lowers to the dot algorithm's precision type {side}")
 
 
 def ragged_layout(lhs_rank: int, rhs_rank: int, numbers) -> RaggedLayout | None:

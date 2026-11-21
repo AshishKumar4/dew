@@ -71,8 +71,10 @@ they are declared: neither is generated yet.
 - **A manual mesh's body** (`jax.shard_map`'s, each device's program) is a boundary, not a leaf: the pass
   rewrites inside it in the map's recorded context (its newly manual axes bound, its abstract mesh manual,
   its variance checked as the map checks it), each traced value typed by the manual axes it varies over, and
-  nothing moves across it; a constant its rewrite holds becomes one of the map's replicated operands, as JAX
-  stages a map (row 6578).
+  nothing moves across it. No constant reaches its body: JAX stages a map's body, as a checkpoint's, without
+  constants, and their replay and lowering pass none, so a form whose program holds one is not spliced
+  (`program._splices`) and an `Algebra` span closing over one is rewritten within its call (row 6578, its
+  review's F1; rows 10692, 10720).
 - **Marked regions** (§6.10): Dew brackets a span of a computation with a marker primitive whose JVP and
   transpose rules bracket the span's tangent and cotangent too, so a span keeps its marker through autodiff. A
   marker carries its kind as an object, never a name string:
@@ -89,8 +91,11 @@ they are declared: neither is generated yet.
   - `Activation`: an activation's gated or ungated product (the fusion seam its epilogue reads), which rules
     rewrite within, as a `Surrogate` span's body.
   - `Algebra`: a derivative written only to restructure algebra (§1.3), which the pass rewrites freely: a span
-    with no effects over arrays opens into the region around it, and any other is rewritten within its call, as
-    a control-flow body is (its constants at hand, its inputs arrays).
+    with no effects over arrays whose body holds no constant opens into the region around it, and any other is
+    rewritten within its call, as a control-flow body is (its constants at hand, its inputs arrays). A span
+    closing over an array opens nowhere, a top-level program's or a nested jit's included: opened, its
+    constants would be the enclosing program's, which a manual mesh's body and a checkpoint's bind none of
+    (`program._opening`).
 - **Control flow:** the bodies of `scan`, `while`, `cond`, nested `jit` (`pjit`) and checkpoint (remat) are regions
   of their own, rewritten in place and recursively (a body whose constants are not all at hand, or one of
   whose inputs is no array, is left as traced). Bodies are never unrolled, so a step's program depth stays
@@ -776,12 +781,19 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   ordered by their seconds, where every rate of a GPU target is stated (`cost.cheaper`'s rule for work no
   rate prices is the compile-time splice's). No module calls `choose` yet (the generator is parked, §6.11).
 - One choice of this kind is built: a product's dot algorithm for the accuracy its site asks
-  (`dew.algebra.error.product_precision`, row 5473; today its test calls it and no site does). Its candidates are the algorithms JAX itself states for
-  the operands' dtype (`dew.nn.programs.dot_algorithms`, by JAX's own conversion of each preset), priced by `cost.product_work` in the mode
-  and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
+  (`dew.algebra.error.product_precision`, row 5473). Its candidates are the algorithms JAX itself states for
+  the operands' dtype (`dew.nn.programs.dot_algorithms`, by JAX's own conversion of each preset), of them
+  those the site's kernel runs as named where it states them (`stated`), priced by `cost.product_work` in the
+  mode and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
   three-pass TF32 product where one pass misses the accuracy and IEEE fp32 costs more); none admitted is
-  refused. A site is to read it in place of a hand-picked preset: the recurrence ports, the template's accurate
-  parts and the GEMM's low-precision forms (their lanes' rows).
+  refused. A gate stated as an algorithm (`error.at_least`) admits one at least as exact: as many significand
+  digits of each operand (`DotArithmetic.digits`, its parts times the narrower side's) and as wide an
+  accumulation. It serves the sites whose kernel lowers the algorithm itself: the Triton ports, each at
+  least fla's own (`fla_gdn._precision` over `TRITON_ALGORITHMS`), and the TPU SSD's Mosaic kernel
+  (`ssd._exact`, its precisions named back). A product XLA compiles states a `Precision` instead
+  (`recurrence_algebra.STATE_PRECISION`'s HIGHEST): XLA routes a dot to an emitter by its shape, and its
+  CPU's elemental emitter took no named algorithm at a `[1, 1]` dot (F64 and BF16x6 alike, M-JS-159), where
+  HIGHEST is one every routing takes.
 - Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
   exact counterpart (`extract.extracted`) is the oracle (exact as a mixed integer program is: solved to a
   relative gap of zero within the solver's feasibility tolerance, each price level held at its least within
@@ -805,12 +817,16 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   added to `GpuTarget` or its `Architecture`, never to the engine. Prices are checked against measured profiles,
   never fitted to them; a form whose price and profile disagree is a finding against the cost model.
 - One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`,
-  whose units kernel-templates.md §6 states. The algebra's terms price through it (`cost.work`: a product's FLOPs in
-  its mode, from its operands' dtypes and its precision as the product declaration reads them, a dot
-  algorithm's passes counted, and its operand bytes; a reduction's operations; a special function's
-  exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing;
-  a leaf's bytes, read once). Today `cost.work` states that by hand, a primitive at a time; the per-primitive
-  rules that are to read a kernel's body are to read each term as its equation too (row 5901). A template
+  whose units kernel-templates.md §6 states. A term's arithmetic is priced by the rule the kernels' counter
+  prices a kernel body's equation by (`emission.operation_work`, row 5901), its primitive's over its operands'
+  shapes: a product's FLOPs in the mode and passes it multiplies in on the price's target
+  (`product.product_mode`, from its operands' dtypes and its precision as the product declaration reads them, a
+  dot algorithm's passes counted, a TPU's fp32 product its bfloat16 passes); a reduction's operations; a special
+  function's exponentials, a conversion's conversions, any other elementwise operation's operations (a clamp's
+  two), a layout change nothing; and a primitive no rule prices (an atan2, an erf_inv) its elements as work no
+  rate prices (`Work.unpriced_operations`), so no form is cheaper for taking more of it. `cost.work` adds XLA's
+  fusion's own accounting beside it: a leaf's bytes, read once, a product's staged operand bytes, each
+  reduction's and product's kernel and what its result keeps on chip, a contracted multiply nothing. A template
   kernel's issued work is read from its body into the same record (docs/design/kernel-templates.md §6; today
   stated by hand, row 5895). The one other per-operation price, a bit form's own, is kernel-templates.md §6's gap (row 5386).
 - A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts, each

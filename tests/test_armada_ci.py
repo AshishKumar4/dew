@@ -677,6 +677,19 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     # Its stall's record among this task's own artifacts (`stalls.kept`), never an enclosing task's.
     [kept] = interrupted["artifacts"]
     assert (tmp_path / "artifacts" / kept).is_file()
+    # So is a pass a task of which crashed, never started its file, or left no coverage data (row 10801).
+    shutil.rmtree(tmp_path / "runs/2")
+    complete = json.loads((tmp_path / "runs/0/rows.json").read_text())
+    for kind in ("whole", "stale", None):
+        shutil.copytree(tmp_path / "runs/0", tmp_path / "runs/2")
+        rows = ([{**row, "exitCode": 1, "kind": kind} for row in complete["rows"]] if kind
+                else complete["rows"])
+        (tmp_path / "runs/2/rows.json").write_text(json.dumps({**complete, "rows": rows}))
+        if kind is None:
+            for part in (tmp_path / "runs/2").glob(".coverage.*"):
+                part.unlink()
+        assert ci.coverage_report.report(tmp_path / "runs") == 1, kind
+        shutil.rmtree(tmp_path / "runs/2")
 
 
 def test_the_scenario_suites_coverage_items_are_its_tasks_alone(ci, tmp_path):
@@ -1210,6 +1223,47 @@ def test_a_group_past_its_bound_is_cut_again_with_its_nearest_groups_alone_and_t
     assert ci.cuts.rebalanced(ci.session, dict.fromkeys(nodes, 100.0), bounds, [210.0] * 6, 180.0) is None
 
 
+def test_a_stored_cut_another_cut_of_its_count_ran_in_place_of_is_stored_as_ran(ci, tmp_path):
+    """A stored cut main's CI ran no group of as stored (a bound timed in another group than the one it
+    starts: a reweighed plan cut the file afresh at the same count) stores the cut that ran, never its own,
+    which a plan would take up again and rename every group of (review, row 10776); a bound timed in no
+    group (skipped) proves nothing and keeps the stored cut, so none is recut every train."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 120, "environment": {}}))
+    name = "tests/test_steady.py"
+    nodes = [f"{name}::test_{index}" for index in range(4)]
+    own = dict.fromkeys(nodes, 50.0)
+    ran = [100.0, 100.0]
+    as_ran = [set(nodes[:2]), set(nodes[2:])]
+    # Stored [test_0], [test_1..3]; ran [test_0, test_1], [test_2, test_3]: the cut that ran is stored.
+    stored = {name: [nodes[1]]}
+    folded = ci.cuts.refolded(ci.session, stored, {name: ran}, 120.0, {name: own}, {name: own},
+                              {name: as_ran})
+    assert ci.session.cut_by(nodes, folded[name]) == [nodes[:2], nodes[2:]]
+    # A boundary moved earlier ([a, b] | [c, d] stored; [a] | [b, c, d] ran, as the record it was cut by
+    # weighs it) is found too: the fold stores b, and the next plan runs [a] | [b, c, d], where a stored cut
+    # kept unrun would have stood at c.
+    before = dict(zip(nodes, [180.0, 40.0, 50.0, 50.0], strict=True))
+    after = dict(zip(nodes, [100.0, 40.0, 50.0, 50.0], strict=True))
+    folded = ci.cuts.refolded(ci.session, {name: [nodes[2]]}, {name: [100.0, 140.0]}, 120.0, {name: before},
+                              {name: after}, {name: [set(nodes[:1]), set(nodes[1:])]})
+    assert folded[name] == [nodes[1]]
+    assert ci.session.planned(name, nodes, list(after.values()), 2, folded) == [nodes[:1], nodes[1:]]
+    # Its bound untimed (skipped): the stored cut stays.
+    untimed = [set(nodes[:1]), set(nodes[2:])]
+    assert ci.cuts.refolded(ci.session, stored, {name: ran}, 120.0, {name: own}, {name: own},
+                            {name: untimed}) == stored
+    # The same rows read back: each group's timed tests, in order.
+    rows = {name: [{"name": f"3.12:{name}#2/2", "exitCode": 0, "seconds": 100.0,
+                    "tests": dict.fromkeys(nodes[2:])},
+                   {"name": f"3.12:{name}#1/2", "exitCode": 0, "seconds": 100.0,
+                    "tests": dict.fromkeys(nodes[:2])}]}
+    assert ci.cuts.held(rows) == {name: as_ran}
+    # A one-group split (`--split=1/1`) reads as its one group.
+    whole = {name: [{"name": f"3.12:{name}#1/1", "exitCode": 0, "seconds": 200.0,
+                     "tests": dict.fromkeys(nodes)}]}
+    assert ci.cuts.held(whole) == {name: [set(nodes)]} and ci.cuts.ran(whole) == {name: [200.0]}
+
+
 def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
         ci, tmp_path, monkeypatch, cache_worker):
     """Tests marked shared_setup with one name, on their own decorators, run in one group of their
@@ -1419,9 +1473,11 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     """A run that reads a checkout file and writes it keeps no key, however it writes it: Python's write, one
     handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, through
     an alias of what it read, under a nested hidden directory, a copy that puts the file's time back, or a
-    native writer (sqlite's); nor does one that found a file absent and made it: its key would hash the
-    checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its review).
-    A file a run only writes, as each run here appends to `runs`, is no input and leaves its key."""
+    native writer (sqlite's); nor does one that found a file absent and made it, a package beside a module
+    it imported among them, which only its key's import lookups cover (`ci.inputs`; row 10800): its key would
+    hash the checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its
+    review), its record saying so (row 10775). A file a run only writes, as each run here appends to `runs`,
+    is no input and leaves its key."""
     import sqlite3
 
     counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
@@ -1438,6 +1494,9 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     (tmp_path / "docs/.data").mkdir()
     (tmp_path / "docs/.data/input.txt").write_text("input\n")
     (tmp_path / "docs/same.txt").write_text("PAGE\n")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src/held.py").write_text("VALUE = 1\n")
+    (tmp_path / "docs/gone.txt").write_text("gone\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     for test, body in (
             ("plain", "    assert True\n"),
@@ -1460,18 +1519,41 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
                      "        made.write_text('made\\n')\n"),
             ("native", "    with sqlite3.connect('tests/fixtures/rows.db') as database:\n"
                        "        database.execute('insert into t values (1)')\n"
-                       "    database.close()\n")):
+                       "    database.close()\n"),
+            ("emptied", "    gone = Path('docs/gone.txt')\n    if gone.is_file():\n"
+                        "        assert gone.read_text()\n        gone.unlink()\n        gone.mkdir()\n"),
+            ("shadowed", "    import sys\n    sys.path.insert(0, 'src')\n    import held\n    assert held\n"
+                         "    made = Path('src/held')\n    if not made.exists():\n        made.mkdir()\n"
+                         "        (made / '__init__.py').write_text('')\n")):
         written(tmp_path, {"test_a.py": "import mmap\nimport os\nimport shutil\nimport sqlite3\n"
                                         "from pathlib import Path\n\n\ndef test_a():\n" + counted + body})
         (tmp_path / "runs").unlink(missing_ok=True)
         commit(tmp_path, test)
-        assert [run(), run()] == ([1, 1] if test == "plain" else [1, 2]), test
+        first = run()
+        if test == "shadowed":
+            # Its first run's record, before the second (which finds the package made) records its own.
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            kept = json.loads(cache_worker[1][place])
+            assert kept["key"] is None and "its task wrote its input src/held" in kept["why"], kept["why"]
+        assert [first, run()] == ([1, 1] if test == "plain" else [1, 2]), test
         # Its record keeps what it read all the same, which a change's reach reads (`reached`).
         if test == "python":
             place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
             kept = json.loads(cache_worker[1][place])
             assert kept["key"] is None and kept["depends"] is None
             assert any(path.partition(ci.followed.CODE)[0].endswith("docs/page.txt") for path in kept["read"])
+
+
+
+def test_a_lookups_entries_are_its_names_alone(ci):
+    """A write counts against an import lookup (`ci.looked_entry`) only where it is an entry the lookup
+    lists: its name, a module or package of any suffix beside it, a package's own __init__; none of another
+    name, a deeper file, or one under a namesake package (review: `held/__init__report.json`)."""
+    entry = ci.looked_entry
+    assert all(entry(path, "src/held") for path in ("src/held", "src/held.py", "src/held.cpython-312.so",
+                                                    "src/held/__init__.py", "src/held/__init__.pyc"))
+    assert not any(entry(path, "src/held") for path in ("src/held/__init__report.json", "src/held/mod.py",
+                                                        "src/helder.py", "src/other/held.py"))
 
 
 def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(ci, tmp_path, monkeypatch,
@@ -2346,33 +2428,6 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
         return [word for word in run if word.startswith("--deadline")]
 
     assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
-
-
-def run_options(tmp_path: Path, ref: str, policy: str, option: str) -> list[str]:
-    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy` (`suite_step`)."""
-    calls = suite_step(tmp_path / ref.replace("/", "-"), ref, "", policy, 2)
-    [run] = [call for call in calls if call[0] == "run"]
-    return [word for word in run if word.startswith(option)]
-
-
-def test_a_base_push_runs_above_every_lanes_run_and_no_higher_than_main(tmp_path):
-    """A push to base/kernels runs its suite above a lane's run, with the suite's ordinary deadline, so it is
-    graded: at a lane's whole-suite priority (-10) with the background deadline it waited behind every train,
-    precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs that started from
-    2026-11-09 to 11-12 (the owner's rule, 2026-11-01: every push to base is graded, a red its committer's the
-    same day); and at a targeted run's 0 its judges' draws waited out their deadline behind lane work
-    (2026-11-16). It runs no higher than main's own push, below which trains keep theirs (the queue's gates on
-    the hub set a train's, runbooks/hub.md)."""
-    def level(ref: str) -> int:
-        # armada's default where the workflow names none.
-        given = run_options(tmp_path, ref, "off", "--priority")
-        return int(given[0].partition("=")[2]) if given else 0
-
-    assert level("fix/lane") < level("base/kernels") <= level("main")
-    # A base push, on the pool armada gives it, has the suite's ordinary deadline: main's.
-    assert (run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline")
-            == run_options(tmp_path / "main-deadline", "main", "on", "--deadline"))
-    assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):

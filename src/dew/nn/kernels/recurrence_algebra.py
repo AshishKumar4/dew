@@ -51,7 +51,9 @@ STATE_PRECISION = exact_float32(None)
 rounding every later chunk reads compounded, so IEEE float32 (`dew.nn.precision.exact_float32`) whatever JAX's
 configured precision, whose default runs an fp32 product as TF32 on a GPU (the derived scan's at post81 on an
 A100: 1823 times the fp32 recurrence's distance from float64, M-JS-96). It is the reference the template's
-forms are held to; TF32 stays where the run's default numerics put it, in the ports and the fast forms."""
+forms are held to; TF32 stays where the run's default numerics put it, in the ports and the fast forms. A
+`Precision`, not a dot algorithm derived for it (`dew.algebra.error.product_precision`): XLA routes a dot to
+an emitter by its shape, and its CPU's elemental emitter takes no named algorithm (row 5473)."""
 
 
 def portable(name: str, left, right):

@@ -36,7 +36,11 @@ from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
+from dew.nn.kernels.generation import device_generation
 from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p
+
+__accuracy_gate__ = True
+"""The accuracy gate's own: its floats compared within their bounds (tools/lint_slop.py's SLOP020)."""
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
              primitives.reduce_scatter_p: "axis_name"}
@@ -71,7 +75,13 @@ def compensating() -> frozenset:
 
 SCALES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 """Each function's compiled rounding scale (`rounding_scale`) of a static program, by its arguments' tree,
-shapes, dtypes and weak types and the matmul precision it traced under, held while the function lives."""
+shapes, dtypes and weak types and the matmul precision it traced under (`_signature`), held while the
+function lives."""
+
+TRACED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+"""Each function's program as `rounding_scale` traces it (`_traced`), by the same signature, held while the
+function lives: a weighed site's recording asks its reference's scale at thousands of draws of one program,
+and tracing it again at each took 6.8 of a recording's 25 s (row 5864)."""
 
 
 @jax.tree_util.register_dataclass
@@ -167,12 +177,8 @@ def rounding_scale(fn, *args, seed: int = 0):
     weighs alike for every arm. The program is traced at `args` as given, its roundings those formats', and
     evaluated in float64; a non-floating output's scale is None. A static program (no branch or loop its
     values pick) evaluates compiled, once a signature and matmul precision; any other walks eagerly."""
-    # The program as written: traced with the algebra pass off, a reference's (`arm_arithmetic.unrewritten`),
-    # its outputs' tree read from the same trace.
-    closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
-    tree = jax.tree.structure(shapes)
-    # Traced in the caller's arithmetic (its default matmul precision among it), replayed in float64's own.
-    traced = str(jax.config.jax_default_matmul_precision)
+    signature = _signature(args)
+    closed, tree = _traced(fn, args, signature)
     moved = on_float64_host(jax.tree.leaves(args))
     with on_float64_device(), evaluated_on(moved), jax.enable_x64(new_val=True), \
             jax.default_matmul_precision("highest"):
@@ -180,18 +186,16 @@ def rounding_scale(fn, *args, seed: int = 0):
         consts = [_widened(value) for value in on_float64_host(closed.consts)]
         keys = _keys(seed)
         if static(closed.jaxpr):
-            signature = (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
-                                                          getattr(jax.typeof(leaf), "weak_type", False))
-                                                         for leaf in jax.tree.leaves(args)),
-                         traced, _target())
             held = SCALES.setdefault(fn, {})
-            if signature not in held:
+            # Compiled for the device it evaluates on (`float64_terms.evaluated_on`), which its trace is not.
+            compiled = (signature, _target())
+            if compiled not in held:
                 jaxpr = closed.jaxpr
                 # One tapped evaluation compiled, which every draw runs with its own key: a program of
                 # one copy of `fn`, not one of each draw's.
-                held[signature] = jax.jit(lambda consts, leaves, key, scale: walked(
+                held[compiled] = jax.jit(lambda consts, leaves, key, scale: walked(
                     jaxpr, consts, leaves, TapRule(key, scale)))
-            outputs, scales = _scaled(closed.jaxpr, functools.partial(held[signature], consts, leaves), keys)
+            outputs, scales = _scaled(closed.jaxpr, functools.partial(held[compiled], consts, leaves), keys)
         else:
             # Its runs of static steps between a branch and a loop compiled, the rule passed in (`_span`).
             outputs, scales = _scaled(closed.jaxpr, lambda key, scale: walked(
@@ -200,28 +204,72 @@ def rounding_scale(fn, *args, seed: int = 0):
             tree.unflatten([None if scale is None else np.asarray(scale) for scale in scales]))
 
 
+def _signature(args) -> tuple:
+    """What a program `rounding_scale` traces at `args` is keyed by (`TRACED`; `SCALES` beside the device it
+    evaluates on): the arguments' tree, shapes, dtypes and weak types, and the context a trace reads beside
+    them: the matmul precision it is traced under (the caller's arithmetic, which its replay in float64 does
+    not keep), whether x64 is on (its constants' widths), the abstract mesh (its values' shardings) and the
+    generation its kernels are chosen for (`generation.device_generation`)."""
+    return (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
+                                             getattr(jax.typeof(leaf), "weak_type", False))
+                                            for leaf in jax.tree.leaves(args)),
+            str(jax.config.jax_default_matmul_precision), bool(jax.config.jax_enable_x64),
+            jax.sharding.get_abstract_mesh(), device_generation())
+
+
+def _traced(fn, args, signature: tuple) -> tuple:
+    """`fn`'s program as written at `args`, traced with the algebra pass off, a reference's
+    (`arm_arithmetic.unrewritten`), and its outputs' tree from the same trace, once a signature
+    (`TRACED`): a function is its program, as `SCALES` holds it."""
+    held = TRACED.setdefault(fn, {})
+    if signature not in held:
+        closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
+        held[signature] = (closed, jax.tree.structure(shapes))
+    return held[signature]
+
+
 def _scaled(jaxpr, tapped, keys):
     """`jaxpr`'s untapped float64 outputs and each floating output's scale (`rounding_scale`), from
     `tapped(key, scale)`, its evaluation with every rounding moved by `scale` times a draw keyed by `key`
     (`keys`: the untapped evaluation's and each draw's, `_keys`): the root mean square of each draw's
-    displacement from the untapped evaluation (`_spread`)."""
+    displacement from the untapped evaluation, folded in a draw at a time (`_folded`), so the untapped
+    outputs, one draw's and the running fold are all it holds, where it held every draw's at once (row 9780:
+    a 10-layer model's loss and gradients, nine float64 copies of them, were killed for memory)."""
     key, drawn = keys
     plain = tapped(key, 0.0)
-    draws = [tapped(each, 1.0) for each in drawn]
-    return plain, [_spread(value, *(draw[at] for draw in draws))
-                   if jnp.issubdtype(var.aval.dtype, jnp.floating) else None
-                   for at, (var, value) in enumerate(zip(jaxpr.outvars, plain, strict=True))]
+    floating = [jnp.issubdtype(var.aval.dtype, jnp.floating) for var in jaxpr.outvars]
+    # The largest displacement at the outputs' own width (a float64 output's may lie below float32's range),
+    # the scaled squares, at most the count, in float32: held, the untapped outputs, one draw's and about
+    # one more output's (rows 9780 on: a 2 GiB float64 gradient tree's walk peaked at 6.15 GiB).
+    folds = [(jnp.zeros_like(value), jnp.zeros(jnp.shape(value), jnp.float32)) if kept else None
+             for value, kept in zip(plain, floating, strict=True)]
+    for each in drawn:
+        draw = tapped(each, 1.0)
+        folds = [None if fold is None else _folded(value, moved, *fold)
+                 for value, moved, fold in zip(plain, draw, folds, strict=True)]
+        del draw
+    return plain, [None if fold is None else _spread(*fold, len(drawn)) for fold in folds]
 
 
 @jax.jit
-def _spread(value, *draws):
-    """The root mean square of each draw's displacement from `value`, each element taken relative to its
-    largest displacement, so no square overflows and a nonfinite displacement stays nonfinite: one program
-    a shape, where its operations eagerly were a dispatch each."""
-    moved = jnp.stack([jnp.abs(draw - value) for draw in draws])
-    largest = jnp.max(moved, axis=0)
-    held = jnp.where(largest > 0, largest, 1)
-    return jnp.where(largest > 0, largest * jnp.sqrt(jnp.mean(jnp.square(moved / held), axis=0)), largest)
+def _folded(value, draw, largest, squares):
+    """A draw's displacement from `value` folded into its running root mean square: the largest
+    displacement so far and the sum of the squares of each displacement relative to it, rescaled where a
+    larger one comes (LAPACK's `dnrm2` update), so no square overflows and a nonfinite displacement keeps the
+    fold nonfinite. One program a shape, where its operations eagerly were a dispatch each."""
+    moved = jnp.abs(draw - value)
+    larger = moved > largest
+    held = jnp.where(larger, moved, jnp.where(largest > 0, largest, 1))
+    # Each ratio at most 1 at the outputs' width, then the sum's float32 (`_scaled`).
+    squares = jnp.where(larger, squares * jnp.square(largest / held).astype(squares.dtype) + 1,
+                        squares + jnp.where(largest > 0, jnp.square(moved / held), 0).astype(squares.dtype))
+    return jnp.maximum(largest, moved), squares
+
+
+def _spread(largest, squares, count: int):
+    """The root mean square of `count` folded displacements (`_folded`), zero where none moved, at the
+    largest's width."""
+    return jnp.where(largest > 0, largest * jnp.sqrt(squares / count).astype(largest.dtype), largest)
 
 
 def _widened(leaf):

@@ -179,6 +179,27 @@ def trajectory_batch(trajectory, advantages, mask=None):
                            advantages, trains=mask)
 
 
+def test_a_walks_rows_cut_to_their_trained_prefix_lay_out_as_the_whole_walks():
+    """`transition_rows` over a walk's parts cut to their first two transitions (its states to three, its
+    densities and stochastic steps to two, as a rank reads its rows of a long walk, row 10795) is the batch
+    the whole walk's parts give at `selected=2`, every field bit for bit, its grid points read from the walk's
+    whole times; states cut short of the transitions they step to are refused."""
+    rng = np.random.default_rng(10795)
+    states = rng.standard_normal((4, 6, 3)).astype(np.float32)
+    times = np.linspace(1.0, 0.0, 6, dtype=np.float32)
+    densities = rng.standard_normal((4, 5)).astype(np.float32)
+    stochastic = rng.random((4, 5)) < 0.5
+    advantages = rng.standard_normal(4).astype(np.float32)
+    whole = transition_rows(states, times, densities, stochastic, advantages, selected=2)
+    cut = transition_rows(states[:, :3], times, densities[:, :2], stochastic[:, :2], advantages, selected=2)
+    assert whole.keys() == cut.keys()
+    for name in whole:
+        np.testing.assert_array_equal(np.asarray(cut[name]), np.asarray(whole[name]), err_msg=name)
+    np.testing.assert_array_equal(np.asarray(cut["rollout_steps"]), np.full(4, 6))
+    with pytest.raises(ValueError):
+        transition_rows(states[:, :2], times, densities[:, :2], stochastic[:, :2], advantages, selected=2)
+
+
 @pytest.mark.parametrize("prediction", ["clean", "v"])
 def test_flow_objective_uses_converted_predictions(prediction):
     """JiT and other parameterizations share the rectified transition and its rescored density: the
@@ -469,7 +490,9 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     would not guide a step 1 of 6, so the rescoring reads the rollout's step
     count off the batch. Its group advantages are the float64 normalization's,
     rounded once, and its timesteps the 4-point walk's first two, bit for
-    bit."""
+    bit. The walk its collective gathers is its trained prefix: three of its
+    four states, two densities and stochastic marks, its four times whole
+    (row 10795)."""
     from dew.inputs import CharTable, Condition
     from dew.nn.backbones.dit import SimpleDiT
 
@@ -494,12 +517,26 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     def reward(images, context):
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
+    from dew.distributed.batches import split_fields
+
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
+    # What the rollout's generation hands its collective (`_generate_impl`), by its shapes alone.
+    expanded = rollout._expanded(split_fields(prompts)[0])[0]
+    walk = jax.eval_shape(lambda: rollout._generate_impl(rollout._policy(state), expanded,
+                                                         jax.random.key(23)))[0]
+    assert (walk.states.shape[1], walk.log_probs.shape[1], walk.stochastic.shape[1], walk.times.shape) == (
+        3, 2, 2, (4,))
     batch = rollout(state, prompts, jax.random.key(23), objective=objective)
     rewards = np.asarray(batch["rewards"], np.float64).reshape(2, 3)
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
     np.testing.assert_array_equal(batch["timesteps"], np.broadcast_to(process.times(4)[:2], (6, 2)))
+    # Another rollout of the objective over the same walk that trains another prefix reads its own (the
+    # objective's program held per prefix, row 10821), where it read the first rollout's two transitions.
+    for trained, taken in ((1, 1), (None, 3)):
+        other = FlowRollout(objective, reward, groups=3, steps=4, train_steps=trained)(
+            state, prompts, jax.random.key(23), objective=objective)
+        assert other["timesteps"].shape == other["transition_mask"].shape == (6, taken)
     # A source row a partly read pool share repeats (`VALID_ROWS`) trains none of its samples' transitions,
     # whatever their advantages (row 3346's review).
     from dew.batch import VALID_ROWS

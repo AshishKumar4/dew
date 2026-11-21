@@ -29,7 +29,6 @@ recording) has no program, and runs as given."""
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import dataclasses
 import functools
 import hashlib
@@ -47,6 +46,7 @@ from typing import Any
 
 import jax
 import numpy as np
+from store_wire import COMPILED, SITE_IN_PROGRESS
 from tool_support import load
 
 
@@ -159,6 +159,16 @@ class CompiledTruths:
         yield
         self.done.update(labels)
 
+    def judged_its_zeros(self, error: BaseException, before: frozenset[str] = frozenset()) -> bool:
+        """Whether `error`, raised in this store's prepare, checked what the prepare gave in place of the
+        sites and arms it tried since `before` (its `tried` then; the test's whole where none is given): one
+        at least tried, every one finished (`preparing`), and the error any but a missing program
+        (`MissingTruth`). Such a check reads an `ahead_arm`'s zeros, which judges nothing, its run judging it
+        (rows 8555, 10169): the one rule a flow's cell (`gpu_flow._deferred`), a test (tests/conftest.py's
+        `judged_on_zeros`) and a test's child process (`of_the_parent`'s callers) pass their prepare by."""
+        new = self.tried - before
+        return self.prepare and bool(new) and new <= self.done and not isinstance(error, MissingTruth)
+
     def arm_again(self, label: str, name: str):
         """A prepare's call of an arm with no site (`reference_error.ahead_arm`) whose label it compiled
         (`arms`): its program's zeros (of the shapes its own trace gave, in the store's tracing: a jit of its
@@ -204,6 +214,22 @@ class CompiledTruths:
         from dew.nn.kernels.generation import compile_only_gpus
 
         return compile_only_gpus(self.target.generation, 1)[0]
+
+    @contextlib.contextmanager
+    def on_its_gpu(self) -> Iterator[None]:
+        """Within the block, this process as on the store's target's GPU: that GPU's compile-only device its
+        default (`device`), on which nothing computes, and every kernel chosen as on that GPU
+        (`generation.assumed`: its generation and facts, which a compile-only device placed off the CPU
+        backend reads as the bare platform 'gpu', every kernel it takes refused, rows 8076 and 10088); as it
+        is where the store names no target. A part's prepare (`prepared`) and its child process's
+        (`of_the_parent`) alike."""
+        if self.target is None:
+            yield
+            return
+        from dew.nn.kernels.generation import assumed
+
+        with jax.default_device(self.device()), assumed(self.target):
+            yield
 
     @contextlib.contextmanager
     def tracing(self) -> Iterator[None]:
@@ -380,15 +406,6 @@ def admitted_needs(arms: Sequence[dict[str, int]], truths: Sequence[dict[str, in
             *(admitted_as(CompiledMemory(**memory), state) for memory in truths)]
 
 
-COMPILED: contextvars.ContextVar[CompiledTruths | None] = contextvars.ContextVar("truths_ahead_store",
-                                                                                default=None)
-"""The store open (`compiled_truths`), None outside one."""
-
-SITE_IN_PROGRESS: contextvars.ContextVar[str | None] = contextvars.ContextVar("truths_ahead_site",
-                                                                              default=None)
-"""The label of the check-1 site whose truths are computed (`judged`), None outside one."""
-
-
 READ: list[Path] = []
 """Each store this process's runs read, in order (`compiled_truths`): a test's own and a flow's alike, whose
 records of what its run compiled on its GPU (`AT_RUN`, `UNPREPARED`) the run's summary names
@@ -413,33 +430,19 @@ def compiled_truths(directory: str | Path, *, prepare: bool, stamp: str,
 @contextlib.contextmanager
 def prepared(directory: Path, *, stamp: str, target) -> Iterator[CompiledTruths]:
     """A GPU tier part's test's prepare (`tests/conftest.py`'s `compiled_ahead`): its check-1 sites compiled
-    into `directory` for the node's GPU (`target`, its `GpuTarget`: `generation_support.node_target`) with
-    that GPU's compile-only device this process's default, on which nothing computes, every kernel chosen as
-    on that GPU (`generation.assumed`: its generation and facts, which a compile-only device placed off the
-    CPU backend reads as the bare platform 'gpu', every kernel it takes refused, rows 8076 and 10088), and
-    their programs' needs (`admitted_needs`) filed under the part's unit as it closes, whatever its test ended
-    in (`tier_wire.unit_needs`, as a flow's are, row 7900), by which the lane sizes the unit's worker."""
+    into `directory` for the node's GPU (`target`, its `GpuTarget`: `generation_support.node_target`), this
+    process as on that GPU (`CompiledTruths.on_its_gpu`), and their programs' needs (`admitted_needs`) filed
+    under the part's unit as it closes, whatever its test ended in (`tier_wire.unit_needs`, as a flow's are,
+    row 7900), by which the lane sizes the unit's worker."""
     import tier_wire
-
-    from dew.nn.kernels.generation import assumed, compile_only_gpus
 
     try:
         with (compiled_truths(directory, prepare=True, stamp=stamp, target=target) as store,
-              jax.default_device(compile_only_gpus(target.generation, 1)[0]), assumed(target)):
+              store.on_its_gpu()):
             yield store
     finally:
         arms, truths = compiled_memory(directory, arms=True), compiled_memory(directory)
         tier_wire.unit_needs(admitted_needs(arms, truths))
-
-
-@contextlib.contextmanager
-def judged(label: str) -> Iterator[None]:
-    """Within the block, site `label`'s truths are computed (`running`)."""
-    token = SITE_IN_PROGRESS.set(label)
-    try:
-        yield
-    finally:
-        SITE_IN_PROGRESS.reset(token)
 
 
 PARENT = "DEW_PARENT_STORE"
@@ -466,28 +469,24 @@ def for_a_child() -> dict[str, str]:
 @contextlib.contextmanager
 def of_the_parent() -> Iterator[CompiledTruths | None]:
     """In a child process of a test (`for_a_child`), its test's store as the test's process opened it:
-    preparing it, its target's compile-only GPU the default device as a part's prepare's (`prepared`), or
-    reading it; outside one, none."""
+    preparing it, the process as on its target's GPU as a part's prepare's (`CompiledTruths.on_its_gpu`,
+    row 10765: a child's prepare read the bare platform 'gpu'), or reading it; outside one, none."""
     directory = os.environ.get(PARENT)
     if directory is None:
         yield None
         return
     prepare, stamp, target = pickle.loads((Path(directory) / PARENT_STORE).read_bytes())
-    with compiled_truths(directory, prepare=prepare, stamp=stamp, target=target) as store:
-        if not prepare or target is None:
-            yield store
-            return
-        from dew.nn.kernels.generation import compile_only_gpus
-
-        with jax.default_device(compile_only_gpus(target.generation, 1)[0]):
-            yield store
+    with (compiled_truths(directory, prepare=prepare, stamp=stamp, target=target) as store,
+          store.on_its_gpu() if prepare else contextlib.nullcontext()):
+        yield store
 
 
 def reading() -> tuple[CompiledTruths, str] | None:
     """The store a run reads the site in progress from, and its label: where a run reads a store
-    (`compiled_truths(prepare=False)`) within a site (`judged`) its prepare reached, else None. A site its
-    prepare did not reach (a cell its prepare skipped, one computing past an earlier site) runs unprepared,
-    recorded (`CompiledTruths.unprepared`); one prepared at another stamp is a red (`MissingTruth`)."""
+    (`compiled_truths(prepare=False)`) within a site (`store_wire.judged`) its prepare reached, else None. A
+    site its prepare did not reach (a cell its prepare skipped, one computing past an earlier site) runs
+    unprepared, recorded (`CompiledTruths.unprepared`); one prepared at another stamp is a red
+    (`MissingTruth`)."""
     store, label = COMPILED.get(), SITE_IN_PROGRESS.get()
     if store is None or store.prepare or label is None:
         return None

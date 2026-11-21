@@ -85,6 +85,14 @@ def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[fl
     return moved
 
 
+def merges(tiles: "Tiles", dtype, *, dense: bool) -> bool:
+    """Whether a launch at `tiles` would balance its last wave over the programs, each adding another's
+    partial (`tail.balanced`), where its registers hold the merge (`grouped_matmul._Mosaic.balanced`): a dense
+    call of one product (`dense`), its tile alone on its multiprocessor and its depth unsplit, on a family
+    that fixes a tile up across programs (`fixes_up`)."""
+    return dense and tiles.cluster == 1 and tiles.splits == 1 and fixes_up(tiles, dtype)
+
+
 def fixes_up(tiles: "Tiles", dtype) -> bool:
     """Whether a tile's steps may be walked by several programs at `tiles`, each leaving its partial and the
     last to arrive adding them (`mosaic.Family.fixed_up`): its family's, where its consumers hold the tile's

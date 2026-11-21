@@ -111,7 +111,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     refused,
     scaled_drop,
-    scopes_products,
     score_places,
     split_queries,
     stagings,
@@ -120,6 +119,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     varying_slopes,
     walked_extents,
     walked_layouts,
+    walked_unit,
     whole_tiles,
 )
 from dew.nn.kernels.templates.base import Template
@@ -149,25 +149,18 @@ def _launch_programs(kernel) -> int:
     return math.prod(kernel.params["grid_mapping"].grid)
 
 
-def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget) -> float:
-    """A launch's seconds on `target`: the longer of one program on a multiprocessor (`cost.walked`, plus
-    launch latency) and the whole launch across the device (`cost.seconds`), no constant (row 6710)."""
+def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget, *,
+                    resident: int = 1) -> float:
+    """A launch's seconds on `target`: the longer of its quantized waves (`ceil(programs / (SMs * resident))`
+    times one program's `cost.walked`, plus launch latency) and the whole launch across the device
+    (`cost.seconds`), no constant (rows 6216, 6710)."""
     count = max(programs, 1)
-    per_program = dataclasses.replace(
-        work,
-        flops=work.flops / count,
-        operations=work.operations / count,
-        exponentials=work.exponentials / count,
-        conversions=work.conversions / count,
-        device_bytes=work.device_bytes / count,
-        shared_bytes=work.shared_bytes / count,
-        tf32_flops=work.tf32_flops / count,
-        fp8_flops=work.fp8_flops / count,
-        kernels=0,
-    )
-    return max(cost.walked(per_program, target) + (target.launch_seconds or 0.0),
+    shared = {unit: getattr(work, unit) / count for unit in (*cost.ISSUED_UNITS, "device_bytes")}
+    per_program = dataclasses.replace(work, **shared, kernels=0)
+    processors = target.multiprocessors or 1
+    waves = math.ceil(count / (processors * max(resident, 1)))
+    return max(waves * cost.walked(per_program, target) + (target.launch_seconds or 0.0),
                cost.seconds(work, target))
-
 
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
@@ -181,10 +174,11 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
     installed = seal().digest
     if installed is None:
         return None
+    rates = cost.rates(target, device=False)
     stated = [package_digest(), installed.hex(), report._identity(op, ba), target.generation,
-              target.multiprocessors, tuning.encoded(candidates), _keyed_environment()]
+              target.device_kind, target.multiprocessors, target.launch_seconds, rates._asdict(),
+              tuning.encoded(candidates), _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
-
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                              tiles: Callable[[int, int, int], Config],
@@ -265,15 +259,10 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     # count, its issuer's rows at least, where no tile of them all holds (a 48-row training walk's scaled op
     # on mma.sync held 278 registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`,
     # et-sm86scaled). The first that holds is the config: legality steps down, nothing is ranked (design §7).
-    if rows is None and not family.budgets_registers:
-        # Families without a per-thread register cap (TPU) walk every whole multiple of `unit` up to the
-        # held extent; `fits` (VMEM-priced against `generation.shared_budget`) steps down (rows 10715, 10716).
-        heights = [h for h in extents(family, dtype, held)
-                   if h > unit and (h & (h - 1) == 0) and padded(h, 1) - padded(unit, 1) <= held // 8]
-    elif wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8:
-        heights = [2 * unit]
-    else:
-        heights = []
+    top = (held if rows is None and not family.budgets_registers
+           else 2 * unit if wide else unit)
+    heights = [h for h in extents(family, dtype, top)
+               if h > unit and padded(h, 1) - padded(unit, 1) <= held // 8]
     heights.append(unit)
     fewer = range(unit - family.rows, 0, -family.rows) if rows is None and few_rows(family, held) else ()
     order = ((unit, [count for count in counts(unit) if count > 1]), *((height, [1]) for height in heights),
@@ -364,9 +353,6 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     UNBUNDLED: ClassVar[str] = "the Mosaic mainloop has no bundle for {name} yet"
     """Why a launch runs on no device of a family it has no bundle of (`declined`)."""
 
-    @property
-    def _tile_parts(self) -> int:
-        return 1
     @staticmethod
     def _bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
         """The bundle the launch runs on (`bundle`)."""
@@ -450,7 +436,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # Blackwell's, an unseen NVIDIA GPU's: `bundles.of`, row 4727).
         alone = family is not None and isinstance(config, Tiles) and config.consumers == 1
         return (family is not None and (walks_whole or alone or not split_queries(family))
-                and whole_tiles(family, config, parts=self._tile_parts)
+                and whole_tiles(family, config, parts=self.parts if isinstance(self, MosaicForward) else 1)
                 and self.refusal(ba, family) is None and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
@@ -470,7 +456,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         family = bundle_of(config, query.dtype)
         walked = getattr(config, self.WALKED)
         reach = max(walked * 2, query.shape[1], _keys(ba))
-        walks = walked_extents if isinstance(config, Tiles) else extents  # `_derived`'s `walks`
+        walks = (functools.partial(walked_extents, parts=self.parts)
+                 if isinstance(self, MosaicForward) else extents)
         sizes = [size for size in walks(family, query.dtype, reach) if size in (walked // 2, walked * 2)]
         changes = [*({self.WALKED: size} for size in sizes),
                    {"stages": config.stages - 1}, {"stages": config.stages + 1},
@@ -556,9 +543,6 @@ class MosaicForward(_Mainloop[Tiles]):
     stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
     each 16-bit (attention.md 4b). One for a 16-bit call."""
 
-    @property
-    def _tile_parts(self) -> int:
-        return self.parts
     rounds: float | None = None
     """A quantized model's weights' bound (`Hooks.rounds`), which the anchored training walk rounds them to
     at each row's maximum: a call that keeps its split residuals' alone. None where its weights stay whole."""
@@ -798,8 +782,8 @@ class MosaicForward(_Mainloop[Tiles]):
             return False
         # wgmma's P·V depth (`block_k`) must be a multiple of V's swizzle tile (`swizzle_for(val_columns)`):
         # 64 for >=64-column V blocks, 32 for 32-column V blocks (row 6508).
-        if (self.parts > 1 and not family.places_on_role and not scopes_products(family)
-                and not family.operands_in_registers
+        if (self.parts > 1 and not family.operands_in_registers
+                and walked_unit(family, query.dtype, self.parts) < family.walked_rows
                 and config.block_k % swizzling.swizzle_columns(
                     query.dtype, swizzling.swizzle_for(query.dtype, val_columns))):
             return False
@@ -867,13 +851,13 @@ class MosaicForward(_Mainloop[Tiles]):
         if not kernels:
             return None
         total = 0.0
+        resident = self.resident(ba, config, target)
         for kernel in kernels:
             work = emission.work_of(kernel)
             if work is None:
                 return None
-            total += _launch_seconds(work, _launch_programs(kernel), target)
+            total += _launch_seconds(work, _launch_programs(kernel), target, resident=resident)
         return total
-
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget) -> Tiles:
         """Pick the fastest consumer count among `candidates` from `emission.work_of` and `cost.walked` /
@@ -1145,17 +1129,14 @@ class MosaicForward(_Mainloop[Tiles]):
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
-        # On TPU (`not family.budgets_registers`), live score-tile VMEM intermediates (`S`, mask, `exp2`, `P`,
-        # softmax temps: ~12 fp32 tiles plain, ~20 in natural/scaled walks matching v5e's 22 MiB measurement)
-        # plus the fp32 accumulator (`4 * block_q * value_width`) bound tile size against `shared_budget`
-        # instead of repurposing `copy_extent` (row 10715).
-        score_tiles = 20 if (config.natural_form or self.scales_in_kernel(ba)) else 12
-        score_vmem = (0 if family.budgets_registers
-                      else (score_tiles * config.block_q * config.block_k
-                            + 4 * config.block_q * value_width) * 4)
-        return score_vmem + resources.shared_bytes(
+        score_pairs = 12 if (config.natural_form or self.scales_in_kernel(ba)) else 6
+        tpu_values = ({"keys": ((config.block_k, width), query.dtype),
+                       "values": ((config.block_k, value_width), query.dtype)},
+                      (((config.block_q, value_width), jnp.float32),
+                       *(((config.block_q, config.block_k), jnp.float32),) * score_pairs))
+        return resources.shared_bytes(
             family, launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
-                                 products=products, over_rings=True))
+                                 products=products, over_rings=True, values=tpu_values))
     def _products(self, ba: tokamax.BoundArguments, config: Tiles,
                   target: generation.GpuTarget) -> tuple:
         """The launch's products at `config` as its program scopes them (`forward_products`): its logits a
@@ -1528,10 +1509,9 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     if hooks.score_mod is None and hooks.score_params:
         hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
-    parts = product.EXACT_PARTS if fp32 else 1
+    parts = algebra.bf16_part_count(accurate=True) if fp32 else 1
     if hooks.query_mod is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
-        # its parts, and a padded width's rows hold zeros past it (a norm over them is another norm); XLA's
         # program before the launch takes it.
         query = prologued(query, hooks.query_mod, hooks.query_params)
         hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
@@ -2047,9 +2027,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The fused launch's warpgroups reserve fp16's running scale's reduction scratch too, as it launches
         # (`reducing`'s `scaled`: `_fused_launch`'s and `_coop_launch`'s).
         scaled = config.fused and staged_parts(dtype) > 1
-        score_vmem = 0 if family.budgets_registers else 24 * config.block_q * config.block_k * 4
-        return score_vmem + max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
-            layout, tiles.consumers, self.score_reduces, scaled=scaled), reduces=reduces))
+        return max(resources.shared_bytes(layout, launch_scope(
+            layout, allocations, reducing(layout, tiles.consumers, self.score_reduces, scaled=scaled),
+            reduces=reduces, values=(
+                {"queries": ((tiles.block_q, width), dtype), "keys": ((tiles.block_k, width), dtype),
+                 "values": ((tiles.block_k, value_width), dtype)},
+                (((tiles.block_k, width), jnp.float32), ((tiles.block_k, value_width), jnp.float32),
+                 ((tiles.block_q, width), jnp.float32),
+                 *(((tiles.block_q, tiles.block_k), jnp.float32),) * 10))))
             for layout, tiles, allocations, reduces in launches)
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
         # None on a family that budgets none (`Family.budgets_registers`), which holds every config.

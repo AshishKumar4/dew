@@ -1,4 +1,4 @@
-"""The one client of the R2 Worker (dew-xla-cache, deployed from dew-ops), and its contract, r2.json beside
+"""The one client of the R2 Worker (dew-xla-cache), and its contract, r2.json beside
 this file: the bodies the Worker takes (none empty, and none past Cloudflare's request bound on the
 account's plan) and its key rule. The Worker reads the same file, so the client refuses what the Worker
 would before sending it.
@@ -11,7 +11,7 @@ the Worker announced, and each status as an outcome or a typed error. A 404 and 
 busy or down (429, 5xx), or a request that did not complete, `Unavailable`. Each caller keeps its own policy:
 what a failure costs it, and whether to retry. What sends a request is a `Sender`: the standard library's
 (`urllib_send`, a connection a request) by default, `KeptSend` (a connection a thread keeps), or the caller's
-own, such as dew-ops' pooled one, which carries the same protocol.
+own, such as a pooled one, which carries the same protocol.
 
 The standard library alone: tools/armada/ci.py imports it as its sibling and tests/remote_cache.py loads it by
 its path, both before any environment exists to import Dew from."""

@@ -531,7 +531,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
     import numpy as np
     from reference_error import _verdict
 
-    from dew.parity import NO_ZERO_ROWS, _Draws, _largest_share, _staged
+    from dew.parity import ELEMENT, NO_ZERO_ROWS, SHARE_KINDS, _Draws, _largest_share, _staged
     from dew.parity_stages import staged_units
 
     rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified) + 2 * int(shared)]
@@ -553,7 +553,11 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
             # Each seed's worst row's largest element's share, as check 1 reads each arm's.
             shares.append(_largest_share(errors[np.arange(span), np.argmax(sized, axis=1)]))
         worst = np.stack(arms, axis=-1)[:, None, :]
-        shares = np.stack(shares, axis=-1)[:, None, :]
+        # Each seed's shares as check 1's draws hold them (`_Draws.shares`, seed by leaf by kind by arm): the
+        # largest element's; the share along a truth row unknown, the controls drawing a row's size alone.
+        held = np.full((span, 1, len(SHARE_KINDS), 2), np.nan)
+        held[:, 0, ELEMENT] = np.stack(shares, axis=-1)
+        shares = held
 
         def drawn(start, stop, worst=worst, shares=shares):
             count = stop - start
