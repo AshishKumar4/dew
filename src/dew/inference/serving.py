@@ -1060,10 +1060,10 @@ class Server:
         # A stage-local run's state is read on its stored layers, as the served tree holds them.
         from dew.nn.backbones.layer_names import stored_layers
 
-        # Packed on the devices, as the served groups are joined: a host leaf placed first, so a group of
-        # host and device members joins where its device members are.
-        packed = pack_projections(jax.tree.map(jnp.asarray, normalized(stored_layers(self.model, variables),
-                                                                       self._source_shapes)),
+        # Packed where its members are, a group holding a host member on the host
+        # (`projections._concatenated`), each leaf placed once, on the served placement (`reloaded`,
+        # row 10822).
+        packed = pack_projections(normalized(stored_layers(self.model, variables), self._source_shapes),
                                   self._weight_groups)
         self.variables = reloaded(packed, self.variables)
         if self.prefill_mesh is not None:
