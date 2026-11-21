@@ -376,11 +376,11 @@ def launch_code(provenance: frozenset[str] | None) -> list[str] | None:
     its `provenance` names (`_provenance`): an op's lowering, a value it holds. An edit of Dew's code
     elsewhere (a trainer's, another op's) keeps them (row 10743). The whole package's where `provenance`
     is None. None where Dew's source changed while this process ran (`code_digest`): it keeps no record."""
-    from dew._cache import package_digest
-    from dew._code import code_digest
+    from dew._code import code_digest, whole_digest
 
     if provenance is None:
-        return [package_digest()]
+        whole = whole_digest()
+        return None if whole is None else [whole]
     found = [code_digest(module) for module in (__name__, *sorted(provenance))]
     return None if None in found else [digest for digest in found if digest is not None]
 
@@ -923,8 +923,8 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: fro
 
     from dew.nn.kernels.tuning import encoded
 
-    installed, code = seal().digest, launch_code(provenance)
-    if installed is None or code is None:
+    installed = seal().digest
+    if installed is None or (code := launch_code(provenance)) is None:
         return None
     stated = [code, installed.hex(), _assemblers(), identity, encoded(config), reverse,
               _keyed_environment()]

@@ -1681,7 +1681,7 @@ def test_a_launchs_call_and_its_gradients_product_are_two_launches_in_either_ord
     assert digests[False] != digests[True]
     launches = {reverse: report.traced(found) for reverse, found in digests.items()}
     assert {reverse: launch.reverse for reverse, launch in launches.items()} == {False: False, True: True}
-    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse)
+    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse, launch.provenance)
             for launch in launches.values()}
     assert len(keys) == 2 or keys == {None}, keys
 
@@ -2196,7 +2196,8 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
     stored = [tuning.stored_verdict(report.verdict_target(device),
-                                    report._verdict_key(identity, rung, refused.reverse))
+                                    report._verdict_key(identity, rung, refused.reverse,
+                                                        refused.provenance))
               is not None for rung in rungs]
 print(json.dumps({"stored": stored}))
 """

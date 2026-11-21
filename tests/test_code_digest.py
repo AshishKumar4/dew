@@ -19,11 +19,10 @@ class Kept(logging.Handler):
 
 
 logging.getLogger("dew._code").addHandler(Kept())
-from dew._cache import package_digest
-from dew._code import code_digest
+from dew._code import code_digest, whole_digest
 print(json.dumps({name: code_digest(*roots) for name, roots in (
     ("certification", ("dew.nn.kernels.templates.report",)), ("communicators", ("dew.communicators",)),
-    ("reader", ("dew._reader",)), ("computed", ("dew._computed",)))} | {"whole": package_digest(),
+    ("reader", ("dew._reader",)), ("computed", ("dew._computed",)))} | {"whole": whole_digest(),
                                                                          "logged": logged}))
 """
 

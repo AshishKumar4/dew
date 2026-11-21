@@ -11,7 +11,7 @@ resolved to the module that defines it, or the package's whole table where its c
 value (`getattr(package, name)`, an argument). A name bound twice is read as either. An import by a name its
 code computes is a dynamic site, named by the expression it imports: each of Dew's is reviewed (`REVIEWED`)
 or resolved by the literal table it selects from (`SELECTED`), and a closure holding any other, or a lazy
-table no literal states, is keyed by the whole package instead (`dew._cache.package_digest`), logged, so a
+table no literal states, is keyed by the whole package instead (`whole_digest`), logged, so a
 site added unreviewed costs warm records, never a stale one.
 
 Every read is of one snapshot of the tree a process takes once (`_snapshot`: each file's digest), so a
@@ -26,11 +26,11 @@ import hashlib
 import json
 import logging
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from pathlib import Path
 
 from dew._builds import dew_cache_dir
-from dew._cache import VERSION_FILE, package_digest
+from dew._cache import VERSION_FILE
 from dew._files import write_atomically
 from dew._records import JSON
 
@@ -95,25 +95,34 @@ _LOADERS = frozenset({"spec_from_file_location", "exec_module", "run_path", "run
 def code_digest(*roots: str) -> str | None:
     """The digest of the modules `roots` name and every module of Dew's their code can import (`closure`),
     each by its path and contents (`_snapshot`), the release's version (`dew._version`) not read: what a
-    record of what those modules computed keys on. The whole package's (`package_digest`) where the
-    closure holds a dynamic import site not `REVIEWED`, which is logged: its code could import any module.
-    None where Dew's source is not the one this process first read (a checkout edited while it ran), whose
-    code no digest of the files states: such a process keeps and reads no record, logged. Read once a
-    process."""
+    record of what those modules computed keys on. The whole package's (`whole_digest`) where the closure
+    holds a dynamic import site not `REVIEWED`, which is logged: its code could import any module. None
+    where Dew's source is not the one this process first read (`_current`). Read once a process: a process
+    takes its source as it first read it, as its imports do."""
     try:
         modules, sites = _kept_closure(roots)
-        current = _listed() == _snapshot()
     except _Changed:
-        current = False
-    if not current:
-        _log.warning("Dew's source changed while this process ran: it keeps no record of %s",
-                     ", ".join(roots))
-        return None
+        return _declined(roots)
+    if not _current():
+        return _declined(roots)
     unreviewed = sorted(set(sites) - REVIEWED.keys())
     if unreviewed:
         _log.warning("the code of %s imports by computed names at %s, none reviewed (dew._code.REVIEWED): "
                      "its records are keyed by all of Dew's code", ", ".join(roots), ", ".join(unreviewed))
-        return package_digest()
+        return _digest(_snapshot())
+    return _digest(modules)
+
+
+@functools.cache
+def whole_digest() -> str | None:
+    """The digest of every module of Dew's (`_snapshot`), the release's version not read: what a record of
+    code no closure bounds keys on (a launch with a hook, `report.launch_code`). None, as `code_digest`,
+    where Dew's source is not the one this process first read."""
+    return _digest(_snapshot()) if _current() else _declined(("dew",))
+
+
+def _digest(modules: Collection[str]) -> str:
+    """The digest of `modules` by their paths and contents as this process's snapshot holds them."""
     files = _snapshot()
     digest = hashlib.sha256()
     for module in sorted(modules):
@@ -121,6 +130,18 @@ def code_digest(*roots: str) -> str | None:
         if relative != f"dew/{VERSION_FILE}":
             digest.update(f"{relative}\0{contents}\0".encode())
     return digest.hexdigest()
+
+
+def _declined(roots: tuple[str, ...]) -> None:
+    _log.warning("Dew's source changed while this process ran: it keeps no record of %s", ", ".join(roots))
+
+
+def _current() -> bool:
+    """Whether Dew's source is the one this process first read (`_snapshot`)."""
+    try:
+        return _listed() == _snapshot()
+    except FileNotFoundError:
+        return False
 
 
 def defining_modules(values: Sequence[object]) -> frozenset[str]:
@@ -230,7 +251,10 @@ def _source(module: str) -> bytes:
     path = _path(module)
     if path is None:
         raise LookupError(f"no module of Dew's is named {module}")
-    contents = path.read_bytes()
+    try:
+        contents = path.read_bytes()
+    except FileNotFoundError as missing:
+        raise _Changed(f"{path} was removed after this process first read Dew's source") from missing
     if hashlib.sha256(contents).hexdigest() != _snapshot()[module][1]:
         raise _Changed(f"{path} changed after this process first read Dew's source")
     return contents
