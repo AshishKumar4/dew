@@ -143,8 +143,8 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
                  for index, (ref, kind, kept) in enumerate(laid))
 
 def _read(value):
-    """Resolve a deferred reader (`callable`), or return an eager value unchanged."""
-    return value() if callable(value) else value
+    """Resolve a deferred reader (`functools.partial`), or return an eager value unchanged."""
+    return value() if isinstance(value, functools.partial) else value
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                  coords: algebra.Coords | Callable[[], algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
