@@ -196,7 +196,8 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                                              rows: int | None = None,
                                              least_walked: Callable[[int], int] = lambda rows: 1,
                                              least_held: Callable[..., int] = query_rows,
-                                             choose: Callable[[list[Config]], Config] | None = None
+                                             choose: Callable[[list[Config]], Config] | None = None,
+                                             residency: Callable[[Config], int] | None = None
                                              ) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7): its
     consumers up to the family's count (`Family.consumers`, at most a launch's `most_consumers`)
@@ -247,17 +248,20 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                 # count's (a 192-row tile of three consumers over a 256-row shard pads it by half, where two
                 # consumers' 128 pad none): the call's padding is a copy and its last tile's work wasted.
                 continue
+            best_res = 0
             for extent in walks(family, dtype, max(walked, least_walked(rows))):
                 for narrow in stagings(family):
                     config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
                     if fits(config):
-                        picked.append(config)
                         if choose is None:
                             return config
+                        res = residency(config) if residency is not None else 1
+                        if not best_res or res > best_res:
+                            picked.append(config)
+                            best_res = res
                         break
-                else:
-                    continue
-                break
+                if best_res and residency is None:
+                    break
         if not picked:
             return None
         return picked[0] if len(picked) == 1 or choose is None else choose(picked)
@@ -843,7 +847,8 @@ class MosaicForward(_Mainloop[Tiles]):
                 return self._launchable(ba, config, target) not in (None, *refused)
 
             choose = functools.partial(self._choose_consumers, ba, target=target)
-            config = self._searched(ba, family, fits, choose=choose)
+            residency = functools.partial(self.resident, ba, target=target)
+            config = self._searched(ba, family, fits, choose=choose, residency=residency)
             if config is not None:
                 return self._launchable(ba, config, target)
         return None
@@ -887,7 +892,12 @@ class MosaicForward(_Mainloop[Tiles]):
         launched = [self._launchable(ba, config, target) or config for config in candidates]
         key = _choice_key(self, ba, tuple(launched), target)
         stored = None if key is None else tuning.stored_choice(target.generation, key)
-        if isinstance(stored, int):
+        if isinstance(stored, (tuple, list)) and len(stored) == 2:
+            pair = tuple(stored)
+            matched = next((c for c in candidates if (c.consumers, c.block_k) == pair), None)
+            if matched is not None:
+                return matched
+        elif isinstance(stored, int):
             matched = next((config for config in candidates if config.consumers == stored), None)
             if matched is not None:
                 return matched
@@ -899,7 +909,7 @@ class MosaicForward(_Mainloop[Tiles]):
             prices[config] = price
         best = min(candidates, key=prices.__getitem__)
         if key is not None:
-            tuning.store_choice(target.generation, key, best.consumers)
+            tuning.store_choice(target.generation, key, (best.consumers, best.block_k))
         return best
 
     def offered(self, ba: tokamax.BoundArguments, family: mosaic.Family, target: generation.GpuTarget
@@ -920,7 +930,8 @@ class MosaicForward(_Mainloop[Tiles]):
         return tuple(found)
 
     def _searched(self, ba: tokamax.BoundArguments, family: mosaic.Family, fits: Callable[[Tiles], bool], *,
-                  choose: Callable[[list[Tiles]], Tiles] | None = None) -> Tiles | None:
+                  choose: Callable[[list[Tiles]], Tiles] | None = None,
+                  residency: Callable[[Tiles], int] | None = None) -> Tiles | None:
         """The derivation's search of `family`'s configs for the call of `ba` (`_derived`, over the value
         columns whole and then in blocks, `_column_blocks_of`): the first `fits` takes, or None."""
         query = ba.arguments["query"]
@@ -930,7 +941,8 @@ class MosaicForward(_Mainloop[Tiles]):
 
             config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits, overlapped=True,
                               walks=functools.partial(walked_extents, parts=self.parts),
-                              least_walked=functools.partial(_least_keys, family), choose=choose)
+                              least_walked=functools.partial(_least_keys, family), choose=choose,
+                              residency=residency)
             if config is not None:
                 return config
         return None

@@ -1600,3 +1600,42 @@ def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
         assert algebra.bf16_part_count(accurate=False) == 1
         assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
         assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
+
+
+def test_forward_pricing_aligns_with_m_fs_15_sm90_and_sm80_receipts():
+    """Wave-quantized residency pricing (`_launch_seconds` + `_derived`'s residency-step rung, row 6216)
+    ranks M-FS-15's faster sm90 2-consumer config ahead of 3-consumer on T=512 split forward (0.0508 vs
+    0.0846 ms on GH200) and ranks a higher-residency smaller `block_k` ahead of a 1-resident `block_k`
+    when `_derived` offers both."""
+    spans = template.spans(512, 512, 1, causal=True)
+    q = jax.ShapeDtypeStruct((2, 512, 32, 128), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((2, 512, 8, 128), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        sm90 = generation.gpu_target()
+        op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=template.Kept.SPLIT, interpret=False)
+        c2 = attention_mosaic.Tiles(64, 64, 2, 2, family="wgmma")
+        c3 = attention_mosaic.Tiles(64, 64, 2, 3, family="wgmma")
+        p2 = op._price_config(ba, c2, sm90)
+        p3 = op._price_config(ba, c3, sm90)
+        assert p2 is not None and p3 is not None and p2 < p3, (p2, p3)
+
+    # Verify `_derived` offers a higher-residency smaller `block_k` to `choose` on sm80 when residency jumps.
+    with generation.assumed("sm80"):
+        family = attention_mosaic_program.bundle_of(
+            attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync"), jnp.bfloat16)
+        seen: list[list[attention_mosaic.Tiles]] = []
+
+        def choose(cands: list[attention_mosaic.Tiles]) -> attention_mosaic.Tiles:
+            seen.append(list(cands))
+            return cands[0]
+
+        def fake_res(cfg: attention_mosaic.Tiles) -> int:
+            return 2 if cfg.block_k <= 32 else 1
+
+        attention_mosaic._derived(
+            family, jnp.bfloat16, 512, 512,
+            lambda r, w, c: attention_mosaic.Tiles(r, w, 2, c, family=family.name),
+            lambda cfg: cfg.block_k <= 64, overlapped=True, choose=choose, residency=fake_res)
+        assert seen and any(c.block_k == 64 for c in seen[0]) and any(c.block_k == 32 for c in seen[0]), seen
