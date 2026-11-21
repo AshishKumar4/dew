@@ -1,4 +1,4 @@
-"""The one client of the R2 Worker (dew-xla-cache, deployed from dew-ops), and its contract, r2.json beside
+"""The one client of the R2 Worker (dew-xla-cache), and its contract, r2.json beside
 this file: the bodies the Worker takes (none empty, and none past Cloudflare's request bound on the
 account's plan) and its key rule. The Worker reads the same file, so the client refuses what the Worker
 would before sending it.

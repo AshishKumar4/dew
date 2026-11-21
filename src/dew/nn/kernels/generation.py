@@ -914,14 +914,14 @@ TARGETS = {target.generation: target for target in (
               step_seconds=5.41e-6,
               # In-kernel: a dependent lane reduction's 144.0 ns (its two rounds 144.05 and 144.04).
               kernel_step_seconds=144.0e-9,
-              # tools/device_facts.py on a B200 (lab-b200-20261113-facts2): its stream's line over 1 MiB to
+              # tools/device_facts.py on a B200: its stream's line over 1 MiB to
               # 1 GiB, 6.43 TB/s read at 1 GiB, as HS-CAL-b200's dram read of its 1.07 GB (6.40); its
               # launch HS-CAL-b200's, a kernel after another with no programmatic dependent launch (1.20 us);
               # its hand-off device_facts' (0.651 us a round trip). Its multiprocessors' clock under a
               # step's large products: 1.549 GHz, the time-weighted mean of sm__cycles_elapsed.avg.per_second
               # over the 15 GEMM launches of 0.1 ms or more in the 4B's one-row Muon step under ncu (1.520 to
-              # 1.600; the driver's software power capping counter running at the default 1,000 W limit;
-              # lab-b200-20261112-bundle2/ncu-muon-raw.csv), where its idle-sampled 1965 MHz above stands.
+              # 1.600; the driver's software power capping counter running at the default 1,000 W limit),
+              # where its idle-sampled 1965 MHz above stands.
               measured={'NVIDIA B200': Measured(4.29e-6, 6.593e12, launch=1.20e-6, handoff=0.651e-6,
                                                 loaded_clock=1.549e9)},
               # HGX B200's PCIe Gen5 x16 a GPU (its datasheet's 128 GB/s both ways); GB200's NVLink-C2C to
