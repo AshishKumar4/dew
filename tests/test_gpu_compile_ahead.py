@@ -523,12 +523,15 @@ def test_a_certification_compiles_alike_on_this_gpu_and_a_compile_only_one_of_it
     its key (`xla_gpu_deviceless_cub_mode`) and the build's did not, and a GH200 run of a step built on a
     compile-only H100 compiled five of its certifications again (row 8372, M-MC-27-3e). Each side certifies
     in a process of its own: in one, the second reads the first's certification, keyed by its generation
-    alone, and compiles none (row 9608)."""
+    alone, and compiles none (row 9608). Each reads and writes a compilation cache of its own too, beside
+    which its verdicts are stored (`tuning.store_verdict`, by generation, `report.verdict_target`): in one
+    they share, the second reads the first's verdict and compiles nothing to compare (row 10104)."""
     (tmp_path / "certified.py").write_text(CERTIFIED)
     environment = environment_of(tmp_path)
 
     def options(where: str) -> set[str]:
-        ran = subprocess.run([sys.executable, str(tmp_path / "certified.py"), where], env=environment,
+        ran = subprocess.run([sys.executable, str(tmp_path / "certified.py"), where],
+                             env={**environment, "JAX_COMPILATION_CACHE_DIR": str(tmp_path / where)},
                              check=True, capture_output=True, text=True)
         return set(json.loads(ran.stdout.strip().splitlines()[-1]))
 
