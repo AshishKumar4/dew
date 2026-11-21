@@ -831,7 +831,7 @@ class FitSearch[LossT, EffectsT]:
     is the one at the rung `searched` settles on (`found`)."""
     sampled: SampledStep | None = None
     """The last measured candidate's sampled step (`measured`), which summarizes what the run inspects."""
-    taken_ahead: dict[str, jax.stages.Compiled] = dataclasses.field(default_factory=dict)
+    taken_ahead: dict[Hashable, jax.stages.Compiled] = dataclasses.field(default_factory=dict)
     """The step taken ahead (`ahead`), by its compiled key, where its whole candidate fitted: a later measure
     of the same program in this search takes it again (row 7988)."""
     ahead: AheadOfTime | None = None
