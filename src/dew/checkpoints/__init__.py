@@ -1498,7 +1498,7 @@ class Checkpoints:
             # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
             self._hold(artifact, tokenizer)
             profiles, state_tree, frozen, deltas, payloads = self._state_items(state, saved, share, rollout,
-                                                                               weights_only)
+                                                                               weights_only, held_apart)
         profile_metadata = None if profiles is None else {**_profile_record(profiles[1]),
                                                           'at': _named(profiles[0])}
         self._metadata = None
@@ -1617,7 +1617,7 @@ class Checkpoints:
         if failures:
             raise failures[0]
 
-    def _frozen(self, state_tree: dict[str, StateLeaf]
+    def _frozen(self, state_tree: dict[str, StateLeaf], held_apart: bool = False
                 ) -> tuple[Mapping[str, object], dict[str, dict[str, str]]]:
         """Return `state_tree` with the collections but `params` of each of its variables trees
         (`_variable_trees`: the variables and the EMA, the run's and each DiLoCo group's, stacked) held
@@ -1654,7 +1654,8 @@ class Checkpoints:
                 digest = digests[tree][name]
                 if digest not in written and digest not in stored:
                     with region("checkpoint.frozen"), ocp.Checkpointer(_handler()) as checkpointer:
-                        checkpointer.save(root / digest, args=ocp.args.PyTreeSave(value))
+                        checkpointer.save(root / digest, args=ocp.args.PyTreeSave(
+                            value, save_args=save_args(value, held_apart)))
                     written.add(digest)
         kept_tree: Mapping[str, object] = state_tree
         for path, collections in trees.items():
@@ -1817,7 +1818,7 @@ class Checkpoints:
         return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)
 
     def _state_items(self, state: TrainState, saved: bytes | None, share: DataPartition | None,
-                     rollout: Mapping[str, object] | None, weights_only: bool) -> tuple:
+                     rollout: Mapping[str, object] | None, weights_only: bool, held_apart: bool) -> tuple:
         """`state`'s items as `save` writes them: its profiles where it records them, its tree less its
         frozen trees and its EMA as deltas (`_with_ema_deltas`), those frozen trees, the deltas and the
         payloads its items make (`_in_payloads`), its model alone where `weights_only`."""
@@ -1828,7 +1829,7 @@ class Checkpoints:
             from dew.state import MODEL_STATE
             state_tree = {name: state_tree[name] for name in MODEL_STATE}
         profiles = None if weights_only else _profiles_at(state_tree)
-        state_tree, frozen = self._frozen(state_tree)
+        state_tree, frozen = self._frozen(state_tree, held_apart)
         state_tree, deltas = _with_ema_deltas(state_tree)
         return profiles, state_tree, frozen, deltas, _in_payloads(state_tree, None if profiles is None
                                                                   else profiles[0])
