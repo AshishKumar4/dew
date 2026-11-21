@@ -1,86 +1,114 @@
-"""The digest of a producer's code (`dew._code.code_digest`), which a kernel's stored verdicts and choices
-and a program's kept communicators key on (row 10743): an edit outside a store's code keeps its records, one
-inside it computes them again, and a closure holding an import by a computed name no review covers is keyed
-by the whole package."""
+"""The digest of a producer's code (`dew._code.code_digest`), which a kernel launch's stored verdict and
+choice and a program's kept communicators key on (row 10743): an edit outside a store's code keeps its
+records, one inside it computes them again, and a closure holding an import by a computed name no review
+covers is keyed by the whole package."""
 
-import json
-import os
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 
-SOURCE = Path(__file__).resolve().parents[1] / "src"
+from process_support import REPO_ROOT, fresh
 
 DIGESTS = """
 import json, logging
-logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
+logged = []
+
+
+class Kept(logging.Handler):
+    def emit(self, record):
+        logged.append(record.getMessage())
+
+
+logging.getLogger("dew._code").addHandler(Kept())
 from dew._cache import package_digest
-from dew._code import code_digest, every_module
-print(json.dumps({"kernels": code_digest(*every_module("dew.nn.kernels")),
-                  "communicators": code_digest("dew.communicators"),
-                  "synthetic": code_digest("dew._synthetic"), "whole": package_digest()}))
+from dew._code import code_digest
+print(json.dumps({name: code_digest(*roots) for name, roots in (
+    ("certification", ("dew.nn.kernels.templates.report",)), ("communicators", ("dew.communicators",)),
+    ("reader", ("dew._reader",)), ("computed", ("dew._computed",)))} | {"whole": package_digest(),
+                                                                         "logged": logged}))
 """
 
-SYNTHETIC = '''import importlib
+READER = '''from typing import TYPE_CHECKING
+
+from dew.nn.kernels import gpu_target
+
+if TYPE_CHECKING:
+    from dew import _unread
+else:
+    if TYPE_CHECKING:
+        from dew import _unread
+    else:
+        from dew import _spare
 
 
-def load(name):
-    return importlib.import_module(name)
+def scan():
+    from dew.algebra import Scan
+
+    return Scan, gpu_target, _spare
 '''
+"""A module whose imports are a lazy table's names (one a `dict.fromkeys` states, one read in a function)
+and a nested `if TYPE_CHECKING:`'s live `else`."""
+
+COMPUTED = '''from importlib import import_module as load
 
 
-def digests(tree: Path) -> tuple[dict[str, str], str]:
-    """`DIGESTS` run over the Dew tree at `tree` in a process of its own, and what it logged."""
-    done = subprocess.run([sys.executable, "-c", DIGESTS], check=True, capture_output=True, text=True, env={
-        **os.environ, "PYTHONPATH": str(tree), "JAX_PLATFORMS": "cpu", "XDG_CACHE_HOME": str(tree / "cache")})
-    return json.loads(done.stdout.strip().splitlines()[-1]), done.stderr
+def loaded(name):
+    return load(name)
+'''
+"""A module importing by a computed name, through an alias of `import_module`."""
 
 
-def edited(path: Path) -> None:
-    path.write_text(path.read_text() + "\n# edited\n")
-
-
-def test_a_stores_digest_follows_its_own_code_and_an_unreviewed_import_keys_it_by_the_whole_package(tmp_path):
-    """An edit of Dew's code outside the kernels' and the communicators' (a trainer's) and of the release's
-    version keeps both digests; an edit of a GPU family's template (`mosaic_sm90`) changes the kernels'.
-    Neither store's code holds an unreviewed dynamic import, so neither is the whole package's, and nothing
-    is logged; a module that imports by a computed name is keyed by the whole package, which any edit
-    changes, and the site is named."""
+def test_a_stores_digest_follows_its_code_and_an_unreviewed_import_keys_the_whole_package(tmp_path):
+    """An edit of Dew's code outside the certification's and the communicators' (a trainer's), of a module
+    only a `TYPE_CHECKING` block imports and of the release's version keeps every digest; an edit of a
+    module imported by a lazy table's name, a function's own import or a nested guard's `else` changes the
+    digest of the code importing it, and one of a GPU family's template (`mosaic_sm90`) the
+    certification's. Neither store's code holds an unreviewed dynamic import: neither is the whole
+    package's, and nothing of theirs is logged. A module importing by a computed name, through an alias of
+    `import_module`, is keyed by the whole package, which any edit changes, its site logged by the
+    expression it imports."""
+    tree = tmp_path / "src"
     for name in ("dew", "_dew_torch"):
-        shutil.copytree(SOURCE / name, tmp_path / name, ignore=shutil.ignore_patterns("__pycache__"))
-    (tmp_path / "dew" / "_synthetic.py").write_text(SYNTHETIC)
-    before, logged = digests(tmp_path)
-    assert before["synthetic"] == before["whole"]
-    assert "dew._synthetic:load" in logged
-    assert "dew.nn.kernels" not in logged and "dew.communicators" not in logged
-    assert before["whole"] not in (before["kernels"], before["communicators"])
+        shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
+    package = tree / "dew"
+    (package / "_reader.py").write_text(READER)
+    (package / "_computed.py").write_text(COMPUTED)
+    for name in ("_unread.py", "_spare.py"):
+        (package / name).write_text("")
 
-    edited(tmp_path / "dew" / "training" / "rungs.py")
-    edited(tmp_path / "dew" / "_version.py")
-    after, _ = digests(tmp_path)
-    assert (after["kernels"], after["communicators"]) == (before["kernels"], before["communicators"])
-    assert after["synthetic"] != before["synthetic"]
+    def digests(*edits: Path) -> dict:
+        for path in edits:
+            path.write_text(path.read_text() + "\n# edited\n")
+        return fresh(DIGESTS, source=tree, platforms="cpu", variables={"XDG_CACHE_HOME": str(tmp_path)})
 
-    edited(tmp_path / "dew" / "nn" / "kernels" / "templates" / "mosaic_sm90.py")
-    assert digests(tmp_path)[0]["kernels"] != after["kernels"]
+    before = digests()
+    assert before["computed"] == before["whole"]
+    assert before["whole"] not in (before["certification"], before["communicators"], before["reader"])
+    assert len(before["logged"]) == 1 and "dew._computed:loaded:name" in before["logged"][0], before
+    kept = digests(package / "training" / "rungs.py", package / "_unread.py", package / "_version.py")
+    assert {name: kept[name] == before[name] for name in ("certification", "communicators", "reader",
+                                                          "computed")} == {
+        "certification": True, "communicators": True, "reader": True, "computed": False}
+    for parts in (("_spare.py",), ("algebra", "scan.py"), ("nn", "kernels", "generation.py")):
+        now = digests(package.joinpath(*parts))
+        assert now["reader"] != kept["reader"], parts
+        kept = now
+    now = digests(package / "nn" / "kernels" / "templates" / "mosaic_sm90.py")
+    assert now["certification"] != kept["certification"]
 
 
 IMPORTED = """
 import json, sys
 import {module}
-from dew._code import closure, every_module
-held = closure(*{roots})[0]
+from dew._code import closure
+held = closure("{module}")[0]
 print(json.dumps(sorted(name for name in sys.modules
                         if name.partition(".")[0] in ("dew", "_dew_torch") and name not in held)))
 """
 
 
 def test_every_module_a_stores_code_imports_is_in_its_closure():
-    """A store's closure holds every module of Dew's that importing its code imports: the kernels' (their
-    certification, `report`) and the communicators', each in a fresh process."""
-    for module, roots in (("dew.nn.kernels.templates.report", 'every_module("dew.nn.kernels")'),
-                          ("dew.communicators", '("dew.communicators",)')):
-        done = subprocess.run([sys.executable, "-c", IMPORTED.format(module=module, roots=roots)], check=True,
-                              capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
-        assert json.loads(done.stdout.strip().splitlines()[-1]) == [], module
+    """A store's closure holds every module of Dew's that importing its code imports, each in a fresh
+    process: the certification's, an attention op's and the communicators'."""
+    for module in ("dew.nn.kernels.templates.report", "dew.nn.kernels.templates.attention_mosaic",
+                   "dew.communicators"):
+        assert fresh(IMPORTED.format(module=module), platforms="cpu") == [], module

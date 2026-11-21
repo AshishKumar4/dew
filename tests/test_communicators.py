@@ -259,7 +259,7 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
 
 
-def test_a_programs_communicators_are_kept_under_the_digest_of_the_code_that_reads_them(tmp_path, monkeypatch):
+def test_a_programs_communicators_are_kept_under_the_digest_of_their_readers_code(tmp_path, monkeypatch):
     """A program's communicators are kept under the digest of the code that reads them
     (`dew._code.code_digest`): those kept under this code's digest are taken as they are kept, its text
     unread, and those kept by another code, under its digest or none, are read again from the program's

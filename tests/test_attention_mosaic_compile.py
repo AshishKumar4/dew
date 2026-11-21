@@ -910,42 +910,60 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
 
 EDITED_FORWARD = """
 import jax
-from dew.nn.kernels.templates import report as edited_report
-
-# The kernels' code edited outside the launch's kernels: its digest another, the launch's kernels the same.
-edited = edited_report.kernels_code()[::-1]
-edited_report.kernels_code = lambda: edited
-certifying = []
+lowered, compiled = [], []
 
 
 def heard(event, seconds, *, fun_name="", **_):
-    if event == "/jax/core/compile/backend_compile_duration" and fun_name.startswith("jit(certified_"):
-        certifying.append(fun_name)
+    if fun_name.startswith("jit(certified_"):
+        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration":
+            lowered.append(fun_name)
+        elif event == "/jax/core/compile/backend_compile_duration":
+            compiled.append(fun_name)
 
 
 jax.monitoring.register_event_duration_secs_listener(heard)
-""" + CERTIFIED_FORWARD.replace("print(json.dumps([[", "print(json.dumps([certifying, *[[", 1).replace(
+""" + CERTIFIED_FORWARD.replace("print(json.dumps([[", "print(json.dumps([lowered, compiled, *[[", 1).replace(
     "for found in report.certifications()]))", "for found in report.certifications()]]))", 1)
-"""`CERTIFIED_FORWARD` in a Dew tree edited outside the launch's kernels (its code's digest another,
-`report.kernels_code`), first naming each certification program it compiled."""
+"""`CERTIFIED_FORWARD`, first naming each certification program it lowered and each it compiled."""
 
 
 @COMPILES_ON_CPU
 def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them(tmp_path):
     """A launch certified by one process is certified in the next on the same machine by its stored verdict
-    though Dew's code changed outside the launch's kernels (`report._lowered_verdict_key`): the edited tree
-    lowers the launch, its kernels the same, and reads their verdict, compiling none; keyed by Dew's whole
-    code alone, every commit compiled every launch of a start again (row 8650: 23 of an edited tree's 51
-    seconds certifying a hybrid decoder's step ahead, FS-8650-SPLIT)."""
-    from process_support import fresh, keeping_picks
+    though Dew's code changed: outside the launch's code (`report.launch_code`: a trainer's), read before it
+    traces, nothing lowered; in its op's module, outside its kernels (`report._lowered_verdict_key`), the
+    launch lowered, its kernels the same, and their verdict read, compiling none. Keyed by Dew's whole code
+    alone, every commit compiled every launch of a start again (row 8650: 23 of an edited tree's 51 seconds
+    certifying a hybrid decoder's step ahead, FS-8650-SPLIT), and lowered each (row 10743)."""
+    import shutil
 
-    cold = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
-    compiled, *edited = fresh(EDITED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
-    assert cold and not any(stored for _, stored, _ in cold), cold
-    assert edited and all(stored for _, stored, _ in edited), edited
-    assert not compiled, compiled
-    assert (sorted((op, sorted(modules.items())) for op, _, modules in edited)
-            == sorted((op, sorted(modules.items())) for op, _, modules in cold))
+    from process_support import REPO_ROOT, fresh, keeping_picks
+
+    tree = tmp_path / "src"
+    for name in ("dew", "_dew_torch"):
+        shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
+
+    def run() -> list:
+        return fresh(EDITED_FORWARD, cache_dir=tmp_path / "xla", flags=keeping_picks(), source=tree,
+                     variables={"XDG_CACHE_HOME": str(tmp_path / "cache")})
+
+    def edited(*parts: str) -> None:
+        path = tree.joinpath("dew", *parts)
+        path.write_text(path.read_text() + "\n# edited\n")
+
+    def certified(found: list) -> list:
+        return sorted((op, sorted(modules.items())) for op, _, modules in found)
+
+    _, cold_compiled, *cold = run()
+    assert cold and cold_compiled and not any(stored for _, stored, _ in cold), cold
+    edited("training", "rungs.py")
+    lowered, compiled, *elsewhere = run()
+    assert all(stored for _, stored, _ in elsewhere) and certified(elsewhere) == certified(cold), elsewhere
+    assert (lowered, compiled) == ([], [])
+    edited("nn", "kernels", "templates", "attention_mosaic.py")
+    lowered, compiled, *op_edited = run()
+    assert all(stored for _, stored, _ in op_edited) and certified(op_edited) == certified(cold), op_edited
+    assert lowered and not compiled, (lowered, compiled)
 
 
 @COMPILES_ON_CPU
