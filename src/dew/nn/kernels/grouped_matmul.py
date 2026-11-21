@@ -534,7 +534,8 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         if not candidate(ran, tile, target):
             return False
         family = pricing.family_of(tile, ran.arguments['tokens'].dtype)
-        launch = dataclasses.replace(self.launch_of(ba, config), floor=tile.stages, most=tile.stages)
+        launch = dataclasses.replace(self._launch(ran, tile, merges=self._merges(ba, config)),
+                                     floor=tile.stages, most=tile.stages)
         return resources.plan([launch], family, target, programs=tile.programs) is not None
 
     def _stated(self, ba, config: tiling.Tiles) -> dict:
@@ -550,12 +551,15 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         the stages its program's share of the GPU's block (`generation.shared_budget`) holds of a step's
         two operand blocks at an element a byte and its contraction has steps, at least two: the call's a
         launch at `config` runs (`_ran`)."""
+        # Its schedule read on the call and tile as given (`_merges`: a split's runs merge no last wave).
+        return self._launch(*self._ran(ba, config), merges=self._merges(ba, config))
+
+    def _launch(self, ba, config: tiling.Tiles, *, merges: bool) -> resources.Launch:
+        """`launch_of`'s launch for the call `ba` as a launch at `config` runs it (`_ran`), whose last wave
+        `merges` as the call given decided (`_merges`)."""
         from .templates import resources
         from .templates.gemm import pricing
 
-        # Its schedule read on the call and tile as given (`_merges`: a split's runs merge no last wave).
-        merges = self._merges(ba, config)
-        ba, config = self._ran(ba, config)
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         steps = self._steps(ba, config)
         registers = self._ran_tail(ba, config, merges=merges)[0]
