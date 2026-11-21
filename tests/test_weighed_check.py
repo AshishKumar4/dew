@@ -339,6 +339,20 @@ def test_a_compensated_sum_is_weighed_as_its_double_float_pair_rounds():
     assert np.all(np.asarray(compensated) < np.asarray(plain))
 
 
+def test_a_power_of_a_float_rounds_as_its_exponent_takes_it():
+    """A float raised to a float power (`lax.pow`: Adam's bias correction, `1 - b**count`, row 8752 found its
+    step had no rule): at an integer exponent its value rounds `max(|e| - 1, 1)` times, as an integer power's
+    (`lax.integer_pow`) does, so its scale is the integer power's; at another, through `exp(e log x)`, by
+    the exponential's ulps and the logarithm's, more than once."""
+    x = jnp.asarray(np.linspace(0.5, 1.5, 64), jnp.float32)
+    _, powered = rounding_scale(lambda x: jax.lax.pow(x, jnp.float32(3)), x)
+    _, cubed = rounding_scale(lambda x: jax.lax.integer_pow(x, 3), x)
+    np.testing.assert_array_equal(np.asarray(powered), np.asarray(cubed))
+    _, fractional = rounding_scale(lambda x: jax.lax.pow(x, jnp.float32(0.5)), x)
+    _, rooted = rounding_scale(jnp.sqrt, x)
+    assert np.all(np.asarray(fractional) > np.asarray(rooted))
+
+
 def test_the_rounding_scale_knows_an_operation_by_its_object():
     """The rounding scale reads each operation's rule by JAX's primitive object: a user's primitive named
     `add`, which doubles its operand, has no rule and is refused, where its name's rule weighed it as one

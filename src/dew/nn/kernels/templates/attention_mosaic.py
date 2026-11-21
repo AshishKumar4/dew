@@ -64,6 +64,8 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _trained_forward,
     certified_walk,
     column_slices,
+    folded_form,
+    forward_block_plan,
     forward_products,
     logits_ahead,
 )
@@ -99,6 +101,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     query_rows,
     reducing,
     refused,
+    scaled_drop,
     score_places,
     split_queries,
     stagings,
@@ -277,8 +280,6 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     (`attention_decode`), whose walk the memory bounds."""
     per_span: int = 1
     """The queries each of the spans' intervals holds (`KeySpans.per_span`)."""
-    whole: bool = False
-    """Whether the spans' every query sees every key (`KeySpans.whole`), which its launches' costs state."""
 
     @property
     def score_types(self) -> tuple:
@@ -287,7 +288,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
         """The call's spans from its arrays and the op's static form, key count and queries an interval."""
-        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span, whole=self.whole)
+        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span)
 
     UNBUNDLED: ClassVar[str] = "the Mosaic mainloop has no bundle for {name} yet"
     """Why a launch runs on no device of a family it has no bundle of (`declined`)."""
@@ -507,9 +508,9 @@ class MosaicForward(_Mainloop[Tiles]):
                             arguments.get("drop"))
 
     def _decided_model(self, query, value, score_params, residuals: Kept | None, config: Tiles,
-                       table=None, sources=None, scales=None, initial=None, drop=None, *, peaks: bool = False,
-                       columns: int | None = None, decides: bool | None = None, priced: bool = True
-                       ) -> tuple[bool, ForwardRegisters, int | None]:
+                       table=None, sources=None, scales=None, initial=None, drop=None, *,
+                       peaks: bool = False, columns: int | None = None, decides: bool | None = None,
+                       priced: bool = True) -> tuple[bool, ForwardRegisters, int | None]:
         """Resolve whether `config` decides its scaled walk, its `ForwardRegisters`, and (when `priced`) its
         register count in one pass (row 8843): builds the register facts once and reuses the scaled price so
         planning, residency and emission agree without double-pricing prologues."""
@@ -646,8 +647,10 @@ class MosaicForward(_Mainloop[Tiles]):
         # A family that places its products on a role issues its logits ahead (`_ahead`: tcgen05's rows,
         # whose issuer warp is a step ahead of its consumer), which past its tensor memory it does not: its
         # products' scratch then none it takes (`Issuer.product_scratch`).
-        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and not self._ahead(ba, config,
-                                                                                              target):
+        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and (
+                not self._ahead(ba, config, target)
+                or scaled_drop(ba.arguments["query"].dtype, ba.arguments.get("drop"),
+                               ba.arguments.get("initial"))):
             return False
         if not super().legal(ba, config, target):
             return False
@@ -920,12 +923,10 @@ class MosaicForward(_Mainloop[Tiles]):
         query = ba.arguments["query"]
         if self._natural(query):
             return True
-        power, scale = prescale(query.dtype, query.shape[3], self.scale)
-        taken = power if self.form != "spans" else 1.0
         subtracted = self.subtracted and ba.arguments.get("residuals") is not Kept.SPLIT
-        return not algebra.Forward(self.form, self.keys, ids=False, scale=scale * taken,
-                                   score_mod=self.score_mod, natural=self.natural, prescale=power / taken,
-                                   subtracted=subtracted).reaches
+        return not folded_form(self.form, self.keys, ids=False, dtype=query.dtype, width=query.shape[3],
+                               scale=self.scale, natural=self.natural, score_mod=self.score_mod,
+                               subtracted=subtracted)[0].reaches
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
                      decides: bool | None = None) -> int:
@@ -938,17 +939,19 @@ class MosaicForward(_Mainloop[Tiles]):
                       products: tuple, decides: bool | None = None) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
-        width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
+        width, full_v = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         # A launch of a block of the value columns (`Tiles.columns`) stages that block.
-        value_width = value_columns(value_width, config.columns)
+        value_width = value_columns(full_v, config.columns)
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
+        training = ba.arguments.get("residuals") is Kept.SPLIT
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
+        plan = forward_block_plan(full_v, config.columns, out_dtype,
+                                  has_output_mod=self.output_mod is not None, training=training)
         # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
         page = _page(ba)
         deciding = self.deciding(ba, config) if decides is None else decides
-        allocations = _forward_allocations(family, config, width, value_width, query.dtype,
-                                           ba.arguments.get("residuals") is Kept.SPLIT,
-                                           min(config.stages, steps), out_dtype=out_dtype, page=page,
+        allocations = _forward_allocations(family, config, width, value_width, query.dtype, training,
+                                           min(config.stages, steps), out_dtype=plan.out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
                                            parts=self.parts, params=self.score_types,
                                            in_key=self.reads_key_slot(family), decides=deciding)
@@ -957,7 +960,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # (`reducing`).
         arguments = ba.arguments
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
-        reduced = reducing(family, config.consumers, self.score_reduces or self.output_mod is not None,
+        reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
         return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
                                                            reduces=forward_reduces(family, reduced),
@@ -988,24 +991,26 @@ class MosaicForward(_Mainloop[Tiles]):
                 staged = (self._staged_bytes(ba, config, target, products=base)
                           if target.shared_limit else None)
                 regs = self.registers(ba, config)
-                joined = self.joined_roles(ba, config, target)
+                tmem_limit = target.tmem_columns or 0
+                base_tmem = family.product_columns(base)
+                with_tmem = family.product_columns(with_query)
+                base_joined = placed.correction_roles(family, config.consumers, base_tmem, tmem_limit)
+                with_joined = placed.correction_roles(family, config.consumers, with_tmem, tmem_limit)
                 base_most = resources.register_model(family, config.consumers, regs, shared=staged,
-                                                     target=target, tmem=family.product_columns(base),
-                                                     joined=joined).most
+                                                     target=target, tmem=base_tmem,
+                                                     joined=base_joined).most
                 with_most = resources.register_model(family, config.consumers, regs, shared=staged,
-                                                     target=target, tmem=family.product_columns(with_query),
-                                                     joined=joined).most
+                                                     target=target, tmem=with_tmem,
+                                                     joined=with_joined).most
                 if with_most >= base_most:
                     return with_query
         return base
 
     def joined_roles(self, ba: tokamax.BoundArguments, config: Tiles,
                      target: generation.GpuTarget) -> tuple:
-        del target
         family = bundle_of(config, ba.arguments["query"].dtype)
-        query, value = ba.arguments["query"], ba.arguments["value"]
-        value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
-        return placed.correction_roles(family, config.consumers, value_width)
+        return placed.correction_roles(family, config.consumers, self.tmem_columns(ba, config, target),
+                                       target.tmem_columns or 0)
 
     def tmem_columns(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
@@ -1057,8 +1062,8 @@ class MosaicForward(_Mainloop[Tiles]):
         return self._decided_model(arguments["query"], arguments["value"], arguments["score_params"],
                                    arguments.get("residuals"), config, arguments.get("table"),
                                    arguments.get("sources"), arguments.get("scales"),
-                                   arguments.get("initial"), arguments.get("drop"), peaks=peaks,
-                                   columns=columns, decides=decides)[2]
+                                   arguments.get("initial"), arguments.get("drop"),
+                                   peaks=peaks, columns=columns, decides=decides)[2]
 
     def registered(self, query, value, score_params, residuals, table=None, sources=None,
                    scales=None, initial=None, drop=None) -> ForwardRegisters:
@@ -1075,7 +1080,9 @@ class MosaicForward(_Mainloop[Tiles]):
                                 if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
+                                dropped=drop is not None,
                                 weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
+                                scaled_products=scaled_drop(computed, drop, initial),
                                 prologue=(None if self.query_mod is None
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)))
 
@@ -1353,7 +1360,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
-                       splits=splits, subtracted=subtracted, per_span=spans.per_span, whole=spans.whole,
+                       splits=splits, subtracted=subtracted, per_span=spans.per_span,
                        parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded, in_key=in_key,
                        query_mod=hooks.query_mod,
                        query_kinds=tuple(param.kind for param in hooks.query_params),

@@ -37,7 +37,7 @@ from dew.objectives import DistillationObjective
 from dew.objectives.base import EMASpec, Step
 from dew.objectives.distillation import PROJECTIONS, TEACHER
 from dew.objectives.lm import LMObjective
-from dew.objectives.routing import ExpertBalance
+from dew.objectives.routing import ExpertBalance, RoutedStatistics
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "distillation"
@@ -433,16 +433,30 @@ def test_a_vocabulary_mismatch_is_refused_with_the_reason(student_vocab, teacher
         objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
 
 
-def test_a_student_with_the_router_balance_loss_is_refused():
-    """The balance loss's router terms normalize per router, not per token,
-    so the seam refuses them at the first trace and names the way out."""
-    arrays = fixture()
-    student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None,
-                          balance=ExpertBalance(aux_loss_alpha=0.01))
-    teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
-    objective = DistillationObjective(student, teacher)
-    with pytest.raises(ValueError):
-        objective.scalar_loss(nn.unbox(objective.init(jax.random.key(0))), fixture_batch(arrays), step_at())
+def test_a_routed_students_balance_and_z_loss_train_beside_the_distilled_loss():
+    """A mixture-of-experts student whose loss adds DeepSeek V2's balance loss and ST-MoE's router z-loss
+    distills with them (row 9071: refused): the distilled statistics hold the student's own router terms,
+    each over its own count, to the bit as the student's own loss computes them, which its reduction adds
+    to the token mix as the student's does."""
+    from dew.nn.backbones.decoder_block import Mixture
+
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ, qk_norm=False,
+                              mixture=Mixture(experts=4, top_k=2, norm_topk_prob=False,
+                                              score_function="softmax"))
+    balance = ExpertBalance(aux_loss_alpha=0.05, seq_aux=False, router_z_loss=0.001)
+    routed = LMObjective(model, SEQ, ema_decay=None, balance=balance)
+    tokens = jax.random.randint(jax.random.key(1), (2, SEQ + 1), 0, VOCAB)
+    step = step_at()
+
+    objective = DistillationObjective(routed, LMObjective(model, SEQ, ema_decay=None), alpha=0.5)
+    params = nn.unbox(objective.init(jax.random.key(0)))
+    mixed = objective.loss(params, {TEXT_KEY: tokens}, step)[0]
+    own = routed.loss(objective.student_variables(params), {TEXT_KEY: tokens}, step)[0]
+    assert isinstance(mixed, RoutedStatistics) and isinstance(own, RoutedStatistics)
+    assert jax.tree.all(jax.tree.map(jnp.array_equal, (mixed.global_routers, mixed.router_z),
+                                     (own.global_routers, own.router_z)))
+    assert mixed.global_routers and mixed.router_z
 
 
 # --------------------------------------------------------------------------

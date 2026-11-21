@@ -340,7 +340,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         others, own, others_total, prior = (part[row, head, rows] for part in sums)
         m = maxima
         if draw is not None:
-            # Dropout's D: each dropped product centred about its query's heaviest key.
+            # Dropout's D: each dropped product centred about its query's heaviest key before any
+            # reduction, which split_delta's D from the forward's split sums cannot replace: those sums
+            # round before the subtraction, so identical keys' dQ stood 5e-8 off its exact zero and a
+            # tiny kept anchor's product lost its accuracy (row 9510).
             def terms(j):
                 columns, seen, _, v_tile, logits, _ = formed(j)
                 products = gradient.dropped_products(interpreted_dot(do, v_tile.T),

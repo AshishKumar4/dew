@@ -14,6 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, rings, swizzling
 from dew.nn.kernels.templates.mosaic_sm100 import (
     STORED,
@@ -122,12 +123,13 @@ class Tcgen05Placed(Tcgen05Rings):
                                   handoffs.Role("producer", warp=True, weight=0),
                                   handoffs.Role("issuer", warp=True, weight=0)), floor=producer)
 
-    def corrects(self, consumers: int, value_width: int) -> bool:
-        """Whether a launch of `consumers` softmax warpgroups and `value_width` value columns places its
-        sums' rescales on a dedicated `CORRECTION` warpgroup (at one consumer and width >= 256, where TMEM
-        already caps residency to 1 CTA/SM and two softmax warpgroups do not fit)."""
-        return consumers == 1 and value_width >= 256
-
+    def corrects(self, consumers: int, tmem_columns: int, tmem_limit: int) -> bool:
+        """Whether this launch places its sums' rescales on a dedicated `CORRECTION` warpgroup (rows 5368,
+        9788): derived from the launch's facts (`consumers == 1` and rounded TMEM allocation already capping
+        residency to 1 CTA/SM against `tmem_limit`, so joining `CORRECTION` costs zero residency)."""
+        if not (self.rescales_kept and consumers == 1 and 0 < tmem_columns <= tmem_limit):
+            return False
+        return tmem_limit // resources.tensor_memory_allocated(tmem_columns) <= 1
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
                     walk: Callable[..., R], *, between=None, counted=0) -> R:
         # Its consumer reads no ring (its issuer does): no step it passes.
@@ -164,7 +166,9 @@ class Tcgen05Placed(Tcgen05Rings):
         if query_left:
             ((q_width, q_dtype),) = query_left
             scratch[QUERY] = tuple(self.tensor_memory((rows, q_width), q_dtype) for _ in range(consumers))
-        if self.corrects(consumers, kept):
+        held = tuple(scratch[name] for name in (LOGITS, SUMS, QUERY) if name in scratch)
+        cols = resources.tensor_memory_columns(jax.tree.leaves(held))
+        if self.corrects(consumers, cols, generation.gpu_target().tmem_columns or 0):
             scratch["factor_ready"] = self.signals(2).scratch()
             scratch[FACTORS] = plgpu.SMEM((2, rows), jnp.float32)
         return scratch
@@ -466,11 +470,12 @@ CORRECTION = handoffs.Role("correction", 1, weight=0.5)
 sums in tensor memory off the softmax warpgroup's critical path."""
 
 
-def correction_roles(family: mosaic.Family, consumers: int,
-                     value_width: int) -> tuple[tuple[handoffs.Role, int], ...]:
-    """The joined correction warpgroup role for `family` at `consumers` and `value_width`, or empty."""
+def correction_roles(family: mosaic.Family, consumers: int, tmem_columns: int,
+                     tmem_limit: int) -> tuple[tuple[handoffs.Role, int], ...]:
+    """The joined correction warpgroup role for `family` derived from `consumers`, `tmem_columns` and
+    `tmem_limit` (rows 5368, 9788), or empty."""
     return ((CORRECTION, 1),) if (isinstance(family, Tcgen05Placed)
-                                  and family.corrects(consumers, value_width)) else ()
+                                  and family.corrects(consumers, tmem_columns, tmem_limit)) else ()
 
 
 def placed_products(products: Sequence[mosaic.Product]) -> tuple[mosaic.Product, mosaic.Product]:

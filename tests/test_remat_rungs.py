@@ -234,6 +234,7 @@ def _steps_its_gradient(name: str, model, variables, inputs, **apply) -> None:
                     truth_fn=lambda *drawn: _stepped(judged(twin), wide, drawn, **apply))
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_remat_rungs_climb_and_restore(name):
     source = loaded(name)
@@ -244,6 +245,7 @@ SCANNED = ("qwen35-tiny", "qwen35-native-tiny", "qwen35-blocks-tiny", "qwen38-mo
 """Hybrid checkpoints whose decoders scan by period, a gated delta net's rung read in the scan's body."""
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", SCANNED)
 def test_a_scanned_checkpoints_remat_rungs_climb(name):
     """A decoder that scans its runs (`scan_layers`, a period of delta nets and attention one body) climbs
@@ -254,12 +256,14 @@ def test_a_scanned_checkpoints_remat_rungs_climb(name):
                          method="logits")
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_top_rung_steps_its_forward_as_it_does(name):
     source = loaded(name)
     _steps_its_forward(source.model, source.variables, (tokens(name),), method="logits")
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if name in GRADIENT_SEEDS])
 def test_a_covering_checkpoints_top_rung_steps_its_gradient_as_it_does(name):
     source = loaded(name)

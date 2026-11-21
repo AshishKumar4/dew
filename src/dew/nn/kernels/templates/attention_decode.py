@@ -42,11 +42,11 @@ from dew.nn.kernels.templates.attention import (
     Kept,
     KeySpans,
     grouped_rows,
-    prescale,
     prologues_taken,
     spans as key_spans,
     ungrouped_rows,
 )
+from dew.nn.kernels.templates.attention_mosaic_forward import folded_form
 from dew.nn.kernels.templates.cost import Work
 
 
@@ -91,16 +91,20 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
            ) -> tuple[jax.Array, KeySpans, Initial | None]:
     """`query` `[B, T, H, D]` as `[B, T·G, KV, D]` over its `kv_heads` key heads (`grouped_rows`), and `spans`
     `[B, T]` and `initial` `[B, H, T]` alike: each packed row sees its query's keys and starts from its head's
-    state; `ungrouped_rows` takes an output back. A position's interval holds its G rows
-    (`KeySpans.per_span`), read by position in the program; a call of several runs or documents an interval
-    a row."""
+    state; `ungrouped_rows` takes an output back. A full call's rows a full call's, its form kept, so its
+    launches price it as one (row 8981: packed as spans of a `whole` flag beside them, its price had a second
+    owner); a call of one run's position's interval holds its G rows (`KeySpans.per_span`), read by position
+    in the program; a call of several runs or documents an interval a row."""
     batch, positions, heads, _ = query.shape
     group = heads // kv_heads
     rows = grouped_rows(query, kv_heads)
-    if spans.query_ids is None and spans.start.ndim == 2:
-        # A full call's rows see every key still, which its launches' costs state (`KeySpans.whole`).
+    if spans.form == "full":
+        # A full call's rows see every key still: a full call of G rows a position, its launches priced so.
+        start, end = (jnp.repeat(x, group, axis=1) for x in (spans.start, spans.end))
+        spans = KeySpans(start, end, None, spans.key_ids, spans.keys, "full")
+    elif spans.query_ids is None and spans.start.ndim == 2:
         spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans",
-                         spans.per_span * group, whole=spans.whole or spans.form == "full")
+                         spans.per_span * group)
     else:
         start, end = (jnp.repeat(x, group, axis=1) for x in (spans.start, spans.end))
         query_ids = None if spans.query_ids is None else jnp.repeat(spans.query_ids, group, axis=1)
@@ -250,13 +254,12 @@ def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation
 
 
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
-    """The call's form as the template's forward takes it (`attention_mosaic_forward._prepared`), its fold of
-    raw products (`algebra.Forward.subtracted`): the units its finished rows' maxima are in
+    """The call's form as the template's forward builds it (`attention_mosaic_forward.folded_form`), its fold
+    of raw products (`algebra.Forward.subtracted`): the units its finished rows' maxima are in
     (`algebra.finished_form`), which its merge takes."""
-    power, factor = prescale(query.dtype, query.shape[3], scale)
-    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
-                           score_mod=hooks.score_mod, natural=False, initial=hooks.initial is not None,
-                           prescale=power, subtracted=True)
+    spec, _ = folded_form(spans.form, spans.keys, ids=spans.query_ids is not None, dtype=query.dtype,
+                          width=query.shape[3], scale=scale, natural=False, score_mod=hooks.score_mod,
+                          subtracted=True, initial=hooks.initial is not None)
     return algebra.finished_form(spec)
 
 

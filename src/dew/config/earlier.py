@@ -62,8 +62,10 @@ def earlier_trainer_layout(record: Mapping[str, object]) -> Mapping[str, object]
 
     fields = record.get("fields")
     trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
-    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(
-            trainer.get("layout"), Mapping) or from_record(Layout, trainer["layout"]) != Layout():
+    # A record written since states `layout_unsettable` (`TrainerConfig`), its `Layout()` stated (row 9664).
+    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or "layout_unsettable" in trainer:
+        return record
+    if not isinstance(trainer.get("layout"), Mapping) or from_record(Layout, trainer["layout"]) != Layout():
         return record
     return {**record, "fields": {**fields, "trainer": {**trainer, "layout": None}}}
 

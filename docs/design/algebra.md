@@ -157,7 +157,9 @@ glue is (ยง6.2), reorderings over its values held by the dominance rule alone (ย
     is zero where the magnitude keeps its bits), nor for a complex value; an exponential's logarithm is the
     stable set's (log space, below), and a logarithm's exponential holds only over a sign and a range. None of
     these is built;
-  - **reuse** (`reuse`, compile time and dev time, `reorders`; row 9035): a value the forward already
+  - **reuse** (`reuse`, `reorders`, row 9035; dev time until its receipt is measured, row 9777: of the nine
+    perf-gate steps compiled ahead for an H100 it changes finetune-4b's program alone, whose timing with and
+    without it is M-DC-14's; compile time once measured): a value the forward already
     computed. An equal term is one e-class and extraction prices a shared one once, so a value written twice is
     read once without a rule. The rules relate a new value to another the program holds: a quotient by a value
     whose reciprocal it holds, `a / y` as `a (1/y)`, and by a root whose reciprocal root it holds, `a /
@@ -700,7 +702,7 @@ class RuleFamily:
 
 @dataclass(frozen=True)
 class Rules:
-    name: str                                # "identities", "contracted", "stable", "linear", "joined"
+    name: str                                # "identities", "contracted", "stable", "reuse", "linear", "joined"
     rounding: Literal["exact", "reorders", "bounded"]   # the rounding class each of its rewrites gives
     ruleset: egglog.Ruleset                  # its families' rules (`Rules.declared`)
     receipt: str                             # the measurement it ships with: a ledger row and its receipts
@@ -1033,7 +1035,23 @@ equation the language has no constructor for is a leaf. The algebra's identities
 sums commute and associate, products distribute and factor, and a contraction is linear in each operand.
 Where the update is affine, its class then holds the form: a decay `exp(z)` (or `exp2`) on the state, a
 scalar's or each key's, a rank-one input `B U^T`, and corrections along `B` that read the decayed state
-(`Affine.decayed`, `corrected`). The readout's form is a contraction of the state with a vector plus a free part, over the keys
+(`Affine.decayed`, `corrected`: `D h + B (U + X^T D h)^T`) or the state the token enters (`corrected_before`:
+`D h + B (U + X^T h)^T`, whose decay a read after it would take twice), or an erase along a vector of its own
+beside the write, reading the state the token enters (`erased_before`: `D h + A (X^T h)^T + B U^T`, RWKV7's),
+`X` the reader each traces.
+The pre-decay forms' WY system reads each earlier write and the entering state through the decays a token
+back, to the token before the reader's (`entering_before`, `between_before`: `entering` and `between` shifted
+a row, never a token's exponent taken away), cut at a document's start alone (a key whose decay vanishes at
+the reader is read whole, as the recurrence reads it); where a decay a head's commutes into the read, the
+after-decay form is the cheaper and is extracted. One sign convention holds every corrected form: the reader the update
+traces, `X` (`U + X^T D h`, `A (X^T h)^T`), is negated into the solve's `C = -X` at strength `s = 1`, so the
+transitions are `(I - s B C^T) D`, `D - s B C^T` and `D - s A C^T`. The erase's system solves for its erased
+values alone, `W_i = s_i C_i^T h_{i-1}` of the state each token enters, its writes known:
+`(I + diag(s) strictly_lower(gram(C, A))) W = diag(s) ((C * gamma') h_in + strictly_lower(gram(C, B)) U)`,
+`gamma'` and the pairs' decays a token back; its outputs are `(Q * gamma) h_in + lower(gram(Q, B)) U -
+lower(gram(Q, A)) W + R` and its state `gamma_last h_in + sum_j (B_j * exp(G_last - G_j)) U_j^T - sum_j
+(A_j * exp(G_last - G_j)) W_j^T`, the writes' less the erases'. The readout's form is a contraction of the
+state with a vector plus a free part, over the keys
 (`Affine.readout`, `reader^T h + free`, a vector along the values) or over the values (`Affine.applied`,
 `h reader + free`, a vector along the keys). An update or readout that reaches no such form is refused. The affine update then
 enters a second e-graph as its chunk's token loop, and the identities of affine scans hold every equal
@@ -1286,10 +1304,10 @@ each joins `DECLARATIONS` when one of its forms is generated rather than traced.
 ```python
 @dataclass(frozen=True)
 class Generated:
-    declaration: str                  # the declaring module and name
+    declarations: tuple[str, ...]     # the declaring module's declarations it holds, each module and name
     module: str                       # the generated module, beside the declaring one: *_derived.py
-    tests: str                        # its gate sites and stability suite
-    rules: tuple[str, ...]            # the rule sets and their receipts
+    tests: str                        # the one suite that holds every generated module (`TESTS`)
+    rules: tuple[str, ...]            # the rule sets it was saturated with
     egglog: str                       # the pinned version
 
 @dataclass(frozen=True)
