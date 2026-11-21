@@ -594,6 +594,10 @@ def _unlike(cap: Planned, other: Planned) -> list[str]:
         ours, theirs = leaves(held), leaves(given)
         unlike += [f"{name}{path}" for path in sorted(ours.keys() | theirs.keys())
                    if ours.get(path) != theirs.get(path)]
+    # What its loss returns by kind, not by leaves alone: a metric pooled as another kind of mean over the
+    # same leaves (an `Exponentiated` where the cap's is a `Ratio`) would pool as the cap's (row 10815).
+    if jax.tree.structure(cap.candidate.shapes) != jax.tree.structure(other.candidate.shapes):
+        unlike.append("the loss's terms by kind")
     return unlike
 
 
