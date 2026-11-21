@@ -1728,12 +1728,21 @@ def wrote_inputs(depends: list[str], changed: Collection[str]) -> list[str]:
     for item in depends:
         if item.startswith(followed.LOOKUP):
             looked = item[len(followed.LOOKUP):]
-            if any(path == looked or path.startswith((f"{looked}.", f"{looked}/__init__"))
-                   for path in changed):
+            if any(looked_entry(path, looked) for path in changed):
                 written.append(looked)
         elif (path := item.removeprefix(followed.PROBED).partition(followed.CODE)[0]) in changed:
             written.append(path)
     return written
+
+
+def looked_entry(path: str, looked: str) -> bool:
+    """Whether `path` is an entry the import lookup of `looked` lists (`digests.looked_up`): its name, a
+    module or package of any suffix beside it, or a package's own __init__ of any suffix; no file of another
+    name (review: `held/__init__report.json` is none of `held`'s)."""
+    parent, _, entry = path.rpartition("/")
+    directory, _, name = looked.rpartition("/")
+    return ((parent == directory and (entry == name or entry.startswith(f"{name}.")))
+            or (parent == looked and entry.partition(".")[0] == "__init__"))
 
 
 def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[str] | None:
@@ -1807,15 +1816,17 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         name = parsed_row(row_["name"])[1]
         # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
         file = grading.owning(name)
-        ran = executed.get(file) or followed.unrecorded()
+        ran = executed.get(file, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
         why = list(ran.get("why") or ())  # Each reason the row keeps no key, as its record says it.
         site = session.SITE.fullmatch(parsed_row(row_["name"])[2])  # a check-1 judge reads not as its site
         read = (None if ran["depends"] is None or (site is not None and site["start"] is None) else
                 sorted({*ran["depends"], *(opened or ())}))
         if ran["depends"] is not None:
             inputs_ = None if opened is None else sorted({*ran["depends"], *opened})
-            # Its writes weighed against the inputs its key covers (`inputs`: an import lookup's entries too).
-            wrote = [] if inputs_ is None else wrote_inputs(inputs(file, inputs_), changed)
+            # Its writes weighed against what it read and ran, then against the import lookups its key covers
+            # besides (`inputs`), each as the key reads it (a lookup by its entries' names; row 10800).
+            wrote = [] if inputs_ is None else sorted({*wrote_inputs(inputs_, changed), *wrote_inputs(
+                [item for item in inputs(file, inputs_) if item.startswith(followed.LOOKUP)], changed)})
             why += (["its task's watch of the checkout was blind"] if inputs_ is None
                     else [f"its task wrote its input {path}" for path in wrote[:6]])
             ran = {**ran, "depends": None if inputs_ is None or wrote else inputs_}

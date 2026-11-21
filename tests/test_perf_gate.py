@@ -802,6 +802,18 @@ def test_a_runs_step_rows_read_the_steps_their_trees_prepare_compiled_ahead(gate
         assert handed == (str(tmp_path / "ahead" / "head") if tree == "head" else None), (tree, command)
 
 
+def test_a_filter_chooses_the_same_step_probes_to_compile_ahead_as_to_run(gate):
+    """`--only` chooses a step probe by any of its rows' names (its step's, its peak's, its MFU's), the same
+    for the prepare that compiles it ahead as for the run that measures it (`chosen`): a filter on an MFU
+    row compiled no step and the run then found its handed directory without it (row 10796's review)."""
+    stepped = [probe for probe in gate.PROBES if probe.tool == "benchmark_step.py"
+               and probe.rows[0].name in gate.STEP_CASES]
+    assert stepped and all(gate.chosen(probe, ["mfu step"]) for probe in stepped)
+    assert [probe.rows[0].name for probe in stepped if gate.chosen(probe, ["peak step lm-dense"])] == [
+        "step lm-dense 4x1024"]
+    assert all(gate.chosen(probe, None) for probe in gate.PROBES)
+
+
 def test_ahead_fails_where_a_trees_compile_ahead_fails_and_asks_none_of_a_tree_that_has_none(
         gate, tmp_path, monkeypatch):
     """`ahead` ends nonzero where a tree whose benchmark_step compiles ahead fails to, so the job's prepare

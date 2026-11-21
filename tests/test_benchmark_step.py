@@ -209,29 +209,31 @@ def test_a_prepare_that_cannot_compile_a_case_ahead_fails_and_a_run_handed_its_d
     from dew.nn.kernels.selection import Unlowerable
 
     tool = load("benchmark_step")
+    ahead = tmp_path / "ahead"
     config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['causal_transformer', 'simple_dit'],
-                                  warmup=1, steps=1, dtype='float32', compile_ahead=str(tmp_path / "ahead"),
+                                  warmup=1, steps=1, dtype='float32', compile_ahead=str(ahead),
                                   generation="sm90", capacity_gib=80)
-    first, second = tool.build_cases(config)
-    saved = []
+    compiled, refused = tool.build_cases(config)
 
     class Ahead:
         def save(self, path):
-            saved.append(Path(path).name)
+            Path(path).write_text("a step")
 
     def ahead_of(case, *_):
-        if case.architecture == second.architecture:
-            raise Unlowerable("attention kernel 'flash' does not lower on this host")
+        if case.architecture == refused.architecture:
+            raise Unlowerable("attention", "flash", "library unavailable")
         return Ahead()
 
     monkeypatch.setattr(tool, "ahead_of", ahead_of)
     with pytest.raises(SystemExit, match="not compiled ahead"):
         tool.main(config)
-    assert saved == [tool.ahead_name(first)]
-    run = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['simple_dit'], warmup=1, steps=1,
-                               dtype='float32', ahead=str(tmp_path / "ahead"))
+    assert sorted(path.name for path in ahead.iterdir()) == [tool.ahead_name(compiled)]
+    # A run of the refused case, handed the directory, refuses it before it builds a trainer.
+    monkeypatch.setattr(tool, "build_trainer", lambda *_, **__: pytest.fail("compiled in its place"))
+    run = tool.BenchmarkConfig(preset='cpu-smoke', architectures=[refused.architecture], warmup=1, steps=1,
+                               dtype='float32', ahead=str(ahead))
     with pytest.raises(SystemExit, match="no step compiled ahead"):
-        tool.measure(second, run)
+        tool.measure(*tool.build_cases(run), run)
 
 
 def test_a_steps_count_reads_as_the_bound_it_is():

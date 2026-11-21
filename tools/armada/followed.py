@@ -777,12 +777,6 @@ def visited(lines: list[list[str]]) -> list[str]:
     return [name for name, item in lines if item == VISIT and name != SHARED]
 
 
-def unrecorded() -> dict:
-    """The record of a test file its task's log never names (`recorded`'s shape): no key, and why."""
-    return {"depends": None, "reads": [], "peak": None, "why": ["its task's log names no record of it"],
-            "shares": 0, "pools": 0}
-
-
 def recorded(path: Path) -> dict[str, dict]:
     """Each test file's record in the log at `path` and its children's (followed.py's `gathered`): the files
     it executed and read, every earlier file's up to the end of its last visit, `SHARED`'s whenever, and its

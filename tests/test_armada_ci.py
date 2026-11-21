@@ -1496,6 +1496,7 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     (tmp_path / "docs/same.txt").write_text("PAGE\n")
     (tmp_path / "src").mkdir(exist_ok=True)
     (tmp_path / "src/held.py").write_text("VALUE = 1\n")
+    (tmp_path / "docs/gone.txt").write_text("gone\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     for test, body in (
             ("plain", "    assert True\n"),
@@ -1519,6 +1520,8 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
             ("native", "    with sqlite3.connect('tests/fixtures/rows.db') as database:\n"
                        "        database.execute('insert into t values (1)')\n"
                        "    database.close()\n"),
+            ("emptied", "    gone = Path('docs/gone.txt')\n    if gone.is_file():\n"
+                        "        assert gone.read_text()\n        gone.unlink()\n        gone.mkdir()\n"),
             ("shadowed", "    import sys\n    sys.path.insert(0, 'src')\n    import held\n    assert held\n"
                          "    made = Path('src/held')\n    if not made.exists():\n        made.mkdir()\n"
                          "        (made / '__init__.py').write_text('')\n")):
@@ -1526,17 +1529,31 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
                                         "from pathlib import Path\n\n\ndef test_a():\n" + counted + body})
         (tmp_path / "runs").unlink(missing_ok=True)
         commit(tmp_path, test)
-        assert [run(), run()] == ([1, 1] if test == "plain" else [1, 2]), test
+        first = run()
+        if test == "shadowed":
+            # Its first run's record, before the second (which finds the package made) records its own.
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            kept = json.loads(cache_worker[1][place])
+            assert kept["key"] is None and "its task wrote its input src/held" in kept["why"], kept["why"]
+        assert [first, run()] == ([1, 1] if test == "plain" else [1, 2]), test
         # Its record keeps what it read all the same, which a change's reach reads (`reached`).
         if test == "python":
             place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
             kept = json.loads(cache_worker[1][place])
             assert kept["key"] is None and kept["depends"] is None
             assert any(path.partition(ci.followed.CODE)[0].endswith("docs/page.txt") for path in kept["read"])
-        if test == "shadowed":
-            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
-            kept = json.loads(cache_worker[1][place])
-            assert kept["key"] is None and "its task wrote its input src/held" in kept["why"], kept["why"]
+
+
+
+def test_a_lookups_entries_are_its_names_alone(ci):
+    """A write counts against an import lookup (`ci.looked_entry`) only where it is an entry the lookup
+    lists: its name, a module or package of any suffix beside it, a package's own __init__; none of another
+    name, a deeper file, or one under a namesake package (review: `held/__init__report.json`)."""
+    entry = ci.looked_entry
+    assert all(entry(path, "src/held") for path in ("src/held", "src/held.py", "src/held.cpython-312.so",
+                                                    "src/held/__init__.py", "src/held/__init__.pyc"))
+    assert not any(entry(path, "src/held") for path in ("src/held/__init__report.json", "src/held/mod.py",
+                                                        "src/helder.py", "src/other/held.py"))
 
 
 def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(ci, tmp_path, monkeypatch,
