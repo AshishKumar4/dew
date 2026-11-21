@@ -465,3 +465,29 @@ def test_an_fp32_turned_training_step_certifies_on_h100():
              if id(each) not in before and each.op == type(template.MOSAIC).__name__]
     bodies = _certified_bodies(found)
     assert bodies and all(not entries[-1].refused for entries in bodies.values()), bodies
+
+
+@pytest.mark.parametrize('target', ['sm90', 'sm100'])
+@pytest.mark.parametrize('name', ['nemotron-h-4b-ssd', 'qwen3.5-27b-gdn'])
+def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
+    """A 16-bit forward no gradient follows, under a decay a head on warpgroup MMA and tcgen05, at its own
+    tiles (`Tiles.forward`): the launches the training forward runs (`Mosaic.launches`), its states then
+    its output. Its states and output walked in one launch lost to them at every measured shape: on a GH200
+    Nemotron-H 4B's SSD forward took 669.5 us walked against 271.2 apart, 30B's 192.3 against 182.4 and
+    the 27B gated delta net's 569.8 against 440.6 (M-JS-148b; a B200's 27B walk 613 us against its training
+    forward's states 254, js106c), rows 5668, 7877."""
+    from test_recurrence_mosaic import RATED, _form, _skipped, resource_operands
+
+    dtype = jnp.bfloat16
+    bound = template.MOSAIC.bind(*resource_operands(name, dtype, 1, 4096), None, max_segments=None,
+                                 bound=None if name in RATED else 1.0, **_form(name, dtype), **_skipped(name))
+    facts = generation.gpu_target(target)
+    with generation.assumed(facts):
+        tiles = template.MOSAIC.derived(bound, facts)
+
+        def names(tiles, *, training: bool) -> list[str]:
+            return [launch.name for launch in template.MOSAIC.launches(bound, tiles, facts, backward=False,
+                                                                       training_forward=training)]
+
+        forward, trained = names(tiles.forward or tiles, training=False), names(tiles, training=True)
+    assert forward == trained, (forward, trained)

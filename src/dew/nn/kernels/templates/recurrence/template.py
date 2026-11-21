@@ -499,12 +499,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
                        *, training: bool) -> bool:
         """Whether one product's forward holds at `tiles` (`legal`'s rules on its launches alone: a training
         call's where `training`, `launches`' `training_forward`, else a forward without a gradient's): the
-        tiles a rule stages for one product are held to the launches that product runs. A forward alone walks
-        its states and output in one launch where its family's products read shared memory
-        (`chunk_forward.walks_once`), which a training call never runs: on a B200 the 4B's gated delta net's
-        walk held no program at two roles where the training call's held every launch (its states launch 121
-        registers of 240, its reverse 149), and judged by it the training call walked one role, its states
-        launch's 2,304 programs 15.6 waves of one a multiprocessor (row 5668)."""
+        tiles a rule stages for one product are held to the launches that product runs: a forward alone keeps
+        nothing for a backward (`chunk_forward.kept_forward`'s `keeps`), a training call's forward keeps its
+        memories and corrected values, each its own tiles (`Tiles.forward`, row 5668)."""
         family = bundle(target, _dtype(ba))
         if family is None:
             return self.takes(ba, tiles, target)
@@ -956,12 +953,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _states(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget, *,
                 training: bool = False) -> mainloop.Launch:
-        """The forward's walk over each sequence's chunks: a forward without a gradient's scan, forming the
-        output in the walk (`mainloop._scan`), or where `training` the states launch of the forward its fast
-        backward takes (`chunk_forward.kept_forward`), a call without one its scan."""
+        """The forward's walk over each sequence's chunks, its states launch: a forward without a gradient's, or
+        where `training` the forward its fast backward takes (`chunk_forward.kept_forward`)."""
         return next(launch for launch in self.launches(ba, tiles, target, backward=False,
                                                         training_forward=training)
-                    if launch.name.startswith(("recurrence_states", "recurrence_scan")))
+                    if launch.name.startswith("recurrence_states"))
 
     def _blocks(self, ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
                 ) -> list[int]:

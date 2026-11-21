@@ -21,7 +21,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Tiles,
     Walked,
     _parts,
-    _scan,
     _solved,
     _solves_apart,
     _states,
@@ -30,7 +29,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     family_of,
     padded_widths,
     per_key_refusal,
-    scan_holds,
 )
 from dew.nn.kernels.templates.recurrence.output import output_launch
 from dew.nn.kernels.templates.recurrence.table import Table, turning_rows
@@ -176,19 +174,6 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     return out, final
 
 
-def walks_once(dtype, *, per_key: bool, family: mosaic.Family | None, keeps: bool) -> bool:
-    """Whether a forward of `dtype` runs its states and output in one walk (`_scan`), no memory kept for a
-    backward to take: one keeping nothing (`keeps`) under a decay a head, where its `family`'s products read
-    their operands from shared memory (warpgroup MMA's) and a 16-bit call's operands are one part; a forked
-    call's only where the walk holds its table's slices at its tiles too (`prepared`). Where they read
-    registers (mma.sync's), the
-    walk's two phases' operand fragments held its thread past its registers at every tile (an sm87's and an
-    A100's), as the output launch's two phases at once did (`output._output_held`); an fp32 call's parts
-    spilled it at an H100's widest (132 bytes at two roles of 16 columns, jsf-scan4 at d54ec6b02)."""
-    return (not keeps and not per_key and jnp.dtype(dtype).itemsize == 2 and family is not None
-            and not family.operands_in_registers)
-
-
 def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
                  max_segments: int | None = None,
                  scale: float | None = None, delta: bool = True, wide: bool = False,
@@ -203,27 +188,18 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     `A`, and the launches' weighted keys, memories, corrected values and a forked call's stored slots,
     `(w, h, corrected, stored)`, which the port
     keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
-    dtype = jnp.result_type(q, k, v)
-    scans = walks_once(dtype, per_key=g.ndim == 4, family=family_of(dtype) if family is None else family,
-                       keeps=keeps)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, apart=apart, values_gated=values_gated, unit_keys=unit_keys,
-                       ranged=ranged, scans=scans, forked=forked,
+                       ranged=ranged, forked=forked,
                    out_dtype=jnp.float32 if wide else None, skipped=skip is not None)
     call, tiles, out_dtype = run.call, run.tiles, run.landed
     # The skip in the launch that holds the values as given (`Call.gated_keys`); where they hold them gated,
     # added to the output after it, landed fp32 (the output rounded once).
     fused = skip if call.gated_keys else None
-    if run.scans:
-        o, final = _scan(run.q, run.keys, run.a, run.v, run.hi, run.lo, run.beta, run.h0, run.sequences,
-                         run.taken, call, tiles, scale=run.scale, out_dtype=out_dtype, skip=fused,
-                         table=run.table)
-        final = run.shaped(final)
-    else:
-        o = output_launch(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, run.beta, call,
-                          tiles, scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=fused)
-        final = run.final
+    o = output_launch(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, run.beta, call, tiles,
+                      scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=fused)
+    final = run.final
     o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
     if fused is None and skip is not None:
         o = recurrence.skip_added(o, skip, v, jnp.float32).astype(jnp.float32 if wide else run.dtype)
@@ -268,8 +244,6 @@ class _Run:
     """Each row's entering memory `[B * HV * Dk, Dv]` fp32, as the states launch takes it."""
     table: Table | None = None
     """A forked call's table, as its walks take it (`tabled`)."""
-    scans: bool = False
-    """Whether the forward walks its states and output in one launch (`_scan`; `prepared`'s choice)."""
     landed: jnp.dtype | None = None
     """The dtype the output launches land the output in (`prepared`'s)."""
     stored: jax.Array | None = None
@@ -317,18 +291,13 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
 
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None, inverse=None, kept=None, keeps: bool = True, rounded: bool = False, apart: int = 0,
-             values_gated: bool = False, unit_keys: bool = False, ranged: bool = False, scans: bool = False,
-             forked=None, out_dtype=None, skipped: bool = False) -> _Run:
+             values_gated: bool = False, unit_keys: bool = False, ranged: bool = False, forked=None,
+             out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
-    `kept` values, `(w, h, corrected, stored)`, are (`kept_forward`'s; its final memory then None), or but the
-    states launch's where `scans` asks for a walk forming the output too (`_scan`, which runs it; its
-    memories, corrected values and final memory then None), a forked call's where that walk holds its table's
-    slices at its tiles too (`mainloop.scan_holds`), else its states and output launches apart: at a B200's
-    248 registers the walk beside a table spilled Nemotron-H 4B's SSD 16 bytes and a write gate 60 to 80 at
-    every ring's depth under the cuda13 build's ptxas, which an H100's write gate holds (row 5761), its output
+    `kept` values, `(w, h, corrected, stored)`, are (`kept_forward`'s; its final memory then None), its output
     landing in `out_dtype` (the operands' where None), or in fp32 where a skip is added to it after the
-    launches (`skipped`, `kept_forward`), so it rounds once (`_Run.landed`); `_Run.scans` says which. A
+    launches (`skipped`, `kept_forward`), so it rounds once (`_Run.landed`). A
     skip is a call's without the delta rule alone (`skipped` with `delta` refused). The solve stores its
     inverse where the call `keeps` it (`_solved`). A forked call's documents, laid as a packed call's are (its
     `starts`, `firsts` and `max_segments`), give `forked` (`tabled`): each row's walk takes up each document's
@@ -376,7 +345,6 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
     landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)
-    scans = scans and (table is None or scan_holds(call, tiles, landed, table))
     beta = laid(beta).reshape(rows, heads).T
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores, system = None, None, v, k, None, []
@@ -406,9 +374,6 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         u = _weighted_values(v, a, beta, taken, call)
     elif per_key:
         (keys,) = _weighted(k, v, None, hi, lo, beta, taken, call)
-    elif delta and inverse is None and scans:
-        # A walk correcting its values itself (`_scan`) takes the inverse alone.
-        (a,) = _solved(k, v, hi, lo, beta, taken, call, applies=False)
     elif delta and inverse is None:
         # The forward's residuals come in pairs: a recomputed forward has neither.
         assert kept is None, "a kept forward keeps its inverse"
@@ -424,13 +389,11 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     h0 = h0.reshape(-1, columns)
     run = _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta, a,
                w, keys, scores, None, None, None, taken, sequences, laid, unlaid, u=u, h0=h0,
-               table=table, scans=scans, landed=landed)
+               table=table, landed=landed)
     if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
         (w, h, corrected, stored) = kept
         return dataclasses.replace(run, w=w, h=h, corrected=corrected, stored=stored)
-    if scans:
-        return run
     h, corrected, final, stored = _states(keys, w, u, hi, lo, beta, h0, sequences, taken, call, tiles,
                                           run.table)
     return dataclasses.replace(run, h=h, corrected=corrected, final=run.shaped(final), stored=stored)

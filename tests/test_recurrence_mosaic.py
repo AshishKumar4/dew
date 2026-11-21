@@ -107,9 +107,8 @@ a drawn test of its own (`drawn_forward`) but the 16-bit call under a decay a ke
 and final memory test_recurrence_mosaic_gradient's cell judges on the same recorded site (`fla_sites.ruled`'s
 leaves) by the same launches: under a decay a key dimension the inference forward is the training forward's
 launches keeping nothing (`chunk_forward.forward`, `kept_forward`'s `keeps`). Under a decay a head a 16-bit
-inference forward walks once (`walks_once`: one scan launch, its own rounded expression), so its ragged and
-packed cases are drawn tests of their own. Interpreted, the whole grid took 3.5 times these (2838 against
-805 seconds)."""
+call's ragged and packed cases are drawn tests of their own, at the forward's own tiles (`Tiles.forward`).
+Interpreted, the whole grid took 3.5 times these (2838 against 805 seconds)."""
 
 INTERPRETED_GRADIENT = frozenset({
     ('packed documents', 'bf16', 'kept'), ('a ragged length', 'bf16', 'kept'),
@@ -1068,11 +1067,11 @@ def test_a_plan_at_a_rings_depth_is_the_trace_at_that_depth(target, name):
             assert deepened == traced, (stages, kind)
 
 
-@pytest.mark.parametrize('kernel', ['recurrence_scan', 'recurrence_states', 'recurrence_reverse'],
+@pytest.mark.parametrize('kernel', ['recurrence_output', 'recurrence_states', 'recurrence_reverse'],
                          ids=['forward', 'training forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     """A compile that refused the 27B gated delta net's derived tiles on an H100 (`report.refused_at`: a
-    kernel spilled), its forward's walk (`mainloop._scan`), its training forward's or its backward's: the
+    kernel spilled), its forward's output launch, its training forward's states or its backward's: the
     derivation steps the refused tiles down, which the call takes (`fits`); a refusal of the joined tiles once
     matched none of the rules' candidates, and the call found none (`Unfitted`)."""
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
@@ -2317,8 +2316,8 @@ def _reach(target: str, group: tuple) -> set:
                  for kind, _, launch in _rungs_of(bound, tiles, training, facts)}
     kind = 'two roles' if variant == TWO_ROLES else 'derived' if variant is None else 'a neighbour'
     # The arithmetic form a launch's emitted part reads (`_form`: the delta rule, the rounding), beside the
-    # operands' dtype: without it a cover could drop every write gate's group, whose unrounded walk emits a
-    # branch of its own (`mainloop._scan`'s).
+    # operands' dtype: without it a cover could drop every write gate's group, whose unrounded launches emit
+    # branches of their own.
     form = tuple(sorted(_form(name, dtype).items()))
     return (found | {('dtype', jnp.dtype(dtype).name), ('packed', packed), ('tiles', kind), ('form', form)}
             if found else found)
@@ -2492,6 +2491,6 @@ def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():
     """A kernel spilling under a launch name another launch's extends (`recurrence_intra_solve` beside
     `recurrence_intra`) is that longer launch's alone (`template._owners`), so only its producer rises."""
     launches = [types.SimpleNamespace(name=name)
-                for name in ('recurrence_intra', 'recurrence_intra_solve', 'recurrence_scan')]
-    owners = template._owners({'recurrence_intra_solve__l1f2', 'recurrence_scan__l3a4'}, launches)
-    assert owners == {'recurrence_intra_solve', 'recurrence_scan'}
+                for name in ('recurrence_intra', 'recurrence_intra_solve', 'recurrence_output')]
+    owners = template._owners({'recurrence_intra_solve__l1f2', 'recurrence_output__l3a4'}, launches)
+    assert owners == {'recurrence_intra_solve', 'recurrence_output'}

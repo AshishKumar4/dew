@@ -43,13 +43,6 @@ def test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures(target, d
         assert np.all(inside), (name, float(np.mean(inside)))
 
 
-def test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches():
-    """On mma.sync's bundle an inference forward runs its states and output launches, no fused walk
-    (`chunk_forward.walks_once`): the walk witness holds the records those launches keep."""
-    with generation.assumed("sm80", interpreted=True):
-        rw.assert_walk_witnessed(rw.interpreted_lane(), heads=2)
-
-
 def test_an_fp32_forward_the_template_does_not_train_is_witnessed_as_its_inference_forward():
     """An fp32 call on mma.sync's bundle, whose fast backward holds no A100 thread (264 to 328 registers):
     a training step takes another kernel, so the witness holds the template's inference forward
