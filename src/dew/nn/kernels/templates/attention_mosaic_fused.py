@@ -20,7 +20,7 @@ from dew.nn.kernels.templates import (
     stacked,
     stores,
 )
-from dew.nn.kernels.templates.attention import Dropout
+from dew.nn.kernels.templates.attention import Dropout, by_power
 from dew.nn.kernels.templates.attention_backward_algebra import derived_from_weights, derived_weights
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
@@ -203,8 +203,9 @@ def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged
         family.staged(narrowed, staged.at[0])
         return weights, slopes, seen
 
+    q_lhs = by_power(family.tile_of(q_slot), walk.spec.prescale) if walk.scaled else q_slot
     (weights, slopes, seen), dp = family.product_pair(
-        q_slot, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)), shape,
+        q_lhs, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)), shape,
         between=stage_weights)
     dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     tiles_ds = {"weights": weights, "products": dp, "anchor": anchor, "delta": delta}
@@ -247,7 +248,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
             masked=masked, whole_operands=True))
     if (masked is not None and family.products_overlap and not family.operands_in_registers
-            and not walk.interpret and not walk.scaled and not walk.accurate and not walk.dropped):
+            and not walk.interpret and not walk.accurate and not walk.dropped):
         return _overlapped_fused_step(walk, resident, rows_of(slots, q_first), staged, coords, add_dq,
                                       slots, carry, accumulators, q_first, masked=masked)
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,

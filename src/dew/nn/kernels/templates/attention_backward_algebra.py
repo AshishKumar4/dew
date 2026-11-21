@@ -122,7 +122,7 @@ def derived_from_weights(keys_first: bool, masked: bool) -> derive.Derived:
     axes = {"weights": tile, "products": tile, "anchor": ("rows",), "delta": ("rows",),
             **({"seen": tile} if masked else {})}
     declared = functools.partial(softmax_from_weights, keys_first=keys_first)
-    return derive.derive(derive.Reduction(declared, axes, walked="keys"), accurate=False,
+    return derive.derive(derive.Reduction(declared, axes, walked="keys", exponent="e"), accurate=False,
                          saturation=SATURATION)
 
 def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, slope=None, seen=None,
