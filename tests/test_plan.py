@@ -159,6 +159,30 @@ def test_every_process_keeps_or_drops_the_narrow_copies_together():
     assert FitSearch.freed(search(60, others=False), "with", "without") is False
 
 
+def test_a_start_whose_head_alone_fits_tiled_settles_it_at_no_recomputation(monkeypatch):
+    """A decoder whose 4,096-word head's logits are most of its step, read whole and without narrow copies,
+    given room for its step with that head tiled and recomputing nothing: no remat rung at its whole head
+    fits, so past them the search climbs the whole ladder from its own rung and settles the tiled head at no
+    recomputation, not a recomputing rung's (row 6740's order: the ladder read from the start's rung, not
+    from the last remat rung asked)."""
+    from dew.nn.kernels.generation import chosen
+
+    def decoder():
+        return lm(split=1, vocab=4096)
+
+    with chosen(narrow_copies="off"):
+        tiled = decoder()
+        assert tiled.objective.tile_head() is not None
+        room = needs(monkeypatch, tiled)
+        free(monkeypatch, room)
+        trainer = decoder()
+        state, _, _ = trainer.place()
+        trainer.compile(state, BATCH, Trials(state, BATCH))
+    probes = trainer.plan["probes"]
+    assert any(probe["remat"] is not None for probe in probes), probes
+    assert trainer.plan["head_tile"] is not None and trainer.plan["remat"] is None, probes
+
+
 def test_a_miss_computes_the_split_its_temporaries_leave_room_at():
     """A compile that missed by its `shortfall`, its stranding counted: a split above it holds what its
     rows scale at their share (`MemoryMiss.fits_at`)."""
@@ -1329,18 +1353,8 @@ H100 = 2 ** 40
 """The allocator limit of the compile-only H100 a census shape's need at each rung is read on: past any."""
 
 
-class LazyFit:
-    """A place's fit, compiled where it is first read as a truth value (`climbed`)."""
-
-    def __init__(self, fits, moves: int):
-        self.fits, self.moves = fits, moves
-
-    def __bool__(self) -> bool:
-        return self.fits(self.moves)
-
-
 def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, request
-            ) -> tuple[list, int, tuple, tuple] | None:
+            ) -> tuple[list, int, tuple, tuple | None, tuple | None, list[tuple]] | None:
     """A census shape's step at four microbatches on `target` ('cpu', its devices' memory stated through
     `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): the places of the fit
     ladder in its order (`recompute_more`: at each remat rung its head's rungs, then the next), as the
@@ -1408,20 +1422,25 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
             return refused.probes[0].fits
 
     if request.node.get_closest_marker("shards") is None:
-        # Each place's fit compiled where it is read, once (no later place is compiled for the lightest).
+        # Each place's fit compiled where it is asked, once (no place past the one sought is compiled).
         fitted = functools.cache(fits)
-        found = [LazyFit(fitted, moves) for moves in range(len(places))]
     else:
         walked = sharded(f"{request.node.name} walk", lambda start, stop: [fits(moves) for moves in
                                                                             range(start, stop)], len(places))
         if walked is None:
             return None
         found = [fit for part in walked for fit in part]
-    lightest = next((place for place, fit in zip(places, found, strict=True) if fit), None)
-    # The first remat rung past the start's, at the run's own head, that fits: what a tight start asks next.
-    recomputing = next((place for place, fit in zip(places[1:], found[1:], strict=True)
-                        if place[0] is None and place[2] != places[0][2] and fit), None)
-    return places, room, placed(planned(0, room)), lightest, recomputing
+        fitted = found.__getitem__
+    # The remat rungs past the start's at the run's own head, in order: what a tight start asks next.
+    preferred = [moves for moves, place in enumerate(places)
+                 if moves and place[0] is None and place[2] != places[0][2]]
+    recomputing = next((places[moves] for moves in preferred if fitted(moves)), None)
+    lightest = None if recomputing is not None else next(
+        (place for moves, place in enumerate(places) if fitted(moves)), None)
+    trainer = planned(0, room)
+    probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
+              for probe in trainer.plan["probes"]]
+    return places, room, placed(trainer), lightest, recomputing, probes
 
 
 CENSUS = {
@@ -1459,11 +1478,19 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
         climb = climbed(monkeypatch, target, fields, batch, room_of, request)
     if climb is None:
         return
-    ladder, room, plan, lightest, recomputing = climb
-    # A tight start asks the remat rungs at its own head first (row 6740): it settles the first of them that
-    # fits, where one does, else the lightest place of the ladder.
-    expected = recomputing if recomputing is not None else lightest
-    assert expected is not None and plan[:3] == expected[:3], (ladder, room, plan, lightest, recomputing)
+    ladder, room, plan, lightest, recomputing, probes = climb
+    if recomputing is not None:
+        # A tight start asks its own rung, then the remat rungs at its own head and options in order, and
+        # settles the first of them that fits: no head or options rung compiled on the way (row 6740).
+        asked = list(dict.fromkeys(probes))
+        assert all(place[0] is None and not place[3] for place in asked), (asked, recomputing)
+        assert plan == (*recomputing[:3], False) and asked[-1] == plan, (asked, plan, recomputing)
+    else:
+        # Where no remat rung at its own head fits, the whole ladder: no later than the lightest place the
+        # walk (under the step's own options alone) finds fits, a rung of XLA's defaults maybe earlier.
+        places = [place[:3] for place in ladder]
+        assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (
+            ladder, room, plan, probes)
 
 
 def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss(

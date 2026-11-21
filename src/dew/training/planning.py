@@ -1130,7 +1130,8 @@ class FitSearch[LossT, EffectsT]:
         and joining its Newton-Schulz stacks `ns_group` at a time.
         A run that states its remat has its head's rungs alone (docs/design/training.md, every choice can be
         overridden). The rungs at `start`'s remat and head are left out, asked already; the objective is
-        left at `start`."""
+        read from `start` and left there, wherever the search stood before."""
+        self.at(start)
         # The step's own options as its program reads them, the compile's stop past the limit no option of
         # the program's (`limited`): where they are XLA's defaults, a rung under them is the same program.
         own = {name: value for name, value in (self.chosen or {}).items() if name != LIMIT_EXIT} or None
