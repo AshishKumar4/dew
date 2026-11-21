@@ -542,7 +542,7 @@ def _graded(score_params: tuple, kinds: tuple, shares: tuple, shape: tuple, keys
 
 
 def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, widths: bool, split: bool,
-              fused: bool, after: bool, vectors: bool = True) -> tuple:
+              fused: bool, after: bool, vectors: bool) -> tuple:
     """The dK/dV program's refs by role: its nine inputs, its spans' and hook parameters' (`treedef` of
     `leaves`), a fused launch's dQ and the hook's key and tile gradients, each added into in place, a ref a
     group of equal shapes (`_dkv_launched`, `stacked.groups`), its dK and dV outputs, and its scoped
@@ -591,7 +591,7 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
         pl.run_scoped(total, family.staged_memory(value.shape, jnp.float32),
                       **across.summing(value.shape, consumers), collective_axes="wg")
 
-def _dkv_scoped(refs, *, widths: bool, staged: bool, vectors: bool = True) -> tuple:
+def _dkv_scoped(refs, *, widths: bool, staged: bool, vectors: bool) -> tuple:
     """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, dK's output
     stage and dV's (dK's where the head `widths` agree) and its key gradients' stage where the program's
     scope holds them (`staged`: none where its consumers share its keys, `split_queries`, or a scope after
@@ -605,7 +605,7 @@ def _dkv_scoped(refs, *, widths: bool, staged: bool, vectors: bool = True) -> tu
     return keys, values, dk_stage, dv_stage, rows_stage, *refs[count:]
 
 
-def _output_stages(refs, *, widths: bool, vectors: bool = True) -> tuple:
+def _output_stages(refs, *, widths: bool, vectors: bool) -> tuple:
     """dK's output stage, dV's (dK's where the head `widths` agree) and the key gradients' from the first of
     `refs` (`_dkv_allocations`' outputs)."""
     dk_stage = refs[0]
