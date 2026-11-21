@@ -1725,7 +1725,7 @@ CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
 and as the tests' oracle (`recurrence_chunk.PORT_SUPPORTS` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x
 3072 tokens, 16 key and 16 value heads of 128) and the 9B's (4 x 3072, 16
-and 32) shapes against fla's 2.66 and 2.37 (kernel lab `fwd` job,
+and 32) shapes against fla's 2.66 and 2.37 (a GPU `fwd` job,
 9ae3a6bdc).
 
 With canonical metadata the call is exactly the plain call. Its outputs are

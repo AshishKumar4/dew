@@ -200,6 +200,42 @@ def test_the_tools_step_is_the_program_a_runs_first_step_compiles(monkeypatch):
     assert lowered(timed) == lowered(fitted)
 
 
+def test_a_prepare_that_cannot_compile_a_case_ahead_fails_and_a_run_handed_its_directory_refuses_one_missing(
+        tmp_path, monkeypatch):
+    """`--compile-ahead` keeps each case it compiled and fails where this host refused one (`Unlowerable`),
+    so the job's prepare fails; and a run handed a directory of steps compiled ahead refuses a case the
+    directory lacks, never compiling its own on the GPU in its place (row 10796: the prepare exited 0 without
+    the case's step, and the run compiled it)."""
+    from dew.nn.kernels.selection import Unlowerable
+
+    tool = load("benchmark_step")
+    ahead = tmp_path / "ahead"
+    config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['causal_transformer', 'simple_dit'],
+                                  warmup=1, steps=1, dtype='float32', compile_ahead=str(ahead),
+                                  generation="sm90", capacity_gib=80)
+    compiled, refused = tool.build_cases(config)
+
+    class Ahead:
+        def save(self, path):
+            Path(path).write_text("a step")
+
+    def ahead_of(case, *_):
+        if case.architecture == refused.architecture:
+            raise Unlowerable("attention", "flash", "library unavailable")
+        return Ahead()
+
+    monkeypatch.setattr(tool, "ahead_of", ahead_of)
+    with pytest.raises(SystemExit):
+        tool.main(config)
+    assert sorted(path.name for path in ahead.iterdir()) == [tool.ahead_name(compiled)]
+    # A run of the refused case, handed the directory, refuses it before it builds a trainer.
+    monkeypatch.setattr(tool, "build_trainer", lambda *_, **__: pytest.fail("compiled in its place"))
+    run = tool.BenchmarkConfig(preset='cpu-smoke', architectures=[refused.architecture], warmup=1, steps=1,
+                               dtype='float32', ahead=str(ahead))
+    with pytest.raises(SystemExit):
+        tool.measure(*tool.build_cases(run), run)
+
+
 def test_a_steps_count_reads_as_the_bound_it_is():
     """A row's FLOPs and utilization show as the bound their count is (`StepFlops.bound`, `BOUND_MARKS`), as
     the trainer names its train/hfu: at least the value where a launch's work went uncounted (row 3023), at

@@ -531,6 +531,12 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
     np.testing.assert_array_equal(batch["timesteps"], np.broadcast_to(process.times(4)[:2], (6, 2)))
+    # Another rollout of the objective over the same walk that trains another prefix reads its own (the
+    # objective's program held per prefix, row 10821), where it read the first rollout's two transitions.
+    for trained, taken in ((1, 1), (None, 3)):
+        other = FlowRollout(objective, reward, groups=3, steps=4, train_steps=trained)(
+            state, prompts, jax.random.key(23), objective=objective)
+        assert other["timesteps"].shape == other["transition_mask"].shape == (6, taken)
     # A source row a partly read pool share repeats (`VALID_ROWS`) trains none of its samples' transitions,
     # whatever their advantages (row 3346's review).
     from dew.batch import VALID_ROWS

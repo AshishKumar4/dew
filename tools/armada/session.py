@@ -575,7 +575,7 @@ def own(recorded: Mapping[str, float], sites: Container[str]) -> dict[str, float
 def cut_record() -> Path:
     """The record a task's groups are cut by (split.py) and keyed by (ci.py's `members`): the durations record
     (`DURATIONS`), or where the task is a GPU tier's, the seconds its GPUs took (DEW_SPLIT_DURATIONS, a record
-    of the same shape dew-ops' maintier writes: the CPU suite skips a file's GPU tests, so its record times
+    of the same shape the GPU tier writes: the CPU suite skips a file's GPU tests, so its record times
     none of them)."""
     weights = os.environ.get("DEW_SPLIT_DURATIONS")
     return Path(weights) if weights else DURATIONS

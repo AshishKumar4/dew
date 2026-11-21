@@ -75,15 +75,23 @@ import arm_arithmetic
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED, Truth, rounds_nothing, summed_as_run, unrewritten, widened
+from arm_arithmetic import (
+    FORMATTED,
+    Truth,
+    drawn_on_the_host,
+    rounds_nothing,
+    summed_as_run,
+    unrewritten,
+    widened,
+)
 from arm_forms import (
     HELD,
     _arms,
     _arms_with,
     _bounded,
-    _compile_for,
     _declared,
     _given,
+    _holds_program,
     _layers,
     _mode_of,
     _one_draws_program,
@@ -92,6 +100,8 @@ from arm_forms import (
     _varies,
     _window_count,
     _Windowed,
+    _written_references,
+    _written_role,
     _written_twin,
     _ynn_decided,
     as_given as as_given,
@@ -107,25 +117,12 @@ from arm_forms import (
     windows as windows,
     without_ynn as without_ynn,
 )
-from arm_store import (
-    _arm_compile,
-    _arm_program,
-    _compile_arms,
-    _hold,
-    _holds_program,
-    _stored_arm,
-    _stored_arms,
-    _written_references,
-    _written_role,
-    armed,
-    drawn_on_the_host as drawn_on_the_host,
-)
 from check1_judge import SWITCHED as SWITCHED, Verdict, _judged_pooled, _logged, _narrow, _verdicts
 from check1_wire import QUALIFY
-from float64_terms import POWER, evaluated, evaluated_on, float64_terms, lowered, scan_groups, static, traced
+from float64_terms import evaluated_on, float64_terms, lowered, scan_groups
 from map_judge import drawing, host_class, judging, record_units
+from store_wire import COMPILED, judged, reading, running
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
-from truths_ahead import COMPILED, CompiledTruths, arm_role, judged, named, reading, running
 
 from dew._accuracy import distance, reduction_bound, within
 from dew.nn import programs
@@ -635,62 +632,6 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
                            f"depends on more than them")
 
 
-def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
-                  terms, also, orders, plain: bool, library_fn=None) -> None:
-    """`assert_as_exact`'s site prepared into `store` (`truths_ahead.compiled_truths`): every program its
-    truths and terms take (`_ahead`), at each shape the draws of its stages take, compiled for the devices its
-    run computes on, and its truth held to float64 on its first draw's shapes (`_of_float64`); and each of its
-    arms' (`_compile_arms`), at a qualification run's sizing draws too where its verdict is the `plain` pair's
-    (`_qualified`); no truth computed and no arm run. A truth the gate runs as given or replays (a
-    recording) has no program."""
-    terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
-                           library_row=None, library_leaves=(), also=also, terms=terms)
-    truth = truth_fn if truth_fn is not None else reference_fn
-    shaped = {}
-    for seed in range(staged_units(seeds)):
-        inputs = drawn_on_the_host(draw, seed)
-        shaped.setdefault(named("truth", widened(inputs)), inputs)
-
-    # The algebra's switch and the kernels' report read where a site prepares, never at load: a test of the
-    # gate imports no kernel (the test cache keys a row on every module it loads).
-    from dew.algebra import passes
-    from dew.nn.kernels.templates import report
-
-    programs, held = {}, {}
-    with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
-          evaluated_on([])):
-        for index, inputs in enumerate(shaped.values()):
-            wide = widened(inputs)
-            # A truth the gate runs as given has its value alone to read, held to float64 in its run on its
-            # first draw (`_drawn`): the prepare computes none (bible section 8; on its default device, a
-            # compile-only GPU, its eager operations raised "'Executable' object has no attribute
-            # 'local_devices'", row 4881's class).
-            if index == 0 and not _given(truth):
-                _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
-            _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
-        try:
-            store.compile_site(label, programs, held)
-        except report.CompiledOnDevice as refused:
-            # A truth its target's GPU would leave a choice of to run time (a convolution's algorithm,
-            # `report.at_run_time`), which no compile without that GPU holds: its run compiles its truths
-            # on the GPU, their float64 on its FP64 units, as its arms (`_compile_arms`), named
-            # (`truths_ahead.running`); the choice moves a float64 truth by float64's rounding alone
-            # (row 8576).
-            store.compile_site(label, programs, held, at_run=str(refused))
-    # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
-    sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
-    compile = _compile_for(dew_fn, reference_fn)
-    # A library arm (`library_fn`) one of them, run on Dew's own inputs as a further reference is (row 8468).
-    _compile_arms(store, {"dew": (dew_fn, False), "reference": (reference_fn, True),
-                          **({} if library_fn is None else {"library": (library_fn, True)}),
-                          **{f"further {name}": (fn, True) for name, fn in also.items()}},
-                  draw, label, seeds=seeds, orders=orders, sizing=sizing, compile=compile)
-    # Each reference its accuracy claim holds Dew's arm against as written, compiled so (`_written_twin`).
-    twins = {_written_role(name): (fn, True) for name, fn in _written_references(reference_fn, also)}
-    _compile_arms(store, twins, draw, label, seeds=seeds, orders=orders, compile=compile, sizing=sizing,
-                  written=True)
-
-
 def _paired_most(reference_fn, most: int = MOST_SEEDS, *, paired: bool = True) -> int | None:
     """The most seeds a sizing of `reference_fn` takes (`seeds_for`'s, its draws from SIZING_FROM on,
     `parity._sized_count`: twice it paired, four times it of the reference compared with itself): `most`, a
@@ -707,71 +648,6 @@ def _sizing_seeds(reference_fn) -> range:
     where it takes none (`_paired_most`)."""
     most = _paired_most(reference_fn)
     return range(0) if most is None else range(SIZING_FROM, SIZING_FROM + 2 * most)
-
-
-def _ahead(programs: dict, held: dict, label: str, truth, terms_fn, *, terms, wide) -> None:
-    """Into `programs` and `held` (`truths_ahead.CompiledTruths.compile_site`), the programs a site's draw of
-    widened inputs `wide` takes: its truth's (`truth`; a window loop's on one window, its every window's
-    shapes), unless the gate runs it as given or replays it (`_given`); its own terms program's
-    (`_SiteTerms`), or the float64 walk of its truth its rows may be sized by (`terms`, unless False: the walk
-    a site's first draw decides on, `_cancelling_terms`), where the walk is static: one that takes a branch
-    or loop its values pick is read as it runs, so its run walks it on its GPU where it needs it, named
-    (`float64_terms._termed`). Each traced as written, its constants arguments held beside it."""
-    if isinstance(truth, _Windowed):
-        # Its truth window by window; its terms on the whole draw, as its run reads them: a site's own
-        # program, or the walk of its window's function (`terms=True`, `_site`).
-        window = jax.tree.map(lambda leaf: leaf[0], wide)
-        _ahead(programs, held, label, truth.fn, None, terms=False, wide=window)
-        if isinstance(terms_fn, _SiteTerms):
-            _held_program(programs, held, "site terms", terms_fn.fn, wide)
-        elif terms is True and not _given(truth):
-            _held_walk(programs, held, truth.fn, wide)
-        return
-    if not _given(truth):
-        _held_program(programs, held, "truth", truth, wide)
-    if isinstance(terms_fn, _SiteTerms):
-        _held_program(programs, held, "site terms", terms_fn.fn, wide)
-    elif terms is not False and not _given(truth):
-        _held_walk(programs, held, truth, wide)
-
-
-def _held_walk(programs: dict, held: dict, fn, wide) -> None:
-    """`fn`'s float64 terms walk at `wide` (`float64_terms`) as a program of its constants and inputs, flat,
-    its terms alone, beside `fn`'s truth at `wide` (`_held_program`), which its values are: two programs a
-    draw runs in turn, each within a GPU part's memory where the walk's values and terms together were not
-    (a sinks flow's training step: 1.33 GiB and 1.71 GiB against 2.86 GiB, its worker's 2.84). Where the
-    walk is static; held as one its run walks as it runs where its values steer it."""
-    closed, _ = traced(fn, wide)
-    name = named(f"terms {POWER.get()}", wide)
-    if not static(closed.jaxpr):
-        held[name] = {"walked": "its truth takes a branch or loop its values pick, which its terms' walk "
-                                "reads as it runs"}
-        return
-    if named("truth", wide) not in programs:
-        _held_program(programs, held, "truth", fn, wide)
-    count = len(closed.consts)
-
-    def walked(*flat):
-        return evaluated(closed.jaxpr, flat[:count], list(flat[count:]))[1]
-
-    programs[name] = (walked, [*map(jax.typeof, closed.consts), *map(jax.typeof, jax.tree.leaves(wide))])
-    held[name] = {"constants": [*map(np.asarray, closed.consts)]}
-
-
-def _shaped_truth(truth, wide):
-    """`truth` (a traced one, not one the gate runs as given) on widened inputs `wide` as `_of_float64` reads
-    it, its leaves' dtypes and sizes: its shapes alone (a window loop's on one window), no float64
-    computed."""
-    if isinstance(truth, _Windowed):
-        return jax.eval_shape(unrewritten(truth.fn), *jax.tree.map(lambda leaf: leaf[0], wide))
-    return jax.eval_shape(unrewritten(truth), *wide)
-
-
-def _held_program(programs: dict, held: dict, role: str, fn, wide) -> None:
-    """`fn` at `wide` as a program of its constants and inputs, flat (`truths_ahead.CompiledTruths`), traced
-    as written (`float64_terms.traced`)."""
-    closed, tree = traced(fn, wide)
-    _hold(programs, held, named(role, wide), closed, tree, wide, lambda flat: closed)
 
 
 class NarrowTruth(TypeError):
@@ -1091,7 +967,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, followed, dew_fn, inputs)
-        if not at and (running() is None or _given(truth_fn or reference_fn)):  # else held (`_compile_site`)
+        # Else held (`arm_store.compile_site`).
+        if not at and (running() is None or _given(truth_fn or reference_fn)):
             _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
@@ -1371,9 +1248,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     terms = terms if followed is None else _followed_site(label, truth_fn, orders, library_fn, terms,
                                                           conditioning, examples)
     # Its verdict the plain pair's, the one a qualification run sizes (`_qualified`, and the draws a prepare
-    # compiles its arms at, `_compile_site`): no library arm, further reference, terms program of its own or
-    # weighed check beside Dew and its reference; the gate's own terms (`terms=True`) are the plain pair's
-    # still, sizing reading none (spec alignment, 9044).
+    # compiles its arms at, `arm_store.compile_site`): no library arm, further reference, terms program of its
+    # own or weighed check beside Dew and its reference; the gate's own terms (`terms=True`) are the plain
+    # pair's still, sizing reading none (spec alignment, 9044).
     plain = not (library_fn or also or callable(terms) or conditioning)
     refuse_rounded(label, reference_fn, *(also or {}).values(), truth_fn=truth_fn, followed=followed,
                    conditioning=conditioning)
@@ -1382,9 +1259,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
                          "which no program compiled ahead holds")
     if store is not None and store.prepare:
-        with store.preparing(label, armed(label)):
-            _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
-                          terms=terms, also=also, orders=orders, plain=plain, library_fn=library_fn)
+        from arm_store import compile_site
+        compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms,
+                     also=also, orders=orders, plain=plain, library_fn=library_fn)
         return
     with holding(held):
         if os.environ.get(QUALIFY) and not (drawing() or judging()):
@@ -1511,6 +1388,8 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
             truth_fn = _truth_program(truth_fn if truth_fn is not None else reference_fn,
                                       jax.local_devices(backend="cpu")[0])
             if store.holds(label):
+                from arm_store import _stored_arms
+
                 # Its arms the programs its prepare compiled at the sizing draws' shapes too
                 # (`_compile_arms`'s `sizing`), never compiled here.
                 arms = _stored_arms(store, label, dew_fn, reference_fn, {},
@@ -1549,6 +1428,8 @@ def _written_pair(store, label: str, dew_fn, reference_fn, draw, arms):
     `(dew, twin, (dew, reference))`."""
     twin = _written_twin(dew_fn, reference_fn)
     if arms is not None:
+        from arm_store import _stored_arm
+
         return arms[0], _stored_arm(store, label, reference_fn, twin, _written_role(None), written=True), arms
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
     alike = _arms_with(dew_fn, reference_fn, [], label)[:2]
@@ -1594,6 +1475,8 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
         _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                            *also.values())
     else:
+        from arm_store import _stored_arm, _stored_arms
+
         # Each arm's draws run by the programs its prepare compiled (`_compile_arms`), whose trace refused an
         # arm computing in NumPy.
         compiled = _stored_arms(ahead[0], label, dew_fn, reference_fn, also, compiled)
@@ -1905,34 +1788,11 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
             return run(*placed)
 
     def called(*inputs):
-        store = COMPILED.get()
-        if store is None:
+        if COMPILED.get() is None:
             return unprepared(*inputs)
-        role = arm_role("dew", fn, label)
-        if role is None:
-            store.unprepared(f"{label}: its arm has no statement of what it computes")
-            return unprepared(*inputs)
-        # Its placement is its program's too: a host's arm and a device's of one function are two programs.
-        role = f"{role} on the host" if host else role
-        if store.prepare:
-            if armed(label) in store.arms:
-                return store.arm_again(armed(label), named(role, inputs))
-            programs: dict = {}
-            held: dict = {}
-            # A host-placed arm traced, and retraced where its compile lowers it, on the host's CPU.
-            with (store.preparing(armed(label)),
-                  jax.default_device(jax.devices("cpu")[0]) if host else contextlib.nullcontext()):
-                with contextlib.nullcontext() if host else store.tracing():
-                    shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
-                store.compile_site(armed(label), programs, held, compiled=_arm_compile(jax.jit, None),
-                                   arms=True, host=host)
-            name = named(role, inputs)
-            store.arms[armed(label)] = (name, shapes, held[name]["launches"])
-            return store.arm_again(armed(label), name)
-        if not store.holds(armed(label)):
-            store.unprepared(f"{label}: its prepare did not reach this arm")
-            return unprepared(*inputs)
-        return store.ran(armed(label), role, inputs)
+        from arm_store import stored_call
+
+        return stored_call(fn, label, inputs, host=host, unprepared=unprepared)
 
     if not launched:
         return called

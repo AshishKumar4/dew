@@ -469,7 +469,8 @@ _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 *
                              fp32_by_bf16_precise=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
-                             exponentials_per_clock=1.79e12 / (918e12 / 524288))}
+                             exponentials_per_clock=1.79e12 / (918e12 / 524288),
+                             fp32_by_bf16_precise=False)}
 
 
 def architecture(generation: str) -> Architecture | None:

@@ -43,7 +43,7 @@ def _matrix(case: dict[str, str]) -> tuple[formats.NvFp4, np.ndarray]:
     """`case`'s NVFP4 matrix (`low_precision_support.nvfp4`, tensor scale 0.75) and its values in float64."""
     depth, width = int(case["depth"]), int(case["width"])
     # Formed on the host's CPU and held as NumPy's, as a site's draws are
-    # (`reference_error.drawn_on_the_host`): a GPU tier's prepare computes on no other device (its default a
+    # (`arm_arithmetic.drawn_on_the_host`): a GPU tier's prepare computes on no other device (its default a
     # compile-only GPU's, rows 8020-8103).
     with jax.default_device(jax.devices("cpu")[0]):
         return jax.device_get(nvfp4(depth + width, depth, width, scale=0.75))

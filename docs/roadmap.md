@@ -43,6 +43,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
 - Grouped scores' gradient cancellation untested. [10551]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
+- Emission prices every operation Mosaic GPU can approximate (emission.APPROXIMATED: exp, exp2, log, log2, log1p, tanh, logistic, sin, cos, sqrt, rsqrt, pow) as…. [10824]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - Exact on every path, every edge and every derivative order. [2656]
@@ -51,12 +52,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - The interpreter (Pallas Mosaic GPU interpret mode, the CPU suite's) takes about 8 times as long a draw for a tcgen05 (sm100) recurrence launch as for its wgmma…. [6521]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
-- The portable recurrence gradient (tests/test_recurrence_stability.py's scalar-delta site at aligned keys, chunk_on 'xla', as tests/test_gpu_compile_ahead.py's…. [9762]
 
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [9780, 5625]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [9780, 10839, 5625]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -69,7 +69,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- The saved data plan as recorded rules, one last version, and the resume modes. [10569, 10814, 10816]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 
@@ -78,6 +77,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [5292]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353]
 - A device-plan search whose devices hold no plan walks the whole remat/head ladder before refusing. [8541]
+- The saved data plan as recorded rules, one last version, and the resume modes. [10814, 10816]
 - The BFC bound places a step's non-aliased outputs beside its temporaries at XLA's raw sizes (memory.placed_beside: stats.output - stats.alias), where each…. [8792]
 
 ## RL and serving

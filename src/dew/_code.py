@@ -106,6 +106,8 @@ def code_digest(*roots: str) -> str | None:
     holds a dynamic import site not `REVIEWED`, which is logged: its code could import any module. None
     where Dew's source is not the one this process first read (`_current`). Read once a process: a process
     takes its source as it first read it, as its imports do."""
+    if any(root not in _snapshot() and root in _listed() for root in roots):
+        return _declined(roots)
     try:
         modules, sites = _kept_closure(roots)
     except _Changed:
@@ -200,7 +202,9 @@ def _listed() -> dict[str, tuple[str, str]]:
         for path in sorted((SOURCE / package).rglob("*.py")):
             relative = path.relative_to(SOURCE)
             name = ".".join(relative.with_suffix("").parts).removesuffix(".__init__")
-            if (contents := _hashed(path)) is not None:
+            # A package's `__init__` is what its name imports where a module file of that name is beside it.
+            shadowed = name in files and files[name][0].endswith("/__init__.py")
+            if (contents := _hashed(path)) is not None and not shadowed:
                 files[name] = (relative.as_posix(), contents)
     return files
 

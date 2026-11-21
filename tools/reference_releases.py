@@ -16,15 +16,22 @@ from importlib.metadata import version
 from pathlib import Path
 
 
+def pinned(requirements: list[str], name: str) -> str | None:
+    """The release `requirements` pin `name` at: its first `name==release` requirement, an extra in brackets
+    or an environment marker beside it; None where none pins it."""
+    for requirement in requirements:
+        if found := re.match(rf"{re.escape(name)}(?:\[[^]]*\])?==([^;\s]+)", requirement):
+            return found[1]
+    return None
+
+
 def tested(distribution: str) -> str:
     """The release of `distribution` the reference suite pins in pyproject.toml's test extra, which
     the locks and CI install: the release most fixtures are recorded against."""
     extras = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
-    for requirement in extras["project"]["optional-dependencies"]["test"]:
-        pinned = re.fullmatch(rf"{re.escape(distribution)}==([^;\s]+)", requirement)
-        if pinned:
-            return pinned[1]
-    raise LookupError(f"pyproject.toml's test extra pins no {distribution} release")
+    if (release := pinned(extras["project"]["optional-dependencies"]["test"], distribution)) is None:
+        raise LookupError(f"pyproject.toml's test extra pins no {distribution} release")
+    return release
 
 
 MODELOPT = {"nvidia-modelopt": "0.47.0"}
@@ -41,7 +48,7 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     # GPT-OSS's exchange gradients, recorded on torch's CPU build (gpt_oss_reference.write_exchange_cases).
     "gpt-oss-exchange": {"transformers": "5.16.1", "torch": "2.14.0"},
     # fla's kernels and Qwen3.5's fla path, in their own environment (joint_checkpoint_reference.on_fla): the
-    # fleet's DEW_FLA_PYTHON (dew-ops' session.FLA, torch 2.14.1 past fla #640's Hopper miscompile), whose
+    # fleet's DEW_FLA_PYTHON (torch 2.14.1, past fla #640's Hopper miscompile), whose
     # 2.8.0 pin no node could record against (M-JS-92's refusal, 11-12).
     "fla": {"torch": "2.14.1", "transformers": "5.22.2", "fla-core": "0.5.2"},
     "diffusers": {"diffusers": tested("diffusers")},

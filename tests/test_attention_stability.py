@@ -967,12 +967,21 @@ def _resumed_attention(query, key, value, state, keep, *, anchored: bool, round_
     if round_logits is not None:
         logits = logits + jax.lax.stop_gradient(logits.astype(round_logits).astype(logits.dtype) - logits)
     logits = jnp.where(keep, logits, -jnp.inf)
-    joined = jnp.concatenate([(m + jnp.log(total))[..., None], logits], axis=-1)
-    weights = (anchored_softmax if anchored else functools.partial(jax.nn.softmax, axis=-1))(joined)
-    mean = acc / total[..., None]
-    weighted = jnp.einsum("bhqk,bkhd->bhqd", weights[..., 1:].astype(value.dtype), value,
-                          preferred_element_type=wide)
-    out = mean * weights[..., :1] + weighted
+    if anchored:
+        joined = jnp.concatenate([(m + jnp.log(total))[..., None], logits], axis=-1)
+        weights = anchored_softmax(joined)
+        mean = acc / total[..., None]
+        weighted = jnp.einsum("bhqk,bkhd->bhqd", weights[..., 1:].astype(value.dtype), value,
+                              preferred_element_type=wide)
+        out = mean * weights[..., :1] + weighted
+    else:
+        top = jnp.maximum(m, jnp.max(logits, axis=-1))
+        prior = total * jnp.exp(m - top)
+        exp_logits = jnp.exp(logits - top[..., None])
+        denom = prior + jnp.sum(exp_logits, axis=-1)
+        weighted = jnp.einsum("bhqk,bkhd->bhqd", (exp_logits / denom[..., None]).astype(value.dtype), value,
+                              preferred_element_type=wide)
+        out = (acc / total[..., None]) * (prior / denom)[..., None] + weighted
     return jnp.swapaxes(out, 1, 2)
 
 

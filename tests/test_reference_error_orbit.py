@@ -185,6 +185,16 @@ def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
             assert bool(over) == fails, (width, worst)
 
 
+def _element(shares: np.ndarray) -> np.ndarray:
+    """`shares` `[seed, leaf, arm]` as the draws hold an element's share alone (`_Draws.shares`' `[seed, leaf,
+    kind, arm]`, its share along its truth row unknown)."""
+    from dew.parity import ELEMENT, SHARE_KINDS
+
+    held = np.full((*shares.shape[:2], len(SHARE_KINDS), shares.shape[2]), np.nan)
+    held[:, :, ELEMENT] = shares
+    return held
+
+
 def test_a_worst_row_one_element_rules_takes_one_values_factor():
     """A wide leaf whose worst rows, Dew's and the reference's, each have one element carrying past
     RULED_SHARE of the row's squared error is judged at a row of one value's factor (row 3684), at three and
@@ -205,14 +215,15 @@ def test_a_worst_row_one_element_rules_takes_one_values_factor():
             shares = np.tile([[[mine, theirs]]], (8, 1, 1))
             draws = _Draws(["leaf"], np.zeros((8, 1)), np.zeros((8, 1)),
                            np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
-                           np.ones((8, 1), bool), (width,), shares=shares)
+                           np.ones((8, 1), bool), (width,), shares=_element(shares))
             over, _ = _judgement(draws, "leaf")
             assert bool(over) == fails, (width, shares)
         # Joined from a chunk whose shares are all unknown (a map task's draws, a stage's), the factor is the
         # whole run's: the known chunk holds both maxima.
         ruled_chunk = _Draws(["leaf"], np.zeros((4, 1)), np.zeros((4, 1)),
                              np.tile([[[np.log(worst), 0.0]]], (4, 1, 1)), [[NO_ZERO_ROWS]] * 4,
-                             np.ones((4, 1), bool), (width,), shares=np.tile([[[ruled, ruled]]], (4, 1, 1)))
+                             np.ones((4, 1), bool), (width,),
+                             shares=_element(np.tile([[[ruled, ruled]]], (4, 1, 1))))
         unknown = _Draws(["leaf"], np.zeros((4, 1)), np.zeros((4, 1)), np.full((4, 1, 2), -1.0),
                          [[NO_ZERO_ROWS]] * 4, np.ones((4, 1), bool), (width,))
         for joined in (unknown.joined(ruled_chunk), ruled_chunk.joined(unknown)):
@@ -223,7 +234,7 @@ def test_a_worst_row_one_element_rules_takes_one_values_factor():
         draws = _Draws(["leaf"], np.zeros((8, 1)), np.zeros((8, 1)),
                        np.zeros((8, 1, 2)), [[NO_ZERO_ROWS]] * 8,
                        np.ones((8, 1), bool), (width,), example_rows=tenfold,
-                       shares=np.tile([[[ruled, ruled]]], (8, 1, 1)))
+                       shares=_element(np.tile([[[ruled, ruled]]], (8, 1, 1))))
         assert _judgement(draws, "leaf")[0], width
 
 
@@ -240,7 +251,8 @@ def test_a_worst_row_one_element_of_dews_rules_defers_to_a_conditioned_sites_wei
     def judged(worst: float, mine: float, width: int, *, deferring: bool):
         draws = _Draws(["leaf"], np.zeros((8, 1)), np.zeros((8, 1)),
                        np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
-                       np.ones((8, 1), bool), (width,), shares=np.tile([[[mine, spread]]], (8, 1, 1)))
+                       np.ones((8, 1), bool), (width,),
+                       shares=_element(np.tile([[[mine, spread]]], (8, 1, 1))))
         return _judgement(draws, "leaf", deferring=deferring)
 
     for width in (3, 16):

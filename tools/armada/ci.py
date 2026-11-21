@@ -1718,20 +1718,31 @@ def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
             for parent in path.parents if parent == digests.FIXTURES or digests.FIXTURES in parent.parents}
 
 
-def wrote_inputs(depends: list[str], changed: Collection[str]) -> bool:
-    """Whether a run's inputs `depends` (followed.py's records) hold a file `changed` (`watched.changed`:
-    written, removed or made) names: a file read, probed or run as a module, or the entries an import's lookup
-    finds of its name (`followed.LOOKUP`, `digests.looked_up`). A directory's listing is weighed by none: a
-    file made in it is new to every checkout a plan reads, so no plan finds the key it leaves."""
+def wrote_inputs(depends: list[str], changed: Collection[str]) -> list[str]:
+    """The inputs among a run's `depends` (followed.py's records, as `inputs` expands them for its key) that a
+    file `changed` (`watched.changed`: written, removed or made) names: a file read, probed or run as a
+    module, or the entries an import's lookup finds of its name (`followed.LOOKUP`, `digests.looked_up`). A
+    directory's listing is weighed by none: a file made in it is new to every checkout a plan reads, so no
+    plan finds the key it leaves."""
+    written = []
     for item in depends:
         if item.startswith(followed.LOOKUP):
             looked = item[len(followed.LOOKUP):]
-            if any(path == looked or path.startswith((f"{looked}.", f"{looked}/__init__"))
-                   for path in changed):
-                return True
-        elif item.removeprefix(followed.PROBED).partition(followed.CODE)[0] in changed:
-            return True
-    return False
+            if any(looked_entry(path, looked) for path in changed):
+                written.append(looked)
+        elif (path := item.removeprefix(followed.PROBED).partition(followed.CODE)[0]) in changed:
+            written.append(path)
+    return written
+
+
+def looked_entry(path: str, looked: str) -> bool:
+    """Whether `path` is an entry the import lookup of `looked` lists (`digests.looked_up`): its name, a
+    module or package of any suffix beside it, or a package's own __init__ of any suffix; no file of another
+    name (review: `held/__init__report.json` is none of `held`'s)."""
+    parent, _, entry = path.rpartition("/")
+    directory, _, name = looked.rpartition("/")
+    return ((parent == directory and (entry == name or entry.startswith(f"{name}.")))
+            or (parent == looked and entry.partition(".")[0] == "__init__"))
 
 
 def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[str] | None:
@@ -1806,13 +1817,25 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
         file = grading.owning(name)
         ran = executed.get(file, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
+        why: list[str] = [*(ran.get("why") or ())]  # Each reason the row keeps no key, as its record says.
         site = session.SITE.fullmatch(parsed_row(row_["name"])[2])  # a check-1 judge reads not as its site
         read = (None if ran["depends"] is None or (site is not None and site["start"] is None) else
                 sorted({*ran["depends"], *(opened or ())}))
         if ran["depends"] is not None:
-            inputs = None if opened is None else sorted({*ran["depends"], *opened})
-            ran = {**ran, "depends": None if inputs is None or wrote_inputs(inputs, changed) else inputs}
-        ran = {**ran, "depends": site_inputs(python, row_["name"], ran["depends"])}
+            inputs_ = None if opened is None else sorted({*ran["depends"], *opened})
+            # Its writes weighed against what it read and ran, then against the import lookups its key covers
+            # besides (`inputs`), each as the key reads it (a lookup by its entries' names; row 10800).
+            wrote = [] if inputs_ is None else sorted({*wrote_inputs(inputs_, changed), *wrote_inputs(
+                [item for item in inputs(file, inputs_) if item.startswith(followed.LOOKUP)], changed)})
+            why += (["its task's watch of the checkout was blind"] if inputs_ is None
+                    else [f"its task wrote its input {path}" for path in wrote[:6]])
+            ran = {**ran, "depends": None if inputs_ is None or wrote else inputs_}
+        judged = site_inputs(python, row_["name"], ran["depends"])
+        if ran["depends"] is not None and judged is None:
+            why.append("its check-1 site's judge ran over map tasks not drawn whole")
+        ran = {**ran, "depends": judged}
+        if ran["depends"] is not None and file in unkeyed:
+            why.append("the durations record names its file's groups not wholly (unkeyed)")
         if row_["exitCode"] == 0 and file not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
@@ -1833,7 +1856,8 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             current = None
         elif current is None:
             current = begun(python, row_["name"], held, common, token, fresh_only=True)
-        body = json.dumps({"key": key, "why": ran.get("why"),
+        stated = (why or None) if key is None and row_["exitCode"] == 0 else None
+        body = json.dumps({"key": key, "why": stated,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            **({"read": read} if ran["depends"] is None and read is not None else {}),
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
@@ -2125,8 +2149,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     # a 5.84 GiB pool, which ran out).
     [total] = ((int(whole) - int(kept)) * 2 ** 20 for whole, kept in
                (answer.split(",") for answer in gpu_query("memory.total,memory.reserved")))
-    # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, dew-ops'
-    # session `settings`): its processes may take what one process takes by JAX's own default (row 2570).
+    # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, its
+    # session's settings): its processes may take what one process takes by JAX's own default (row 2570).
     budget = float(os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", WHOLE_GPU)) * total
     held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
