@@ -589,13 +589,15 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
 
 class GemmCase(NamedTuple):
     """A GEMM launch's compile case (`_gemm_mainloop_cases`): its form (`_gemm_forms`' name), its tile, the
-    consumer count of a family contract's case (`every_consumer_count`, else None) and the kernel case
-    compiled."""
+    consumer count of a family contract's case (`every_consumer_count`, else None), the kernel case
+    compiled, and a contract case's cases at each next legal tile of its form at its count, in its search's
+    order (`alternates`, a witness's where its tile spills: `_witnessed`)."""
 
     form: str
     tile: Any
     consumers: int | None
     case: support.KernelCase
+    alternates: tuple = ()
 
     @property
     def kernel(self) -> tuple:
@@ -624,6 +626,7 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                 continue
             config = launch.derived(ba, target)
             configs = {(f"{name} {config}", None): config}
+            searched: dict[int, list] = {}
             if every_consumer_count:
                 family = pricing.family_of(config, jnp.bfloat16)
                 configs = {}
@@ -644,11 +647,11 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                         cluster=config.cluster if consumers > 1 else 1)
                               for rows_ in shares for depth in depths for programs in residencies
                               for stages in range(config.stages, 1, -1))
-                    tile = next((tile for tile in staged
-                                 if isinstance(tile, tiling.Tiles) and launch.legal(ba, tile, target)),
-                                None)
-                    if tile is not None:
-                        configs[(f"{name} x{consumers} {tile}", consumers)] = tile
+                    legal = [tile for tile in staged
+                             if isinstance(tile, tiling.Tiles) and launch.legal(ba, tile, target)]
+                    if legal:
+                        configs[(f"{name} x{consumers} {legal[0]}", consumers)] = legal[0]
+                        searched[consumers] = legal[1:]
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for (label, consumers), config in configs.items():
                 if settled:
@@ -658,12 +661,19 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                               lambda launch=launch, ba=ba: launch.lowering(ba, None),
                                               required=launch.legal(ba, config, target))
                 else:
-                    case = support.KernelCase(label, lambda launch=launch, ba=ba, config=config:
-                                              launch.lowering(ba, config),
-                                              {kernel: _model(launch, ba, config)},
-                                              required=launch.legal(ba, config, target))
-                cases.append(GemmCase(name, config, consumers, case))
+                    case = _pinned_case(label, launch, ba, config, kernel, target)
+                alternates = tuple(
+                    _pinned_case(f"{name} x{consumers} {tile}", launch, ba, tile, kernel, target)
+                    for tile in searched.get(consumers, ()))
+                cases.append(GemmCase(name, config, consumers, case, alternates))
     return cases
+
+
+def _pinned_case(label: str, launch, ba, config, kernel: str, target) -> support.KernelCase:
+    """`launch`'s call `ba` compiled at `config` (`KernelOp.lowering`), its `kernel`'s model the template's at
+    that tile, required where the tile is legal on `target`."""
+    return support.KernelCase(label, lambda: launch.lowering(ba, config),
+                              {kernel: _model(launch, ba, config)}, required=launch.legal(ba, config, target))
 
 
 def _replaced(config, **changes):
@@ -757,26 +767,53 @@ def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> lis
             for param in generations(*names) for name in param.values for form in sorted(forms_of(name))]
 
 
+def _witnessed(generation_name: str, witness: GemmCase) -> list[dict]:
+    """The records of a family contract witness's compiles (`compile_mosaic_kernels`): at its tile, and while
+    that tile's kernels spill, at each next legal tile of its form at its consumer count
+    (`GemmCase.alternates`), until one spills nothing. A run's certification refuses a tile whose kernels
+    spill and takes the next (the owner's 11-14 ruling: no register model is held to ptxas), so the
+    contract holds a form at a count where one of its legal tiles there lowers spilling nothing."""
+    from kernel_compile import compile_mosaic_kernels
+
+    records = compile_mosaic_kernels([witness.case], generation_name)
+    for alternate in witness.alternates:
+        if not any(kernel.get("spilled") for kernel in records[-1].get("kernels", ())):
+            break
+        records += compile_mosaic_kernels([alternate], generation_name)
+    return records
+
+
+def _unspilled(record: dict) -> dict:
+    """`record` with its kernels' spills read as none: what else of it fails (`mosaic_failures`)."""
+    return {**record, "kernels": [{**kernel, "spilled": 0} for kernel in record.get("kernels", ())]}
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "form"), _by_form(gate_generations(stated=True), _gate_forms))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, form):
     """Every distinct GEMM Mosaic GPU kernel of a form a generation runs at a real projection (`_gate_cases`),
-    a test each form, at the tile its launch derives from the generation's facts, compiled by Mosaic for a
-    compile-only device of the generation on
-    this CPU through ptxas, with the JAX this checkout pins. Required launches must spill nothing; compiler
-    errors and missing reports fail any. Beside them, each launch of the
-    form's family contract (`_family_cases`: each consumer count) the gate does not hold lowers, within the
-    block, spilling nothing, before any consumer adopts a Family head; no version guard skips it."""
+    a test each form, at the tile its launch settles on as a call (its certification refusing a derived tile
+    whose kernels spill, its derivation taking the next), compiled by Mosaic for a compile-only device of the
+    generation on this CPU through ptxas, with the JAX this checkout pins. Required launches must spill
+    nothing; compiler errors and missing reports fail any. Beside them, each launch form of the form's family
+    contract (`_family_cases`: each consumer count) lowers within the block at a legal tile spilling nothing
+    (`_witnessed`), before any consumer adopts a Family head; no version guard skips it."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     cases = [each.case for each in _gate_cases(generation_name, form)]
-    contract = ([each.case for each in _family_cases(generation_name, form)]
-                if form in _family_forms(generation_name) else [])
+    contract = _family_cases(generation_name, form) if form in _family_forms(generation_name) else []
     assert cases
-    found = compile_mosaic_kernels(cases + contract, generation_name)
-    failed = failures(found) + mosaic_failures(found[len(cases):])
-    required = [record for case, record in zip(cases, found[:len(cases)], strict=True) if case.required]
+    # The contract's witnesses first, each its own kernels' first compile in the process, whose reports the
+    # gate reads (Mosaic compiles a module once a process); the gate's launches then certify as they trace.
+    witnessed = [_witnessed(generation_name, witness) for witness in contract]
+    found = compile_mosaic_kernels(cases, generation_name)
+    attempts = [record for records in witnessed for record in records]
+    failed = failures(found + attempts) + mosaic_failures([records[-1] for records in witnessed])
+    # A witness's tile that spills is passed over; its other faults are the contract's still.
+    failed += mosaic_failures([_unspilled(record) for records in witnessed for record in records[:-1]])
+    required = [record for case, record in zip(cases, found, strict=True) if case.required]
     failed += mosaic_failures(required)
+    found = found + attempts
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
