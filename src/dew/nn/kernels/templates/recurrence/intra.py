@@ -385,10 +385,12 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
 def _prefix_halves(g, taken, call: Call):
     """`(hi, lo) [R, HV * Dk]` fp32: the laid decay `g`'s prefix halves within each chunk (`algebra.prefix`'s
     pair, `call.gates`), a program a chunk, value head and key block (`_prefix_keys`), each its block's one
-    load, scan (`_running_prefix`) and store: fla_kda's chunk_local_cumsum, a launch the sub-chunk walk and
-    every later launch read (`_sub_chunk_walk`)."""
+    load, scan and store: a running compensated sum down each column where the block fills the warpgroup's
+    threads (`_running_prefix`), else the doubling scan (`_intra_prefix`). fla_kda's chunk_local_cumsum, a
+    launch the sub-chunk walk and every later launch read (`_sub_chunk_walk`)."""
     chunk, width, gates, family = call.chunk, call.width, call.gates, call.family
     keys = _prefix_keys(width)
+    running = keys == scan.THREADS
 
     def program(at, g_ref, taken_ref, hi_ref, lo_ref, *, streams, staging, landing):
         del taken_ref
@@ -400,90 +402,75 @@ def _prefix_halves(g, taken, call: Call):
         def step(index, slots, carry, accumulators):
             del index
             slots.acquire_all()
-            prefix = _running_prefix(call, rows, stream_tile(slots, "decays", gates).value(), keys)
+            decays = stream_tile(slots, "decays", gates).value()
+            if running:
+                prefix = _running_prefix(call, rows, decays, keys)
+            else:
+                _scan_zeroed(call, rows, keys)
+                prefix = _intra_prefix(call, rows, decays, keys)
+            # The running sum's halves through one landing in turn (each store waited), the doubling's their
+            # own.
             for i, (half, ref) in enumerate(zip(prefix, (hi_ref, lo_ref), strict=True)):
-                gates.store(ref, half, row, chunk, column, keys, family=family, smem=landing[f"prefix{i}"])
+                gates.store(ref, half, row, chunk, column, keys, family=family,
+                            smem=landing["prefix0" if running else f"prefix{i}"])
             return carry, accumulators
 
         return mosaic.Walk(views, step)
 
     blocks = stream_blocks(decays=((chunk, keys), gates))
-    landing = {f"prefix{i}": gates.landing(chunk, keys) for i in (0, 1)}
-    # Its decays and their terms, two of each: the running sums' slabs are a word a thread.
+    landing = {f"prefix{i}": gates.landing(chunk, keys) for i in ((0,) if running else (0, 1))}
+    # The running sum's tiles: its decays, then a sub-chunk's rows of them and their terms; the doubling's
+    # five.
+    held = (Held(phases=([f32(chunk, keys)], [f32(algebra.SUB, keys)] * 3)) if running
+            else Held(phases=([f32(chunk, keys)] * 5,)))
     return launch_kernel(program, call, out_type=(gates.shape(call.heads * width),) * 2,
                          grid=(call.chunks, call.heads, width // keys),
                          grid_names=("chunks", "heads", "blocks"), blocks=blocks, stages=1,
-                         live=chunk_liveness(1), steps=1, model=chunk * keys,
-                         held=Held(phases=([f32(chunk, keys)] * 3,)),
-                         staging=(swizzling.plain((2, _padded(chunk, keys) + chunk, keys), jnp.float32),),
+                         live=chunk_liveness(1), steps=1, model=chunk * keys, held=held,
+                         staging=(swizzling.plain((2, chunk if running else 2 * chunk, keys), jnp.float32),),
                          landing=landing)(g, taken)
 
 
 def _prefix_keys(width: int) -> int:
-    """`_prefix_halves`' key block: two sub-chunks' worth, or the width where narrower, so a block's rows
-    divide the warpgroup's threads into column runs (`_running_prefix`)."""
-    return math.gcd(width, 2 * algebra.SUB)
-
-
-def _padded(chunk: int, keys: int) -> int:
-    """The zero rows `_running_prefix` stages before a chunk's: one fewer of its runs' rows than it has runs,
-    which its carries read where a run has fewer runs before it."""
-    runs = scan.THREADS // keys
-    return (runs - 1) * (chunk // runs)
+    """`_prefix_halves`' key block: the warpgroup's threads' worth where the width takes it, a column a thread
+    (`_running_prefix`), else two sub-chunks' worth or the width where narrower (the doubling scan's)."""
+    return scan.THREADS if width % scan.THREADS == 0 else math.gcd(width, 2 * algebra.SUB)
 
 
 def _running_prefix(call: Call, rows, decays: jax.Array, keys: int) -> tuple:
-    """A key block's prefix halves of its `decays` `[C, keys]` as running compensated sums down its columns:
-    the warpgroup's threads `THREADS // keys` runs of `C // runs` rows a column, each thread one run of one
-    column (a slab of every run's row at once, `plgpu.Layout.WG_STRIDED`): each token's term
-    (`algebra.prefix_terms`) staged in `rows` `(2, pad + C, keys)` after zero rows (`_padded`), each run
-    summed down its rows (`compensated_add`), then each run's carry, the earlier runs' last sums, added
-    over its rows; the halves returned in the accumulator's layout. The doubling scan staged each of its
-    six steps' pairs through shared memory, 119 thread instructions an element, 160 us of an emulated
+    """A key block's prefix halves of its `decays` `[C, keys]` (`keys` the warpgroup's threads) as a running
+    compensated sum down each column, a column a thread (`scan.striped`): the decays staged in `rows`
+    `(2, C, keys)`, each token's term (`algebra.prefix_terms`) formed a sub-chunk's rows at a time in a
+    row-major layout over them (`_rows_of`), then each row's pair added to the running one (`compensated_add`)
+    and stored over its terms, the halves returned in the accumulator's layout. The doubling scan staged each
+    of its six steps' pairs through shared memory, 119 thread instructions an element, 160 us of an emulated
     GH200's Kimi Linear forward against fla's cumsum's 40 measured, its stores each a bank conflict
-    (M-JS-145c); a position here takes at most a run's rows plus its runs' adds, 19 at 32 keys, within the
-    prefix's bound (the witness's `EXPONENT_BOUND`, 63). The terms staged, and the threads met, before they
-    are summed: a product held in registers into a sum was contracted into an FMA, its rounding counted
-    twice (`algebra.scanned_prefix`, M-MC-9)."""
-    chunk, runs = call.chunk, scan.THREADS // keys
-    length, pad = chunk // runs, _padded(chunk, keys)
-    layout = plgpu.Layout.WG_STRIDED((runs, keys), vec_size=1)
+    (M-JS-145c); a position here takes 63 compensated adds where the doubling took 12, within the prefix's
+    bound either way (the witness's `EXPONENT_BOUND`). The terms staged, and the threads met, before they are
+    summed: a product held in registers into a sum was contracted into an FMA, its rounding counted twice
+    (`algebra.scanned_prefix`, M-MC-9)."""
+    chunk, sub = call.chunk, algebra.SUB
     mosaic.synced(call.interpret)
-    for half, term in enumerate(algebra.prefix_terms(decays)):
-        plgpu.store(rows.at[half, pl.ds(pad, chunk)], term, optimized=False)
-        if pad:
-            plgpu.store(rows.at[half, pl.ds(0, pad)],
-                        plgpu.layout_cast(jnp.zeros((pad, keys), jnp.float32),
-                                          plgpu.Layout.WG_STRIDED((pad, keys), vec_size=1)), optimized=False)
+    plgpu.store(rows.at[0], decays, optimized=False)
     mosaic.synced(call.interpret)
+    for start in range(0, chunk, sub):
+        # Each thread its own elements of a sub-chunk's rows: read, formed and written back in one layout.
+        for half, term in enumerate(algebra.prefix_terms(_rows_of(rows.at[0, pl.ds(start, sub)], keys))):
+            plgpu.store(rows.at[half, pl.ds(start, sub)], term, optimized=False)
+    mosaic.synced(call.interpret)
+    layout = scan.striped(keys)
 
-    def slab(first: int) -> tuple:
-        """Every run's row `first` rows past its first, both halves (`first` may reach into the zero rows)."""
-        return tuple(rows.at[half, pl.ds(pad + first, runs, stride=length)] for half in (0, 1))
+    def added(t, running):
+        found = compensated_add(running, tuple(plgpu.load(rows.at[half, t], layout=layout, optimized=False)
+                                               for half in (0, 1)))
+        for half, value in enumerate(found):
+            plgpu.store(rows.at[half, t], value, optimized=False)
+        return found
 
-    def loaded(refs) -> tuple:
-        return tuple(plgpu.load(ref, layout=layout, optimized=False) for ref in refs)
-
-    def stored(refs, pair) -> None:
-        for ref, value in zip(refs, pair, strict=True):
-            plgpu.store(ref, value, optimized=False)
-
-    # Unrolled: a slab's rows strided at a static start (Mosaic GPU slices no stride from a traced one).
-    zero = plgpu.layout_cast(jnp.zeros((runs, keys), jnp.float32), layout)
-    running = (zero, zero)
-    for t in range(length):
-        running = compensated_add(running, loaded(slab(t)))
-        stored(slab(t), running)
+    zero = plgpu.layout_cast(jnp.zeros((keys,), jnp.float32), layout)
+    jax.lax.fori_loop(0, chunk, added, (zero, zero))
     mosaic.synced(call.interpret)
-    # Each run's carry: the runs before it, each's last row, the zero rows where there are fewer.
-    carry = (zero, zero)
-    for back in range(1, runs):
-        carry = compensated_add(carry, loaded(slab(length - 1 - back * length)))
-    mosaic.synced(call.interpret)
-    for t in range(length if runs > 1 else 0):
-        stored(slab(t), compensated_add(loaded(slab(t)), carry))
-    mosaic.synced(call.interpret)
-    return tuple(call.family.tile_of(rows.at[half, pl.ds(pad, chunk)]) for half in (0, 1))
+    return tuple(call.family.tile_of(rows.at[half]) for half in (0, 1))
 
 
 def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: tuple[str, ...]):
