@@ -1863,8 +1863,8 @@ def test_sm90_fed_fused_backward_deepens_to_3_stages_and_compiles_spill_free():
 
 @COMPILES_ON_CPU
 def test_sm80_d128_backward_deepens_to_3_stages_without_losing_residency():
-    """Row 5272: sm80 mma.sync d128 backward (`32x32` two-launch, qwen3-8b) deepens its cp.async ring to
-    3 stages while preserving `resident >= 2` and compiles spill-free."""
+    """Row 5272: sm80 mma.sync d128 fused backward (`64x64`, qwen3-8b) deepens its cp.async ring to
+    3 stages without losing SM residency and compiles spill-free."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1879,8 +1879,8 @@ def test_sm80_d128_backward_deepens_to_3_stages_without_losing_residency():
                                                    accurate=False)
         ba = op.bind(*args, interpret=False)
         cfg = op.derived(ba, target)
-        assert cfg is not None and cfg.stages >= 3 and op.resident(ba, cfg, target) >= 2, cfg
-
+        assert cfg is not None and cfg.stages >= 3, cfg
+        assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
         def _make():
             def backward(query, key, value, dout, residuals):
                 grads = attention_mosaic.backward(query, key, value, spans, None, dout,
