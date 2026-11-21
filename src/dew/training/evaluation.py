@@ -75,7 +75,6 @@ class EpisodeScore:
     or a summary reads it as a data split's (`Best("flight/return")`): its `name` and how it shows
     (`shown`, which way is better). A pass holds one artifact, the episodes' `Flown` scores, which it
     reads its own entry of."""
-    fields = ()
 
     name: str
     shown: Shown
@@ -685,7 +684,7 @@ def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> N
 def _named_fields(metrics: Sequence[Metric]) -> list[tuple[str, str]]:
     """Each batch field a metric of `metrics` reads beside its artifact (`Metric`'s `fields`), by the
     metric's name."""
-    return [(metric.name, field) for metric in metrics for field in metric.fields]
+    return [(metric.name, field) for metric in metrics for field in getattr(metric, "fields", ())]
 
 
 def _metrics_read(metrics: Sequence[Metric], batch: Batch, split: str) -> None:

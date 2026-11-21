@@ -2119,17 +2119,13 @@ class Metric(Protocol[S]):
     belongs to the one pass, so `merge` may update its buffers in place. A
     metric must never run process collectives or keep state between passes.
     It may have a `shown` attribute, a `Shown` for how the training display
-    shows it.
+    shows it, and a `fields` attribute, the batch fields it reads beside its
+    artifact (`dew.eval.common.Mean.fields`, FID's reference images), which
+    every split it scores holds from its first batch (row 10561).
     """
 
     @property
     def name(self) -> str: ...
-
-    @property
-    def fields(self) -> tuple[str, ...]:
-        """The batch fields it reads beside its artifact (`dew.eval.common.Mean.fields`, FID's reference
-        images), which every split it scores holds from its first batch (row 10561); none for most."""
-        ...
 
     @property
     def reads(self) -> type:

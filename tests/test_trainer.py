@@ -2352,7 +2352,6 @@ def test_a_batch_of_other_dtypes_at_the_same_shapes_runs_a_step_compiled_for_the
 
 def test_a_failing_metric_fails_the_validation_pass():
     class Broken:
-        fields = ()
         name = "broken"
         reads = Representations
 

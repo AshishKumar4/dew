@@ -574,7 +574,6 @@ class PeakToPeak:
     under test is the metric plumbing (artifacts in, score out, logged),
     which is identical whatever the score means.
     """
-    fields = ()
     name = "sample_range"
     reads = Representations
 

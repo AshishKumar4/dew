@@ -60,7 +60,6 @@ def main() -> None:
     reward, callback_rewards, callback_captions = reward_service()
 
     class PixelMean:
-        fields = ()
         name = "pixel_mean"
         reads = ImageGrid
 

@@ -94,7 +94,6 @@ class Spread:
     Recording the shapes here and asserting afterwards makes an evaluation
     that never ran a failure.
     """
-    fields = ()
 
     def __init__(self, seen, reads):
         self.seen = seen

@@ -45,7 +45,6 @@ class Overfit(Objective):
 
 @dataclasses.dataclass
 class Value:
-    fields = ()
     name: str
     shown: Shown
     reads = TokenScores
@@ -64,7 +63,6 @@ class Value:
 class Scripted:
     """A lower-is-better metric that scores each evaluation it finalizes `scores`' next value, whatever
     it reads: a warming pass, which finalizes nothing, takes none."""
-    fields = ()
     name: str
     scores: Iterator[float]
     shown: Shown = dataclasses.field(default_factory=lambda: Shown(better='lower'))

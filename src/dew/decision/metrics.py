@@ -69,7 +69,6 @@ class MacroF1:
     or are answered as (sklearn's `f1_score(average="macro")`): a class is a question's option
     (`Decisions.classes`), the same in every batch and split that asks it, so each class's true and
     false positives and false negatives add over the whole pass before its F1 is taken."""
-    fields = ()
 
     name = "macro_f1"
     reads = Decisions
@@ -112,7 +111,6 @@ class MacroF1:
 class ScoredQuestions:
     """How many questions with a known answer the split scored, the count every other metric of it
     is taken over."""
-    fields = ()
 
     name = "scored_questions"
     reads = Decisions
@@ -137,7 +135,6 @@ class ECE:
     It is taken over `bins` equal bins on (0, 1], closed on the right, and
     weighted by how many rows each bin holds (Laya's `ece_score`, 15 bins).
     """
-    fields = ()
 
     bins: int = 15
     name = "ece"
@@ -174,7 +171,6 @@ class AURC:
     a whole in any row order (Laya's `aurc`, laya/evals.py). Lower is better; it
     rewards a confidence that ranks right answers above wrong ones.
     """
-    fields = ()
 
     name = "aurc"
     reads = Decisions
