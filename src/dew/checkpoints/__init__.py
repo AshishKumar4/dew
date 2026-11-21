@@ -1537,12 +1537,12 @@ class Checkpoints:
                               tuple(name for name in (*ROLES, ONE_ITEM) if name in payloads))
         try:
             with region("checkpoint.submit"):
-                saved: dict[str, ocp.args.CheckpointArgs] = {
+                written: dict[str, ocp.args.CheckpointArgs] = {
                     name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
                     for name, tree in payloads.items()}
                 if self.export_model and not mapping:
-                    saved[EXPORTED] = ocp.args.StandardSave(exported(state, held_apart))
-                persistent.save(step, args=ocp.args.Composite(**saved),
+                    written[EXPORTED] = ocp.args.StandardSave(exported(state, held_apart))
+                persistent.save(step, args=ocp.args.Composite(**written),
                                 metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
             self._staged.pop(step)
