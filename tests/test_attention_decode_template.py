@@ -1008,19 +1008,19 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
                                           heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
     assert priced is not None
     assert priced.device_bytes >= 2 * rows * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
-    # Non-deciding fallback target (sm80 d256, row 8813 F2) prices only the common bounded arm, not both arms.
-    sm80, wide = generation.gpu_target("sm80"), 256
-    fallback = attention_decode.priced_step(sm80, rows=1, queries=1, keys=keys, heads=8, kv_heads=kv_heads,
-                                            width=wide, dtype=jnp.bfloat16)
-    with generation.assumed(sm80):
-        q80 = jnp.zeros((1, 1, 8, wide), jnp.bfloat16)
-        k80 = jnp.zeros((1, keys, kv_heads, wide), jnp.bfloat16)
-        plan80, *_ = attention_decode.planned(q80, k80, k80, attention_decode.key_spans(1, keys, 1),
-                                              template.Hooks())
-    assert plan80 is not None and "bounded" in plan80 and "scaled" in plan80
-    expected_kernels = 1 + int(plan80["bounded"].slices > 1)
+    # Non-deciding fallback target (sm100, row 8813 F2) prices only the common bounded arm, not both arms.
+    sm100 = generation.gpu_target("sm100")
+    fallback = attention_decode.priced_step(sm100, rows=1, queries=1, keys=keys, heads=8, kv_heads=kv_heads,
+                                            width=width, dtype=jnp.bfloat16)
+    with generation.assumed(sm100):
+        q100 = jnp.zeros((1, 1, 8, width), jnp.bfloat16)
+        k100 = jnp.zeros((1, keys, kv_heads, width), jnp.bfloat16)
+        plan100, *_ = attention_decode.planned(q100, k100, k100, attention_decode.key_spans(1, keys, 1),
+                                               template.Hooks())
+    assert plan100 is not None and "bounded" in plan100 and "scaled" in plan100
+    expected_kernels = 1 + int(plan100["bounded"].slices > 1)
     assert fallback is not None and fallback.kernels == expected_kernels
-    assert fallback.device_bytes >= 2 * keys * kv_heads * wide * jnp.dtype(jnp.bfloat16).itemsize
+    assert fallback.device_bytes >= 2 * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
 
 
 @COMPILES_ON_CPU
