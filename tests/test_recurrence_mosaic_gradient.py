@@ -504,15 +504,15 @@ def test_a_forward_alones_kernels_are_refused_at_its_own_tiles():
     from dew.nn.kernels.templates import report
 
     name, dtype = 'nemotron-h-4b-ssd', jnp.bfloat16
-    operands = resource_operands(name, dtype, 1, 4096)
-    options = dict(max_segments=None, bound=None, **_form(name, dtype), **_skipped(name))
+    operands, skip = resource_operands(name, dtype, 1, 4096), _skipped(name)['skip']
+    options = dict(max_segments=None, bound=None, **_form(name, dtype))
     facts = generation.gpu_target('sm90')
     with generation.assumed(facts):
-        bound = template.MOSAIC.bind(*operands, None, **options)
+        bound = template.MOSAIC.bind(*operands, None, skip=skip, **options)
         tiles = template.MOSAIC.derived(bound, facts)
         # Lowered, as a compile names its kernels (`report.named`).
-        jax.jit(lambda *x: template.MOSAIC(*x, None, **options)).trace(*operands).lower(
-            lowering_platforms=("cuda",))
+        call = jax.jit(lambda *x: template.MOSAIC(*x[:-1], None, skip=x[-1], **options))
+        call.trace(*operands, skip).lower(lowering_platforms=("cuda",))
     identity = report._identity(template.MOSAIC, bound)
     ran = {kernel for launch in report._LAUNCHES.values()
            if launch.identity == identity and launch.config == tiles.forward for kernel in launch.kernels}
