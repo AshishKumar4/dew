@@ -202,7 +202,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
     `A`, and the launches' weighted keys, memories, corrected values and a forked call's stored slots,
     `(w, h, corrected, stored)`, which the port
-    keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
+    keeps unless a remat rung recomputes them (`residuals.RECOMPUTED`), the caller's choice."""
     dtype = jnp.result_type(q, k, v)
     scans = walks_once(dtype, per_key=g.ndim == 4, family=family_of(dtype) if family is None else family,
                        keeps=keeps)
