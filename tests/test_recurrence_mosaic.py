@@ -967,8 +967,8 @@ def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.Shap
 @lowers('sm90')
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     """The 27B gated delta net's forward launched twice in one program on an H100, at the first two variants'
-    distinct forward tiles (`_ran`): a kernel's name compiled under both launches (`report.launching`) is gated
-    on each launch's evidence, the second's shared memory its own; one read by its name alone kept one's."""
+    distinct forward tiles (`_ran`): a kernel's name compiled under both launches (`report.launching`) is
+    gated on each launch's evidence, the second's shared memory its own; one read by its name kept one's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
