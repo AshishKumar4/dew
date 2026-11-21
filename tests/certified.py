@@ -608,7 +608,7 @@ def _ratio_factor(factor, laid, units) -> np.ndarray:
     """A ratio's factor (`ratios.Ratio`) exactly, as the ratio forms it: an operand as it is (a subnormal's
     value kept, read from its bits: `scaled`'s account), the units' scale in the format, an exponential its
     factor as formed
-    (`windows._factors_value`, a stated input: its one rounding is the exponential's), None where it is NaN."""
+    (`windows._factors_value`, a stated input: its one rounding is the exponential's), None if NaN."""
     if factor[0] == "v":
         return _exactly(laid[factor[1]])
     if factor[0] == "s":

@@ -133,8 +133,8 @@ def test_the_ratios_contract_holds_a_zero_as_plus_zero_alone():
 def test_the_ratios_contract_holds_quotients_summed_across_as_their_sum(numerators, denominators, summed,
                                                                         apart):
     """`ratios.ratio_p`'s contract (`certified._ratio_holds`) of quotients summed across an axis before they
-    land (`ratios.Ratio.across`, `sum_c N_c / D_c`) holds the law's own landing of their sum, exact (2/3, and 0
-    where each quotient passes the format), and refuses a quotient's own and their sum landed apart (`apart`),
+    land (`ratios.Ratio.across`, `sum_c N_c / D_c`) holds the law's own landing of their sum, exact (2/3,
+    and 0 where each quotient passes the format), and refuses a quotient's own and their sum landed apart (`apart`),
     as a contract reading one quotient alone, or the quotients landed, would pass them (the merge P0's base
     review F1)."""
     from dew.algebra import ratios, windows
@@ -152,7 +152,7 @@ def test_the_ratios_contract_holds_quotients_summed_across_as_their_sum(numerato
 
 def _formed_high(anchors, joined, *, units):
     """The law's factors (`windows._factors_value`) formed `2^-12` high: a factor's fault."""
-    from dew.algebra import ratios, windows
+    from dew.algebra import windows
 
     significand, exponent = windows._factors_value(anchors, joined, units=units)
     return np.asarray(significand) * np.float32(1 + 2.0 ** -12), exponent
@@ -190,7 +190,7 @@ def test_the_ratios_factor_check_holds_a_fold_past_the_format_to_its_cutoffs_fac
     (`certified._plain_fold`) to -inf past the floor, where the law's factor is zero, or +inf past the
     ceiling, where it is NaN. The check holds the law's own factor and refuses a factor of one in its place;
     it raised making a Fraction of the infinity (the merge P0's head review, F5)."""
-    from dew.algebra import means, ratios, windows
+    from dew.algebra import ratios, windows
 
     form = ratios.Ratio(((1.0, (("v", 0), ("e", 1, 2))),), (), 0, reduced=True,
                        units=windows.Units(scale=0.5, compensated=False))
@@ -226,7 +226,8 @@ def test_the_ratios_factor_check_refuses_a_zero_factor_its_exponent_holds_within
     P0's base review 11, F4)."""
     from dew.algebra import ratios, windows
 
-    form = ratios.Ratio(((1.0, (("v", 0), ("e", 1, 2))),), (), 0, reduced=True, units=windows.Units(scale=1.0))
+    form = ratios.Ratio(((1.0, (("v", 0), ("e", 1, 2))),), (), 0, reduced=True,
+                        units=windows.Units(scale=1.0))
     laid = [np.float64([1.0]), np.float64([-45425.75]), np.float64([0.0])]
 
     def zero(anchors, joined, *, units):

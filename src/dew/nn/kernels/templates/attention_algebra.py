@@ -569,7 +569,8 @@ def finished_form(spec: Forward) -> Forward:
     return spec if spec.natural or spec.raw else unfolded(spec)
 
 
-def slice_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
+def slice_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Array, total: jax.Array
+                ) -> Partial:
     """A finished slice of a row's keys as a state of their merge (`finished_merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
     keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
