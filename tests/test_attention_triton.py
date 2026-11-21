@@ -135,8 +135,9 @@ def check(case: dict, names: tuple[str, ...], dtype, config: attention_triton.Ti
     check_each(case, names, dtype, (config,), **options)
 
 
-def check_each(case: dict, names: tuple[str, ...], dtype, configs, *, residuals: bool = False, width: int = 32,
-               value_width: int = 32, natural: bool = template.NATURAL, mainloop: str = "triton"):
+def check_each(case: dict, names: tuple[str, ...], dtype, configs, *, residuals: bool = False,
+               width: int = 32, value_width: int = 32, natural: bool = template.NATURAL,
+               mainloop: str = "triton"):
     """`attention_triton.forward` pinned at each of `configs` (or with `mainloop` "portable" the plain-JAX
     mainloop's `attend` at their tiles) on par with `template.reference` over `case`'s keys and the hooks
     `names`, at the site's declared seeds, its exponent `natural` or the fold: one check of every config,
