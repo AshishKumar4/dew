@@ -1084,10 +1084,10 @@ def test_tritons_compiler_rounds_a_product_and_the_sum_it_feeds_apart():
     fused multiply-add would keep the product's dropped bits, `2^-24`, and the merge's recovery would read
     the product's rounding error as the sum's. (On an H100 compile, Triton's `a * b + c` assembles to FMUL
     and FADD, no FFMA: XLA compiles a Triton call with no floating-point contraction.)"""
-    from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as plt
 
     from dew.nn import precision
+    from dew.nn.kernels import launches
 
     def alone(a_ref, b_ref, c_ref, s_ref, e_ref):
         s_ref[...] = a_ref[...] * b_ref[...] + c_ref[...]
@@ -1101,8 +1101,9 @@ def test_tritons_compiler_rounds_a_product_and_the_sum_it_feeds_apart():
     c = -(a * a)
     vector = jax.ShapeDtypeStruct(a.shape, jnp.float32)
     for kernel in (alone, two_sum):
-        total, error = pl.pallas_call(kernel, out_shape=(vector, vector),
-                                      compiler_params=plt.CompilerParams(num_warps=4, num_stages=1))(a, a, c)
+        total, error = launches.pallas_call(
+            kernel, name=kernel.__name__, out_shape=(vector, vector),
+            compiler_params=plt.CompilerParams(num_warps=4, num_stages=1))(a, a, c)
         np.testing.assert_array_equal(np.asarray(total), np.zeros_like(a), err_msg=kernel.__name__)
         np.testing.assert_array_equal(np.asarray(error), np.zeros_like(a), err_msg=kernel.__name__)
 
