@@ -17,6 +17,7 @@ block's outputs, the row's statistics stored by the first block alone; a row a p
 row, where programs each of a block of channels formed them a block (four times a row at a decode step of
 one row on an A100, M-ET-87 at 7598a24655f). A call with an initial state merges it beside the slices on
 the law's path (`merged_split`)."""
+import dataclasses
 import functools
 from collections.abc import Callable
 
@@ -155,44 +156,89 @@ THREADS = 4 * 32
 """A program's threads: Pallas Triton's default of four warps (`CompilerParams.num_warps`), the merge's."""
 
 
+def _launch_for_block(spec: algebra.Forward, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                      queries: int, width: int, block: int) -> tuple[cost.Work, cost.Work, int]:
+    """One program's on-chip work, the full launch's work, and the grid size of `_launch` at `block` channels
+    on the common one-window path (`means.merged_state_chunked`): one anchor/hull joining pass (`joining`:
+    chunk 0 in `role.fixed` plus `chunks - 1` loop steps) followed by one window's two dependent passes
+    (`_placing` and `_summing`, `2 * chunks` steps), excluding the rare re-landing `lax.cond` branch, for a
+    span of `3 * chunks` steps. Arithmetic work uses the full power-of-two tile from `emission.emitted`;
+    device traffic counts only the valid (unmasked) `slices` and `width` channels read across all 3 passes
+    and written once, with each channel block rereading the row's `slices` valid maxima and totals 3 times
+    and only the first channel block (`program_id(3) == 0`) writing the row's maximum and total."""
+    batch, slices, _, heads, _ = padded.shape
+    channels, chunks = 1 << (width - 1).bit_length(), -(-slices // means.chunk_width(slices))
+    blocks = channels // block
+    rows = batch * queries * heads
+    launched = rows * blocks
+    launch = functools.partial(_launch, spec=spec, queries=queries, width=width, block=block)
+    (kernel,) = (equation for equation in jax.make_jaxpr(launch)(padded, stacked).jaxpr.eqns
+                 if programs.opaque(equation))
+    body = kernel.params["jaxpr"]
+    (role,) = emission.emitted(body, 1, None, device=range(len(body.invars))).roles
+    if len(role.walks) == 3:
+        joining_walk, mean_walk, _ = role.walks
+    else:
+        joining_walk = cost.Work()
+        mean_walk, _ = role.walks
+    walk_work = emission.repeated(joining_walk, chunks - 1) + emission.repeated(mean_walk, 2 * chunks)
+    passes = 3 * chunks
+    padded_item, stacked_item = padded.dtype.itemsize, stacked.dtype.itemsize
+    total_device_bytes = float(rows * ((3 * slices + 1) * width * padded_item
+                                       + (blocks * 3 * slices + 1) * 2 * stacked_item))
+    per_program = dataclasses.replace(role.fixed + walk_work, device_bytes=total_device_bytes / launched,
+                                      span=float(passes))
+    total = dataclasses.replace(emission.repeated(per_program, launched), device_bytes=total_device_bytes,
+                                span=float(passes), kernels=1.0)
+    return per_program, total, launched
+
+
 @functools.cache
+def _planned_block(spec: algebra.Forward, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                   queries: int, width: int, target: generation.GpuTarget) -> tuple[int, cost.Work]:
+    """The channels a program of `_kernel` merges and that launch's total device work (`_launch_for_block`),
+    cached together so `_channel_block` and `launch_work` trace each candidate once."""
+    _, slices, _, _, _ = padded.shape
+    channels = 1 << (width - 1).bit_length()
+    blocks = [block for block in (channels >> shift for shift in range(channels.bit_length()))
+              if block * means.chunk_width(slices) >= THREADS] or [channels]
+
+    candidates = {block: _launch_for_block(spec, padded, stacked, queries, width, block) for block in blocks}
+
+    def seconds(block: int) -> float:
+        per_program, total, launched = candidates[block]
+        # A program a wave where the target states no multiprocessors; traffic free where no rate is known.
+        waves = -(-launched // (target.multiprocessors or 1))
+        traffic = total.device_bytes / target.memory_rate if target.memory_rate else 0.0
+        return max(waves * cost.walked(per_program, target), traffic)
+
+    chosen = min(blocks, key=lambda block: (seconds(block), -block))
+    return chosen, candidates[chosen][1]
+
+
 def _channel_block(spec: algebra.Forward, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
                    queries: int, width: int, target: generation.GpuTarget) -> int:
     """The channels a program of `_kernel` merges for operands `padded` and `stacked` (`_launch`): of the
     powers of two from a row's channels down to the least whose chunk of slices holds an element a thread
-    (`THREADS`), the one whose launch the cost model prices least. A program's work is its launch body's as
-    it emits (`emission.emitted`): outside its walks, and each of the law's loops over the chunks a step a
-    chunk (`mosaic.step_index`), its loads and stores of its blocks device traffic. The launch takes the
-    longer of its programs' walks, one's on a multiprocessor (`cost.walked`) times its waves over the
-    target's multiprocessors, and its programs' device traffic at the device's rate
-    (`GpuTarget.memory_rate`): a narrower block rereads its row's maxima and totals, a program each. Of two
-    alike, the wider. A program a row's whole channels left a decode step's few rows on a few
-    multiprocessors (B1: 32 rows of a GH200's 132, merged_padded 19.2 us at 4096 keys, row 8439)."""
-    batch, slices, _, heads, _ = padded.shape
-    channels, chunks = 1 << (width - 1).bit_length(), -(-slices // means.chunk_width(slices))
-    blocks = [block for block in (channels >> shift for shift in range(channels.bit_length()))
-              if block * means.chunk_width(slices) >= THREADS] or [channels]
+    (`THREADS`), the one whose launch the cost model prices least (`_planned_block`). A program a row's whole
+    channels left a decode step's few rows on a few multiprocessors (B1: 32 rows of a GH200's 132,
+    merged_padded 19.2 us at 4096 keys, row 8439)."""
+    return _planned_block(spec, padded, stacked, queries, width, target)[0]
 
-    def seconds(block: int) -> float:
-        launch = functools.partial(_launch, spec=spec, queries=queries, width=width, block=block)
-        (kernel,) = (equation for equation in jax.make_jaxpr(launch)(padded, stacked).jaxpr.eqns
-                     if programs.opaque(equation))
-        body = kernel.params["jaxpr"]
-        (role,) = emission.emitted(body, 1, None, device=range(len(body.invars))).roles
-        work = role.fixed + emission.repeated(sum(role.walks, cost.Work()), chunks)
-        launched = batch * queries * heads * (channels // block)
-        # A program a wave where the target states no multiprocessors; traffic free where no rate is known.
-        waves = -(-launched // (target.multiprocessors or 1))
-        traffic = launched * work.device_bytes / target.memory_rate if target.memory_rate else 0.0
-        return max(waves * cost.walked(work, target), traffic)
 
-    return min(blocks, key=lambda block: (seconds(block), -block))
+def launch_work(spec: algebra.Forward, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                queries: int, width: int, target: generation.GpuTarget) -> cost.Work:
+    """One native `merged_padded` launch's device work at `_channel_block`'s chosen block (`_planned_block`):
+    common-path arithmetic across the grid, valid unmasked device traffic with row-stat stores counted once
+    per row, span `3 * chunks`, one kernel."""
+    return _planned_block(spec, padded, stacked, queries, width, target)[1]
 
 
 def _kernel(padded, stacked, *, spec: algebra.Forward, queries: int, width: int):
     """`_value` as one launch (`_launch`), a program a row's block of channels (`_channel_block`)."""
-    shaped = tuple(jax.ShapeDtypeStruct(operand.shape, operand.dtype) for operand in (padded, stacked))
-    block = _channel_block(spec, *shaped, queries, width, generation.gpu_target())
+    padded_s, stacked_s = (jax.ShapeDtypeStruct(operand.shape, operand.dtype)
+                           for operand in (padded, stacked))
+    block = _channel_block(spec, padded_s, stacked_s, queries, width, generation.gpu_target())
     return _launch(padded, stacked, spec=spec, queries=queries, width=width, block=block)
 
 

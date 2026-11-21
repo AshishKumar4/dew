@@ -150,6 +150,12 @@ def _least_beyond(op, ba, generation_name: str):
     return derived(high)
 
 
+DROPPING = tuple(generation_name for generation_name in GATED
+                 if (family := bundles.of(generation_name, jnp.float16, scoped=True, tpu=True)) is not None
+                 and not family.places_on_role)
+"""`GATED`'s GPUs whose family's mainloop drops: every one but those whose products a role places, whose walk
+takes no dropout (`MosaicForward._placed_refusal`)."""
+
 FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
                 for width in (64, 128, 256)
                 for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)]
@@ -165,8 +171,11 @@ FORWARD_GATE += [(generation_name, width, training, hook, jnp.float16) for gener
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
 beside the walk's), a softcap's inference forward 256 wide (Gemma's), all in bf16, and fp16's inference and
-training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes); and a B200's
-bf16 forwards on tcgen05's chunks (products into scoped tensor memory, read back into registers, the
+training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes), hookless and
+dropping where the mainloop drops (`DROPPING`: its kept weights' two parts beside the step, `weight_parts`;
+row 9526: an sm100's split training forward at width 128 spilled 20 bytes, its warpgroup selector and walk
+bound held across the register move, none with each consumer a static branch, its draw unpriced); and a
+B200's bf16 forwards on tcgen05's chunks (products into scoped tensor memory, read back into registers, the
 weights staged for the values' product: the Blackwell fold's H1)."""
 
 
@@ -1383,3 +1392,56 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
                                     KernelCase("backward", lambda: (backward, (query, key, key, query)))],
                                    "sm90")
     assert not failures(found), "\n".join(failures(found))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
+def test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free(generation_name):
+    """Row 5449: an int8 KV-cache decode at width 256 derives a legal config and compiles spill-free once
+    `Family.converted` converts at most `CONVERT_COLUMNS` (128) columns at a time."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_decode
+
+    rows, keys, heads, kv_heads, width = 1, 512, 8, 2, 256
+    spans = template.spans(1, keys, rows)
+    query = jax.ShapeDtypeStruct((rows, 1, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), jnp.int8)
+    scales = (jax.ShapeDtypeStruct((rows, keys, kv_heads), jnp.float32),
+              jax.ShapeDtypeStruct((rows, keys, kv_heads), jnp.float32))
+
+    def decoded(query, key, value, k_scale, v_scale):
+        return attention_decode.attend(query, key, value, spans, scales=(k_scale, v_scale))
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels(
+            [KernelCase("int8-w256-decode", lambda: (decoded, (query, key, key, *scales)))],
+            generation_name)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("stored", [jnp.float8_e4m3fn, jnp.float8_e5m2], ids=["e4m3fn", "e5m2"])
+def test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free(stored):
+    """Row 8549: an FP8 KV-cache decode on sm80 decodes via `bits.decoded` integer arithmetic (no sm_89
+    `cvt.e4m3x2`/`e5m2x2` instruction) and compiles spill-free with ptxas."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_decode
+
+    rows, keys, heads, kv_heads, width = 1, 512, 8, 2, 128
+    spans = template.spans(1, keys, rows)
+    query = jax.ShapeDtypeStruct((rows, 1, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), stored)
+    scales = (jax.ShapeDtypeStruct((rows, keys, kv_heads), jnp.float32),
+              jax.ShapeDtypeStruct((rows, keys, kv_heads), jnp.float32))
+
+    def decoded(query, key, value, k_scale, v_scale):
+        return attention_decode.attend(query, key, value, spans, scales=(k_scale, v_scale))
+
+    with generation.assumed("sm80"):
+        found = compile_mosaic_kernels(
+            [KernelCase("fp8-sm80-decode", lambda: (decoded, (query, key, key, *scales)))], "sm80")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

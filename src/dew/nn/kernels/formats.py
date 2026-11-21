@@ -16,7 +16,7 @@ from dew.algebra import bits
 from dew.nn.float_bits import exact_power2
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, power2
 
 FORM = np.frombuffer(bytes.fromhex(bits.NVFP4_BFLOAT16_FORM.version), np.uint8)
 """The version of the form an `NvFp4`'s words are packed by (`bits.BitForm.version`, its encoder's digest),
@@ -53,16 +53,15 @@ class NvFp4:
         stored bytes (every addressable shard, or the gathered `form` a collective restore hands it,
         row 8958)."""
         target = self.form if form is None else form
-        if isinstance(target, jax.Array):
-            found: set[str] = set()
-            for shard in target.addressable_shards:
-                held = np.asarray(shard.data)
-                if held.shape[-1] != FORM.size:
-                    raise ValueError(f"NVFP4 form digest sharded across its {FORM.size} bytes "
-                                     f"(shard shape {held.shape}); pass the gathered form to checked()")
-                found.update(bytes(row).hex() for row in held.reshape(-1, FORM.size))
-        else:
-            found = {bytes(row).hex() for row in np.asarray(target).reshape(-1, FORM.size)}
+        pieces = ([shard.data for shard in target.addressable_shards]
+                  if isinstance(target, jax.Array) else [target])
+        found: set[str] = set()
+        for piece in pieces:
+            held = np.asarray(piece)
+            if held.ndim == 0 or held.shape[-1] != FORM.size:
+                raise ValueError(f"NVFP4 form digest sharded across its {FORM.size} bytes "
+                                 f"(shard shape {held.shape}); pass the gathered form to checked()")
+            found.update(bytes(row).hex() for row in held.reshape(-1, FORM.size))
         if found != {FORM.tobytes().hex()}:
             raise ValueError(f"NVFP4 words packed by form version {', '.join(sorted(found))}, where this Dew "
                              f"decodes form version {FORM.tobytes().hex()}: repack them from the source "
@@ -221,11 +220,12 @@ class MxFp8:
         # biased exponent a power, none a zero; its byte the exponent plus 127, which its int8 sum wraps to
         # past 127 and its bitcast reads back; row 8832).
         scales = exact_power2(exponent, scale)
-        # Each value over its scale as its exponent (`jnp.ldexp`), as `decoded` applies it: the least scale,
-        # a block of zeros' or of magnitudes under 2^-118, is float32's subnormal 2^-127, which a program
-        # that flushes subnormals (XLA's CPU, op by op or with its simplifier off) reads as zero, its zeros
-        # over it NaN (row 6931).
-        codes = fake_quant.fp8_codes(jnp.ldexp(blocks, -exponent)).reshape(x.shape)
+        # Each value over its scale as its exponent (`precision.power2`, the one owner of scaling by a power
+        # of two; row 8971), as `decoded` applies it: the least scale, a block of zeros' or of magnitudes
+        # under 2^-118, is float32's subnormal 2^-127, which a program that flushes subnormals (XLA's CPU, op
+        # by op or with its simplifier off) reads as zero, its zeros over it NaN (row 6931). A subnormal
+        # value a scale below 1 raises is kept where the backend keeps subnormals (`jnp.ldexp` flushed it).
+        codes = fake_quant.fp8_codes(power2(blocks, -exponent)).reshape(x.shape)
         return cls(codes.astype(jnp.float8_e4m3fn), scales[..., 0])
 
     def decoded(self, dtype=jnp.float32) -> jax.Array:
@@ -233,10 +233,12 @@ class MxFp8:
         its block's scale, an E8M0 byte 0xFF's block NaN (OCP MX 5.4.1: E8M0's one non-number)."""
         held = jax.lax.bitcast_convert_type(self.scales, jnp.uint8)
         exponents = jnp.repeat(held.astype(jnp.int32) - 127, formats_of.MXFP8.depth, axis=-1)
-        # Each E8M0 scale applied as its exponent (`jnp.ldexp`, in two normal steps): a scale below
-        # float32's least normal (2**-128 for inputs near 2**-120) would read as zero where a device
-        # flushes subnormals, though the value it scales to is normal.
-        values = jnp.ldexp(self.codes.astype(dtype), exponents)
+        # Each E8M0 scale applied as its exponent (`precision.power2`, in normal powers of two): a scale
+        # below float32's least normal (2**-127 for inputs near 2**-120) would read as zero where a device
+        # flushes subnormals, though the value it scales to is normal; a subnormal value rounds once where
+        # the backend keeps subnormals (`jnp.ldexp` flushed it). Scaled at least in float32 (`power2`), then
+        # in `dtype` once, so a narrow one's range is its own.
+        values = power2(self.codes.astype(dtype), exponents).astype(dtype)
         return jnp.where(exponents == 0xFF - 127, jnp.asarray(jnp.nan, dtype), values)
 
 

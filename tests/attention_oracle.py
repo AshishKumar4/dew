@@ -258,17 +258,19 @@ ATTENTION_SEEDS = 8
 `seeds_for` paired on the GPU it runs on."""
 
 
-def attention_on_par(fused, reference, draw, label: str, *, keep=None, truth=None, split=tuple,
+def attention_on_par(fused, reference, draw, label: str, *, keep=None, softcap=None, truth=None, split=tuple,
                      seeds: int = ATTENTION_SEEDS):
     """`fused`'s output and its inputs' gradients (`with_gradients`; an attention call of `(query, key,
     value[, sinks])` and the output's cotangent drawn last), as `split` lays them out (a leaf a document's
     rows), on par with `reference`'s over `draw`'s inputs (check 1). With `keep`, the keys each query keeps
-    (`kept`), the truth is attention written out over them (`exact_attention`) and every entry is sized by
-    the terms attention's float64 gradients carry through their cancellation (`attention_terms`: a query
-    that keeps one key has a logit gradient of float64 zero, which a fused kernel forms from its rounded
-    output), a sink's gradient as a logit's beside the keys. Without, `truth` is the truth and each row is
+    (`kept`), the truth is attention written out over them (`exact_attention`), under `softcap` where given,
+    and every entry is sized by its float64 terms (`attention_terms`): a query that keeps one key has a
+    logit gradient of float64 zero, which a fused kernel forms from its rounded output. A sink's gradient
+    is a logit's beside the keys. Without, `truth` is the truth and each row is
     sized by its final sums' terms (a call whose keys this file does not lay out, every query keeping
-    many). A packed call's tokens, one run `[T, H, D]`, are read as a batch of one."""
+    many). The terms are a program of the draw's widened inputs (`traced_attention_terms`), which a GPU tier
+    part's prepare traces and compiles ahead as it does the truth (row 7359). A packed call's tokens, one
+    run `[T, H, D]`, are read as a batch of one."""
     def batched(fn):
         def run(*arrays):
             if arrays[0].ndim == 4:
@@ -286,14 +288,14 @@ def attention_on_par(fused, reference, draw, label: str, *, keep=None, truth=Non
         return
 
     def exact(query, key, value, *sinks):
-        return batched(lambda q, k, v, s: [exact_attention(q, k, v, s, keep=keep)])(
+        return batched(lambda q, k, v, s: [exact_attention(q, k, v, s, keep=keep, softcap=softcap)])(
             query, key, value, *(sinks or (None,)))[0]
 
     def terms(*inputs):
         query, key, value, *rest = inputs
         sinks = rest[0] if len(rest) == 2 else None
-        return split(tuple(batched(lambda q, k, v, s, dy: attention_terms(q, k, v, dy, keep, sinks=s))(
-            query, key, value, sinks, rest[-1])))
+        return split(tuple(batched(lambda q, k, v, s, dy: traced_attention_terms(
+            q, k, v, dy, keep, sinks=s, softcap=softcap))(query, key, value, sinks, rest[-1])))
 
     assert_as_exact(jax.jit(program(fused)), jax.jit(program(reference)), draw, label, seeds=seeds,
                     truth_fn=program(exact), terms=terms)

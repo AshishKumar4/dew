@@ -59,12 +59,11 @@ def largest(keys: Iterable[str], read: Callable[[str], dict | None],
 
 NEEDED = """import json, sys
 import jax
-from dew._devices import allocator_limit
-from dew.training.memory import needed
+from dew.training.memory import least_limit
 device = jax.local_devices()[0]
 units = json.load(sys.stdin)
-print(json.dumps({name: allocator_limit(max(needed(device, p["resident"], p["beside"], p["temporaries"])
-                                            for p in programs)) for name, programs in units.items()}))
+print(json.dumps({name: least_limit(device, [(p["resident"], p["beside"], p["temporaries"]) for p in each])
+                  for name, each in units.items()}))
 """
 """Each unit's least pool, in the pool's bytes the lane's budget counts, by Dew's own admission
 (dew.training.memory `needed`, the inverse of `admitted`) of the most demanding of its programs on this

@@ -97,9 +97,9 @@ def keywords(case: dict) -> dict:
     if case.get("segment_ids") == "cross":
         keywords["segment_ids"], keywords["key_segment_ids"] = cross_documents()
     if case.get("lengths"):
-        keywords["key_value_seq_lengths"] = LENGTHS
+        keywords["key_value_seq_lengths"] = jnp.asarray(LENGTHS, jnp.int32)
     if case.get("starts"):
-        keywords["key_value_seq_starts"] = STARTS
+        keywords["key_value_seq_starts"] = jnp.asarray(STARTS, jnp.int32)
     if case.get("block_groups"):
         keywords["block_groups"], keywords["image_groups"] = (jnp.asarray(groups)
                                                               for groups in block_groups(geometry(case)[1]))

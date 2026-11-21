@@ -525,10 +525,12 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
     planning takes half as long again regresses past COMPILE_FLOOR, and a step whose compile is refused (a
     kernel this host cannot lower, `selection.Unlowerable`) is a round not run, failing the gate as the
     gate's own; each sample's selected plan is kept. A step sized for another device is not compiled for
-    this kind. The step's own compile (its traces, lowerings and compiles) is the gated row, the whole
-    planning and the initializer's fresh state (`start`) shown beside it: a head whose initializer's compile
-    alone grew regresses its whole and leaves its step level, not failing the gate on it (6740: dit and
-    finetune read as regressed once the initializer's compile entered the planning)."""
+    this kind. The step's own compile (its traces, lowerings and compiles), the initializer's fresh state
+    (`start`) and the algebra are each a gated row, the whole planning shown beside them: a head whose
+    initializer's compile alone grew regresses its start row, failing the gate there (train 1104's review
+    F3), and leaves its step level; a base whose tree keeps no start apart compares none of its parts, so a
+    compile moved into the planning reads as no part's regression (6740: dit and finetune read as regressed
+    once the initializer's compile entered it)."""
     from types import SimpleNamespace
 
     built, _ = standing_in_environments(gate, monkeypatch)
@@ -578,9 +580,9 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False, verdicts=str(verdicts))) == 1
     judged = json.loads(verdicts.read_text())["rows"]
     assert {name: (row["state"], row["gated"]) for name, row in judged.items()} == {
-        f"{dense} step": ("level", True), dense: ("regressed", False), f"{dense} start": ("regressed", False),
-        f"{dense} algebra": ("level", False),
-        **{f"{moe}{part}": ("incomplete", part == " step") for part in (" step", "", " start", " algebra")}}
+        f"{dense} step": ("level", True), dense: ("regressed", False), f"{dense} start": ("regressed", True),
+        f"{dense} algebra": ("level", True),
+        **{f"{moe}{part}": ("incomplete", part != "") for part in (" step", "", " start", " algebra")}}
     # Each arm's selected configurations beside the verdict, structured values kept: why its planning moved.
     tiled = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"}, "head_tile": [1024, 2],
              "head_fused": None, "xla_defaults": None, "narrow": None}
@@ -591,7 +593,8 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
     # A tree before `start` was kept apart mixes it into its step's parts: its step is no measurement, so a
     # base of that tree compares no step.
     mixed = gate.compile_samples(dense, 32.0, {"traced": 6.0, "lowered": 2.0, "compiled": 20.0})
-    assert mixed[dense] == 32.0 and not gate.measured(mixed[f"{dense} step"])
+    assert mixed[dense] == 32.0
+    assert not any(gate.measured(mixed[f"{dense} {part}"]) for part in ("step", *gate.SHOWN_PARTS))
     table = tmp_path / "table.md"
     gate.report(SimpleNamespace(results=out, table=str(table), claim=False, verdicts=None))
     [line] = [line for line in table.read_text().splitlines() if line.startswith(f"| {dense} |")]

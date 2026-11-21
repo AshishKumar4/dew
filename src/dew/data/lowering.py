@@ -55,6 +55,7 @@ from dew.data.analysis import (
     _until,
     _volatile,
     _written,
+    groups_held,
 )
 from dew.data.cache import _Mapped
 from dew.data.completion import Completed, Numbered, cuts, reach, released
@@ -746,10 +747,8 @@ def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[i
 
 
 class _GroupedRows(_WrappingDataset):
-    """A batched step that keeps its rows (`Batched.same_rows`) over an indexed order: each record as its
-    group of `size` consecutive records of the order makes it (`BatchedGroups`), so the rows are the same
-    however many readers share the order and wherever a read resumes (row 9007). The groups the read's
-    threads are in are kept, each made once (at most `held`), shared by its threads (row 9711)."""
+    """A same-rows batched step over an indexed order: each record as its group of `size` consecutive
+    records makes it (`BatchedGroups`; 9007), at most `held` kept (`groups_held`), each made once (9711)."""
 
     def __init__(self, parent: pygrain.MapDataset, groups: BatchedGroups, size: int, held: int):
         super().__init__(parent)
@@ -782,8 +781,7 @@ class _GroupedRows(_WrappingDataset):
 
 
 class _TokenSplit(_WrappingDataset):
-    """A token split of a finite indexed order, such as a shuffled corpus: the spans `_token_spans` keeps,
-    computed once over the order, or those resolved already (`spans`, `_Build.spans`)."""
+    """A token split of a finite indexed order: the spans `_token_spans` keeps, or those resolved already."""
 
     def __init__(self, parent: pygrain.MapDataset, split: TokenSplit,
                  spans: list[tuple[int, int, int]] | None = None):
@@ -1335,8 +1333,7 @@ class _Build:
     already, sorted, which it draws past (`dew.data.ordering.Skipping`). Empty for any other read."""
     spans: dict[tuple[tuple[int, ...], int, TokenSplit, int], list[tuple[int, int, int]]] = dataclasses.field(
         default_factory=dict, compare=False, hash=False, repr=False)
-    """Each token split's spans (`_TokenSplit`) by corpus, place, split and order length, resolved once for
-    every copy of this build: the plan's fingerprint and the reader's split share one scan (row 9011)."""
+    """Each token split's spans (`_TokenSplit`), resolved once for every copy of this build (row 9011)."""
     DRAWN: ClassVar[str] = "drawn"
     """The `phases` rule a phase of a global order records where it continues a corpus past places the run
     trained out of order (`skipped`): where an earlier phase read it, as the order's twin of draws traces
@@ -2065,10 +2062,10 @@ class _Build:
             # A Grain step reads cache fills through an iterator that owns them (`_Filled`).
             given = _as_iter(rows, self.loading) if _fills(rows) else rows
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
-        elif (isinstance(stage, Batched) and not _drops(stage, pipeline.stages[at + 1:])
-              and isinstance(rows, pygrain.MapDataset)):
-            # Its groups the order's own records, read in order (`_drops`; rows 9007, 9711).
-            rows = _GroupedRows(rows, BatchedGroups(stage), stage.size, 2 * max(1, self.loading.threads))
+        elif isinstance(stage, Batched) and stage.same_rows and isinstance(rows, pygrain.MapDataset):
+            # Its groups the order's own records (rows 9007, 9784), as many held as its reads hold (9711).
+            rows = _GroupedRows(rows, BatchedGroups(stage), stage.size,
+                                groups_held(pipeline.stages[at + 1:], stage.size, self.loading.threads))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))

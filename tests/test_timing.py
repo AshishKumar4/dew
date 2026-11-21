@@ -163,6 +163,24 @@ def test_one_window_a_gpu_kind_is_a_timing_job_running_its_kinds_manifest(tmp_pa
     assert h100["minutes"] > a100["minutes"] >= 15
 
 
+def test_a_window_whose_case_profiles_is_a_profile_its_profiled_runs_in_its_minutes(tmp_path):
+    """A window any of whose cases profiles is a profile, which a node runs with its GPU's counters open,
+    and its minutes hold each profiled cell and arm's run past its timed calls' (row 4557: submitted as a
+    timing, its Nsight Compute ran with them closed, its minutes counting its timed calls alone)."""
+    case = {"name": "a", "builder": "b:c", "cells": [{}] * 3, "arms": [{"name": "x"}, {"name": "y"}],
+            "rounds": 1, "repeats": 1}
+    profiling = {**case, "name": "p", "profile": {"kernel": "k"}}
+    names = ("timed.json", "profiled.json")
+    for name, cases in zip(names, ([case], [case, profiling]), strict=True):
+        (tmp_path / name).write_text(json.dumps({"cases": cases}))
+    timed, profiled = (json.loads(subprocess.run(
+        [sys.executable, str(TIMING), "jobs", "--ref", "abc", "--name", "W", f"h100={tmp_path / name}"],
+        capture_output=True, text=True, check=True).stdout)["jobs"][0] for name in names)
+    assert (timed["kind"], profiled["kind"]) == ("timing", "profile")
+    # Its second case adds its own timed calls, a minute or so, and 3 cells x 2 arms of profiles.
+    assert profiled["minutes"] - timed["minutes"] >= 6 * 2
+
+
 CALLED = '''import os
 import time
 

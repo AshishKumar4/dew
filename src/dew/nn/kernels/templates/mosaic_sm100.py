@@ -31,7 +31,16 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import handoffs, mosaic, mosaic_sm90, persistent, resources, rings, swizzling
+from dew.nn.kernels.templates import (
+    handoffs,
+    mosaic,
+    mosaic_sm90,
+    persistent,
+    resources,
+    ring_family,
+    rings,
+    swizzling,
+)
 from dew.nn.kernels.templates.rings import Ref
 
 PRODUCTS = handoffs.Role("mma", warp=True, weight=0)
@@ -612,9 +621,9 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         raise NotImplementedError(f"{self._HOME}; its operands are read from shared or tensor memory")
 
 
-class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
+class Tcgen05Rings(Tcgen05Issuer, ring_family.RingFamily[Accumulator]):
     """tcgen05's bundle: its issuer and tensor-memory home (`Tcgen05Issuer`) on TMA rings a producer warpgroup
-    fills (`mosaic.RingFamily`), whose slots its products release by their commit (`CommittedRing`). A
+    fills (`ring_family.RingFamily`), whose slots its products release by their commit (`CommittedRing`). A
     persistent launch's tiles run three roles: the producer's load warp fills the rings, its product warp
     walks each tile's steps into one of two accumulator turns in tensor memory (`issue`), and the consumer
     warpgroup reads each finished tile's accumulators out in chunks and stores them (`finish`), freeing its
@@ -1420,9 +1429,9 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         self._waited(scoped["settles"].at[mosaic.ROLE.get()] if "settles" in scoped else self._done())
 
 
-class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
+class Tcgen05Chunks(Tcgen05ChunksIssuer, ring_family.RingFamily):
     """The recurrence's bundle on Blackwell (row 4747): tcgen05's chunks issuer (`Tcgen05ChunksIssuer`) on TMA
-    rings fed by a producer warpgroup (`mosaic.RingFamily`), as wgmma's bundle is: the one composition in
+    rings fed by a producer warpgroup (`ring_family.RingFamily`), as wgmma's bundle is: the one composition in
     which its products are the family's own, mma.sync's on TMA rings spilling its key-block, fp32 solve and
     scores' gradient launches at every geometry on a B200."""
 

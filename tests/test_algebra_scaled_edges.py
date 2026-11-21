@@ -664,3 +664,17 @@ def test_a_merged_total_at_degenerate_states_holds_its_contract(case, tangent):
     value = _unsigned_land(np.sum(totals.astype(np.float64) * factors))
     assert_bits(got, [value, _unsigned_land(np.sum(factors * along)), 0.0], "value, first, second")
     assert np.isfinite(got[0]), f"{case}: a total landed past the format"
+
+
+def test_applied_preserves_single_rounding_under_gradual_underflow():
+    """`scaled.applied` uses `precision.power2`'s single-rounding path so an in-range negative exponent
+    applies one exact power of two before the significand (never splitting `2^-4` into two `2^-2` factors
+    that double-round a subnormal on a gradual-underflow backend)."""
+    x = np.uint32(0x00800009).view(np.float32)
+    y = np.float32(15.0 / 256.0)
+    got = np.asarray(scaled.applied(jnp.asarray(x), scaled.scaled(jnp.asarray(y))), np.float32)
+    probe = np.asarray(jnp.asarray(x) * jnp.asarray(np.float32(2.0 ** -4)), np.float32)
+    if probe != 0.0:
+        assert int(got.view(np.uint32)) == 0x00078001
+    else:
+        assert int(got.view(np.uint32)) == 0x00000000

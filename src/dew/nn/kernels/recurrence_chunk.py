@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
+from dew import _cache
 from dew.algebra import derive, scan
 from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY, Reads
@@ -690,13 +691,16 @@ class Templated(Protocol):
 
 
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
+    # The measured device first: off a GPU the automatic route refuses here, before the launch's eligibility
+    # fits a target's configs (18 fits a decision on the CPU, 0.86 of its 0.87 s, row 6740); a call naming
+    # the template passes it (`selection`'s forcing) and reaches its eligibility interpreted.
+    Requirement('device', lambda case: case.family is not None,
+                "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
+                row=INHERENT, kind='measured'),
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "
                 "fits this device or holds in its compiles (each spilling, the start's misses name them), "
                 "or no Mosaic bundle claims its instruction family", row='ledger 1294'),
-    Requirement('device', lambda case: case.family is not None,
-                "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
-                row=INHERENT, kind='measured'),
     Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
                 "a gradient the template's fast backward does not take (`mainloop_backward."
                 "fast_backward_form`): an fp32 decay a key dimension in three bf16 parts, an fp16 call "
@@ -939,14 +943,23 @@ def _walk_once(facts: tuple, *, width: int, recomputed: bool, held: int, context
     target, numerics, precision and checks a split is priced and traced under), which the walk reads no
     other way: JAX's trace cache keys on none of Dew's, and the split one context derives is no other's.
     Traced at every call, each layer's walk took 0.65 s of a trace again (jsf-gdn-layers: 8 equal layers'
-    training step 5.2 s, 1 layer's 0.63 s)."""
+    training step 5.2 s, 1 layer's 0.63 s). Run unrecorded (`dew._cache.unrecorded`): the walk is portable
+    math, launching nothing and dispatching no op of its own, its routes its caller's, so it traces once under
+    every receipt its caller records into, where each receipt's identity keyed it a trace of its own (row
+    6740: a decision step's walk traced twice, 0.84 s against 0.30)."""
     del context
     walked = _walk(_delta_forms(**dict(facts)), width, recomputed, held, documents, added, turned)
 
     def recurrence_walk(operands, h):
         return walked(operands, h)
 
-    return nested(recurrence_walk)
+    staged = nested(recurrence_walk)
+
+    def run(operands, h):
+        with _cache.unrecorded():
+            return staged(operands, h)
+
+    return run
 
 
 def _rows_local(walk, like):
