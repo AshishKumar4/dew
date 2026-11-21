@@ -163,6 +163,14 @@ class Work:
         return Work(**summed, span=max(self.span, other.span), chains=chains)
 
 
+ISSUED_UNITS = ("flops", "operations", "exponentials", "conversions", "shared_bytes", "tf32_flops",
+                "fp8_flops", "integer_operations")
+"""The units of `Work` a kernel's body issues, which its emission counts instruction by instruction: a
+launch's work from its emission takes each (`emission.launch_work`), and a launch's programs share each alike
+beside its device bytes (a program's share of a launch's work), so a unit added to `Work` is counted and
+shared wherever these are, none priced at none by a list that omits it (row 10793)."""
+
+
 class Rates(NamedTuple):
     """A target's rate of each unit `units` prices, per second (`rates`), read by name: the tensor cores'
     16-bit, TF32 and FP8 modes, the CUDA cores, the special-function units, shared memory, the on-chip memory

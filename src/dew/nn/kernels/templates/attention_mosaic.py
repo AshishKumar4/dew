@@ -153,18 +153,8 @@ def _launch_seconds(work: cost.Work, programs: int, target: generation.GpuTarget
     """A launch's seconds on `target`: the longer of one program on a multiprocessor (`cost.walked`, plus
     launch latency) and the whole launch across the device (`cost.seconds`), no constant (row 6710)."""
     count = max(programs, 1)
-    per_program = dataclasses.replace(
-        work,
-        flops=work.flops / count,
-        operations=work.operations / count,
-        exponentials=work.exponentials / count,
-        conversions=work.conversions / count,
-        device_bytes=work.device_bytes / count,
-        shared_bytes=work.shared_bytes / count,
-        tf32_flops=work.tf32_flops / count,
-        fp8_flops=work.fp8_flops / count,
-        kernels=0,
-    )
+    shared = {unit: getattr(work, unit) / count for unit in (*cost.ISSUED_UNITS, "device_bytes")}
+    per_program = dataclasses.replace(work, **shared, kernels=0)
     return max(cost.walked(per_program, target) + (target.launch_seconds or 0.0),
                cost.seconds(work, target))
 

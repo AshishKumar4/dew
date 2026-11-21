@@ -29,7 +29,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn import derivatives, precision, programs
 from dew.nn.kernels.templates import resources
-from dew.nn.kernels.templates.cost import Chain, Stated, Work, followed
+from dew.nn.kernels.templates.cost import ISSUED_UNITS, Chain, Stated, Work, followed
 
 
 class Unpriced(ValueError):
@@ -824,10 +824,8 @@ def launch_work(kernel, stated: Stated) -> Work:
     # The steps on its critical path: its longest program's walk where it states one, else their mean.
     walked = stated.steps / programs if stated.longest is None else stated.longest
 
-    return Work(flops=issued("flops"), operations=issued("operations"), exponentials=issued("exponentials"),
-                conversions=issued("conversions"), device_bytes=stated.bytes_accessed,
-                shared_bytes=issued("shared_bytes"), tf32_flops=issued("tf32_flops"),
-                span=walked, fp8_flops=issued("fp8_flops"), kernels=1, chains=counted.paths(walked))
+    return Work(**{unit: issued(unit) for unit in ISSUED_UNITS}, device_bytes=stated.bytes_accessed,
+                span=walked, kernels=1, chains=counted.paths(walked))
 
 
 def _estimate(work: Work) -> pl.CostEstimate:
