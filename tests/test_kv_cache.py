@@ -669,7 +669,9 @@ def test_a_tpu_decode_steps_paged_kernel_is_one_branch_of_a_conditional_on_a_mes
     def step(params, cache, tokens):
         return decoder.apply({**params, "cache": cache}, tokens, decode=True, mutable=["cache"])
 
-    text = tpu_lowering(step, (placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, "data")), mesh)
+    with jax.default_matmul_precision("default"):
+        text = tpu_lowering(step, (placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, "data")),
+                            mesh)
     found, outside = _kernel_branches(text, "mosaic_tpu")
     holding = [branches for branches in found if any(branches)]
     assert holding and all(sum(branches) == 1 for branches in holding) and not outside, (found, outside)
