@@ -2000,6 +2000,26 @@ def test_an_elementwise_aligned_sum_split_over_a_mesh_is_computed_shard_by_shard
     assert value.sharding.is_equivalent_to(rows, value.ndim)
 
 
+def test_a_compensated_sum_over_axes_of_one_element_is_its_values():
+    """`compensated_sum` over an axis of one element, alone or beside a longer one, and the compensated pair
+    reduction under it (`summed_pairs`): the values themselves, and beside a longer axis the same sum as the
+    reduction over that axis alone, bitwise, where XLA:GPU's simplifier rewrote a pair reduction over an
+    axis of one element into one array's bitcast and refused its program (row 10674; the GPU's own run in
+    test_gpu_models' users-process cells)."""
+    from dew.nn.precision import compensated_sum, summed_pairs
+
+    rng = np.random.default_rng(10674)
+    x = jnp.asarray(rng.standard_normal((32, 1, 5)), jnp.float32)
+    found = jax.jit(lambda x: compensated_sum(x, (1,)))(x)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(x[:, 0]))
+    alone = jax.jit(lambda x: compensated_sum(x, (2,)))(x[:, 0])
+    beside = jax.jit(lambda x: compensated_sum(x, (1, 2)))(x)
+    np.testing.assert_array_equal(np.asarray(beside), np.asarray(alone))
+    hi, lo = jax.jit(lambda x: summed_pairs((x, x * 0), (-2,)))(x)
+    assert hi.shape == lo.shape == (32, 5)
+    np.testing.assert_array_equal(np.asarray(hi), np.asarray(x[:, 0]))
+
+
 def test_an_aligned_sum_over_an_empty_axis_is_zero():
     """`aligned_sum([(x, y)])` of a scalar `x` beside an empty `y`: an empty value whose pullback gives `x` a
     zero cotangent, and a sum over an empty axis zero, where the largest binade over no element raised
