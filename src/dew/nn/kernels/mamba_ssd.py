@@ -44,7 +44,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew.nn import derivatives
-from dew.nn.kernels import generation, launches, recurrence_algebra as algebra, tuning
+from dew.nn.kernels import launches, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
 from dew.nn.precision import compensated_add, compensated_difference, compensated_sum, two_sum
@@ -98,35 +98,35 @@ class _Launch(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> Tiles:
         operand = _operand(ba)
         dtype = "float32" if operand is None or jnp.dtype(operand.dtype).itemsize == 4 else "bfloat16"
-        picked = self.PICKS[dtype]
-        # An A100's bf16 call at a chunk mamba_ssm's autotuner was read at takes its pick there (`AMPERE`),
-        # the summing kernels' heads a group's as the port's (mamba_ssm states none).
-        ampere = AMPERE.get(self.NAME, {}).get(ba.arguments.get("chunk"))
-        if dtype == "bfloat16" and ampere is not None and generation.gpu_target().generation == "sm80":
-            picked = dataclasses.replace(ampere, heads=picked.heads)
-        return self._fitted(ba, picked)
+        return self._fitted(ba, self.PICKS[dtype])
+
+    def variants(self, ba) -> tuple[Tiles, ...]:
+        """Its derived config, then mamba_ssm's own autotuner's picks on an A100 for its kernel (`MEASURED`),
+        fitted to the call and the summing kernels' heads the derived config's: a tuning run's candidates
+        (`tuning.tune`), each held to the port's gate (tests/test_mamba_ssd.py)."""
+        derived = ba.heuristics_config
+        found = (self._fitted(ba, dataclasses.replace(tiles, heads=derived.heads))
+                 for tiles in MEASURED.get(self.NAME, ()))
+        return tuple(dict.fromkeys((derived, *found)))
 
 
-AMPERE: Mapping[str, Mapping[int, Tiles]] = {
-    "chunk_cumsum": {256: Tiles(8, 0, 0, 4, 3), 128: Tiles(4, 0, 0, 4, 3)},
-    "chunk_state": {256: Tiles(128, 64, 32, 4, 4), 128: Tiles(64, 64, 32, 2, 4)},
-    "state_passing": {256: Tiles(1024, 0, 0, 4, 3), 128: Tiles(512, 0, 0, 4, 3)},
-    "bmm_chunk": {256: Tiles(128, 64, 32, 4, 4), 128: Tiles(128, 64, 32, 4, 4)},
-    "chunk_scan": {256: Tiles(64, 128, 32, 4, 4), 128: Tiles(32, 64, 32, 2, 5)},
-    "chunk_scan_bwd_dstates": {256: Tiles(128, 128, 32, 4, 4), 128: Tiles(64, 128, 32, 4, 4)},
-    "state_passing_bwd": {256: Tiles(1024, 0, 0, 4, 3), 128: Tiles(512, 0, 0, 4, 3)},
-    "chunk_scan_chunk_state_bwd_dx": {256: Tiles(128, 128, 32, 4, 4), 128: Tiles(64, 64, 32, 4, 4)},
-    "chunk_state_bwd_db": {256: Tiles(64, 64, 0, 4, 3), 128: Tiles(128, 64, 0, 4, 3)},
-    "chunk_scan_bwd_dc": {256: Tiles(128, 32, 0, 4, 3), 128: Tiles(128, 64, 0, 4, 3)},
-    "chunk_scan_bwd_dcb": {256: Tiles(64, 64, 0, 4, 3), 128: Tiles(32, 64, 0, 4, 3)},
-    "bmm_chunk_bwd": {256: Tiles(64, 128, 32, 4, 4), 128: Tiles(64, 128, 32, 4, 4)},
-    "chunk_scan_bwd_ddacs_stable": {256: Tiles(64, 64, 0, 4, 3), 128: Tiles(64, 32, 0, 4, 3)},
-    "chunk_cumsum_bwd": {256: Tiles(8, 0, 0, 4, 3), 128: Tiles(16, 0, 0, 4, 3)},
+MEASURED: Mapping[str, tuple[Tiles, ...]] = {
+    "chunk_state": (Tiles(128, 64, 32, 4, 4), Tiles(64, 64, 32, 2, 4)),
+    "bmm_chunk": (Tiles(128, 64, 32, 4, 4),),
+    "chunk_scan": (Tiles(64, 128, 32, 4, 4), Tiles(32, 64, 32, 2, 5)),
+    "chunk_scan_bwd_dstates": (Tiles(128, 128, 32, 4, 4), Tiles(64, 128, 32, 4, 4)),
+    "chunk_scan_chunk_state_bwd_dx": (Tiles(128, 128, 32, 4, 4), Tiles(64, 64, 32, 4, 4)),
+    "chunk_state_bwd_db": (Tiles(64, 64, 0, 4, 3), Tiles(128, 64, 0, 4, 3)),
+    "chunk_scan_bwd_dc": (Tiles(128, 32, 0, 4, 3), Tiles(128, 64, 0, 4, 3)),
+    "chunk_scan_bwd_dcb": (Tiles(64, 64, 0, 4, 3), Tiles(32, 64, 0, 4, 3)),
+    "bmm_chunk_bwd": (Tiles(64, 128, 32, 4, 4),),
+    "chunk_scan_bwd_ddacs_stable": (Tiles(64, 64, 0, 4, 3), Tiles(64, 32, 0, 4, 3)),
 }
-"""mamba_ssm 2.3.2.post1's own Triton autotuner's picks on an A100 SXM4 40GB for a bf16 scan, by launch and
-chunk: at Nemotron-H 4B's (256-token chunks, 96 heads of 80, a state of 128) and 30B's (128-token chunks, 64
-heads of 64), each launch's BLOCK_SIZE_M, _N and _K (`Tiles`' reading), warps and stages (M-JS-155-a100).
-The port's H100 picks ran its training 1.54 and 1.17 times mamba_ssm's on that A100 (M-JS-144-a100)."""
+"""mamba_ssm 2.3.2.post1's own Triton autotuner's picks on an A100 SXM4 40GB for a bf16 scan, by launch: each
+launch's BLOCK_SIZE_M, _N and _K (`Tiles`' reading), warps and stages at Nemotron-H 4B's shapes (256-token
+chunks, 96 heads of 80, a state of 128) and 30B's (128-token chunks, 64 heads of 64), M-JS-155-a100. The
+port's derived configs (an H100's picks, `_picks`) ran its training 1.54 and 1.17 times mamba_ssm's there
+(M-JS-144-a100); these are its tuning run's candidates (`_Launch.variants`), no plain run's."""
 
 
 def _operand(ba):
