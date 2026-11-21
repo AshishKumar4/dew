@@ -34,6 +34,7 @@ from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training._lowering import Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
+from dew.training.memory import step_footprint
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import holds_copies, narrow_copies, narrowed, read_paths
 from dew.training.planning import Candidate, splits
@@ -301,8 +302,11 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
             made, found = routed(lambda: jitted.trace(*apart(prepared), given, part))
             lowered = made.lower(lowering_platforms=platforms)
             kernels = kernel_report(found, lowered)
+    # Its arguments' and new outputs' bytes on each device, which its GPU compile's limit reads.
+    footprint = {} if mesh is not None else step_footprint((*apart(prepared), given, part), lowered,
+                                                           jax.local_devices())
     candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, kernels,
-                          joins=bool(joined))
+                          footprint=footprint, joins=bool(joined))
     return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
                                                            split, platforms))
 

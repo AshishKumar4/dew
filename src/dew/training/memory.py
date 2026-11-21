@@ -17,6 +17,7 @@ import logging
 import math
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -28,7 +29,7 @@ from dew._devices import allocator_limit, device_memory, fresh_pool, gpu_free_by
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
-from dew.distributed.placement import parameter_axes
+from dew.distributed.placement import ALLOCATION_BYTES, parameter_axes, placed_bytes
 from dew.mesh import batch_axes, mesh_axes
 from dew.nn.backbones.layer_names import StoredRow, group_layers, stored_layers
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
@@ -649,18 +650,23 @@ class MemoryMiss:
     no live set, which errs toward a split too coarse, which its compile refuses, never one too fine, which
     every step would pay for) and the bytes it was short (`shortfall`, its stranding counted, `factor`). A
     split above it holds its share of them; the next program is XLA's to fuse and schedule again, so the
-    compile at the split this names is its judge."""
+    compile at the split this names is its judge. `vocabulary`: the bytes at its peak a head's tile or fusion
+    can change (`LiveSet.vocabulary`), None where it states none."""
 
     split: int
     scaled: int
     shortfall: int
     factor: int
+    vocabulary: int | None = None
+
+    def closes(self, freed: int) -> bool:
+        """Whether `freed` bytes fewer, those of a temporary its stranding counts (`factor`), leave room."""
+        return self.factor * freed >= self.shortfall
 
     def fits_at(self, split: int) -> bool:
         """Whether the temporaries this miss read leave room at `split` microbatches, held at their share,
         `scaled * self.split / split`."""
-        saved = self.scaled - self.scaled * self.split // split
-        return self.factor * saved >= self.shortfall
+        return self.closes(self.scaled - self.scaled * self.split // split)
 
 
 LIMIT_EXIT = "xla_gpu_memory_limit_early_exit_bytes"
@@ -670,22 +676,85 @@ executable stating its memory and its live set and refusing to run; within it, i
 attempt of a plan is one compile, whole where the step can fit and stopped where it cannot."""
 
 
-def compile_limit(devices: Sequence, held: int, built: int) -> int | None:
+def compile_limit(devices: Sequence, held: int, built: int, footprint: Mapping) -> int | None:
     """The bytes past which no step fits `devices` (`LIMIT_EXIT`), as XLA sums a step (its arguments, its
-    outputs that write over none of them and its temporaries): the fit check's own arithmetic
-    (`step_headroom`) solved for that sum. The check places the step's temporaries and new outputs beside
-    its arguments, `built` of them not yet resident, and the `held` bytes the loop keeps beside it, `built`
-    among them, all in the least allocator limit among `devices`; so the most a fitting step's sum reaches
-    is that limit less what is held beside the step outside its arguments (`held - built`: the prefetched
-    batches), where the devices hold nothing but its arguments. A step XLA stops past it fits nowhere the
-    check admits; one within it is compiled whole and the fit check judges it. A 4.8B multimodal
-    transformer's step on a GH200 (row 5805): the
-    limit less all of `held`, the arguments it builds among it counted twice, stopped a step the check
-    admitted, which its first run then refused. None where a device states no limit."""
-    limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
-    if not limits or len(limits) < len(devices):
-        return None
-    return min(limits) - (held - built)
+    outputs that write over none of them and its temporaries): the fit check's own arithmetic, its free
+    bytes in all (`admitted`), solved for that sum. `footprint` states, by device, the step's arguments (as
+    its pool charges them, at least XLA's count) and the most its new outputs take (`Footprint`). Each
+    device holds the arguments but the `built` ones, and beside the step the `held` bytes, `built` among
+    them, leaving `room`; the step's new outputs and temporaries take it, the temporaries twice where its
+    allocator strands them (`stranding`), so the most a fitting step's sum reaches is its arguments, its new
+    outputs and half the room they leave where it strands, all of it where not. A 4B decoder on a GH200
+    (UB-6740-TWINS2): 51.72 GiB of arguments and 36.62 of temporaries fit its 89.77 GiB in XLA's sum and not
+    stranded, and its compile went past buffer assignment to the code the check then refused. None where
+    a device states no limit or no footprint."""
+    limits = []
+    for device in devices:
+        if device not in footprint:
+            return None
+        arguments, outputs = footprint[device]
+        memory = device_memory(device, arguments - built)
+        if "bytes_limit" not in memory:
+            return None
+        room = available(memory, unclaimed(device, memory)) - held
+        limits.append(arguments + outputs + (room - outputs) // stranding(device, memory))
+    return min(limits) if limits else None
+
+
+class Footprint(NamedTuple):
+    """A step's bytes on one device before its compile states them (`compile_limit`): its `arguments`,
+    each a whole allocation of its pool (`allocated_bytes`), at least XLA's count of them; and its `outputs`
+    less the arguments it donates, at most the outputs XLA writes over none of them where every donated
+    argument is written over, as JAX lowers a step's donations (`FitSearch.measured`: where not)."""
+
+    arguments: int
+    outputs: int
+
+
+def step_footprint(arguments, lowered: jax.stages.Lowered, devices: Iterable) -> dict:
+    """Each of `devices`' `Footprint` of the step `lowered` over `arguments` (its arguments' shapes, each
+    carrying its sharding): its arguments' bytes on it, each rounded up to a pool's allocation, and its
+    outputs' less those of the arguments it donates. An output of no stated sharding counts whole."""
+    leaves = jax.tree.leaves(arguments)
+    donated = [info.donated for info in jax.tree.leaves(lowered.args_info)]
+    outputs = jax.tree.leaves(lowered.out_info)
+    unit = ALLOCATION_BYTES
+    footprint = {}
+    for device in devices:
+        held = [placed_bytes(leaf, device=device) for leaf in leaves]
+        written = sum(placed_bytes(output, device=device) if output.sharding is not None
+                      else math.prod(output.shape) * output.dtype.itemsize for output in outputs)
+        given = sum(size for size, donates in zip(held, donated, strict=True) if donates)
+        footprint[device] = Footprint(sum(-(-size // unit) * unit for size in held), max(0, written - given))
+    return footprint
+
+
+def stopped(executable: jax.stages.Compiled, options: jax.stages.CompilerOptions | None) -> bool:
+    """Whether a GPU compile under `options` stopped after buffer assignment (`LIMIT_EXIT`): XLA's sum of
+    its arguments, its new outputs and its temporaries past the limit they state."""
+    limit = (options or {}).get(LIMIT_EXIT)
+    stats = compiled_memory(executable)
+    return (limit is not None and stats is not None
+            and stats.argument + stats.output - stats.alias + stats.temp > int(limit))
+
+
+INERT_OPTIONS = frozenset({'xla_gpu_dot_merger_threshold_mb'})
+"""Options a step's own differ from XLA's defaults in that change no temporaries: the dot merger's threshold
+concatenates dots that read one operand into one, their outputs as many bytes (`step_compiler_options`)."""
+
+
+def defaults_free(own: jax.stages.CompilerOptions | None,
+                  required: jax.stages.CompilerOptions | None) -> bool:
+    """Whether a step compiled under XLA's defaults (`required` alone) can take other temporaries than under
+    its `own` options, so a fit asks it where its own miss (`FitSearch.ladder`): its own differ in an option
+    not inert (`INERT_OPTIONS`), the Triton GEMM fusions' among them where this GPU's autotuner keeps
+    cuBLAS's GEMMs either way (`GpuTarget.triton_gemm_temporaries`)."""
+    own, required = dict(own or {}), dict(required or {})
+    differ = {name for name in own.keys() | required.keys() if own.get(name) != required.get(name)}
+    inert = set(INERT_OPTIONS)
+    if 'xla_gpu_enable_triton_gemm' in differ and not gpu_target(device_generation()).triton_gemm_temporaries:
+        inert.add('xla_gpu_enable_triton_gemm')
+    return bool(differ - inert)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -698,23 +767,34 @@ class LiveSet:
 
     scaled: int
     unknown: int
+    vocabulary: int | None = None
+    """The bytes of its buffers a dimension of which descends from a vocabulary table's (`tables`), with
+    those it states no provenance of: the most a head's tile or fusion can change, the head's logits and
+    their gradients, those of its table among them, the rest of the step left as it is. None where no
+    table's axes were given."""
 
     @staticmethod
-    def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]]) -> LiveSet | None:
-        """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows; None where
-        the backend states none."""
+    def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]],
+           tables: frozenset[tuple[int, int]] | None = None) -> LiveSet | None:
+        """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows and `tables`
+        those of a vocabulary table's rows (`dew.training.planning.vocabulary_axes`); None where the backend
+        states none."""
         live = executable.peak_live()
         if live is None:
             return None
-        scaled = unknown = 0
+        scaled = unknown = vocabulary = 0
         for buffer in live:
             if buffer.kind == "parameter":
                 continue
             if any(dimension is None for dimension in buffer.dims):
                 unknown += buffer.bytes
-            elif any(dimension is not None and dimension & rows for dimension in buffer.dims):
+                vocabulary += buffer.bytes
+                continue
+            if any(dimension & rows for dimension in buffer.dims):
                 scaled += buffer.bytes
-        return LiveSet(scaled, unknown)
+            if tables and any(dimension & tables for dimension in buffer.dims):
+                vocabulary += buffer.bytes
+        return LiveSet(scaled, unknown, None if tables is None else vocabulary)
 
 
 def fits_everywhere(read: Callable[[], int | None]) -> tuple[bool, int | None]:

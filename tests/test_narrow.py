@@ -514,14 +514,16 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     assert copies > 0 and held[0] - held[1] == copies
 
 
-def test_a_step_that_fits_no_recomputation_with_its_copies_drops_them_where_that_frees_bytes(monkeypatch):
-    """A tight start asks each remat rung with its copies first (`FitSearch.recomputing`, row 6740), then,
-    where none fits, drops the copies at its own rung and keeps them dropped where the step without them falls
-    less short; where it falls no less short, the copies come back, their 1-2% of a step kept, and the ladder
-    climbs with them. The plan says which (`narrow`). In the geometry of row 1661's run, a window of two
-    steps, the devices hold the step fully recomputed without its copies and not with them. On a CPU the drop
-    frees bytes, the step's casts fused into their uses; on a GPU the step casts its weights whole either way
-    (a GH200: 68.352 MB without its copies, 68.344 MB with them, rows 5041, train 857 F2)."""
+def test_a_step_short_of_more_than_its_copies_drops_them_only_at_a_rung_they_can_close(monkeypatch):
+    """The narrow copies are dropped at the first rung at the run's own head whose miss with them was short
+    of no more than they hold (`FitSearch.drops_copies`), never at one short of more, where dropping them
+    cannot close it: there it recomputes more with them first. In the geometry of row 1661's run, a window
+    of two steps, the devices hold the step fully recomputed without its copies and not with them. Dropped,
+    the copies stay dropped where the step without them falls less short, and come back, their 1-2% of a
+    step kept, where it falls no less short. The plan says which (`narrow`). On a CPU the drop frees bytes,
+    the step's casts fused into their uses; on a GPU the step casts its weights whole either way (a GH200:
+    68.352 MB without its copies, 68.344 MB with them, rows 5041, train 857 F2; its 4B step some 35 GiB
+    short with 6.77 GiB of copies freed none dropping them, row 10817)."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -533,19 +535,22 @@ def test_a_step_that_fits_no_recomputation_with_its_copies_drops_them_where_that
     free -= recomputed.plan["probes"][0]["headroom"]
     state, _, trainer = trained(copies=True, remat=None)
     probes = trainer.plan["probes"]
-    dropped = next(index for index, probe in enumerate(probes) if not probe["narrow"])
-    first, second = probes[0], probes[dropped]
-    # Every remat rung asked with the copies, and missed, before they are dropped at the start's rung.
-    assert all(probe["narrow"] and not probe["fits"] for probe in probes[:dropped]), probes
-    assert len({probe["remat"] for probe in probes[:dropped]}) > 1, probes
-    assert second["remat"] == first["remat"] and probes[-1]["fits"] is True
-    # On a CPU the step without them falls less short, and they stay dropped; on a GPU it falls no less
-    # short, and they come back.
+    assert probes[-1]["fits"] is True, probes
     frees = jax.default_backend() == "cpu"
-    assert (second["headroom"] > first["headroom"]) is frees
+    if frees:
+        dropped = next(index for index, probe in enumerate(probes) if not probe["narrow"])
+        with_copies, without = probes[dropped - 1], probes[dropped]
+        copies = with_copies["argument"] - without["argument"]
+        own = (probes[0]["head_tile"], probes[0]["head_fused"])
+        # Asked with its copies at the rung it drops them at, and short of more than they hold at every rung
+        # of its own head before it.
+        assert without["remat"] == with_copies["remat"] and not with_copies["fits"] and copies > 0, probes
+        assert all(probe["narrow"] and -probe["headroom"] > copies for probe in probes[:dropped - 1]
+                   if (probe["head_tile"], probe["head_fused"]) == own), probes
+        # On a CPU the step without them falls less short, and they stay dropped.
+        assert without["headroom"] > with_copies["headroom"]
     assert trainer.plan["narrow"] is not frees
     assert (state.compute is None) is frees
-
 
 def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monkeypatch):
     """Row 1661's run (1765): devices that hold the state a run keeps between steps, its parameters,
@@ -773,12 +778,12 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
     assert run.plan["split"] == 2, run.plan["probes"]
 
 
-def test_a_plan_a_rung_above_that_fits_with_its_copies_keeps_them(monkeypatch):
+def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_them_helped(monkeypatch):
     """A window of one step that recomputes nothing holds about as much without its copies as with them:
-    its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its own
-    rung neither way, the plan asks the remat rungs with its copies first (`FitSearch.recomputing`, row
-    6740) and settles the first that fits, its copies kept, none dropped: once a plan fits, a run compiles
-    no other."""
+    its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
+    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
+    reaches holds them dropped where dropping them left the step less short, and back where it did not
+    (train 857 F2): once a plan fits, a run compiles no other."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -791,11 +796,18 @@ def test_a_plan_a_rung_above_that_fits_with_its_copies_keeps_them(monkeypatch):
     state, _, trainer = trained(copies=True)
     probes, plan = trainer.plan["probes"], trainer.plan
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
-    # Its own rung short with its copies, then each remat rung asked with them until one fits.
-    assert not probes[0]["fits"] and all(probe["narrow"] for probe in probes), probes
-    assert probes[-1]["fits"] is True and plan["remat"] != base["remat"], probes
-    assert {key: plan[key] for key in rung} != {key: base[key] for key in rung}
-    assert plan["narrow"] is True and state.compute is not None
+    at_base = {key: base[key] for key in rung}
+    # Its own rung, with its copies and without them, both short: what dropping them freed, before any
+    # recomputation was asked.
+    own = {probe["narrow"]: probe for probe in probes if {key: probe[key] for key in rung} == at_base}
+    with_copies, without = own[True], own[False]
+    assert not with_copies["fits"] and not without["fits"]
+    assert all(probe["remat"] == base["remat"] for probe in probes[:probes.index(without) + 1])
+    # The plan, a rung above, holds them dropped where dropping them left the step less short, and back where
+    # it did not, and the run trains on the plan it found.
+    kept = without["headroom"] <= with_copies["headroom"]
+    assert {key: plan[key] for key in rung} != at_base and probes[-1]["fits"] is True
+    assert plan["narrow"] is kept and (state.compute is None) is not kept
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=2)
