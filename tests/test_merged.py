@@ -611,5 +611,5 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
 
     (launched,) = merged._launch(padded, stacked, init_m, init_t, init_acc, units=algebra.units_of(spec),
                                  queries=queries, width=width, block=width, out_dtype=jnp.bfloat16,
-                                 out_heads=out_heads, interpret=True)
+                                 out_heads=out_heads)
     np.testing.assert_array_equal(np.asarray(launched, dtype=np.float32), expected)
