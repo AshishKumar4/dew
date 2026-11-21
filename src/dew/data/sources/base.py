@@ -166,7 +166,9 @@ class ShardManifest:
     `counted`, where the shards state no rows that their store can count,
     returns each one's rows, given the reads it may make at once, which a read
     that needs them reads then (`sized`): a streamed Parquet store's files'
-    from their footers, which a read that needs none never reads.
+    from their footers, a line store's ranges from its provisioned offset
+    index (None each where it has none), which a read that needs none never
+    reads.
 
     `fixed_parts` states that `subdivide` cuts the same parts whatever its
     count, the store's own finer shards (a Parquet store's row groups): a
@@ -177,7 +179,7 @@ class ShardManifest:
     reader: ShardOpener
     subdivide: Callable[[int], tuple[Shard, ...]] | None = None
     index_ordered: bool = False
-    counted: Callable[[int], tuple[int, ...]] | None = None
+    counted: Callable[[int], tuple[int | None, ...]] | None = None
     fixed_parts: bool = False
 
     @property
