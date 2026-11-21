@@ -53,16 +53,15 @@ class NvFp4:
         stored bytes (every addressable shard, or the gathered `form` a collective restore hands it,
         row 8958)."""
         target = self.form if form is None else form
-        if isinstance(target, jax.Array):
-            found: set[str] = set()
-            for shard in target.addressable_shards:
-                held = np.asarray(shard.data)
-                if held.shape[-1] != FORM.size:
-                    raise ValueError(f"NVFP4 form digest sharded across its {FORM.size} bytes "
-                                     f"(shard shape {held.shape}); pass the gathered form to checked()")
-                found.update(bytes(row).hex() for row in held.reshape(-1, FORM.size))
-        else:
-            found = {bytes(row).hex() for row in np.asarray(target).reshape(-1, FORM.size)}
+        pieces = ([shard.data for shard in target.addressable_shards]
+                  if isinstance(target, jax.Array) else [target])
+        found: set[str] = set()
+        for piece in pieces:
+            held = np.asarray(piece)
+            if held.ndim == 0 or held.shape[-1] != FORM.size:
+                raise ValueError(f"NVFP4 form digest sharded across its {FORM.size} bytes "
+                                 f"(shard shape {held.shape}); pass the gathered form to checked()")
+            found.update(bytes(row).hex() for row in held.reshape(-1, FORM.size))
         if found != {FORM.tobytes().hex()}:
             raise ValueError(f"NVFP4 words packed by form version {', '.join(sorted(found))}, where this Dew "
                              f"decodes form version {FORM.tobytes().hex()}: repack them from the source "
