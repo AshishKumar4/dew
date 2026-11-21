@@ -37,6 +37,10 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "mask": ("causal", "full", "documents"),
         "dtype": ("bfloat16", "float16", "float32"),
     },
+    "sparse_attention": {
+        "generation": ("sm90", "sm80"),
+        "dtype": ("bfloat16", "float16"),
+    },
     "decode": {
         "generation": ("sm90", "sm80", "v5e"),
         "layout": ("dense", "paged"),
@@ -231,6 +235,7 @@ whatever the covering takes besides (`covering`), so the row's own case proves i
 CELLS: dict[str, tuple[str, str]] = {
     "attention": ("attention_matrix", "a_routes_training_step_is_on_par"),
     "attention_kernels": ("attention_kernels_matrix", "a_kernels_training_step_is_on_par"),
+    "sparse_attention": ("sparse_attention_matrix", "a_sparse_attention_step_is_on_par"),
     "decode": ("decode_matrix", "a_decode_step_is_on_par"),
     "gemm": ("gemm_matrix", "a_gemm_training_step_is_on_par"),
     "fused_gemm": ("fused_gemm_matrix", "a_fused_gemm_training_step_is_on_par"),
