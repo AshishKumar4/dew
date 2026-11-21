@@ -156,18 +156,13 @@ def _tangent(units, queries, width, raw_scale, out_dtype, out_heads, primals, ta
     along an exponential's operand, which it refuses (the base review of 9bc8a9da1, F1)."""
     value = functools.partial(_value, units=units, queries=queries, width=width, raw_scale=raw_scale,
                               out_dtype=out_dtype, out_heads=out_heads)
-    moving = [i for i, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero)]
-    if not moving:
+    live = [not isinstance(tangent, SymbolicZero) for tangent in tangents]
+    if not any(live):
         out = value(*primals)
         return out, tuple(SymbolicZero(jax.typeof(x).to_tangent_aval()) for x in out)
-    if len(moving) == len(primals):
-        return jax.jvp(value, primals, tangents)
-
-    def moved(*active):
-        it = iter(active)
-        return value(*(next(it) if i in moving else primal for i, primal in enumerate(primals)))
-
-    return jax.jvp(moved, tuple(primals[i] for i in moving), tuple(tangents[i] for i in moving))
+    perturbed, fill = programs.holes(primals, live)
+    moving = tuple(tangent for tangent, is_live in zip(tangents, live, strict=True) if is_live)
+    return jax.jvp(lambda *active: value(*fill(active)), tuple(perturbed), moving)
 
 _merged = contracted("test_a_padded_merges_derivatives_are_the_laws")(
     declared_tangent(KernelGlue(), _launched, _tangent, nondiff_argnums=(0, 1, 2, 3, 4, 5),
