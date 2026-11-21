@@ -2,14 +2,17 @@
 take (tests/test_native_certificates.py: two value heads on a key head, on mma.sync's bundle and warpgroup
 MMA's), interpreted: each record the launches keep inside its step's enclosure (rows 5412, 5421)."""
 
+import dataclasses
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import recurrence_witness as rw
-from interval_certificates import within
+from interval_certificates import point, staged, within
 from op_certificates import FLOAT32, exp2_rounded
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import product
 
 TARGETS = ("sm80", "sm90")
 """The native cells' bundles: mma.sync's (an A100's) and warpgroup MMA's (an H100's)."""
@@ -69,3 +72,18 @@ def test_an_inference_forward_is_witnessed_at_its_own_tiles(target):
     for held in found:
         for name, inside in held.items():
             assert np.all(inside), (name, float(np.mean(inside)))
+
+
+def test_two_bf16_parts_of_a_value_sum_within_its_staged_reach():
+    """fp32 values split into two bf16 parts (`product.formed`, a 16-bit call's doubling merges' operands in
+    fp32, `mainloop.merge_parts`) sum within the witness's reach of the value
+    (`interval_certificates.staged`), subnormals among them, whose second part rounds below bf16's normals at
+    an absolute step: a value near 1e-40 dropped 2^-134 where the reach held none, and Kimi's steep inverse
+    lay one bf16 step outside its enclosure on a GH200 (row 10007)."""
+    rng = np.random.default_rng(0)
+    x = np.concatenate([np.float32([1.0e-40, -6.43e-40, 1.956e-38, 2.5e-38, -1.4e-45, 0.0, 1.0, -3.7e-3]),
+                        rng.standard_normal(256).astype(np.float32) * np.float32(2.0) ** rng.integers(
+                            -149, 20, 256).astype(np.float32)])
+    total = sum(np.asarray(part, np.float64) for part in product.formed(jnp.asarray(x), 2))
+    found = staged(point(x), dataclasses.replace(rw.interpreted_lane(), held=2, wide=True))
+    assert np.all((found.lo <= total) & (total <= found.hi)), x[(total < found.lo) | (total > found.hi)]
