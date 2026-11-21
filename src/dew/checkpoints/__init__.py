@@ -248,6 +248,14 @@ def location(directory: str) -> epath.Path:
     return path if is_uri(directory) else path.resolve()
 
 
+def _grids_recorded(written: Mapping[str, JSON]) -> JSON:
+    """The grids a local step records (`Grid.each`), one a mesh: a step an earlier Dew wrote records its one
+    mesh's alone (`grid`), read as the list of it."""
+    if "grids" in written:
+        return written["grids"]
+    return None if written.get("grid") is None else [written["grid"]]
+
+
 class Envelope(TypedDict):
     """What a checkpoint of a run's state holds on every tier, as `Checkpoints.save` and `save_local` each
     take it, their own metadata beside it: the state as saved, its data position (`saved`), the partition
@@ -1326,8 +1334,8 @@ class Checkpoints:
         # A process that lost its copy recovers it where the processes holding it hold a copy of
         # every shard it held (`_covered`).
         holders = frozenset(index for index, step in enumerate(steps) if step == newest)
-        recorded = self._from_holder(holders, lambda: (self._open_local().metadata(newest).custom_metadata
-                                                       or {}).get("grids"))
+        recorded = self._from_holder(holders, lambda: _grids_recorded(
+            self._open_local().metadata(newest).custom_metadata or {}))
         grids = tuple(from_record(Grid, grid) for grid in recorded) if isinstance(recorded, list) else None
         if grids is None or not _covered(grids, holders):
             return None
@@ -1444,6 +1452,9 @@ class Checkpoints:
         it holds one (`rollout`), which `rollout_state` reads back, and the run holding `tokenizer`, where
         given, the one the step's inference declaration (`artifact`) states the files of, before the step is
         written (`dew.inference.tasks.hold_tokenizer`): a committed step's tokenizer is in its run.
+        `held_apart` writes each array on part of the pool by the processes holding it (`Envelope`): for a
+        pipeline's rows, each leaf one global array placed alike on every process, never a value each
+        process holds of its own under one name, which Orbax refuses as host-local.
 
         `state` is a run's `TrainState`, or a mapping of arrays in its place
         for a state that is not a training run's, such as a simulation's,
@@ -1850,7 +1861,8 @@ class Checkpoints:
         held_apart: bool = False,
     ) -> None:
         """Write `state` under `step` to this process's local directory, asynchronously, with its
-        rollout's tree where it holds one (`rollout`, replicated: every process writes it whole).
+        rollout's tree where it holds one (`rollout`, replicated: every process writes it whole);
+        `held_apart` as `save` takes it, for a pipeline's rows alone.
 
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The

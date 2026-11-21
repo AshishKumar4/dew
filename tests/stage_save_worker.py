@@ -125,7 +125,9 @@ def _diagonal(directory) -> dict:
                                              barrier_sync_key_prefix=f"diagonal{me}")
     registry = ocp.type_handlers.create_type_handler_registry(
         (jax.Array, SubmeshArrays(primary_host=None, replica_id=None, use_replica_parallel=False)))
-    handler = _handler(multiprocessing_options=multiprocessing, type_handler_registry=registry)
+    # The local tier's own handler: OCDBT and Zarr 3 (`Checkpoints._open_local`).
+    handler = _handler(use_ocdbt=True, use_zarr3=True, multiprocessing_options=multiprocessing,
+                       type_handler_registry=registry)
     path = f"{directory}/diagonal-{me}"
     with ocp.Checkpointer(handler, multiprocessing_options=multiprocessing) as checkpointer:
         checkpointer.save(path, {"x": array})

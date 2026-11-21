@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from orbax.checkpoint._src.futures import future
+from orbax.checkpoint._src.metadata import array_metadata
 from orbax.checkpoint._src.path import async_path
 from orbax.checkpoint._src.serialization import jax_array_handlers as handlers, replica_slices
 
@@ -94,17 +95,19 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
         args = list(args or [ocp.SaveArgs()] * len(values))
         parted: list[int] = []
         whole: list[int] = []
-        # A local tier's array whose held shards Orbax's own write would leave some of, each index written
-        # once by this process (`held_slices`), whatever replica holds it.
+        indexed: list[int] = []
         local = self._primary_host is None and self._replica_id is None
-        indexed = [index for index, value in enumerate(values) if local and omitted_replicas(value)
-                   and (not apart(value) or isinstance(args[index], HeldApart))]
         for index, value in enumerate(values):
-            if index in indexed:
-                continue
-            # A stage's array alone: any other's on part of the pool, Orbax's own refusal (module docstring).
-            (parted if apart(value) and isinstance(value.sharding, jax.sharding.NamedSharding)
-             and isinstance(args[index], HeldApart) else whole).append(index)
+            held_apart = (apart(value) and isinstance(value.sharding, jax.sharding.NamedSharding)
+                          and isinstance(args[index], HeldApart))
+            if local and (held_apart or not apart(value)) and omitted_replicas(value):
+                # A local tier's array whose held shards Orbax's own write would leave some of, each index
+                # written once by this process (`held_slices`), whatever replica holds it.
+                indexed.append(index)
+            else:
+                # A stage's array alone: any other's on part of the pool, Orbax's own refusal (module
+                # docstring).
+                (parted if held_apart else whole).append(index)
         futures = [] if not whole else list(await super().serialize(
             [values[index] for index in whole], [infos[index] for index in whole],
             [args[index] for index in whole]))
@@ -158,17 +161,24 @@ class SubmeshArrays(ocp.type_handlers.ArrayHandler):
     def _written(self, values, infos, args, indexed: list[int]) -> future.Future:
         """The local tier's write of the arrays at `indexed`, each index this process holds once
         (`held_slices`), with their shardings where the handler writes them, as Orbax's own write does."""
-        slices = [held_slices(values[index]) for index in indexed]
+        # A key as Orbax writes one: its words, its implementation in the array's metadata.
+        typed = {index for index in indexed if jnp.issubdtype(values[index].dtype, jax.dtypes.prng_key)}
+        physical = [jax.random.key_data(values[index]) if index in typed else values[index]
+                    for index in indexed]
+        keys = {infos[index].name: {array_metadata.RANDOM_KEY_IMPL: str(jax.random.key_impl(values[index]))}
+                for index in typed}
+        slices = [held_slices(value) for value in physical]
 
         async def written() -> None:
             if self._enable_write_sharding_file:
                 await handlers._async_serialize_shardings(
-                    shardings=[values[index].sharding for index in indexed],
+                    shardings=[value.sharding for value in physical],
                     infos=[infos[index] for index in indexed], primary_host=None)
             await handlers._async_serialize_replica_slices(
                 slices, [infos[index] for index in indexed], [args[index] for index in indexed],
-                primary_host=None, metadata_key=self._metadata_key, array_metadata_store=None,
-                enable_replica_parallel_separate_folder=False, use_replica_parallel=False, ext_metadata={})
+                primary_host=None, metadata_key=self._metadata_key,
+                array_metadata_store=self._array_metadata_store,
+                enable_replica_parallel_separate_folder=False, use_replica_parallel=False, ext_metadata=keys)
 
         return future.CommitFutureAwaitingContractedSignals(written(), name="serialize_local_indexed")
 

@@ -52,7 +52,10 @@ class Grid:
             if not isinstance(leaf.sharding, jax.sharding.NamedSharding):
                 return None
             mesh = leaf.sharding.mesh
-            if not isinstance(mesh, jax.sharding.Mesh):
+            # A mesh of another backend's devices than the pool's default (a CPU-owned run's companion beside
+            # its accelerator's banks) is no grid a recovery resolves by device id.
+            if (not isinstance(mesh, jax.sharding.Mesh)
+                    or mesh.devices.flat[0].platform != jax.default_backend()):
                 return None
             meshes.setdefault(_placed_on(mesh), {})[jax.tree_util.keystr(path)] = tuple(
                 _split_axes(leaf.sharding.spec))
@@ -122,12 +125,12 @@ def _from_replicas(tree, grids: Sequence[Grid], holders: frozenset[int]):
         if all(mesh.shape[name] == 1 for name in along):
             return leaf
         grid = next(grid for grid in grids if grid.holds(mesh))
-        if (grid.devices, split) not in masks:
+        if (_placed_on(mesh), split) not in masks:
             sources = _sources(grid, split, holders)
             assert sources is not None, "a recovered step's shards are covered (`_covered`)"
             every = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*mesh.axis_names))
-            masks[grid.devices, split] = jax.make_array_from_callback(sources.shape, every,
-                                                                      lambda index: sources[index])
+            masks[_placed_on(mesh), split] = jax.make_array_from_callback(sources.shape, every,
+                                                                          lambda index: sources[index])
         typed = jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
         values = jax.random.key_data(leaf) if typed else leaf
         held = values.sharding
@@ -142,7 +145,7 @@ def _from_replicas(tree, grids: Sequence[Grid], holders: frozenset[int]):
         summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
                                 in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
         summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")),
-                                        masks[grid.devices, split])
+                                        masks[_placed_on(mesh), split])
         value = (summed != 0 if values.dtype == np.bool_
                  else jax.lax.bitcast_convert_type(summed, values.dtype))
         value = jax.device_put(value, held)

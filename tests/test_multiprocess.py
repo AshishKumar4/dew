@@ -1615,6 +1615,16 @@ def test_a_process_that_lost_its_copy_of_a_key_of_another_implementation_recover
             assert report[name] == report["expected"]
 
 
+@pytest.mark.distributed
+def test_a_local_step_on_two_meshes_is_recovered_on_each_from_a_replica(tmp_path):
+    """Two leaves the pool replicates, each on its own mesh of the same devices: the local step's record holds
+    a grid a mesh, the holders cover both, and the process that lost its copy receives each leaf's values
+    over its own mesh (row 10814; `replica_key_worker.replica_grids`)."""
+    for report in run_pool("replica_grids", tmp_path / "pool", 2, devices=2, script=REPLICA_KEY):
+        assert report["grids"] == 2 and report["covered"] is True, report
+        assert report["recovered"] == report["expected"], report
+
+
 # --------------------------------------------------------------------------
 # Validation and artifacts in a pool
 # --------------------------------------------------------------------------
