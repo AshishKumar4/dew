@@ -2002,22 +2002,32 @@ def test_an_elementwise_aligned_sum_split_over_a_mesh_is_computed_shard_by_shard
 
 def test_a_compensated_sum_over_axes_of_one_element_is_its_values():
     """`compensated_sum` over an axis of one element, alone or beside a longer one, and the compensated pair
-    reduction under it (`summed_pairs`): the values themselves, and beside a longer axis the same sum as the
-    reduction over that axis alone, bitwise, where XLA:GPU's simplifier rewrote a pair reduction over an
-    axis of one element into one array's bitcast and refused its program (row 10674; the GPU's own run in
-    test_gpu_models' users-process cells)."""
+    reduction under it (`summed_pairs`): the values themselves, both limbs of a pair as they are, with no
+    reduction of pairs left in the program, and beside a longer axis the same sum as the reduction over that
+    axis alone, bitwise, where XLA:GPU's simplifier rewrote a pair reduction over an axis of one element into
+    one array's bitcast and refused its program (row 10674; the GPU's own run in test_gpu_models'
+    users-process cells). An axis out of range or a pair of two shapes is refused."""
+    from reference_error import equations
+
     from dew.nn.precision import compensated_sum, summed_pairs
 
     rng = np.random.default_rng(10674)
     x = jnp.asarray(rng.standard_normal((32, 1, 5)), jnp.float32)
+    # Each low limb under half its high one's unit, so the pair is renormalized as it is.
+    low = x * jnp.asarray(rng.uniform(-1.0, 1.0, (32, 1, 5)) * 2.0 ** -30, jnp.float32)
     found = jax.jit(lambda x: compensated_sum(x, (1,)))(x)
     np.testing.assert_array_equal(np.asarray(found), np.asarray(x[:, 0]))
     alone = jax.jit(lambda x: compensated_sum(x, (1,)))(x[:, 0])
     beside = jax.jit(lambda x: compensated_sum(x, (1, 2)))(x)
     np.testing.assert_array_equal(np.asarray(beside), np.asarray(alone))
-    hi, lo = jax.jit(lambda x: summed_pairs((x, x * 0), (-2,)))(x)
-    assert hi.shape == lo.shape == (32, 5)
+    hi, lo = jax.jit(lambda x, low: summed_pairs((x, low), (1,)))(x, low)
     np.testing.assert_array_equal(np.asarray(hi), np.asarray(x[:, 0]))
+    np.testing.assert_array_equal(np.asarray(lo), np.asarray(low[:, 0]))
+    traced = jax.make_jaxpr(lambda x, low: summed_pairs((x, low), (1,)))(x, low)
+    assert not [eqn for eqn in equations(traced) if eqn.primitive is jax.lax.reduce_p]
+    for axes, pair in (((3,), (x, low)), ((1,), (x, low[:1]))):
+        with pytest.raises(ValueError):
+            summed_pairs(pair, axes)
 
 
 def test_an_aligned_sum_over_an_empty_axis_is_zero():
