@@ -15,6 +15,7 @@ import hashlib
 import itertools
 import math
 from collections.abc import Callable, Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -1198,13 +1199,6 @@ class _Draws:
                       uncovered("examples"), uncovered("example_rows"), shares, collinear)
 
 
-def _shares(found: list[list], count: int) -> np.ndarray:
-    """The worst rows' shares over a run's seeds (`_Draws.shares`, seed by leaf by arm), NaN where one is
-    unknown (a recording's summary keeps no row's elements)."""
-    return np.asarray([[[np.nan if share is None else share for share in pair] for pair in seed]
-                       for seed in found], np.float64).reshape(count, -1, 2)
-
-
 def example_mse(arm, truth) -> np.ndarray | None:
     """An arm's mean squared error from its float64 `truth` on each of a leaf's independent examples, its
     first axis (`judge`'s `examples`); None for a leaf of no axis."""
@@ -1350,7 +1344,8 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (path, kept, their.dtype)
-            row.append((-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0), (0.0, 0.0)))
+            row.append(Paired(-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, finite=True,
+                              shares=np.zeros((len(SHARE_KINDS), 2))))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (was and not own) or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
@@ -1372,7 +1367,35 @@ def _one_row(recorded: RecordedLeaf, truth, terms=None) -> RecordedLeaf:
     return dataclasses.replace(row, example_mse=recorded.example_mse, example_worst=recorded.example_worst)
 
 
-def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
+class Paired(NamedTuple):
+    """One seed's evidence of a leaf for check 1 (`_paired`), read by name (`_drawn_from`): its arms' log
+    mean squared errors, their worst sized rows, the rows of float64 zero with both arms' errors on them
+    (`ZeroRows`), whether every value was finite, and the shares of each arm's worst row's squared error,
+    one array `[kind, arm]` (`SHARE_KINDS`), NaN where unknown (row 10786: a share added as one more
+    positional field broke every reader unpacking the entry)."""
+
+    mse: float
+    their_mse: float
+    worst: float
+    their_worst: float
+    zero_rows: ZeroRows
+    finite: bool
+    shares: np.ndarray
+
+
+SHARE_KINDS = ("element", "collinear")
+"""The kinds of a worst row's share of its squared error `Paired.shares` holds, in its order: its largest
+element's (`RecordedLeaf.share`) and its share along its truth row (`RecordedLeaf.collinear`, row 9780)."""
+
+
+def _shares_of(mine: RecordedLeaf | None, theirs: RecordedLeaf | None) -> np.ndarray:
+    """`Paired.shares` from each arm's summary (`SHARE_KINDS` of it), NaN for an arm passed as None or a
+    share it does not know."""
+    return np.asarray([[np.nan if leaf is None or getattr(leaf, kind) is None else getattr(leaf, kind)
+                        for leaf in (mine, theirs)] for kind in ("share", "collinear")], np.float64)
+
+
+def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> Paired:
     """One seed's evidence of a leaf for check 1 (`_Draws`), Dew's and the reference's alike from
     `leaf_summary`: their mean squared errors, their worst sized rows, the rows of float64 zero with
     both arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and
@@ -1392,8 +1415,8 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
-        return (mine.log_mse, theirs.log_mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
-                mine.finite and theirs.finite, (mine.share, theirs.share), (mine.collinear, theirs.collinear))
+        return Paired(mine.log_mse, theirs.log_mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
+                      mine.finite and theirs.finite, _shares_of(mine, theirs))
     # Each of Dew's rows of float64 zero against the reference's same row, every row at once (up to 283k a
     # draw at 2469's chunk sites, which a loop of scalar logs held for a fifth of a GPU attention file's
     # time, row 5461): aligned in any order, a repeated row read at its last, as a mapping of rows reads it.
@@ -1417,12 +1440,10 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     carried = ~measured & ((errors != 0) | (their_errors != 0))
     rows, errors, their_errors = rows[carried], errors[carried], their_errors[carried]
     # A measured row of float64 zero that became an arm's worst keeps no share of its own: unknown.
-    shares = (mine.share if worst == mine.log_worst else None,
-              theirs.share if their_worst == theirs.log_worst else None)
-    collinear = (mine.collinear if worst == mine.log_worst else None,
-                 theirs.collinear if their_worst == theirs.log_worst else None)
-    return (mine.log_mse, theirs.log_mse, worst, their_worst, (rows, errors, their_errors),
-            mine.finite and theirs.finite, shares, collinear)
+    shares = _shares_of(mine if worst == mine.log_worst else None,
+                        theirs if their_worst == theirs.log_worst else None)
+    return Paired(mine.log_mse, theirs.log_mse, worst, their_worst, (rows, errors, their_errors),
+                  mine.finite and theirs.finite, shares)
 
 
 def _at_least(worst: float, logs: np.ndarray) -> float:
@@ -1836,12 +1857,16 @@ def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[t
     examples' ratios and worst rows (`_example_ratios`, `_example_worst_rows`)."""
     count = len(evidence)
 
-    def each(at: int) -> list[list]:
-        return [[entry[at] for entry in row] for row in evidence]
+    def each(field: str) -> list[list]:
+        return [[getattr(entry, field) for entry in row] for row in evidence]
 
-    worst = np.asarray([[(entry[2], entry[3]) for entry in row] for row in evidence]).reshape(count, -1, 2)
-    return _Draws(names, np.asarray(each(0)), np.asarray(each(1)), worst, each(4), np.asarray(each(5)),
-                  widths, examples, example_rows, _shares(each(6), count), _shares(each(7), count))
+    worst = np.asarray([[(entry.worst, entry.their_worst) for entry in row]
+                        for row in evidence]).reshape(count, -1, 2)
+    # Each seed's leaves' shares, `[seed, leaf, arm]` a kind (`Paired.shares`' `[kind, arm]`).
+    shares = np.asarray(each("shares"), np.float64).reshape(count, -1, len(SHARE_KINDS), 2)
+    return _Draws(names, np.asarray(each("mse")), np.asarray(each("their_mse")), worst, each("zero_rows"),
+                  np.asarray(each("finite")), widths, examples, example_rows, shares[:, :, 0],
+                  shares[:, :, 1])
 
 
 
