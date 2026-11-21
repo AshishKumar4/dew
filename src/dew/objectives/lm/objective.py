@@ -1716,7 +1716,7 @@ class LMObjective(TokenScorer):
         return statistics, aux
 
     def predict(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
-                logits: bool = True) -> tuple[Ratio, Aux[Variables], Prediction]:
+                logits: bool = True) -> tuple[Ratio | RoutedStatistics, Aux[Variables], Prediction]:
         """Return the loss with the logits, target weights and `layers` outputs behind it.
 
         A teacher compares these (`Objective.predict`). The logits are the whole
@@ -1724,21 +1724,15 @@ class LMObjective(TokenScorer):
         distillation's KL reads every column; without `logits` the loss is scored as `loss` scores
         it, its head a tile at a time where its policy tiles it, and the prediction holds none (a
         distillation reading the sampled ids' likelihoods alone). The balance loss's and the router
-        z-loss's terms normalize per router, so they cannot share a distillation's token mass and are
-        refused; a `balance_rate` alone balances without a loss term. The indexer warm-up scores no
-        tokens, so it has nothing to distill.
+        z-loss's terms normalize per router, so they come beside the token statistics (`RoutedStatistics`),
+        which a distillation keeps apart from its own mass (row 9071: refused). The indexer warm-up scores
+        no tokens, so it has nothing to distill.
         """
         if self._warmup:
             raise ValueError("the indexer warm-up scores no token, so it has no prediction")
-        balance = self.balance
-        if balance is not None and (balance.aux_loss_alpha is not None or balance.router_z_loss):
-            raise ValueError(
-                "the balance loss's and the router z-loss's router terms normalize per router, and a "
-                "distillation mixes terms over the counted tokens; balance the "
-                "student's routers with balance_rate instead")
         statistics, aux, scores, _ = self._scored_loss(params, batch, step, train=train, layers=layers,
                                                        logits=logits)
-        assert isinstance(statistics, Ratio) and (scores.logits is not None or not logits)
+        assert scores.logits is not None or not logits
         whole = None if scores.logits is None else constrain(scores.logits, LOGITS)
         return statistics, aux, Prediction(whole, scores.losses, scores.weights, scores.layers)
 

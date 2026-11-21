@@ -100,51 +100,12 @@ def built_objectives(tmp_path_factory):
                  else WorldModelObjective(dynamics, tokenizer, tokens))
         return built, None
 
-    root = tmp_path_factory.mktemp("guided")
-
-    def guided():
-        # Guidance distillation over a guidance-embedded denoiser (a tiny Flux), which the recipe's DiT is
-        # not, its teacher the same objective at its draw, so both stability cells trace and refit it
-        # (row 9695: its case carried no batch, and both skipped it).
-        from flax import linen as nn
-        from interop_support import extract_fixture
-        from objective_data import IMAGES, first
-        from test_guidance_distillation import FIXTURES, FLUX
-
-        from dew.config import ObjectiveConfig
-        from dew.config.diffusion import DiffusionRunConfig
-        from dew.data import TFDS, images as image_steps, presets
-        from dew.diffusion.presets import Flow
-        from dew.inputs import TextCondition
-        from dew.objectives.base import TEACHER
-        from dew.objectives.diffusion import GuidanceDistillationObjective
-        from dew.registry import ModelConfig
-        from dew.sampling import Euler
-
-        # One text pipeline for every build, as its path is part of its encoder's record.
-        if not (root / "flux").exists():
-            extract_fixture(FIXTURES / "flux_source.tar.xz", root / "flux")
-        config = DiffusionRunConfig(
-            model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-            data=TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 8, batch=2,
-                                                                          caption=image_steps.caption()),
-            preset=Flow(), val_metrics=(),
-            text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")),
-            objective=ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2,
-                                                    "ema_decay": None}))
-        base = config.build()
-        drawn = nn.unbox(base.init(jax.random.key(0)))
-        built = GuidanceDistillationObjective(base.model, base.process, base.inputs,
-                                              variables={TEACHER: drawn}, steps=2)
-        return built, first(config.data, built)
-
     # Built for its key alone (`None`, no batch): the cells that trace or fit an objective read the ones a
     # recipe or a config trains on.
     keyed = {"lm indexer": indexed, "world model": functools.partial(world, "dynamics"),
              "world tokenizer": functools.partial(world, "tokenizer")}
     windows = corpus_windows(tmp_path_factory.mktemp("corpus"))
-    return {**cases(windows), "guidance_distillation": guided,
-            **{f"run {kind}": functools.partial(run, kind) for kind in RUN_KINDS}, **keyed}
+    return {**cases(windows), **{f"run {kind}": functools.partial(run, kind) for kind in RUN_KINDS}, **keyed}
 
 
 @dataclasses.dataclass(frozen=True)

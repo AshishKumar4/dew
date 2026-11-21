@@ -967,13 +967,11 @@ def test_every_objectives_watched_cotangents_reach_its_model_calls(name, windows
     cotangent probes to each model call it watches, which no step refuses, and the loss's cotangent
     reaches each probe: a count of entries and a finite sum of their squares, the parameters' gradient
     the unprobed step's to the bit. Flow-GRPO's, trained on rollouts, is `test_flow_grpo`'s."""
-    from test_whole_validation import runnable
-
     from dew.nn.inspection import Watched
     from dew.objectives.base import Step
     from dew.training.transaction import probed_loss
 
-    objective, batch = runnable(name, windows, tmp_path)
+    objective, batch = cases(windows)[name]()
     if name == "ppo":
         mask = np.asarray(batch["response_mask"], np.float32)
         batch = {**batch, "old_values": np.zeros_like(mask), "returns": mask}
@@ -1043,13 +1041,11 @@ def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbat
 def rcm_probes(windows, tmp_path, *, student: bool, consistency_weight: float | None = None) -> dict:
     """The gradient of an rCM step's watched blocks' cotangent probes (`probed_loss`), at the first update
     past its warm-up of the phase `student` names, its consistency weight `consistency_weight` if given."""
-    from test_whole_validation import runnable
-
     from dew.nn.inspection import Watched
     from dew.objectives.base import Step
     from dew.training.transaction import probed_loss
 
-    objective, batch = runnable("rcm", windows, tmp_path)
+    objective, batch = cases(windows)["rcm"]()
     if consistency_weight is not None:
         objective.consistency_weight = consistency_weight
     variables = objective.init(jax.random.key(0))

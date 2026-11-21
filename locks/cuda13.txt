@@ -1,5 +1,5 @@
 --index-url https://pypi.org/simple
---extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post115/46619bb2cb59c1f9/simple/
+--extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post117/fa5c7c355fb76364/simple/
 --extra-index-url https://pypi.dewml.dev/simple
 
 absl-py==2.5.1 \
@@ -2688,8 +2688,8 @@ jaraco-functools==4.6.0 \
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post115 \
-    --hash=sha256:3e811eefbc13b81ee71f77119ca577e38224afbeac9a7a32830effcd1d9ae7e7
+jax==0.12.0.1.post117 \
+    --hash=sha256:b74b66449aa77c66043c486d43e6b70b7d1684f8e99f715f4a95f45a905411f9
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -2700,19 +2700,19 @@ jax==0.12.0.1.post115 \
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jax-cuda13-pjrt==0.12.0.1.post114 \
-    --hash=sha256:a869ed8ff196347569d106747f4195fb036ec4dc4093116886e3419df4b7eac8 \
-    --hash=sha256:e384d6044f69201da93d50e87ca1ad2f46557f7013df38312517336b9b1e35b2
+jax-cuda13-pjrt==0.12.0.1.post117 \
+    --hash=sha256:02d9bfa0f1495097a1b388863afc009ecbe64816d50429ee350260f26fa540d9 \
+    --hash=sha256:05a7f93e9c78db969dcaceb0a332f6e15f9a8d8cdd41921176940aa5636666ed
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda13-plugin
-jax-cuda13-plugin==0.12.0.1.post114 \
-    --hash=sha256:0f0c819c8bf7a122a5d3e8337953daccc237c4d97632e659ab0716e6de4e2a54 \
-    --hash=sha256:189b28c91475ba2712447f24e38aaa59e881e0d152e2f9193db9962ea6814e2c \
-    --hash=sha256:4bb8e7623480c1121354f1990e27acaef50950758ddbf96b8686933b2e6070f4 \
-    --hash=sha256:7935e79f2e54806aca873f10f810841eee274c0474bd37a172a6b93e7e740b74 \
-    --hash=sha256:81a09b1c5428621ab6037bd0553dcd846d66f5af679209e8532d7ba13ac36407 \
-    --hash=sha256:be6924325bc9fda6cf52c35b4549ae16e97ff7d81fab6c7f789071bd721a0a3d
+jax-cuda13-plugin==0.12.0.1.post117 \
+    --hash=sha256:06cacfd61bf25548aa37a6582869e9471c2505f2ea5f1a1fced1811d80f20a49 \
+    --hash=sha256:62396b10b6d7fef3ee3fa0bd0ad047ee4cdf606322a7ae59ca0e6124411510ea \
+    --hash=sha256:72791d10c945278be0b655219830a2ef005ee7b926feafed9cf5febe28a52a04 \
+    --hash=sha256:e260fef296e46ccd86fcdd763b5184ad1173ef3a6a43cc31385a87794cbb4e4f \
+    --hash=sha256:e3947357425093a9f2fbc48faa050d3465c54bbc15cb6638564f204048efea50 \
+    --hash=sha256:f8420fedbde08df22d52b2f42328d2203b325ddbac15e8f92e3698bb2e539aa5
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1 ; (platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux' \
     --hash=sha256:00acba6d262f20110289e5d3384cd92298ae362226b66f77f92c518fab55c2c6 \
@@ -2743,13 +2743,13 @@ jaxlib==0.12.0.1 ; (platform_machine != 'aarch64' and platform_machine != 'x86_6
     #   optax
     #   qwix
     #   tokamax
-jaxlib==0.12.0.1.post114 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
-    --hash=sha256:05677f48c195a484f6772d844fb13997a9f02ea6896b960eac6ebf0baad0cce5 \
-    --hash=sha256:06bc0275ff271af8b2c451ec7a5c09376b425e216884781eadbce33b055eebe1 \
-    --hash=sha256:117a7169960d734619bc2a79cad97968e040b28923bf478d12a7b9f0a1f7d138 \
-    --hash=sha256:3b84b7312b11c3f79308dc61935549ac525e0822d5b39614bb8c18733d40eeb1 \
-    --hash=sha256:82d1e01147145acb708672a49395a30d51136fc5df395ff54867b4d829208ad6 \
-    --hash=sha256:8522f75b983d83407726bda8a05b14a933da621b373d81255e68a8a1c8624739
+jaxlib==0.12.0.1.post117 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
+    --hash=sha256:40160b5666dbe7c25a599a436d11ad7c66fd733b71e17ae498633550cd182c40 \
+    --hash=sha256:55d520652f97ac411da0bc6d7e3f633877ed3eaad9c63dc5b689105cccd8b217 \
+    --hash=sha256:a4d18e9aa5bf234740de2428d4ae5b251a3c365b338ace131bef724d2b06311a \
+    --hash=sha256:e24202c129a1ffb27ccbfd95419ada92d857712c9310dda96f71f91f07e4f405 \
+    --hash=sha256:f0949bae188262a1577e00961b32b16f64589d91f72ca6865d6b29cd3a9c7bbd \
+    --hash=sha256:fa1e651f7e872da36763f0968df2a825a234cd690a9b1aea6c86c9689faacee3
     # via
     #   dewml (pyproject.toml)
     #   jax

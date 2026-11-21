@@ -1301,7 +1301,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
             largest = (_largest(program, hooked, (row, place[2]), k_first, slots, converted,
                                 value_width=value_width) if spec.headroom or unit is not None else None)
             accumulate = family.accumulating(mosaic.declared_into(program.products, "sums"), slots,
-                                             _accumulated(family, interpret))
+                                             _accumulated(family, interpret,
+                                                          product_scale=spec.units / spec.reach))
             keys = algebra.Keys(coords, logits, tile, dot, accumulate, products, largest)
             state = algebra.plain_step(spec, state, keys)
             if certified is not None:
@@ -1640,13 +1641,20 @@ def _parted_products(family: mosaic.Family, acc, scale, weights: jax.Array, valu
     return issued_pairs(family, acc, pairs(), interpret)
 
 
-def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
+def _accumulated(family: mosaic.Family, interpret: bool, *, product_scale: float = 1.0) -> Callable:
     """`algebra.Keys.accumulate` on the family's accumulator: the tile's products issued into it in place,
     after its factor where the step gives one (`Family.rescaled_products`). A scaled tile's small weights'
-    parts (`algebra.small_parts`), which trail the weights' own, take an accumulator of their own each,
-    restored and added in after them (`issued_into`; an fp32 call's of its parts, `_parted_products`), so
-    the weights' own products take the unscaled walk's issue."""
+    parts (`algebra.small_parts`), traced row-scaled parts (`product.Scaled`, row 9507), or products whose
+    sums hold different units (`product_scale != 1`, `algebra.in_units`) take a fresh accumulator each,
+    restored or scaled and added in after the step's rescale (`issued_into`)."""
     def accumulate(acc, scale, parts, value):
+        if product_scale != 1.0 and not isinstance(value, operands.Parts):
+            if scale is not None:
+                acc = family.rescaled_products(acc, scale, (), None, interpret)
+            first = parts[0].value if isinstance(parts[0], product.Scaled) else parts[0]
+            fresh = issued_into(family, None, parts, value, interpret,
+                                shape=(first.shape[0], value.shape[-1]))
+            return family.added_into(acc, fresh * jnp.float32(product_scale), interpret)
         count = sum(1 for part in parts if _small(part))
         if count:
             acc = accumulate(acc, scale, parts[:-count], value)
@@ -1660,6 +1668,10 @@ def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
         if isinstance(value, operands.Parts):
             (weights,) = parts
             return _parted_products(family, acc, scale, weights, value, interpret)
+        if any(isinstance(part, product.Scaled) for part in parts):
+            if scale is not None:
+                acc = family.rescaled_products(acc, scale, (), None, interpret)
+            return issued_into(family, acc, parts, value, interpret)
         if scale is None:
             return issued_into(family, acc, parts, value, interpret)
         return family.rescaled_products(acc, scale, parts, value, interpret)
@@ -1727,7 +1739,8 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
         total, own, others_total, *scale = carry
         k_first, coords, logits, products = scored(index, slots)
         accumulate = family.accumulating(mosaic.declared_into(placed, "sums"), slots,
-                                         _accumulated(family, interpret))
+                                         _accumulated(family, interpret,
+                                                      product_scale=spec.units / spec.reach))
         keys = algebra.Keys(coords, logits, values(slots), dot, accumulate, products,
                             largest(k_first, slots) if spec.headroom else None)
         # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`).

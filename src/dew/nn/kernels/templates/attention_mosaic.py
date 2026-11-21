@@ -102,6 +102,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     query_rows,
     reducing,
     refused,
+    scaled_drop,
     score_places,
     split_queries,
     stagings,
@@ -647,8 +648,10 @@ class MosaicForward(_Mainloop[Tiles]):
         # A family that places its products on a role issues its logits ahead (`_ahead`: tcgen05's rows,
         # whose issuer warp is a step ahead of its consumer), which past its tensor memory it does not: its
         # products' scratch then none it takes (`Issuer.product_scratch`).
-        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and not self._ahead(ba, config,
-                                                                                              target):
+        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and (
+                not self._ahead(ba, config, target)
+                or scaled_drop(ba.arguments["query"].dtype, ba.arguments.get("drop"),
+                               ba.arguments.get("initial"))):
             return False
         if not super().legal(ba, config, target):
             return False
@@ -1082,6 +1085,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 started=initial is not None and residuals is Kept.SPLIT,
                                 dropped=drop is not None,
                                 weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
+                                scaled_products=scaled_drop(computed, drop, initial),
                                 prologue=(None if self.query_mod is None
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)))
 

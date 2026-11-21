@@ -172,8 +172,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post115 and, on Linux x86_64 and aarch64, its own jaxlib build
-  0.12.0.1.post114, with its CUDA and PJRT plugins 0.12.0.1.post114 (post96's until now). A GPU compile takes a
+- Dew requires its JAX build 0.12.0.1.post117 and, on Linux x86_64 and aarch64, its own jaxlib build
+  0.12.0.1.post117, with its CUDA and PJRT plugins 0.12.0.1.post117 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
   executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the buffers
@@ -213,7 +213,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   algorithm states, where it refused such a dot (row 8554); and a program's Mosaic GPU kernels instantiating at
   once leave the compile threads free while they wait on LLVM's options lock (row 8602); and a Mosaic GPU kernel's
   lowering cache keys its placement only where the kernel reads it, so a kernel that reads no mesh is one cache entry
-  under any mesh (row 8793). Elsewhere jaxlib stays the stock 0.12.0.1.
+  under any mesh (row 8793), its equations' placement (a nested jit's context mesh, a broadcast's or a reshard's
+  sharding) among it, so a launch certified alone and its program's per-shard lowering share one entry (row 6740: a
+  hybrid decoder's cold step lowered 11 of 13 kernels again, 4 now); the Pallas fuser carries a cast along manual
+  mesh axes through a fused stage, so a fused epilogue in a checked `shard_map` reads a value each device holds its
+  own of (row 9808); and a CPU executable read back from the compilation cache keeps one collective communicator
+  across a while loop's body, a call's and a conditional's branches and the sequence holding them, where ranks
+  entered a loop's all-reduce and an all-gather beside it in different orders until their rendezvous timed out (row
+  10128: a sharded Mamba step's cached program). Elsewhere jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes
