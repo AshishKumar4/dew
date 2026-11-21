@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from hypothesis import strategies as st
-from reference_error import as_given, assert_as_exact, dew_path
+from reference_error import ahead_arm, as_given, assert_as_exact, dew_path, ran_here
 
 from dew.algebra import means, scaled
 from dew.algebra.forms import Refused
@@ -33,59 +33,91 @@ def _merge(outputs, totals, anchors):
     return means.merged_output(outputs, totals, anchors, NATURAL, 0)
 
 
-def _ways(fn):
-    """`fn` jitted and op by op, and jitted on a GPU's and a TPU's tier (`WAYS`)."""
+def _ways(fn, label: str):
+    """`fn` each way a cell runs the law (`WAYS`): op by op, eagerly, and jitted as an arm a GPU tier part's
+    prepare compiles ahead at its host inputs and its run runs from that program (`reference_error.ahead_arm`,
+    `fn` jitted outside a part), under `label`, one program a label. A cell of several arms runs each before
+    it judges any: a prepare's arm gives zeros, and a check between two would fail there, the arms after it
+    never compiled ahead."""
     def eager(*args):
         with jax.disable_jit():
             return fn(*args)
-    return {"jitted": jax.jit(fn), "op by op": eager, "on a gpu": jax.jit(fn), "on a tpu": jax.jit(fn)}
+    jitted = ahead_arm(jax.jit(fn), label)
+    return {"jitted": jitted, "op by op": eager, "on a gpu": jitted, "on a tpu": jitted}
 
 
-WAYS = ["jitted", "op by op",
+CPU_LANE = pytest.mark.cpu(reason="eager dispatch and the CPU lane's jit: a GPU's tier runs the law on a gpu")
+"""The ways the CPU lane alone takes (`WAYS`): op by op, whose eager dispatch no prepare compiles ahead, and
+jitted here, which a GPU's tier takes as its own way."""
+
+WAYS = [pytest.param("jitted", marks=CPU_LANE), pytest.param("op by op", marks=CPU_LANE),
         pytest.param("on a gpu", marks=pytest.mark.gpu(reason="the primitives on a GPU")),
         pytest.param("on a tpu", marks=pytest.mark.tpu(reason="the primitives on a TPU"))]
-"""Each way a cell runs the law: jitted and op by op here, jitted on a GPU and on a TPU on their tiers."""
+"""Each way a cell runs the law: jitted and op by op on the CPU lane, jitted on a GPU and on a TPU on their
+tiers, each from the programs its tier's prepare compiled ahead (`_ways`)."""
 
 
 def test_a_scaled_value_lands_as_the_float_it_holds():
     values = np.asarray([0.0, 1.0, -1.5, 3.0, 2.0 ** -126, -(2.0 ** -100), 2.0 ** 100, LARGEST, -LARGEST],
                         np.float32)
-    np.testing.assert_array_equal(np.asarray(scaled.landed(scaled.scaled(values))), values)
+    landings = ran_here(lambda x: scaled.landed(scaled.scaled(x)), "scaled values landed")
+    found = [run(values) for run in landings]
+    for landed in found:
+        np.testing.assert_array_equal(np.asarray(landed), values)
 
 
 def test_a_product_and_a_quotient_past_the_range_land_their_value():
     """(2^100 2^100) / 2^150 and (2^-100 2^-100) 2^150 exactly: their products are past fp32's range on the
     way, as the masses of the merge's cases are."""
-    big, small, step = (scaled.scaled(np.float32(2.0 ** e)) for e in (100, -100, 75))
-    assert float(scaled.landed(scaled.div(scaled.mul(big, big), scaled.mul(step, step)))) == 2.0 ** 50
-    assert float(scaled.landed(scaled.mul(scaled.mul(small, small), scaled.mul(step, step)))) == 2.0 ** -50
+    def landed(*values):
+        big, small, step = (scaled.scaled(value) for value in values)
+        return (scaled.landed(scaled.div(scaled.mul(big, big), scaled.mul(step, step))),
+                scaled.landed(scaled.mul(scaled.mul(small, small), scaled.mul(step, step))))
+
+    values = tuple(np.float32(2.0 ** e) for e in (100, -100, 75))
+    found = [run(*values) for run in ran_here(landed, "products and quotients past the range")]
+    assert all((float(high), float(low)) == (2.0 ** 50, 2.0 ** -50) for high, low in found)
 
 
 def test_a_product_by_a_scaled_coefficient_moves_one_way_to_its_value():
     """fp32's largest by 3/4 is 3/4 of it, where the coefficient's significand first (1.5) would pass the
     format; 2^-120 by 2^200 / 2^150 is 2^-70, where 2^-120 by 2^-150 first would flush."""
-    three_quarters = scaled.div(scaled.scaled(np.float32(3.0)), scaled.scaled(np.float32(4.0)))
+    def applied(three, four, largest, high, low, least):
+        three_quarters = scaled.div(scaled.scaled(three), scaled.scaled(four))
+        coefficient = scaled.div(scaled.div(scaled.scaled(high), scaled.scaled(low)), scaled.scaled(high))
+        return scaled.applied(largest, three_quarters), scaled.applied(least, coefficient)
+
     largest = np.float32(LARGEST)
-    assert float(scaled.applied(largest, three_quarters)) == largest * np.float32(0.75)
-    coefficient = scaled.div(scaled.scaled(np.float32(2.0 ** 100)), scaled.scaled(np.float32(2.0 ** -50)))
-    coefficient = scaled.div(coefficient, scaled.scaled(np.float32(2.0 ** 100)))
-    assert float(scaled.applied(np.float32(2.0 ** -120), coefficient)) == 2.0 ** -70
+    values = (np.float32(3.0), np.float32(4.0), largest, *(np.float32(2.0 ** e) for e in (100, -50, -120)))
+    found = [run(*values) for run in ran_here(applied, "a product by a scaled coefficient")]
+    assert all((float(near), float(far)) == (largest * np.float32(0.75), 2.0 ** -70) for near, far in found)
 
 
 def test_a_form_past_its_exponents_reach_is_refused():
     """Squaring a value 21 times takes its exponent's bound past `REACH`: refused, never emitted."""
-    value = scaled.scaled(np.float32(1.5))
-    with pytest.raises(Refused):
+    def squared(x):
+        value = scaled.scaled(x)
         for _ in range(21):
             value = scaled.mul(value, value)
+        return scaled.landed(value)
+
+    # Refused as it is traced, nothing computing (a GPU tier part's prepare computes nothing).
+    with pytest.raises(Refused):
+        jax.eval_shape(squared, jax.ShapeDtypeStruct((), jnp.float32))
 
 
 def test_the_compensated_sum_keeps_what_cancels_in_every_order():
     """+-1.7 2^126 / 3 beside 1.3 2^-126: the residual exactly, whatever the order of the terms."""
     large, tiny = np.float32(1.7 * 2.0 ** 126 / 3), np.float32(1.3 * 2.0 ** -126)
-    for order in itertools.permutations([large, -large, tiny]):
-        summed, errors = scaled.compensated(list(jnp.asarray(order, jnp.float32)))
-        assert float(summed + errors) == tiny
+
+    def kept(terms):
+        summed, errors = scaled.compensated(list(jnp.asarray(terms, jnp.float32)))
+        return summed + errors
+
+    sums = ran_here(kept, "a compensated sum of cancelling terms")
+    found = [run(np.asarray(order, np.float32)) for order in itertools.permutations([large, -large, tiny])
+             for run in sums]
+    assert all(float(value) == tiny for value in found)
 
 
 L = LARGEST
@@ -115,7 +147,7 @@ def test_a_merge_at_fp32s_edges_stays_in_its_hull(case, way):
     mass weighed nothing, V7's 5 never read), where the forms of the five rounds each left it for an
     overflow, a flush or a cancellation."""
     outputs, totals, anchors = (np.asarray(x, np.float32) for x in CASES[case])
-    mean = np.asarray(_ways(_merge)[way](outputs, totals, anchors))
+    mean = np.asarray(_ways(_merge, "a merge at fp32's edges")[way](outputs, totals, anchors))
     least, most = _hull(outputs, totals)
     assert np.all(np.isfinite(mean)) and np.all(mean >= least) and np.all(mean <= most)
 
@@ -124,12 +156,17 @@ def test_exactly_opposite_terms_leave_the_rest_exactly():
     """V4: outputs +-1.7 2^126 beside 3.9 2^-126 at equal masses: the mean is the third output's term alone,
     its output by a third (`scaled.applied`), jitted and op by op, whatever the states' order."""
     large, tiny = 1.7 * 2.0 ** 126, 3.9 * 2.0 ** -126
-    reciprocal = scaled.div(scaled.one_like(np.float32(1.0)), scaled.scaled(np.float32(3.0)))
-    third = float(scaled.applied(np.float32(tiny), reciprocal))
-    for order in itertools.permutations([large, -large, tiny]):
-        outputs = np.asarray(order, np.float32)[:, None]
-        for merged in _ways(_merge).values():
-            assert float(merged(outputs, np.ones(3, np.float32), np.zeros(3, np.float32))[0]) == third
+
+    def a_third(x, three):
+        return scaled.applied(x, scaled.div(scaled.one_like(three), scaled.scaled(three)))
+
+    # Every arm run before any is judged (`ran_here`): each way's third and its merges, judged by its own.
+    thirds = [run(np.float32(tiny), np.float32(3.0)) for run in ran_here(a_third, "a third of the rest")]
+    merges = ran_here(_merge, "opposite terms beside a third")
+    found = [[merged(np.asarray(order, np.float32)[:, None], np.ones(3, np.float32), np.zeros(3, np.float32))
+              for order in itertools.permutations([large, -large, tiny])] for merged in merges]
+    for third, merged in zip(thirds, found, strict=True):
+        assert all(float(mean[0]) == float(third) for mean in merged)
 
 
 def test_a_window_a_sum_completed_is_not_summed_again():
@@ -144,7 +181,7 @@ def test_a_window_a_sum_completed_is_not_summed_again():
                           [0.0, -(2.0 ** 120)], [0.0, 2.0 ** 120]], np.float32)
     masses = np.full(5, 2.0 ** -120, np.float32)
     anchors = np.asarray([0.0, 0.0, -200.0, -200.0, -400.0], np.float32)
-    for merged in _ways(_merge).values():
+    for merged in ran_here(_merge, "windows a sum completed"):
         np.testing.assert_array_equal(np.asarray(merged(outputs, masses, anchors)), [2.0 ** -121, 0.0])
 
 
@@ -154,13 +191,18 @@ def test_a_subnormal_output_weighs_in_the_merge_and_its_derivative():
     mass direction `[2^127, 0]` by `-2^-130 2^127 / 4 = -2^-5`. A subnormal read as zero gave `2^-126` and
     `0` (`scaled.scaled`, the merge P0's head review, F2), jitted and op by op."""
     unit, level = np.ones(2, np.float32), np.zeros(2, np.float32)
-    for merged in _ways(_merge).values():
-        mean = merged(np.asarray([[2.0 ** -127], [2.0 ** -125]], np.float32), unit, level)
-        assert float(mean[0]) == 1.25 * 2.0 ** -126
     outputs = np.asarray([[0.0], [2.0 ** -130]], np.float32)
     along = np.asarray([2.0 ** 127, 0.0], np.float32)
-    for merged in _ways(lambda totals: _merge(outputs, totals, level)).values():
-        assert float(jax.jvp(merged, (unit,), (along,))[1][0]) == -(2.0 ** -5)
+
+    def moved(totals):
+        return jax.jvp(lambda totals: _merge(outputs, totals, level), (totals,), (along,))[1]
+
+    # Every arm run before any is judged (`_ways`).
+    merged_means = [merged(np.asarray([[2.0 ** -127], [2.0 ** -125]], np.float32), unit, level)
+              for merged in ran_here(_merge, "subnormal outputs merged")]
+    tangents = [run(unit) for run in ran_here(moved, "a subnormal output's tangent")]
+    assert all(float(mean[0]) == 1.25 * 2.0 ** -126 for mean in merged_means)
+    assert all(float(tangent[0]) == -(2.0 ** -5) for tangent in tangents)
 
 
 def test_a_subnormal_total_holds_its_mass_and_a_negative_one_none():
@@ -174,14 +216,17 @@ def test_a_subnormal_total_holds_its_mass_and_a_negative_one_none():
     level = np.zeros(2, np.float32)
     outputs, masses = np.asarray([[1.0], [3.0]], np.float32), np.full(2, least, np.float32)
     totals = np.asarray([2.0 ** -125, -(2.0 ** -127)], np.float32)
-    for finished in _ways(lambda x, total: means.finished(x, total)).values():
-        assert float(finished(np.full(1, least, np.float32), least)[0]) == 1.0
-    for merged in _ways(_merge).values():
-        assert float(merged(outputs, masses, level)[0]) == 2.0
-    for state in _ways(lambda o, w, m: means.merged_state(o, w, m, NATURAL, 0)[0]).values():
-        assert float(state(outputs, masses, level)[0]) == 2.0
-    for total in _ways(lambda w, m: means.merged_total(w, m, NATURAL, 0)[0]).values():
-        assert float(total(totals, level)) == 2.0 ** -125
+    # Every arm run before any is judged (`_ways`).
+    finished = [run(np.full(1, least, np.float32), least)
+                for run in ran_here(lambda x, total: means.finished(x, total), "a subnormal state finished")]
+    merged = [run(outputs, masses, level) for run in ran_here(_merge, "subnormal masses merged")]
+    states = [run(outputs, masses, level) for run in ran_here(
+        lambda o, w, m: means.merged_state(o, w, m, NATURAL, 0)[0], "subnormal masses' merged state")]
+    landed = [run(totals, level) for run in ran_here(lambda w, m: means.merged_total(w, m, NATURAL, 0)[0],
+                                                  "a negative subnormal total beside a positive one")]
+    assert all(float(value[0]) == 1.0 for value in finished)
+    assert all(float(value[0]) == 2.0 for value in (*merged, *states))
+    assert all(float(value) == 2.0 ** -125 for value in landed)
 
 
 MIXED = {
@@ -203,7 +248,7 @@ def test_the_merges_mixed_second_derivative_is_its_laws(case, way):
     derivative its tangents' difference (`means.gapped_p`), never read off the gap's exponent."""
     outputs, totals, along_mass, along_output, expected = MIXED[case]
     operands = (np.asarray(x, np.float32) for x in (outputs, totals, along_mass, along_output))
-    assert float(_ways(_mixed_along)[way](*operands)[0]) == expected
+    assert float(_ways(_mixed_along, "the merge's mixed second derivative")[way](*operands)[0]) == expected
 
 
 def _mixed_along(o, w, along_mass, along_output):
@@ -248,7 +293,8 @@ def test_the_derivatives_of_the_merges_gradient_are_the_laws(case, way):
     (-1, and the Hessian's product 1 and 3); a subnormal gap finite (train 943's review)."""
     outputs, totals, along_outputs, along_masses, mixed, hessian = (np.asarray(x, np.float32)
                                                                     for x in GRADIENTS[case])
-    along_o, forward, reverse = (np.asarray(x) for x in _ways(_gradients_derivatives_along)[way](
+    along_o, forward, reverse = (np.asarray(x) for x in _ways(
+        _gradients_derivatives_along, "the merge's gradient's derivatives")[way](
         outputs, totals, along_outputs, along_masses))
     assert along_o.tolist() == mixed.tolist()
     assert forward.tolist() == hessian.tolist() and reverse.tolist() == hessian.tolist()
@@ -269,7 +315,7 @@ def test_the_merges_derivative_along_a_common_scaling_of_its_masses_is_zero(way)
         ones = jax.jvp(lambda moved: _merge(moved, w, anchors), (o,), (jnp.ones_like(o),))[1]
         return masses, ones
 
-    masses, ones = _ways(along)[way](outputs, totals)
+    masses, ones = _ways(along, "a common scaling of the masses")[way](outputs, totals)
     assert (float(masses[0]), float(ones[0])) == (0.0, 1.0)
 
 
@@ -296,10 +342,13 @@ def test_a_merged_total_lands_at_an_anchor_that_keeps_its_mass(way, total, ancho
     state weighed it a half (base review F2). Two of 2^126 at 2^31 sum to 2^127, within the format, kept at
     their anchor: moved by its spacing, 256, the total landed at 0 and the third weighed it whole (the
     re-review's F1). Totals 1 and 2 at one anchor land as 3 at it."""
-    relanded = _ways(_relanded(total, total, anchor))[way]
-    assert float(relanded(np.full(2, total, np.float32))[0]) == float(np.float32(1 / 3))
-    landed, at = _ways(lambda totals, anchors: means.merged_total(totals, anchors, NATURAL, 0))[way](
+    # Both arms run before either is judged (`_ways`).
+    relanded = _ways(_relanded(total, total, anchor), "a total relanded at its anchor")[way](
+        np.full(2, total, np.float32))
+    landed, at = _ways(lambda totals, anchors: means.merged_total(totals, anchors, NATURAL, 0),
+                       "totals landed at one anchor")[way](
         np.asarray([1.0, 2.0], np.float32), np.full(2, anchor, np.float32))
+    assert float(relanded[0]) == float(np.float32(1 / 3))
     assert (float(landed), float(at)) == (3.0, anchor)
 
 
@@ -314,7 +363,7 @@ def test_a_zero_total_merged_moves_the_next_merge_along_its_total(way):
         return means.merged_output(jnp.stack([output, jnp.ones(1)]), jnp.stack([total, jnp.float32(1.0)]),
                                    jnp.stack([anchor, jnp.float32(0.0)]), NATURAL, 0)[0]
 
-    assert float(_ways(jax.grad(composed))[way](np.float32(0.0))) == -0.25
+    assert float(_ways(jax.grad(composed), "a zero total's merge moved")[way](np.float32(0.0))) == -0.25
 
 
 @pytest.mark.parametrize("way", WAYS)
@@ -324,7 +373,7 @@ def test_a_state_negligible_beside_a_large_output_weighs_nothing(way):
     which rounds to 0; a factor held at a floor of 2^-378 merged them to 4 (base review F1). Its anchor a
     billion below, past `means.FLOOR`, it weighs nothing too."""
     for far in (-1000.0, -1e9):
-        merged = _ways(_merge)[way](np.asarray([[0.0], [2.0 ** 127]], np.float32),
+        merged = _ways(_merge, "a state far below")[way](np.asarray([[0.0], [2.0 ** 127]], np.float32),
                                     np.asarray([2.0 ** -126, 2.0 ** 127], np.float32),
                                     np.asarray([0.0, far], np.float32))
         assert float(merged[0]) == 0.0
@@ -334,14 +383,18 @@ def test_a_finished_and_a_resumed_state_land_once():
     """V5 and V8: a contraction of 1.5 2^126 over a total of 2^127, whose reciprocal is subnormal, finishes to
     3/4 where a division through that reciprocal flushed; a mean of 0.8 over a total of 1.5 2^126 resumes to
     its contraction, each one product by a scaled value."""
-    for finish in _ways(means.finished).values():
-        finished = finish(np.asarray([[1.5 * 2.0 ** 126]], np.float32), np.asarray([2.0 ** 127], np.float32))
-        assert float(finished[0, 0]) == 0.75
     total = np.asarray([1.5 * 2.0 ** 126], np.float32)
-    for resume in _ways(means.resumed).values():
-        assert float(resume(np.asarray([[0.8]], np.float32), total)[0, 0]) == np.float32(0.8) * total[0]
+    # Every arm run before any is judged (`_ways`).
+    finished = [finish(np.asarray([[1.5 * 2.0 ** 126]], np.float32), np.asarray([2.0 ** 127], np.float32))
+                for finish in ran_here(means.finished, "a state finished past the range")]
+    resumed = [resume(np.asarray([[0.8]], np.float32), total)
+               for resume in ran_here(means.resumed, "a state resumed past the range")]
+    assert all(float(value[0, 0]) == 0.75 for value in finished)
+    assert all(float(value[0, 0]) == np.float32(0.8) * total[0] for value in resumed)
 
 
+@pytest.mark.cpu(reason="Hypothesis draws apart in each process, which no GPU part's prepare compiles "
+                        "ahead: the ways' cells hold the hull on a GPU (test_a_merge_at_fp32s_edges_...)")
 @hypothesis.settings(max_examples=60, deadline=None)
 @hypothesis.given(count=st.integers(1, 12), data=st.data())
 def test_any_merge_stays_in_its_hull(count, data):
@@ -393,7 +446,7 @@ def test_a_channel_beside_either_edge_keeps_what_an_lse_scaled_combine_keeps(cou
         return jax.jvp(lambda totals: means.merged_output(outputs, totals, np.zeros(count, np.float32),
                                                           NATURAL, 0), (totals,), (along,))
 
-    mean, moved = _ways(merged)[way](outputs, np.ones(count, np.float32))
+    mean, moved = _ways(merged, "a channel beside either edge")[way](outputs, np.ones(count, np.float32))
     np.testing.assert_array_equal(mean, outputs.astype(np.float64).mean(0).astype(np.float32))
     assert np.all(np.isfinite(moved))
 
@@ -445,7 +498,8 @@ def _on_par(state, apart, way: str, draw, label: str) -> None:
     common bits, held so and not bit for bit (docs/design/testing.md; the merge P0's base review 11, F10).
     Each draw's arms read alike in every draw, so a pair of one value resolves at the fewest seeds."""
     if way == "op by op":
-        state, apart = (as_given(_ways(fn)["op by op"]) for fn in (state, apart))
+        state, apart = (as_given(_ways(fn, f"{label}, {role}")["op by op"])
+                        for fn, role in ((state, "state"), (apart, "apart")))
     assert_as_exact(state, dew_path(apart), draw, f"{label}, {way}", seeds=FEWEST_SEEDS)
 
 
@@ -517,8 +571,8 @@ def test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_deriva
     _on_par(_second(_state(1)), _second(_apart(1)), way, drawn, f"{label}, the gradient's derivative")
     _on_par(_value(_batched_form(_state)), _value(_batched_form(_apart)), way, drawn, f"{label}, batched")
     operands = draw(0)
-    np.testing.assert_array_equal(np.asarray(_ways(_state(1))[way](*operands)[2]),
-                                  np.asarray(_ways(_apart(1))[way](*operands)[2]))
+    np.testing.assert_array_equal(np.asarray(_ways(_state(1), "a merged state's anchor")[way](*operands)[2]),
+                                  np.asarray(_ways(_apart(1), "its parts' anchor")[way](*operands)[2]))
 
 
 def _gradients_derivatives(form):
@@ -563,7 +617,7 @@ def test_a_float64_merge_keeps_what_float64_holds(way):
     review)."""
     with jax.enable_x64(new_val=True):
         outputs = np.asarray([[2.0 ** 900], [-(2.0 ** 900)], [2.0 ** -900]])
-        merged = _ways(_merge)[way](outputs, np.ones(3), np.zeros(3))
+        merged = _ways(_merge, "a float64 merge")[way](outputs, np.ones(3), np.zeros(3))
         assert np.asarray(merged).tolist() == [2.0 ** -900 / 3]
 
 
@@ -589,7 +643,8 @@ def test_a_merged_state_is_the_same_on_whichever_axis_its_states_lie(way):
     _on_par(lambda *xs: first(*xs)[:2], lambda *xs: second(*xs)[:2], way, drawn,
             "a merged state along either axis")
     operands = drawn(0)
-    anchors = [np.asarray(_ways(fn)[way](*operands)[2]).view(np.uint32) for fn in (first, second)]
+    anchors = [np.asarray(_ways(fn, f"a merged state's anchor, {index}")[way](*operands)[2]).view(np.uint32)
+               for index, fn in enumerate((first, second))]
     np.testing.assert_array_equal(*anchors)
 
 
@@ -599,15 +654,23 @@ def test_a_vmapped_merge_and_its_gradient_are_each_merges_own():
     totals unbatched as well as batched."""
     outputs, totals, anchors = _batch(0)
     gradients = _gradient(_merge)
+    merge_alone, gradient_alone = (ahead_arm(jax.jit(fn), label) for fn, label in (
+        (_merge, "a merge alone"), (gradients, "a merge's gradient alone")))
+    # Every arm run before any is judged (`ran_here`).
+    found = []
     for in_axes in ((0, 0, 0), (0, None, 0)):
         shared = totals if in_axes[1] == 0 else totals[0]
-        mapped = jax.jit(jax.vmap(_merge, in_axes))(outputs, shared, anchors)
-        derived = jax.jit(jax.vmap(gradients, in_axes))(outputs, shared, anchors)
-        for k in range(len(outputs)):
-            alone = (outputs[k], shared if in_axes[1] is None else shared[k], anchors[k])
-            assert np.asarray(mapped[k]).tolist() == np.asarray(jax.jit(_merge)(*alone)).tolist()
-            for got, own in zip(derived, jax.jit(gradients)(*alone), strict=True):
-                assert np.asarray(got[k]).tolist() == np.asarray(own).tolist()
+        mapped, derived = (ahead_arm(jax.jit(jax.vmap(fn, in_axes)), f"{label} mapped over {in_axes}")(
+            outputs, shared, anchors) for fn, label in ((_merge, "merges"), (gradients, "gradients")))
+        alone = [(outputs[k], shared if in_axes[1] is None else shared[k], anchors[k])
+                 for k in range(len(outputs))]
+        found.append((mapped, derived, [merge_alone(*each) for each in alone],
+                      [gradient_alone(*each) for each in alone]))
+    for mapped, derived, merged, own_gradients in found:
+        for k, (merge, own) in enumerate(zip(merged, own_gradients, strict=True)):
+            assert np.asarray(mapped[k]).tolist() == np.asarray(merge).tolist()
+            for got, expected in zip(derived, own, strict=True):
+                assert np.asarray(got[k]).tolist() == np.asarray(expected).tolist()
 
 
 @pytest.mark.mesh(devices=2)
@@ -727,22 +790,24 @@ def test_a_merged_state_of_broadcast_anchors_is_its_output_and_its_total(anchors
 
     _on_par(value(_state(1)), value(_apart(1)), "jitted", drawn, "a merged state of broadcast anchors")
     operands = drawn(0)
-    assert np.asarray(jax.jit(_state(1))(*operands)[2]).tolist() == np.asarray(
-        jax.jit(_apart(1))(*operands)[2]).tolist()
+    anchors_of = [np.asarray(ahead_arm(jax.jit(form), f"broadcast anchors' {label}")(*operands)[2]).tolist()
+                  for form, label in ((_state(1), "state"), (_apart(1), "parts"))]
+    assert anchors_of[0] == anchors_of[1]
 
 
 def test_the_primitives_result_types_keep_weak_types():
     """A scaled product (`applied_p`) of weakly typed operands is weakly typed, as JAX's own entrywise
     products are, and of a strongly typed one strongly: a Python float's product promotes as a float's
     would."""
-    weak, strong = jnp.asarray(3.0), jnp.asarray(3.0, jnp.float32)
-    exponent = jnp.asarray(2, jnp.int32)
+    # Types alone, nothing placed (a GPU tier part's prepare computes nothing, not even an array's placing).
+    weak, strong = (jax.ShapeDtypeStruct((), jnp.float32, weak_type=weak) for weak in (True, False))
+    exponent = jax.ShapeDtypeStruct((), jnp.int32)
 
-    def product(x, significand):
+    def product(x, significand, exponent):
         return scaled.applied_p.bind(x, significand, exponent)
 
-    assert jax.eval_shape(product, weak, jnp.asarray(1.5)).weak_type
-    assert not jax.eval_shape(product, weak, strong).weak_type
+    assert jax.eval_shape(product, weak, weak, exponent).weak_type
+    assert not jax.eval_shape(product, weak, strong, exponent).weak_type
 
 
 def test_every_primitive_of_the_construct_is_recorded_with_the_value_it_lowers_as():
@@ -755,11 +820,21 @@ def test_every_primitive_of_the_construct_is_recorded_with_the_value_it_lowers_a
     assert reached <= set(scaled.MADE)
     value, several = scaled.MADE[means.merged_state_p]
     assert several
-    found = value(jnp.asarray(outputs), jnp.asarray(totals), jnp.asarray(anchors), units=NATURAL, axis=1)
-    for got, expected in zip(found, _state(1)(outputs, totals, anchors), strict=True):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+    bound = _state(1)
+
+    def recorded_and_bound(*operands):
+        o, w, m = (jnp.asarray(x) for x in operands)
+        return value(o, w, m, units=NATURAL, axis=1), bound(o, w, m)
+
+    # Every way run before any is judged (`ran_here`).
+    for found, held in [run(outputs, totals, anchors)
+                        for run in ran_here(recorded_and_bound, "the merged state's value and its bind")]:
+        for got, expected in zip(found, held, strict=True):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
+@pytest.mark.cpu(reason="a refusal at bind, alike on every backend: the CPU lane holds it")
 def test_a_parameter_made_at_each_call_is_refused_at_bind():
     """A law primitive's parameter keys its compiled programs (`scaled._Primitive`): units made at each call,
     a partial or a closure, are refused at bind, where each call would compile again and hold its executable;
