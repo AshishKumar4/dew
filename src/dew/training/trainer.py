@@ -761,8 +761,13 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             from dew.distributed.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
-        # Its kernels certified on the GPU the run targets, outside the mesh its step traces under (row 6824).
-        with report.targeting(self.device_mesh):
+        # Its kernels certified on the GPU the run targets, outside the mesh its step traces under (row
+        # 6824). A host step's state is built on its CPU companion (`execution.placed_host`), so its shapes
+        # are traced there too, whatever the process's default device: traced on an attached GPU, its
+        # initializer took the GPU's routes the run's CPU build does not (row 10569).
+        on_host = (jax.default_device(self.state_mesh.local_devices[0]) if self.host_master
+                   else contextlib.nullcontext())
+        with report.targeting(self.device_mesh), on_host:
             stated = self._step_key(self.objective, self._compiler)
             draw = traced_draw(self._staged_start, initializer, key, HELD_APART,
                                stated and (stated, self._start_owner()))
