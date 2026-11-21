@@ -1184,8 +1184,7 @@ class AheadTarget:
             # Into a cache a device run reads as tuned, as a device step's (below): a program no device run
             # has tuned is counted, its run compiling it on its GPU, never a traceback (row 9693).
             try:
-                with report.for_devices():
-                    return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
+                return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
             except report.Untuned as refused:
                 # Named as every untuned program is (`program_name`), a host step's VJP results stating no
                 # form.
@@ -1577,8 +1576,10 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     # refused the step (row 6163). The start is traced within it too, as a run on that GPU traces it: traced
     # before, in a build that sees no GPU, its initializer's launches took the CPU's routes and certified
     # nothing, so the run certified them on its GPU (rows 7322, 8299: five init-shape launches).
+    # A host step's start runs on its CPU companion (`Trainer._started`), traced as that run traces it.
+    start = trainer._started() if trainer.host_master else None
     with assumed(on, portable=portable), certifying:
-        start = trainer._started()
+        start = trainer._started() if start is None else start
         if start.resume is not None and trainer.checkpoints is not None:
             # A resumed run's step compiles at the rung its checkpoint records and the split its state was
             # saved at (a checkpoint keeps a window only part filled, `dew.state.without_empty_window`), as
@@ -1684,8 +1685,10 @@ def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch:
     fresh state's and `batch`'s shapes as its run's startup does (`StepCompiler._compile_host`), its CPU
     companion this process's CPUs: JAX's persistent cache, keyed by what each program lowers to under its
     options and target, then holds each, and the run's startup on those GPUs reads them, compiling none
-    (training.md's warm start; Main's choice for row 7908: no file, the shared cache). What the pass
-    compiled, by backend (`HostStartup`)."""
+    (training.md's warm start; Main's choice for row 7908: no file, the shared cache). Its GPU programs are
+    compiled for the devices to run (`report.for_devices`), each taking the tuned choices a run of the GPU
+    left, `report.Untuned` where none has and the run tunes. What the pass compiled, by backend
+    (`HostStartup`)."""
     if not trainer.host_master:
         raise ValueError("prepare_host_step prepares a step that keeps its variables on the host "
                          "(Layout(host=('variables',))); compile a device step ahead with compile_ahead")

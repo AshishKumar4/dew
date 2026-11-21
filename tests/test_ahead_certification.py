@@ -1,28 +1,9 @@
 """A step built ahead for compile-only GPUs certifies and lowers its programs as the run on those GPUs does
 (`dew.training.ahead`, `dew.nn.kernels.templates.report`), so the run compiles none of them again."""
 
-import json
 import os
-import subprocess
-import sys
-from pathlib import Path
 
-_TESTS_DIR = str(Path(__file__).resolve().parent)
-
-
-def _run_cpu_subprocess(script: str, cache_dir: Path, extra_env: dict[str, str] | None = None) -> dict:
-    env = {
-        **os.environ,
-        "PYTHONPATH": os.pathsep.join([_TESTS_DIR, os.environ.get("PYTHONPATH", "")]),
-        "CUDA_VISIBLE_DEVICES": "",
-        "JAX_PLATFORMS": "cpu",
-        "JAX_COMPILATION_CACHE_DIR": str(cache_dir),
-        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
-        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1",
-        **(extra_env or {}),
-    }
-    done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
-    return json.loads(done.stdout.splitlines()[-1])
+from process_support import fresh
 
 
 def test_a_build_for_compile_only_gpus_certifies_its_starts_launches(tmp_path):
@@ -46,7 +27,8 @@ with _targeted(trainer, batch, what="test", platforms=(frozenset({"gpu"}),)):
     ops = [c.op for c in report.certifications()]
 print(json.dumps({"ops": ops}))
 """
-    result = _run_cpu_subprocess(script, tmp_path / "cache")
+    result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
+                   variables={"CUDA_VISIBLE_DEVICES": ""})
     ops = result["ops"]
     assert "RmsForward" in ops and "SwigluForward" in ops, ops
 
@@ -84,15 +66,9 @@ with assumed(stated, portable=True), report.certifying(gpu), jax.set_mesh(mesh):
         warm = owned_program(two_layers).trace(x, w).lower()
     report.settled_aside(aside2)
 
-cold_text, warm_text = cold.as_text(), warm.as_text()
-print(json.dumps({
-    "cold_digest": program_digest(cold),
-    "warm_digest": program_digest(warm),
-    "cold_priv_funcs": sum(1 for ln in cold_text.splitlines() if "func.func private" in ln),
-    "warm_priv_funcs": sum(1 for ln in warm_text.splitlines() if "func.func private" in ln),
-}))
+print(json.dumps({"cold_digest": program_digest(cold), "warm_digest": program_digest(warm),
+                  "certified": len(report.certifications())}))
 """
-    extra = {"XLA_FLAGS": f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0".strip()}
-    result = _run_cpu_subprocess(script, tmp_path / "cache", extra_env=extra)
-    assert result["cold_digest"] == result["warm_digest"], result
-    assert result["cold_priv_funcs"] == result["warm_priv_funcs"], result
+    result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
+                   variables={"CUDA_VISIBLE_DEVICES": ""}, flags=f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0".strip())
+    assert result["certified"] > 0 and result["cold_digest"] == result["warm_digest"], result

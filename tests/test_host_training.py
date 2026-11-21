@@ -2084,7 +2084,7 @@ def test_a_part_stating_no_host_link_prices_no_streamed_step():
     assert not trainer.host_master and trainer.layout_choice.refused is not None
 
 
-def test_a_host_startups_ledger_holds_its_own_compiles_and_no_other_threads():
+def test_a_host_startups_ledger_holds_its_own_compiles_and_no_other_threads(monkeypatch):
     """A host step's startup reads what it compiled from the one ledger of JAX's events
     (`telemetry.compiles.Ledger`), each compile through Dew's compile point its span (`spanning`) and the
     startup's own by its block (`owning`): a program another thread compiles through Dew's compile point
@@ -2096,6 +2096,9 @@ def test_a_host_startups_ledger_holds_its_own_compiles_and_no_other_threads():
     from dew.nn.kernels.options import owned_program
     from dew.training.ahead import prepare_host_step
 
+    # Prepared where its run tunes nothing (the autotuner's level 0), so no GPU run's choices are needed
+    # (`prepare_host_step` compiles for the devices to run, `report.for_devices`).
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0".strip())
     trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
     trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
     tokens = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
