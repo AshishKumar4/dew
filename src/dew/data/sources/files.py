@@ -985,8 +985,10 @@ class Files(Dataset):
         Each file's rows are counted from its footer where a read needs them (`ShardManifest.sized`), unless
         `where` filters them, and its row groups are its shards where readers and workers outnumber its
         files (`_row_groups`)."""
+        # Named by the paths Arrow reads, each a fragment of its dataset in turn, its schema unread
+        # (row 9009: a compile building the dataset read every file's).
         shards = tuple(Shard(name, name, number) for number, name in enumerate(
-            self._shard_name(fragment.path) for fragment in self._listed_files))
+            self._shard_name(path) for path in self._arrow_files[1]))
         return ShardManifest(shards, self._read_shard, self._row_groups,
                              counted=None if self.where is not None else self._file_rows, fixed_parts=True)
 
@@ -1130,6 +1132,18 @@ class Files(Dataset):
 
     def metadata(self) -> Mapping[str, object]:
         return self._metadata
+
+    SCHEMA_FACTS = frozenset({"class_names", "rows", "count_rules"})
+    """The facts a raw Parquet or Arrow store's schema can state (`_metadata`), and no other."""
+
+    def asked(self, keys: Iterable[str]) -> Mapping[str, object]:
+        """Those of its facts named by `keys` (`dew.data.compile.asked_facts`): a raw Parquet or Arrow
+        store, whose schema states none of the others, opens no file for a fact outside `SCHEMA_FACTS`
+        (row 9009: a seeded streamed mix read every member's schema to check the tokenizer contract)."""
+        wanted = set(keys)
+        if self.committed is None and self.kind in ("parquet", "arrow") and not wanted & self.SCHEMA_FACTS:
+            return {}
+        return {key: value for key, value in self._metadata.items() if key in wanted}
 
     def stated(self) -> Mapping[str, object]:
         """What its committed manifest says, or a parquet or Arrow store's schema names (class

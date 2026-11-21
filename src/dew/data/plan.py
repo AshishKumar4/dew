@@ -459,7 +459,7 @@ def structured(value) -> JSON:
 _RULE: contextvars.ContextVar[int] = contextvars.ContextVar("dew.data.plan._RULE")
 """The plan version whose field rule `structured` describes a generated instance by, where one is set: an
 earlier one's, as a plan rebuilt under it reads a position saved under it (`described_under`); this Dew's
-(`DECIDED`) otherwise."""
+(`ASKED`) otherwise."""
 
 
 @contextlib.contextmanager
@@ -474,7 +474,7 @@ def described_under(version: int):
 
 def rule_in_force() -> int:
     """The plan version whose field rule describes steps now (`_RULE`, `described_under`)."""
-    return _RULE.get(DECIDED)
+    return _RULE.get(PLAN_VERSIONS[-1])
 
 
 def _stated_fields(value) -> list[str]:
@@ -963,11 +963,17 @@ it (`referenced`), a generated instance by the fields its repr shows. A plan reb
 it (`Plan.under`)."""
 
 DECIDED = 16
-"""The plan version this Dew records: `REFERENCED`'s record, a generated instance described by every field
+"""A plan version this Dew reads too: `REFERENCED`'s record, a generated instance described by every field
 that decides its equality, a base's of an undecorated subclass among them (`_stated_fields`), where 15
 omitted those its repr hides (a large table, a reader) and an undecorated subclass's."""
 
-PLAN_VERSIONS = (STRUCTURED, REFERENCED, DECIDED)
+ASKED = 17
+"""The plan version this Dew records: `DECIDED`'s record, a store's order of lengths (`Source.lengths`) among
+its derived facts only where a step of its pipeline packs by them (`dew.data.compile._derived`), so a store
+whose lengths only its files' schema states (a raw Parquet store's) opens no file to compile a read that
+packs none (row 9009); 16 recorded every store's that stated them."""
+
+PLAN_VERSIONS = (STRUCTURED, REFERENCED, DECIDED, ASKED)
 """The versions this Dew reads a plan of, the latest the one every plan records and every read reads by
 (`read_by`): the current one and those before it, whose records differ, read by a plan rebuilt under their
 field rule (`Plan.under`). A run saved under an earlier
@@ -1046,9 +1052,9 @@ class Plan:
 
     def under(self, version: int) -> Plan:
         """This plan as a plan of `version` described its steps (`described_under`, `rebuilt`), to be read
-        within that rule: itself where `version` is this Dew's (`DECIDED`) or it holds no rebuild (one
+        within that rule: itself where `version` is this Dew's (`ASKED`) or it holds no rebuild (one
         rebuilt under an earlier rule holds none, `rule_in_force`)."""
-        if version >= DECIDED or self.rebuilt is None:
+        if version >= PLAN_VERSIONS[-1] or self.rebuilt is None:
             return self
         with described_under(version):
             fresh = self.rebuilt()
@@ -1095,7 +1101,7 @@ class Plan:
         """The order as a position names it (`spelled_order`, as JSON text), its stages described as the
         plan `version` described them (`described_under`): what a position saved under it is compared
         with; this Dew's where `version` is None."""
-        with described_under(DECIDED if version is None else version):
+        with described_under(PLAN_VERSIONS[-1] if version is None else version):
             return json.dumps(self.spelled_order(), sort_keys=True)
 
     def spelled_order(self) -> JSON:
@@ -1135,7 +1141,7 @@ class Plan:
                 ("version",),
                 f"the saved data position was written under data plan version {written!r}, and this Dew "
                 f"reads versions {', '.join(map(str, PLAN_VERSIONS))} alone: {_RESUMED}")
-        if written < DECIDED and self.rebuilt is not None:
+        if written < PLAN_VERSIONS[-1] and self.rebuilt is not None:
             earlier = self.under(written)
             with described_under(written):
                 return earlier.check(saved, resume=resume)

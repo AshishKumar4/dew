@@ -158,7 +158,7 @@ from dew.data.pipeline import (
     with_stores,
 )
 from dew.data.plan import (
-    DECIDED,
+    ASKED,
     DataResume,
     Plan,
     StepIdentity,
@@ -170,6 +170,7 @@ from dew.data.plan import (
 )
 from dew.data.readers import GRAIN, Replayed, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
+    TOKENIZER_CONTRACT,
     Read,
     Rows,
     ShardManifest,
@@ -181,6 +182,7 @@ from dew.data.sources.base import (
     stream_manifest,
     tokenizer_contract,
 )
+from dew.data.sources.files import Files
 from dew.data.steps.generic import Coordinated
 from dew.data.storage import Mirrored
 
@@ -286,7 +288,10 @@ class _Facts(View[Source]):
     source: Source
     read: Read
     stated_snapshot: Mapping[str, object]
-    stated_metadata: Mapping[str, object]
+    stated_metadata: Mapping[str, object] | None
+    """The facts the source states as pinning read them, or None where pinning read none (a stream's,
+    `_stated`), which the first reader of them reads then (`metadata`): an undrawn member's files are not
+    opened for facts the plan never asks (row 9009)."""
     stated_description: str
     """The source's description as the compile took it, which every reader the compile makes names its
     corpus by: a store in memory describes itself by a hash of every record it holds, which a reader
@@ -308,7 +313,11 @@ class _Facts(View[Source]):
         return self.stated_snapshot
 
     def metadata(self) -> Mapping[str, object]:
-        return self.stated_metadata
+        return self._metadata
+
+    @functools.cached_property
+    def _metadata(self) -> Mapping[str, object]:
+        return self.source.metadata() if self.stated_metadata is None else self.stated_metadata
 
     def supports(self, read: Read) -> bool:
         return read == self.read or self.source.supports(read)
@@ -398,8 +407,19 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     return found
 
 
+def asked_facts(source: Source, keys: Iterable[str]) -> Mapping[str, object]:
+    """Those of `source`'s facts named by `keys`: a pinned source's as pinning read them, a raw store's
+    without opening a file for a fact its schema cannot state (`Files.asked`), any other's off its
+    metadata (row 9009)."""
+    wanted = frozenset(keys)
+    held = source.source if isinstance(source, _Facts) and source.stated_metadata is None else None
+    if isinstance(held, Files):
+        return held.asked(wanted)
+    return {key: value for key, value in source.metadata().items() if key in wanted}
+
+
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
-    tokenizer_contract((f"corpus {_name(leaf)}", source.metadata())
+    tokenizer_contract((f"corpus {_name(leaf)}", asked_facts(source, TOKENIZER_CONTRACT))
                        for pipeline in pipelines for leaf, source in _leaves(pipeline))
 
 
@@ -503,7 +523,9 @@ def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
     for index, (leaf, source) in enumerate(_leaves(pipeline)):
         if isinstance(source, _Memory):
             arrays.update({f"{index}/{key}": value for key, value in source.derived.items()})
-        lengths = source.lengths()
+        # A store's lengths since `ASKED` where a step packs by them, its files opened for nothing else.
+        packs = any(isinstance(stage, Pack) for stage in leaf.stages)
+        lengths = source.lengths() if packs or rule_in_force() < ASKED else None
         if isinstance(source, _OrderFacts):
             arrays.update({f"{index}/{key}": value for key, value in source.order_fingerprints().items()})
         if lengths is not None and f"{index}/lengths" not in arrays:
@@ -520,7 +542,7 @@ def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
             # that states its content (a store given no name names its shards by no content of its own).
             arrays[f"{index}/shards"] = stream_manifest(
                 source, positioned=any(isinstance(stage, MapWithIndex) for stage in leaf.stages)).digest
-        metadata = source.metadata()
+        metadata = asked_facts(source, ("valid_targets",))
         if "valid_targets" in metadata:
             arrays[f"{index}/valid_targets"] = fingerprint(
                 integer(metadata["valid_targets"], "valid_targets")
@@ -1147,7 +1169,7 @@ def _compiled(
             # The steps it describes read a saved plan's earlier descriptions of them (`ReadsEarlier`).
             earlier=earlier_readers(described, host),
             # Rebuilt under an earlier rule, it is that rule's plan and builds no other.
-            rebuilt=planned if rule_in_force() >= DECIDED else None,
+            rebuilt=planned if rule_in_force() >= ASKED else None,
         )
 
     plan = planned()

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from token_support import write_token_corpus
 
-from dew.data import Loading, Memory, from_iter, mix, presets, text
+from dew.data import Files, Loading, Memory, from_iter, mix, presets, text
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 
@@ -208,3 +208,41 @@ def test_host_flips_jitters_crops_and_captions_keep_the_images_shape_their_steps
     cropped = pictures.pipe(presets.images, 16, batch=None, caption=images.caption("a photo")).map(
         images.CenterCrop(8))
     assert cropped.facts()["fields"]["image"] == [8, 8, 3]
+
+
+SCHEMAS_READ: list[str] = []
+"""Each store whose files' schema a `SchemaCounted` read, by its URL."""
+
+
+class SchemaCounted(Files):
+    """A file store that notes each read of its files' schema (`SCHEMAS_READ`)."""
+
+    @property
+    def arrow(self):
+        SCHEMAS_READ.append(str(self.url))
+        return Files.arrow.func(self)
+
+
+def test_a_seeded_streamed_mix_of_raw_parquet_stores_reads_no_schema_to_compile(tmp_path):
+    """A seeded mix of raw Parquet stores read as streams compiles reading none of its members' schemas,
+    whose facts its plan asks nothing of: the tokenizer contract's facts no raw store's schema states, a
+    stream pins no member's facts, its shards are named by its files' paths, and its lengths are a fact of
+    a plan that packs by them alone (plan version 17; row 9009: compiling read each member's schema four
+    times); its read opens the members it draws."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.pipeline import Pipeline
+
+    for name in ("a", "b"):
+        pq.write_table(pa.table({"x": list(range(8))}), tmp_path / f"{name}.parquet")
+    members = [Pipeline(SchemaCounted(str(tmp_path / f"{name}.parquet")), name=name) for name in ("a", "b")]
+    SCHEMAS_READ.clear()
+    loader = compile(mix(members, seed=3).batch(2), read="streamed", loading=Loading(workers=0))
+    assert SCHEMAS_READ == []
+    stream = loader.train(DataPartition())
+    try:
+        next(stream)
+    finally:
+        stream.close()
+    assert SCHEMAS_READ
