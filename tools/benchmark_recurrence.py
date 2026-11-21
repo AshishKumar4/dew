@@ -222,8 +222,7 @@ def _ssd_parts(shape: Shape, given: dict) -> tuple:
         return out, jnp.swapaxes(final, -1, -2)
 
     def hand(x, dt, A, B, C, D):
-        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, None, shape.chunk,
-                                  not generation.triton_runs())
+        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, shape.chunk, not generation.triton_runs())
 
     # What the kernels take, whatever this GPU's row prefers.
     case = scan_case(x, B, shape.chunk)
