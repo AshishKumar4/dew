@@ -1730,6 +1730,8 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
     for gen in ("sm80", "sm100"):
         _, _, cfg = _gated_backward(gen, 64, accurate=False)
         assert cfg is not None and cfg.fused, (gen, cfg)
+        if gen == "sm100":
+            assert cfg.stages >= 3, cfg
         with generation.assumed(gen):
             found = compile_mosaic_kernels([
                 KernelCase(f"{gen}-fused-d64", lambda: (backward, (query, key, key, query, shapes))),

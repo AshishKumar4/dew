@@ -1839,7 +1839,20 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                           family=queries.name, columns=columns)
                for columns in (1, 2, 4) for walked in walked_extents(queries, query.dtype, key.shape[1])
                for step in steps] if queries is not None else []
-        return next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
+        config = next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
+        if config is None:
+            return None
+        # Deepen sm100 tcgen05 walked backward's TMA ring up to 3 stages (`TURNS + 1`) where SMEM holds it
+        # without reducing SM residency so TMA prefetches ahead of tcgen05 MMA (row 4839).
+        q_steps = -(-query.shape[1] // config.dkv_blocks[0])
+        steps_count = q_steps if config.fused else min(q_steps, -(-key.shape[1] // config.block_k))
+        want = min(3, steps_count)
+        base_resident = self.resident(ba, config, target)
+        for stage_count in range(want, config.stages, -1):
+            candidate = dataclasses.replace(config, stages=stage_count)
+            if self.takes(ba, candidate, target) and self.resident(ba, candidate, target) == base_resident:
+                return candidate
+        return config
 
     def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
         # The query blocks its derivation walks below `config`'s for its consumer's rows (`_query_walk`) on
