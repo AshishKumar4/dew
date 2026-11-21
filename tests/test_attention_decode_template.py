@@ -1008,14 +1008,14 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
                                           heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
     assert priced is not None
     assert priced.device_bytes >= 2 * rows * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
-    # Non-deciding fallback target (sm100, row 8813 F2) prices only the common bounded arm, not both arms.
+    # Non-deciding fallback target (sm100 tcgen05, row 8813 F2) prices only the common bounded arm.
     sm100 = generation.gpu_target("sm100")
-    fallback = attention_decode.priced_step(sm100, rows=1, queries=1, keys=keys, heads=8, kv_heads=kv_heads,
+    fallback = attention_decode.priced_step(sm100, rows=1, queries=32, keys=keys, heads=8, kv_heads=kv_heads,
                                             width=width, dtype=jnp.bfloat16)
     with generation.assumed(sm100):
-        q100 = jnp.zeros((1, 1, 8, width), jnp.bfloat16)
+        q100 = jnp.zeros((1, 32, 8, width), jnp.bfloat16)
         k100 = jnp.zeros((1, keys, kv_heads, width), jnp.bfloat16)
-        plan100, *_ = attention_decode.planned(q100, k100, k100, attention_decode.key_spans(1, keys, 1),
+        plan100, *_ = attention_decode.planned(q100, k100, k100, attention_decode.key_spans(32, keys, 1),
                                                template.Hooks())
     assert plan100 is not None and "bounded" in plan100 and "scaled" in plan100
     expected_kernels = 1 + int(plan100["bounded"].slices > 1)
