@@ -1629,3 +1629,28 @@ def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
         assert algebra.bf16_part_count(accurate=False) == 1
         assert attention._default_16bit_preset("bfloat16", "sm90") == jax.lax.DotAlgorithmPreset.BF16_BF16_F32
         assert attention._default_16bit_preset("float16", "sm90") == jax.lax.DotAlgorithmPreset.F16_F16_F32
+
+
+@COMPILES_ON_CPU
+def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compiles_spill_free():
+    """Row 5272: compute-bound multi-consumer sm90 forward deepens its TMA ring to `consumers + 1` stages
+    when SMEM holds it without reducing SM residency, and compiles spill-free at d64 and d128."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        spans = template.spans(4096, 4096, 1, causal=True)
+        cases = []
+        for label, heads, kv_heads, width in (("sm90-mha-d64", 16, 16, 64), ("sm90-qwen-d128", 32, 8, 128)):
+            q = jax.ShapeDtypeStruct((2, 4096, heads, width), jnp.bfloat16)
+            k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
+            op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+            ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+            cfg = op.derived(ba, target)
+            assert cfg is not None and cfg.consumers >= 2, (label, cfg)
+            assert cfg.stages >= 3, (label, cfg)
+            cases.append(KernelCase(label, lambda op=op, ba=ba, cfg=cfg: op.lowering(ba, cfg)))
+        found = compile_mosaic_kernels(cases, "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
