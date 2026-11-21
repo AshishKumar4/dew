@@ -389,7 +389,7 @@ def test_the_sparse_latent_template_shards_over_batch_and_heads():
                      for x in (absorbed, query_rot, latent, rot, indices))
     with jax.sharding.use_abstract_mesh(explicit), generation.assumed("sm90"):
         explicit_traced = jax.make_jaxpr(lambda *args: _template_forward(*args, scale=1.0)[0])(*rep_args)
-    assert explicit_traced.out_avals[0].sharding.spec == P()
+    assert explicit_traced.out_avals[0].sharding.spec == P(None, None, None, None)
 
     # Behavioral check: distinct per-batch-row latents across 2 rows per shard must match the unsharded call.
     rng = jax.random.split(jax.random.key(10530), 4)
