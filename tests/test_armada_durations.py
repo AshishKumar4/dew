@@ -406,6 +406,38 @@ def test_a_green_run_lowers_each_test_its_record_holds_well_past_what_it_took(ci
         assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == lowered
 
 
+def test_one_verdict_folded_again_moves_nothing_and_a_cold_time_follows_only_runs_the_plan_would_make(
+        ci, tmp_path, monkeypatch):
+    """Each test is lowered before its file is folded whole, so a file whose lowered tests make it stale is
+    refreshed at once and the same verdict folded again moves nothing (review: lowered after, the refresh
+    fired on the second fold). A cold time follows a green run armada made as the plan packs it, never one
+    it ran alone after a failure beside other tasks; a red run's past it raises it whatever order the rows
+    come in."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    pair, cells = "tests/test_pair.py", "tests/test_cells.py"
+    (tmp_path / pair).write_text("def test_one(): pass\ndef test_two(): pass\n")
+    (tmp_path / cells).write_text("".join(f"def test_{x}(): pass\n" for x in "ijk"))
+    one, two = f"{pair}::test_one", f"{pair}::test_two"
+    i, j, k = (f"{cells}::test_{x}" for x in "ijk")
+    record = {one: 200.0, two: 100.0, i: [10.0, 156.0], j: [10.0, 100.0], k: [10.0, 100.0]}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
+    rows = [{"name": f"3.12:{pair}#1/2", "exitCode": 0, "seconds": 80.0, "tests": {one: 80.0}},
+            {"name": f"3.12:{pair}#2/2", "exitCode": 0, "seconds": 200.0, "tests": {two: 200.0}},
+            {"name": f"3.12:{cells}#1/3", "exitCode": 0, "seconds": 42.0, "tests": {i: 42.0}, "cold": [i],
+             "aloneAfter": "timed out beside other tasks"},
+            {"name": f"3.12:{cells}#2/3", "exitCode": 0, "seconds": 40.0, "tests": {j: 40.0, k: 300.0},
+             "cold": [j, k]},
+            {"name": f"3.12:{cells}#3/3", "exitCode": 1, "seconds": 300.0, "tests": {j: 300.0, k: 40.0},
+             "cold": [j, k]}]
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    folded = {one: 80.0, two: 200.0, i: [10.0, 156.0], j: [10.0, 300.0], k: [10.0, 300.0]}
+    for _ in range(2):
+        assert ci.main() == 0
+        assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == folded
+
+
 def test_a_file_armada_has_not_timed_weighs_no_less_than_its_tests_recorded_costs(ci, tmp_path):
     """Scaled by how armada ran the files it timed, a file it has not is never weighed below its own tests'
     recorded costs: here a timed file ran in a tenth of its tests' cold costs, as a warm run does, and the

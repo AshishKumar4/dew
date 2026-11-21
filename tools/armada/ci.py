@@ -780,12 +780,12 @@ def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
     """Each file's seconds on armada under `python`: its median, which armada sums over a split file's groups
     (`task`), or its tests' sum in tests/test_durations.json where that is more: each test's record is its
-    recorded time (`durations`), so a sum past the median may mean the measured runs predate the file's current
-    tests, and the sum is a floor on what it takes. base/kernels' route census, 1,576 tests recorded at 2,654
-    s in a file main ran in 6 s, was packed by that median with six other files into one task, which ran past
-    its deadline (train 18). Else the recorded sum, scaled by how much slower armada ran the files measured
-    both ways, and never below it, a floor as a measured file's is (a test's cold time outweighs a warm run's
-    measure); else None, for a file nothing has timed."""
+    recorded time (`durations`), so a sum past the median may mean the measured runs predate the file's
+    current tests, and the sum is a floor on what it takes. base/kernels' route census, 1,576 tests recorded
+    at 2,654 s in a file main ran in 6 s, was packed by that median with six other files into one task, which
+    ran past its deadline (train 18). Else the recorded sum, scaled by how much slower armada ran the files
+    measured both ways, and never below it, a floor as a measured file's is (a test's cold time outweighs a
+    warm run's measure); else None, for a file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     # A file armada holds no timing of weighs its rows' sum at the cut they name (`measured_cut`), which is
     # what its timing would say: armada keeps a plan's rows from run to run, and drops the file timings a run
@@ -1285,8 +1285,8 @@ def stale_row(python: str, name: str, group: str, why: str) -> dict:
 def stale_cost(name: str, group: str, reading: Reading) -> float:
     """What a kept row of test file `name` (in `group`'s group) costs a task that runs it, its record not
     found: its tests' recorded seconds, its check-1 sites' aside, which run apart (`own_tests`; a group's,
-    `members`), each its recorded cost, and what a run cold adds to them (`COLD_SECONDS`), as the plan weighs a
-    cold row; a file the record does not name, that alone."""
+    `members`), each its recorded cost, and what a run cold adds to them (`COLD_SECONDS`), as the plan weighs
+    a cold row; a file the record does not name, that alone."""
     reading.cut(name, 1)
     own = own_tests(name, (reading.durations or {}).get(name, {}))
     nodes = members(name, cut, reading) if (cut := cut_of(group)) else list(own)
@@ -2200,15 +2200,16 @@ def folded_entries(record: dict[str, "Entry"], verdict: dict, target: float,
     """The durations `record`'s entries with main's CI `verdict` folded in, its `rows` (`verdict_rows`): each
     file whole (`folded`), each cold-timed test seen at its warm record where it has one, a cold run moving
     no warm time (a test no warm run has timed takes its cold time as its warm one, which a warm run lowers),
-    then each test by itself (fold.py's `entries`: its warm time lowered to what its green runs take, its
-    cold time and its peak); each file's sites read once for both."""
-    warm = {node: session.warm_cold(held)[0] for node, held in record.items()}
+    each test's warm time lowered first to what its green runs take (fold.py's `lowered`, so the same verdict
+    folded again moves nothing), then its cold time and peak (fold.py's `entries`); each file's sites read
+    once for both."""
+    marks = {name: sites(name) for name in rows}
+    warm = fold.lowered(session, {node: session.warm_cold(held)[0] for node, held in record.items()}, rows,
+                        marks, target)
     calm = {name: [{**row_, "tests": {node: warm[node] if node in row_.get("cold", ()) and node in warm
                                       else seconds for node, seconds in row_.get("tests", {}).items()}}
                    for row_ in held] for name, held in rows.items()}
-    marks = {name: sites(name) for name in rows}
-    return fold.entries(session, record, folded(warm, verdict, target, calm, marks), rows, marks,
-                        grading.owning, target)
+    return fold.entries(session, record, folded(warm, verdict, target, calm, marks), rows, grading.owning)
 
 
 def folded(record: dict[str, float], verdict: dict, target: float, rows: dict[str, list[dict]] | None = None,
