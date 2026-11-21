@@ -2012,7 +2012,7 @@ def test_a_compensated_sum_over_axes_of_one_element_is_its_values():
     x = jnp.asarray(rng.standard_normal((32, 1, 5)), jnp.float32)
     found = jax.jit(lambda x: compensated_sum(x, (1,)))(x)
     np.testing.assert_array_equal(np.asarray(found), np.asarray(x[:, 0]))
-    alone = jax.jit(lambda x: compensated_sum(x, (2,)))(x[:, 0])
+    alone = jax.jit(lambda x: compensated_sum(x, (1,)))(x[:, 0])
     beside = jax.jit(lambda x: compensated_sum(x, (1, 2)))(x)
     np.testing.assert_array_equal(np.asarray(beside), np.asarray(alone))
     hi, lo = jax.jit(lambda x: summed_pairs((x, x * 0), (-2,)))(x)
