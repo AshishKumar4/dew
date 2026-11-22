@@ -10,6 +10,7 @@ Interpreted, the scan is XLA's (`lax.associative_scan`)."""
 
 import math
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +23,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, vector
 
+from dew.nn import precision
 from dew.nn.kernels.templates import emission
 from dew.nn.kernels.templates.cost import Work
 
@@ -162,28 +164,36 @@ def _zeroed_columns(running) -> None:
     utils.warpgroup_barrier()
 
 
+class _Emitted(NamedTuple):
+    """An fp32 MLIR value whose `+` and `-` emit its kernel's own addition and subtraction (`arith.addf`,
+    `arith.subf`, rounded each): what `precision.renormalized_sum`'s arithmetic reads in a kernel's body."""
+
+    value: ir.Value
+
+    def __add__(self, other: "_Emitted") -> "_Emitted":  # type: ignore[override]
+        return _Emitted(arith.addf(self.value, other.value))
+
+    def __sub__(self, other: "_Emitted") -> "_Emitted":
+        return _Emitted(arith.subf(self.value, other.value))
+
+
 def _compensated_columns(ref, running) -> None:
-    """`compensated_columns` in Mosaic GPU's terms."""
+    """`compensated_columns` in Mosaic GPU's terms, each row's pair joined by `precision.renormalized_sum`,
+    the arithmetic the interpreted scan's `compensated_add` runs."""
     index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
     rows = ir.MemRefType(ref.type).shape[1]
     column = arith.index_cast(index, arith.remui(utils.thread_idx(), arith.constant(i32, THREADS)))
     halves = [arith.constant(index, half) for half in (0, 1)]
 
-    def two_sum(left, right):
-        total = arith.addf(left, right)
-        part = arith.subf(total, left)
-        return total, arith.addf(arith.subf(left, arith.subf(total, part)), arith.subf(right, part))
-
-    hi, lo = (memref.load(running, [half, column]) for half in halves)
+    pair = tuple(_Emitted(memref.load(running, [half, column])) for half in halves)
     for row in range(rows):
         at = [arith.constant(index, row), column]
-        term_hi, term_lo = (memref.load(ref, [half, *at]) for half in halves)
-        total, dropped = two_sum(hi, term_hi)
-        hi, lo = two_sum(total, arith.addf(arith.addf(dropped, lo), term_lo))
-        for half, value in zip(halves, (hi, lo), strict=True):
-            memref.store(value, ref, [half, *at])
-    for half, value in zip(halves, (hi, lo), strict=True):
-        memref.store(value, running, [half, column])
+        term = tuple(_Emitted(memref.load(ref, [half, *at])) for half in halves)
+        pair = precision.renormalized_sum(pair, term)
+        for half, value in zip(halves, pair, strict=True):
+            memref.store(value.value, ref, [half, *at])
+    for half, value in zip(halves, pair, strict=True):
+        memref.store(value.value, running, [half, column])
     utils.warpgroup_barrier()
 
 
