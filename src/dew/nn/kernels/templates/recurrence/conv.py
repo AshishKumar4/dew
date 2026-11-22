@@ -243,7 +243,8 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
     grid = (rows, pl.cdiv(length, tokens), x.shape[-1] // lanes_)
     launched = mosaic.kernel(entry, out_type=out_type, grid=grid,
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
-                             family=family.name, name=_named("short_conv", parts), scratch=(scan.scratch(),))
+                             family=family.name, compiled=mosaic.compiler_params(),
+                             name=_named("short_conv", parts), scratch=(scan.scratch(),))
     return tuple(launched(*(operand for operand in operands if operand is not None)))
 
 
@@ -313,8 +314,8 @@ def _backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation:
                 outputs.output(jnp.float32, row, spans, channel))
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, channels // lanes_),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
-                             family=family.name, name=_named("short_conv_backward", parts),
-                             scratch=(scan.scratch(),))
+                             family=family.name, compiled=mosaic.compiler_params(),
+                             name=_named("short_conv_backward", parts), scratch=(scan.scratch(),))
     dx, dw, db = launched(*(operand for operand in operands if operand is not None), *dys)
     # The bias's partials summed in one rounding, the one rule of a conv's bias (`short_conv.conv_bias`).
     return dx, jnp.sum(dw, axis=(0, 1)), compensated_sum(db, (0, 1))

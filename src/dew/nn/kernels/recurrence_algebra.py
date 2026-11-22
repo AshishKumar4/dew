@@ -846,7 +846,7 @@ def write_gated(tile: jax.Array, strengths: jax.Array) -> jax.Array:
 
 def gated(word, strength):
     """A word scaled by its token's write strength, one rounding: `write_gated`'s arithmetic on any values
-    that multiply (arrays, or a native kernel's emitted words, `templates.scan.Emitted`)."""
+    that multiply (arrays, or a native kernel's emitted words, `templates.native.Word`)."""
     return word * strength
 
 

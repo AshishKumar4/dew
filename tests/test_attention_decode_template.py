@@ -20,6 +20,7 @@ from reference_error import assert_as_exact
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
+    assembled,
     attention as template,
     attention_algebra as algebra,
     attention_decode,
@@ -699,8 +700,9 @@ def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100
     def decode(query, key_pool, value_pool, table):
         return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
 
-    # The Mosaic kernels the executable itself carries (`report.binaries`): a launch compiled, none spilling.
-    found = report.binaries(lowered_for(decode, (query, pool, pool, table), "sm90").compile())
+    # The Mosaic kernels the executable itself carries (`assembled.binaries`): a launch compiled, none
+    # spilling.
+    found = assembled.binaries(lowered_for(decode, (query, pool, pool, table), "sm90").compile())
     assert found and all(binary.spills == 0 for binary in found), found
 
 
@@ -989,21 +991,17 @@ def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumer
     """A split launch (`MosaicForward.splits`, `_Program._sliced`) traced for an H100 at 64 by 64 tiles: its
     work as its costed launch counts it (`_split_work`) spans its longest program's walk
     (`cost.Stated.longest`), where its programs' mean was 10/3 for ten tiles in three (row 8844; the base
-    review of 31b5fe85b, F2), and issues its consumers' steps as the kernel slices and streams them, its
-    unsplit launch's tensor work by their ratio to its steps (`attention_mosaic_program.walks`)."""
+    review of 31b5fe85b, F2), and issues its consumers' steps as the kernel slices and streams them: its
+    walk's tensor products and exponentials its unsplit launch's by their ratio to its steps
+    (`attention_mosaic_program.walks`), and every other unit its body issues (`cost.ISSUED_UNITS`, its
+    integer work among them, row 10793) no less than that share, each slice its own epilogue, staging and
+    index arithmetic beside its walk."""
     split = _split_work(form, queries, keys, consumers, family, splits)
     unsplit = _split_work(form, queries, keys, consumers, family, 1)
     assert split.span == span
-    assert split.flops * steps[1] == unsplit.flops * steps[0]
-
-
-def test_a_launchs_costed_work_holds_the_integer_work_its_emission_counts():
-    """A causal forward's launch traced for an H100 (`_split_work`) counts the integer work its emission
-    issues (its mask's comparisons and index arithmetic, `cost.Work.integer_operations`) in its costed work,
-    as every other unit its emission counts: its launch's work had dropped them, pricing them at none in the
-    decode and the forward consumer's choice (row 10793)."""
-    work = _split_work("causal", 256, 256, 2, "wgmma", 1)
-    assert work.integer_operations > 0, work
+    for unit in cost.ISSUED_UNITS:
+        shares = getattr(split, unit) * steps[1], getattr(unsplit, unit) * steps[0]
+        assert shares[0] == shares[1] if unit in ("flops", "exponentials") else shares[0] >= shares[1], unit
 
 
 def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():

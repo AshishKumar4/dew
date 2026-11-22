@@ -66,10 +66,12 @@ def replayed(closed, mesh: jax.sharding.Mesh, reverse: bool, device, name: str
     from dew.nn.kernels.options import owned_program
     from dew.nn.programs import meshless
 
-    # In the context its capture copied, of no launch tracing and no block's aside: a replayed derivative's
-    # launches name their own and certify in turn, the block's pending none of theirs.
+    # In the context its capture copied, of no launch tracing, no block's aside and no settle: a replayed
+    # derivative's launches name their own and certify in turn, the block's pending none of theirs, and its
+    # certifications step past none of the settle's misses, which its own thread reads.
     report._TRACING.set(None)
     report._ASIDE.set(None)
+    report._SETTLING.set(None)
     # Its constants (a hook's closed-over operand) its arguments, a closed program of none (`type(closed)`).
     launch = jax_core.jaxpr_as_fun(type(closed)(pe.convert_constvars_jaxpr(closed.jaxpr), ()))
     operands = [*map(jax.typeof, closed.consts), *closed.in_avals]

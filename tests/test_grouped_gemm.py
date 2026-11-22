@@ -1320,7 +1320,7 @@ def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
         assert expected_tile is not None
         expected_staged = launch.staged_bytes(ba, expected_tile, sm86)
         expected_launch = launch.launch_of(ba, expected_tile, sm86)
-        sm86_identity = report._identity(launch, ba)
+        sm86_identity = report._identity(launch, ba, sm86)
     with generation.assumed("sm80"):
         got_tile = launch.derived(ba, sm86)
         assert got_tile == expected_tile

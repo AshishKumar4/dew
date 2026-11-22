@@ -2,6 +2,7 @@
 by TMA into `Ring`s beside consumer warpgroups at `setmaxnreg` budgets, sm90's and sm100's, on `mosaic`'s
 toolkit (its `Family`, walk, loads and stores)."""
 
+import dataclasses
 import functools
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
@@ -95,17 +96,20 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         del scalars
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
+        compiled = self.compiled_with(approx_math=approx_math)
+        assert isinstance(compiled, plgpu.CompilerParams), "a ring family's kernels are Mosaic GPU's"
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers, joined), family=self.name, interpret=interpret,
-                      name=name, approx_math=approx_math, cluster=cluster, cost=cost,
-                      model_flops=model_flops, resident=resident, prefetched=prefetched,
+                      name=name, cluster=cluster, cost=cost, model_flops=model_flops, prefetched=prefetched,
                       model=(None if registers is None
                              else resources.register_model(self, consumers, registers, producer=producer,
                                                            programs=resident, shared=shared, tmem=tmem,
                                                            moves=moves, joined=joined)),
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
-                      reduction_scratch=((self.reduction_scratch if reduces else 0)
-                                         + self.warpgroup_reduction_scratch * reducing_warpgroups))
+                      compiled=dataclasses.replace(
+                          compiled, min_blocks_per_sm=resident,
+                          reduction_scratch_bytes=((self.reduction_scratch if reduces else 0)
+                                                   + self.warpgroup_reduction_scratch * reducing_warpgroups)))
 
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,

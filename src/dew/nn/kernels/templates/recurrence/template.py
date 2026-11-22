@@ -570,7 +570,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         walk = [base, *self.rungs(ba, base)]
         if config not in walk:
             return frozenset()
-        refused = [report.refused_at(self, ba, rung) for rung in walk[:walk.index(config) + 1]]
+        refused = [report.refused_at(self, ba, rung, target) for rung in walk[:walk.index(config) + 1]]
         return frozenset(kernel for kernel in terminal if all(kernel in at for at in refused))
 
     def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
@@ -578,7 +578,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
         (`report.refused_at`), of the product `training` names where it names one (`_refused`), whose
         launch's producer can rise no further, or would leave its tiles unheld (`_raised`)."""
-        spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles) if _of(kernel, training))
+        spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles, target)
+                            if _of(kernel, training))
         return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
 
     def _plans(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
@@ -679,7 +680,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             forward = trained if alone in (None, trained) else alone
             joined = self._settled(ba, trained if forward is trained
                                    else dataclasses.replace(trained, forward=alone), target)
-            if not _refused_kernels(self, ba, joined):
+            if not _refused_kernels(self, ba, joined, target):
                 return joined
             # Each product's tiles refused where a kernel it runs spilled past the last raise: the training
             # call's launches at its tiles, a forward alone's at its own (`Tiles.forward`, the training call's
@@ -688,15 +689,15 @@ class Mosaic(base.Template[mainloop.Tiles]):
             # (Nemotron-H 4B's on sm100).
             # A forward alone's launches are named apart from a training call's (`mainloop.Call.alone`), so a
             # refused kernel's name says which product ran it: each product steps its own tiles.
-            spilled = report.refused_at(self, ba, joined)
+            spilled = report.refused_at(self, ba, joined, target)
             products = ((refused[True], trained, self.launches(ba, joined, target, backward=True), spilled),
                         (refused[False], forward,
                          self.launches(ba, joined.forward or joined, target, backward=False),
-                         _refused_kernels(self, ba, joined)))
+                         _refused_kernels(self, ba, joined, target)))
             ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches, kernels in products
                    if _owners(kernels, launches)]
-            assert ran, (f"the spilled kernels {sorted(_refused_kernels(self, ba, joined))} are none of the "
-                         "call's launches")
+            refused_here = sorted(_refused_kernels(self, ba, joined, target))
+            assert ran, f"the spilled kernels {refused_here} are none of the call's launches"
             for tiles_refused, tiles in ran:
                 tiles_refused.add(tiles)
 
@@ -714,7 +715,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         certifications of an H100's start to its share from the top down, two from the least through its
         statement's share (row 6743). Past its ladder's foot, a launch takes a program fewer a
         multiprocessor, its producer at the least and its ladder run again there (`_stepped`)."""
-        while (spilled := _refused_kernels(self, ba, tiles)) and (
+        while (spilled := _refused_kernels(self, ba, tiles, target)) and (
                 stepped := self._stepped(ba, tiles, spilled, target)) is not None:
             tiles = stepped
         return tiles
@@ -741,7 +742,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         (`tuning.KernelOp._climbed`)."""
         if not self._typed(config):
             return
-        target, spilled, rung = generation.gpu_target(), _refused_kernels(self, ba, config), config
+        target = generation.gpu_target()
+        spilled, rung = _refused_kernels(self, ba, config, target), config
         while spilled and (stepped := self._stepped(ba, rung, spilled, target)) is not None:
             rung = stepped
             yield rung
@@ -765,8 +767,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         ladder has left raises the producer, giving the consumers less, which a program fewer gives more (row
         6744: a write-gated H100 scores' backward spilled 16 bytes in its consumers at the least, and its
         ladder compiled a hundred rungs from the top down, each spilling more, before the program fewer)."""
-        roles = report.spilled_in(self, ba, joined) | (
-            report.spilled_in(self, ba, joined.forward) if joined.forward else {})
+        roles = report.spilled_in(self, ba, joined, target) | (
+            report.spilled_in(self, ba, joined.forward, target) if joined.forward else {})
         if any(roles.get(kernel) != (sass.CONSUMERS,) for kernel in spilled):
             return False
         family = bundle(target, _dtype(ba))
@@ -1098,11 +1100,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
 
 
-def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset[str]:
-    """The kernels a compile refused at `tiles` (`report.refused_at`): its training call's and its forward
-    alone's, at its own tiles where it has them (`Tiles.forward`)."""
-    return report.refused_at(op, ba, tiles) | (report.refused_at(op, ba, tiles.forward) if tiles.forward
-                                               else frozenset())
+def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+                     ) -> frozenset[str]:
+    """The kernels a compile refused at `tiles` on `target` (`report.refused_at`): its training call's and its
+    forward alone's, at its own tiles where it has them (`Tiles.forward`)."""
+    return report.refused_at(op, ba, tiles, target) | (report.refused_at(op, ba, tiles.forward, target)
+                                                       if tiles.forward else frozenset())
 
 
 def _of(kernel: str, training: bool | None) -> bool:

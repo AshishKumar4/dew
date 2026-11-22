@@ -110,7 +110,7 @@ class _Triton(_GroupedLaunch[Tile]):
         from .templates import bundles
 
         dtype, issuer = ba.arguments['tokens'].dtype, generation.family(target.generation)
-        held = int(issuer is None or bundles.named(issuer, jnp.bfloat16).operands_in_registers)
+        held = int(issuer is None or bundles.named(issuer, jnp.bfloat16, None).operands_in_registers)
         step = self.loaded(config) * jnp.dtype(dtype).itemsize + _side_tile_bytes(
             ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
         # A contraction of one step has no loop whose dead stages the output's layout conversion reuses:

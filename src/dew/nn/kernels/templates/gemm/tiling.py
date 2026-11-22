@@ -76,7 +76,7 @@ class Tiles:
     def __post_init__(self):
         from dew.nn.kernels.templates import bundles
 
-        family = bundles.named(self.family, jnp.bfloat16)
+        family = bundles.named(self.family, jnp.bfloat16, None)
         # A pair of multiprocessors shares a group's matrix block between two consumers' row tiles, or, on a
         # family whose products span the pair (`mosaic.Transport.pairs_product`, tcgen05's), one product.
         paired = self.cluster == 2 and self.warpgroups == 1 and not family.pairs_product

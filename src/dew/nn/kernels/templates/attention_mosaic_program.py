@@ -486,7 +486,7 @@ def holders(family: mosaic.Family, consumers: int) -> int:
 def dkv_holders(config: BackwardTiles) -> int:
     """The key blocks a program of the dK/dV launch at `config` holds (`holders`), its layout's own."""
     dkv = config.dkv
-    return holders(bundles.named(dkv.family, jnp.bfloat16), dkv.consumers)
+    return holders(bundles.named(dkv.family, jnp.bfloat16, None), dkv.consumers)
 
 
 def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int, int]:

@@ -21,6 +21,7 @@ from test_attention_template import (
 from dew.nn.attention_masks import alibi_slopes
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
+    assembled,
     attention as template,
     attention_algebra as algebra,
     attention_portable,
@@ -912,7 +913,7 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     assert found is not None, record
     staged = {}
     # Each template launch's kernel and the shared bytes it launches with, as its executable carries them
-    # (`report.binaries`): the launch it names gives its config.
+    # (`assembled.binaries`): the launch it names gives its config.
     for binary in record["binaries"]:
         if binary["launch"] is None or binary["shared"] is None:
             continue
@@ -1089,7 +1090,7 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
     # Each launch refused is one XLA refuses alone, at the bytes it asked alone (a launch the run did not
     # trace, the backward's here, derives again with the forward it reads).
     assert {(miss.kernel, miss.shared) for miss in misses} <= {
-        (report.kernel_of(name)[0], asked) for name, asked in alone.items()}, (misses, alone)
+        (assembled.kernel_of(name)[0], asked) for name, asked in alone.items()}, (misses, alone)
 
 
 @COMPILES_ON_CPU
