@@ -374,13 +374,17 @@ def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
     from dew.checkpoints import Checkpoints
 
     bank, _ = nvfp4_bank(3, 2, 256, 128)
-    assert bytes(np.asarray(bank.form)).hex() == bits.NVFP4_BFLOAT16_FORM.version
+    assert bytes(np.asarray(bank.form)).hex() == formats.FORM.tobytes().hex()
     stacked = jax.tree.map(lambda *layers: jnp.stack(layers), bank, bank)
-    assert bytes(np.asarray(stacked.layer(jnp.int32(1)).form)).hex() == bits.NVFP4_BFLOAT16_FORM.version
+    assert bytes(np.asarray(stacked.layer(jnp.int32(1)).form)).hex() == formats.FORM.tobytes().hex()
+    reordered = formats.form_version(bits.NVFP4_BFLOAT16_FORM.version,
+                                     formats.staged_rows(formats.NVFP4_STAGE)[::-1])
+    assert not np.array_equal(reordered, formats.FORM)
+    with pytest.raises(ValueError):
+        dataclasses.replace(bank, form=reordered).checked()
     other = dataclasses.replace(bank, form=np.frombuffer(bytes.fromhex("0" * 16), np.uint8).copy())
     with pytest.raises(ValueError):
         other.checked()
-
     def template(of):
         where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
         return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), of)

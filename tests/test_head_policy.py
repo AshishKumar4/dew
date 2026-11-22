@@ -49,3 +49,29 @@ def test_every_token_objective_runs_its_head_by_the_one_policy(name, windows):
     objective.restore_head(chunked_tile(), fused=False)
     reported = [(entry.head_tile, entry.head_fused) for entry in objective.program_key() if entry.trained]
     assert (chunked_tile(), False) in reported, reported
+
+
+def test_an_objectives_copy_reading_its_head_holds_its_model_in_no_reading_of_the_original():
+    """An LM objective's copy running a model of its own (`substituted`, as `PhasePasses.apart` makes) reads
+    its head on its own (`output_table`): once the copy is gone, its model is too, the original's readings
+    holding none of it (row 11741: the copies shared one map of readings, which kept every model a copy
+    read alive)."""
+    import gc
+    import weakref
+
+    import jax
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8)
+    objective = LMObjective(model, 8, ema_decay=None)
+    variables = objective.init(jax.random.key(0))
+    copy = objective.substituted([model.clone()])
+    assert copy.output_table(variables) is not None
+    held = weakref.ref(copy.model)
+    del copy
+    gc.collect()
+    assert held() is None
+    assert objective.output_table(variables) is not None

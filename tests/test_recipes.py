@@ -23,9 +23,20 @@ IMAGE_MODEL = ["--model.patch-size", "2", "--model.emb-features", "16", "--model
                "--model.num-heads", "2"]
 
 
-def saved(root: Path) -> list[Path]:
-    """The runs a recipe saved under `root/runs`: each run's configuration beside its checkpoints."""
-    return sorted((root / "runs").glob("**/run.json"))
+def saved(root: Path, state) -> bool:
+    """Whether the run a recipe saved under `root/runs` holds the state it returned: its configuration beside
+    its checkpoints, its latest step the state's, its parameters read back the state's (row 11749: a run's
+    configuration is written before it trains, so a run that saved no step passed)."""
+    import jax
+
+    from dew.checkpoints import Checkpoints
+
+    [configuration] = sorted((root / "runs").glob("**/run.json"))
+    checkpoints = Checkpoints(str(configuration.parent))
+    assert checkpoints.latest == int(state.step), (checkpoints.latest, int(state.step))
+    restored = checkpoints.variables(step=checkpoints.latest, ema=False, on_host=True)["params"]
+    jax.tree.map(np.testing.assert_array_equal, restored, jax.device_get(state.variables["params"]))
+    return True
 
 
 def tickets():
@@ -59,7 +70,7 @@ def test_the_decision_recipe_trains_and_saves_its_run(command, tmp_path):
     state = recipe.main([*pretrained, *command, *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs")],
                         tickets())
     assert int(state.step) == 2 if "--trainer.steps" in command else int(state.step) > 0
-    assert saved(tmp_path)
+    assert saved(tmp_path, state)
 
 
 @pytest.mark.mesh
@@ -73,7 +84,7 @@ def test_the_diffusion_recipe_trains_and_saves_its_run(tmp_path):
                          "--set", "validation.images.size=8", "--set", "validation.images.batch=8",
                          "--val-metrics", "[]", "--text.encoder", "char_table", "--text.checkpoint",
                          "char_table"], pictures())
-    assert int(state.step) > 0 and saved(tmp_path)
+    assert int(state.step) > 0 and saved(tmp_path, state)
 
 
 @pytest.mark.mesh
@@ -87,7 +98,7 @@ def test_the_jepa_recipe_trains_and_saves_its_run(tmp_path):
                          "--trainer.checkpoint-dir", str(tmp_path / "runs"),
                          "--set", "validation.images.size=16", "--set", "validation.images.batch=8"],
                         images.holdout(split="test"))
-    assert int(state.step) > 0 and saved(tmp_path)
+    assert int(state.step) > 0 and saved(tmp_path, state)
 
 
 @pytest.mark.mesh
@@ -104,7 +115,7 @@ def test_the_lm_recipe_trains_an_epoch_of_its_store_and_saves_its_run(tmp_path):
                          "--model.emb-features", "16", "--model.num-layers", "1", "--model.num-heads", "2",
                          *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs"),
                          "--max-new-tokens", "0"])
-    assert int(state.step) == 5 and saved(tmp_path)
+    assert int(state.step) == 5 and saved(tmp_path, state)
 
 
 @pytest.mark.mesh
@@ -120,7 +131,7 @@ def test_the_rigel_recipe_trains_its_phases_and_saves_its_run(corpora, tmp_path)
                          "--model.layer-types", "mamba", "mamba", "mamba", "attention",
                          "--max-new-tokens", "0",
                          *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs")])
-    assert int(state.step) == 8 and saved(tmp_path)
+    assert int(state.step) == 8 and saved(tmp_path, state)
 
 
 @pytest.mark.mesh
@@ -133,3 +144,19 @@ def test_the_mixture_recipe_counts_each_sources_targets():
     recipe = load("mixture", "recipes/lm")
     targets = recipe.main(tyro.cli(recipe.Args, args=["--show", "8"]))
     assert set(targets) == set(recipe.WEIGHTS) and sum(targets.values()) > 0
+
+
+@pytest.mark.mesh
+def test_the_mixture_recipe_counts_each_sources_targets_over_known_documents():
+    """recipes/lm/mixture.py's count over three sources whose every document holds a known number of
+    targets (3, 5 and 7), named otherwise than its keys, is each source's targets among the first 24
+    documents its token mix draws: each draw the source furthest below its share of the targets drawn
+    (`WEIGHTS`, 70/20/10), the first of equals, as the token mix states it draws
+    (`dew.data.mixing.TokenDeficit`): 19 web documents, 3 code and 2 chat (row 11750: a source counted
+    zero, or a mix of equal documents, passed; its review: a source named otherwise counted zero)."""
+    recipe = load("mixture", "recipes/lm")
+    per = {"web": 3, "code": 5, "chat": 7}
+    parts = {name: Memory([{"text": np.arange(1, count + 2, dtype=np.int32)} for _ in range(64)])
+             .read("memory").named(f"source {name}") for name, count in per.items()}
+    assert recipe.main(recipe.Args(show=24), parts) == {"web": 57, "code": 15, "chat": 14}
+

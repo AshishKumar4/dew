@@ -425,20 +425,21 @@ def _llama_8b() -> CausalSelfAttention:
 
 def test_an_8b_layers_training_step_takes_its_input_gradient_as_one_chained_launch():
     """An attention layer at Llama-3.1-8B's projections (4,096 features, 32 query heads over 8 key heads of
-    128) over 12,288 bf16 rows, its training step traced as an assumed H100 runs it, the selectors' own picks
-    (nothing named): its query, key and value run side by side (`qkv` `joined`), and the step binds their
-    input gradient as one chained launch, its products' cell its own (`Kind.together`, M-EM-73's receipt),
-    where the ordinary products' cells, XLA's on Hopper, kept them apart (head review of 4ddd0d7ea F1)."""
+    128) over 12,288 bf16 rows, its training step traced on an assumed H100 with `qkv` and the GEMM template
+    named: `qkv="joined"` runs side by side and binds its input gradient as one chained launch, while
+    `qkv="apart"` binds no chained launch (row 9769)."""
     layer = _llama_8b()
     x = jax.ShapeDtypeStruct((3, 4096, 4096), jnp.bfloat16)
     params = jax.eval_shape(layer.init, jax.random.key(0), x)
 
-    def under():
-        return generation.assumed("sm90"), generation.chosen(attention="xla")
-    assert _qkv_routes(layer, params, x, *under())[:1] == ["joined"]
-    assert _chained_step(layer, params, x, *under())
+    def under(qkv):
+        return (generation.assumed("sm90"),
+                generation.chosen(attention="xla", grouped_matmul="mosaic", qkv=qkv))
 
-
+    assert _qkv_routes(layer, params, x, *under("joined"))[:1] == ["joined"]
+    assert _chained_step(layer, params, x, *under("joined"))
+    assert _qkv_routes(layer, params, x, *under("apart"))[:1] == ["apart"]
+    assert not _chained_step(layer, params, x, *under("apart"))
 def test_projections_no_launch_takes_side_by_side_run_apart_where_the_template_is_named():
     """On an assumed A100 with the GEMM template named, whose cp.async rings take no matrices side by side:
     the attention layer's query, key and value run apart, each its own call, and the layer traces, where the
@@ -642,22 +643,22 @@ def test_a_watched_projection_keeps_its_own_call_and_its_output_is_sown():
     assert "k_proj" in sown[INSPECTED], sown[INSPECTED].keys()
 
 
-@pytest.mark.parametrize(("rows", "kernel"), [((4, 3072), "joined"), ((1, 2048), "apart")],
+@pytest.mark.parametrize(("rows", "choice"), [((4, 3072), "joined"), ((1, 2048), "apart")],
                          ids=["4x3072", "1x2048"])
-def test_a_4b_layers_query_key_and_value_join_where_a_receipt_timed_their_chain(rows, kernel):
+def test_a_4b_layers_query_key_and_value_respect_named_qkv_choice(rows, choice):
     """Qwen3.5-4B's attention layer (2,560 features, 16 query heads over 4 key heads of 256, its query
-    doubled by its output gate) traced as an assumed H100 runs it, nothing named but the attention kernel:
-    at 4 x 3072 rows its query, key and value run side by side, their chained input gradient M-EM-73's win
-    (`grouped_cells.TOGETHER`); at 1 x 2048, where the chain took 1.32 times XLA's time, each its own call
-    (head review of 4d6c7a69c F1)."""
+    doubled by its output gate) traced on an assumed H100 with `qkv` named explicitly: `joined` runs side by
+    side and binds a chained input gradient under `grouped_matmul="mosaic"`, while `apart` runs each
+    projection independently with no chained launch (row 9769)."""
     layer = CausalSelfAttention(MixerContext(emb_features=2560, num_heads=16, num_kv_heads=4, head_dim=256,
                                              max_seq_len=4096, output_gate=True, dtype=jnp.bfloat16))
     x = jax.ShapeDtypeStruct((*rows, 2560), jnp.bfloat16)
     params = jax.eval_shape(layer.init, jax.random.key(0), x)
-    assert _qkv_routes(layer, params, x, generation.assumed("sm90"),
-                       generation.chosen(attention="xla"))[:1] == [kernel]
-
-
+    def under():
+        return (generation.assumed("sm90"),
+                generation.chosen(attention="xla", grouped_matmul="mosaic", qkv=choice))
+    assert _qkv_routes(layer, params, x, *under())[:1] == [choice]
+    assert bool(_chained_step(layer, params, x, *under())) is (choice == "joined")
 def test_captured_intermediates_keep_each_projections_own_call():
     """An attention layer applied capturing each module's output (Flax's `capture_intermediates`): its query,
     key and value run apart, and the key projection's output is captured (head review of f7c7072aa F8)."""

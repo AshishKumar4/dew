@@ -113,14 +113,13 @@ def teacher_forward():
 
 
 DISTILLATION_SEEDS = {"terms": 64, "gradient": 16, "wide temperature": 8}
-"""Each site's declared seeds; the wide temperature's `seeds_for`'s at the suite's host level, paired with
-its tiled arm."""
+"""Check 1's declared seeds, each sized by `seeds_for` on armada at the suite's host level: the loss's terms
+and the student's gradient (2026-10-21), and the wide temperature's (2026-11-22), 8 for its tiled arm paired
+with the whole logits' as the gate compiles them."""
 
 TILE = (6, META["student"]["vocab_size"])
 """A tiled head whose full KL takes 3 of a row's positions a slice (`chunked.head_divergence`), which do not
 divide the fixture's 8."""
-"""Check 1's declared seeds for the loss's terms and the student's gradient, sized by `seeds_for`
-(2026-10-21, on armada)."""
 
 
 def drawn_parameters(params):
@@ -753,23 +752,15 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
     rows, positions = batch[TEXT_KEY].shape[0], batch[TEXT_KEY].shape[1] - 1
     vocab = META["student"]["vocab_size"]
 
-    import jax.extend
+    from dew.nn.programs import equations
 
     whole = {(rows, positions, vocab), (rows * positions, vocab)}
 
     def holds_whole(program) -> bool:
         """Whether any value `program` computes, in any of its nested programs, is a whole logits tensor."""
-        def walk(jaxpr) -> bool:
-            for equation in jaxpr.eqns:
-                if any(tuple(getattr(var.aval, "shape", ())) in whole for var in equation.outvars):
-                    return True
-                inner = [value for held in equation.params.values()
-                         for value in (held if isinstance(held, tuple) else (held,))
-                         if isinstance(value, (jax.extend.core.Jaxpr, jax.extend.core.ClosedJaxpr))]
-                if any(walk(getattr(value, "jaxpr", value)) for value in inner):
-                    return True
-            return False
-        return walk(jax.make_jaxpr(program)(params).jaxpr)
+        traced = jax.make_jaxpr(program)(params).jaxpr
+        return any(tuple(getattr(var.aval, "shape", ())) in whole
+                   for equation in equations(traced) for var in equation.outvars)
 
     def gradient(objective):
         return lambda params: jax.grad(lambda held: objective.scalar_loss(held, batch, step_at())[0])(params)

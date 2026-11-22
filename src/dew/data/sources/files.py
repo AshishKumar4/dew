@@ -13,7 +13,7 @@ import os
 import posixpath
 import re
 import threading
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
@@ -57,6 +57,10 @@ from .index import ArrayIndex
 type Format = Literal[
     "jsonl", "json", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"
 ]
+
+
+type SchemaFact = dict[str, tuple[str, ...]] | int | list[str] | None
+"""A fact a raw store states (`Files._raw_facts`), None where it states none."""
 
 
 def _format(url: str) -> Format:
@@ -1142,17 +1146,44 @@ class Files(Dataset):
     def metadata(self) -> Mapping[str, object]:
         return self._metadata
 
-    SCHEMA_FACTS = frozenset({"class_names", "rows", "count_rules"})
-    """The facts a raw Parquet or Arrow store's schema can state (`_metadata`), and no other."""
-
-    def asked(self, keys: Iterable[str]) -> Mapping[str, object]:
-        """Those of its facts named by `keys` (`dew.data.compile.asked_facts`): a raw Parquet or Arrow
-        store, whose schema states none of the others, opens no file for a fact outside `SCHEMA_FACTS`
+    def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
+        """Those of its facts named by `keys` (`dew.data.sources.base.asked`): a raw Parquet or Arrow store
+        reads only those asked (`_raw_facts`), opening no file for a fact it states none of
         (row 9009: a seeded streamed mix read every member's schema to check the tokenizer contract)."""
-        wanted = set(keys)
-        if self.committed is None and self.kind in ("parquet", "arrow") and not wanted & self.SCHEMA_FACTS:
+        if self.committed is None:
+            facts = {key: read() for key, read in self._raw_facts().items() if key in keys}
+            return {key: value for key, value in facts.items() if value is not None}
+        return {key: value for key, value in self._metadata.items() if key in keys}
+
+    def _raw_facts(self) -> dict[str, Callable[[], SchemaFact]]:
+        """A raw store's facts, each by the read that states it, None where its store states none: the one
+        place they are built (`_metadata`, `asked`), its names known with no file opened, a Parquet or Arrow
+        store's from its schema, a text store's rows from its offset index (row 11638: a list of them
+        beside the builder dropped a key it gained; its review: a text store's index opened for any)."""
+        if self.kind in ("jsonl", "text", "csv"):
+            return {"rows": self._indexed_rows}
+        if self.kind == "files":
+            return {"rows": lambda: len(self.paths)}
+        if self.kind not in ("parquet", "arrow"):
             return {}
-        return {key: value for key, value in self._metadata.items() if key in wanted}
+
+        def class_names() -> dict[str, tuple[str, ...]]:
+            schema = self.arrow.schema.metadata or {}
+            details = json.loads(schema[b"huggingface"]) if b"huggingface" in schema else {}
+            features = details.get("info", {}).get("features", {})
+            return {name: tuple(feature["names"]) for name, feature in features.items()
+                    if isinstance(feature, Mapping) and feature.get("_type") == "ClassLabel"}
+
+        def rows() -> int | None:
+            # A Parquet store's rows a read counts from its files' footers where it needs them
+            # (`ShardManifest.sized`), which no fact a store states is found by (row 4131).
+            return int(self._pieces.rows.sum()) if self.where is None and self.kind == "arrow" else None
+
+        def count_rules() -> list[str] | None:
+            # Rows with no counted targets column hold no count of Dew's (`CountRule`).
+            return None if "_dew_valid_targets" in self.arrow.schema.names else []
+
+        return {"class_names": class_names, "rows": rows, "count_rules": count_rules}
 
     def stated(self) -> Mapping[str, object]:
         """What its committed manifest says, or a parquet or Arrow store's schema names (class
@@ -1171,28 +1202,15 @@ class Files(Dataset):
                 raise ValueError("export metadata must be a mapping")
             rules = {"count_rules": self.committed["count_rules"]} if "count_rules" in self.committed else {}
             return {**metadata, **rules, "rows": self.committed["rows"], "format": self.committed["format"]}
-        if self.kind in ("parquet", "arrow"):
-            schema = self.arrow.schema.metadata or {}
-            details = json.loads(schema[b"huggingface"]) if b"huggingface" in schema else {}
-            features = details.get("info", {}).get("features", {})
-            names = {
-                name: tuple(feature["names"])
-                for name, feature in features.items()
-                if isinstance(feature, Mapping) and feature.get("_type") == "ClassLabel"
-            }
-            # A Parquet store's rows a read counts from its files' footers where it needs them
-            # (`ShardManifest.sized`), which no fact a store states is found by (row 4131).
-            counted = self.where is None and self.kind == "arrow"
-            counts = {"rows": int(self._pieces.rows.sum())} if counted else {}
-            # Rows with no counted targets column hold no count of Dew's (`CountRule`).
-            rules = {} if "_dew_valid_targets" in self.arrow.schema.names else {"count_rules": []}
-            return {"class_names": names, **counts, **rules}
-        if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
-            with contextlib.closing(_IndexedLines(self)) as indexed:
-                return {"rows": len(indexed)}
-        if self.kind == "files":
-            return {"rows": len(self.paths)}
-        return {}
+        facts = {key: read() for key, read in self._raw_facts().items()}
+        return {key: value for key, value in facts.items() if value is not None}
+
+    def _indexed_rows(self) -> int | None:
+        """A text store's records as its offset index counts them, None where it holds no index."""
+        if not self.supports("indexed"):
+            return None
+        with contextlib.closing(_IndexedLines(self)) as indexed:
+            return len(indexed)
 
     def lengths(self) -> np.ndarray | None:
         if not self.paths:

@@ -22,7 +22,7 @@ import dataclasses
 import hashlib
 import itertools
 import logging
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, TypeGuard, runtime_checkable
 
 from dew._records import JSON, integer, json_value
@@ -130,6 +130,10 @@ def stated(source: Source) -> Mapping[str, object]:
     from dew.data.pipeline import Stated
 
     return source.stated() if isinstance(source, Stated) else {}
+
+
+type Stated = int | float | str | bool | None | Sequence[Stated] | Mapping[str, Stated]
+"""A fact a store or a view states of itself (`Source.metadata`): a count, a name, or those nested."""
 
 
 def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:
@@ -357,8 +361,25 @@ class View[S: Source]:
         return self.source.lengths()
 
     def metadata(self) -> Mapping[str, object]:
-        facts = self.source.metadata()
+        return {**self._viewed(self.source.metadata()), **{key: read() for key, read in self._own().items()}}
+
+    def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
+        """Those of its facts named by `keys`: its store's asked alone (`asked`), taken as `metadata` takes
+        all of them (`_viewed`), and those of its own asked, each read alone (`_own`; row 11638's review: a
+        view's own facts were dropped, then read whole for any key)."""
+        own = self._own()
+        stored = {key: value for key, value in self._viewed(asked(self.source, keys)).items() if key in keys}
+        return {**stored, **{key: read() for key, read in own.items() if key in keys}}
+
+    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Its store's facts as it states them (`facts`, all of them or those asked), its counts dropped
+        where its rows are not its store's (`_uncounted`)."""
         return facts if self.rows in ("read", "described") else _uncounted(facts)
+
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
+        """The facts it states of its own over its store's, each by the read that states it: the one place
+        a view states them, read only where asked (`asked`)."""
+        return {}
 
     def stated(self) -> Mapping[str, object]:
         return _uncounted(stated(self.source)) if self.rows == "selected" else {}
@@ -416,6 +437,26 @@ def _indexed_manifest(source: Source, uri: str, rows: int,
         _IndexedSlice(source) if reader is None else reader,
         index_ordered=True,
     )
+
+
+@runtime_checkable
+class AsksFacts(Protocol):
+    """A store that can state some of its facts without the work of stating them all (a raw Parquet store's,
+    which opens no file for a fact its schema cannot state, `dew.data.sources.Files.asked`)."""
+
+    def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
+        """Those of its facts (`Source.metadata`) named by `keys`."""
+        ...
+
+
+def asked(source: Source, keys: Iterable[str]) -> Mapping[str, object]:
+    """Those of `source`'s facts named by `keys`: as it states them where it can ask for them alone
+    (`AsksFacts`), else off all of them (`Source.metadata`); the one read a compile asks some facts of a
+    store by (row 11638)."""
+    wanted = frozenset(keys)
+    if isinstance(source, AsksFacts):
+        return source.asked(wanted)
+    return {key: value for key, value in source.metadata().items() if key in wanted}
 
 
 @runtime_checkable

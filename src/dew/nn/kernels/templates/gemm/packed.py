@@ -54,10 +54,7 @@ CONSUMER = "wgmma"
 """The consumer the packed decode writes its registers for: the warpgroup MMA's register operand, whose
 fragment layout the transform declares (`bits.NVFP4_BFLOAT16.fragments`)."""
 
-LAYOUTS = {"wgmma": plgpu.Layout.WGMMA}
-"""Mosaic GPU's layout of each fragment a transform declares (`bits.BitTransform.fragments`' values)."""
-
-FRAGMENT = LAYOUTS[bits.NVFP4_BFLOAT16.fragments[CONSUMER]]
+FRAGMENT = getattr(plgpu.Layout, bits.NVFP4_BFLOAT16.fragments[CONSUMER].upper())
 """The register layout the decode writes and its family's products read: the transform's declared
 fragment for `CONSUMER`, not one the decode chooses (algebra.md 7.4, row 6101)."""
 

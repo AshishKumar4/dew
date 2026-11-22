@@ -3,6 +3,7 @@ trained (`earlier_run`, the one place earlier record shapes are read), and the d
 gained since keeps for runs that predate it (`_earlier_default`)."""
 
 import dataclasses
+import sys
 from collections.abc import Mapping
 
 from dew import _records, registry
@@ -39,17 +40,19 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     by today's names (`dew.data.records.earlier_chains`); an encoder or conditioner by the import path it
     has now (`dew._records.moved_paths`, row 5996); a decision layout of a class it was before by the
     segment layout it is now, wherever the record holds it (`dew._records.earlier_layout`, row 6140); a
-    source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550).
+    source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550); and wherever it holds
+    a run or trainer, a trainer's retired `export_model` taken off and a looped decoder's
+    `loop_message_additive` true read as unset where it could not be unset (`earlier_retired`, rows 11636,
+    11742).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    unsettable = record.get(LAYOUT_UNSETTABLE) is True
-    moved = _records.moved_record({key: value for key, value in record.items()
-                                   if key != LAYOUT_UNSETTABLE})
+    unsettable, additive = (record.get(key) is True for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE))
+    moved = _records.moved_record({key: value for key, value in record.items() if key not in MARKERS})
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved)))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
-    earlier = earlier_packed_experts(earlier)
+    earlier = earlier_retired(earlier_packed_experts(earlier), additive_unset=additive)
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
@@ -61,6 +64,75 @@ LAYOUT_UNSETTABLE = "layout_unsettable"
 this Dew does, unset as null: a record written while it could not be unset (`Layout()` its default) lacks
 it and reads `Layout()` as unset (`earlier_trainer_layout`), where one written since keeps a stated
 `Layout()` (row 9664). Beside the fields, where no field of the run's holds it (train 1109's review, F3)."""
+
+ADDITIVE_UNSETTABLE = "additive_unsettable"
+"""The key beside a run record's fields (`RunConfig.record`) that says it states `loop_message_additive` as
+this Dew does, unset as null: a record written while it could not be unset (true its default) lacks it and
+reads its true as unset (`earlier_retired`), where one written since keeps a stated true (row 11742)."""
+
+MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE)
+"""Every key a run record holds beside its fields, each saying how it states a field (`RunConfig.record`)."""
+
+
+def earlier_retired(record: Mapping[str, object], *, additive_unset: bool) -> Mapping[str, object]:
+    """A saved run's record with each run and trainer it holds, the root and every one a field holds as its
+    class record, in today's shapes (`_retire`): a trainer's `export_model`, the field that wrote each
+    persistent step's model beside it (row 11636), taken off, `dew export` the one export since; and a
+    looped decoder's `loop_message_additive` true read as unset where the record could not leave it unset
+    (no `ADDITIVE_UNSETTABLE`, `additive_unset` false; row 11742), every such record writing true for its
+    default, a checkpoint's choice kept, its false a choice. A record written since states its own. Untyped
+    data, and a class no module imported yet holds, pass as they are. Carried to 1.0 (ledger 1552)."""
+    from dew.config import RunConfig
+
+    # The record read as JSON once, here, a tree of its own the walk below migrates in place (row 11824).
+    retired = {key: _records.json_value(value, key) for key, value in record.items()}
+    _retire(retired, additive_unset, RunConfig)
+    return retired
+
+
+def _retire(value: _records.JSON, additive_unset: bool, default: type | None = None) -> None:
+    """Each run and trainer `value`'s class records name, at any depth, taken to today's shapes in place
+    (`_retire_fields`), `default` the class of a record that names none it resolves (the root's, a run):
+    data no migration reads stays as it is (a payload naming a class with no fields keeps none)."""
+    if isinstance(value, list):
+        for held in value:
+            _retire(held, additive_unset)
+        return
+    if not isinstance(value, dict):
+        return
+    for entry in value.values():
+        _retire(entry, additive_unset)
+    named = registry.class_record(value)
+    kind = (_recorded_class(named[0]) or default) if named is not None else None
+    fields = value.get("fields")
+    if kind is not None and isinstance(fields, dict):
+        _retire_fields(kind, fields, additive_unset)
+
+
+def _retire_fields(kind: type, fields: dict[str, _records.JSON], additive_unset: bool) -> None:
+    """The fields of a record of `kind` taken to today's shapes in place (`earlier_retired`)."""
+    from dew.config import DecoderRunConfig, RunConfig
+    from dew.config.trainer import TrainerConfig
+
+    if issubclass(kind, TrainerConfig):
+        fields.pop("export_model", None)
+    # A trainer recorded flat, by its run's class, is read here; one recorded by its own class as a record.
+    trainer = fields.get("trainer")
+    if issubclass(kind, RunConfig) and isinstance(trainer, dict) and registry.class_record(trainer) is None:
+        trainer.pop("export_model", None)
+    if (issubclass(kind, DecoderRunConfig) and not additive_unset
+            and fields.get("loop_message_additive") is True):
+        fields["loop_message_additive"] = None
+
+
+def _recorded_class(name: str) -> type | None:
+    """The class a record names, a run's alias or an import path, where a module imported already holds it;
+    None else (a class a record imports is `registry.imported`'s, as it is built)."""
+    module, _, qualified = registry.runs.paths.get(name, name).partition(":")
+    found = sys.modules.get(module)
+    for part in qualified.split(".") if qualified else ():
+        found = getattr(found, part, None)
+    return found if isinstance(found, type) else None
 
 
 def earlier_packed_experts(record: Mapping[str, object]) -> Mapping[str, object]:

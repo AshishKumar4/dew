@@ -49,7 +49,7 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.config.earlier import LAYOUT_UNSETTABLE, earlier_run
+from dew.config.earlier import ADDITIVE_UNSETTABLE, LAYOUT_UNSETTABLE, MARKERS, earlier_run
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.config.trainer import (
@@ -927,8 +927,10 @@ class RunConfig:
     def record(self) -> dict[str, JSON]:
         """The run's class record: its class by its alias in `dew.registry.runs`, or by its import path
         where the table holds none, and its fields (`to_dict`); beside them, that it states its trainer's
-        layout as this Dew does (`LAYOUT_UNSETTABLE`), which `earlier_run` reads and takes off."""
-        return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict(), LAYOUT_UNSETTABLE: True}
+        layout and its messages' additive term as this Dew does (`LAYOUT_UNSETTABLE`, `ADDITIVE_UNSETTABLE`),
+        which `earlier_run` reads and takes off."""
+        return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict(), LAYOUT_UNSETTABLE: True,
+                ADDITIVE_UNSETTABLE: True}
 
     def source_keywords(self, *, frozen: bool) -> SourceOptionsKeywords:
         """`Pretrained.load`'s keywords for the source the run starts from: what it builds of it
@@ -1145,8 +1147,7 @@ class RunConfig:
                              "it (docs/recipes.md, Python experiments)")
         registry.import_trusted(record, trust)
         # Read in this Dew's shapes, whatever the record says of them beside its fields (`earlier_run`).
-        named = registry.class_record({key: value for key, value in record.items()
-                                       if key != LAYOUT_UNSETTABLE})
+        named = registry.class_record({key: value for key, value in record.items() if key not in MARKERS})
         if named is None:
             raise ValueError('a run record is its class and its fields, {"class": ..., "fields": ...}')
         run_class = registry.runs[named[0]]
@@ -1812,17 +1813,19 @@ class DecoderRunConfig(RunConfig):
     """The layers each banked summary closes (`CrossPass.block_size`); None its default."""
     loop_message_rank: int | None = None
     """The rank of each merge's controller (`CrossPass.rank`); None its default."""
-    loop_message_additive: bool = True
+    loop_message_additive: bool | None = None
     """Whether each merge's message adds a term of its own beside the gained summary
-    (`CrossPass.additive`): `--no-loop-message-additive` drops it; left on, a checkpoint's own choice is
-    kept, and the default taken where it holds no messages."""
+    (`CrossPass.additive`): `--loop-message-additive True` keeps it and `False` drops it, over a checkpoint's
+    own choice; unstated, a checkpoint's own choice is kept, and the default taken where it holds no
+    messages (row 11742: stating it on was read as unstated, so a checkpoint that dropped it kept it
+    dropped)."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
         stated = (self.loop_message_block_size, self.loop_message_rank)
         if not self.loop_messages and (any(field is not None for field in stated)
-                                       or not self.loop_message_additive):
-            raise ValueError("--loop-message-block-size, --loop-message-rank and --no-loop-message-additive "
+                                       or self.loop_message_additive is not None):
+            raise ValueError("--loop-message-block-size, --loop-message-rank and --loop-message-additive "
                              "shape the messages --loop-messages passes")
         sampling = (self.loop_steps_mean, self.loop_steps_dispersion, self.loop_steps_max)
         if self.loop_steps_sample is None and any(field is not None for field in sampling):
@@ -1924,14 +1927,14 @@ class DecoderRunConfig(RunConfig):
     def messages(self, held: "CrossPass | None") -> "CrossPass | None":
         """The messages the run's loop passes (`loop_messages`), None where it keeps a checkpoint's own: the
         checkpoint's own messages where it holds them (`held`), else the defaults, with what the run
-        states in their place (a block size, a rank, `--no-loop-message-additive`), so a checkpoint's
+        states in their place (a block size, a rank, `--loop-message-additive`), so a checkpoint's
         others, which shape no parameter, are kept, not reset (row 10855)."""
         if not self.loop_messages:
             return None
         from dew.nn.cross_pass import CrossPass
 
         stated = {"block_size": self.loop_message_block_size, "rank": self.loop_message_rank,
-                  "additive": None if self.loop_message_additive else False}
+                  "additive": self.loop_message_additive}
         return dataclasses.replace(CrossPass() if held is None else held,
                                    **{name: value for name, value in stated.items() if value is not None})
 

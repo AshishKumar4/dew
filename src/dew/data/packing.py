@@ -26,7 +26,16 @@ from dew.data.generation import Generation
 from dew.data.pipeline import ACCOUNTS, DOCUMENT, ExpandStep, Pack
 from dew.data.placement import FirstFit, first_fit
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
+from dew.data.sources.base import (
+    Read,
+    Rows,
+    ShardManifest,
+    Source,
+    Stated,
+    View,
+    _consumed,
+    _indexed_manifest,
+)
 from dew.data.tokens import PackedWindows, chunk_lengths, chunk_table, entries, packed_window
 
 
@@ -494,12 +503,11 @@ class PackedSource(View[Source]):
     def records(self, read: Read) -> _PackedRows:
         return _PackedRows(self.source.records(read), self.plan)
 
-    def metadata(self) -> Mapping[str, object]:
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
         return {
-            **super().metadata(),
-            "rows": len(self.plan),
-            "valid_targets": self.plan.at("totals", 0),
-            "zero_target_windows": 0,
+            "rows": lambda: len(self.plan),
+            "valid_targets": lambda: self.plan.at("totals", 0),
+            "zero_target_windows": lambda: 0,
         }
 
     def lengths(self) -> np.ndarray | None:

@@ -22,7 +22,6 @@ import tyro
 
 from dew.data import Hub, chat, mix, text
 from dew.data.pipeline import Pipeline
-from dew.data.steps.text import ValidTargets
 
 TOKENIZER = "HuggingFaceTB/SmolLM2-360M-Instruct"
 TOKENIZER_REVISION = "a10cc1512eabd3dde888204e902eca88bddb4951"
@@ -45,23 +44,22 @@ def sources(tok) -> dict[str, Pipeline]:
                revision="8e72b18ab4a29b52fbd6a39c1441f67d09633ade")
     conversations = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft", columns=("messages",),
                         revision="8049631c405ae6576f93f445c6b8166f76f5505a")
-    return {"web": web.read("streamed").map(text.tokenize(tok, eos=True)).named("web"),
-            "code": code.read("streamed").map(text.tokenize(tok, field="content", eos=True)).named("code"),
-            "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text")
-            .named("chat")}
+    return {"web": web.read("streamed").map(text.tokenize(tok, eos=True)),
+            "code": code.read("streamed").map(text.tokenize(tok, field="content", eos=True)),
+            "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text")}
 
 
-def mixed(tok) -> Pipeline:
-    """The three sources mixed at `WEIGHTS` by valid target tokens, unpacked."""
-    parts = sources(tok)
-    return mix([parts[name] for name in WEIGHTS], list(WEIGHTS.values()), by="tokens")
+def mixed(parts: dict[str, Pipeline]) -> Pipeline:
+    """The three sources (`sources`) mixed at `WEIGHTS` by valid target tokens, unpacked, each named by its
+    key, which its metrics are labelled by (`data/weighed_tokens/<source>`)."""
+    return mix([parts[name].named(name) for name in WEIGHTS], list(WEIGHTS.values()), by="tokens")
 
 
 def build(batch: int, seed: int = 0) -> Pipeline:
     """Rows of `SEQ_LEN + 1` tokens, a document longer than one cut first, packed first-fit and shuffled, in
     batches of `batch`."""
-    return (mixed(tokenizer()).flat_map(text.Chunks(SEQ_LEN + 1, overlap=1)).pack(seq_len=SEQ_LEN + 1)
-            .shuffle(seed=seed, window=10_000).batch(batch))
+    return (mixed(sources(tokenizer())).flat_map(text.Chunks(SEQ_LEN + 1, overlap=1))
+            .pack(seq_len=SEQ_LEN + 1).shuffle(seed=seed, window=10_000).batch(batch))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,15 +68,15 @@ class Args:
     """Mixed documents to read and count."""
 
 
-def main(args: Args) -> dict[str, int]:
-    tok = tokenizer()
-    counts = mixed(tok).stats(records=args.show)
+def main(args: Args, parts: dict[str, Pipeline] | None = None) -> dict[str, int]:
+    """Each source's valid targets among the first `args.show` mixed documents of `parts`, each source's
+    token documents (`sources`, the Hub's where None)."""
+    parts = sources(tokenizer()) if parts is None else parts
+    counts = mixed(parts).stats(records=args.show)
     for metric, value in sorted(counts.items()):
         print(f"{metric}: {value:g}")
-    # The mix read each source's first rows in order: the same rows read alone hold its targets.
-    parts = sources(tok)
-    targets = {name: sum(map(ValidTargets(), parts[name].take(int(counts[f"data/rows/{name}"]))))
-               for name in WEIGHTS}
+    # The valid targets the mix drew of each source, which it weighs by (`data/weighed_tokens/<source>`).
+    targets = {name: int(counts.get(f"data/weighed_tokens/{name}", 0)) for name in WEIGHTS}
     total = sum(targets.values())
     for name, weight in WEIGHTS.items():
         print(f"{name}: {targets[name]} valid targets, {targets[name] / total:.3f} of the mix "
