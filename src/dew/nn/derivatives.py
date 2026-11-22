@@ -50,6 +50,7 @@ __all__ = [
     "contracted",
     "declared_derivative",
     "declared_tangent",
+    "formed_together",
     "marked",
     "marked_call_p",
     "portable_formed",
@@ -474,3 +475,30 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
             for index in range(returned["structure"].num_leaves)])
     return call
 
+
+def _together_value[Input, Parameters](value: Input, parameters: Parameters) -> tuple[Input, Parameters]:
+    """`formed_together`'s value: its operands as they are."""
+    return value, parameters
+
+
+def _together_tangent(primals, tangents):
+    """`formed_together`'s tangent: its operands' tangents through the rule's dual (`with_tangents_formed`),
+    an operand no derivative reaches a zero beside them, as the identity's."""
+    from jax.custom_derivatives import SymbolicZero
+
+    t_value, t_parameters = with_tangents_formed(*tangents)
+    held = jax.tree.map(lambda primal, tangent: jnp.zeros_like(primal) if isinstance(tangent, SymbolicZero)
+                        else tangent, primals, (t_value, t_parameters),
+                        is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+    return primals, held
+
+
+formed_together = declared_tangent(KernelGlue(), _together_value, _together_tangent, symbolic_zeros=True)
+"""`value` and `parameters` as they are, a module's reads of them, whose reverse mode returns `value`'s
+cotangent only with the `parameters`' gradients formed (`with_tangents_formed`): what a module computes in
+any way of its own (its products under the quantization a scope rules, its submodules' calls, which
+observers see) is no more than read from these, and the layer below, reading `value`'s cotangent, waits on
+its parameters' gradients, which XLA puts off to the step's end otherwise, holding what they read live
+across layers (row 11713: a cross-pass merge's controller products and its depth query, held live across
+an exit-gated loop's unrolled passes, ~130 GiB on a Qwen3.5-4B step). Identity forward, its reverse mode
+retains no primal."""

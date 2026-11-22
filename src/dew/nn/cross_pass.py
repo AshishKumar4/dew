@@ -28,8 +28,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .attention_residuals import DepthAttention, depth_attended
-from .derivatives import portable_formed
+from .attention_residuals import DepthAttention
+from .derivatives import formed_together
 from .flops import projection_flops
 from .norms import unweighted_rmsnorm
 from .precision import at_least_fp32
@@ -109,44 +109,33 @@ class CrossPassMerge(nn.Module):
 
     def __call__(self, read: jax.Array, bank: jax.Array) -> jax.Array:
         """`read` `[B, S, D]` with `bank` `[B, S, blocks, D]` merged in, in `read`'s dtype."""
-        # Form every merge parameter's gradient before returning `(d_read, d_bank)` (`portable_formed`):
-        # without the barrier XLA defers the five low-rank controller matmuls and the depth-attention
-        # query gradients to the step's end, holding ~0.8 GiB of fp32 `[B, S, D]` activations and
-        # cotangents per merge site live across layers and unrolled loop passes.
-        spec, eps = self.spec, self.norm_eps
+        # The read's cotangent leaves only with the controller's gradients formed (`formed_together`):
+        # XLA otherwise puts the five low-rank products' weight gradients off to the step's end, holding the
+        # fp32 `[B, S, D]` states they read live across layers and an exit-gated loop's unrolled passes
+        # (row 11713). The products are this module's own, under any quantization its scope rules.
+        controller = (self.input_down, self.message_down, self.gain, self.forget,
+                      *((self.added,) if self.spec.additive else ()))
+        read, (input_down, message_down, gain, forget, *added) = formed_together(read, controller)
+        wide = at_least_fp32(read.dtype)
+        highest = jax.lax.Precision.HIGHEST
 
-        def portable(read, bank, parameters):
-            scale, kernel, input_down, message_down, forget, gain, *rest = parameters
-            wide = at_least_fp32(read.dtype)
-            highest = jax.lax.Precision.HIGHEST
+        def times(x, kernel):
+            return jnp.matmul(x, kernel.astype(wide), precision=highest)
 
-            def times(x, weight):
-                return jnp.matmul(x, weight.astype(wide), precision=highest)
-
-            u = read.astype(wide)
-            mixed = depth_attended(bank.astype(wide), scale, kernel, norm_eps=eps,
-                                   normalize_values=spec.normalize_values)
-            message = unweighted_rmsnorm(mixed, eps, implementation='xla')
-            sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(eps, wide))
-            state = times(u / sigma, input_down) + times(message, message_down)
-            sent = jnp.tanh(times(state, gain)) * message
-            if spec.additive:
-                sent = sent + jnp.tanh(times(state, rest[0]))
-            kept = (1 - jnp.tanh(times(state, forget))) * u
-            return (kept + (sigma * sent if spec.scale_by_input_rms else sent)).astype(read.dtype)
-
-        parameters = (self.depth.scale, self.depth.kernel, self.input_down, self.message_down,
-                      self.forget, self.gain, *((self.added,) if spec.additive else ()))
-        return portable_formed(portable)(read, bank, parameters)
-
-
-def _pass_bank(x, bank):
-    """`(x, bank)` as they are, the identity `tie_bank` forms the reverse of."""
-    return x, bank
+        u = read.astype(wide)
+        message = unweighted_rmsnorm(self.depth(bank.astype(wide)), self.norm_eps, implementation='xla')
+        sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(self.norm_eps, wide))
+        state = times(u / sigma, input_down) + times(message, message_down)
+        sent = jnp.tanh(times(state, gain)) * message
+        if added:
+            sent = sent + jnp.tanh(times(state, added[0]))
+        kept = (1 - jnp.tanh(times(state, forget))) * u
+        return (kept + (sigma * sent if self.spec.scale_by_input_rms else sent)).astype(read.dtype)
 
 
 def tie_bank(x, bank):
-    """`x` and a pass's `bank` as they are; in reverse mode each a cotangent formed before the layers below
-    run (`portable_formed`): the bank's summed over the layers above in one accumulator, rather than every
-    merge site's `[B, S, blocks, D]` cotangent held live to the pass's end (row 11713)."""
-    return portable_formed(_pass_bank)(x, bank)
+    """`x` and a pass's `bank` as they are, `x`'s cotangent leaving only with the bank's formed
+    (`formed_together`): the bank's cotangent summed over the layers above in one accumulator before the
+    layers below run, rather than every merge site's `[B, S, blocks, D]` one held live to the pass's end
+    (row 11713)."""
+    return formed_together(x, bank)

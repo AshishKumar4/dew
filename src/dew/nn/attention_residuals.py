@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .derivatives import portable_formed
+from .derivatives import formed_together
 from .flops import projection_flops
 from .norms import unweighted_rmsnorm
 from .precision import at_least_fp32, float32_einsum
@@ -112,25 +112,15 @@ class DepthAttention(nn.Module):
         return projection_flops(lengths, self.emb_features, num_sources)
 
     def __call__(self, values):
-        # The query's scale and kernel gradients, reductions over every token, through the rule
-        # (`derivatives.portable_formed`): XLA otherwise defers them to the step's end, holding the
-        # fp32 `[B, S, n, D]` keys and values live across layers and unrolled passes.
-        def portable(values, parameters):
-            scale, kernel = parameters
-            return depth_attended(values, scale, kernel, norm_eps=self.norm_eps,
-                                  normalize_values=self.normalize_values)
-
-        return portable_formed(portable)(values, (self.scale, self.kernel))
-
-
-def depth_attended(values: jax.Array, scale: jax.Array, kernel: jax.Array, *,
-                   norm_eps: float, normalize_values: bool) -> jax.Array:
-    """`DepthAttention`'s mixture over `values` `[B, S, n, D]` with `scale` `[D]` and `kernel` `[D, 1]`."""
-    wide = at_least_fp32(values.dtype)
-    work = values.astype(wide)
-    keys = unweighted_rmsnorm(work, norm_eps, implementation='xla')
-    query = scale.astype(wide) * kernel[:, 0].astype(wide)
-    return depth_mixed(keys, query, keys if normalize_values else work).astype(values.dtype)
+        # The values' cotangent leaves only with the query's scale and kernel gradients formed
+        # (`formed_together`), reductions over every token XLA otherwise puts off to the step's end, holding
+        # the fp32 keys and values they read live across layers (row 11713).
+        values, (scale, kernel) = formed_together(values, (self.scale, self.kernel))
+        wide = at_least_fp32(values.dtype)
+        work = values.astype(wide)
+        keys = unweighted_rmsnorm(work, self.norm_eps, implementation='xla')
+        query = scale.astype(wide) * kernel[:, 0].astype(wide)
+        return depth_mixed(keys, query, keys if self.normalize_values else work).astype(values.dtype)
 
 
 def depth_mixed(keys: jax.Array, query: jax.Array, values: jax.Array) -> jax.Array:
