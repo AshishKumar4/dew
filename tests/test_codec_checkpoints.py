@@ -314,9 +314,9 @@ def test_a_packed_matrixs_non_finite_products_are_ieees():
     from dew.nn.kernels.formats import NvFp4
     from dew.quantization import _product_rounded, packed_values
 
-    codes = np.zeros((16, 2), np.float32)
+    codes = np.zeros((256, 2), np.float32)
     codes[1, 0], codes[2, 0] = 1.5, -6.0
-    ones, nan = np.ones((1, 2), np.float32), np.full((1, 2), np.nan, np.float32)
+    ones, nan = np.ones((16, 2), np.float32), np.full((16, 2), np.nan, np.float32)
     values = np.asarray(packed_values(NvFp4.of(codes, ones.astype(jnp.float8_e4m3fn), -np.inf)))
     assert np.isnan(values[0, 0]) and values[1, 0] == -np.inf and values[2, 0] == np.inf
     tiny = np.uint32(1).view(np.float32)
