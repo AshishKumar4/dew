@@ -1861,8 +1861,8 @@ def test_a_token_budget_reached_inside_a_split_step_keeps_the_window_its_later_p
     """A step read in two microbatches whose first step's first part is rejected: the second step's first
     part commits the window its second part opened, reaching a budget of one token, and its second part
     opens the next. The run ends with that step and keeps the window its second part opened, its row
-    pooled, so a continuation reads on exactly (training.md §4, row 6143's option 1, until the owner
-    chooses; row 10982: a drop lost those rows silently)."""
+    pooled, so a continuation reads on exactly (training.md §4, row 6143's option 1; row 10982: a drop lost
+    those rows silently)."""
     import jax
     import optax
     from affine_run import Replaying

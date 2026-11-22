@@ -46,6 +46,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec, mesh_axes
 from dew.nn.categorical import (
+    kl_divergence,
     label_entry,
     label_logit,
     label_terms,
@@ -107,6 +108,14 @@ def _operand_dtype(precision: jax.lax.PrecisionLike, work: jnp.dtype):
     """The dtype the head's operands take: bf16 under the bf16 algorithm, the
     work dtype (`at_least_fp32` of the states') otherwise."""
     return jnp.bfloat16 if precision is BF16 else work
+
+
+def _head_product(head: OutputTable, states) -> jax.lax.PrecisionLike:
+    """The product a head's tiles take `states`, what its `OutputTable.states` gave, at: the bf16 algorithm
+    where the head's compute dtype (the states' where it states none) rounds to bf16 (`rounds_to_bf16`),
+    else exact fp32 at the head's precision."""
+    compute = states.dtype if head.compute is None else head.compute
+    return BF16 if rounds_to_bf16(compute, head.precision) else exact_float32(head.precision)
 
 
 def _logits_cotangent(cotangent, precision: jax.lax.PrecisionLike):
@@ -830,8 +839,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     the tokens' gradient cross devices. Otherwise the head is gathered whole
     on each device, and its gradient is the one sum that crosses devices.
     """
-    hidden, vocab_major, precision = head.states(hidden), head.vocab_major, head.precision
-    compute = hidden.dtype if head.compute is None else head.compute
+    hidden, vocab_major = head.states(hidden), head.vocab_major
     columns = _Columns.of(head, at_least_fp32(hidden.dtype))
     features = head.matrix.shape[1 if vocab_major else 0]
     if hidden.shape[-1] != features:
@@ -847,7 +855,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     # held vocabulary-major so a column tile is a row slice.
     cap = None if head.softcap is None else jnp.asarray(head.softcap, at_least_fp32(hidden.dtype))
     table = head.matrix if vocab_major else head.matrix.T
-    product = BF16 if rounds_to_bf16(compute, precision) else exact_float32(precision)
+    product = _head_product(head, hidden)
 
     def scored(hidden, table, targets, excluded, cap, columns, *, picked: bool = False,
                group: tuple[str, ...] = ()):
@@ -860,10 +868,9 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     def column_logits(states, rows, cap, columns):
         """The capped logit of each state against its own row of the head,
         as the head's tiles score it."""
-        effective = BF16 if rounds_to_bf16(compute, precision) else exact_float32(precision)
-        operands = _operand_dtype(effective, at_least_fp32(states.dtype))
+        operands = _operand_dtype(product, at_least_fp32(states.dtype))
         logits = jax.vmap(lambda state, row: _tile_logits(
-            state[None].astype(operands), row[None], effective)[0, 0])(states, rows)
+            state[None].astype(operands), row[None], product)[0, 0])(states, rows)
         return capped_logits(columns.logits(logits), cap, temperature)
 
     left_out = None if excluded is None else jnp.asarray(excluded, jnp.int32)
@@ -1037,8 +1044,7 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
     if hidden.shape[:-1] != targets.shape or weights.shape != targets.shape:
         raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
     states = head.states(hidden)
-    compute = states.dtype if head.compute is None else head.compute
-    precision = BF16 if rounds_to_bf16(compute, head.precision) else exact_float32(head.precision)
+    precision = _head_product(head, states)
     table = head.matrix if head.vocab_major else head.matrix.T
     columns = _Columns.of(head, at_least_fp32(states.dtype))
     statics = (float(z_loss), head.softcap)
@@ -1098,6 +1104,81 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     return losses, jnp.argmax(logits, axis=-1) if predict else None, log_z
 
 
+def head_divergence(hidden, head: OutputTable, reference, reference_head: OutputTable, kept, temperature, *,
+                    tile: tuple[int, int]) -> jax.Array:
+    """Each position's `KL(q || p)`, `[B, S]`: `p` the categorical of `head`'s logits of the final states
+    `hidden`, `q` of `reference_head`'s of `reference` (a frozen teacher's, which take no gradient), both over
+    `temperature` (a scalar or `[B, S]`), the reference's logits 0 at a position `kept` leaves out.
+
+    Each row is taken whole over the vocabulary through `dew.nn.categorical.kl_divergence`, whose derivative
+    (arXiv:2610.31642, eq. 9) reads a whole row (`q`'s most probable class, the rows' difference's mean
+    under `q`, its normalizer): a vocabulary tile, the cross entropy's (`chunked_cross_entropy`), would take
+    a plain `p - q`, which cancels where the two near each other, or three more passes of the vocabulary,
+    so the positions are sliced instead, over every row at a time, each slice recomputed in the backward
+    (row 10978). A slice holds as many positions as `tile`'s area allows logits of (`tile[0] * tile[1]`
+    over the vocabulary, every local row at least one position): neither model's `[B, S, vocab]` logits are
+    held. A logit is the head's tiles' (`_tile_logits`, the per-column terms, the cap). On a mesh each device
+    scores its own tokens against both tables gathered whole, which a whole row reads, the head's gradient
+    reduce-scattered (`_sharded_head`)."""
+    hidden, reference = head.states(hidden), jax.lax.stop_gradient(reference_head.states(reference))
+    if hidden.shape[:-1] != kept.shape or reference.shape[:-1] != kept.shape:
+        raise ValueError(f"{hidden.shape[:-1]} and {reference.shape[:-1]} states for {kept.shape} positions")
+    table, other = (side.matrix if side.vocab_major else side.matrix.T for side in (head, reference_head))
+    if table.shape[0] != other.shape[0]:
+        raise ValueError(f"the KL compares two distributions column by column, and the head scores "
+                         f"{table.shape[0]} ids where the reference's scores {other.shape[0]}")
+    work = at_least_fp32(hidden.dtype)
+    products = _head_product(head, hidden), _head_product(reference_head, reference)
+    cap = None if head.softcap is None else jnp.asarray(head.softcap, work)
+    temperatures = jnp.broadcast_to(jnp.asarray(temperature, work), kept.shape)
+
+    def scored(hidden, table, targets, excluded, cap, columns, reference_table):
+        del excluded
+        kept, temperatures, reference = targets
+        rows, positions = kept.shape
+        per = max(1, min(positions, tile[0] * tile[1] // table.shape[0] // rows))
+        chunks = -(-positions // per)
+
+        def padded(values: jax.Array, value=0) -> jax.Array:
+            return jnp.pad(values, ((0, 0), (0, chunks * per - positions), *((0, 0),) * (values.ndim - 2)),
+                           constant_values=value)
+
+        # Each side's operands cast once, not per slice, as `_forward` casts its table.
+        sides = ((padded(hidden), table.astype(_operand_dtype(products[0], work)), cap, columns, products[0]),
+                 (padded(reference),
+                  reference_table[0].astype(_operand_dtype(products[1], at_least_fp32(reference.dtype))),
+                  reference_head.softcap, reference_table[1], products[1]))
+        # The tail past the positions held at temperature 1, its logits finite: its KL is dropped, and over a
+        # temperature of 0 its cotangent, though 0, would reach the head's gradient as 0 / 0.
+        kept, temperatures = padded(kept), padded(temperatures, 1)
+
+        def logits(start, states, matrix, cap, columns, product):
+            sliced = jax.lax.dynamic_slice_in_dim(states, start, per, axis=1)
+            raw = _tile_logits(sliced.reshape(-1, sliced.shape[-1]).astype(matrix.dtype), matrix, product)
+            return capped_logits(columns.logits(raw), cap).reshape(rows, per, -1)
+
+        @jax.checkpoint
+        def one(at):
+            start = at * per
+            own, theirs = (logits(start, *side) for side in sides)
+            held = jnp.where(jax.lax.dynamic_slice_in_dim(kept, start, per, axis=1)[..., None], theirs, 0)
+            over = jax.lax.dynamic_slice_in_dim(temperatures, start, per, axis=1)[..., None]
+            return kl_divergence(own / over, held / over)
+
+        divergence = jax.lax.map(one, jnp.arange(chunks))
+        return jnp.moveaxis(divergence, 0, 1).reshape(rows, chunks * per)[:, :positions]
+
+    columns = _Columns.of(head, work)
+    reference_table = (jax.lax.stop_gradient(other),
+                       jax.lax.stop_gradient(_Columns.of(reference_head, at_least_fp32(reference.dtype))))
+    targets = (kept, temperatures, reference)
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty:
+        return scored(hidden, table, targets, None, cap, columns, reference_table)
+    return _sharded_head(mesh, hidden, table, targets, None, cap, columns, scored, None, predict=False,
+                         reference=reference_table)
+
+
 @overload
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, column_logits: Callable, *,
                   predict: bool) -> Terms: ...
@@ -1105,49 +1186,73 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
 
 @overload
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, column_logits: None, *,
-                  predict: bool) -> tuple[jax.Array, Terms]: ...
+                  predict: bool, reference: None = None) -> tuple[jax.Array, Terms]: ...
+
+
+@overload
+def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, column_logits: None, *,
+                  predict: bool, reference: tuple[jax.Array, _Columns]) -> jax.Array: ...
 
 
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, column_logits, *,
-                  predict: bool):
+                  predict: bool, reference: tuple[jax.Array, _Columns] | None = None):
     """`head` on a mesh: each device scores its own tokens in a `shard_map`,
     against the head's own columns where they stay split (`_vocabulary_split`)
     or the head gathered whole (`chunked_cross_entropy`). A `head` with no
     `column_logits` returns a sum over its tokens before their outputs
     (`fused_head_loss`), each device's share of it out along the token axes,
-    and gathers the head whole. `targets` may be a tuple of arrays alike, split alike."""
-    sums = column_logits is None
+    and gathers the head whole. `targets` may be a tuple of arrays whose leading `[batch, length]`
+    dimensions are alike, split alike. A `reference`, a second head's vocabulary-major table and its
+    per-column terms (`head_divergence`'s), is gathered whole as the head is, `head` takes it last and
+    returns one per-token array."""
+    sums = column_logits is None and reference is None
+    operands = (hidden, table, targets, excluded, cap, columns, *(() if reference is None else (reference,)))
     spec = token_spec(jax.tree.leaves(targets)[0].shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
     if not axes:
-        return head(hidden, table, targets, excluded, cap, columns)
+        return head(*operands)
     # The head arrives in its own shards on the token axes and is gathered
     # whole inside, so its gradient leaves reduce-scattered onto them rather
     # than summed whole. Unchecked, the transpose sums the cotangents of
     # what reaches every token shard alike, the head over the axes that do
     # not split it and the cap, over the shards; checked, the tile loops'
     # carries, which start from constants, would have to be told they vary.
-    # A spec drops its trailing unsplit dimensions; both of the table's count.
-    entries = logical_spec(("vocab", "embed"), table.shape)
-    kept = [tuple(axis for axis in mesh_axes(entry) if axis in axes)
-            for entry in (*entries, *[None] * (2 - len(entries)))]
-    held = P(*(entry if entry else None for entry in kept))
-    group, widths = kept
-    size = math.prod(mesh.shape[axis] for axis in group)
-    split = not sums and bool(group) and (hidden.size // math.prod(
-        mesh.shape[axis] for axis in axes) * size * hidden.dtype.itemsize
-        < table.size * table.dtype.itemsize)
+    def held(table) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The token axes that split a table's vocabulary and its features (a spec drops its trailing
+        unsplit dimensions; both of the table's count)."""
+        entries = logical_spec(("vocab", "embed"), table.shape)
+        group, widths = (tuple(axis for axis in mesh_axes(entry) if axis in axes)
+                         for entry in (*entries, *[None] * (2 - len(entries))))
+        return group, widths
 
-    def local(hidden, table, targets, excluded, cap, columns):
+    def whole(table, columns, kept: tuple[tuple[str, ...], tuple[str, ...]]):
+        """A table and its per-column terms gathered over the token axes that split them."""
+        group, widths = kept
         if widths:
             table = jax.lax.all_gather(table, widths, axis=1, tiled=True)
-        if split:
-            return _vocabulary_split(hidden, table, targets, excluded, cap, columns, group, head,
-                                     column_logits)
         if group:
             table = jax.lax.all_gather(table, group, axis=0, tiled=True)
             columns = jax.tree.map(lambda terms: jax.lax.all_gather(terms, group, axis=0, tiled=True),
                                    columns)
+        return table, columns
+
+    group, widths = held(table)
+    other = None if reference is None else held(reference[0])
+    size = math.prod(mesh.shape[axis] for axis in group)
+    # A whole row is what a reference's head reads (`head_divergence`), so its heads are never split.
+    split = not sums and reference is None and bool(group) and (hidden.size // math.prod(
+        mesh.shape[axis] for axis in axes) * size * hidden.dtype.itemsize
+        < table.size * table.dtype.itemsize)
+
+    def local(hidden, table, targets, excluded, cap, columns, *gathered):
+        if split:
+            return _vocabulary_split(hidden, whole(table, None, ((), widths))[0], targets, excluded, cap,
+                                     columns, group, head, column_logits)
+        table, columns = whole(table, columns, (group, widths))
+        if other is not None:
+            (reference_table, reference_columns), = gathered
+            return head(hidden, table, targets, excluded, cap, columns,
+                        whole(reference_table, reference_columns, other))
         if sums:
             total, outputs = head(hidden, table, targets, excluded, cap, columns)
             return total.reshape(1), outputs
@@ -1168,13 +1273,17 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
     def naming(entry):
         return (*mesh_axes(entry), *alone) or None
 
-    outputs = (spec, spec if predict else None, spec)
-    inputs = (P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]), spec, P(), P(),
-              jax.tree.map(lambda terms: P(naming(held[0])), columns))
+    def placed(table, columns):
+        """A table's and its per-column terms' specs: each split as it arrives over the token axes."""
+        vocabulary, features = (entry or None for entry in held(table))
+        return P(naming(vocabulary), features), jax.tree.map(lambda terms: P(naming(vocabulary)), columns)
+
+    outputs = spec if reference is not None else (spec, spec if predict else None, spec)
+    inputs = (P(naming(spec[0]), *spec[1:], None), placed(table, columns)[0], spec, P(), P(),
+              placed(table, columns)[1], *(() if reference is None else (placed(*reference),)))
     return jax.shard_map(local, in_specs=inputs,
                          out_specs=(P(tuple(sorted(axes)) + alone), outputs) if sums else outputs,
-                         axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
-        hidden, table, targets, excluded, cap, columns)
+                         axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(*operands)
 
 
 def _vocabulary_split(hidden, table, targets, excluded, cap, columns, group: tuple[str, ...],
