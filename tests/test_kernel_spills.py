@@ -612,6 +612,29 @@ def _thunk(calls: int, kernels: list[bytes]) -> bytes:
         _field(3, _field(5, kernel)) for kernel in kernels)
 
 
+def test_a_models_draw_of_its_variables_selects_no_kernel():
+    """A model's draw of its variables (`Objective.init`) runs its forward over a one-row batch no step runs,
+    for the variables its modules make, none of its values drawn: within it every selector takes its op's
+    generic program and reports no route (`generation.drawing`), so no launch is derived, traced or
+    certified at the draw's shapes (row 11803: an every-template decoder's ahead compile certified its
+    draw's kernels, 29% of its main thread), where the model's forward over the same variables selects and
+    reports its kernels."""
+    from dew.nn.kernels.generation import routes
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=128, num_layers=1, num_heads=2,
+                         num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=128, dtype="bfloat16",
+                         attention_impl="template")
+    objective = LMObjective(model, 128)
+    with routes() as drawn_routes:
+        drawn = jax.eval_shape(objective.init, jax.random.key(0))
+    with routes() as applied_routes:
+        jax.eval_shape(model.apply, drawn, jax.ShapeDtypeStruct((2, 128), jnp.int32))
+    assert not drawn_routes, drawn_routes
+    assert applied_routes, "the model's forward selects no kernel, so its draw's selecting none says nothing"
+
+
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
     """Each Mosaic GPU call a thunk names has its binary (`assembled.thunk_kernels`): two calls and two kernel
     protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a
