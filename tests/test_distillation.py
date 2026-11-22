@@ -828,7 +828,7 @@ def test_a_tiled_full_kl_divides_by_a_wide_temperature_at_its_width_as_the_whole
 
     vocab, width, rows, positions = 16, 8, 2, 5
     keys = jax.random.split(jax.random.key(0), 4)
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         tables = [jax.random.normal(key, (width, vocab), jnp.float32) for key in keys[:2]]
         states = [jax.random.normal(key, (rows, positions, width), jnp.float32) for key in keys[2:]]
         student, teacher = (OutputTable(table, vocab_major=False) for table in tables)
