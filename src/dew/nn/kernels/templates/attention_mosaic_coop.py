@@ -19,7 +19,6 @@ from dew.nn.kernels.templates.attention_mosaic_fused import (
     _STREAM_ORDER,
     _statistics,
     dq_and_dkv,
-    overlapped_tile_scores,
     staged_parts,
     streamed_statistics,
     walked_sums,
@@ -84,17 +83,9 @@ def _share_scores(walk: _Backward, share: int, resident: tuple, rows_of, coords_
     q_first = index * tiles.block_q
     own = pl.ds(share * keys, keys)
     coords = coords_of(q_first, read=walk.places_read(masked=masked))
-    family = walk.program.family
-    if (not whole_operands and masked is not None and family.products_overlap
-            and not family.operands_in_registers and not walk.interpret and not walk.accurate
-            and not walk.dropped):
-        scores = overlapped_tile_scores(walk, (slots["queries"], slots["douts"]),
-                                        (k_smem.at[own], v_smem.at[own]), rows_of(slots, q_first), coords,
-                                        (tiles.block_q, keys), masked=masked)
-    else:
-        scores = _tile_scores(walk, (slots["queries"], slots["douts"]), (k_smem.at[own], v_smem.at[own]),
-                              rows_of(slots, q_first), coords, whole(index), (tiles.block_q, keys),
-                              masked=masked, whole_operands=whole_operands)
+    scores = _tile_scores(walk, (slots["queries"], slots["douts"]), (k_smem.at[own], v_smem.at[own]),
+                          rows_of(slots, q_first), coords, whole(index), (tiles.block_q, keys),
+                          masked=masked, whole_operands=whole_operands)
     return scores, own, pl.ds(share * columns, columns), q_first
 
 

@@ -187,28 +187,20 @@ def _cotangent_part(walk: _Backward, weights, dp, anchor, delta, slopes, seen, d
     return mosaic.unscaled_part(*algebra.cotangent_parts(pulled * walk.grad_scale, dtype, accurate=False))
 
 
-def overlapped_tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords,
-                           shape: tuple[int, int], *, masked: bool) -> tuple[jax.Array, jax.Array]:
-    """Overlapped S/dP tile scores via `product_pair(..., between=...)` (row 5272): runs `S` softmax and
-    weight narrowing while `dP = dO Vᵀ` runs on Tensor Cores, returning `(narrowed, part)`."""
-    narrowed, weights, slopes, seen, dp, anchor, delta = _overlapped_weights_and_dp(
-        walk, slots, resident, rows, coords, shape, masked=masked)
-    return narrowed, _cotangent_part(walk, weights, dp, anchor, delta, slopes, seen, slots[0].dtype)
-
-
-def _overlapped_weights_and_dp(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords,
-                               shape: tuple[int, int], *, masked: bool,
-                               after_weights: Callable | None = None):
-    """Issue `S` and `dP` via `product_pair(..., between=...)`, running `S` softmax + optional
-    `after_weights(narrowed)` while `dP` is in flight on Tensor Cores."""
-    family = walk.program.family
-    (q_slot, do_slot), (k_smem, v_smem) = slots, resident
+def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged, coords, add_dq,
+                           slots, carry, accumulators, q_first, *, masked: bool):
+    """Pipelined sm90 fused backward step (row 5272): overlaps `S` softmax + staging `P` with `dP = dO Vᵀ`,
+    overlaps `dS` + staging `dS` with `dV = Pᵀ dO`, and overlaps `add_dq` with `dK = dSᵀ Q`."""
+    family, tiles = walk.program.family, walk.program.tiles
+    k_smem, v_smem = resident
+    q_slot, do_slot = slots["queries"], slots["douts"]
+    dk_acc, dv_acc = accumulators
     peak, total, anchor, delta = (_read(row) for row in rows[:4])
     tile_coords = _read(coords)
     how = walk.how
     scale = walk.spec.scale if how.factor is None else 1.0
 
-    def between(s):
+    def stage_weights(s):
         seen = algebra.seen(walk.spec, tile_coords, s) if masked else None
         logits, slopes = gradient.tile_logits(tile_coords.hooked(walk.spec.score_mod), s, seen,
                                               tile_coords.q_pos, tile_coords.k_pos, (), scale=scale,
@@ -216,27 +208,13 @@ def _overlapped_weights_and_dp(walk: _Backward, slots: tuple, resident: tuple, r
         exponentials, weights = derived_weights(keys_first=False, how=how, accurate=False).mapped(
             {"logits": logits, "peak": peak, "total": total})
         narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped)
-        if after_weights is not None:
-            after_weights(narrowed)
-        return narrowed, weights, slopes, seen
+        family.staged(narrowed, staged.at[0])
+        return weights, slopes, seen
 
     q_lhs = by_power(family.tile_of(q_slot), walk.spec.prescale) if walk.scaled else q_slot
-    (narrowed, weights, slopes, seen), dp = family.product_pair(
-        q_lhs, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)), shape, between=between)
-    return narrowed, weights, slopes, seen, dp, anchor, delta
-
-
-def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged, coords, add_dq,
-                           slots, carry, accumulators, q_first, *, masked: bool):
-    """Pipelined sm90 fused backward step (row 5272): overlaps `S` softmax + staging `P` with `dP = dO Vᵀ`,
-    overlaps `dS` + staging `dS` with `dV = Pᵀ dO`, and overlaps `add_dq` with `dK = dSᵀ Q`."""
-    family, tiles = walk.program.family, walk.program.tiles
-    k_smem = resident[0]
-    q_slot, do_slot = slots["queries"], slots["douts"]
-    dk_acc, dv_acc = accumulators
-    _, weights, slopes, seen, dp, anchor, delta = _overlapped_weights_and_dp(
-        walk, (q_slot, do_slot), resident, rows, coords, (tiles.block_q, tiles.block_k), masked=masked,
-        after_weights=lambda narrowed: family.staged(narrowed, staged.at[0]))
+    (weights, slopes, seen), dp = family.product_pair(
+        q_lhs, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)),
+        (tiles.block_q, tiles.block_k), between=stage_weights)
     dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     part = _cotangent_part(walk, weights, dp, anchor, delta, slopes, seen, q_slot.dtype)
     cotangents_staged = staged.at[1]
