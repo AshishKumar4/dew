@@ -960,3 +960,36 @@ def test_a_steps_reads_of_its_parameters_pass_over_another_collections_attribute
     assert held_copies(copies) == reads.casts
     np.testing.assert_array_equal(np.asarray(copies["params"]["w"]),
                                   np.asarray(variables["params"]["w"].astype(jnp.bfloat16)))
+
+
+def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_steps_with_its_copies():
+    """A fit whose state holds, beside its parameters, a collection of structured leaves its step reads no
+    copy of (a packed checkpoint's `quantization`, an NvFp4 weight's attributes), its narrow copies on, plans
+    and steps, its loss finite and its copies built of its parameters alone (row 11730: its first step
+    raised on those attribute paths before it ran; row 11779: its proof read the analysis alone)."""
+    from typing import NamedTuple
+
+    from token_support import repeated_token_batch
+
+    from dew.data.dataset import Loader
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, MeshSpec, Trainer
+
+    class Packed(NamedTuple):
+        """Leaves reached through attributes, as a packed weight's are."""
+        values: jax.Array
+        scale: jax.Array
+
+    plain, _ = _decoder()
+    variables = dict(plain.init(jax.random.key(0)))
+    variables["quantization"] = {"head": Packed(jnp.ones((4, 2), jnp.uint8), jnp.ones((4,), jnp.float32))}
+    objective = LMObjective(plain.model, seq_len=8, pad_id=0, variables=variables)
+    with chosen(narrow_copies="on"):
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
+                          layout=Layout(min_shard=1, tolerance=1.0))
+        state = trainer.fit(Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None,
+                                   records=None, batch=8), steps=1)
+    assert int(state.step) == 1 and state.compute, state.compute
+    assert {path[0].key for path, _ in jax.tree_util.tree_flatten_with_path(state.compute)[0]} == {"params"}
+    np.testing.assert_array_equal(np.asarray(state.variables["quantization"]["head"].scale), np.ones(4))
+
