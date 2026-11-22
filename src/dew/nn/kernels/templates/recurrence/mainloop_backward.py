@@ -714,16 +714,16 @@ def _reverse(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, call: C
                                         lambda role: walked + role * bv, bv, row,
                                         lambda role: roled(role)[1]["table"]))
 
-    operands, walks = _reverse_operands(q, k, w, do, local, prefix, dht, sequences, v, beta, skip, memory,
-                                        table)
+    operands, walks = _reverse_inputs(q, k, w, do, local, prefix, dht, sequences, v, beta, skip, memory,
+                                      table)
     launched = _reverse_launched(program, call, tiles, batch, sequences.shape[0], gates=gates, skips=skips,
                                  table=table, walks=walks)(*operands)
     # A forked call's stored slots' gathered gradients the walk alone reads.
     return launched[:-1] if returns == 2 else launched
 
 
-def _reverse_operands(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, skip, memory,
-                      table: Table | None) -> tuple[tuple, int]:
+def _reverse_inputs(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, skip, memory,
+                    table: Table | None) -> tuple[tuple, int]:
     """`_reverse`'s launch's operands in order, and the index among them of its walks' table (`sequences`,
     `sequence_live`'s). The keys take the place of weights without the delta rule, and the keys and the
     prefix that of values a walk gates none of: operands no step reads."""
