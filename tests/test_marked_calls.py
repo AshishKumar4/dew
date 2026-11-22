@@ -374,3 +374,15 @@ def test_a_held_span_reports_its_routes_wherever_it_is_taken():
         found.append([route.choice for route in routes])
     assert found == [["rms_norm"], ["rms_norm"]]
 
+
+
+def test_a_marked_span_closing_over_its_enclosing_traces_value_is_traced_as_it_is():
+    """A marked span whose function closes over a value of the trace enclosing it (an outer jit's argument)
+    computes with that value, traced at its call: no statement holds a trace's value, which raised as its
+    placement was read (row 11002's review, F3: `ConcretizationTypeError` where an unstated span was
+    meant)."""
+    def scaled(x, y):
+        return marked(Protected(), lambda v: v * y)(x)
+
+    out = jax.jit(scaled)(jnp.ones(3), jnp.full(3, 2.0))
+    np.testing.assert_array_equal(np.asarray(out), np.full(3, 2.0, np.float32))
