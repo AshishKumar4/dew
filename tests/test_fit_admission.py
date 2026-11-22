@@ -311,15 +311,16 @@ def test_a_stream_with_no_batch_ends_its_run_where_it_starts_its_final_checkpoin
         Trainer(named, optax.sgd(0.1), key=jax.random.key(0)).fit(empty, steps=5, log_every=100)
 
 
-def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_its_run_holds(tmp_path,
-                                                                                          monkeypatch):
+def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_once(tmp_path, monkeypatch):
     """A fit compiled ahead that evaluates midway states a need admitting each of its evaluation's programs
-    with the run's state beside it, as its run holds the state while it scores (row 8710: the need admitted
-    every program compiled beside the step with nothing beside it, so a GPU admitted at it ran out of memory
-    at an evaluation of batches larger than its step's, where the run's own admission refused it). A model
-    1024 wide, whose state outweighs its step's other bytes, and an evaluation of 32 times its step's rows:
-    its evaluation, alone, needs less than its step, and beside the state more (FS-8710-NEEDW: 111 against
-    163 MB, and 193)."""
+    beside the state its run holds while it scores, the weights each reads from that state counted once
+    (row 8710: the need admitted every program compiled beside the step with nothing beside it, so a GPU
+    admitted at it ran out of memory at an evaluation of batches larger than its step's, where the run's own
+    admission refused it; then it counted the weights twice, beside the state and among the evaluation's
+    arguments, and refused a GPU the evaluation fitted). A model 1024 wide, its state outweighing its step's
+    other bytes: an evaluation of 4 times its step's rows fits where its step does and adds nothing to the
+    need (its weights counted twice, 27 MB more, FS-8710-N-c1ff975583c-4x1024); one of 32 times needs more
+    than the step (FS-8710-N-87cbc58440b-32x1024), and the need admits it."""
     from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune, gpus
     from token_support import token_rows
 
@@ -329,17 +330,28 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_its
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    scored = 32 * BATCH
-    validation = {"val": Memory(token_rows(VOCAB, 2 * scored, SEQ_LEN + 1, seed=1)).batch(scored)}
-    plain = compile_ahead(fine_tune(MeshSpec().build(gpus("sm90")), width=1024), batch)
-    evaluating = compile_ahead(fine_tune(MeshSpec().build(gpus("sm90")), width=1024), batch,
-                               fit={"steps": 4, "validation": validation, "eval_every": 2})
-    evaluations = [evaluating.starts[digest] for digest in set(evaluating.starts) - set(plain.starts)]
-    assert evaluations and evaluating.built.memory is not None
-    with stand_in_gpus(jax.devices("cpu")[:1], evaluating.built.memory, share=1.0) as stood:
-        for program in evaluations:
-            memory = program.memory
+
+    def built(scale: int | None):
+        trainer = fine_tune(MeshSpec().build(gpus("sm90")), width=1024)
+        if scale is None:
+            return trainer, compile_ahead(trainer, batch)
+        scored = scale * BATCH
+        validation = {"val": Memory(token_rows(VOCAB, 2 * scored, SEQ_LEN + 1, seed=1)).batch(scored)}
+        return trainer, compile_ahead(trainer, batch, fit={"steps": 4, "validation": validation,
+                                                           "eval_every": 2})
+
+    trainer, plain = built(None)
+    assert built(4)[1].built.memory == plain.built.memory
+    _, evaluating = built(32)
+    weights = sum(leaf.size * leaf.dtype.itemsize
+                  for leaf in jax.tree.leaves(jax.eval_shape(trainer.objective.init, jax.random.key(0))))
+    evaluations = [evaluating.starts[digest].memory for digest in set(evaluating.starts) - set(plain.starts)]
+    need = evaluating.built.memory
+    assert evaluations and need is not None and need > plain.built.memory
+    with stand_in_gpus(jax.devices("cpu")[:1], need, share=1.0) as stood:
+        for memory in evaluations:
             assert memory is not None
-            spare = admitted(stood, memory.argument, memory.output - memory.alias + evaluating.argument_bytes,
-                             memory.temp)
-            assert spare is not None and spare >= 0, (spare, memory, evaluating.argument_bytes)
+            # Beside the state the run holds, less the weights the evaluation reads from it.
+            beside = memory.output - memory.alias + evaluating.argument_bytes - weights
+            spare = admitted(stood, memory.argument, beside, memory.temp)
+            assert spare is not None and spare >= 0, (spare, memory, evaluating.argument_bytes, weights)
