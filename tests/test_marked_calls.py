@@ -2,6 +2,7 @@
 (`dew.nn.derivatives.marked`), which every transform keeps a call of that kind, so the algebra pass reads a
 span's kind from the program it rewrites, its forward, tangent and cotangent alike."""
 
+import functools
 import typing
 
 import jax
@@ -282,3 +283,177 @@ def test_a_declared_derivatives_nondifferentiable_array_is_bound_not_traced():
 
     for run in (lambda f: f, jax.jit):
         np.testing.assert_array_equal(np.asarray(gradient(declared, run)), np.asarray(gradient(bare, run)))
+
+
+def test_a_marked_span_called_again_in_one_state_is_traced_once(monkeypatch):
+    """A marked span called again in the same state, its function's reads, its arguments' types and the
+    context a trace reads alike, is the program its first call traced (`derivatives._SPANS`), never traced
+    again: precision's error-free transforms were traced afresh at every call, 7.5 percent of a padded
+    merge's grad of grad (row 10762). Each trace of a span counted as JAX makes it."""
+    traced = []
+    making = jax.make_jaxpr
+
+    def counted(fn, *args, **kwargs):
+        # A marked call's own trace of its span, among whatever else the trace makes.
+        traced.append(getattr(fn, "__name__", None))
+        return making(fn, *args, **kwargs)
+
+    span = marked(Protected(), body)
+    x, y = jnp.ones(3), jnp.full(3, 2.0)
+    monkeypatch.setattr(jax, "make_jaxpr", counted)
+    first = jax.jit(lambda x, y: span(x, y)).trace(x, y)
+    second = jax.jit(lambda x, y: span(x, y) + 0.0).trace(x, y)
+    assert traced.count("span") == 1
+    assert kinds_of(first.jaxpr) == kinds_of(second.jaxpr) == [Protected()]
+
+
+SCALE = 2.0
+"""A module global a marked span reads (`test_a_marked_span_reads_the_state_its_function_reads_now`)."""
+
+
+def test_a_marked_span_reads_the_state_its_function_reads_now(monkeypatch):
+    """A marked span's program is its function's in the state it reads now: a module global rebound, a
+    closure's dict changed, between two calls, the second computes with the new values, never a program
+    the first traced (row 10762's reviews: a key that missed a function's reads served the old one)."""
+    held = {"shift": 1.0}
+
+    def scaled(x):
+        return x * SCALE + held["shift"]
+
+    span = marked(Protected(), scaled)
+    x = jnp.ones(3)
+    first = jax.jit(lambda x: span(x))(x)
+    monkeypatch.setattr(__import__(__name__), "SCALE", 3.0)
+    held["shift"] = 5.0
+    second = jax.jit(lambda x: span(x) + 0.0)(x)
+    np.testing.assert_array_equal(np.asarray(first), np.full(3, 3.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(second), np.full(3, 8.0, np.float32))
+
+
+def _span_traces(monkeypatch) -> list:
+    """The marked spans' traces JAX makes from here on (`derivatives.marked`'s `span`), each counted."""
+    traced = []
+    making = jax.make_jaxpr
+
+    def counted(fn, *args, **kwargs):
+        traced.append(getattr(fn, "__name__", None))
+        return making(fn, *args, **kwargs)
+
+    monkeypatch.setattr(jax, "make_jaxpr", counted)
+    return traced
+
+
+def test_an_error_free_transform_called_again_in_one_state_is_traced_once(monkeypatch):
+    """An error-free transform (`precision.two_sum`, one `bound_span` of `Protected`) called again in one
+    state is the program its first call traced: its span closes over stated values alone, never the call's
+    bound arguments, which no statement holds (row 11003: every bound span, the error-free transforms row
+    10762 names among them, was traced at each call)."""
+    from dew.nn.precision import two_sum
+
+    x, y = jnp.ones(3), jnp.full(3, 2.0)
+    traced = _span_traces(monkeypatch)
+    jax.jit(lambda x, y: two_sum(x, y)).trace(x, y)
+    jax.jit(lambda x, y: jax.tree.map(lambda z: z + 0.0, two_sum(x, y))).trace(x, y)
+    assert traced.count("span") == 1
+
+
+def test_a_held_span_reports_its_routes_wherever_it_is_taken():
+    """A marked span whose body takes a route (a kernel's choice) reports it in every trace that takes the
+    span, its program held or not: a held span reported nothing again, and a kernel report and the tuner
+    missed its route and launch (row 11002)."""
+    from dew.nn.kernels import generation
+
+    def routed(x):
+        generation.route("rms_norm", kernel="xla")
+        return x * 2.0
+
+    span = marked(Protected(), routed)
+    found = []
+    for program in (lambda x: span(x), lambda x: span(x) + 0.0):
+        with generation.routes() as routes:
+            jax.jit(program).trace(jnp.ones(3))
+        found.append([route.choice for route in routes])
+    assert found == [["rms_norm"], ["rms_norm"]]
+
+
+
+def test_a_marked_span_closing_over_its_enclosing_traces_value_is_traced_as_it_is():
+    """A marked span whose function closes over a value of the trace enclosing it (an outer jit's argument)
+    computes with that value, traced at its call: no statement holds a trace's value, which raised as its
+    placement was read (row 11002's review, F3: `ConcretizationTypeError` where an unstated span was
+    meant)."""
+    def scaled(x, y):
+        return marked(Protected(), lambda v: v * y)(x)
+
+    out = jax.jit(scaled)(jnp.ones(3), jnp.full(3, 2.0))
+    np.testing.assert_array_equal(np.asarray(out), np.full(3, 2.0, np.float32))
+
+
+def test_a_bound_flax_modules_statement_runs_none_of_its_setup():
+    """A Flax module bound to its variables (a layer within its model's `init` or `apply`) has no statement:
+    its identity is its variables' as well as its fields, and stating it ran its `setup`, which a second run
+    of found its submodules' names in use (train 1169: a held span's statement over a model's layer raised
+    `NameInUseError` in 49 cells). Nothing of it runs."""
+    import flax.linen as nn
+
+    from dew._stated import Unestablished, stated
+
+    made = []
+
+    class Made(nn.Module):
+        def setup(self):
+            made.append(None)
+            self.dense = nn.Dense(2)
+
+        def __call__(self, x):
+            return self.dense(x)
+
+    variables = Made().init(jax.random.key(0), jnp.ones((1, 3)))
+    made.clear()
+    bound = Made().bind(variables)
+    with pytest.raises(Unestablished):
+        stated(bound, "a bound module")
+    assert made == []
+
+
+def test_a_local_functions_bound_span_called_again_in_one_state_is_traced_once(monkeypatch):
+    """A bound span of a local function (a kernel's glue: `declared_tangent` of a closure) called again in one
+    state is the program its first call traced, as a module function's is: its statement holds it (row
+    11650: local functions were traced at each call, an exception for a recursion its launch's digest made,
+    not a collision of statements)."""
+    from dew.nn.derivatives import declared_tangent
+
+    def glued(scale):
+        def applied(y):
+            return y * scale
+
+        def tangent(primals, tangents):
+            return primals[0] * scale, tangents[0] * scale
+
+        return declared_tangent(Protected(), applied, tangent)
+
+    x = jnp.ones(3)
+    traced = _span_traces(monkeypatch)
+    jax.jit(lambda x: glued(2.0)(x)).trace(x)
+    jax.jit(lambda x: glued(2.0)(x) + 0.0).trace(x)
+    assert traced.count("span") == 1
+
+
+
+class Doubled(functools.partial):
+    """A partial doubling what it calls (`test_a_partial_subclass_overriding_its_call_is_stated_apart_from_a_
+    plain_partial`)."""
+
+    def __call__(self, *args, **kwargs):
+        return 2 * super().__call__(*args, **kwargs)
+
+
+def test_a_partial_subclass_overriding_its_call_is_stated_apart_from_a_plain_partial():
+    """A `functools.partial` subclass whose `__call__` is its own (one doubling what it calls) is stated apart
+    from a plain partial of the same function and arguments, its class among its statement: two marked spans
+    over them are two programs (train 1174's return: test_cpu_accumulation's doubled contraction took the
+    plain one's held program, 1x where 2x was asked)."""
+    from dew._stated import stated
+
+    plain = functools.partial(jnp.multiply, 3.0)
+    assert stated(Doubled(jnp.multiply, 3.0), "doubled") != stated(plain, "plain")

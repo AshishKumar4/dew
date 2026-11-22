@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import logging
 import os
 import sys
@@ -23,6 +24,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from jax._src.named_sharding import UNSPECIFIED
+from jax.core import Tracer
 from jax.experimental.layout import Format, Layout
 from jaxlib import xla_client
 from jaxlib._jax import PjitFunction
@@ -127,8 +129,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return ["logger", value.name]
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
         return _own(value, at, known, walking)
-    if _sources.hand_written(getattr(value, "__wrapped__", None)):
-        return _wrapping_users(value, at, again)
+    if (wrapping := _wrapping(value, at, again)) is not None:
+        return wrapping
     if (named := _named(value, at)) is not None:
         return named
     if isinstance(value, type):
@@ -163,7 +165,10 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return ["map", again(type(value), at=at),
                 [[again(key, at=at), again(each, at=f"{at}[{key!r}]")] for key, each in value.items()]]
     if isinstance(value, functools.partial):
-        return ["partial", again(value.func, at=at), again(value.args, at=at), again(value.keywords, at=at)]
+        # Its class among it, as a container's: a subclass's own `__call__` computes otherwise (train 1174:
+        # a doubling partial took a plain partial's held program).
+        return ["partial", again(type(value), at=at), again(value.func, at=at), again(value.args, at=at),
+                again(value.keywords, at=at)]
     if isinstance(value, types.MethodType):
         return ["method", again(value.__self__, at=at), value.__name__]
     if isinstance(value, types.FunctionType):
@@ -196,6 +201,22 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
 
 
 
+def _wrapping(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """A callable wrapping one of the user's functions (`_wrapping_users`), its `__wrapped__` read as stored,
+    never through the object's own lookup, which a Flax module's runs its `setup` by (a `__wrapped__` its
+    class declares as a property is that descriptor, no function it wraps); None for any other.
+    Refused for a Flax module bound to its variables (within its model's `init` or `apply`): its identity is
+    its variables' as well as its fields' (train 1169: stating one ran its `setup`, and a second run found
+    its submodules' names in use)."""
+    flax_module = sys.modules.get("flax.linen.module")
+    if (flax_module is not None and isinstance(value, flax_module.Module)
+            and inspect.getattr_static(value, "scope", None) is not None):
+        raise Unestablished(f"{at}: a Flax module bound to its variables, which no statement holds")
+    if _sources.hand_written(inspect.getattr_static(value, "__wrapped__", None)):
+        return _wrapping_users(value, at, again)
+    return None
+
+
 def _wrapping_users(value, at: str, again: Callable[..., JSON]) -> JSON:
     """A callable that is no function and wraps one of the user's, a jitted one aside (`_computed`): a
     function with JAX's custom derivative is its function, its rules and the options a trace reads, as the
@@ -212,10 +233,14 @@ def _wrapping_users(value, at: str, again: Callable[..., JSON]) -> JSON:
 
 
 def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
-    """One of JAX's values a program computes from or with: an array (`_jax_array`), a function `jax.jit`
-    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`), a
-    program Dew's compile point compiles, by its function and arguments (`_outer_program`); None for any
-    other."""
+    """One of JAX's values a program computes from or with: an array (`_jax_array`; a trace's value, none an
+    identity states, refused), a function `jax.jit` wraps, by its module's name for it where a library's
+    (`_named`), else by what it wraps (`_jitted`), a program Dew's compile point compiles, by its function and
+    arguments (`_outer_program`); None for any other."""
+    if isinstance(value, Tracer):
+        # A value of a trace in progress (a span's enclosing jit's argument): no value to state, and its
+        # placement raises as it is read (row 11002's review, F3: `ConcretizationTypeError`).
+        raise Unestablished(f"{at}: a value of a trace in progress")
     if isinstance(value, jax.Array):
         return _jax_array(value, at, again)
     if (program := _outer_program(value, at, again)) is not None:

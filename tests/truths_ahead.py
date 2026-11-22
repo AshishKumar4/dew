@@ -287,6 +287,15 @@ class CompiledTruths:
             self.begun.discard(label)
             shutil.rmtree(site)
             raise
+        except RuntimeError:
+            # A host callback is lowered by the backend its program runs on, a GPU's absent from a prepare
+            # (row 11497: "Unknown backend: 'gpu' requested"): its run compiles the site on its GPU, and its
+            # memory, which no lowering here reads, is its run's to read. Asked only of a compile that failed.
+            if host or not any(_calls_the_host(fn, shapes) for fn, shapes in programs.values()):
+                raise
+            (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": {},
+                                                 "arms": arms, "host": host, "at_run": CALLS_THE_HOST}))
+            return
         built.save(site / PROGRAMS)
         (site / HELD).write_bytes(_held_bytes(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
@@ -494,6 +503,23 @@ def reading() -> tuple[CompiledTruths, str] | None:
         store.unprepared(f"{label}: its prepare did not reach this site")
         return None
     return store, label
+
+
+CALLS_THE_HOST = "a program calling the host, which a compile lowers by its GPU's own backend"
+"""Why a site whose programs call the host (`_calls_the_host`) compiles at its run (`compile_site`)."""
+
+
+def _calls_the_host(fn: Callable, shapes: Sequence) -> bool:
+    """Whether `fn`'s program at `shapes` calls back to the host anywhere within it (`jax.pure_callback`,
+    `jax.experimental.io_callback`, `jax.debug.callback`): each lowered by the backend it runs on."""
+    from dew.nn import programs
+
+    closed = jax.make_jaxpr(fn)(*shapes)
+    return any(equation.primitive.name in HOST_CALLBACKS for equation in programs.equations(closed.jaxpr))
+
+
+HOST_CALLBACKS = frozenset({"pure_callback", "io_callback", "debug_callback"})
+"""JAX's primitives that call back to the host, by name."""
 
 
 def running() -> tuple[CompiledTruths, str] | None:
