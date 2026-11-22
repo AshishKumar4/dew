@@ -271,7 +271,10 @@ class ScanCase:
                 return all(selection_margins.margin(self.config, selected(tree, ids), shape) > least
                            for tree in (self.variables, self.training))
 
-            self.draw = selection_margins.clearing(drawn, clears)
+            # Each seed's clearing draw found once for every site judged over it (`scans_as_the_loop`): its
+            # selections' forwards and margins were a third of a conditioned map task's time drawn again a
+            # site (row 9780).
+            self.draw = functools.cache(selection_margins.clearing(drawn, clears))
         else:
             self.draw = drawn
 
