@@ -18,7 +18,7 @@ from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
-from dew.nn.protocols import EXITS, CountedCondition, Looped, TokenModel, VocabularyRows
+from dew.nn.protocols import EXIT_PASSES, EXITS, CountedCondition, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
@@ -281,6 +281,25 @@ class DecisionModel(HeadedModel):
         logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
                                              opened=opened)
         return logits, beside_head(sown, head_sown, opened)
+
+    def exit_logits(self, variables: Variables, inputs: DecisionInputs, *,
+                    media: ModelInputs | None = None) -> tuple[jax.Array, jax.Array]:
+        """The option logits (`logits`) and each question's 1-based exit pass `[B, Q]` int32, read at its
+        answer cue (`DecisionInputs.readout`): the pass whose state the backbone's exit threshold handed on
+        for that token (`EXIT_PASSES`, `Loop.exit_threshold`), the forward the logits are read from. For a
+        readout of labels over a looped backbone under an exit threshold (`reports_exits`)."""
+        logits, sown = self.observed_logits(variables, inputs, media=media, opened=(EXIT_PASSES,))
+        (chosen,) = jax.tree.leaves(sown[EXIT_PASSES])
+        return logits, answer_states(chosen[..., None], inputs)[..., 0]
+
+    @property
+    def reports_exits(self) -> bool:
+        """Whether its forward chooses each token's exit pass and reads its answers at a cue alone
+        (`exit_logits`): a looped backbone under an exit threshold (`Loop.exit_threshold`) beneath a
+        readout of labels that pools no spans (a slot head's answers read its options' lines too)."""
+        backbone = self.backbone
+        return (self.head.reads_labels and not self.head.pools_spans and isinstance(backbone, Looped)
+                and backbone.loop is not None and backbone.loop.exit_threshold is not None)
 
     def pass_logits(self, variables: Variables, inputs: DecisionInputs, *,
                     media: ModelInputs | None = None, train: bool = False,
