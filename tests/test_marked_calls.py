@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental import checkify
 from jax.sharding import Mesh, PartitionSpec
@@ -457,3 +458,55 @@ def test_a_partial_subclass_overriding_its_call_is_stated_apart_from_a_plain_par
 
     plain = functools.partial(jnp.multiply, 3.0)
     assert stated(Doubled(jnp.multiply, 3.0), "doubled") != stated(plain, "plain")
+
+
+class _Echo(nn.Module):
+    """A module of the user's own handing back its prediction
+    (`test_a_function_reading_ones_own_flax_module_is_stated_and_told_apart`)."""
+
+    def __call__(self, prediction):
+        return prediction
+
+
+class _Doubling(nn.Module):
+    """A module of the user's own doubling its prediction
+    (`test_a_function_reading_ones_own_flax_module_is_stated_and_told_apart`)."""
+
+    def __call__(self, prediction):
+        return 2 * prediction
+
+
+def _echoed(x):
+    return _Echo().apply({}, x)
+
+
+def _doubled(x):
+    return _Doubling().apply({}, x)
+
+
+def test_a_function_reading_ones_own_flax_module_is_stated_and_told_apart():
+    """A function reading a Flax module class of the user's own is stated (its class's `parent` descriptor
+    and that field's default, Flax's unspecified-parent sentinel, instances holding nothing of their own),
+    and two reading modules that compute otherwise are two statements: an APG arm reading the guidance's own
+    model class had no statement, and a GPU tier part's prepare left its cell unprepared."""
+    from dew._stated import stated
+
+    assert stated(_echoed, "echoed") != stated(_doubled, "doubled")
+
+
+class _Held:
+    """A plain object its module holds by name, which holds a value of its own
+    (`test_a_module_held_instance_holding_a_value_has_no_statement`)."""
+
+
+_HELD = _Held()
+_HELD.value = 1
+
+
+def test_a_module_held_instance_holding_a_value_has_no_statement():
+    """An instance holding a value of its own (`_HELD.value`) has no statement: stated by its type alone, a
+    change of its value would read as the same, so only one holding nothing is stated so."""
+    from dew._stated import Unestablished, stated
+
+    with pytest.raises(Unestablished):
+        stated(_HELD, "a held instance")
