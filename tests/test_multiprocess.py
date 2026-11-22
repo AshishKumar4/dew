@@ -791,9 +791,9 @@ def test_a_pipeline_whose_stages_are_each_one_processs_checkpoints_and_resumes(t
     assert [report["refused"] for report in pool] == [True, True], pool
     # A value each process puts on its own stage's devices under one name, no checkpoint's row, is refused.
     assert [report["stray_refused"] for report in pool] == [True, True], pool
-    # Each process's diagonal of a tensor-split array, written to its local directory and read back whole
-    # (row 10813: Orbax's local tier wrote one replica's shards, one index of the two each process holds).
-    assert [report["diagonal"] for report in pool] == [{"held": True}] * 2, pool
+    # A run of stages copied over a data axis, its step 1 on the local tier alone, process 1's copy then
+    # lost: its fit resumes it from process 0's replica, to step 2 the persistent tier holds (row 10897).
+    assert [report["lost"] for report in pool] == [[1, 2, 2]] * 2, pool
     # The stepped step and the persistent tier's latest after each run: the first ran on the local tier
     # alone, the second resumed from it, the third from the persistent tier's step 2.
     assert [report["steps"] for report in pool] == [[[1, None], [2, 2], [3, 2]]] * 2, pool
