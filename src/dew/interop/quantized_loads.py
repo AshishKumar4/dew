@@ -5,7 +5,6 @@ source's expert banks and a ModelOpt source's W4A16_NVFP4 Linears."""
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 from collections.abc import Mapping
 
@@ -101,8 +100,7 @@ def bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables
         dense = table.get(("params", *path))
         if dense is None:
             continue
-        names = [member.name for member in dataclasses.fields(bank)]
-        for name, axes in zip(names, bank.leaf_axes(dense), strict=True):
+        for name, axes in bank.leaf_axes(dense).items():
             held[(QUANTIZATION, *path, name)] = axes
     return held
 

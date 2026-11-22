@@ -322,6 +322,10 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
         return jax.value_and_grad(loss, has_aux=True)(loaded.variables["params"], ids)
 
     stepped = ahead_arm(jax.jit(step), f"float32 {fixture} logits and gradients, its step")
+    with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
+        # Its program held at a draw's shape where a GPU tier part prepares (`ahead_arm`), whose prepare runs
+        # no arm of the site below (a host arm's, `as_given`'s): its run launches it there.
+        stepped(np.asarray(ids, np.int32))
 
     @as_given
     def ours(ids):

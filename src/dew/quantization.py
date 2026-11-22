@@ -381,9 +381,7 @@ class LinearProducts(nn.Module):
 
         module = getattr(self, name)
         kernel = packed_matrix(module, "kernel", lambda: module.get_variable("params", "kernel"))
-        if isinstance(kernel, NvFp4):
-            return kernel.decoded().astype(jnp.float32) * kernel.factor
-        return meta.unbox(kernel)
+        return packed_values(kernel) if isinstance(kernel, NvFp4) else meta.unbox(kernel)
 
     def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
         """Whether this call computes the submodule `name`, or a module under it, other than as a linear
@@ -562,7 +560,26 @@ def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> l
     (`NvFp4.leaf_axes`)."""
     from dew.nn.kernels.formats import NvFp4
 
-    return matrix.leaf_axes(axes) if isinstance(matrix, NvFp4) else [tuple(axes)]
+    return list(matrix.leaf_axes(axes).values()) if isinstance(matrix, NvFp4) else [tuple(axes)]
+
+
+def packed_values(matrix: NvFp4) -> jax.Array:
+    """A packed matrix's values, float32 (`[..., depth, width]`): each code times its block's scale times the
+    matrix's (`NvFp4.decoded` times its `factor`), a subnormal kept where a backend's float32 multiply
+    flushes it (XLA's CPU, row 4023): the decode's bfloat16 values times the factor's significand (exact
+    where the factor is a power of two, an MXFP4 bank's, row 4516; else rounded once in float32's normal
+    range), then its power of two applied from the bits, a result below the least normal rounded there once
+    (`float_bits.lowered_rounded`, `precision.power2`). The one decode of a packed matrix's values, a
+    Linear's applied kernel's (`LinearProducts.applied_kernel`, row 11740's review) and an export's
+    (`decoded_banks`)."""
+    from dew.nn.float_bits import lowered_rounded
+    from dew.nn.precision import power2
+
+    significand, exponent = jnp.frexp(jnp.asarray(matrix.factor, jnp.float32))
+    significand, exponent = (2 * significand)[..., None, None], (exponent - 1)[..., None, None]
+    scaled = matrix.decoded().astype(jnp.float32) * significand
+    return jnp.where(exponent < 0, lowered_rounded(scaled, jnp.maximum(-exponent, 0)),
+                     power2(scaled, jnp.maximum(exponent, 0)))
 
 
 def decoded_banks(variables: Variables) -> Variables:
@@ -571,7 +588,7 @@ def decoded_banks(variables: Variables) -> Variables:
     before their experts), a Linear's kernel `[..., in, out]`, each value its
     code times its block's scale times its matrix's, exactly (`NvFp4.decoded` times its factor), the bank
     gone from `QUANTIZATION`: the float tree an export or a merge takes, as `decoded_frozen_fp8` decodes a
-    frozen FP8 site."""
+    frozen FP8 site, each bank's values `packed_values`', on the host's CPU."""
     from dew.nn.kernels.formats import NvFp4
 
     held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
@@ -579,10 +596,8 @@ def decoded_banks(variables: Variables) -> Variables:
     banks = {path: bank for path, bank in held.items() if isinstance(bank, NvFp4)}
     if not banks:
         return variables
-    # Multiplied on the host: an MXFP4 group under the 0x00 byte holds float32 subnormals, which XLA's CPU
-    # arithmetic flushes to zero.
-    dense = {path: np.asarray(bank.decoded(), np.float32)
-             * np.asarray(bank.factor, np.float32)[..., None, None] for path, bank in banks.items()}
+    with jax.default_device(jax.devices("cpu")[0]):
+        dense = {path: np.asarray(packed_values(bank)) for path, bank in banks.items()}
     rest = {path: leaf for path, leaf in held.items() if path not in banks}
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
     decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **dense})

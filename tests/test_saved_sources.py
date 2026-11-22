@@ -89,7 +89,7 @@ def native_release_run(tmp_path_factory):
 
 @pytest.mark.shared_setup("native_release_run")
 def test_a_decision_run_whose_head_holds_no_backbone_of_its_family_exports_as_its_native_release(
-        native_release_run):
+        native_release_run, monkeypatch):
     """Such a run exports as its native release, which a run naming it (`--pretrained <run>`) starts from
     as from the run's own task: its head and backbone the first run's final ones; loaded without its
     weights, it holds their shapes, its projections packed as its weights are (row 4776: the release's
@@ -98,7 +98,9 @@ def test_a_decision_run_whose_head_holds_no_backbone_of_its_family_exports_as_it
     from dew.inference.tasks import saved_model
     from dew.interop import Pretrained
 
-    _, first, source, state = native_release_run
+    root, first, source, state = native_release_run
+    # The fixture's own cache, which its run and the run from it publish their release in.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
     assert format_unstated("laya", saved_model(SavedRun.pinned(str(source)).record, None).build()) is not None
     shapes = Pretrained.load(str(source), weights=False)
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
@@ -108,16 +110,16 @@ def test_a_decision_run_whose_head_holds_no_backbone_of_its_family_exports_as_it
 
 
 @pytest.mark.shared_setup("native_release_run")
-def test_a_decision_run_started_from_a_native_release_trains_records_it_and_answers(native_release_run):
+def test_a_decision_run_started_from_a_native_release_trains_records_it_and_answers(native_release_run,
+                                                                                     monkeypatch):
     """A run started from that native release trains, its record naming the run and step it read, and its
     task answers (row 4776)."""
     from dew.decision import Choice, Decide
 
     root, first, source, _ = native_release_run
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
     run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
-        second, _ = trained(run, root, "second", trainer={"checkpoint_final": True})
+    second, _ = trained(run, root, "second", trainer={"checkpoint_final": True})
     assert int(second.step) == 1
     recorded = DecisionRunConfig.load(str(root / "runs" / "second"))
     assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
