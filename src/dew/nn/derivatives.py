@@ -476,7 +476,7 @@ class _HeldSpan(NamedTuple):
     """A marked span's traced program (`_traced_span`): it, its outputs' structure, its known zeros and what
     its trace reported (`fusion.Recorded`)."""
 
-    closed: jax_core.ClosedJaxpr
+    closed: jax_core.Jaxpr
     structure: object
     zeros: object
     record: Recorded
