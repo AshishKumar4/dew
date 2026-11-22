@@ -61,7 +61,9 @@ EXAMPLES = [
 
 
 def qwen35(length: int) -> Pretrained:
-    return Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference", max_seq_len=length)
+    # Loaded on the host in a GPU tier prepare, whose compile-only GPU runs no load's checks (row 11788).
+    with ahead_on_the_host():
+        return Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference", max_seq_len=length)
 
 
 def attending(length: int, implementation: str = "xla") -> CausalTransformer:
@@ -257,7 +259,9 @@ class AttentionTerms:
     def __init__(self, objective, batch):
         self.names: dict = {}
         self.places: dict = {}
-        step = Step(jnp.asarray(0), jax.random.key(0), None, training=False)
+        with ahead_on_the_host():
+            # The step's constants on the host in a GPU tier prepare (row 11788).
+            step = Step(jnp.asarray(0), jax.random.key(0), None, training=False)
 
         def total(variables, added):
             held: dict = {}
