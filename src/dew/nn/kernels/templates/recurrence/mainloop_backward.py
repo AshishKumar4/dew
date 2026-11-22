@@ -964,7 +964,10 @@ def _query_key_holds(call: Call, vq: int) -> bool:
     those. Else each value head's added into the output in turn (`Family.added`), the same fp32 sums in the
     same order: held, an A100's element-wise global atomics each value head (26% of query_key's stall
     samples, its tensor pipe under 10% busy, M-JS-183) are one store a key head; an sm86's 100 KB block held
-    no Qwen3.5-27B's two more tiles."""
+    no Qwen3.5-27B's two more tiles. A key head of one value head at one split adds nothing to hold: its sums
+    stored as they come."""
+    if call.group == 1 and vq == call.value_width:
+        return False
     tiles, _ = _query_key_launched(call, vq)
     landing = _query_key_landing(call, call.value_width // vq)
     staging = _query_key_staging(call)
