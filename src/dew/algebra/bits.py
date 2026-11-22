@@ -22,6 +22,7 @@ import numpy as np
 
 from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
 from dew.nn.float_bits import raised_exactly
+from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
 
@@ -319,6 +320,15 @@ class BitForm:
         """Its instructions on each unit."""
         return {unit: sum(step.op.issues for step in self.steps if step.unit is unit) for unit in Unit}
 
+    def work(self, words: float = 1) -> Work:
+        """What decoding `words` stored words costs, in the one vocabulary every price is told in
+        (`templates.cost.Work`, row 5386): each step's issues on its unit (`issues`), the ALU's as integer
+        operations (`Work.integer_operations`) and the FMA pipe's (an IMAD's, beside the fp32 lanes' FFMA) as
+        its operations (`Work.operations`); a step two output registers read counted once, as ptxas
+        computes it once in the kernel's whole PTX (`ptx`)."""
+        issues = self.issues
+        return Work(integer_operations=issues[Unit.ALU] * words, operations=issues[Unit.FMA] * words)
+
     @property
     def live(self) -> int:
         """The most registers a word's decode holds at once: its stored word and each step's value, each
@@ -379,9 +389,16 @@ class BitForm:
 
     @property
     def price(self) -> tuple[int, int]:
-        """Its busiest unit's issues, then its instructions (`Unit`: one rate): a decoder's words are many
-        and independent, so its pipes' throughput prices it, not its chain's latency."""
-        return max(self.issues.values()), sum(step.op.issues for step in self.steps)
+        """A word's work's price (`work`, `priced`): a decoder's words are many and independent, so its
+        pipes' throughput prices it, not its chain's latency."""
+        return priced(self.work())
+
+
+def priced(work: Work) -> tuple[int, int]:
+    """A form's price from its work (`BitForm.work`): its busiest unit's issues, the ALU's integer operations
+    or the FMA pipe's, then all its instructions (`Unit`: one rate), the order the search walks shapes in
+    (`_priced`) and a form is chosen by."""
+    return int(max(work.integer_operations, work.operations)), int(work.integer_operations + work.operations)
 
 
 # LOP3's truth table of `c & (a ^ b)` and of `c & a`, over its operands' tables 0xF0, 0xCC and 0xAA (PTX ISA,
@@ -500,13 +517,14 @@ def _shifted(bits: Sequence[int], op: BitOp, amount: int) -> tuple[int, ...]:
 
 
 def _priced(shape: _Shape, registers: int, units: frozenset[Unit]) -> tuple[tuple[int, int], int]:
-    """A shape's price (`BitForm.price`) with one LOP3 a register, and its shifts on the ALU: a rotation there
-    (the ALU's alone), the rest split so the two pipes balance, or all of them where `units` holds no FMA."""
+    """A shape's price (`priced`, a form's of it) with one LOP3 a register, and its shifts on the ALU: a
+    rotation there (the ALU's alone), the rest split so the two pipes balance, or all of them where `units`
+    holds no FMA."""
     shifts = (shape.right is not None) + shape.lefts
     rotations = int(shape.right is BitOp.ROTR)
     on_alu = (shifts if Unit.FMA not in units
               else min(shifts, max(rotations, -(-(shifts - registers) // 2))))
-    return (max(registers + on_alu, shifts - on_alu), registers + shifts), on_alu
+    return priced(Work(integer_operations=registers + on_alu, operations=shifts - on_alu)), on_alu
 
 
 def _configs(shape: _Shape, reach: int, width: int) -> Iterator[list[_Shift]]:
