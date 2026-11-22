@@ -590,19 +590,18 @@ def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
     np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
 
 
-@pytest.mark.parametrize("site", [r".*cross_pass_[^/]+/depth", r".*cross_pass.*"], ids=["depth", "merge"])
-def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(site):
-    """A merge whose depth mixture's einsums a direct `qwix.quantize_model` rule owns, by the depth child's
-    path or the merge's, runs as Flax and Qwix see it in both modes (row 11713's review: recomputed apart,
-    its reverse mode bypassed the rule): its gradients the ones of the same model run as a watched merge runs
-    (captured, `capture_intermediates`), and the rule's, not the unquantized model's. (A Qwix rule over the
-    merge's matmuls is Qwix's to refuse: its controller's kernels share a shape.)"""
+def qwix_owned(provider: str, rule: dict, spec: CrossPass = MESSAGES) -> list:
+    """The gradients of a two-pass decoder passing messages by `spec`, quantized by a direct Qwix provider of
+    `rule` (`QtProvider`'s or `OdmlQatProvider`'s, jit off where Qwix finds a weight by its value), its gates
+    off zero (`gated`), each beside the same model's run as a watched merge runs (captured,
+    `capture_intermediates`) and the unquantized model's: `(owned, watched, plain)` leaves."""
     qwix = pytest.importorskip("qwix")
 
-    model = decoder("attention", steps=2)
+    model = decoder("attention", steps=2, messages=spec)
     ids = jnp.asarray(np.random.default_rng(11716).integers(0, VOCAB, (2, 12)), jnp.int32)
-    quantized = qwix.quantize_model(model, qwix.QtProvider([qwix.QtRule(
-        module_path=site, weight_qtype=jnp.int8, act_qtype=jnp.int8, op_names=("einsum",))]))
+    made = {"qt": qwix.QtProvider, "odml": qwix.OdmlQatProvider}[provider]
+    quantized = qwix.quantize_model(model, made([qwix.QtRule(**rule)],
+                                                **({"disable_jit": True} if provider == "qt" else {})))
     variables = gated(quantized.init(jax.random.key(0), ids), 11716)
 
     def gradients(applied, **watched):
@@ -610,12 +609,27 @@ def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(si
             out = applied({**variables, "params": params}, ids, **watched)
             logits = out[0] if watched else out
             return jnp.sum(jnp.square(logits.astype(jnp.float32)))
-        return jax.tree.leaves(jax.grad(loss)(variables["params"]))
+        return [np.asarray(leaf) for leaf in jax.tree.leaves(jax.grad(loss)(variables["params"]))]
 
-    owned = gradients(quantized.apply)
-    for got, watched in zip(owned, gradients(quantized.apply, capture_intermediates=True,
-                                             mutable=["intermediates"]), strict=True):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(watched))
-    assert any(not np.array_equal(np.asarray(got), np.asarray(plain))
-               for got, plain in zip(owned, gradients(model.apply), strict=True))
+    return (gradients(quantized.apply), gradients(quantized.apply, capture_intermediates=True,
+                                                  mutable=["intermediates"]), gradients(model.apply))
 
+
+@pytest.mark.parametrize(("provider", "rule", "spec"), [
+    ("qt", {"module_path": r".*cross_pass_[^/]+/depth", "weight_qtype": jnp.int8, "act_qtype": jnp.int8,
+            "op_names": ("einsum",)}, MESSAGES),
+    ("odml", {"module_path": r".*cross_pass_[^/]+/depth", "act_qtype": jnp.int8, "op_names": ("softmax",)},
+     MESSAGES),
+    ("qt", {"module_path": r".*cross_pass_[^/]+", "weight_qtype": jnp.int8, "act_qtype": jnp.int8,
+            "op_names": ("dot_general",)}, dataclasses.replace(MESSAGES, additive=False))],
+    ids=["depth einsums", "depth softmax", "merge matmuls"])
+def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(provider, rule, spec):
+    """A merge whose ops a direct `qwix.quantize_model` rule owns, its depth child's alone (`QtProvider`'s
+    einsums, `OdmlQatProvider`'s softmax) or its own alone (its controller's matmuls: a merge of no added
+    projection, whose two same-shaped gates Qwix tells apart by their values), runs as Flax and Qwix see it
+    in both modes (row 11713's review: recomputed apart, its reverse mode bypassed the rule): its gradients
+    the ones of the same model run as a watched merge runs, and the rule's, not the unquantized model's."""
+    owned, watched, plain = qwix_owned(provider, rule, spec)
+    for got, seen in zip(owned, watched, strict=True):
+        np.testing.assert_array_equal(got, seen)
+    assert any(not np.array_equal(got, unquantized) for got, unquantized in zip(owned, plain, strict=True))
