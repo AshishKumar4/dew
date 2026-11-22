@@ -909,6 +909,7 @@ def launch_work(kernel, stated: Stated) -> Work:
         counted = emitted(_body(kernel), mesh.num_threads or 1, mesh.thread_name, forms=forms)
     else:
         counted = emitted(_body(kernel), 1, None, forms=forms)
+
     def issued(field: str) -> float:
         return counted.issued(lambda work: getattr(work, field), stated.steps, programs)
 

@@ -152,6 +152,7 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
         op_provenance(op, ba.arguments), report._identity(op, ba), target.generation, target.device_kind,
         target.multiprocessors, target.launch_seconds, rates._asdict(), tuning.encoded(candidates))
 
+
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                              tiles: Callable[[int, int, int], Config],
                                              fits: Callable[[Config], bool], *,
