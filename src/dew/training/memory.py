@@ -381,12 +381,13 @@ def admitted(devices: Sequence, resident: int, beside: int, temporaries: int, *,
     return _admitted(devices, memory, beside, temporaries, placed=placed)
 
 
-def ceiling_headroom(devices: Sequence, beside: int, temporaries: int) -> int | None:
-    """The headroom `admitted` reads of a step beside a state not placed yet, at each allocator's own
-    ceiling (`bytes_limit - bytes_in_use`), no GPU's free bytes capping a growing pool's (`unclaimed`, which
-    another process may give back between readings): the most room a later reading of the devices can give
-    the step while this process holds what it holds now."""
-    memory = [device_memory(device) for device in devices]
+def ceiling_headroom(devices: Sequence, resident: int, beside: int, temporaries: int) -> int | None:
+    """The headroom `admitted` reads of a step of its admission's terms (`admission`: `resident`, `beside`,
+    `temporaries`) beside a state not placed yet, at each allocator's own ceiling (`bytes_limit -
+    bytes_in_use`), no GPU's free bytes capping a growing pool's (`unclaimed`, which another process may give
+    back between readings): the most room a later reading of the devices can give the step while this
+    process holds what it holds now."""
+    memory = [device_memory(device, resident) for device in devices]
     return _admitted(devices, memory, beside, temporaries, placed=False, ceiling=True)
 
 

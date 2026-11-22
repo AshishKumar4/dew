@@ -1747,14 +1747,14 @@ class Trainer(Generic[Loss, Effects]):
             return None
         key = shapes_of(fresh.key)
         begun = start_compiling(fresh.placing, fresh.initializer, key, fresh.abstract, fresh.shardings,
-                                self.device_mesh)
+                                mesh := self.device_mesh)
         self.phase_passes.at(first)
         with run.startup.phase("compile", "compiling the step"), run.held():
             # As the loop hands its step the batch, planned once: where the layout's choice did, not again.
             batch = handed(placed, self._shape.examples)
             if run.searched != planned_over(batch, self._shape):
                 self._planned_unplaced(run, fresh, batch)
-            self._compiler.refuse_unplaced(run.searched, lambda: fresh.freed(mesh), mesh := self.device_mesh)
+            self._compiler.refuse_unplaced(run.searched, lambda: fresh.freed(mesh), mesh, begun)
         return begun
 
     def _whole_validated(self, state: TrainState, batch: Batch, split: int) -> Validation:

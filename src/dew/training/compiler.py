@@ -11,6 +11,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from concurrent import futures
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -83,6 +84,7 @@ from dew.training.rungs import keep_rung, plan_flops, recorded_rung
 from dew.training.transaction import Transaction, outcome_of
 
 if TYPE_CHECKING:
+    from dew.nn.kernels.options import Compiling
     from dew.training.ahead import AheadOfTime
     from dew.training.interval import Interval
     from dew.training.transaction import Committed
@@ -1008,7 +1010,8 @@ class StepCompiler[L, E]:
         self._unplaced = Unplaced(signature, planned, compiled, keep)
         return signature
 
-    def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int | None], mesh: Mesh) -> None:
+    def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int | None], mesh: Mesh,
+                        begun: Compiling | None) -> None:
         """Refuse a fresh run whose first step over `signature` (`planned_over`) fit no plan before its state
         was placed (`planned_unplaced`) where the placed devices could hold none either: placing the state
         gives each device at most the room the search read beside its bytes and what the held arrays the
@@ -1040,14 +1043,19 @@ class StepCompiler[L, E]:
         room = freed()
         whole = whole and room is not None
         devices = local_devices(mesh)
+        # The start's own compile, begun beside the search (`begun`), ended: its scratch held in the
+        # allocators no more, which a reading during it counts (row 11712's review).
+        if begun is not None:
+            futures.wait([begun.attempt])
 
         def beyond(probe: Probe) -> bool:
             # Its miss read again at each allocator's ceiling, no GPU's free bytes capping a growing pool,
-            # which another process may give back by the time the state is placed (`ceiling_headroom`; row
-            # 11712's review: a miss read under that cap, the cap gone by this reading).
-            if room is None or probe.fits or probe.temp is None or probe.beside is None:
+            # which another process may give back by the time the state is placed (`ceiling_headroom`), by
+            # the terms its executable was admitted by (row 11712's review: a miss read under that cap, the
+            # cap gone by this reading).
+            if room is None or probe.fits or probe.admitted is None:
                 return False
-            margin = ceiling_headroom(devices, probe.beside, probe.temp)
+            margin = ceiling_headroom(devices, *probe.admitted)
             return margin is not None and -margin > room
 
         every = from_every_process([whole, [beyond(probe) for probe in probes]])

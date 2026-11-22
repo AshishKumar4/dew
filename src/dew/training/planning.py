@@ -62,6 +62,7 @@ from dew.training.memory import (
     LIMIT_EXIT,
     LiveSet,
     MemoryMiss,
+    admission,
     compile_limit,
     compiled_if_it_fits,
     local_devices,
@@ -374,6 +375,10 @@ class Probe:
     """The bytes the fit check placed beside the step's temporaries (`placed_beside`): its outputs that
     write over no donated argument and what the loop holds outside the step (copies, accumulators, a state
     not placed yet). None where none were read."""
+    admitted: tuple[int, int, int] | None = None
+    """The terms the fit check admitted by (`memory.admission`: resident, beside, temporaries), the
+    executable's whose fit it states (the sampled step's where it stands for the step, `FitSearch.measured`);
+    None where it read none."""
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
@@ -940,12 +945,14 @@ class FitSearch[LossT, EffectsT]:
         return tuple(found)
 
     def fitting(self, executable: jax.stages.Compiled | None,
-                candidate: Candidate) -> tuple[bool, int | None]:
+                candidate: Candidate) -> tuple[bool, int | None, tuple[int, int, int] | None]:
         """`step_fits` of `executable`, `candidate`'s compiled step or its sampled twin, with the state's
-        `unplaced` bytes beside it where the devices hold none of it yet."""
-        unplaced = self.unplaced or 0
-        return step_fits(executable, self.mesh, self.held(candidate), candidate.built + unplaced,
-                         placed=self.unplaced is None)
+        `unplaced` bytes beside it where the devices hold none of it yet, and the terms it admitted by
+        (`admission`), None where its executable states no memory."""
+        held, built = self.held(candidate), candidate.built + (self.unplaced or 0)
+        stats = None if executable is None else compiled_memory(executable)
+        fit, headroom = step_fits(executable, self.mesh, held, built, placed=self.unplaced is None)
+        return fit, headroom, None if stats is None else admission(stats, held, built)
 
     def held(self, candidate: Candidate) -> int:
         """The bytes the fit check holds beside `candidate`'s step: its own (`Candidate.held`), and the
@@ -1044,7 +1051,7 @@ class FitSearch[LossT, EffectsT]:
                 executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
-            fit, headroom = self.fitting(executable, candidate)
+            fit, headroom, admitted = self.fitting(executable, candidate)
             # Its lowering's own key, derived again only where a spill relowered it.
             key = looked if relowered is None or relowered.last is None else self.compiled_key(
                 candidate.lowered, options)
@@ -1082,11 +1089,12 @@ class FitSearch[LossT, EffectsT]:
                                     else SampledStep(lowered[-1], compiled))
                 # Admitted by the plan whichever compiled it, ahead or here (training.md: the sampled step is
                 # admitted by the same memory plan).
-                fit, headroom = self.fitting(None if self.sampled is None else self.sampled.executable,
-                                             candidate)
+                fit, headroom, admitted = self.fitting(
+                    None if self.sampled is None else self.sampled.executable, candidate)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable, self.held(candidate))
-        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, spent=spent)
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, spent=spent,
+                                    admitted=admitted)
         return options, candidate, executable, probe
 
     def fits_here(self, split: int) -> bool:
