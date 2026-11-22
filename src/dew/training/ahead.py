@@ -71,7 +71,7 @@ from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, 
 from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
-from dew.batch import Batch
+from dew.batch import Batch, Variables
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
     GpuTarget,
@@ -1727,25 +1727,26 @@ def _arguments(executable: jax.stages.Compiled) -> int:
     return 0 if memory is None else memory.argument
 
 
-def _weights_among(placed: TrainState) -> Callable[[jax.stages.Compiled], int]:
-    """The bytes of the run's state among an evaluation program's arguments: its first argument's, where
-    that is the weights the run holds (`Objective._validation_report` passes the state's variables, or the
-    average it keeps, `evaluation_variables`), those of them the program reads (a leaf it drops holds no
-    sharding, `Compiled.input_shardings`); else none. Its batches and other arguments are none of the
-    state, so they count beside it, and its weights once (row 8710: an evaluation counted beside the whole
-    state counted them twice, and refused a GPU it fitted)."""
+def _weights_among(evaluated: Variables) -> Callable[[jax.stages.Compiled], int]:
+    """The bytes of the run's state among an evaluation program's arguments: where its first argument is the
+    weights it scores by (`evaluated`, as the state places them, `Objective._pipeline_weights`: its variables,
+    or the average it keeps beside them), each leaf of them it reads (a leaf it drops holds no sharding,
+    `Compiled.input_shardings`) that the state holds in a device's own memory; else none. Its batches and
+    other arguments are none of the state, nor is an average the run keeps in host memory, which its
+    evaluation fetches to the device beside the live variables (`fetched_state`): new bytes there, counted
+    beside the state as its batches are (row 8710: an evaluation counted beside the whole state counted the
+    weights it holds on the device twice, and refused a GPU it fitted; its review: a fetched average read as
+    the state's)."""
     from dew.distributed.placement import placed_bytes
 
-    held = {_signature(tree) for tree in (placed.variables, placed.ema) if tree is not None}
+    signature = _signature(evaluated)
 
     def among(executable: jax.stages.Compiled) -> int:
         (arguments, _), (shardings, _) = executable.in_avals, executable.input_shardings
-        if not arguments or _signature(arguments[0]) not in held:
+        if not arguments or _signature(arguments[0]) != signature:
             return 0
-        read = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=sharding)
-                for aval, sharding in zip(jax.tree.leaves(arguments[0]),
-                                          jax.tree.leaves(shardings[0], is_leaf=lambda leaf: leaf is None),
-                                          strict=True)
+        placed = jax.tree.leaves(shardings[0], is_leaf=lambda leaf: leaf is None)
+        read = [leaf for leaf, sharding in zip(jax.tree.leaves(evaluated), placed, strict=True)
                 if sharding is not None]
         return placed_bytes(read, memory="device")
 
@@ -1795,6 +1796,6 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             with _collected(programs, _arguments):
                 copied(together(moving, frozen))
     if plan is not None:
-        with _collected(programs, _weights_among(placed)):
+        with _collected(programs, _weights_among(trainer.objective._pipeline_weights(placed, None))):
             trainer._evaluator().warmed_ahead(plan, placed, start.shardings,
                                               trainer._compiler.links(trainer.device_mesh))
