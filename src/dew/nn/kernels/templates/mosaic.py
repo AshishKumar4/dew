@@ -1637,6 +1637,12 @@ class Transport[Allocated, Opened](abc.ABC):
         kernel against; whether its program moves registers between its roles where the launch states
         it (`moves`; else its model decides, `resources.moves_registers`); its scratch where it `reduces`."""
 
+    def compiled_with(self, *, approx_math: bool):
+        """The compiler parameters its kernels compile with at `approx_math` (`kernel`'s: Mosaic GPU's
+        warpgroup lowering, `compiler_params`), whose special functions' forms a launch's price reads
+        (`emission.forms_of`)."""
+        return compiler_params(approx_math=approx_math)
+
     def scoped(self, body, *allocations, streams, after_walks: tuple = (), over_rings: bool = False):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
         (`streams`), and what it returns; with `after_walks`, allocations no walk reads, `body` takes `after`

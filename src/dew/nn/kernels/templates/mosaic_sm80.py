@@ -592,6 +592,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     an issuer composed with it gives (`Mma`)."""
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
+
+    def compiled_with(self, *, approx_math: bool):
+        # Its kernels' lane-level lowering (`kernel`'s), Mosaic GPU's default.
+        return plgpu.CompilerParams(approx_math=approx_math)
     prefetches_fragments = True  # `emit_pipeline`'s `prefetch`: a step's first fragments under the last's
 
     # Its programs fix a tile up across programs through global-memory atomics (`Family.fixed_up`), which
@@ -653,12 +657,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         built = launches.kernel(bodies.dependent(entry, interpret, prefetched=prefetched),
                                 name=name or self.name,
                                 out_type=outputs.structs(out_type), grid=grid, grid_names=grid_names,
-                                compiler_params=plgpu.CompilerParams(approx_math=approx_math,
-                                                                     reduction_scratch_bytes=(
-                                                                         self.reduction_scratch if reduces
-                                                                         else 0),
-                                                                     min_blocks_per_sm=resident,
-                                                                     metadata=report.launch_metadata()),
+                                compiler_params=dataclasses.replace(
+                                    self.compiled_with(approx_math=approx_math),
+                                    reduction_scratch_bytes=self.reduction_scratch if reduces else 0,
+                                    min_blocks_per_sm=resident, metadata=report.launch_metadata()),
                                 interpret=bodies.interpreted(interpret),
                                 kernel_name=report.named(
                                     name, model=(None if registers is None
