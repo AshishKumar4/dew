@@ -74,32 +74,49 @@ MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE)
 """Every key a run record holds beside its fields, each saying how it states a field (`RunConfig.record`)."""
 
 
-def earlier_retired(record: JSON, *, additive_unset: bool, root: bool = True) -> JSON:
+def earlier_retired(record: Mapping[str, object], *, additive_unset: bool) -> Mapping[str, object]:
     """A saved run's record with each run and trainer it holds, the root and every one a field holds as its
-    class record, in today's shapes: a trainer's `export_model`, the field that wrote each persistent step's
-    model beside it (row 11636), taken off, `dew export` the one export since; and a looped decoder's
-    `loop_message_additive` true read as unset where the record could not leave it unset (no
-    `ADDITIVE_UNSETTABLE`, `additive_unset` false; row 11742), every such record writing true for its
+    class record, in today's shapes (`_retired`): a trainer's `export_model`, the field that wrote each
+    persistent step's model beside it (row 11636), taken off, `dew export` the one export since; and a
+    looped decoder's `loop_message_additive` true read as unset where the record could not leave it unset
+    (no `ADDITIVE_UNSETTABLE`, `additive_unset` false; row 11742), every such record writing true for its
     default, a checkpoint's choice kept, its false a choice. A record written since states its own. Untyped
     data, and a class no module imported yet holds, pass as they are. Carried to 1.0 (ledger 1552)."""
+    from dew.config import RunConfig
+
+    walked = {key: _retired(_records.json_value(value, key), additive_unset)
+              for key, value in record.items()}
+    named = registry.class_record(walked)
+    if named is None:
+        return walked
+    return {**walked, "fields": _retired_fields(_recorded_class(named[0]) or RunConfig, named[1],
+                                                additive_unset)}
+
+
+def _retired(value: _records.JSON, additive_unset: bool) -> _records.JSON:
+    """`value` with each run and trainer its class records name taken to today's shapes
+    (`_retired_fields`), at any depth."""
+    if isinstance(value, list):
+        return [_retired(held, additive_unset) for held in value]
+    if not isinstance(value, Mapping):
+        return value
+    walked = {key: _retired(held, additive_unset) for key, held in value.items()}
+    named = registry.class_record(walked)
+    kind = None if named is None else _recorded_class(named[0])
+    if named is None or kind is None:
+        return walked
+    return {**walked, "fields": _retired_fields(kind, named[1], additive_unset)}
+
+
+def _retired_fields(kind: type, recorded: Mapping[str, object], additive_unset: bool) -> _records.JSON:
+    """The fields of a record of `kind` in today's shapes (`earlier_retired`)."""
     from dew.config import DecoderRunConfig, RunConfig
     from dew.config.trainer import TrainerConfig
 
-    if isinstance(record, list):
-        return [earlier_retired(value, additive_unset=additive_unset, root=False) for value in record]
-    if not isinstance(record, Mapping):
-        return record
-    walked: dict[str, JSON] = {key: earlier_retired(value, additive_unset=additive_unset, root=False)
-                               for key, value in record.items()}
-    named = registry.class_record(walked)
-    kind = _recorded_class(named[0]) if named is not None else None
-    if kind is None and not root:
-        return walked
-    kind = RunConfig if kind is None else kind
-    fields: dict[str, JSON] = dict(named[1] if named is not None else {})
+    fields = dict(recorded)
     if issubclass(kind, TrainerConfig):
         fields.pop("export_model", None)
-    # A trainer recorded flat, by its run's class, is read here; one recorded by its own class above.
+    # A trainer recorded flat, by its run's class, is read here; one recorded by its own class as a record.
     trainer = fields.get("trainer")
     if (issubclass(kind, RunConfig) and isinstance(trainer, Mapping)
             and registry.class_record(trainer) is None):
@@ -107,7 +124,7 @@ def earlier_retired(record: JSON, *, additive_unset: bool, root: bool = True) ->
     if (issubclass(kind, DecoderRunConfig) and not additive_unset
             and fields.get("loop_message_additive") is True):
         fields["loop_message_additive"] = None
-    return {**walked, "fields": fields} if named is not None else walked
+    return _records.json_value(fields, "fields")
 
 
 def _recorded_class(name: str) -> type | None:
