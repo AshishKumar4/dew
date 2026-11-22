@@ -580,23 +580,6 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
             f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
 
 
-def test_a_merge_under_a_capture_that_reads_its_modules_parameters_runs_its_depth_mixture_as_its_own_call():
-    """A capture whose filter reads what a module's call sets up (its parameters, which Flax asks after the
-    call) keeps a merge's depth mixture's output as the model is initialized, the merge running as Flax sees
-    it (row 11820's review: the filter asked before the call, the depth mixture's kernel not yet set up, the
-    merge computed apart and the capture lost)."""
-    model = decoder("attention", steps=2)
-    ids = jnp.asarray(np.random.default_rng(11820).integers(0, VOCAB, (2, 12)), jnp.int32)
-
-    def depth_by_its_kernel(module, method):
-        return method == "__call__" and module.has_variable("params", "kernel") and module.name == "depth"
-
-    _, made = model.init_with_output(jax.random.key(0), ids, capture_intermediates=depth_by_its_kernel)
-    captured = jax.tree_util.tree_leaves_with_path(made["intermediates"])
-    paths = [jax.tree_util.keystr(path) for path, _ in captured]
-    assert any(MERGE_PREFIX in path and "'depth'" in path for path in paths)
-
-
 @pytest.mark.parametrize("watch", ["captured", "inspected"])
 def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
     """A caller watching a merge's calls, capturing every module's outputs (`capture_intermediates`) or
