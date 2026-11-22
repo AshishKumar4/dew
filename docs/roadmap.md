@@ -51,7 +51,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [9780, 5625]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [9780, 10839, 5625]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -77,7 +77,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## RL and serving
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
-- An NVFP4 source's weights served packed, algebra.md §7.4's prepare step. [8550]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
