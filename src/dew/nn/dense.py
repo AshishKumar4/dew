@@ -132,7 +132,8 @@ def observed(module: nn.Module) -> bool:
     if not keep:
         return False
     method = keep.__func__ if isinstance(keep, types.MethodType) else keep
-    if method is flax_module.capture_call_intermediates or method in PRE_CALL_CAPTURES:
+    # Matched by identity: a caller's filter may be an unhashable callable (row 11876).
+    if method is flax_module.capture_call_intermediates or any(method is each for each in PRE_CALL_CAPTURES):
         return bool(keep(module, "__call__"))
     return True
 

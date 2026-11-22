@@ -418,6 +418,27 @@ def test_a_torch_power_is_weighed_with_its_exponent_narrowed_to_its_operands_for
         assert np.all(erred <= scale)
 
 
+@pytest.mark.parametrize(("format", "unit", "base", "exponent"), [
+    ("bfloat16", 2.0 ** -8, 2.0 ** -60, 2 + 2.0 ** -7),
+    ("bfloat16", 2.0 ** -8, -1.0, 257),
+    ("bfloat16", 2.0 ** -8, 0.0, 2.0 ** -134),
+    ("float32", 2.0 ** -24, 1.0, 1.7976931348623157e308)])
+def test_a_torch_powers_scale_covers_the_power_at_its_converted_exponent(format, unit, base, exponent):
+    """A torch power's scale is bounded by the power at the exponent its kernel converts to (rows 11844 and
+    11845): a bfloat16 2^-60 to the 2 + 2^-7 off by 38% where a derivative's reach gave 33%; `(-1)**257`
+    taken as `(-1)**256`, a sign where `log|-1|` is 0; `0**(2^-134)` taken as `0**0`, the exponent a bfloat16
+    zero by way of float32, 1 where the power is 0; a float32 1 to float64's largest, its exponent an
+    infinity, weighed where its exponent's rounding overflowed."""
+    torch = pytest.importorskip("torch")
+    from _dew_torch.rounding import rounding_scale as torch_scale
+
+    narrow = torch.tensor([base], dtype=getattr(torch, format))
+    wide = narrow.to(torch.float64)
+    value, scale = torch_scale(lambda: torch.pow(wide, exponent), unit)
+    erred = np.abs(torch.pow(narrow, exponent).to(torch.float64).numpy() - value)
+    assert np.all(erred <= scale)
+
+
 @pytest.mark.parametrize("power", [-1, -2, -3, 2, 5])
 def test_an_integer_powers_scale_covers_its_chain_and_a_negative_ones_reciprocal(power):
     """`lax.integer_pow` lowers to its chain of multiplications, and a negative power to the reciprocal of

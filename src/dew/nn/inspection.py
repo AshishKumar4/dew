@@ -339,17 +339,19 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         leaves[index] = tapped(first, module.get_variable(PROBES, PROBE), where, scale, histogram)
         return jax.tree.unflatten(tree, leaves)
 
-    _WATCHES[interceptor] = modules
+    watch = (interceptor, modules)
+    _WATCHES.append(watch)
     try:
         with nn.intercept_methods(interceptor):
             yield
     finally:
-        del _WATCHES[interceptor]
+        _WATCHES.remove(watch)
 
 
-_WATCHES: dict[Callable, tuple[str, ...]] = {}
-"""Each method interceptor an open `watching` block installed on Flax's stack, by the globs it watches: the
-stack's own entry, so a watch is read where Flax holds it, whatever thread or context runs the module."""
+_WATCHES: list[tuple[Callable, tuple[str, ...]]] = []
+"""Each method interceptor an open `watching` block installed on Flax's stack, with the globs it watches: the
+stack's own entry, so a watch is read where Flax holds it, whatever thread or context runs the module; found
+by identity, as a caller's interceptor on the stack may be an unhashable callable (row 11877)."""
 
 def _named(module: nn.Module, modules: tuple[str, ...]) -> tuple[bool, bool]:
     """Whether a glob of `modules` names `module`, by its class name or its path (`layers_3/attn`, and a
@@ -371,7 +373,7 @@ def watched_by(interceptor: Callable, module: nn.Module) -> bool:
     """Whether a method interceptor on Flax's stack may intercept `module`'s own calls: any not a watch of
     Dew's (`watching`), and a watch where a glob of it names `module` or a layer of the run it is (row 11820:
     a watch of the MLPs leaves a cross-pass merge to its own rules)."""
-    modules = _WATCHES.get(interceptor)
+    modules = next((globs for watch, globs in _WATCHES if watch is interceptor), None)
     return modules is None or any(_named(module, modules))
 
 
