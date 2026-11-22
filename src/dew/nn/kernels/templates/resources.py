@@ -794,10 +794,7 @@ def register_model(family: "Family", consumers: int, registers: int | None, *, t
     and whether its program moves registers at its plan's residency, `programs` (`moves_registers`), or as
     its launch states (`moves`, if given). Its `joined` roles (`Family.role_schedule`'s: a correction
     warpgroup) take their share beside its consumers."""
-    if target == generation.gpu_target():
-        return _register_model(family, consumers, registers, target, shared, tmem, producer, programs, moves,
-                               joined)
-    with generation.assumed(target):
+    with generation.as_target(target):
         return _register_model(family, consumers, registers, target, shared, tmem, producer, programs, moves,
                                joined)
 
