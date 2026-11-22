@@ -584,13 +584,18 @@ def _cubin(registers: int, frame: int) -> bytes:
 
 def _kernel_proto(name: str, registers: int, frame: int, notes: tuple[tuple[str, str], ...] = (),
                   spilled: int | None = None) -> bytes:
-    """A `MosaicGpuKernelProto`: its version, binary, kernel name, launch's shared memory, what ptxas noted
-    of a loss of performance (each a code and a message) and the bytes it spilled, where measured."""
-    return (_field(1, 4) + _field(8, _cubin(registers, frame))
-            + _field(9, f"{name}_mosaic_gpu_kernel".encode()) + _field(10, 1024)
-            + b"".join(_field(13, _field(1, code.encode()) + _field(2, message.encode()))
-                       for code, message in notes)
-            + (b"" if spilled is None else _field(report.SPILLED_BYTES, spilled)))
+    """A `MosaicGpuKernelProto`, built through the plugin's own schema (`jax.extend.mosaic_gpu`'s
+    `kernel_record_class`): its binary, kernel name, launch's shared memory, what ptxas noted of a loss of
+    performance (each a code and a message) and the bytes it spilled, where measured."""
+    from jax.extend import mosaic_gpu
+
+    record = mosaic_gpu.kernel_record_class()(version=4, gpu_binary=_cubin(registers, frame),
+                                              kernel_name=f"{name}_mosaic_gpu_kernel", smem_bytes=1024)
+    for code, message in notes:
+        record.assembler_notes.add(code=code, message=message)
+    if spilled is not None:
+        record.spilled_bytes = spilled
+    return record.SerializeToString()
 
 
 def _thunk(calls: int, kernels: list[bytes]) -> bytes:
@@ -614,7 +619,7 @@ def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_n
 
 def test_a_kernel_is_refused_for_what_ptxas_spilled_not_for_its_stack_frame():
     """A kernel whose stack frame holds its own locals and nothing spilled (a prologue's sine: libdevice's
-    range reduction keeps a 32-byte array, row 9649), as ptxas measured it (`report.SPILLED_BYTES`), is
+    range reduction keeps a 32-byte array, row 9649), as ptxas measured it (its record's `spilled_bytes`), is
     certified; one that spilled is refused; one a build measured nothing of is held to its frame, which
     holds every byte it spills."""
     kernels = report.thunk_kernels(_thunk(3, [_kernel_proto("dew_gmm", 168, 32, spilled=0),
@@ -625,8 +630,8 @@ def test_a_kernel_is_refused_for_what_ptxas_spilled_not_for_its_stack_frame():
 
 def test_a_kernels_assembler_notes_are_read_from_its_compiled_call():
     """What ptxas noted of a loss of performance as it assembled a kernel (Dew's JAX build keeps each note's
-    code and message in its compiled call, `report.ASSEMBLER_NOTES`) is read with its binary, in order: an
-    sm90 attention backward's warpgroup products serialized for want of registers, where nothing spills,
+    code and message in its compiled call, its record's `assembler_notes`) is read with its binary, in order:
+    an sm90 attention backward's warpgroup products serialized for want of registers, where nothing spills,
     is data a certification refuses by, not text a process printed. A kernel noted nothing reads none."""
     serialized = ("C7512", "wgmma.mma_async instructions are serialized due to insufficient register "
                   "resources for the function 'attention_dkv'")
