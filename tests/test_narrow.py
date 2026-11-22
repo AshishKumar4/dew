@@ -1004,11 +1004,12 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
     np.testing.assert_array_equal(np.asarray(held.scale), np.ones(4))
 
 
-@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_a_forwards_parameter_reads_are_its_drawn_forwards(dtype):
     """A decoder's forward whose every launch taking a parameter runs a template where a GPU runs it (the
     GEMM template's projections, the fused RMS norm's scale, SwiGLU's fused product, the attention template,
-    a mixture's grouped matmul), traced as an H100 builds it, reads its parameters as its forward drawn reads
+    a mixture's grouped matmul; its fp32 parameters computed in 16 bits, an fp32 product none of them takes),
+    traced as an H100 builds it, reads its parameters as its forward drawn reads
     them (`generation.drawing`: every selector its generic program, no launch derived, traced or certified),
     each parameter's one narrowing cast and every read alike (`program_reads`), and returns the same shapes:
     so the loss's shape trace a plan's narrow copies read (`Trainer._loss_shape`) is drawn, and the step's
