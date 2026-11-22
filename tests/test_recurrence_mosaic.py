@@ -1505,7 +1505,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
     without them stood for either)."""
     bound = template.MOSAIC.bind(*resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256), None, bound=1.0)
     tiles, kernel = mainloop.Tiles(32, 3, 128, 2, chunk=64), 'recurrence_output'
-    keys = []
+    target, keys = generation.gpu_target('sm90'), []
     for roles in ((sass.CONSUMERS,), (sass.PRODUCER,)):
         with report.refusals(), generation.assumed('sm90'):
             report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
@@ -1513,8 +1513,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
             handed = report.refusal_entries()
         with report.refusals(), generation.assumed('sm90'):
             report.refuse(handed)
-            roles_spilled = report.spilled_in(template.MOSAIC, bound, tiles, generation.gpu_target())
-            assert roles_spilled == {kernel: roles}
+            assert report.spilled_in(template.MOSAIC, bound, tiles, target) == {kernel: roles}
     assert keys[0] != keys[1]
 
 
