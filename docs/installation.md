@@ -101,7 +101,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post122,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post123,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too.
@@ -179,6 +179,9 @@ Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pi
 - A scatter's indices are flattened in their own integer type, and a mixed-precision dot multiplies in one: under deterministic ops XLA:GPU's scatter expansion multiplied 32-bit indices by 64-bit strides, a dot its emitter could not translate (a RET_CHECK in `mlir_kernel_emitter`), which failed a paged decode's gathered reference and Pallas Triton attention's backward.
 - A Pallas interpreter's thread map compiles its body once for all its threads and for every trace of one text, keyed by its structure, which it walks once per body (a walk at each call of an interpreted kernel's thread map made each grid step pay it: an interpreted recurrence test 3 to 4.5 times slower).
 - A Pallas Mosaic GPU interpreter's scoped allocation is one callback in and one out (`run_scoped`), where each of its buffers was its own: an interpreted per-shard recurrence 22% faster (row 5458); its race reports print their vector clocks' counts.
+- A Pallas Triton kernel's lowering looks its MLIR dialects up once a context, where each lowering registered them again: a 4B model's ahead compile lowered its Triton kernels in 1.5 s, where they took 9 to 13 s (row 5556).
+- A Mosaic GPU kernel's lowering-cache key holds its device by identity and a custom derivative's rule by the program it calls, where both made a lowering uncacheable: 75 of 133 lowerings of an every-template ahead compile missed every process's cache (row 11803).
+- A Mosaic GPU kernel's record (its launch digest, the assembler's notes, the bytes ptxas spilled and its shared memory) is read through one typed reader (`jax.extend.mosaic_gpu`'s `kernel_record` and `kernel_record_class`), not by its proto's field numbers.
 - A complex dot under an explicit algorithm multiplies its real and imaginary parts: under `jax.default_matmul_precision('F32_F32_F32')` JAX converted a complex64 dot's operands to float32, dropping their imaginary parts without a warning (row 7191).
 - XLA:CPU's collectives wait for the last one before them to complete, not to start (upstream bd5b6fb67b): a CPU program of collectives in loops over a mesh aborted on a rendezvous timeout.
 - A compiled program's peak live buffers (`Compiled.peak_live()`) read HLO's own opcode names.
