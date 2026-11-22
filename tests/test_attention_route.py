@@ -851,10 +851,9 @@ def _causal_truth(length: int):
     query gradient its own and the keys' and values' gradients the blocks' sum. The whole call's truth held
     `length` squared logits a head in float64, 3 GiB at 8192, more than a GPU tier job's pool of an A100
     (2.69 GiB, MAINGPU-a9e29b08f); a block's are an eighth of them."""
-    keys = jnp.arange(length)
-
     def truth(query, key, value, sinks, dout):
         del sinks
+        keys = jnp.arange(length)
 
         def block(first):
             seen = (first + jnp.arange(TRUTH_ROWS))[:, None] >= keys[None, :]

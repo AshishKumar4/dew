@@ -1427,25 +1427,29 @@ def _forked_rows(operands, rows: tuple, length: int):
 def test_a_turned_forked_documents_arithmetic_reads_only_its_ancestors(case):
     """A turned forked call's documents read no document but their ancestors (test_mixers' no token reaches
     another document, for forks): `two trees` a row of a document and its child, then an independent root
-    and its child, against a row of the first tree alone; `a later sibling` a document and its child, then a
-    second child of the same document, against the row without it. The shared documents' outputs bit for
-    bit: a row's last token's frame moved an earlier tree's rotations by a rounding (row 7419)."""
+    and its child; `a later sibling` a document and its child, then a second child of the same document. The
+    later tree's or sibling's tokens drawn again, the program's shapes and table the same: the shared
+    documents' outputs bit for bit, one program's (row 7977), where a row's last token's frame moved an
+    earlier tree's rotations by a rounding (row 7419)."""
     (operands,) = draw(TURNED, packed=False, seed=0)
-    operands = dataclasses.replace(operands, state=jnp.zeros((ROWS, GIVEN, *operands.state.shape[1:])))
-    if case == 'two trees':
-        rows = (((0, 23, 40, 55), (0, 2, 0, 3), (1, 0, 2, 0)), ((0, 23, 40, 55), (0, 2, 0, 3), (1, 0, 2, 0)))
-        alone = (((0, 23), (0, 2), (1, 0)), ((0, 23), (0, 2), (1, 0)))
-        shared, length = 40, 70
-    else:
-        rows = (((0, 23, 40), (0, 2, 2), (1, 0, 0)), ((0, 23, 40), (0, 2, 2), (1, 0, 0)))
-        alone = (((0, 23), (0, 2), (1, 0)), ((0, 23), (0, 2), (1, 0)))
-        shared, length = 40, 64
+    (other,) = draw(TURNED, packed=False, seed=1)
+    operands, other = (dataclasses.replace(x, state=jnp.zeros((ROWS, GIVEN, *x.state.shape[1:])))
+                       for x in (operands, other))
+    row, length = {'two trees': (((0, 23, 40, 55), (0, 2, 0, 3), (1, 0, 2, 0)), 70),
+                   'a later sibling': (((0, 23, 40), (0, 2, 2), (1, 0, 0)), 64)}[case]
+    rows, shared = (row, row), 40
+    drawn = ('query', 'key', 'value', 'log_decay', 'beta', 'turn')
+    redrawn = dataclasses.replace(operands, **{
+        name: getattr(operands, name).at[:, shared:].set(getattr(other, name)[:, shared:])
+        for name in drawn if getattr(operands, name) is not None})
+
     def run(forked):
         return chunk_on('xla', TURNED, forked, chunk_size=CHUNK)[0]
 
     together = run(_forked_rows(operands, rows, length))
-    apart = run(_forked_rows(operands, alone, shared))
-    np.testing.assert_array_equal(np.asarray(together[:, :shared]), np.asarray(apart))
+    changed = run(_forked_rows(redrawn, rows, length))
+    assert not np.array_equal(np.asarray(together[:, shared:]), np.asarray(changed[:, shared:]))
+    np.testing.assert_array_equal(np.asarray(together[:, :shared]), np.asarray(changed[:, :shared]))
 
 
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))

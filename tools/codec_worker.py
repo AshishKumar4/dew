@@ -15,7 +15,6 @@ input QDQ there as published (`nvfp4_qdq_reference.quantized_as_published`). IN 
 
 import sys
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
@@ -42,13 +41,14 @@ def run(family: str, kind: str, cases: dict[str, np.ndarray]) -> dict[str, np.nd
     exact = float64_twin(model, lambda: AutoModelForCausalLM.from_pretrained(
         directory, dtype=torch.float64, attn_implementation="eager"))
     # compressed-tensors' attributes on the modules it wraps, which torch's types do not declare.
+    # Plain attributes, written where `torch.nn.Module.__setattr__` writes any value neither a tensor nor a
+    # module (the instance's dict), which its declared value type does not cover.
     for module in (*model.modules(), *exact.modules()):
-        wrapped: Any = module
         if family == "storage":
-            wrapped.quantization_enabled = False
+            vars(module).update(quantization_enabled=False)
         elif hasattr(module, "quantization_status"):
             # The decoded weights' QDQ again is redundant; the input QDQ stays (tools/nvfp4_qdq_reference.py).
-            wrapped.quantization_status = QuantizationStatus.COMPRESSED
+            vars(module).update(quantization_status=QuantizationStatus.COMPRESSED)
     def answer(inputs):
         ids = torch.from_numpy(np.asarray(inputs["ids"])).long()
         with torch.no_grad():

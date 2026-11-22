@@ -20,6 +20,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from dew.nn import programs
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import emission, handoffs, mosaic, outputs as stated_outputs, persistent, rings
 from dew.nn.kernels.templates.cost import Stated
@@ -542,9 +543,14 @@ def _product(lhs, rhs) -> jax.Array:
     left, left_transposed = _operand(lhs)
     right, right_transposed = _operand(rhs)
     contracting = ((0 if left_transposed else 1,), (1 if right_transposed else 0,))
-    # At the default precision whatever the context's: the MXU multiplies its bf16 operands whole (Mosaic
-    # TPU refused a bf16 matmul at an fp32 contract precision, "Bad lhs type", the compile gate's libtpu).
-    return lax.dot_general(left, right, (contracting, ((), ())), precision=lax.Precision.DEFAULT,
+    if left.dtype == jnp.float32 and right.dtype == jnp.float32:
+        precision = programs.mosaic_tpu_fp32_precision(
+            left.shape[1 if left_transposed else 0], left.shape[0 if left_transposed else 1],
+            right.shape[0 if right_transposed else 1])
+    else:
+        # TPU refused a bf16 matmul at an fp32 contract precision, "Bad lhs type", the compile gate's libtpu).
+        precision = lax.Precision.DEFAULT
+    return lax.dot_general(left, right, (contracting, ((), ())), precision=precision,
                            preferred_element_type=jnp.float32)
 
 

@@ -1863,23 +1863,53 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
     return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in chunked]
 
 
+def powered_in_kernel(family: mosaic.Family, dtype, *, has_query_mod: bool = False,
+                      parts: int = 1) -> bool:
+    """Whether consumers apply `spec.prescale` in-kernel in their query stage (rows 5272, 11789)."""
+    return has_query_mod or (parts == 1 and jnp.dtype(dtype).itemsize == 2 and family.fixes_up
+                             and not family.places_on_role)
+
+
+class BlockPlan(NamedTuple):
+    """Forward value-column block plan (`forward_block_plan`): hook split, `out_dtype`, in-kernel hook."""
+    split: bool
+    out_dtype: Any
+    output_hook: bool
+
+    def epilogue_chunk(self, family: mosaic.Family, value_width: int, dtype, *,
+                       training: bool = False, masked: bool = False, kept: bool | None = None) -> int:
+        if (training or self.output_hook or masked or not family.budgets_registers
+                or (family.places_on_role if kept is None else kept) or value_width <= 128):
+            return 0
+        return stores.staged_columns(value_width, (dtype if self.out_dtype is None else self.out_dtype,))
+
+
+def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
+                       training: bool) -> BlockPlan:
+    """Derive hook placement and block `out_dtype` from `value_columns` (row 9542)."""
+    split = not training and has_output_mod and value_columns(total_v, columns) < total_v
+    return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split)
+
+
 def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, value_width: int, dtype, *,
-                        residuals: bool) -> int:
-    """Wide (>128) inference epilogue's live registers (`attention_mosaic_forward._stored_walk`): chunks
-    `state.acc` by `stores.staged_columns`, holding the fp32 slice/quotient/finished chunk and narrowed
-    output beside carried `state.acc` and its two finished rows `(maximum, denominator)` (row 10964)."""
-    if residuals or family.operands_in_registers or scopes_products(family) or value_width <= 128:
+                        residuals: bool, plan: BlockPlan | None = None, masked: bool = False) -> int:
+    """Wide (>128) inference epilogue's live registers (chunked, or whole-width finish + masked preserve)."""
+    if residuals or not family.budgets_registers or family.places_on_role or value_width <= 128:
         return 0
-    chunk = stores.staged_columns(value_width, (dtype,))
-    phase = [(block_q, chunk, jnp.float32)] * 3 + [(block_q, chunk, dtype)]
-    return resources.live_registers(family, carried, phase) + 2 * family.row_registers(block_q, jnp.float32)
+    block = plan or BlockPlan(split=False, out_dtype=None, output_hook=False)
+    ed = dtype if block.out_dtype is None else block.out_dtype
+    w = block.epilogue_chunk(family, value_width, dtype, training=residuals, masked=masked) or value_width
+    r, live = family.row_registers(block_q, jnp.float32), resources.live_registers
+    fin = live(family, carried, [(block_q, w, jnp.float32)] * 3 + [(block_q, w, ed)]) + 2 * r
+    return max(fin, live(family, [], [(block_q, value_width, ed)] * 2) + r) if masked else fin
 
 
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
-                      natural: bool = False, params: tuple = (), width: int | None = None,
-                      parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
-                      per_span: int = 1, merged: bool = False, started: bool = False,
-                      dropped: bool = False, weight_parts: int = 1, scaled_products: bool = False) -> int:
+                      natural: bool = False, params: tuple = (), width: int | None = None, parts: int = 1,
+                      scaled: bool = False, codes: bool = False, positions: int = 0, per_span: int = 1,
+                      merged: bool = False, started: bool = False, dropped: bool = False,
+                      weight_parts: int = 1, scaled_products: bool = False,
+                      block_plan: BlockPlan | None = None, masked: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -1983,16 +2013,15 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         resources.Product(block_q, depth, block_k, beside=[logits], transposed=True),
         resources.Product(block_q, block_k, value_width, beside=[weights], held=True),
         narrow=tiles.narrow, lhs_swizzle=query_swizzle(family))
-    # Its weighted values' sums carried across the walk, but where its family keeps them in its own memory
-    # (`Issuer.keeps_sums`, `_scoped_phases`).
     carried = [] if kept else [(block_q, value_width, jnp.float32)]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     if codes:
-        phases += _converted(block_k, value_width if width is None else width, value_width)
-    walked = max(max(resources.live_registers(family, carried, *phases, *products), scored)
-                 + _held_registers(family, block_q, params, residuals=residuals, natural=natural)
-                 + (_started_rows(family, block_q) if started else 0),
-                 _epilogue_registers(family, carried, block_q, value_width, dtype, residuals=residuals))
+        phases += _converted(block_k, depth, value_width)
+    epilogue = _epilogue_registers(family, carried, block_q, value_width, dtype, residuals=residuals,
+                                   plan=block_plan, masked=masked)
+    held = _held_registers(family, block_q, params, residuals=residuals, natural=natural) + (
+        _started_rows(family, block_q) if started else 0)
+    walked = max(max(resources.live_registers(family, carried, *phases, *products), scored) + held, epilogue)
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
 
 
@@ -2105,18 +2134,10 @@ def peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tuple
 
 @dataclasses.dataclass(frozen=True)
 class ForwardRegisters:
-    """A forward call's facts its launches' consumer registers read (`forward_registers`, `peaks_registers`),
-    the one computation its derivation plans with (`MosaicForward.registers`) and each launch states its
-    kernel's register model by as it lowers (`Family.kernel`'s `registers`, `report.Launch.kernels`): its
-    operands' dtype (an fp32 call's, whose launches walk its 16-bit `parts`), its query and value heads'
-    widths, whether it keeps a training walk's split sums (`residuals`), whether its logits stay natural
-    (`natural`, beside a config's own natural form), its score hook's parameters' kinds and kept dtypes,
-    whether its walk scales in its kernel (`scaled`, `MosaicForward.scales_in_kernel`), converts its keys'
-    and values' quantized codes (`codes`, `attention_mosaic_forward._Codes`), a packed call's intervals
-    and their queries each (`positions`, `per_span`; none unpacked), whose reach its walk reads first
-    (`_reach_registers`), whether its walk merges an initial state past its keys (`merged`), and the parts
-    its kept weights enter their product as (`weight_parts`: a dropping fp16 call's two,
-    `algebra.kept_parts`)."""
+    """A forward call's facts its launches' consumer registers read (`forward_registers`, `peaks_registers`):
+    operand dtype, query/value widths, training split sums (`residuals`), natural logits, score hook
+    parameters, fp32 parts, in-kernel scaling, quantized codes, packed positions, initial-state merge/start,
+    dropout/weight parts, query prologue, prescale flags, output dtype, and output-hook presence."""
     dtype: Any
     width: int
     value_width: int
@@ -2137,12 +2158,12 @@ class ForwardRegisters:
     """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
     parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
     prescaled: bool = False
-    """Whether the plain launch applies non-unit query `prescale` in-kernel."""
     rewalk_prescaled: bool = False
-    """Whether the natural rewalk applies non-unit query `prescale` in-kernel."""
+    out_dtype: Any = None
+    has_output_mod: bool = False
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
-           columns: int | None = None) -> int | None:
+           columns: int | None = None, masked: bool = False) -> int | None:
         """A consumer's registers at `tiles` on `family`: its walk's over the values' columns its launch
         walks (`columns`, a block of them; the tiles' own by default), or its peak walk's (`peaks`), and its
         query prologue's before either walks (`prologue_registers`); None on a family that budgets none
@@ -2153,21 +2174,24 @@ class ForwardRegisters:
         in_kernel_prescale = self.prescaled or (tiles.natural_form and self.rewalk_prescaled)
         if self.prologue is not None:
             before = prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue)
-        elif (in_kernel_prescale and self.parts == 1 and jnp.dtype(self.dtype).itemsize == 2
-              and family.fixes_up and not family.places_on_role and query_swizzle(family) is None):
+        elif (in_kernel_prescale and powered_in_kernel(family, self.dtype, parts=self.parts)
+              and query_swizzle(family) is None):
             before = resources.live_registers(family, [], [(tiles.block_q, width, self.dtype)])
         else:
             before = 0
         if peaks:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
-        value_width = value_columns(_width(self.value_width, family, self.dtype), columns or tiles.columns)
+        padded_v = _width(self.value_width, family, self.dtype)
+        value_width = value_columns(padded_v, columns or tiles.columns)
+        plan = forward_block_plan(padded_v, columns or tiles.columns, self.out_dtype,
+                                  has_output_mod=self.has_output_mod, training=self.residuals)
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
             scaled=self.scaled, codes=self.codes,
             positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started,
             dropped=self.dropped, weight_parts=self.weight_parts,
-            scaled_products=self.scaled_products))
+            scaled_products=self.scaled_products, block_plan=plan, masked=masked))
 
 
 def value_columns(padded: int, columns: int | None) -> int:

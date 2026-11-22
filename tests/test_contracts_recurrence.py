@@ -354,9 +354,17 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
                           plain_fn=jax.jit(recurrent), taking=ORDER_SETS[taken])
 
 
+TEMPLATE_ORDER_SETS = {"primal and jvp": ("primal", "jvp"), "vjp": ("vjp",),
+                       **{name: held for name, held in ORDER_SETS.items() if name != "first orders"}}
+"""The template rule's order sets: `ORDER_SETS`' with its first orders two cases, the primal and its forward
+derivative, and its reverse one, whose interpreted launches compile apart: together at normal draws 121 to
+129 s (tests/test_durations.json at dc7ebf822, row 9776; 169 compiles, 171 lowerings and 133 interpreted
+thread runs, armada's p-9776)."""
+
+
 # The template rule near float32's largest: its reverse derivative is NaN at entries fla's chunked form keeps
 # finite (ledger 2656).
-@pytest.mark.parametrize("taken", list(ORDER_SETS))
+@pytest.mark.parametrize("taken", list(TEMPLATE_ORDER_SETS))
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
 def test_the_template_rule_holds_its_orders(edge, taken):
     """The recurrence template's chunked rule (`template.mosaic_rule`, a custom VJP over the
@@ -386,7 +394,8 @@ def test_the_template_rule_holds_its_orders(edge, taken):
 
     assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"the template rule {edge}",
                           truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
-                          taking=order_set(taken, INTERPRETED_REMAT), without=INTERPRETED_REMAT)
+                          taking=order_set(taken, INTERPRETED_REMAT, TEMPLATE_ORDER_SETS),
+                          without=INTERPRETED_REMAT)
 
 
 EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]

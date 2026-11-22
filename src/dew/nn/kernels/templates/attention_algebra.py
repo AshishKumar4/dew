@@ -1401,7 +1401,7 @@ def small_parts(small: jax.Array, dtype) -> tuple[product.Scaled, ...]:
         return (product.Scaled(small, float(-SMALL_SHIFT)),)
     return tuple(
         product.Scaled(part, float(-SMALL_SHIFT))
-        for part in product.formed(small, bf16_part_count(accurate=True))
+        for part in product.formed(small, product.bf16_part_count(accurate=True))
     )
 
 
@@ -2114,7 +2114,7 @@ def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool, rows: bool = F
         # The leading part saturates at bf16's largest: an fp32 cotangent past it by more than half its ulp
         # rounds to infinity in bf16, an infinite product, or a NaN against a zero operand. The accurate
         # form's later parts take the difference whole, the fast form's one part is within 2^-8 of it.
-        yield from product.bf16_parts(cotangents, bf16_part_count(accurate=accurate), saturating=1)
+        yield from product.bf16_parts(cotangents, product.bf16_part_count(accurate=accurate), saturating=1)
         return
     scaled, high_exponent = _scaled(cotangents, rows)
     high = scaled.astype(dtype)
@@ -2122,25 +2122,6 @@ def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool, rows: bool = F
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32), rows)
     yield product.Scaled(low, low_exponent + high_exponent)
 
-
-_BF16_PARTS: dict[tuple[str | None, bool], int] = {}
-def bf16_part_count(*, accurate: bool) -> int:
-    """bf16 parts for fp32 attention products from `dew.algebra.error.product_precision` (row 5473)."""
-    from dew.algebra.error import product_precision
-    from dew.nn import programs
-    from dew.nn.kernels import generation
-    target = generation.gpu_target()
-    key = (target.generation if target is not None else generation.placed_platform(), accurate)
-    if key not in _BF16_PARTS:
-        chosen = product_precision(
-            64, 64, 64, jnp.float32,
-            admits=lambda p: (a := programs.dot_arithmetic(p, jnp.float32, jnp.float32)) is not None
-            and a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
-            and not a.imprecise and a.operations >= (6 if accurate else 1))
-        arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
-        assert arith is not None, chosen
-        _BF16_PARTS[key] = (math.isqrt(1 + 8 * arith.operations) - 1) // 2
-    return _BF16_PARTS[key]
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
                       dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool) -> jax.Array:

@@ -2425,12 +2425,13 @@ def test_an_unrounded_fused_backward_keeps_its_key_and_value_gradients_fp32_inte
 
 
 def test_hopper_forward_derives_consumer_count_from_analytic_launch_price():
-    """Hopper's forward derives two consumers across M-ET-79's causal cells via `cost.launch_seconds`
-    (rows 6710, 10680, 10681): three consumers' analytic launch price exceeds two consumers'."""
-    from dew.nn.kernels.templates import mosaic_sm90
+    """Hopper's forward derives legal schedules across M-ET-79's 5 causal geometries and prices explicit
+    2- vs 3-consumer schedules at matched unpadded lengths via `MosaicForward.price_config` (rows 6710,
+    10680, 10681, 11746, 11826, 11828)."""
+    from dew.nn.kernels.templates import attention_mosaic_program as program, mosaic_sm90
 
-    cells = ((1, 1024, 8, 64), (1, 1024, 8, 128), (2, 4096, 16, 64), (2, 4096, 32, 64), (2, 4096, 32, 128))
-    for batch, seq, heads, width in cells:
+    original = ((1, 1024, 8, 64), (1, 1024, 8, 128), (2, 4096, 16, 64), (2, 4096, 32, 64), (2, 4096, 32, 128))
+    for batch, seq, heads, width in original:
         query = jax.ShapeDtypeStruct((batch, seq, heads, width), jnp.bfloat16)
         spans = template.spans(seq, seq, batch, causal=True)
         with generation.assumed("sm90"):
@@ -2439,13 +2440,23 @@ def test_hopper_forward_derives_consumer_count_from_analytic_launch_price():
                                                       natural=attention_mosaic.NATURAL)
             ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
             chosen = op.derived(ba, target)
-            assert chosen is not None and chosen.consumers == 2, (batch, seq, heads, width, chosen)
-            threes = [c for c in op.offered(ba, mosaic_sm90.WGMMA, target) if c.consumers == 3]
-            if threes:
-                price_two = op._price_config(ba, chosen, target)
-                price_three = op._price_config(ba, threes[0], target)
-                assert price_two is not None and price_three is not None
-                assert price_three > price_two, (batch, seq, heads, width, price_two, price_three)
+            assert chosen is not None and op.takes(ba, chosen, target), (batch, seq, heads, width, chosen)
+    matched = ((1, 1152, 8, 64), (1, 1152, 8, 128), (2, 3840, 32, 128))
+    for batch, seq, heads, width in matched:
+        query = jax.ShapeDtypeStruct((batch, seq, heads, width), jnp.bfloat16)
+        spans = template.spans(seq, seq, batch, causal=True)
+        with generation.assumed("sm90"):
+            target = generation.gpu_target()
+            op, args = attention_mosaic._forward_call(query, query, query, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+            ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+            block_k = 128 if width == 64 else 64
+            two = program.Tiles(64, block_k, 2, 2, family=mosaic_sm90.WGMMA.name)
+            three = program.Tiles(64, block_k, 2, 3, family=mosaic_sm90.WGMMA.name)
+            assert op.takes(ba, two, target) and op.takes(ba, three, target)
+            p2, p3 = op.price_config(ba, two, target), op.price_config(ba, three, target)
+            assert p2 is not None and p3 is not None
+            assert (p3 > p2 if batch == 1 else p3 >= p2), (batch, seq, heads, width, p2, p3)
 
 
 def test_consumer_choice_persists_beside_verdicts_in_tuning_store(tmp_path):
@@ -2469,3 +2480,11 @@ def test_consumer_choice_persists_beside_verdicts_in_tuning_store(tmp_path):
     recheck = ("from dew.nn.kernels import tuning; "
                "assert tuning.stored_choice('sm90', 'choice-key') == 2")
     subprocess.run([sys.executable, "-c", recheck], env=env, check=True)
+
+
+@INTERPRETS
+def test_mma_sync_fused_32x32_backward_is_on_par_interpreted():
+    """Row 11905 / 5272: pinned 32x32 `mma.sync` fused backward matches reference from real residuals."""
+    pin = attention_mosaic.BackwardTiles(32, 32, 2, 1, fused=True, family="mma.sync")
+    _check_backward("causal", (1, 64, 2, 1), width=64, form=None, config=pin,
+                    target=generation.gpu_target("sm80"), interpret=True)

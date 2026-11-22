@@ -1534,11 +1534,9 @@ def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     product (`interpreted_dot`)."""
     if interpret:
         return interpreted_dot(a, b)
-    from jax.experimental.pallas import triton as plgpu
+    from dew.nn import programs
 
-    def dot(x, y):
-        return plgpu.dot(x, y, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
-
+    dot = functools.partial(programs.triton_dot, ieee=True)
     if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
         return dot(a, b)
     blocks = a.shape[-1] // FP32_BLOCK

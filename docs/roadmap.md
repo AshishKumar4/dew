@@ -104,10 +104,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## CI and tooling
 
-- Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
-- Shared XLA cache (tests/remote_cache.py). [9797]
+- Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670, 11958, 11959, 11960, 11961, 11757, 9797]
 - The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
 - The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
 - Tools that import their siblings by putting tools/ on sys.path at import time. [11756]
-- Src/dew/communicators.py:475 keeps a program's communicators under dew_cache_dir() while the executables they describe live in the compilation cache…. [11757]

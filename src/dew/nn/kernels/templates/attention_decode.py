@@ -198,9 +198,8 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         # at most those it holds), none past them: one program past those it holds waits a whole walk for a
         # slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a second wave as
         # long as the first), and one past those that stream it only lengthens the merge.
-        longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
+        longest = math.ceil(spans.keys / config.block_k) // (2 * min(config.stages, 2))
         return max(1, min(processors * op.streamed(ba, config, target) // programs, longest))
-
     if sliced(config, op, ba) == 1:
         return planned(config, op, ba, 1)
     walked = None if hooks is None else dataclasses.replace(hooks, initial=None)
