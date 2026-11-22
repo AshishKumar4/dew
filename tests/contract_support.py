@@ -317,7 +317,11 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     mesh = _training_mesh()
     meshed = {} if mesh is None else runs(fn, _placed(mesh, given), functools.partial(jax.set_mesh, mesh),
                                          lambda name: f"{label}, {name}, on training's mesh of two")
-    _compiled_ahead([*narrow.values(), *plainly.values(), *wide_runs.values(), *meshed.values()])
+    # Each run holding its program compiled ahead, which it calls in its program's place (`_Run.at`).
+    compiled = iter(_compiled_ahead([*narrow.values(), *plainly.values(), *wide_runs.values(),
+                                     *meshed.values()]))
+    narrow, plainly, wide_runs, meshed = ({name: next(compiled) for name in group}
+                                          for group in (narrow, plainly, wide_runs, meshed))
     plain = {name: run() for name, run in plainly.items()}
     truths = {name: run() for name, run in wide_runs.items()}
     with _on_float64():
@@ -360,13 +364,18 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
 class _Run:
     """One order of one arm of a case (`assert_contract`): its program (`_mesh_program`), the fixed arguments
     and context it runs in, and the site and order that name its failure (`running`), built once for its
-    compile ahead (`_compiled_ahead`) and its run, which lowers alike and finds it compiled."""
+    compile ahead (`_compiled_ahead`) and its run, which calls what that compiled."""
 
     program: Callable
     arguments: tuple
     context: Callable
     site: str
     name: str
+    executable: jax.stages.Compiled | None = None
+    """Its program compiled ahead at its own arguments (`_compiled_ahead`), which a call at arguments of their
+    types runs itself: compiled with the options Dew's compile states for its target (`report.targeted`), it
+    is no program a plain jit of the same function finds by its key (row 11890: on a GPU the run compiled
+    each program again)."""
 
     def lowered(self) -> jax.stages.Lowered:
         with self.context(), running(self.site, self.name):
@@ -379,7 +388,13 @@ class _Run:
         """Its program's leaves at `arguments` (a seeded draw's, `_on_a_mesh`), run in its context, a failure
         named by its site and order."""
         with self.context():
-            return ran(lambda: self.program(*arguments), self.site, self.name)
+            return ran(lambda: self._program_at(arguments)(*arguments), self.site, self.name)
+
+    def _program_at(self, arguments: tuple) -> Callable:
+        """What runs at `arguments`: the executable compiled ahead where they are of its own arguments' types,
+        else the program, which compiles for theirs."""
+        typed = jax.tree.map(jax.typeof, arguments) == jax.tree.map(jax.typeof, self.arguments)
+        return self.executable if self.executable is not None and typed else self.program
 
 
 def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
@@ -450,17 +465,21 @@ def _on_float64():
         yield
 
 
-def _compiled_ahead(runs: list[_Run]) -> None:
+def _compiled_ahead(runs: list[_Run]) -> list[_Run]:
     """Each program a case runs (`runs`, `_Run`) lowered in turn in its context and compiled side by side
-    by Dew's compile of several (`report.attempts`), which its run's lowering finds: a convex mean's
-    narrow, float64 and mesh programs of one order, 141,776 operations each, compiled one after another took
-    its cell 140 s cold (row 11720). A compile's error is raised named by its site and order (`running`)."""
+    by Dew's compile of several (`report.attempts`), each run handed back holding its executable: a convex
+    mean's narrow, float64 and mesh programs of one order, 141,776 operations each, compiled one after another
+    took its cell 140 s cold (row 11720). A compile's error is raised named by its site and order
+    (`running`)."""
     from dew.nn.kernels.templates import report
 
+    compiled = []
     for run, attempt in zip(runs, report.attempts([(run.lowered(), None) for run in runs]), strict=True):
         if attempt.error is not None:
             with running(run.site, run.name):
                 raise attempt.error
+        compiled.append(dataclasses.replace(run, executable=attempt.executable))
+    return compiled
 
 
 @functools.lru_cache(maxsize=256)
