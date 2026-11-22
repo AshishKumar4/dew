@@ -353,6 +353,38 @@ def test_a_power_of_a_float_rounds_as_its_exponent_takes_it():
     assert np.all(np.asarray(fractional) > np.asarray(rooted))
 
 
+def test_a_float_power_rounds_once_in_its_library_whatever_its_exponent():
+    """`lax.pow` lowers to one `hlo.power`, XLA's library power, at any exponent it is not given as a constant
+    (row 10157: an integer exponent was weighed as an integer power's chain, so Adam's `1 - b2**t` was
+    scaled a rounding more each step, 999 of them at t = 1000): at 4, whose powers here are powers of two
+    (each relative scale computed alike to the bit), its scale relative to its value is one number at
+    exponents 7, 50 and 2.5; and it covers what XLA's power errs by against float64 where that error is
+    largest, results near float32's least normal."""
+    x = jnp.full((3,), 4.0, jnp.float32)
+    value, scale = rounding_scale(jax.lax.pow, x, jnp.asarray([7.0, 50.0, 2.5], jnp.float32))
+    relative = np.asarray(scale) / np.abs(np.asarray(value))
+    np.testing.assert_array_equal(relative, np.full(3, relative[0]))
+    rng = np.random.default_rng(10157)
+    base = np.asarray(1 - rng.uniform(0, 0.05, 4096), np.float32)
+    exponent = np.asarray(rng.uniform(100, 126, 4096) / -np.log2(base.astype(np.float64)), np.float32)
+    value, scale = rounding_scale(jax.lax.pow, jnp.asarray(base), jnp.asarray(exponent))
+    erred = np.abs(np.asarray(jax.jit(jax.lax.pow)(base, exponent), np.float64) - np.asarray(value))
+    assert np.all(erred <= np.asarray(scale))
+
+
+@pytest.mark.parametrize("power", [-1, -2, -3, 2, 5])
+def test_an_integer_powers_scale_covers_its_chain_and_a_negative_ones_reciprocal(power):
+    """`lax.integer_pow` lowers to its chain of multiplications, and a negative power to the reciprocal of
+    that chain, one rounding more: what float32 errs by against float64 over drawn values is within its
+    scale (row 10157's sibling: `x**-2`, `1 / (x * x)`, was weighed one rounding, which its 1.5 u miss
+    exceeds)."""
+    x = np.random.default_rng(10158).uniform(0.5, 2.0, 4096).astype(np.float32)
+    value, scale = rounding_scale(lambda x: jax.lax.integer_pow(x, power), jnp.asarray(x))
+    erred = np.abs(np.asarray(jax.jit(lambda x: jax.lax.integer_pow(x, power))(x), np.float64)
+                   - np.asarray(value))
+    assert np.all(erred <= np.asarray(scale))
+
+
 def test_the_rounding_scale_knows_an_operation_by_its_object():
     """The rounding scale reads each operation's rule by JAX's primitive object: a user's primitive named
     `add`, which doubles its operand, has no rule and is refused, where its name's rule weighed it as one
