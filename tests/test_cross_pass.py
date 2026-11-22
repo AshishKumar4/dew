@@ -22,7 +22,7 @@ from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
-from dew.nn.cross_pass import MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
+from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
 
 VOCAB = 37
 
@@ -523,3 +523,117 @@ def test_a_loop_passing_messages_resumes_as_it_never_stopped(tmp_path):
     resumed = fitted(tmp_path / "resumed", 4)
     assert int(resumed.step) == 4
     assert_same(parameters(whole), parameters(resumed), "the resumed run is not the run unstopped")
+
+
+def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes():
+    """A bf16 decoder passing messages over an unrolled exit-gated loop (`Loop.messages`, `exit_gate=True`),
+    every block rematerialized (`full`), compiled ahead on two compile-only H100s splitting its rows: its
+    live memory past its arguments grows from two passes to six by no more than a message-free loop's growth
+    plus the added passes' saved banks, rather than holding deferred fp32 merge intermediates or un-summed
+    bank cotangents live across unrolled passes (row 11713)."""
+    from step_memory import MIXER_HEAD, MIXER_LENGTH, MIXER_ROWS, MIXER_WIDTH, STEP_LAYOUT
+    from token_support import token_rows
+
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
+    from dew.training import MeshSpec, Trainer
+    from dew.training.ahead import compile_ahead
+
+    devices = 2
+    spec = CrossPass(block_size=2, rank=64)
+
+    def live_past_args(steps: int, messages: CrossPass | None) -> int:
+        model = CausalTransformer(
+            vocab_size=512, emb_features=MIXER_WIDTH, num_layers=4, num_heads=8, head_dim=MIXER_HEAD,
+            mlp_features=4 * MIXER_WIDTH, max_seq_len=MIXER_LENGTH, dtype="bfloat16",
+            remat=REMAT_POLICIES["full"],
+            loop=Loop(steps, step_norm=False, layers=(0, 4), exit_gate=True, messages=messages))
+        trainer = Trainer(LMObjective(model, MIXER_LENGTH, exit_entropy=0.1),
+                          OptimConfig(optimizer="adamw", learning_rate=1e-3).build(None),
+                          key=jax.random.key(0),
+                          mesh=MeshSpec(fsdp=devices).build(compile_only_gpus("sm90", devices, 2**36)),
+                          layout=STEP_LAYOUT, split=1)
+        ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
+        return ahead.live_bytes - ahead.argument_bytes
+
+    msg_two, msg_six = live_past_args(2, spec), live_past_args(6, spec)
+    plain_two, plain_six = live_past_args(2, None), live_past_args(6, None)
+    msg_growth, plain_growth = msg_six - msg_two, plain_six - plain_two
+    # Four added passes each hold beyond a message-free loop's its saved bf16 bank [B/fsdp, S, blocks, D]
+    # and that bank's one summed cotangent: two banks a pass.
+    added_banks = 4 * (MIXER_ROWS // devices) * MIXER_LENGTH * 2 * MIXER_WIDTH * 2
+    assert msg_growth <= plain_growth + 2 * added_banks, (
+        f"cross-pass live growth {msg_growth} B exceeded plain growth {plain_growth} B + "
+        f"2 * added_banks {2 * added_banks} B "
+        f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
+
+
+@pytest.mark.parametrize("watch", ["captured", "inspected"])
+def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
+    """A caller watching a merge's calls, capturing every module's outputs (`capture_intermediates`) or
+    summarizing its depth mixture's (`inspection.watching`, `INSPECTED`), sees each merge's depth mixture
+    called, as a merge no one watches computes it through its reverse-mode rule (`portable_formed`, row
+    11713's review): the merge runs as Flax sees it, its gates off zero (`gated`) so its output reads the
+    mixture, its logits the unwatched run's."""
+    from dew.nn.inspection import INSPECTED, watching
+
+    model = decoder("attention", steps=2)
+    ids = jnp.asarray(np.random.default_rng(11713).integers(0, VOCAB, (2, 12)), jnp.int32)
+    variables = gated(model.init(jax.random.key(0), ids), 11713)
+    if watch == "captured":
+        logits, seen = model.apply(variables, ids, capture_intermediates=True, mutable=["intermediates"])
+    else:
+        with watching(("DepthAttention",)):
+            logits, seen = model.apply(variables, ids, mutable=[INSPECTED])
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(seen)]
+    assert any(MERGE_PREFIX in path and "'depth'" in path for path in paths)
+    np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
+
+
+def qwix_owned(provider: str, rule: dict, spec: CrossPass = MESSAGES) -> list:
+    """The gradients of a two-pass decoder passing messages by `spec`, quantized by a direct Qwix provider of
+    `rule` (`QtProvider`'s or `OdmlQatProvider`'s), its gates off zero (`gated`), each beside the same
+    model's run as a watched merge runs (captured,
+    `capture_intermediates`) and the unquantized model's: `(owned, watched, plain)` leaves."""
+    qwix = pytest.importorskip("qwix")
+
+    model = decoder("attention", steps=2, messages=spec)
+    ids = jnp.asarray(np.random.default_rng(11716).integers(0, VOCAB, (2, 12)), jnp.int32)
+    made = {"qt": qwix.QtProvider, "odml": qwix.OdmlQatProvider}[provider]
+    # A QAT provider's jit off where Qwix finds a weight by its value; ODML's activation check off, Dew's ops
+    # being more than its converter's (the provider's own refusal of an op it does not convert).
+    options = {"disable_jit": True} if provider == "qt" else {"strict": False}
+    quantized = qwix.quantize_model(model, made([qwix.QtRule(**rule)], **options))
+    variables = gated(quantized.init(jax.random.key(0), ids), 11716)
+
+    def gradients(applied, **watched):
+        def loss(params):
+            out = applied({**variables, "params": params}, ids, **watched)
+            logits = out[0] if watched else out
+            return jnp.sum(jnp.square(logits.astype(jnp.float32)))
+        return [np.asarray(leaf) for leaf in jax.tree.leaves(jax.grad(loss)(variables["params"]))]
+
+    return (gradients(quantized.apply), gradients(quantized.apply, capture_intermediates=True,
+                                                  mutable=["intermediates"]), gradients(model.apply))
+
+
+@pytest.mark.parametrize(("provider", "rule", "spec"), [
+    ("qt", {"module_path": r".*cross_pass_[^/]+/depth", "weight_qtype": jnp.int8, "act_qtype": jnp.int8,
+            "op_names": ("einsum",)}, MESSAGES),
+    ("odml", {"module_path": r".*cross_pass_[^/]+/depth", "act_qtype": jnp.int8, "op_names": ("softmax",)},
+     MESSAGES),
+    ("qt", {"module_path": r".*cross_pass_[^/]+", "weight_qtype": jnp.int8, "act_qtype": jnp.int8,
+            "op_names": ("dot_general",)}, dataclasses.replace(MESSAGES, additive=False))],
+    ids=["depth einsums", "depth softmax", "merge matmuls"])
+def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(provider, rule, spec):
+    """A merge whose ops a direct `qwix.quantize_model` rule owns, its depth child's alone (`QtProvider`'s
+    einsums, `OdmlQatProvider`'s softmax) or its own alone (its controller's matmuls: a merge of no added
+    projection, whose two same-shaped gates Qwix tells apart by their values), runs as Flax and Qwix see it
+    in both modes (row 11713's review: recomputed apart, its reverse mode bypassed the rule): its gradients
+    the ones of the same model run as a watched merge runs, and the rule's, not the unquantized model's."""
+    owned, watched, plain = qwix_owned(provider, rule, spec)
+    for got, seen in zip(owned, watched, strict=True):
+        np.testing.assert_array_equal(got, seen)
+    assert any(not np.array_equal(got, unquantized) for got, unquantized in zip(owned, plain, strict=True))

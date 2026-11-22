@@ -32,7 +32,7 @@ from flax.linen.dtypes import promote_dtype
 from flax.typing import PrecisionLike
 
 from dew import _cache
-from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once
+from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once, intercepting, observed
 from dew.nn.precision import biased, float32_dot_general
 
 from .kernels import gemm, generation
@@ -50,7 +50,7 @@ class Projections:
     its kernel and bias as its own call declares them (`held`, `_held`), whether the run's low-precision
     recipe takes any one's product apart or their joined product (`recipe`: `projections.recipe_takes`),
     each quantized as its own, which a join of them would not be, and whether a caller reads any one's own
-    call (`observed`, `_observed`); `leaves` the held leaves, the one read of them a join's operands are
+    call (`observed`, `dense.observed`); `leaves` the held leaves, the one read of them a join's operands are
     prepared from (`prepared`), None where any is not held."""
 
     dense: bool
@@ -79,7 +79,7 @@ def _dense(projections: Sequence[nn.Module]) -> TypeGuard[Sequence[Dense]]:
 def projections_of(projections: Sequence[nn.Module], depth: int | None = None) -> Projections:
     """The `Projections` of `projections`: whether a wrapper owns their products each asks within its own
     scope (`Dense.product_owned`), a rule over its module path matching it there, or any Flax method
-    interceptor is installed (`_intercepting`). Of projections not every
+    interceptor is installed (`dense.intercepting`). Of projections not every
     one a plain Dense nothing more is read (a module that is no projection, a Dropout, has none of a
     Dense's fields): none stands in for them."""
     if not _dense(projections):
@@ -90,18 +90,9 @@ def projections_of(projections: Sequence[nn.Module], depth: int | None = None) -
         dense=True,
         dot_general=all(projection.dot_general in (None, float32_dot_general)
                         and projection.dot_general_cls is None for projection in projections),
-        intercepted=_intercepting() or any(projection.product_owned() for projection in projections),
+        intercepted=intercepting() or any(projection.product_owned() for projection in projections),
         held=leaves is not None, recipe=leaves is not None and _recipe_differs(leaves.kernels),
-        observed=_observed(projections), leaves=leaves)
-
-
-def _intercepting() -> bool:
-    """Whether a Flax method interceptor is installed (`nn.intercept_methods`, Flax's own stack): any of them
-    may intercept a projection's own call, which a join standing in for the calls would bypass (base review
-    760be77fe F1: an interceptor zeroing `v_proj`'s output, the joined layer returned it)."""
-    from flax.linen import module as flax_module
-
-    return bool(flax_module._global_interceptor_stack)
+        observed=observed(projections[0]), leaves=leaves)
 
 
 def _leaves(projections: Sequence[Dense], depth: int | None) -> Leaves | None:
@@ -123,13 +114,6 @@ def _leaves(projections: Sequence[Dense], depth: int | None) -> Leaves | None:
         kernels.append(kernel)
         stored.append(bias)
     return Leaves(tuple(kernels), tuple(stored))
-
-
-def _observed(projections: Sequence[Dense]) -> bool:
-    """Whether a caller reads `projections`' own calls' outputs as Flax captures every module's (their
-    `intermediates` collection open: `capture_intermediates`); a caller intercepting them is `_intercepting`'s
-    (a watch's, node perturbation's: base review 760be77fe F1)."""
-    return projections[0].is_mutable_collection('intermediates')
 
 
 def _recipe_differs(kernels: Sequence[jax.Array]) -> bool:

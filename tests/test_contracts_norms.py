@@ -395,3 +395,31 @@ def test_a_norms_xla_path_holds_every_order(edge):
                                          weight_first)
 
     assert_contract(normed, primals, direction, cotangent, f"a norm's xla path {edge}", plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_module_reading_its_parameters_formed_together_holds_every_order(edge):
+    """An input and the parameters a module reads through `derivatives.formed_together` (identity, its
+    tangents tied by `with_tangents_formed`, row 11713): every order of a product of them, in the input and
+    each parameter, finite wherever float64 is a normal float32 and wherever the plain product's (the same
+    without the tie) is, at values near float32's ends."""
+    from dew.nn.derivatives import formed_together
+
+    primals = normal_draw(11713, (4, 8), (8,), (8,), scale=EDGES[edge])
+    direction = normal_draw(11714, (4, 8), (8,), (8,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(11715, (4, 8))
+
+    def read(x, gain, shift, fixed, count):
+        return (x * gain + shift) * fixed + count.astype(x.dtype)
+
+    def plain(x, gain, shift):
+        return read(x, gain, shift, jnp.ones(8), jnp.arange(8))
+
+    def tied(x, gain, shift):
+        # Beside the moving parameters a fixed float one and an integer one, whose tangents are symbolic zeros
+        # (an integer's JAX's `float0`): they pass as they came (row 11713's review).
+        x, parameters = formed_together(x, (gain, shift, jnp.ones(8), jnp.arange(8)))
+        return read(x, *parameters)
+
+    assert_contract(tied, primals, direction, cotangent, f"parameters formed together {edge}", plain_fn=plain)
+
