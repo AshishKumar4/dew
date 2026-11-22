@@ -67,8 +67,14 @@ def ahead_on_the_host():
     """Where a GPU tier part's prepare runs a test, whose default device is a compile-only GPU that computes
     nothing, the host's CPU as its default device; elsewhere the test's own: the context of what a cell
     computes before its first check-1 site (a load, an export, a behavioral decode), so its prepare reaches
-    its sites (rows 11424-11619: every cell computing there first was left unprepared)."""
-    return jax.default_device(jax.devices("cpu")[0]) if tier_wire.preparing() else contextlib.nullcontext()
+    its sites (rows 11424-11619: every cell computing there first was left unprepared). Its kernels are
+    the host's own (no GPU `generation.assumed`): a GPU's would not run there."""
+    if not tier_wire.preparing():
+        return contextlib.nullcontext()
+    host = contextlib.ExitStack()
+    host.enter_context(jax.default_device(jax.devices("cpu")[0]))
+    host.enter_context(generation.assumed(None))
+    return host
 
 
 def load(**fields):
@@ -1076,7 +1082,8 @@ def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distance
             return torch.as_tensor(logits).log_softmax(-1).numpy()
 
         truth = transcribed(tensors, torch.float64)
-        host, axes = jax.device_get(loaded.variables), model_axes(loaded.model)
+        with ahead_on_the_host():
+            host, axes = jax.device_get(loaded.variables), model_axes(loaded.model)
 
         def order(seed):
             return recorder.symmetry(config, *divmod(seed, recorder.ORDERS))
