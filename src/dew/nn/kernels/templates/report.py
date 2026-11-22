@@ -1079,8 +1079,11 @@ def _certifying_device():
     if placed.empty:
         placed = _TARGETED.get()
     if placed is None:
+        # JAX's own default for a plain call: the device named, else this process's first of the platform
+        # named (`jax.local_devices`), never another process's (rows 7211, 7224: rank k certified on
+        # process 0's device, which it cannot address).
         default = jax.config.jax_default_device
-        devices = [default if isinstance(default, jax.Device) else jax.devices(default)[0]]
+        devices = [default] if isinstance(default, jax.Device) else jax.local_devices(backend=default)[:1]
     else:
         devices = [device for device in placed.devices.flat if device.process_index == jax.process_index()]
     # A device of another generation (a CPU's, an A100's under an assumed sm90) certifies nothing.
