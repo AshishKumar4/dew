@@ -1123,7 +1123,11 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     # summed the devices' cotangents into it (the add's broadcast transposed to a psum), every device's
     # gradient then their sum (row 10526).
     operands = (lhs, *matrices, *jax.tree.leaves(prologue_arrays))
-    acc = jax.eval_shape(lambda: varying_like(jnp.zeros(acc_shape, at_least_fp32(compute)), *operands))
+
+    def zero() -> jax.Array:
+        return varying_like(jnp.zeros(acc_shape, at_least_fp32(compute)), *operands)
+
+    acc = jax.eval_shape(zero)
     # The epilogue's VJP, traced once, its accumulators' reads and pass-through cotangents read from it.
     vjp = _epilogue_vjp(kept, count, acc, sides)
     rounded = _rounded_accumulator(saved or {}, count, epilogue, acc, sides)
@@ -1137,8 +1141,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
                                paired=matrices[1] if count > 1 else None, summed_as=(acc.dtype,) * count,
                                **plain))
     else:
-        # Typed as the accumulators it stands for (`acc`'s varying axes).
-        accs = (varying_like(jnp.zeros(acc.shape, acc.dtype), *operands),) * count
+        accs = (zero(),) * count
 
     def epilogued(*args):
         # Each row's side values, whose transpose sums a groups axis's cotangents over each group's rows.

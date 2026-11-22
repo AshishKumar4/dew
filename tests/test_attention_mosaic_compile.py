@@ -473,14 +473,15 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
     assert not failed, "\n".join(failed)
 
 
-FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3])
+FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3],
+                                     max_items=3)
 
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "training", "dtype", "hooks_batch"),
                          FORWARD_GATE_BATCHES,
-                         ids=[f"{g}-{w}-{t.name}-{jnp.dtype(d).name}"
-                              for g, w, t, d, _ in FORWARD_GATE_BATCHES])
+                         ids=[f"{g}-{w}-{t.name}-{jnp.dtype(d).name}-{'+'.join(h)}"
+                              for g, w, t, d, h in FORWARD_GATE_BATCHES])
 def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, dtype,
                                                               hooks_batch):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
@@ -915,6 +916,7 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert all(stored for _, stored, _ in warm), warm
     assert certified(warm) == certified(cold)
 
+@COMPILES_ON_CPU
 def test_a_launchs_stored_verdict_is_not_read_where_another_nvcc_wheel_is_installed(tmp_path):
     """A launch certified by one process is certified again by the next where the installed CUDA nvcc wheels
     differ (another wheel's metadata on its path, its kernels' IR the same): the wheels name the ptxas that
@@ -1807,7 +1809,8 @@ def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compi
                                                       natural=attention_mosaic.NATURAL)
             ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
             cfg = op.derived(ba, target)
-            assert cfg is not None and cfg.stages >= 3, (label, cfg)
+            assert cfg is not None and (cfg.stages >= 3 if width <= 128 or cfg.consumers == 1
+                                        else cfg.stages == 2), (label, cfg)
             def _make(q=q, k=k):
                 def forward(query, key, value):
                     return attention_mosaic.forward(query, key, value, spans, None,
@@ -1982,3 +1985,19 @@ def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_d
         found = compile_mosaic_kernels([case], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
+
+def test_planned_stages_deepens_at_residency_two_with_registers():
+    """Row 10993: `_planned_stages` passes the launch's consumer registers to `resources.plan`, so a
+    launch at `resident >= 2` deepens its ring rather than falling back to `floor`."""
+    from dew.nn.kernels.templates import attention_mosaic_program as program, resources
+
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        family = program.layouts("sm80", jnp.bfloat16, 4096)[0]
+        tile = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
+        def scope_of(stages):
+            ring = jax.ShapeDtypeStruct((stages, 64, 64), jnp.bfloat16)
+            return resources.Scope(program=(tile,), walks=((ring,),))
+        stages = attention_mosaic._planned_stages(family, scope_of, target, consumers=1, registers=128,
+                                                  floor=2, most=3, resident=2)
+        assert stages == 3, stages

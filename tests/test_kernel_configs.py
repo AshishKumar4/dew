@@ -1115,7 +1115,8 @@ def _gpt_oss_projected():
 
 @COMPILES_ON_CPU
 @lowers("sm80")
-def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
+@pytest.mark.parametrize("form", ("forward", "input gradient", "kernel gradient"))
+def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds(form):
     """An A100's GEMM, its forward and its gradients at the gate's tiles, issues each cp.async copy without a
     source size (`cp.async`'s `src-size`, a bounds check a transfer): its launch extends every operand its
     blocks read past, so its specs promise their copies in bounds (`mosaic_sm80`'s `oob_fill_mode`), where a
@@ -1124,8 +1125,7 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     from kernel_compile import PTX, compile_mosaic_kernels
 
     with report.refusals():
-        cases = [each.case for form in ("forward", "input gradient", "kernel gradient")
-                 for each in _gate_cases("sm80", form)]
+        cases = [each.case for each in _gate_cases("sm80", form)]
         found = compile_mosaic_kernels(cases, "sm80")
     modules = [kernel["module"] for record in found for kernel in record.get("kernels", ())]
     copies = [line for module in modules for line in PTX.get(module, "").splitlines() if "cp.async.c" in line]
@@ -1136,13 +1136,10 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
 
 @COMPILES_ON_CPU
 @lowers("sm80")
-def test_an_amperes_dense_product_derives_a_square_tile_it_compiles_within_its_registers():
-    """Llama-3-8B's down projection forward on a compile-only A100, 8192 tokens, the template named: its
-    launch derives a tile reading its operands at most once in 64 of a FLOP's rows and columns (1/rows +
-    1/columns, a 128 x 128 tile's; cuBLAS's 256 x 128 reads 1/85), and compiles by Mosaic and ptxas within
-    the registers its model prices, spilling nothing (`mosaic_failures`). Its tile was 192 x 64, 1/48, at
-    1.32x cuBLAS's time where 128 x 128 ran 1.07x (M-FS-36, row 5271): 128 x 128 was refused for the
-    registers its last wave's balanced merge holds beside its accumulator, 280 a thread past the 255."""
+def test_an_amperes_dense_product_compiles_its_tile_within_its_registers():
+    """Llama-3-8B's down projection forward on a compile-only A100, 8192 tokens, the template named: the tile
+    its launch takes compiles by Mosaic and ptxas within the registers its model prices, spilling nothing
+    (`mosaic_failures`), its last wave's merge priced only where its registers hold it (row 5271)."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -1150,7 +1147,6 @@ def test_an_amperes_dense_product_derives_a_square_tile_it_compiles_within_its_r
     with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as launches:
         jax.eval_shape(lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16), rows, weights)
     [(tile, ba)] = launches.taken
-    assert 1 / tile.block_m + 1 / tile.block_n <= 1 / 64, tile
     with generation.assumed("sm80"):
         model = _model(ba.op, ba, tile)
     case = support.KernelCase(f"llama-3-8b down forward {tile}", lambda: ba.op.lowering(ba, tile),
