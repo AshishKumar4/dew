@@ -1232,7 +1232,7 @@ class StepCompiler[L, E]:
     def _refuse_sampled_window(self, cap: Planned) -> None:
         """Refused where a run and a build ahead (`compile_ahead`) both admit a sampled run's counts, as the
         step is built: a window that pools its microbatches by their mean holds their gradient's sum and its
-        mass (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that
+        mass (`dew.training._windows.empty_window`), DiLoCo's its groups' (`TrainState.window`); one that
         replays them holds their batches instead."""
         sampled = self.phase_passes.sampled
         assert sampled is not None, "a run that draws its pass count per microbatch"
