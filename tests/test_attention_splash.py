@@ -25,7 +25,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import (
-    attention_and_grads,
     exact_attention,
     exact_value_and_grads,
     float64_weights,
@@ -38,15 +37,11 @@ from attention_oracle import (
 from gpu_flow import cells_of, run_cells
 from reference_error import (
     FEWEST_SEEDS,
-    ORDERS,
     as_given,
     assert_as_exact,
-    assert_as_exact_over_orders,
     assert_computes_the_oracle,
-    distance,
     with_gradients,
 )
-from residual_orders import orders
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.documents import document_mask
@@ -54,9 +49,10 @@ from dew.nn.precision import FP32_SUMS
 
 on_tpu = pytest.mark.tpu(reason="needs a TPU; the interpreter covers the rest here")
 
-SPLASH_SEEDS = {"cross": 32}
+SPLASH_SEEDS = {"cross": 32, "sinks": 64, "sinks-window": 32}
 """The interpreted kernel's check-1 sites' declared seeds past the fewest (`FEWEST_SEEDS`), by oracle case:
-every case sized by `seeds_for` on armada's CPUs (2026-11-14, size-splash at 314eef0fe73)."""
+every case sized by `seeds_for` on armada's CPUs (2026-11-14, size-splash at 314eef0fe73), the sinks'
+cases with their sinks' gradient, Dew paired with the reference (2026-11-22, row 1569)."""
 
 
 SHARDED_SEEDS = 8
@@ -190,12 +186,9 @@ def test_splash_agrees_with_the_reference_the_oracle_holds(case):
     whose own arithmetic in float64 is first held to that truth. Each argument
     the kernel takes, grouped key heads among them. Interpreted on a CPU, a
     kernel's dots are XLA:CPU's, not the kernel's, so its numerics on its own
-    hardware are held by `test_splash_is_on_par_on_a_tpu`.
-
-    The sinks' gradients use 52 head-unit orders on both sides. Moving
-    q, k and v's units together leaves the masks and sinks intact and only
-    permutes the output and the three qkv gradients; the float64 oracle
-    checks that symmetry under every order.
+    hardware are held by `test_splash_is_on_par_on_a_tpu`. The sinks'
+    gradient is a leaf of the same check over its drawn sinks (row 1569,
+    where 52 head-unit orders of one draw held it).
     """
     q_shape, kv_shape, structure, sunk = oracle_layout(case)
     query, _, _ = qkv(q_shape, jnp.float32)
@@ -214,13 +207,11 @@ def test_splash_agrees_with_the_reference_the_oracle_holds(case):
     # not as the CPU's policy does.
     with jax.default_matmul_precision(FP32_SUMS):
         expected = reference(query, key, value, **structure)
-    ordered = "sinks" if case in ("sinks", "sinks-window") else None
     for name, mine, theirs, wide_theirs, want in zip(names, splash, expected, twin, truth, strict=True):
         assert mine.shape == theirs.shape == want.shape, name
         # A key's logit sums the head width, its weight the keys.
         assert_computes_the_oracle(wide_theirs, want, f"{case} {name}",
                                    roundings=query.shape[-1] + key.shape[1])
-    judged = [index for index, name in enumerate(names) if name != ordered]
 
     def draw(seed):
         query, _, _ = qkv(q_shape, jnp.float32, seed=2 * seed)
@@ -235,34 +226,12 @@ def test_splash_agrees_with_the_reference_the_oracle_holds(case):
         def judged_leaves(query, key, value, *sinks):
             given = {**{name: value for name, value in structure.items() if name != "sinks"},
                      **({"sinks": sinks[0]} if sinks else {})}
-            computed = run(query, key, value, **given)
-            return tuple(computed[index] for index in judged)
+            return tuple(run(query, key, value, **given))
         return judged_leaves
 
     assert_as_exact(leaves(functools.partial(value_and_grads, 'tpu')), leaves(with_fp32_sums(reference)),
                     draw, f"interpreted splash, {case}", seeds=SPLASH_SEEDS.get(case, FEWEST_SEEDS),
                     truth_fn=leaves(exact_value_and_grads))
-    if ordered is not None:
-        sinks = structure.get("sinks")
-        kwargs = {name: value for name, value in structure.items() if name != "sinks"}
-        runs = [attention_and_grads('tpu', has_sinks=True, **kwargs),
-                attention_and_grads('reference', has_sinks=True,
-                                     precision=jax.lax.Precision.HIGHEST, **kwargs)]
-        # The reference sums as the interpreted TPU kernel's target does (`FP32_SUMS`).
-        runs[1] = with_fp32_sums(runs[1])
-        distances = [[], []]
-        for k, order in enumerate(orders(query.shape[-1], ORDERS, seed=0)):
-            inputs = [jnp.asarray(np.take(np.asarray(x), order, -1)) for x in (query, key, value)]
-            inverse = np.argsort(order)
-            exact = exact_value_and_grads(*inputs, **structure)
-            for index, (wide_value, want) in enumerate(zip(exact, truth, strict=True)):
-                unpermuted = wide_value if index == 4 else np.take(wide_value, inverse, -1)
-                assert_computes_the_oracle(unpermuted, want, f"{case} order {k}",
-                                           roundings=query.shape[-1] + key.shape[1])
-            for run, measured in zip(runs, distances, strict=True):
-                _, grads = run(*inputs, sinks)
-                measured.append(distance(grads[-1], truth[-1]))
-        assert_as_exact_over_orders(*distances, f"{case} {ordered}")
 
 
 @on_tpu
