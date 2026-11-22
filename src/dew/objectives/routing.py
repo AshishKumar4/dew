@@ -313,7 +313,8 @@ def _router_queries(shape: tuple[int, ...], queries: jax.Array | None,
     call that did not run (`ran` False: a looped pass a count given per call skipped, `ROUTER_RAN`)."""
     valid = (jnp.ones(shape, bool) if queries is None else
              shifted_span(queries.shape, queries.shape[1] - shape[1], valid=queries, segments=documents))
-    return valid if ran is None else valid & ran
+    # Whether the call ran, a row's own (`ROUTER_RAN`), over its row's queries.
+    return valid if ran is None else valid & jnp.expand_dims(ran, tuple(range(ran.ndim, valid.ndim)))
 
 
 def _calls_ran(routing: Variables, *markers: str) -> list[tuple[tuple[str, ...], tuple, jax.Array | None]]:

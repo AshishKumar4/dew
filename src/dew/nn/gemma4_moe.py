@@ -68,7 +68,7 @@ class Gemma4TextRouter(nn.Module):
         # record): a routing a replay feeds back (`routes`), a run's own or a float64 truth's (row 4739).
         if not self.is_initializing():
             self.sow(ROUTER_COLLECTION, ROUTER_INDICES, indices)
-            self.sow(ROUTER_COLLECTION, ROUTER_RAN, jnp.ones((), bool))
+            self.sow(ROUTER_COLLECTION, ROUTER_RAN, jnp.ones(indices.shape[:1], bool))
         weights = renormalized_softmax(logits, indices)
         if weighs_one(self.top_k, normalized=True, single_softmax=self.num_experts == 1):
             # Its input scale's and projection's scores reach nothing; the per-expert scales still train.

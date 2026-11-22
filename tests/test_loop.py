@@ -874,7 +874,7 @@ def test_a_count_of_passes_given_per_call_sows_whether_each_router_ran(rng):
                                                   loop_passes=jnp.int32(2))[1][ROUTER_COLLECTION])(
         variables, ids)
     # The looped layers' routers are called once a pass, three; the others once, and ran.
-    ran = {path: [bool(each) for each in node] for path, node in leaves_by_path(sown).items()
+    ran = {path: [bool(jnp.all(each)) for each in node] for path, node in leaves_by_path(sown).items()
            if path[-1] == ROUTER_RAN}
     looped = {path: calls for path, calls in ran.items() if len(calls) == 3}
     assert looped and all(calls == [True, True, False] for calls in looped.values()), ran

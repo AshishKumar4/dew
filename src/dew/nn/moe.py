@@ -170,9 +170,10 @@ ROUTER_INDICES = 'indices'
 ROUTER_SCORES = 'scores'
 ROUTER_LOG_Z = 'log_z'
 ROUTER_RAN = 'ran'
-"""Whether a router's call ran, a bool scalar sown beside its choice: True for every call made, False for
+"""Whether a router's call ran, a bool a row sown beside its choice: True for every call made, False for
 one a looped pass given a count per call skipped (`dew.nn.backbones.looping`), whose other sows are
-zeros, so a reader of the routers' statistics leaves it out."""
+zeros, so a reader of the routers' statistics leaves it out. A row's own, so a pipeline's microbatches
+join it by their rows as they join the choices."""
 EXPERT_BIAS_COLLECTION = 'moe'
 EXPERT_BIAS = 'e_score_correction_bias'
 
@@ -477,7 +478,7 @@ class Router(nn.Module):
         # into the tree init returns, where it is not a variable.
         if not self.is_initializing():
             self.sow(ROUTER_COLLECTION, ROUTER_INDICES, indices)
-            self.sow(ROUTER_COLLECTION, ROUTER_RAN, jnp.ones((), bool))
+            self.sow(ROUTER_COLLECTION, ROUTER_RAN, jnp.ones(indices.shape[:1], bool))
             # The V2 balance loss reads the scores beside the choices.
             self.sow(ROUTER_COLLECTION, ROUTER_SCORES, scores)
             # The router z-loss squares each position's log partition.
