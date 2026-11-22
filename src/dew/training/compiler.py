@@ -85,6 +85,7 @@ from dew.training.transaction import Transaction, outcome_of
 if TYPE_CHECKING:
     from dew.training.ahead import AheadOfTime
     from dew.training.interval import Interval
+    from dew.training.trainer import Trainer
     from dew.training.transaction import Committed
 
 _log = logging.getLogger(__name__)
@@ -1059,7 +1060,7 @@ class StepCompiler[L, E]:
         keep()
         return planned, compiled
 
-    def drawing(self, holder: Holding[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
+    def drawing(self, holder: Trainer[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
                 state: TrainState, batch: Batch, key: jax.Array) -> CompiledStep:
         """`compiled`'s step, or where the run draws its pass count per microbatch (`PhasePasses.sampled`)
         its every count's step at its cap's plan, drawing under the run's `key` (`sampled_step`)."""
@@ -1078,7 +1079,7 @@ class StepCompiler[L, E]:
             flops = compiled.drawn(interval, step, state)
         return compiled, flops
 
-    def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
+    def sampled_step(self, holder: Trainer[L, E], stepping: Callable[[], Stepping], cap: Compiled,
                      state: TrainState, batch: Batch, key: jax.Array) -> DrawingStep:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
         `cap`, its cap's step (`compile`), and every other count's admitted at its plan (`admitted_at`), each

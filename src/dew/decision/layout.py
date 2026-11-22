@@ -673,12 +673,6 @@ state, for a bidirectional backbone), a state-first row (for a causal backbone),
 or the joint row, every question of a request in one row."""
 
 
-MERGE_SLACK = 4
-"""The tokens past its room a state's longer cut may run to and a cut longer still come back within, by a
-merge across its end joining its last characters with the text after it (`SegmentLayout._cut`): a merge of
-one boundary in a subword vocabulary joins a few tokens, so a walk that overflows by more stops."""
-
-
 @dataclass(frozen=True)
 class SegmentLayout(Layout):
     """A decision layout, one of three rows (`form`, decision-inputs.md §1): a row per question, scored at
@@ -1321,9 +1315,8 @@ class SegmentLayout(Layout):
         # A merge across a cut may let a longer cut fit than the share counted: each copy takes the
         # longest that still fits, its own cap and the row's length both held. A whole row's encoding
         # need not grow with its cut (a merge across a later boundary can take fewer tokens than one
-        # across an earlier), so the walk goes on past a cut that overflows, while it overflows by no
-        # more than a merge across one boundary takes back (`MERGE_SLACK`), each cut one row encoded
-        # (row 9060).
+        # across an earlier, by as many as a tokenizer's merges join), so the walk asks every longer cut
+        # its cap admits, each one row encoded (rows 9060, 11739: it stopped 4 tokens past the room).
         for at, copy in enumerate(copies):
             if len(laid.tokens) > self.max_len or copy.keep == "all":
                 continue
@@ -1334,8 +1327,6 @@ class SegmentLayout(Layout):
                                 for other in range(len(copies))])
                 if len(longer.tokens) <= self.max_len:
                     kept[at], laid = count, longer
-                elif len(longer.tokens) > self.max_len + MERGE_SLACK:
-                    break
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]
         # What the cut removed is characters: a cut text encodes anew, so no count of its own tokens

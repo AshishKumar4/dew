@@ -1812,17 +1812,19 @@ class DecoderRunConfig(RunConfig):
     """The layers each banked summary closes (`CrossPass.block_size`); None its default."""
     loop_message_rank: int | None = None
     """The rank of each merge's controller (`CrossPass.rank`); None its default."""
-    loop_message_additive: bool = True
+    loop_message_additive: bool | None = None
     """Whether each merge's message adds a term of its own beside the gained summary
-    (`CrossPass.additive`): `--no-loop-message-additive` drops it; left on, a checkpoint's own choice is
-    kept, and the default taken where it holds no messages."""
+    (`CrossPass.additive`): `--loop-message-additive` keeps it and `--no-loop-message-additive` drops it,
+    over a checkpoint's own choice; unstated, a checkpoint's own choice is kept, and the default taken where
+    it holds no messages (row 11742: stating it on was read as unstated, so a checkpoint that dropped it kept
+    it dropped)."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
         stated = (self.loop_message_block_size, self.loop_message_rank)
         if not self.loop_messages and (any(field is not None for field in stated)
-                                       or not self.loop_message_additive):
-            raise ValueError("--loop-message-block-size, --loop-message-rank and --no-loop-message-additive "
+                                       or self.loop_message_additive is not None):
+            raise ValueError("--loop-message-block-size, --loop-message-rank and --loop-message-additive "
                              "shape the messages --loop-messages passes")
         sampling = (self.loop_steps_mean, self.loop_steps_dispersion, self.loop_steps_max)
         if self.loop_steps_sample is None and any(field is not None for field in sampling):
@@ -1931,7 +1933,7 @@ class DecoderRunConfig(RunConfig):
         from dew.nn.cross_pass import CrossPass
 
         stated = {"block_size": self.loop_message_block_size, "rank": self.loop_message_rank,
-                  "additive": None if self.loop_message_additive else False}
+                  "additive": self.loop_message_additive}
         return dataclasses.replace(CrossPass() if held is None else held,
                                    **{name: value for name, value in stated.items() if value is not None})
 

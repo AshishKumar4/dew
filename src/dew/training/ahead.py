@@ -110,7 +110,7 @@ if TYPE_CHECKING:
     from dew.data.pipeline import Dataset
     from dew.state import TrainState
     from dew.training._fit import FitArguments, FitPlan, Start
-    from dew.training.compiler import HostStartup
+    from dew.training.compiler import DrawingStep, HostStartup
     from dew.training.planning import Planned
     from dew.training.trainer import Trainer
 
@@ -1482,7 +1482,8 @@ class LaterCounts:
     7959, 8067)."""
 
     @staticmethod
-    def begun(trainer, cap: Planned, shapes: TrainState, batch: Batch) -> Callable | None:
+    def begun(trainer: Trainer, cap: Planned, shapes: TrainState, batch: Batch
+              ) -> Callable[[DrawingStep, int], None] | None:
         """What begins compiling `trainer`'s counts off its loop at its first draw (`DrawingStep.begin`),
         none where it runs on several processes or where its later phases are planned on the loop
         (`LaterPlans.started`'s exceptions)."""
@@ -1505,12 +1506,14 @@ class LaterCounts:
                     stepping.settings, sampled_passes=count))
                 compiler.admitted_at(stepping, shapes, batch, cap, count, provisional=True).released()
 
-        def begin(step, position: int) -> None:
+        def begin(step: DrawingStep, position: int) -> None:
             # An earlier batch signature's counts still compiling off the loop: those not begun give way to
             # this step's own, and one compiling is kept apart, waited for as the run ends alone.
             prior = trainer._later or LaterPlans({})
-            stale = [*prior.stale, *(future for future in prior.futures.values()
-                                     if not future.cancel() and not future.done())]
+            # A count still compiling is kept apart and waited for as the run ends, and one that failed is
+            # kept with it, its failure said there (`LaterPlans.stopped`; row 11754: dropped unsaid).
+            stale = [*prior.stale, *(future for future in prior.futures.values() if not future.cancel()
+                                     and (not future.done() or future.exception() is not None))]
             order = [count for count in step.upcoming(position, UPCOMING_STEPS * step.split)
                      if count not in step.plans]
             pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-later-counts")

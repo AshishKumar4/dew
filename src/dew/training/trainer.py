@@ -191,7 +191,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, computation_differs, refuse_export, resumed_step, run_data
+from dew.training.startup import Startup, computation_differs, resumed_step, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -1521,7 +1521,7 @@ class Trainer(Generic[Loss, Effects]):
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
         objective that names its input field alone declares it first (`_declare_input`), a resume's from the
         first batch its saved position admits (`_resumed_position`)."""
-        checkpoints, _ = self.checkpoints, refuse_export(self)
+        checkpoints = self.checkpoints
         resumed = None if initial is not None else self._resumed(run, resume)
         self._declare_input(lambda: self._primed_first(run, dataset,
                                                        None if resumed is None else resumed.position))
@@ -2323,7 +2323,8 @@ class Trainer(Generic[Loss, Effects]):
         settled_heap(run)  # A step the process held, its fit's start collected all the same.
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], interval, run.current, state), trials.state)
+        # Drawn over the state the step is handed, its copies built (`Building.fits`): row 11731.
+        return (*self._compiler.drawn(compiled[signature], interval, run.current, trials.state), trials.state)
 
     def _saved_checkpoint(
         self,

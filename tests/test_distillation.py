@@ -753,23 +753,15 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
     rows, positions = batch[TEXT_KEY].shape[0], batch[TEXT_KEY].shape[1] - 1
     vocab = META["student"]["vocab_size"]
 
-    import jax.extend
+    from dew.nn.programs import equations
 
     whole = {(rows, positions, vocab), (rows * positions, vocab)}
 
     def holds_whole(program) -> bool:
         """Whether any value `program` computes, in any of its nested programs, is a whole logits tensor."""
-        def walk(jaxpr) -> bool:
-            for equation in jaxpr.eqns:
-                if any(tuple(getattr(var.aval, "shape", ())) in whole for var in equation.outvars):
-                    return True
-                inner = [value for held in equation.params.values()
-                         for value in (held if isinstance(held, tuple) else (held,))
-                         if isinstance(value, (jax.extend.core.Jaxpr, jax.extend.core.ClosedJaxpr))]
-                if any(walk(getattr(value, "jaxpr", value)) for value in inner):
-                    return True
-            return False
-        return walk(jax.make_jaxpr(program)(params).jaxpr)
+        traced = jax.make_jaxpr(program)(params).jaxpr
+        return any(tuple(getattr(var.aval, "shape", ())) in whole
+                   for equation in equations(traced) for var in equation.outvars)
 
     def gradient(objective):
         return lambda params: jax.grad(lambda held: objective.scalar_loss(held, batch, step_at())[0])(params)
