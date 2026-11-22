@@ -97,18 +97,12 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     flagged = "cuda" if accelerator is None and tier_wire.preparing(environ) else accelerator
     if flagged is None:
         cpu_devices = MESH_DEVICES
-        # XLA:CPU orders the thunks that hold a collective by when each starts, not when it ends
-        # (`Resource::kCollectiveCommunicator`, a scheduling edge), and a while loop's thunk returns
-        # pending before its inner collective has started: under the default schedule the next loops'
-        # collectives then start, their rendezvous block every worker of the pool, and the device the
-        # first one waits for never runs (row 5397: a plain JAX program of three such loops on a 2x2 mesh
-        # hangs 11 of 12 processes, none with the communicator made a completion dependency; armada job
-        # 20261110120401-1a75cf8e).
-        # The memory-optimized schedule reuses buffers between the loops, whose dependencies keep them
-        # apart: tests/test_run_option_matrix.py's staged lm run aborted 3 of 30 runs under the default
-        # schedule and 0 of 60 under this one. XLA's CPU backend ships in jaxlib, which Dew takes as
-        # released, so the setting is a boundary of that dependency (CONTRIBUTING.md) until a jaxlib
-        # release orders CPU collectives by completion.
+        # The suite's memory cells read a program's temporaries from XLA:CPU's buffer assignment, as a
+        # device's planner reads them (the planner's fits, a forked call's buffers, a tight start's split).
+        # The memory-optimized schedule makes those the program's least live set. Under the default one
+        # they move by bytes with incidental op order (train 1175: a forked recurrence's two document
+        # bounds took 15,689,280 and 15,691,008 bytes of temporaries, a tight start's fewest stopped
+        # undercutting its missing split, and a fit whose state fits refused its plan).
         flags.append("--xla_cpu_scheduler_type=CPU_SCHEDULER_TYPE_MEMORY_OPTIMIZED")
     else:
         if flagged == "cuda":
