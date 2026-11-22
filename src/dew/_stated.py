@@ -212,10 +212,14 @@ def _wrapping_users(value, at: str, again: Callable[..., JSON]) -> JSON:
 
 
 def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
-    """One of JAX's values a program computes from or with: an array (`_jax_array`), a function `jax.jit`
-    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`), a
-    program Dew's compile point compiles, by its function and arguments (`_outer_program`); None for any
-    other."""
+    """One of JAX's values a program computes from or with: an array (`_jax_array`; a trace's value, none an
+    identity states, refused), a function `jax.jit` wraps, by its module's name for it where a library's
+    (`_named`), else by what it wraps (`_jitted`), a program Dew's compile point compiles, by its function and
+    arguments (`_outer_program`); None for any other."""
+    if isinstance(value, jax.core.Tracer):
+        # A value of a trace in progress (a span's enclosing jit's argument): no value to state, and its
+        # placement raises as it is read (row 11002's review, F3: `ConcretizationTypeError`).
+        raise Unestablished(f"{at}: a value of a trace in progress")
     if isinstance(value, jax.Array):
         return _jax_array(value, at, again)
     if (program := _outer_program(value, at, again)) is not None:

@@ -537,10 +537,16 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
     it, the meshes, Dew's contexts, the logical axis rules, Dew's environment and the compiles' refused
     launches, the key every held trace of Dew's is kept by) and NumPy's error policy,
     which a host split reads. None for a function no statement holds (a value of the enclosing trace among its
-    reads), whose span is traced at every call."""
+    reads) or within a launch's trace, whose span is traced at every call."""
     from dew._stated import Unestablished, stated
     from dew.nn.kernels import options
+    from dew.nn.kernels.templates import report
 
+    if report.launch_digest() is not None:
+        # Within a launch's trace (a Mosaic kernel's body): the launch's own, which its held trace holds
+        # (`tuning.lowered_once`); keyed here, its pending launch would miss at every launch and pin its
+        # frames (row 11002's review, F4).
+        return None
     try:
         statement = json.dumps(stated(function, f"a marked span of {kind!r}"), sort_keys=True)
     except Unestablished as unstated:
