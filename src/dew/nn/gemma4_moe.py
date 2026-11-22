@@ -20,7 +20,15 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.activations import GatedActivation
 from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops
-from dew.nn.moe import ExpertMLP, chosen_experts, fixed_router, renormalized_softmax, weighs_one
+from dew.nn.moe import (
+    ROUTER_COLLECTION,
+    ROUTER_INDICES,
+    ExpertMLP,
+    chosen_experts,
+    fixed_router,
+    renormalized_softmax,
+    weighs_one,
+)
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, projection_role
 from dew.nn.protocols import Routes
@@ -55,6 +63,10 @@ class Gemma4TextRouter(nn.Module):
         logits = logits.astype(at_least_fp32(logits.dtype))
         indices = chosen_experts(lambda: jax.lax.top_k(jax.nn.softmax(logits, axis=-1), self.top_k)[1],
                                  (*logits.shape[:-1], self.top_k), routes)
+        # The experts it chose, written only where a caller opens the 'router' collection (`moe.Router`'s
+        # record): a routing a replay feeds back (`routes`), a run's own or a float64 truth's (row 4739).
+        if not self.is_initializing():
+            self.sow(ROUTER_COLLECTION, ROUTER_INDICES, indices)
         weights = renormalized_softmax(logits, indices)
         if weighs_one(self.top_k, normalized=True, single_softmax=self.num_experts == 1):
             # Its input scale's and projection's scores reach nothing; the per-expert scales still train.

@@ -40,7 +40,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import clearing_selections, fixture_ids, transformers_arms, transformers_model
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 from selection_margins import NARROW_MARGIN
@@ -182,31 +181,128 @@ def denoise(model, variables, prompt, canvas, **conditioning):
     return logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
 
 
-def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
-    """DiffusionGemma's shared text tree with routed experts, a sliding and a
-    full layer, self-conditioning and the vision conditioner, each forward
-    the fp32 test in tests/test_block_diffusion.py makes, now in bf16."""
+ROUTED_SEEDS = 16
+"""The routed denoiser site's declared seeds, each forward's."""
+
+
+def _layer_of(path) -> int:
+    """A routed layer's index in its stack, from its sown record's path (`layers_<i>`)."""
+    (index,) = (int(str(getattr(part, "key", part)).removeprefix("layers_")) for part in path
+                if str(getattr(part, "key", part)).startswith("layers_"))
+    return index
+
+
+def _recorded(sown, layers: int) -> np.ndarray:
+    """The experts a forward's routers chose (their 'router' collection's `indices`), `[B, S, layers,
+    top_k]`, a layer that routes nothing zeros, which it never reads."""
+    chosen = {_layer_of(path): np.asarray(value) for path, value in
+              jax.tree_util.tree_flatten_with_path(sown, is_leaf=lambda node: isinstance(node, tuple))[0]}
+    first = next(iter(chosen.values()))
+    return np.stack([chosen.get(layer, np.zeros_like(first)) for layer in range(layers)], axis=2)
+
+
+def _denoised(model, variables, prompt, canvas, rest, routes=None):
+    """`denoise`'s canvas logits, its prompt's routing and its canvas's replayed from `routes` where
+    given, else recorded: `(logits, (prompt's experts, canvas's experts))`."""
+    previous, pixels = (rest[0], None) if rest and rest[0].ndim == 3 else (None, rest[0] if rest else None)
+    layers = model.text.num_layers
+    fields = {} if pixels is None else {"image_indices": jnp.where(prompt == 60, 0, -1),
+                                         "conditioning": {"pixel_values": pixels}}
+    cache = model.apply(variables, prompt.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
+    _, held = model.apply({**variables, "cache": cache}, prompt, method=model.encode,
+                          mutable=["cache", "router"], routed_experts=None if routes is None else routes[0],
+                          **fields)
+    logits, sown = model.apply({**variables, "cache": held["cache"]}, canvas, mutable=["router"],
+                               self_conditioning_logits=previous,
+                               routed_experts=None if routes is None else routes[1])
+    return logits, (_recorded(held["router"], layers), _recorded(sown["router"], layers))
+
+
+@contextlib.contextmanager
+def _replayed(network, routes):
+    """`network` (transformers' DiffusionGemma) with each router choosing the experts `routes` holds,
+    `(prompt's, canvas's)` `[B, S, layers, top_k]`, a call's by the rows it routes (the prompt's and the
+    canvas's lengths differ in the fixture's draws), each keeping the weights its own probabilities give
+    them (renormalized over the chosen, times their per-expert scales): only the discrete choice replayed
+    (row 4739). Torch's forward hooks, removed on exit."""
+    import torch
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaTextRouter
+
+    def replaying(layer: int):
+        def hook(module, inputs, outputs):
+            rows = inputs[0].shape[0]
+            (held,) = (held for held in routes if held.shape[0] * held.shape[1] == rows)
+            chosen = held[:, :, layer].reshape(rows, held.shape[-1])
+            index = torch.as_tensor(np.asarray(chosen, np.int64))
+            weights = outputs[0].gather(-1, index)
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+            return outputs[0], weights * module.per_expert_scale[index], index
+        return hook
+
+    handles = [module.register_forward_hook(replaying(int(name.split("layers.")[1].split(".")[0])))
+               for name, module in network.named_modules() if isinstance(module, DiffusionGemmaTextRouter)]
+    try:
+        yield network
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("forward", ["bare", "conditioned", "image_logits"])
+def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16(forward):
+    """DiffusionGemma's shared text tree with routed experts, a sliding and a full layer, self-conditioning
+    and the vision conditioner, each forward the fp32 test in tests/test_block_diffusion.py makes, in bf16:
+    Dew's canvas logits on par with transformers' bf16 forward over drawn prompts and canvases, both from
+    the float64 twin (check 1). Each draw's routing is its float64 run's, replayed to every arm (Dew's
+    `routed_experts`, transformers' routers by `_replayed`), each arm weighing its chosen experts by its own
+    bf16 router: a top-k on near-ties is no function check 1 can hold at bf16, its float64 margins a median
+    9.9e-3 of their scale and none of 64 draws past `NARROW_MARGIN`, where bf16 moves the scores a median
+    2.2e-2 (row 4739, armada IG-DG-MARGIN2). The choice itself is held by tests/test_block_diffusion.py's
+    float32 sites."""
+    import test_block_diffusion as block
+    import torch
+
     directory = FIXTURES / "diffusion-gemma-workflow"
     config = json.loads((directory / "config.json").read_text())
     tensors = load_file(str(directory / "model.safetensors"))
-    reference = {}
-    for name in ("reference.npz", "numerics.npz"):
-        with np.load(directory / name) as stored:
-            reference.update({key: stored[key] for key in stored.files})
-    model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
+    reference = dict(np.load(directory / "reference.npz"))
+    narrow = adapter.build(config, dtype="bfloat16", attention_impl="xla")
     variables, _ = adapter.translate_weights(tensors, config)
-    image = (reference["image_prompt"],
-             ({"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
-              {"pixel_values": jnp.asarray(reference["pixels"])}))
-    runs = {
-        "bare": (reference["prompt"], {}),
-        "conditioned": (reference["prompt"], {"self_conditioning_logits": reference["previous"]}),
-        "image_logits": (image[0], {"media": image[1]}),
-    }
-    for name, (prompt, conditioning) in runs.items():
-        logits = denoise(model, variables, prompt, reference["canvas"], **conditioning)
-        assert_as_exact_as_the_reference(logits, reference[f"{name}_bf16"], reference[f"{name}_f64"],
-                                         f"workflow {name}")
+    wide = adapter.build(config, dtype="float64", attention_impl="xla")
+    image = forward == "image_logits"
+    draw = block.canvas_draw(reference["image_prompt" if image else "prompt"], reference["canvas"], 64,
+                             previous=forward == "conditioned", pixels=reference["pixels"] if image else None)
+
+    routings: dict = {}
+
+    def routes_of(*inputs):
+        """The float64 run's routing of a draw's inputs, found once a draw for every arm."""
+        arrays = tuple(np.asarray(value) for value in inputs)
+        key = b"".join(value.tobytes() for value in arrays)
+        if key not in routings:
+            with jax.enable_x64(new_val=True):
+                held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(
+                    jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
+                prompt, canvas, *rest = (jnp.asarray(value) for value in arrays)
+                rest = [jnp.asarray(value, jnp.float64) for value in rest]
+                routings[key] = _denoised(wide, held, prompt, canvas, rest)[1]
+        return routings[key]
+
+    @as_given
+    def dew(*inputs):
+        prompt, canvas, *rest = (jnp.asarray(value) for value in inputs)
+        logits = _denoised(narrow, variables, prompt, canvas, rest, routes_of(*inputs))[0]
+        return {"logits": np.asarray(logits.astype(jnp.float32))}
+
+    def transformers(network, *inputs):
+        with _replayed(network, routes_of(*(value.numpy() for value in inputs))):
+            return block.transformers_canvas(network, *inputs)
+
+    source = block.transformers_model(directory)
+    reference_arm, truth = transformers_arms(copy.deepcopy(source).to(torch.bfloat16), transformers,
+                                             source=source)
+    assert_as_exact(dew, reference_arm, draw, f"routed workflow {forward}", seeds=ROUTED_SEEDS,
+                    truth_fn=truth)
 
 
 EXPERT_SEEDS = 16
