@@ -261,6 +261,7 @@ class Cache:
         pool: Pool | None = None,
         source: Source | None = None,
         transparent: bool = False,
+        shard_count: int | None = None,
     ) -> ShardOpener:
         """`reader`'s shards read through the cache: a published generation's records read back, or each
         shard's fill written as it is read, `source`'s generation published by the last of its shards'
@@ -280,8 +281,10 @@ class Cache:
                 return computed
             # A transparent read computes its records in the form it saves with the cache read.
             return _CachedReader(reader, self, key, transform, _Computed(), source, transparent=True)
-        # The store's shards, counted once for every shard's writer (`_Writer._published`).
-        shards = None if source is None else len(source.manifest().shards)
+        # The shards the fill is keyed by, counted once for every shard's writer (`_Writer._published`): the
+        # reader's own where it states them (a positioned stream's, `stream_manifest`), else the store's.
+        shards = None if source is None else (shard_count if shard_count is not None
+                                              else len(source.manifest().shards))
         return _CachedReader(reader, self, key, transform,
                              None if published is None
                              else _Published(published, transform, self if self.optional else None), source,

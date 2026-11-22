@@ -38,7 +38,8 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     as the one it read by (`earlier_data_plan`); a chain's store under the fields its class renamed since,
     by today's names (`dew.data.records.earlier_chains`); an encoder or conditioner by the import path it
     has now (`dew._records.moved_paths`, row 5996); a decision layout of a class it was before by the
-    segment layout it is now, wherever the record holds it (`dew._records.earlier_layout`, row 6140).
+    segment layout it is now, wherever the record holds it (`dew._records.earlier_layout`, row 6140); a
+    source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
@@ -48,6 +49,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved)))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
+    earlier = earlier_packed_experts(earlier)
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
@@ -59,6 +61,19 @@ LAYOUT_UNSETTABLE = "layout_unsettable"
 this Dew does, unset as null: a record written while it could not be unset (`Layout()` its default) lacks
 it and reads `Layout()` as unset (`earlier_trainer_layout`), where one written since keeps a stated
 `Layout()` (row 9664). Beside the fields, where no field of the run's holds it (train 1109's review, F3)."""
+
+
+def earlier_packed_experts(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose source states `packed_experts`, the field `SourceOptions.packed_weights`
+    was while it packed an MXFP4 source's experts alone (row 8550): the same choice under today's name.
+    Carried to 1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    source = fields.get("source") if isinstance(fields, Mapping) else None
+    if not isinstance(fields, Mapping) or not isinstance(source, Mapping) or "packed_experts" not in source:
+        return record
+    renamed = {("packed_weights" if key == "packed_experts" else key): value for key, value in source.items()}
+    return {**record, "fields": {**fields, "source": renamed}}
+
 
 
 def earlier_trainer_layout(record: Mapping[str, object]) -> Mapping[str, object]:

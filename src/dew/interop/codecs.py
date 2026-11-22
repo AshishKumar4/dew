@@ -344,6 +344,12 @@ class SourceQuantization:
     decode_kept: Callable[[Mapping[str, Stored], str, str], Stored] | None = None
     """A weight decoded straight into the dtype `param_dtype` keeps it in, for a format that decodes
     faster so than in float32 and rounds alike; None decodes in float32 and casts."""
+    as_nvfp4: Callable[[Mapping[str, Stored], str], tuple[np.ndarray | jax.ShapeDtypeStruct, ...] | None] = (
+        lambda tensors, name: None)
+    """A dense weight's NVFP4 parts as `dew.nn.kernels.formats.NvFp4.of` packs them (its codes `[in, out]`,
+    its block scales `[in / 16, out]` and its tensor scale), read from its stored ones with no value
+    decoded, which a load serves packed (`Pretrained.load`'s `packed_weights`); None for a weight the
+    format stores otherwise or a load decodes (`dew.interop.quantized_loads.packed_banks`)."""
 
     def tensor_names(self, tensors: Mapping[str, Stored]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
@@ -1690,7 +1696,23 @@ def _modelopt_decode(tensors: Mapping[str, Stored], name: str, *, method: str = 
         # rounding in FP8QTensor.dequantize: scale and product both bf16.
         codec = compressed_tensors(_MODELOPT_FP8_WEIGHTS)
         return codec.decode({name: packed, parts[0]: scale.astype(ml_dtypes.bfloat16)}, name)
-    scale, overall = (unread.held(tensors[part]) for part in parts[:2])
+    held = (unread.held(tensors[part]) for part in parts[:2])
+    scale, overall = _modelopt_nvfp4_checked(name, packed, *held)
+    values = unread.lookup(_E2M1_BYTES, packed).reshape(*packed.shape[:-1], -1, 16)
+    # The author's Python reader maps code 8 to +0; packed bytes remain in
+    # the export grid so an untrained save can still keep that source code.
+    values = np.where(np.equal(values, 0), np.float32(0), values)
+    product = values * _modelopt_scales(scale, overall)[..., None]
+    return product.reshape(*packed.shape[:-1], packed.shape[-1] * 2).astype(ml_dtypes.bfloat16).astype(
+        np.float32)
+
+
+def _modelopt_nvfp4_checked(name: str, packed: Stored, scale: Stored, overall: Stored
+                            ) -> tuple[Stored, Stored]:
+    """A ModelOpt NVFP4 weight's block scales and global scale, refused by name unless its U8 E2M1 pairs
+    `packed` hold one E4M3 scale per 16 inputs beside a float32 global scale (one for the tensor or one per
+    leading expert), each finite and nonnegative where the load reads values: what its decode
+    (`_modelopt_decode`) and its packing (`_modelopt_as_nvfp4`) read."""
     if (packed.dtype != np.uint8 or packed.ndim not in (2, 3) or packed.shape[-1] % 8
             or scale.dtype != np.dtype(E4M3) or scale.shape != (*packed.shape[:-1], packed.shape[-1] // 8)
             or overall.dtype != np.float32 or overall.size not in (1, packed.shape[0])):
@@ -1700,13 +1722,37 @@ def _modelopt_decode(tensors: Mapping[str, Stored], name: str, *, method: str = 
             not np.isfinite(scale.astype(np.float32)).all() or not np.isfinite(overall).all()
             or (overall < 0).any()):
         raise ValueError(f"{name} ModelOpt scales must be finite and nonnegative")
-    values = unread.lookup(_E2M1_BYTES, packed).reshape(*packed.shape[:-1], -1, 16)
-    # The author's Python reader maps code 8 to +0; packed bytes remain in
-    # the export grid so an untrained save can still keep that source code.
-    values = np.where(np.equal(values, 0), np.float32(0), values)
-    product = values * _modelopt_scales(scale, overall)[..., None]
-    return product.reshape(*packed.shape[:-1], packed.shape[-1] * 2).astype(ml_dtypes.bfloat16).astype(
-        np.float32)
+    return scale, overall
+
+
+def _modelopt_as_nvfp4(tensors: Mapping[str, Stored], name: str, *, method: str = 'NVFP4',
+                       layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS
+                       ) -> tuple[np.ndarray | jax.ShapeDtypeStruct, ...] | None:
+    """A ModelOpt W4A16_NVFP4 weight's NVFP4 parts (`SourceQuantization.as_nvfp4`), exactly the values its
+    codes, E4M3 block scales and float32 global scale state (code 8 read as +0, as the author's reader reads
+    it): its U8 pairs `[out, in / 2]` as E2M1 nibbles `[in, out]`, its scales `[out, in / 16]` as
+    `[in / 16, out]`, its global scale the tensor's; for a load that reads no values (`weights=False`), their
+    shapes and dtypes (`jax.ShapeDtypeStruct`), so it holds the tree a load of values holds. None for an FP8
+    or NVFP4 weight, whose stored input scale its product quantizes its input under
+    (`dew.interop.quantized_loads.input_quantization`), and for an expert's (`experts.<k>.` in its name,
+    `v_experts.<k>.` among them, a stack's member, which Dew packs as a bank whole or not at all; a shared
+    expert's stays packable)."""
+    if _modelopt_algo(name, method, layers) != 'W4A16_NVFP4' or re.search(r'experts\.\d+\.', name):
+        return None
+    stored = (unread.held(tensors[part]) for part in (name, *_modelopt_layer_parts(name, 'W4A16_NVFP4')))
+    packed = next(stored)
+    scale, overall = _modelopt_nvfp4_checked(name, packed, *stored)
+    if packed.ndim != 2 or overall.size != 1:
+        return None
+    outputs, inputs = packed.shape[0], packed.shape[1] * 2
+    if not (unread.valued(packed) and unread.valued(scale) and unread.valued(overall)):
+        return (jax.ShapeDtypeStruct((inputs, outputs), np.uint8),
+                jax.ShapeDtypeStruct((inputs // 16, outputs), ml_dtypes.float8_e4m3fn),
+                jax.ShapeDtypeStruct((), np.float32))
+    nibbles = np.stack([packed & 15, packed >> 4], axis=-1).reshape(packed.shape[0], -1)
+    nibbles = np.where(nibbles == 8, np.uint8(0), nibbles).astype(np.uint8)
+    return (np.ascontiguousarray(nibbles.T), np.ascontiguousarray(scale.astype(ml_dtypes.float8_e4m3fn).T),
+            overall.reshape(()).astype(np.float32))
 
 
 def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored] | None,
@@ -1781,7 +1827,8 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
         partial(_modelopt_encode, grid=grid, method=str(method), layers=layers),
         grid=lambda name: (*_modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)), name),
         input_scale_dtype='float8_e4m3fn', input_format='modelopt', input_suffix='.input_scale',
-        input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers))
+        input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers),
+        as_nvfp4=partial(_modelopt_as_nvfp4, method=str(method), layers=layers))
 
 
 # --------------------------------------------------------------------------

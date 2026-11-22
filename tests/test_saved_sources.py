@@ -260,7 +260,9 @@ def joint_flags() -> list[str]:
 @pytest.fixture(scope="module")
 def chat_decision_run(tmp_path_factory):
     """A chat-format decision run (`joint_flags`) trained a step and saved, its directory and its state:
-    the source each of the run-from-run cells below names, trained once for them."""
+    the source each of the run-from-run cells below names, trained once for them, which their mark keeps in
+    one group of a split file (`shared_setup`, row 10777: main's cut, tests/test_cuts.json, parted the three
+    into three groups, each training it again, 139 s for one in train 1139's CI)."""
     root = tmp_path_factory.mktemp("chat-decision")
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
@@ -273,6 +275,7 @@ TEAM = {"billing": "payments", "technical": "outages", "sales": "pricing"}
 """The question the chat-format decision runs answer, `Choice("Which team?", TEAM)`."""
 
 
+@pytest.mark.shared_setup("chat_decision_run")
 def test_a_saved_chat_format_decision_runs_release_answers_as_its_run(chat_decision_run, tmp_path,
                                                                       monkeypatch):
     """A chat-format decision run's release, written by `dew export` and by its task's `save_pretrained`,
@@ -297,6 +300,7 @@ def test_a_saved_chat_format_decision_runs_release_answers_as_its_run(chat_decis
                                           served(state_text, {"team": team})["team"].probabilities)
 
 
+@pytest.mark.shared_setup("chat_decision_run")
 def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(chat_decision_run, tmp_path,
                                                                     monkeypatch):
     """A saved chat-format decision run is a source a second decision run names (`--pretrained <run>`):
@@ -321,6 +325,7 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(chat_decisi
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
+@pytest.mark.shared_setup("chat_decision_run")
 def test_a_decision_run_naming_its_own_head_draws_it_fresh_over_a_saved_chat_format_runs_backbone(
         chat_decision_run, tmp_path, monkeypatch):
     """A run naming a head of its own over a saved chat-format decision run draws it fresh over the run's
@@ -479,7 +484,7 @@ def test_a_run_resumes_under_another_kernel_choice_and_refuses_its_experts_packe
                        trainer={"name": "run", "steps": 2, "checkpoint_final": True})
     assert int(again.step) == 2
     record = (tmp_path / "runs" / "run" / "run.json").read_text()
-    packed = dataclasses.replace(first, source=dataclasses.replace(first.source, packed_experts=True))
+    packed = dataclasses.replace(first, source=dataclasses.replace(first.source, packed_weights=True))
     with pytest.raises(ValueError):
         trained(packed, tmp_path, "run", trainer={"name": "run", "steps": 3, "checkpoint_final": True})
     assert (tmp_path / "runs" / "run" / "run.json").read_text() == record
@@ -811,4 +816,31 @@ def exported_tensors(directory: Path) -> dict[str, bytes]:
 
     return {name: (str(array.dtype), array.shape, array.tobytes())
             for path in sorted(directory.glob("*.safetensors")) for name, array in load_file(path).items()}
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_its_run(tmp_path):
+    """A multimodal LM run whose loop passes messages (`Loop.messages`), which no family's layout writes,
+    releases in Dew's own layout (`released_run`), which loads back (`Pretrained.from_saved`'s wrapper
+    branch) as the run's model: its towers' and decoder's weights the run's, its loop the run's messages;
+    its export is refused, stating why, and a change of its merges' rank refused on the reloaded bundle,
+    whose merges it holds, not draws (row 10839)."""
+    from saved_run_kinds import multimodal
+
+    from dew.interop import Pretrained
+    from dew.nn.cross_pass import MESSAGES_UNWRITTEN, CrossPass
+    from dew.nn.multimodal import MultimodalTransformer
+
+    looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop_steps=2, loop_layers=(0, 2),
+                                 loop_messages=True, loop_message_block_size=1)
+    state, _ = trained(looped, tmp_path, "messaged", trainer={"checkpoint_final": True})
+    loaded = Pretrained.load(str(released_run(tmp_path / "runs" / "messaged")), dtype="float32")
+    assert isinstance(loaded.model, MultimodalTransformer)
+    assert loaded.model.loop is not None and loaded.model.loop.messages == CrossPass(block_size=1)
+    leaves_alike(loaded.variables["params"], state.variables["params"])
+    with pytest.raises(ValueError) as refused:
+        loaded.export()
+    assert refused.value.args == (MESSAGES_UNWRITTEN,)
+    with pytest.raises(ValueError):
+        loaded.with_model(loaded.model.with_passes(messages=CrossPass(block_size=1, rank=8)), key=0)
 

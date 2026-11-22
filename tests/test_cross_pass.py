@@ -37,7 +37,8 @@ any of a site's cases asked)."""
 UNROLLED_SEEDS = {"two": 8, "four": 512, "the last trained": 8, "recomputed": 512, "attention": 512,
                   "depth residuals": 8, "scanned layers": 128}
 """Check 1's declared seeds for each unrolled case, sized by `seeds_for` on armada (XP-SIZE); those of 512
-drawn 128 a map task (`check1_shards`)."""
+drawn 128 a map task (`check1_shards`), the scanned layers' 128 drawn 32 a task (237 s whole in train 1156's
+CI, row 10946)."""
 
 MESSAGES = CrossPass(block_size=2, rank=4)
 """Messages over blocks of two layers through a controller of rank 4."""
@@ -248,7 +249,8 @@ def _without_merges(params):
     pytest.param(("attention", {"steps": 3}), UNROLLED_SEEDS["attention"], id="attention",
                  marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
     pytest.param(("depth", {"steps": 3}), UNROLLED_SEEDS["depth residuals"], id="depth residuals"),
-    pytest.param(("scanned", {"steps": 3}), UNROLLED_SEEDS["scanned layers"], id="scanned layers")])
+    pytest.param(("scanned", {"steps": 3}), UNROLLED_SEEDS["scanned layers"], id="scanned-layers",
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32))])
 def test_a_loop_passing_messages_computes_its_passes_unrolled(case, seeds, request):
     """At gates drawn off zero, a loop passing messages computes its passes unrolled pass by pass from the
     stack's own spans (`_messages_by_hand`): its logits and every parameter's gradient, the prelude's and

@@ -418,6 +418,25 @@ def _indexed_manifest(source: Source, uri: str, rows: int,
     )
 
 
+@runtime_checkable
+class PositionedShards(Protocol):
+    """A store whose stream can number its rows as its indexed read does, in shards of other bounds than
+    its own (a text store's offset index, `dew.data.sources.Files.positioned_manifest`)."""
+
+    def positioned_manifest(self) -> ShardManifest:
+        """Its shards for a stream that numbers its rows (`stream_manifest`)."""
+        ...
+
+
+def stream_manifest(source: Source, *, positioned: bool) -> ShardManifest:
+    """The shards a streamed read of `source` reads: where its rows are numbered (`positioned`, a
+    `map_with_index` among its steps), those it numbers them by where it states them (`PositionedShards`),
+    else its own (`Source.manifest`)."""
+    if positioned and isinstance(source, PositionedShards):
+        return source.positioned_manifest()
+    return source.manifest()
+
+
 def _single_indexed_manifest(source: Source, uri: str) -> ShardManifest:
     """One whole-store shard `(0..count)` for a single-reader stream, preserving the single-shard
     positions earlier runs saved, with row-wise `subdivide` when readers × workers exceed one."""

@@ -78,7 +78,7 @@ def test_a_position_saved_under_14_resumes_where_it_stopped(read):
 
 def test_a_position_saved_under_14_resumes_and_saves_one_of_this_dews_that_resumes_again():
     """A seeded mix's position main saved under plan 14 resumes in this Dew's read onto the rows read next,
-    and the position it saves in turn, of this Dew's plan (16), holds each stage of its order once, at the
+    and the position it saves in turn, of this Dew's plan (17), holds each stage of its order once, at the
     step of its manifest that describes it, and resumes again onto the rows after."""
     from saved_positions_support import mixture
 
@@ -94,7 +94,7 @@ def test_a_position_saved_under_14_resumes_and_saves_one_of_this_dews_that_resum
             resumed.close()
         plan = json.loads(saved)["dew_data_plan"]
         stages = plan["order"]["stages"]
-        assert plan["version"] == 16 and stages and all(isinstance(stage, int) for stage in stages)
+        assert plan["version"] == 17 and stages and all(isinstance(stage, int) for stage in stages)
 
 
 SAVED_BEFORE_THE_MOVE = Path(__file__).with_name("fixtures") / "positions" / "main-cdc45f8f9"
