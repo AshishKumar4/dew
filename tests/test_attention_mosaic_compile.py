@@ -1859,12 +1859,23 @@ def test_derived_one_consumer_heights_are_compared_by_choose():
     assert any({(c.block_q, c.block_k) for c in group} >= {(128, 32), (64, 64)} for group in seen), seen
 
 
+def _fast_backward_compile_case(name: str, q, k, spans, shapes):
+    """Build a `KernelCase` for fast-form Mosaic backward compilation."""
+    from fla_gdn_support import KernelCase
+
+    def backward(query, key, value, dout, residuals):
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                          residuals=residuals, accurate=False)
+        return grads.query, grads.key, grads.value
+
+    return KernelCase(name, lambda: (backward, (q, k, k, q, shapes)))
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("gen", ["sm90", "sm80"])
 def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
     """Row 5272: qwen3-8b d128 fused backward deepens its ring to 3 stages without losing SM residency
     on both sm90 (`wgmma.fed`) and sm80 (`mma.sync` cp.async) and compiles spill-free."""
-    from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed(gen):
@@ -1880,15 +1891,8 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
         cfg = op.derived(ba, target)
         assert cfg is not None and cfg.fused and cfg.stages >= 3, (gen, cfg)
         assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
-
-        def _make():
-            def backward(query, key, value, dout, residuals):
-                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                                  residuals=residuals, accurate=False)
-                return grads.query, grads.key, grads.value
-            return backward, (q, k, k, q, shapes)
-
-        found = compile_mosaic_kernels([KernelCase(f"{gen}-fused-d128-3stage", _make)], gen)
+        case = _fast_backward_compile_case(f"{gen}-fused-d128-3stage", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
@@ -1935,7 +1939,6 @@ def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
 def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
     """Row 5272: sm90 overlapped fused backward (`_overlapped_fused_step`: S softmax overlapped with dP,
     dS overlapped with dV, add_dq overlapped with dK) compiles spill-free at d64 and d128."""
-    from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed("sm90"):
@@ -1943,15 +1946,8 @@ def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
         q = jax.ShapeDtypeStruct((2, 4096, 32, width), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((2, 4096, 8, width), jnp.bfloat16)
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
-
-        def _make():
-            def backward(query, key, value, dout, residuals):
-                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                                  residuals=residuals, accurate=False)
-                return grads.query, grads.key, grads.value
-            return backward, (q, k, k, q, shapes)
-
-        found = compile_mosaic_kernels([KernelCase(f"sm90-overlapped-fused-d{width}", _make)], "sm90")
+        case = _fast_backward_compile_case(f"sm90-overlapped-fused-d{width}", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
@@ -1959,7 +1955,6 @@ def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
 def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
     """Row 5272: sm90 overlapped shared-keys backward (`attention_dkv_shared`, qwen3.5-0.8b d256) compiles
     spill-free with S/dP overlap and dead `chosen` excluded."""
-    from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed("sm90"):
@@ -1967,13 +1962,6 @@ def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
         q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
-
-        def _make():
-            def backward(query, key, value, dout, residuals):
-                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                                  residuals=residuals, accurate=False)
-                return grads.query, grads.key, grads.value
-            return backward, (q, k, k, q, shapes)
-
-        found = compile_mosaic_kernels([KernelCase("sm90-overlapped-coop-d256", _make)], "sm90")
+        case = _fast_backward_compile_case("sm90-overlapped-coop-d256", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

@@ -4,7 +4,6 @@ warpgroup MMA reads its right operand from shared memory and its left from share
 accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronously until waited for."""
 
 from collections.abc import Callable
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -84,7 +83,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable[[jax.Array], Any] = lambda value: value) -> tuple[Any, jax.Array]:
+                     between: Callable = lambda value: value) -> tuple:
         if launches.interpreting():
             return super().product_pair(lhs1, rhs1, lhs2, rhs2, shape, between=between)
 

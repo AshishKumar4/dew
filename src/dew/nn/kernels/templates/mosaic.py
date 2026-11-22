@@ -1240,7 +1240,7 @@ class Issuer[Accumulator](abc.ABC):
         return self.products(acc, lhs, rhs, accumulate=accumulate)
 
     def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable[[jax.Array], Any] = lambda value: value) -> tuple[Any, jax.Array]:
+                     between: Callable = lambda value: value) -> tuple:
         """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
         (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
         second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""

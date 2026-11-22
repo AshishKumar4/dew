@@ -177,13 +177,30 @@ def dq_and_dkv(walk: _Backward, accumulators: tuple, weights_ref, cotangents_ref
                   else family.product(cotangents_ref, k_rhs, shape))
     return dq, (dk_acc, dv_acc)
 
+def _cotangent_part(walk: _Backward, weights, dp, anchor, delta, slopes, seen, dtype) -> jax.Array:
+    """Compute narrowed score-cotangent `part` from overlapped `weights` and `dp` (row 5272)."""
+    tiles_ds = {"weights": weights, "products": dp, "anchor": anchor, "delta": delta}
+    if seen is not None:
+        tiles_ds["seen"] = seen
+    cotangents = derived_from_weights(keys_first=False, masked=seen is not None).mapped(tiles_ds)
+    pulled = gradient.pulled(cotangents, slopes, seen, ())[0]
+    return mosaic.unscaled_part(*algebra.cotangent_parts(pulled * walk.grad_scale, dtype, accurate=False))
+
+
 def overlapped_tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords,
-                           shape: tuple[int, int], *, masked: bool,
-                           after_weights: Callable[[jax.Array], object] | None = None):
+                           shape: tuple[int, int], *, masked: bool) -> tuple[jax.Array, jax.Array]:
     """Overlapped S/dP tile scores via `product_pair(..., between=...)` (row 5272): runs `S` softmax and
-    weight narrowing while `dP = dO Vᵀ` runs on Tensor Cores. If `after_weights` is given, calls it with
-    `narrowed` inside `between` (e.g. staging `P` to SMEM before `dP` finishes) and returns
-    `(weights, slopes, seen, dp, anchor, delta)`; otherwise returns `(narrowed, part)`."""
+    weight narrowing while `dP = dO Vᵀ` runs on Tensor Cores, returning `(narrowed, part)`."""
+    narrowed, weights, slopes, seen, dp, anchor, delta = _overlapped_weights_and_dp(
+        walk, slots, resident, rows, coords, shape, masked=masked)
+    return narrowed, _cotangent_part(walk, weights, dp, anchor, delta, slopes, seen, slots[0].dtype)
+
+
+def _overlapped_weights_and_dp(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords,
+                               shape: tuple[int, int], *, masked: bool,
+                               after_weights: Callable[[jax.Array], None] | None = None):
+    """Issue `S` and `dP` via `product_pair(..., between=...)`, running `S` softmax + optional
+    `after_weights(narrowed)` while `dP` is in flight on Tensor Cores."""
     family = walk.program.family
     (q_slot, do_slot), (k_smem, v_smem) = slots, resident
     peak, total, anchor, delta = (_read(row) for row in rows[:4])
@@ -201,24 +218,12 @@ def overlapped_tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows:
         narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped)
         if after_weights is not None:
             after_weights(narrowed)
-            return weights, slopes, seen
         return narrowed, weights, slopes, seen
 
     q_lhs = by_power(family.tile_of(q_slot), walk.spec.prescale) if walk.scaled else q_slot
-    first, dp = family.product_pair(
+    (narrowed, weights, slopes, seen), dp = family.product_pair(
         q_lhs, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)), shape, between=between)
-    if after_weights is not None:
-        weights, slopes, seen = first
-        return weights, slopes, seen, dp, anchor, delta
-    narrowed, weights, slopes, seen = first
-    tiles_ds = {"weights": weights, "products": dp, "anchor": anchor, "delta": delta}
-    if seen is not None:
-        tiles_ds["seen"] = seen
-    cotangents = derived_from_weights(keys_first=False, masked=seen is not None).mapped(tiles_ds)
-    pulled = gradient.pulled(cotangents, slopes, seen, ())[0]
-    part = mosaic.unscaled_part(*algebra.cotangent_parts(pulled * walk.grad_scale, q_slot.dtype,
-                                                         accurate=False))
-    return narrowed, part
+    return narrowed, weights, slopes, seen, dp, anchor, delta
 
 
 def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged, coords, add_dq,
@@ -229,17 +234,11 @@ def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged
     k_smem = resident[0]
     q_slot, do_slot = slots["queries"], slots["douts"]
     dk_acc, dv_acc = accumulators
-    weights, slopes, seen, dp, anchor, delta = overlapped_tile_scores(
+    _, weights, slopes, seen, dp, anchor, delta = _overlapped_weights_and_dp(
         walk, (q_slot, do_slot), resident, rows, coords, (tiles.block_q, tiles.block_k), masked=masked,
         after_weights=lambda narrowed: family.staged(narrowed, staged.at[0]))
     dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
-    tiles_ds = {"weights": weights, "products": dp, "anchor": anchor, "delta": delta}
-    if seen is not None:
-        tiles_ds["seen"] = seen
-    cotangents = derived_from_weights(keys_first=False, masked=seen is not None).mapped(tiles_ds)
-    pulled = gradient.pulled(cotangents, slopes, seen, ())[0]
-    part = mosaic.unscaled_part(*algebra.cotangent_parts(pulled * walk.grad_scale, q_slot.dtype,
-                                                         accurate=False))
+    part = _cotangent_part(walk, weights, dp, anchor, delta, slopes, seen, q_slot.dtype)
     cotangents_staged = staged.at[1]
     family.staged(part, cotangents_staged)
     dq = family.product(
