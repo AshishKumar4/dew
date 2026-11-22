@@ -28,6 +28,7 @@ gate multiplier) takes its one value that says so, `none` or `plain`, and no oth
 """
 
 import dataclasses
+import functools
 
 import generation_support
 import jax
@@ -206,7 +207,12 @@ def per_shard(choice: str, kernel: str) -> dict:
     case = dict(zip(AXES["join"], narrow, strict=True))
     layer = _layer(case)
     dtype = jnp.dtype(case["dtype"])
-    params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
+
+    @functools.cache
+    def params():
+        # On the cell's first draw, not where the family states its cells: every per-shard task's
+        # collection reads that statement, which initialized each join's layer there (rows 11692, 11695).
+        return layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
 
 
     def truth(*operands):
@@ -216,6 +222,7 @@ def per_shard(choice: str, kernel: str) -> dict:
             return with_gradients(_wide(layer).apply)(*operands)
 
     named = {**UNFUSED, "grouped_matmul": "mosaic"}
-    return {"data": Shard(with_gradients(layer.apply), drawing(params, (*ROWS, FEATURES), dtype),
+    return {"data": Shard(with_gradients(layer.apply),
+                          lambda seed: drawing(params(), (*ROWS, FEATURES), dtype)(seed),
                           lambda mesh: [PartitionSpec(), PartitionSpec("data"), PartitionSpec("data")], truth,
                           SEEDS, "data", context=lambda: layer_scope(**named))}
