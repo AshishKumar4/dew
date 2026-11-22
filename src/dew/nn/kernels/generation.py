@@ -228,6 +228,27 @@ def chosen(**kernels: str) -> Iterator[None]:
         yield
 
 
+@contextlib.contextmanager
+def drawing() -> Iterator[None]:
+    """Within the block, a model's draw of its variables (`dew.objectives.base.Objective.init`): its forward
+    runs for the variables its modules make, and none of its values reaches the variables drawn, so every
+    selector takes its op's generic program and reports no route (`selection.select`): no launch is derived,
+    traced or certified at the draw's shapes, a dummy batch no step runs (row 11803: an every-template
+    decoder's ahead compile certified its one-row draw's kernels, 29% of its main thread). JAX keys its
+    trace and compile caches on it (`dew._cache.DRAWING`)."""
+    from dew import _cache
+
+    with _cache.DRAWING(_cache.DRAWING.value + 1):
+        yield
+
+
+def draws() -> bool:
+    """Whether this thread traces a model's draw of its variables (`drawing`)."""
+    from dew import _cache
+
+    return _cache.DRAWING.value > 0
+
+
 def numerics() -> Numerics:
     """The run's numerics in effect (`run_precision`), the defaults outside any: JAX keys its trace and
     compile caches on them (`dew._cache.NUMERICS`), so a function jitted under one run's traces again
