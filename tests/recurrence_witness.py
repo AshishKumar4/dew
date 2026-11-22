@@ -1338,7 +1338,7 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         native, launches = launched(jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal))), operands,
-                                    f"training backward of seed {seed}, delta {delta}")
+                                    f"training backward of seed {seed}, delta {delta}, rounded {rounded}")
         [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
                             zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
         unit_keys = bound.arguments.get("unit_keys", False)
@@ -1356,8 +1356,8 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
-        grads, saved, extra = launched(jax.jit(kept), operands,
-                                       f"kept backward of seed {seed}{named}, delta {delta}", records=False)
+        label = f"kept backward of seed {seed}{named}, delta {delta}, rounded {rounded}"
+        grads, saved, extra = launched(jax.jit(kept), operands, label, records=False)
     for mine, theirs in zip(grads[:6], native, strict=True):
         assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
             "the certify build is the production program"
