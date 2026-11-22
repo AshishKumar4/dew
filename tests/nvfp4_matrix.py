@@ -16,6 +16,8 @@ What the route serves is read from the product's own selector: the product trace
 case's generation with the packed kernel named, the route its choice reports the packed kernel.
 """
 
+import functools
+
 import generation_support
 import jax
 import jax.numpy as jnp
@@ -135,19 +137,23 @@ def per_shard(choice: str, kernel: str) -> dict:
     del choice, kernel
     layer = GptOssExperts(SHARD_HIDDEN, SHARD_INTERMEDIATE, SHARD_EXPERTS, dtype=jnp.bfloat16)
     indices = jnp.broadcast_to(jnp.arange(SHARD_EXPERTS, dtype=jnp.int32), (*SHARD_ROWS, SHARD_EXPERTS))
-    # Formed on the host's CPU and held as NumPy's (`_matrix`'s), the banks packed there.
-    held = drawn_on_the_host(lambda seed: packed_variables(layer.init(
-        jax.random.key(seed), jnp.zeros((*SHARD_ROWS, SHARD_HIDDEN), jnp.bfloat16),
-        jnp.ones((*SHARD_ROWS, SHARD_EXPERTS), jnp.bfloat16), indices)), 5, held=True)
-    banks = held[QUANTIZATION]
+
+    @functools.cache
+    def held():
+        # Formed on the host's CPU and held as NumPy's (`_matrix`'s), the banks packed there, by the cell's
+        # first draw: stated, every per-shard task's collection packed them (rows 11692, 11695).
+        return drawn_on_the_host(lambda seed: packed_variables(layer.init(
+            jax.random.key(seed), jnp.zeros((*SHARD_ROWS, SHARD_HIDDEN), jnp.bfloat16),
+            jnp.ones((*SHARD_ROWS, SHARD_EXPERTS), jnp.bfloat16), indices)), 5, held=True)
 
     def call(params, tokens, weights):
-        return layer.apply({"params": params, QUANTIZATION: banks}, tokens, weights, indices)
+        return layer.apply({"params": params, QUANTIZATION: held()[QUANTIZATION]}, tokens, weights, indices)
 
     def exact(params, tokens, weights):
         # Each bank's exact matrix in float64, its tensor scale widened first (`exact_banks`).
         wide = jax.tree.map(
-            lambda bank: formats.NvFp4(bank.words, bank.scales, jnp.asarray(bank.scale, jnp.float64)), banks,
+            lambda bank: formats.NvFp4(bank.words, bank.scales, jnp.asarray(bank.scale, jnp.float64)),
+            held()[QUANTIZATION],
             is_leaf=lambda leaf: isinstance(leaf, formats.NvFp4))
         matrices = exact_banks({QUANTIZATION: wide})[QUANTIZATION]
         return layer.clone(dtype=jnp.float64).apply({"params": params, QUANTIZATION: matrices}, tokens,
@@ -162,7 +168,7 @@ def per_shard(choice: str, kernel: str) -> dict:
         tokens, weights, cotangent = (jax.random.normal(key, (*SHARD_ROWS, width)).astype(jnp.bfloat16)
                                       for key, width in zip(keys, (SHARD_HIDDEN, SHARD_EXPERTS, SHARD_HIDDEN),
                                                             strict=True))
-        return held["params"], tokens, weights, cotangent
+        return held()["params"], tokens, weights, cotangent
 
     rows = PartitionSpec("data")
     return {"data": Shard(with_gradients(call), draw, lambda mesh: [PartitionSpec(), rows, rows, rows], truth,

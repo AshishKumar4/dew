@@ -295,7 +295,12 @@ the same rounded projections, so their upstream rounding is shared)."""
 def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype):
     """The layer on the port, packed documents and all, hands the scan its compute dtype: over drawn
     inputs and cotangents, its output and every parameter's and input's gradient on par with the XLA
-    scan's, both from the layer's float64 run (check 1)."""
+    scan's, both from the layer's float64 run (check 1). An fp32 layer's interpreted alone: natively the port
+    takes mamba_ssm's own fp32 products, one TF32 (`fla_gdn._dot`), where the XLA scan's are IEEE's, 1929
+    times its distance from float64 on an A100 at main and at every head since (row 11771, M-JS-200), a bar
+    the port does not claim; the GPU tier holds it to mamba_ssm's own instead ([SSD port])."""
+    if dtype == jnp.float32 and not INTERPRETED:
+        pytest.skip("an fp32 layer's port and XLA scan share IEEE products interpreted alone")
     layer = Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, n_groups=2, chunk_size=32,
                    dtype=dtype)
     params = layer.init(jax.random.key(5), jnp.zeros((2, 72, 64), dtype))
