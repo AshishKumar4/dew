@@ -196,7 +196,10 @@ def _move(name: str, func, args, kwargs, computed, unit: float):
             return 2 * unit * computed.abs()
         if exponent in POWER_ATEN:
             return POWER_ATEN[exponent] * unit * computed.abs()
-        power = args[0].pow(_narrowed(exponent, unit))
+        narrowed = _narrowed(exponent, unit)
+        if narrowed == exponent:
+            return 2 * unit * computed.abs()
+        power = args[0].pow(narrowed)
         return 2 * unit * power.abs() + (power - computed).abs()
     return unit * _weight(name, func, args, kwargs, computed)
 

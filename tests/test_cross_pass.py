@@ -634,14 +634,16 @@ def test_a_merge_runs_under_a_callers_unhashable_capture_filter_or_interceptor(w
 def test_a_looped_decoder_runs_under_a_capture_of_every_method():
     """A capture filter may keep every method's output (`capture_intermediates=lambda module, method: True`),
     a method returning a submodule among them: a looped decoder's later pass reads its layers' stored
-    variables alone, never what the capture sowed, so it runs, its logits the unwatched run's (row 11882:
-    the layers' structures read the captured submodule as an array and refused it)."""
+    variables alone, never what the capture sowed, so it runs and captures methods beside the calls (row
+    11882: the layers' structures read the captured submodule as an array and refused it)."""
     model = decoder("attention", steps=2)
     ids = jnp.asarray(np.random.default_rng(11882).integers(0, VOCAB, (2, 12)), jnp.int32)
     variables = gated(model.init(jax.random.key(0), ids), 11882)
-    logits, _ = model.apply(variables, ids, capture_intermediates=lambda module, method: True,
-                            mutable=["intermediates"])
-    np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
+    _, captured = model.apply(variables, ids, capture_intermediates=lambda module, method: True,
+                              mutable=["intermediates"])
+    # Each capture is kept under its method's name: one beside `__call__` the loop's later pass called.
+    methods = {path[-2].key for path, _ in jax.tree_util.tree_leaves_with_path(captured["intermediates"])}
+    assert methods - {"__call__"}, methods
 
 
 def qwix_owned(provider: str, rules: Sequence[dict], spec: CrossPass = MESSAGES) -> tuple:

@@ -213,7 +213,8 @@ def test_an_algorithm_at_least_ieee_fp32_holds_fp32s_range():
     them, BF16x6 and x9 (row 11878): a split's high part is an operand rounded to bfloat16, whose largest is
     beneath float32's, so an fp32 operand near float32's largest splits to an infinity where IEEE fp32's
     product is finite; IEEE fp32 itself is admitted, and a gate at least BF16x3 admits the wider splits, its
-    own parts of bfloat16's range. TF32x3, of float32's range, is refused by its digits, two parts of 11."""
+    own parts of bfloat16's range. TF32x3 is refused on both counts: its digits, two parts of 11, and its
+    range, TF32's largest `(2 - 2^-10) 2^127` beneath float32's for all their exponents' width."""
     presets = jax.lax.DotAlgorithmPreset
     ieee = at_least(presets.F32_F32_F32, jnp.float32)
     assert ieee(presets.F32_F32_F32)

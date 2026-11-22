@@ -792,7 +792,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   the asked algorithm's hold of the operands (`DotArithmetic.largest`, each side's largest finite value, row
   11878): a split whose part's format tops out beneath the operand's rounds an operand near its largest to an
   infinity. So a gate at least IEEE fp32's refuses BF16x6 and x9, whose digits match, by their bfloat16
-  parts' range, and TF32x3 by its digits (two parts of 11). It serves the sites whose kernel lowers the algorithm itself: the Triton ports, each at
+  parts' range, and TF32x3 on both counts: its digits (two parts of 11) and its range, TF32's largest
+  `(2 - 2^-10) 2^127` beneath float32's `(2 - 2^-23) 2^127` for all their exponents' width. It serves the sites whose kernel lowers the algorithm itself: the Triton ports, each at
   least fla's own (`fla_gdn._precision` over `TRITON_ALGORITHMS`), and the TPU SSD's Mosaic kernel
   (`ssd._exact`, its precisions named back). A product XLA compiles states a `Precision` instead
   (`recurrence_algebra.STATE_PRECISION`'s HIGHEST): XLA routes a dot to an emitter by its shape, and its
