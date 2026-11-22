@@ -35,6 +35,11 @@ class Delta(Files):
         """The file as the table's log names it, where Delta's dataset reads it."""
         return path
 
+    def _read_files(self) -> tuple[str, ...]:
+        """The files of the table's version as its log names them, its dataset's fragments' paths: Delta's
+        dataset is read off its log, no file's footer opened, and names them as a resume's shards did."""
+        return tuple(fragment.path for fragment in self.arrow.get_fragments())
+
     @cached_property
     def paths(self) -> tuple[str, ...]:
         return tuple(self.table.file_uris())

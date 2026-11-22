@@ -14,6 +14,7 @@ from generation_support import lowers
 
 from dew import algebra
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import report
 from dew.nn.precision import Numerics
 
 
@@ -543,10 +544,14 @@ def named_rows(x, w):
 def test_a_name_on_a_products_rows_stays_outside_its_prologue():
     """A remat name on the value a product's prologue reads (`named_rows`) bounds the prologue, which still
     fuses the exp2 after it on an H100 whose template a call names: a producer's stage runs no name (a name
-    pulled into it was refused there, and the exp2's operand formed whole)."""
+    pulled into it was refused there, and the exp2's operand formed whole). Its launch is certified as an
+    H100's start certifies it, against a compile-only one, and a config is taken. (An accurate sine, whose
+    form no count prices, is no free fused work, `test_a_consumer_its_launch_prices_no_work_of_is_never_
+    fused_for_free`; a frame its range reduction keeps refuses no config, test_kernel_spills, row 9649.)"""
     shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    [device] = generation.compile_only_gpus("sm90")
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), \
-            generation.routes() as found:
+            report.certifying(device), generation.routes() as found:
         traced = jax.jit(algebra.rewritten(named_rows, kernels=True)).trace(*shapes)
     assert any(route.choice == "gemm_prologue" and route.kernel == "fused" for route in found), [
         (route.choice, route.kernel) for route in found]

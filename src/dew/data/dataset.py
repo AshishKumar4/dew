@@ -2064,9 +2064,9 @@ class StepPhases(Forwarding):
         """Whether the phases before `phase` read what the `saved` identities say, their steps described as
         the plan `version` its phase's reader recorded described them (`dew.data.plan.described_under`),
         this Dew's where it recorded none."""
-        from dew.data.plan import DECIDED, described_under
+        from dew.data.plan import PLAN_VERSIONS, described_under
 
-        with described_under(DECIDED if version is None else version):
+        with described_under(PLAN_VERSIONS[-1] if version is None else version):
             return list(saved[:phase]) == [self._identity(index) for index in range(phase)]
 
     def _identity(self, phase: int) -> str:
