@@ -107,20 +107,16 @@ def value_unit(family: mosaic.Family) -> int:
 def values_unit(family: mosaic.Family, *, kept: bool, per_key: bool) -> int:
     """The step a call's values are padded in on `family`'s bundle: whole value tiles (`value_unit`), which
     the fast backward's launches step through (`Call.value_block`), but whole tiles (`block_of`) where its
-    fast backward reads what the forward keeps (`kept`) and either the decay is a key dimension's or the
-    family's products read their operands from registers: a decay a key dimension's key memory backward walks
-    key blocks down to 8 rows, whose memories' cp.async copies tile only at whole 128-byte rows, an A100's at
-    a 16-wide value tile refused ('Number of tiles is not a multiple of 4', jsf-narrow80; a per-head launch's
-    memories take a tile's 64 rows); and mma.sync's query-key backward at a 16-wide value tile spilled a
-    160-byte frame at 255 registers on an A100, Nemotron-H 4B's training refused there (M-JS-58). Where the
-    products read registers, half a tile: its query-key backward holding its sums in shared memory
-    (`mainloop_backward._query_key_holds`), Nemotron-H 4B's 80-wide values train at 96 on an A100, where 128
-    took every training launch past it (4625.9 against 5879.0 us a training step, M-JS-187)."""
-    if kept and per_key:
-        return block_of(family)
-    if kept and family.operands_in_registers:
-        return max(value_unit(family), block_of(family) // 2)
-    return value_unit(family)
+    fast backward reads what the forward keeps (`kept`) under a decay a key dimension: its key memory
+    backward walks key blocks down to 8 rows, whose memories' cp.async copies tile only at whole 128-byte
+    rows, an A100's at a 16-wide value tile refused ('Number of tiles is not a multiple of 4', jsf-narrow80;
+    a per-head launch's memories take a tile's 64 rows). Under a decay a head a call's values are its own,
+    unpadded where its width is whole value tiles: mma.sync's query-key backward at a 16-wide value tile
+    spilled at 255 registers on an A100 until its held sums were priced (`mainloop_backward._query_key_held`,
+    M-JS-58, M-JS-191); unpadded, Nemotron-H 4B's 80-wide values trained in 3787.0 us a step on an A100
+    where at 96 they took 4615.0 and at 128 5879.0, the walk gating its values itself and no padding or
+    slicing beside the launches (M-JS-190, M-JS-187)."""
+    return block_of(family) if kept and per_key else value_unit(family)
 
 
 def padded_widths(family: mosaic.Family, key_width: int, value_width: int, *, kept: bool, per_key: bool,
