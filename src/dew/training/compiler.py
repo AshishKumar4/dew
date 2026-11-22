@@ -251,11 +251,12 @@ class Building:
 
     def _judged(self, planned: Planned, held: int, built: int) -> tuple[bool, int | None]:
         """`step_fits` of `planned`'s step and, where it samples, its sampled step, `held` bytes beside it,
-        `built` of them among its arguments."""
+        `built` of them among its arguments; its headroom the sampled step's where it samples, which stands
+        for the step as its search's probe read it (`Planned.judged`; row 11832)."""
         mesh = self.stepping.settings.device_mesh
         fit, headroom = step_fits(planned.executable, mesh, held, built)
         if fit and planned.sampled is not None:
-            fit = step_fits(planned.sampled.executable, mesh, held, built)[0]
+            fit, headroom = step_fits(planned.sampled.executable, mesh, held, built)
         return fit, headroom
 
 
@@ -1003,7 +1004,7 @@ class StepCompiler[L, E]:
             # judgements in one record); and the placed judgement whole (`placed`): that headroom with its
             # copies built, and the bytes it held beside the step that the allocators did not.
             held_out = judging.charged[0]
-            stats = compiled_memory(planned.executable)
+            stats = compiled_memory(planned.judged)
             beside = None if stats is None else placed_beside(stats, held_out)
             probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside},
                       *probes[own + 1:]]
