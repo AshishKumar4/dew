@@ -976,7 +976,7 @@ def test_two_kernels_of_one_launch_are_two_names_each_certified_on_its_own():
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
         with report.certifying(compile_only_gpus("sm90")[0]):
             program = lowered()
-        names = [report.launch_name(call.name, call.launch) for call in kernel_calls(program, unrun=True)
+        names = [assembled.launch_name(call.name, call.launch) for call in kernel_calls(program, unrun=True)
                  if call.kind == "mosaic_gpu"]
         alone = report.compiled_alone(program, None, lambda call: True)
     # Certification lowers the launch in a program of its own, whose launch it names by its own placement.

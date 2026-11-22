@@ -35,7 +35,15 @@ from dew import _cache, communicators
 from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.assembled import MOSAIC_TARGET, SERIALIZED, Binary, binaries, carried, kernel_of
+from dew.nn.kernels.templates.assembled import (
+    MOSAIC_TARGET,
+    SERIALIZED,
+    Binary,
+    binaries,
+    carried,
+    kernel_of,
+    launch_name,
+)
 
 if TYPE_CHECKING:
     from dew.nn.kernels.lowered import KernelCall
@@ -367,14 +375,6 @@ def launch_metadata() -> bytes:
     none where no launch traces."""
     digest = launch_digest()
     return b"" if digest is None else digest.encode()
-
-
-def launch_name(kernel: str, launch: str | None, index: str | None = None) -> str:
-    """`kernel`'s name carrying the digest `launch` (`assembled.LAUNCH_SUFFIX`) and optional XLA
-    uniquification `index`, as is where None: the lossless key a kernel's evidence goes by beside its
-    launch."""
-    named = kernel if launch is None else f"{kernel}__l{launch}"
-    return named if index is None else f"{named}__{index}"
 
 
 class KernelsOfOneName(ValueError):
