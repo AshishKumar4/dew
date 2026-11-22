@@ -1109,11 +1109,11 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     # scores products are a segment of their own, which a persistent tile walks none of): a program a tile
     # paid each tile's setup, its chunk's table entries' dependent loads and its ring's and done barriers,
     # most of a modelled B200's CTA (44.3k cycles for three tiles against a persistent one's 11.6k a tile).
+    # One or two deep as its plan hides most latency: 30B's A100 walk 560 us one deep, 516 two (M-JS-204).
     dq, dk, *weights, after, leaving, memory = launch_kernel(
-        program, call, out_type=out_type,
+        program, call, out_type=out_type, stages=(1, 2), live=chunk_liveness(10),
         grid=(splits, width // call.block, call.chunks, call.heads // group),
-        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None, stages=1,
-        live=chunk_liveness(10),
+        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None,
         steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq, holds=holds),
         landing=_query_key_landing(call, splits), staging=_query_key_staging(call) if holds else (),
         persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
