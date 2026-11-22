@@ -42,6 +42,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
 from dew import _cache, communicators
+from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
 
@@ -135,6 +136,8 @@ class Launch:
     reverse: bool = dataclasses.field(default=False, compare=False)
     """Whether it traced as reverse mode runs it (`pulled`), the form its certification compiles
     (`certified`): a kernel's own entry (`named`) its trace's, the launch's its first trace's."""
+    provenance: frozenset[str] | None = dataclasses.field(default=None, compare=False)
+    """The modules of Dew's whose code its records key on (`_provenance`), None for the whole package's."""
 
 
 @dataclasses.dataclass
@@ -148,6 +151,7 @@ class _Pending:
     emitted: Callable[[Hashable, str], Hashable]
     digest: str | None = None
     reverse: bool = False
+    provenance: Callable[[], frozenset[str] | None] = lambda: None
 
 
 _TRACING: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("tracing_launch", default=None)
@@ -343,7 +347,8 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
     the same in every process, and their binaries name the launch (`Binary.launched`, `traced`)."""
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
                                   lambda: op.padded(arguments, config), op.emitted,
-                                  reverse=_PULLED.get() and op.CARRIES_DERIVATIVE))
+                                  reverse=_PULLED.get() and op.CARRIES_DERIVATIVE,
+                                  provenance=lambda: op_provenance(op, arguments.arguments)))
     try:
         yield
     finally:
@@ -363,7 +368,7 @@ def relaunched(digest: str | None) -> Iterator[None]:
         return
     assert launch.emitted is not None
     token = _TRACING.set(_Pending(lambda: launch.identity, launch.op, launch.config, lambda: launch.padded,
-                                  launch.emitted, digest, launch.reverse))
+                                  launch.emitted, digest, launch.reverse, lambda: launch.provenance))
     try:
         yield
     finally:
@@ -484,7 +489,8 @@ def launch_digest() -> str | None:
         digest = _launched(identity, pending.config, pending.reverse)
         with _GUARD:
             _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config, pending.padded(),
-                                                emitted=pending.emitted, reverse=pending.reverse))
+                                                emitted=pending.emitted, reverse=pending.reverse,
+                                                provenance=pending.provenance()))
         pending.digest = digest
     return pending.digest
 
@@ -771,7 +777,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
             return _CERTIFIED[key].refused
         if key in _UNCERTIFIED:
             return None
-    stored = _verdict_key(_identity(op, arguments), config, reverse)
+    provenance = op_provenance(op, arguments.arguments)
+    stored = _verdict_key(_identity(op, arguments), config, reverse, provenance)
     verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (), device, read=True).refused
@@ -856,26 +863,26 @@ def _lowered_verdict_key(calls) -> str | None:
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 
-def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
+def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None
+                 ) -> str | None:
     """What decides a launch's certification for a compile target (the store's file, `verdict_target`,
     `tuning.stored_verdict`) before it traces, as its stored verdict's key: the launch's `identity`
-    (`_identity`, the same in every process), its config, whether reverse mode runs it, Dew's code
-    (`package_digest`: a Dew edit certifies again), the installed JAX, jaxlib and CUDA plugins, whose Mosaic
-    GPU and XLA lower and compile it (the Pallas lowering cache's seal of them), the ptxas that assembles it
-    (`_assemblers`), and the environment a kernel's lowering and compile read (that cache's policy). None
-    where the installation has no seal (an edited or a source install of JAX), whose code no key states: its
-    verdicts are not stored."""
+    (`_identity`, the same in every process), its config, whether reverse mode runs it, its code
+    (`dew._code.provenance_code`: an edit of it certifies again), the installed JAX, jaxlib and CUDA
+    plugins, whose Mosaic GPU and XLA lower and compile it (the Pallas lowering cache's seal of them), the
+    ptxas that assembles it (`_assemblers`), and the environment a kernel's lowering and compile read (that
+    cache's policy). None where the installation has no seal (an edited or a source install of JAX), whose
+    code no key states: its verdicts are not stored."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
-    from dew._cache import package_digest
     from dew.nn.kernels.tuning import encoded
 
     installed = seal().digest
     if installed is None:
         return None
-    stated = [package_digest(), installed.hex(), _assemblers(), identity, encoded(config), reverse,
-              _keyed_environment()]
+    stated = [provenance_code(__name__, provenance), installed.hex(), _assemblers(), identity,
+              encoded(config), reverse, _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 
@@ -1894,15 +1901,16 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
     if device is None:
         return
     modules = kernel_modules(kernel_calls(program, unrun=True))
-    verdicts: dict[tuple[str, Hashable, bool], dict[str, tuple[str, Binary]]] = {}
+    verdicts: dict[tuple[str, Hashable, bool, frozenset[str] | None], dict[str, tuple[str, Binary]]] = {}
     for refusal, binary, launch in found:
         if refusal is None or launch is None:
             continue
         identity, config = refusal
         name = launch_name(binary.kernel, binary.launch)
-        verdicts.setdefault((identity, config, launch.reverse), {})[name] = (modules.get(name, ""), binary)
-    for (identity, config, reverse), kernels in verdicts.items():
-        if (key := _verdict_key(identity, config, reverse)) is not None:
+        verdicts.setdefault((identity, config, launch.reverse, launch.provenance), {})[name] = (
+            modules.get(name, ""), binary)
+    for (identity, config, reverse, provenance), kernels in verdicts.items():
+        if (key := _verdict_key(identity, config, reverse, provenance)) is not None:
             tuning.store_verdict(verdict_target(device), key, kernels)
 
 

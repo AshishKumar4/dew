@@ -354,3 +354,12 @@ def test_a_record_of_a_field_of_a_subscripted_generic_builds_its_class():
     class reads a generic's origin (`nominal_class`), the record's reader as the built value's (row 8387)."""
     built = from_record(_HoldsBoxed, {"boxed": {"size": 3}})
     assert built.boxed == _Boxed(size=3)
+
+
+def test_a_field_of_a_subscripted_generic_records_its_value_as_a_field_of_its_class_does():
+    """A field annotated with a subscripted generic of a dataclass writes a value of that class as its plain
+    fields, as one annotated with the bare class does, not a class record naming an import path: the
+    writer reads a generic's origin as the reader does (`nominal_class`, row 8403)."""
+    from dew.registry import to_record
+
+    assert to_record(_Boxed(size=3), _Boxed[int]) == to_record(_Boxed(size=3), _Boxed) == {"size": 3}

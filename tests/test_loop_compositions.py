@@ -117,3 +117,36 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
     assert np.isfinite(stepped(trainer_of(1)))
     # A law of one count compiles its cap's step alone, whose parts read the statistics of their own model.
     assert np.isfinite(stepped(trainer_of(2, dataclasses.replace(TRAINED, cap=1))))
+
+
+def test_a_drawn_count_whose_metric_is_another_kind_of_mean_over_the_same_leaves_is_refused():
+    """A count whose step returns the same pooled metric over the same leaves as its cap's, as another kind
+    of mean (an `Exponentiated` where the cap's is a `Ratio`), read in two parts a step, would pool with the
+    cap's as the cap's: its admission is refused, where the same metric as one kind at every count steps
+    (row 10815)."""
+    import optax
+    from test_pass_weights import looped
+
+    from dew.objectives.base import Exponentiated, Ratio
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+
+    def objective(kind_at):
+        class Kinded(LMObjective):
+            def loss(self, variables, batch, step):
+                stats, aux = super().loss(variables, batch, step)
+                kind = kind_at(self.model.loop.steps)
+                pooled = {**aux.pooled, "spread": kind(jnp.zeros(()), jnp.ones(()))}
+                return stats, dataclasses.replace(aux, pooled=pooled)
+        return Kinded(looped(steps=CAP), 16)
+
+    def compiled(kind_at):
+        trainer = Trainer(objective(kind_at), optax.sgd(0.1), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED, split=2,
+                          accumulation=2)
+        state, _, _ = trainer.place()
+        return trainer.compile(state, token_batch())
+
+    with pytest.raises(ValueError):
+        compiled(lambda steps: Ratio if steps == CAP else Exponentiated)
+    assert isinstance(compiled(lambda steps: Ratio), DrawingStep)

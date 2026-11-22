@@ -62,6 +62,7 @@ from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation
+from dew.nn.kernels.selection import KernelRefused
 from dew.nn.linear import GatedDeltaNet, decode_gated_delta_rule
 from dew.training import MeshSpec
 
@@ -124,14 +125,28 @@ def trains_on_its_port(make):
                     f"{type(layer).__name__} trained on its port", seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
+TEMPLATE_REFUSES = {("gated_delta_net", "sm80"): 6860}
+"""A layer's training step the recurrence template refuses on a GPU generation, by the open row tracking it:
+the gated delta net at these widths on an A100, its scores' backward spilling at every tiles (row 6860). A
+step named onto the template there is refused (`KernelRefused`), which the cell holds; one the template takes
+fails it until struck, so a declaration retires with its row."""
+
+
 def repeats_bit_for_bit(make, kernel: str):
     """A layer's training step on `kernel`, the same program on the same inputs, run twice, compiled afresh
-    the second time: every gradient the same bit for bit (the kernels sum in a fixed order)."""
+    the second time: every gradient the same bit for bit (the kernels sum in a fixed order). On the
+    template where it refuses the step (`TEMPLATE_REFUSES`), refused: named onto it there, the step raised
+    KernelRefused in its first run (row 8356)."""
     layer = make()
     x = jax.random.normal(jax.random.key(5), (ROWS, TOKENS, WIDTH)).astype(jnp.bfloat16)
     params = named(layer.init, gated_delta_rule="xla")(jax.random.key(6), x)
     step = jax.jit(named(jax.grad(lambda params, x: jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2),
                                   argnums=(0, 1)), gated_delta_rule=kernel))
+    if kernel == "mosaic_gpu" and (make.__name__, generation.gpu_target().generation) in TEMPLATE_REFUSES:
+        # Taken here once the template holds it: the declaration struck then.
+        with pytest.raises(KernelRefused):
+            step(params, x)
+        return
     gpu_flow.repeats_bit_for_bit(step, params, x)
 
 

@@ -51,7 +51,7 @@ import numpy as np
 from flax import traverse_util as flax_traverse
 
 from dew import _records
-from dew._cache import package_digest
+from dew._code import whole_digest
 from dew._isolated import Isolated, prepared_script
 from dew.interop import codecs, decoder_config, decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
@@ -1106,9 +1106,9 @@ _VERIFIED = 'verified'
 
 def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
     """What a verification holds for: the config, the transformers and torch releases, Dew's own
-    implementation (`package_digest`, so any change of a reader, the shrink or a model verifies again)
-    and the repository, commit and folder the remote code was fetched at (`ModelSource.pinned`), as one
-    digest."""
+    implementation (`dew._code.whole_digest`, so any change of a reader, the shrink or a model verifies
+    again) and the repository, commit and folder the remote code was fetched at (`ModelSource.pinned`), as
+    one digest."""
     import importlib.metadata
 
     from transformers import __version__
@@ -1116,7 +1116,7 @@ def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
     remote = None if source.pinned is None else asdict(source.pinned)
     return hashlib.sha256(json.dumps({'config': hf_config, 'transformers': __version__, 'remote': remote,
                                       'torch': importlib.metadata.version('torch'),
-                                      'dew': package_digest()},
+                                      'dew': whole_digest()},
                                      sort_keys=True, default=str).encode()).hexdigest()
 
 

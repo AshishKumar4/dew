@@ -229,6 +229,36 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     assert plain.fused_seconds is None and plain.unfused_seconds is None
 
 
+def _chained(function, wide):
+    """`function` applied eight times over `wide`, in float32."""
+    for _ in range(8):
+        wide = function(wide)
+    return wide
+
+
+@pytest.mark.parametrize("stage", ["epilogue", "prologue"])
+def test_a_fused_launchs_special_functions_are_priced_in_the_forms_it_compiles(stage):
+    """A bf16 product of 8192 x 256 x 4096 with eight chained float32 logs after it (its epilogue's), or of
+    8192 x 4096 x 256 with them before it on its rows (its prologue's), launched by the Mosaic template on a
+    compile-only H100: fused, the logs cost its launch more than as many exp2s, as it compiles them without
+    `approx_math` (`emission.ACCURATE_FORMS`: a log a polynomial of FP32 instructions, an exp2 one MUFU),
+    where each was priced one MUFU an element and the two alike (row 10824). Shapes only."""
+    def region(function, x, w):
+        if stage == "prologue":
+            x = _chained(function, x.astype(jnp.float32)).astype(jnp.bfloat16)
+        product = fused_gemm.product(x, w, out_dtype=jnp.bfloat16)
+        return product if stage == "prologue" else _chained(function, product.astype(jnp.float32))
+
+    depth, width = (4096, 256) if stage == "prologue" else (256, 4096)
+    x = jax.ShapeDtypeStruct((8192, depth), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((depth, width), jnp.bfloat16)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        logs, exp2s = (fused_gemm.analysis(functools.partial(region, function), x, w)
+                       for function in (jnp.log, jnp.exp2))
+    assert exp2s.fused_seconds is not None, exp2s
+    assert logs.fused_seconds > exp2s.fused_seconds, (logs, exp2s)
+
+
 @pytest.mark.parametrize("operation", [jax.lax.erf, jnp.expm1, jnp.isfinite], ids=lambda f: f.__name__)
 def test_a_projection_followed_by_an_elementwise_function_traces_through_dew_jit(operation):
     """A bf16 projection followed by an erf, an expm1 or a finiteness test, traced through `dew.jit` for an

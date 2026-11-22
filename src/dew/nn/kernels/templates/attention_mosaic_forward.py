@@ -323,12 +323,10 @@ def relays(family: mosaic.Family, tiles: Tiles, *, peaks: bool = False) -> bool:
     return not peaks and family.relay_bytes(tiles.block_q, tiles.block_k) > 0
 
 
-def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                   masked: bool = False, **walk):
-    """`MosaicForward`'s launch without residuals (`_inference_walk`), its launches walked by the fold's guard
-    (`algebra.walked_launches`): a `masked` walk's rewalk in place (its launch's programs that walk
-    nothing write nothing, so it declares no output of its own), which takes no output hook, whose rows XLA
-    forms past the launch from its whole output."""
+def _plain_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                masked: bool = False, **walk):
+    """Return `(spec, launch, finished, in_place)` for an inference forward walk (`_inference_walk`), the one
+    owner of the `in_place` rewalk rule shared by `_fwd` and `_main_launch` (row 10677)."""
     if masked and hooks.output_mod is not None:
         raise ValueError("a masked walk rewalks in place, which an output hook formed past its launch does "
                          "not take")
@@ -340,7 +338,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         masked or (hooks.output_mod is None and _copy_costs_more(query, value)))
     spec, launch, finished = _inference_walk(query, key, value, spans, hooks, masked=masked, flagged=in_place,
                                              **walk)
-    return finished(algebra.walked_launches(spec, launch, in_place=in_place))
+    return spec, launch, finished, in_place
 
 
 def _copy_costs_more(query: jax.Array, value: jax.Array) -> bool:
@@ -720,19 +718,6 @@ def _training_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                 anchors[:, :, :queries], split)
 
     return spec, launch, finished
-
-
-def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                     scale: float, natural: bool, tiles: Tiles, interpret: bool, scaled: bool = False,
-                     counts: bool = True, registered: ForwardRegisters | None = None,
-                     tmem_columns: int | None = None
-                     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
-    """`MosaicForward`'s training launches at `tiles` (`_training_walk`), its launches walked by the fold's
-    guard (`algebra.walked_launches`): its rewalk is this kernel's natural launch."""
-    spec, launch, finished = _training_walk(query, key, value, spans, hooks, scale=scale, natural=natural,
-                                            tiles=tiles, interpret=interpret, scaled=scaled, counts=counts,
-                                            registered=registered, tmem_columns=tmem_columns)
-    return finished(algebra.walked_launches(spec, launch))
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -1596,6 +1581,26 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
+        elif (hooks.output_mod is None and keep is None and family.budgets_registers
+              and state.acc.shape[-1] > 128):
+            # Chunk wide (>128) register epilogues by `stores.staged_columns` into `stage`, then flush once
+            # through `family.stored` so `state.acc` and `output` fit without spilling (rows 5272, 10864).
+            width = state.acc.shape[-1]
+            chunk = stores.staged_columns(width, (out_view.dtype,))
+            maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
+
+            def write_chunks(smem):
+                for col in range(0, width, chunk):
+                    sl = pl.ds(col, chunk)
+                    piece = state._replace(acc=state.acc[:, col:col + chunk])
+                    out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
+                                               held=program.parts > 1)[0]
+                    if smem is None:
+                        out_view[:, sl] = out_chunk.astype(out_view.dtype)
+                    else:
+                        family.stage_output(out_chunk, smem.at[:, sl])
+            out_stage(lambda stage: write_chunks(None) if stage is None
+                      else family.stored((mosaic.StagedWriter(write_chunks),), (out_view,), smem=stage))
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,
@@ -2203,7 +2208,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
                                 in_key=value_columns is not None, splits=splits)
-    grid = (heads, queries // pair * splits, batch)
+    grid = (heads, batch, queries // pair * splits)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
                        magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None,
@@ -2217,7 +2222,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     if page is None:
         key, value = head_layout(family, key), head_layout(family, value)
     return family.kernel(entry, out_type=out_type, grid=grid,
-                         grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
+                         grid_names=("heads", "batch", "q_tiles"), consumers=consumers,
                          interpret=interpret,
                          approx_math=spec.approximate, name=name, cost=cost, model_flops=model,
                          registers=registers, shared=shared, tmem=tmem, reducing_warpgroups=reduced,

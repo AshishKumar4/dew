@@ -413,7 +413,9 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         their elements themselves."""
         return self.dtype.itemsize <= 2
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+        if pending:
+            raise ValueError(f"{type(self).__name__}.product is synchronous (pending={pending})")
         out = self.products(self.zeros(shape), lhs, rhs)
         if then is not None:
             then()
@@ -835,15 +837,26 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del wait
         for part, view in zip(parts, views, strict=True):
             if smem is None or len(smem.shape) == 1:
-                if len(view.shape) == 1 and not launches.interpreting():
+                if isinstance(part, mosaic.StagedWriter):
+                    part.write(None)
+                elif len(view.shape) == 1 and not launches.interpreting():
                     plgpu.store(view, part.astype(view.dtype), optimized=False)
                 else:
                     view[...] = part.astype(view.dtype)
                 continue
-            plgpu.store(smem, part.astype(smem.dtype), optimized=False)
+            if isinstance(part, mosaic.StagedWriter):
+                part.write(smem)
+            else:
+                self.stage_output(part, smem)
             rows = smem.shape[0]
             stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
+
+    def stage_output(self, value: jax.Array, smem) -> None:
+        if launches.interpreting():
+            smem[...] = value.astype(smem.dtype)
+        else:
+            plgpu.store(smem, value.astype(smem.dtype), optimized=False)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so

@@ -35,7 +35,7 @@ from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
 from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
-from dew.objectives.base import Objective
+from dew.objectives.base import Objective, head_fused_of, head_tile_of
 from dew.state import TrainState
 from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
 
@@ -289,21 +289,6 @@ def climb_to[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mappi
                for index, entry in enumerate(entries)]
     if any(module is not entry.module for module, entry in zip(modules, entries, strict=True)):
         objective.substitute(modules)
-
-
-def head_tile_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[int, int] | None:
-    """The tile the vocabulary head the objective trains computes its
-    backward in (`ProgramModule.head_tile`), or None for a head that keeps
-    its whole logits or an objective that trains no head: what `tile_head`
-    moves and `restore_head` sets."""
-    return next((entry.head_tile for entry in objective.program_key()
-                 if entry.trained and entry.head_tile is not None), None)
-
-
-def head_fused_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
-    """Whether the vocabulary head the objective trains takes its gradient in the forward
-    (`ProgramModule.head_fused`): what `unfuse_head` moves and `restore_head` sets."""
-    return any(entry.head_fused for entry in objective.program_key() if entry.trained)
 
 
 def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> JSON:

@@ -71,6 +71,31 @@ def test_a_square_root_counts_on_the_special_function_units_as_an_exponential_do
     assert (role.fixed.exponentials, role.fixed.operations) == (128, 0), role.fixed
 
 
+@pytest.mark.parametrize("operation", [jnp.exp, jnp.log, jnp.tanh, jax.nn.sigmoid], ids=lambda f: f.__name__)
+def test_a_kernel_counts_a_special_function_in_the_form_its_approx_math_lowers_it_to(operation):
+    """A kernel's special function counts as its compile lowers it: the hardware's approximate form where
+    the kernel asks `approx_math` (an exp one MUFU beside its scaling multiply), and the accurate form
+    elsewhere, every GEMM launch's (an exp the MUFU beside seven fp32 instructions, a saturating convert and
+    a shift; a log a polynomial with no MUFU; row 10824, FS-APPROX-FORMS3, sm90 and sm100 alike). The
+    accurate form issues more fp32 work an element than the approximate one."""
+    def work(*, approx: bool):
+        def body(row, out, staged):
+            staged[...] = operation(row[...])
+            out[...] = staged[...]
+
+        launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
+                              scratch_types=[plgpu.SMEM((128,), jnp.float32)],
+                              compiler_params=plgpu.CompilerParams(approx_math=approx))
+        traced = jax.make_jaxpr(launch)(jnp.zeros(128, jnp.float32)).jaxpr
+        (kernel,) = [equation for equation in programs.equations(traced)
+                     if equation.primitive.name in ("mpmd_map", "pallas_call")]
+        return emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
+
+    approximate, accurate = work(approx=True), work(approx=False)
+    assert accurate.operations > approximate.operations, (accurate, approximate)
+    assert approximate.unpriced_operations == accurate.unpriced_operations == 0, (accurate, approximate)
+
+
 def test_a_step_counts_each_trip_of_a_loop_inside_it():
     """A walk step holding a loop of four trips counts its body four times."""
     walk = _walked(lambda row: lax.scan(lambda row, _: (jnp.exp(row), None), row, length=4)[0])
@@ -642,3 +667,41 @@ def test_identical_scale_smem_bodies_keep_independent_emission_work():
     gc.collect()
     fixed = emission.emitted(closed, 1, "wg").roles[0].fixed
     assert fixed == work, fixed
+
+
+def test_launch_seconds_shares_sm_units_overlaps_paths_and_prices_integer_work():
+    """`cost.launch_seconds` (rows 10793, 10809, 10810):
+    1. Integer-only `Work` at `programs = multiprocessors + 1` and `resident = 1` prices launch latency
+       plus two waves of per-program integer work at one SM's integer rate.
+    2. Co-resident programs (`resident = 2`) share one SM's throughput units (`ceil(n / SMs)` times
+       per-program unit time, not divided by `resident`) while overlapping dependent paths (`ceil(n /
+       (SMs * resident))` waves of `path`)."""
+    target = generation.gpu_target("sm90")
+    sms = target.multiprocessors
+    assert sms is not None
+    launch = target.launch_seconds or 0.0
+    sm_rates = cost.rates(target, device=False)
+    assert sm_rates.integer is not None and sm_rates.tensor is not None
+
+    # 1. Integer-only work across sms + 1 programs (two waves on the busiest SM).
+    total_int = 1e11
+    programs = sms + 1
+    expected_int = 2 * ((total_int / programs) / sm_rates.integer) + launch
+    got_int = cost.launch_seconds(Work(integer_operations=total_int, kernels=1.0), programs, target,
+                                  resident=1)
+    assert got_int == expected_int, (got_int, expected_int)
+
+    # 2. Throughput-bound work: 176 programs on 132 SMs takes 2 programs on the busiest SM even at
+    #    resident=2 (co-resident programs share one SM's tensor cores, not 2x peak).
+    total_flops = 1e12
+    expected_tput = 2 * ((total_flops / 176) / sm_rates.tensor) + launch
+    got_tput_r1 = cost.launch_seconds(Work(flops=total_flops, kernels=1.0), 176, target, resident=1)
+    got_tput_r2 = cost.launch_seconds(Work(flops=total_flops, kernels=1.0), 176, target, resident=2)
+    assert got_tput_r1 == expected_tput, (got_tput_r1, expected_tput)
+    assert got_tput_r2 == expected_tput, (got_tput_r2, expected_tput)
+
+    # 3. Latency/path-bound work: resident=2 overlaps the two programs on the busiest SM into 1 wave.
+    path_work = Work(span=1e4, kernels=1.0)
+    got_path_r1 = cost.launch_seconds(path_work, 176, target, resident=1)
+    got_path_r2 = cost.launch_seconds(path_work, 176, target, resident=2)
+    assert got_path_r2 < got_path_r1, (got_path_r2, got_path_r1)

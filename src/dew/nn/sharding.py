@@ -745,6 +745,26 @@ def varying_like(x: jax.Array, *operands) -> jax.Array:
     return jax.lax.pcast(x, missing, to="varying") if missing else x
 
 
+def excess_axes(value: jax.Array, of: jax.Array) -> tuple[str, ...]:
+    """The manual axes `value` varies over that `of` does not (a checked `shard_map`'s), sorted: the axes a
+    partial computed per device from operands that vary over them sums over to be typed as `of`."""
+    return tuple(sorted(jax.typeof(value).mat.varying - jax.typeof(of).mat.varying))
+
+
+def summed_to(cotangent, operand):
+    """`cotangent` summed over each manual axis it varies over that `operand` does not (`excess_axes`),
+    typed as `operand` varies: a kernel's result varies over every axis an operand varies over
+    (`dew.nn.kernels.launches._typed`, row 9808), so its gradient of an operand every device holds the same
+    of is each device's partial, which sums to the operand's, as JAX's own transposes give a replicated
+    operand's (row 10526: a GEMM template's kernel gradient for a replicated matrix reached `ad.ct_check`
+    varying over the map's axis). `cotangent` as it is (None included) where no axis is in excess, outside a
+    checked map among them."""
+    if cotangent is None or operand is None:
+        return cotangent
+    axes = excess_axes(cotangent, operand)
+    return jax.lax.psum(cotangent, axes) if axes else cotangent
+
+
 def checked() -> bool:
     """Whether a value traced here is typed by the manual axes it varies over: inside a `shard_map` that
     checks them (`check_vma`)."""

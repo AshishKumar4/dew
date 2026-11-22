@@ -276,3 +276,25 @@ def test_a_map_task_past_a_sites_first_draw_runs_no_arm_again(monkeypatch, tmp_p
 
     first = task(0, 2)
     assert task(2, 4) < first
+
+
+def test_a_later_stage_runs_no_arm_again():
+    """A check's later stage draws past its site's first draw (`assert_moves`' second stage, as a staged
+    check's, a sizing's later blocks and a null run's later runs do), so it runs each arm once a draw: the
+    first-draw repeat, each arm held to its inputs, is the site's alone (row 10880: every driver but the
+    site's own repeated its stage's first draw's arms by a default). Each run of the original counted as it
+    executes; a change that moves nothing is drawn over both stages."""
+    from reference_error import assert_moves
+
+    from dew.parity_stages import staged_units
+
+    ran = []
+
+    def original(x, w):
+        jax.debug.callback(lambda: ran.append(None))
+        return jnp.matmul(x, w)
+
+    with pytest.raises((AssertionError, GateFailure)):
+        assert_moves(original, jnp.matmul, a_product_draw, "a change that moves nothing", seeds=16,
+                     truth_fn=jnp.matmul)
+    assert len(ran) == staged_units(16) + 1
