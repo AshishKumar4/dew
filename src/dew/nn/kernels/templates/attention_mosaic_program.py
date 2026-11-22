@@ -1863,15 +1863,16 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
     return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in chunked]
 
 
-def _epilogue_phase(family: mosaic.Family, block_q: int, value_width: int, dtype, *,
-                    residuals: bool) -> list[list]:
-    """Wide (>128) inference epilogue's live phase (`attention_mosaic_forward._stored_walk`): chunks
-    `state.acc` by `stores.staged_columns`, holding the fp32 slice, quotient, finished chunk, and narrowed
-    output beside carried `state.acc` (row 10964)."""
+def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, value_width: int, dtype, *,
+                        residuals: bool) -> int:
+    """Wide (>128) inference epilogue's live registers (`attention_mosaic_forward._stored_walk`): chunks
+    `state.acc` by `stores.staged_columns`, holding the fp32 slice/quotient/finished chunk and narrowed
+    output beside carried `state.acc` and its two finished rows `(maximum, denominator)` (row 10964)."""
     if residuals or family.operands_in_registers or scopes_products(family) or value_width <= 128:
-        return []
+        return 0
     chunk = stores.staged_columns(value_width, (dtype,))
-    return [[(block_q, chunk, jnp.float32)] * 3 + [(block_q, chunk, dtype)]]
+    phase = [(block_q, chunk, jnp.float32)] * 3 + [(block_q, chunk, dtype)]
+    return resources.live_registers(family, carried, phase) + 2 * family.row_registers(block_q, jnp.float32)
 
 
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
@@ -1957,8 +1958,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if scaled:
         step, scaled_terms = _scaled_step(family, step, logits, weights, (block_q, value_width, jnp.float32),
                                           block_k=block_k, parts=parts, dtype=dtype, residuals=residuals)
-    phases = [step + ([(block_q, value_width, jnp.float32)] if scaled_products and not scaled else []),
-              *_epilogue_phase(family, block_q, value_width, dtype, residuals=residuals)]
+    phases = [step + ([(block_q, value_width, jnp.float32)] if scaled_products and not scaled else [])]
     if family.operands_in_registers:
         # Its weights relaid as the values' product's left operand (`MmaIssuer._left`), a copy in each warp
         # along the columns (`Family.lhs_copies`), beside the step's logits, where `_products` holds a
@@ -1989,9 +1989,10 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     if codes:
         phases += _converted(block_k, value_width if width is None else width, value_width)
-    walked = (max(resources.live_registers(family, carried, *phases, *products), scored)
-              + _held_registers(family, block_q, params, residuals=residuals, natural=natural)
-              + (_started_rows(family, block_q) if started else 0))
+    walked = max(max(resources.live_registers(family, carried, *phases, *products), scored)
+                 + _held_registers(family, block_q, params, residuals=residuals, natural=natural)
+                 + (_started_rows(family, block_q) if started else 0),
+                 _epilogue_registers(family, carried, block_q, value_width, dtype, residuals=residuals))
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
 
 
