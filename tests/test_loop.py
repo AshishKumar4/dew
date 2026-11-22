@@ -769,3 +769,70 @@ def test_a_shared_cache_keeps_each_passs_coda_entries_as_the_coda_wrote_them():
     assert_as_exact(prefilled(shared, (4, 5)), prefilled(own, (8, 9)), draw,
                     "a shared cache's coda entries", seeds=EXITING_SEEDS["shared"],
                     truth_fn=prefilled(own.clone(dtype=jnp.float64), (8, 9)))
+
+
+COUNTED_SEEDS = 8
+"""Check 1's declared seeds for a count of passes given per call against a loop of that many."""
+
+COUNTED_CAP = 4
+"""The passes the program of a count given per call compiles: its loop's `steps`."""
+
+COUNTED = {
+    "whole stack, gated": {"exit_gate": True},
+    "a block before its coda, gated, its last pass trained": {"layers": (1, 3), "exit_gate": True,
+                                                              "backprop_steps": 1},
+    "a block, its last two passes trained": {"layers": (1, 3), "backprop_steps": 2},
+}
+"""The loops a count of passes runs over: every pass exiting through the final norm, a block before a coda
+each pass exits through, the cut a count's last passes leave."""
+
+
+@pytest.mark.parametrize("count", [1, 2, COUNTED_CAP])
+@pytest.mark.parametrize("name", sorted(COUNTED))
+def test_a_count_of_passes_given_per_call_runs_as_a_loop_of_that_many(name, count):
+    """A loop of `COUNTED_CAP` passes given a count per call (`loop_passes`, a traced scalar: one program
+    for every count) computes what a loop of that many passes does, its logits, every gradient and each
+    exit it sows (`exits`, the passes before the last), on par from the loop of that many in float64
+    (check 1), its passes past the count skipped and those before its cut passing no gradient back; and
+    sows whether each later pass ran (`valid`), the count less one of them."""
+    loop = Loop(COUNTED_CAP, **COUNTED[name])
+    capped = tiny(num_layers=4, loop=loop, dtype="float32")
+    fixed = capped.clone(loop=dataclasses.replace(loop, steps=count, backprop_steps=(
+        None if loop.backprop_steps is None else min(loop.backprop_steps, count))))
+
+    def result(model, **counted):
+        def run(tree, ids, cotangent):
+            pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True, **counted))
+            logits, gradients = pulled(tree, cotangent)
+            _, sown = model.apply(tree, ids, train=True, mutable=["exits"], **counted)
+            exits = sown.get("exits", {})
+            # The passes before the count's last exit; a count's later ones are skipped.
+            return {"logits": logits, "gradients": gradients,
+                    "exits": list(exits.get("states", ()))[:count - 1]}
+        return jax.jit(run)
+
+    draw = with_logit_cotangent(drawn(capped, 16, 8), VOCAB, 0x7C0)
+    assert_as_exact(result(capped, loop_passes=jnp.int32(count)), result(fixed), draw,
+                    f"{count} of {COUNTED_CAP} passes given per call over {name}", seeds=COUNTED_SEEDS,
+                    truth_fn=result(fixed.clone(dtype=jnp.float64)))
+    if capped.loop.exiting:
+        _, sown = jax.jit(lambda tree, ids: capped.apply(tree, ids, mutable=["exits"],
+                                                         loop_passes=jnp.int32(count)))(*draw(0)[:2])
+        assert [bool(each) for each in sown["exits"]["valid"]] == [step < count for step in
+                                                                   range(1, COUNTED_CAP)]
+
+
+def test_a_loop_whose_every_pass_exits_lowers_its_block_once_whatever_its_count():
+    """A loop whose every pass exits through a coda (`Loop.exiting`) runs its later passes under one scan,
+    the exit before each pass in its body: its program, at eight passes, holds as many operations as at
+    three, where each pass and its exit were traced one by one (Main's 2026-11-22 measure: a 4B
+    exit-gated loop passing messages lowered to 121k operations, 23 minutes of XLA's compile a count)."""
+    def operations(steps: int) -> int:
+        model = tiny(num_layers=4, loop=Loop(steps, layers=(1, 3), exit_gate=True), dtype="float32")
+        ids = jnp.zeros((2, 8), jnp.int32)
+        variables = model.init(jax.random.key(0), ids)
+        text = jax.jit(lambda tree: model.apply(tree, ids, train=True)).lower(variables).as_text()
+        return sum(1 for line in text.splitlines() if " = " in line)
+
+    assert operations(8) == operations(3)
+
