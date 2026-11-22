@@ -22,6 +22,8 @@ import sys
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
+from etils import epath
+
 from dew._cache import VERSION_FILE, default_compilation_cache_dir
 from dew._files import write_atomically
 from dew._imports import Walk
@@ -226,7 +228,8 @@ def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ..
     written (a read-only home) keeps none, a miss logged: the walk's closure serves the process."""
     named = hashlib.sha256(json.dumps(roots).encode()).hexdigest()[:16]
     python = "{}.{}".format(*sys.version_info[:2])
-    kept = Path(default_compilation_cache_dir()) / "dew-code" / f"{whole_digest()}-{python}-{named}.json"
+    # epath: the compilation cache may be a bucket's (gs://), the closure kept there as JAX keeps programs.
+    kept = epath.Path(default_compilation_cache_dir()) / "dew-code" / f"{whole_digest()}-{python}-{named}"
     with contextlib.suppress(OSError, ValueError):
         found = json.loads(kept.read_text())
         if isinstance(found, dict) and _sound(found, roots):

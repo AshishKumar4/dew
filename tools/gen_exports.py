@@ -5,7 +5,7 @@ editor and `from package import *` read the surface without running the lazy loo
 can drift.
 `_EXPORTS` is a literal dict of names to absolute module names.
 
-    python tools/gen_exports.py [--check] [PACKAGE]
+    python -m tools.gen_exports [--check] [PACKAGE]    # from the checkout's root
 
 ruff orders and wraps the imports and `__all__` (I001, RUF022), so the written file is the one the ruff gate
 passes."""
@@ -85,7 +85,7 @@ def main() -> None:
             if not args.check:
                 path.write_text(text)
     if args.check and stale:
-        sys.exit(f"gen_exports: run python tools/gen_exports.py to rewrite {', '.join(map(str, stale))}")
+        sys.exit(f"gen_exports: run python -m tools.gen_exports to rewrite {', '.join(map(str, stale))}")
     print(f"gen_exports: {len(packages(args.package))} packages")
 
 

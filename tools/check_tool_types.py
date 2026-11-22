@@ -14,11 +14,13 @@ pins and the code of every module it imports from the checkout, followed through
 (`closure`). A key green before is not checked again: a commit that changes no tool and nothing a tool imports
 runs no pyright here.
 
-    python tools/check_tool_types.py            # every tool, its verdict printed; exit 1 where any is red
-    python tools/check_tool_types.py --list     # each cohort set's tools, checking nothing
-    python tools/check_tool_types.py --environment dew    # one environment's tools alone
-    python tools/check_tool_types.py tools/x.py tools/y.py  # these tools alone
-    python tools/check_tool_types.py --shard 2/4    # the second of four shards (tools/check_gates' gates)
+From the checkout's root, which `tools` is a package of (its siblings imported as `tools.<name>`):
+
+    python -m tools.check_tool_types            # every tool, its verdict printed; exit 1 where any is red
+    python -m tools.check_tool_types --list     # each cohort set's tools, checking nothing
+    python -m tools.check_tool_types --environment dew    # one environment's tools alone
+    python -m tools.check_tool_types tools/x.py tools/y.py  # these tools alone
+    python -m tools.check_tool_types --shard 2/4    # the second of four shards (tools/check_gates' gates)
 
 """
 
@@ -55,7 +57,7 @@ PYTHON = "3.12"
 
 def releases() -> Mapping[str, Mapping[str, str]]:
     """tools/reference_releases.py's RELEASES."""
-    from reference_releases import RELEASES  # A neighbour: this script's own directory leads its path.
+    from tools.reference_releases import RELEASES
 
     return RELEASES
 
@@ -323,7 +325,7 @@ def records() -> types.ModuleType | None:
     """tools/armada/records.py, the CI store the verdicts are kept in, or None where this run has no token."""
     if not os.environ.get("DEW_XLA_CACHE_TOKEN") or not os.environ.get("DEW_XLA_CACHE_URL"):
         return None
-    from armada import records  # tools/armada, a namespace package beside this script.
+    from tools.armada import records
 
     return records
 
