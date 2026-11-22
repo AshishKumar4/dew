@@ -413,3 +413,26 @@ def test_a_bound_flax_modules_statement_runs_none_of_its_setup():
     with pytest.raises(Unestablished):
         stated(bound, "a bound module")
     assert made == []
+
+
+def test_a_local_functions_bound_span_called_again_in_one_state_is_traced_once(monkeypatch):
+    """A bound span of a local function (a kernel's glue: `declared_tangent` of a closure) called again in one
+    state is the program its first call traced, as a module function's is: its statement holds it (row
+    11650: local functions were traced at each call, an exception for a recursion its launch's digest made,
+    not a collision of statements)."""
+    from dew.nn.derivatives import declared_tangent
+
+    def glued(scale):
+        def applied(y):
+            return y * scale
+
+        def tangent(primals, tangents):
+            return primals[0] * scale, tangents[0] * scale
+
+        return declared_tangent(Protected(), applied, tangent)
+
+    x = jnp.ones(3)
+    traced = _span_traces(monkeypatch)
+    jax.jit(lambda x: glued(2.0)(x)).trace(x)
+    jax.jit(lambda x: glued(2.0)(x) + 0.0).trace(x)
+    assert traced.count("span") == 1
