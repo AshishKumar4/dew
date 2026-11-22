@@ -22,6 +22,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from arm_arithmetic import drawn_on_the_host, on_float64_device, widened
 from float64_terms import float64_signed_sums
 
@@ -196,6 +197,15 @@ op, took 178 to 193 s and 132 s at unit operands (row 9512): each a case an orde
 references staged (`jax.jit`)."""
 
 
+def order_set(taken: str, without: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """The orders of set `taken` (`ORDER_SETS`) a case takes, skipped where `without` leaves it none (row
+    11778: a remat set under an interpreted kernel's `without` held none, and its cells passed taking no
+    order); its id stays on every lane, so a plan's literal sites (`CHECK1_SHARDS`) name the same cells."""
+    if not set(ORDER_SETS[taken]) - set(without):
+        pytest.skip(f"the order set {taken!r} holds only orders this lane leaves out: {sorted(without)}")
+    return ORDER_SETS[taken]
+
+
 def orders(fn, primals, direction, cotangent):
     """`fn` at each order the contract holds, by name: the primal, a forward and a reverse derivative, a
     forward derivative of the gradient of the output's sum against `cotangent` and a second forward
@@ -258,7 +268,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     precision whatever its inputs' (a declared dot algorithm). `taking` names the orders a case holds, where
     it holds some alone (a seam's orders split across cases, a witness of one order), every order where
     None; `without` names orders the contract does not take yet, each joining with its row's fix (a row's
-    head brings its own test). A name of no order (`orders`) in either is refused.
+    head brings its own test). A name of no order (`orders`) in either is refused, and so is a case they leave
+    no order (`order_set`).
 
     And every order runs on training's mesh of two devices (`_on_a_mesh`), as a training step runs it (row
     7973: a launch whose specs left out two of its operands raised under any mesh, and the suite, run off
@@ -270,6 +281,9 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     if named:
         raise ValueError(f"{label}: no order of the contract's is named {sorted(named)}")
     taken = frozenset(name for name in every if (taking is None or name in taking) and name not in without)
+    if not taken:
+        # A case of no order holds nothing: one its lane leaves no order skips (`order_set`, row 11778).
+        raise ValueError(f"{label}: takes no order, {sorted(taking or ())} all left out by {sorted(without)}")
 
     def orders_of(f, *drawn):
         return {name: order for name, order in orders(f, *drawn).items() if name in taken}
