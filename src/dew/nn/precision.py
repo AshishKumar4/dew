@@ -1898,15 +1898,14 @@ def _summed(pair: tuple[jax.Array, jax.Array], axes: Sequence[int], *, plain: bo
     kept = tuple(axis - sum(one < axis for one in ones) for axis in axes if axis not in ones)
     with rounding_alone():
         (hi,) = uncontracted(hi)
-        zero = jnp.zeros((), hi.dtype)
-        if not kept:
-            # Each pair combined once with the reduction's zero, as a reduction over its one element is.
-            summed = renormalized_add((jnp.zeros_like(hi), jnp.zeros_like(lo)), (hi, lo))
-            return (summed, jnp.zeros_like(hi) + hi) if plain else summed
-        if not plain:
-            return jax.lax.reduce((hi, lo), (zero, zero), renormalized_add, kept)
-        *summed, total = jax.lax.reduce((hi, lo, hi), (zero, zero, zero), _paired_and_plain, kept)
-        return tuple(summed), total
+        limbs = (hi, lo, hi) if plain else (hi, lo)
+        combine = _paired_and_plain if plain else renormalized_add
+        if kept:
+            summed = jax.lax.reduce(limbs, (jnp.zeros((), hi.dtype),) * len(limbs), combine, kept)
+        else:
+            # Each accumulator combined once with the zero, as a reduction over its one element is.
+            summed = combine(tuple(jnp.zeros_like(limb) for limb in limbs), limbs)
+    return ((summed[0], summed[1]), summed[2]) if plain else (summed[0], summed[1])
 
 
 def _paired_and_plain(left, right):
