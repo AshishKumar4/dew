@@ -43,8 +43,8 @@ def test_a_tma_family_runs_a_partial_step_and_column_tile_where_its_rows_are_who
                              *(() if gather is None else ((), (), None, None, gather)),
                              out_dtype="float32", trans_rhs=True, interpret=False)
             target = generation.gpu_target()
-            width_ran, depth_ran = launch._aligned(ba).arguments['kernel'].shape[1:]
-            padded = launch.derived(launch._aligned(ba, whole_tiles=True), target)
+            width_ran, depth_ran = launch._aligned(ba, target).arguments['kernel'].shape[1:]
+            padded = launch.derived(launch._aligned(ba, target, whole_tiles=True), target)
             return (depth_ran, width_ran), launch.derived(ba, target), padded
 
     for depth, width in ((200, 136), (1000, 1400)):
