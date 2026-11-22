@@ -303,8 +303,11 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read)."""
     rows, queries, heads, _ = shape
     make_spans = spans if callable(spans) else (lambda: spans)
-    keys_count = keys if keys is not None else spans.keys  # type: ignore[union-attr]
-    # A hook's parameters drawn for `param_rows` batch rows where given (one every row shares).
+    if keys is not None:
+        keys_count = keys
+    else:
+        assert isinstance(spans, template.KeySpans)
+        keys_count = spans.keys
     score_mod, kinds, draw_hooks = score_hooks(score, queries, keys_count, width,
                                                rows=rows if param_rows is None else param_rows, heads=heads)
     draw_operands = _drawn(shape, dtype, width=width, keys=keys_count)
@@ -370,14 +373,17 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
     queries, keys = core_geometry(case)
     score, gate = FORWARD_HOOKS[hooks]
     rows = 1 if interpret and len(score) + gate > 1 else ROWS
+    _check_spans("causal-documents-window", functools.partial(_document_spans, case, queries, keys, rows),
+                 (rows, queries, 4, 2), interpret=interpret, score=score, gate=gate, dtype=dtype,
+                 natural=natural, keys=keys)
 
-    def make_spans():
-        called = {name: value[:rows] if hasattr(value, "shape") else value
-                  for name, value in arguments(case).items()}
-        return template.spans(queries, keys, rows, **called)
 
-    _check_spans("causal-documents-window", make_spans, (rows, queries, 4, 2), interpret=interpret,
-                 score=score, gate=gate, dtype=dtype, natural=natural, keys=keys)
+def _document_spans(case: dict, queries: int, keys: int, rows: int) -> template.KeySpans:
+    """Build `template.spans` for the first `rows` of `case` lazily inside a check-1 site."""
+    called = {name: value[:rows] if hasattr(value, "shape") else value
+              for name, value in arguments(case).items()}
+    return template.spans(queries, keys, rows, **called)
+
 
 STREAMED_HOOKS = {"key-bias": ("key",), "tile-bias": ("tile",), "query-bias": ("query",)}
 """Score hooks whose parameters ride a producer's streams (`attention_mosaic_program.riding`): a key's and a
@@ -442,15 +448,10 @@ def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int
     sites = INTERPRETED_FP16_SITES if jnp.dtype(dtype) == jnp.float16 else INTERPRETED_HOOK_SITES
     (rows, heads, kv_heads), seeds = sites[hooks] if interpret else ((ROWS, 4, 2), None)
     rows = 2 if shared else rows
-    def make_spans():
-        # The call's documents of its first `rows` rows.
-        called = {name: value[:rows] if hasattr(value, "shape") else value
-                  for name, value in arguments(case).items()}
-        return template.spans(queries, keys, rows, **called)
-
-    _check_spans("causal-documents-window", make_spans, (rows, queries, heads, kv_heads),
-                 interpret=interpret, backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds,
-                 width=width, param_rows=1 if shared else None, dtype=dtype, keys=keys)
+    _check_spans("causal-documents-window", functools.partial(_document_spans, case, queries, keys, rows),
+                 (rows, queries, heads, kv_heads), interpret=interpret, backward=True, form=form,
+                 score=SCORE_HOOKS[hooks], seeds=seeds, width=width, param_rows=1 if shared else None,
+                 dtype=dtype, keys=keys)
 
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
