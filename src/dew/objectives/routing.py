@@ -362,8 +362,9 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax
     """
     terms = []
     calls = sown_calls(routing, ROUTER_LOG_Z)
-    # A z-loss balances each router it reads (`dew.nn.moe.balancing`).
-    balancing(path for path, _ in calls)
+    # A z-loss of a weight balances each router it reads (`dew.nn.moe.balancing`); one of none, none.
+    if weight:
+        balancing(path for path, _ in calls)
     # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
     for _, (log_z,) in calls:
         valid = _router_queries(log_z.shape, queries, documents)
