@@ -37,8 +37,8 @@ import contextvars
 import dataclasses
 import enum
 import functools
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -47,6 +47,7 @@ from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
+from dew.algebra import bits
 from dew.nn.derivatives import (
     KernelGlue,
     contracted,
@@ -55,13 +56,21 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
+from dew.nn.kernels.formats import Fp8Weights, MxFp8, NvFp4, NvFp4Block, _e2m1_values
 from dew.nn.kernels.templates import axes as side_axes_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
-from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
+from dew.nn.precision import (
+    accumulated,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    rms_statistics,
+    rms_weighted,
+    twice_scaled,
+)
 from dew.nn.programs import called, read_by
 from dew.nn.sharding import automatic_axes, varying_like
 
@@ -471,7 +480,8 @@ or when chosen by name (`generation.chosen(grouped_matmul='mosaic')`), else XLA.
 def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: bool, conjugate: bool,
                    precision: PrecisionLike, out_dtype) -> jax.Array:
     """Portable XLA Gram (`x @ x^H` / `x^H @ x` / `x @ x^T` / `x^T @ x`) or symmetric polynomial
-    `c0 * I + c1 * a + c2 * (a @ a)`, bit-equal to `batched_product` when `out_dtype == operand.dtype`."""
+    `c0 * I + c1 * a + c2 * (a @ a)`. Polynomials accumulate in `at_least_fp32` and round once to
+    `out_dtype`, matching native SYRK (row 12025; bit-equal for fp32/complex64)."""
     out_dtype = jnp.dtype(out_dtype)
     last = operand.ndim - 1
     batch = tuple(range(operand.ndim - 2))
@@ -486,20 +496,21 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
         return jax.lax.dot_general(left, right, gram_dims, precision=precision,
                                    preferred_element_type=wide).astype(out_dtype)
     sq_dims = (((last,), (last - 1,)), (batch, batch))
-    if out_dtype == operand.dtype:
-        c = poly if poly.dtype == operand.dtype else poly.astype(operand.dtype)
-        sq = jax.lax.dot_general(operand, operand, sq_dims, precision=precision)
-        eye = jnp.eye(operand.shape[-1], dtype=operand.dtype)
-        return c[0] * eye + c[1] * operand + c[2] * sq
-    c = poly.astype(wide)
-    sq = jax.lax.dot_general(operand, operand, sq_dims, precision=precision, preferred_element_type=wide)
+    c = poly if poly.dtype == wide else poly.astype(wide)
+    sq = (jax.lax.dot_general(operand, operand, sq_dims, precision=precision)
+          if operand.dtype == wide
+          else jax.lax.dot_general(operand, operand, sq_dims, precision=precision,
+                                   preferred_element_type=wide))
     eye = jnp.eye(operand.shape[-1], dtype=wide)
-    return (c[0] * eye + c[1] * operand.astype(wide) + c[2] * sq).astype(out_dtype)
+    op_wide = operand if operand.dtype == wide else operand.astype(wide)
+    summed = c[0] * eye + c[1] * op_wide + c[2] * sq
+    return summed if out_dtype == wide else summed.astype(out_dtype)
 
 
 def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
                  precision: PrecisionLike, out_dtype, interpret_on_cpu: bool) -> bool:
-    """Run `SYRK` kernel selection once without emitting jaxpr equations; returns True for `MosaicSyrk`."""
+    """Run `SYRK` kernel selection once without emitting jaxpr equations, resolving committed operand
+    placement first so CUDA-committed inputs under `default_device(cpu)` see their device (row 12026)."""
     from .templates import base
     from .templates.gemm import syrk as syrk_mod
 
@@ -509,15 +520,17 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
     op_dtype = jnp.dtype(operand.dtype)
     flat = jax.ShapeDtypeStruct((count, d0, d1), op_dtype)
     poly_spec = jax.ShapeDtypeStruct((3,), at_least_fp32(op_dtype)) if has_poly else None
-    interpreting = interpret_on_cpu and jax.default_backend() == 'cpu'
-    ctx = (generation.assumed(generation.interpreted_target())
-           if interpret_on_cpu and not generation.gpu_target().generation else contextlib.nullcontext())
-    with ctx:
-        call = base.call((syrk_mod.MOSAIC_SYRK,), flat, poly_spec, transpose=transpose,
-                         out_dtype=out_dtype.name, interpret=interpreting)
-        case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
-                        no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype))
-        return selection.select(SYRK, case).kernel == 'mosaic'
+    device = _committed_device((operand,))
+    with jax.default_device(device) if device is not None else contextlib.nullcontext():
+        interpreting = xla_products.interpreted(interpret_on_cpu)
+        ctx = (generation.assumed(generation.interpreted_target())
+               if interpreting else contextlib.nullcontext())
+        with ctx:
+            call = base.call((syrk_mod.MOSAIC_SYRK,), flat, poly_spec, transpose=transpose,
+                             out_dtype=out_dtype.name, interpret=interpreting)
+            case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
+                            no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype))
+            return selection.select(SYRK, case).kernel == 'mosaic'
 
 
 def _syrk_run(x: jax.Array, coeffs: jax.Array | None, *, transpose: bool, conjugate: bool,
@@ -537,18 +550,19 @@ def _syrk_run(x: jax.Array, coeffs: jax.Array | None, *, transpose: bool, conjug
         count = int(np.prod(batches, dtype=np.int64))
         flat = operand.reshape(count, d0, d1)
         ctx = (generation.assumed(generation.interpreted_target())
-               if interpret and not generation.gpu_target().generation else contextlib.nullcontext())
+               if xla_products.interpreted(interpret) else contextlib.nullcontext())
         with ctx:
             out = syrk_mod.MOSAIC_SYRK(flat, poly, transpose=transpose, out_dtype=out_dtype.name,
                                        interpret=interpret)
             return out.reshape(*batches, m, m)
 
-    if coeffs is None:
-        return _dispatched(lambda a, *, interpret: kernel(a, None, interpret=interpret),
-                           lambda a: portable(a, None), interpret_on_cpu, x)
-    return _dispatched(kernel, portable, interpret_on_cpu, x, coeffs)
-
-
+    ctx = (generation.assumed(generation.interpreted_target())
+           if xla_products.interpreted(interpret_on_cpu) else contextlib.nullcontext())
+    with ctx:
+        if coeffs is None:
+            return _dispatched(lambda a, *, interpret: kernel(a, None, interpret=interpret),
+                               lambda a: portable(a, None), interpret_on_cpu, x)
+        return _dispatched(kernel, portable, interpret_on_cpu, x, coeffs)
 def _symmetric_gram_value(x: jax.Array, transpose: bool, conjugate: bool, precision: PrecisionLike,
                           out_dtype, interpret_on_cpu: bool) -> jax.Array:
     return _syrk_run(x, None, transpose=transpose, conjugate=conjugate, precision=precision,
@@ -557,8 +571,9 @@ def _symmetric_gram_value(x: jax.Array, transpose: bool, conjugate: bool, precis
 
 def _symmetric_gram_fwd(x: jax.Array, transpose: bool, conjugate: bool, precision: PrecisionLike,
                         out_dtype, interpret_on_cpu: bool):
-    return _symmetric_gram_value(x, transpose, conjugate, precision, out_dtype, interpret_on_cpu), (x,)
-
+    out = _symmetric_gram_value(jax.lax.stop_gradient(x), transpose, conjugate, precision, out_dtype,
+                                interpret_on_cpu)
+    return out, (x,)
 
 def _symmetric_gram_bwd(transpose: bool, conjugate: bool, precision: PrecisionLike, out_dtype,
                         interpret_on_cpu: bool, saved, dy):
@@ -609,8 +624,9 @@ def _symmetric_poly_value(a: jax.Array, coeffs: jax.Array, precision: PrecisionL
 
 def _symmetric_poly_fwd(a: jax.Array, coeffs: jax.Array, precision: PrecisionLike, out_dtype,
                         interpret_on_cpu: bool):
-    return _symmetric_poly_value(a, coeffs, precision, out_dtype, interpret_on_cpu), (a, coeffs)
-
+    out = _symmetric_poly_value(jax.lax.stop_gradient(a), jax.lax.stop_gradient(coeffs), precision,
+                                out_dtype, interpret_on_cpu)
+    return out, (a, coeffs)
 
 def _symmetric_poly_bwd(precision: PrecisionLike, out_dtype, interpret_on_cpu: bool, saved, dy):
     del out_dtype, interpret_on_cpu
@@ -651,11 +667,318 @@ def symmetric_polynomial(a: jax.Array, coeffs, *, precision: PrecisionLike = Non
     return _symmetric_poly_vjp(a, c.astype(at_least_fp32(a.dtype)), precision, out, interpret_on_cpu)
 
 
-def quantize_epilogue(minifloat):
-    """GEMM epilogue encoding fp32 accumulators to `minifloat` codes via `bits.encode_form` (row 8547)."""
-    from .templates.gemm import packed
+def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
+                   minifloat: bits.Minifloat | type[MxFp8] | type[NvFp4Block] = bits.E4M3,
+                   tensor_scale: jax.Array | float | None = None,
+                   transpose_rhs: bool = False, precision: PrecisionLike = None,
+                   interpret_on_cpu: bool = False) -> jax.Array | MxFp8 | NvFp4Block:
+    """GEMM whose epilogue quantizes fp32 accumulators directly to FP8 (`bits.E4M3`/`bits.E5M2`),
+    block-scaled MXFP8 (`formats.MxFp8`, bitwise matching `MxFp8.quantized`), or block-scaled NVFP4
+    (`bits.E2M1` / `formats.NvFp4Block`, bitwise matching `NvFp4Block.quantized` at `tensor_scale`;
+    rows 8547, 12037)."""
+    from .templates.gemm import quantized
 
-    return packed.quantize_epilogue(minifloat)
+    if minifloat in (bits.E4M3, bits.E5M2):
+        assert isinstance(minifloat, bits.Minifloat)
+        out_dtype = jnp.float8_e4m3fn if minifloat == bits.E4M3 else jnp.float8_e5m2
+        sides = (() if tensor_scale is None
+                 else ((jnp.broadcast_to(jnp.asarray(tensor_scale, jnp.float32), (lhs.shape[0],)),
+                        ('rows',)),))
+        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
+                   epilogue=quantized.quantize_epilogue(minifloat), epilogue_operands=sides,
+                   out_dtype=out_dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
+        assert isinstance(out, jax.Array)
+        return out
+    if minifloat is MxFp8:
+        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
+                   epilogue=quantized.quantize_mxfp8_epilogue(),
+                   out_dtype=jnp.float8_e4m3fn, out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu),
+                   precision=precision, interpret_on_cpu=interpret_on_cpu)
+        assert isinstance(out, tuple)
+        codes, block_scales = out
+        return MxFp8(codes, block_scales[..., ::32])
+    if minifloat == bits.E2M1 or minifloat is NvFp4Block:
+        ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
+        ts_rows = jnp.broadcast_to(ts, (lhs.shape[0],))
+        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
+                   epilogue=quantized.quantize_nvfp4_epilogue(),
+                   epilogue_operands=((ts_rows, ('rows',)),),
+                   out_dtype=jnp.uint8, out_dtypes=(jnp.uint8, jnp.float8_e4m3fn),
+                   precision=precision, interpret_on_cpu=interpret_on_cpu)
+        assert isinstance(out, tuple)
+        nibbles, block_scales = out
+        codes = _e2m1_values(nibbles).astype(jnp.float4_e2m1fn)
+        return NvFp4Block(codes, block_scales[..., ::16], ts)
+    raise ValueError(f"gemm_quantized supports E4M3, E5M2, E2M1, MxFp8, or NvFp4Block, got {minifloat}")
+
+@dataclasses.dataclass(frozen=True)
+class _RmsPrologue:
+    """Picklable GEMM prologue applying `precision.rms_weighted` to each loaded tile of a pre-rounded
+    residual stream (`stream_rms_norm_gemm`, row 6104)."""
+    dtype: jnp.dtype
+    after_cast: bool
+    weight_first: bool
+
+    def __call__(self, tile: jax.Array, inv_rms: jax.Array, weight: jax.Array) -> jax.Array:
+        work = at_least_fp32(self.dtype)
+        rounded = (lambda v: v.astype(self.dtype).astype(work)) if self.after_cast else None
+        return rms_weighted(tile.astype(work), inv_rms[:, None], weight=weight[None, :],
+                            rounded=rounded, weight_first=self.weight_first).astype(self.dtype)
+
+
+def stream_rms_norm_gemm(x: jax.Array, branch: jax.Array, scale: jax.Array, rhs: jax.Array,
+                         group_sizes: jax.Array | None = None, *, epsilon: float = 1e-6,
+                         offset: bool = False, after_cast: bool = False, weight_first: bool = False,
+                         transpose_rhs: bool = False, out_dtype=None, precision: PrecisionLike = None,
+                         interpret_on_cpu: bool = False) -> tuple[jax.Array, jax.Array]:
+    """Residual-stream RMSNorm pre-pass fused into a GEMM prologue (kernel-templates.md Appendix C row 16,
+    row 6104): pre-pass writes rounded `stream = x + branch` and its per-row reciprocal RMS statistic, then
+    the GEMM prologue applies `precision.rms_weighted` to each loaded tile of `stream` inline."""
+    work = at_least_fp32(x.dtype)
+    stream = (x.astype(work) + branch.astype(work)).astype(x.dtype)
+    _, inv = rms_statistics(stream, epsilon, axis=-1, keepdims=False)
+    weight = (jnp.asarray(1.0, work) + scale.astype(work)) if offset else scale.astype(work)
+    out = gemm(stream, rhs, group_sizes, transpose_rhs=transpose_rhs,
+               prologue=_RmsPrologue(jnp.dtype(stream.dtype), after_cast, weight_first),
+               prologue_operands=((inv, ('rows',)), (weight, ('depth',))),
+               out_dtype=stream.dtype if out_dtype is None else out_dtype,
+               precision=precision, interpret_on_cpu=interpret_on_cpu)
+    assert isinstance(out, jax.Array)
+    return stream, out
+
+
+LINEAR_CE_ROW = 'ledger 6103'
+
+
+class LinearCECase(NamedTuple):
+    """Facts deciding whether `linear_cross_entropy` runs Mosaic GEMM-fused CE or chunked XLA."""
+    tile: tiling.Tiles | None
+    whole: bool
+    exact_products: bool
+    interpret: bool
+
+
+LINEAR_CE: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+    selection.Kernel('mosaic', (
+        selection.Requirement(
+            'launch', lambda case: case.tile is not None,
+            "no legal Mosaic linear-CE tile holds this shape/dtype on the target", LINEAR_CE_ROW),
+        selection.Requirement(
+            'sharding', lambda case: case.whole,
+            "automatic mesh axes keep chunked XLA outside per-shard launch", LINEAR_CE_ROW),
+        selection.Requirement(
+            'precision', lambda case: case.exact_products,
+            "precision does not match bf16/fp16 exact fp32 accumulation", LINEAR_CE_ROW),
+        selection.Requirement(
+            'measured', lambda case: case.interpret,
+            "no receipt yet has Mosaic linear-CE beat chunked XLA (pending M-NG-6)",
+            LINEAR_CE_ROW, kind='measured'),
+    )),
+    selection.Kernel('xla', (), generic=True),
+))
+
+
+def _linear_ce_select(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None, *,
+                      transpose_rhs: bool, precision: PrecisionLike, interpret_on_cpu: bool) -> bool:
+    from .templates.gemm import linear_ce as lce
+
+    if not lce.supports_dtype(x.dtype):
+        return False
+    exact = exact_products(precision, x.dtype)
+    if xla_products.interpreted(interpret_on_cpu):
+        target = generation.interpreted_target()
+        tile = lce.derive_linear_ce(
+            (x.shape[0], weight.shape[0] if transpose_rhs else weight.shape[1], x.shape[1]),
+            x.dtype, target, transpose_rhs=transpose_rhs, has_bias=bias is not None, interpret=True)
+    else:
+        ba = lce.MOSAIC_LINEAR_CE.bind(
+            jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(weight.shape, weight.dtype),
+            jax.ShapeDtypeStruct(targets.shape, jnp.int32),
+            None if bias is None else jax.ShapeDtypeStruct(bias.shape, bias.dtype),
+            transpose_rhs=transpose_rhs, softcap=None, interpret=interpret_on_cpu)
+        tile = _planned(lce.MOSAIC_LINEAR_CE, ba)
+    case = LinearCECase(tile, whole=not automatic_axes(), exact_products=exact, interpret=interpret_on_cpu)
+    return selection.select(LINEAR_CE, case).kernel == 'mosaic'
+
+
+def _linear_ce_run(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None, *,
+                   softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
+                   chunk_size: int | None, interpret_on_cpu: bool
+                   ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    from .templates.gemm import linear_ce as lce
+
+    if _linear_ce_select(x, weight, targets, bias, transpose_rhs=transpose_rhs, precision=precision,
+                         interpret_on_cpu=interpret_on_cpu):
+        if xla_products.interpreted(interpret_on_cpu):
+            with generation.assumed(generation.interpreted_target()):
+                return lce.MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,
+                                            softcap=softcap, interpret=True)
+        return lce.MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,
+                                    softcap=softcap, interpret=interpret_on_cpu)
+    return lce.portable_linear_ce(x, weight, targets, bias=bias, softcap=softcap,
+                                  transpose_rhs=transpose_rhs, precision=precision, chunk_size=chunk_size)
+
+def _linear_ce_value(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
+                     softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
+                     chunk_size: int | None, interpret_on_cpu: bool) -> jax.Array:
+    return _linear_ce_run(x, weight, targets, bias, softcap=softcap, transpose_rhs=transpose_rhs,
+                          precision=precision, chunk_size=chunk_size, interpret_on_cpu=interpret_on_cpu)[0]
+
+
+def _linear_ce_fwd(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
+                   softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
+                   chunk_size: int | None, interpret_on_cpu: bool):
+    loss, peak, mass, rest = _linear_ce_run(
+        x, weight, targets, bias, softcap=softcap, transpose_rhs=transpose_rhs,
+        precision=precision, chunk_size=chunk_size, interpret_on_cpu=interpret_on_cpu)
+    return loss, (x, weight, targets, bias, peak, mass, rest)
+
+
+def _linear_ce_bwd(softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
+                   chunk_size: int | None, interpret_on_cpu: bool, saved, d_loss: jax.Array):
+    from .templates.gemm import linear_ce as lce
+
+    del interpret_on_cpu
+    x, weight, targets, bias, peak, mass, rest = saved
+    d_x, d_w, d_b = lce.linear_ce_backward(
+        x, weight, targets, bias, peak, mass, rest, d_loss, softcap=softcap,
+        transpose_rhs=transpose_rhs, precision=precision, chunk_size=chunk_size)
+    return d_x, d_w, zero_from_primal(targets), d_b
+
+
+_linear_ce_vjp = contracted("test_a_linear_cross_entropy_holds_every_reverse_order")(
+    declared_derivative(KernelGlue(), _linear_ce_value, _linear_ce_fwd, _linear_ce_bwd,
+                        nondiff_argnums=(4, 5, 6, 7, 8)))
+
+
+def linear_cross_entropy(x: jax.Array, weight: jax.Array, targets: jax.Array, *,
+                         bias: jax.Array | None = None, softcap: float | None = None,
+                         transpose_rhs: bool = True, precision: PrecisionLike = None,
+                         chunk_size: int | None = None, interpret_on_cpu: bool = False) -> jax.Array:
+    """GEMM-fused linear cross-entropy (`-log softmax(x @ W^T + bias)[targets]`, kernel-templates.md
+    Appendix C row 25, row 6103): computes per-token cross-entropy without materializing `[..., V]` logits
+    in forward or backward, using Barron et al. zero-sum label derivatives."""
+    lead = x.shape[:-1]
+    if targets.shape != lead:
+        raise ValueError(f"linear_cross_entropy targets shape {targets.shape} != x leading shape {lead}")
+    x_flat = x.reshape(-1, x.shape[-1])
+    t_flat = targets.reshape(-1)
+    loss = _linear_ce_vjp(x_flat, weight, t_flat, bias, softcap, transpose_rhs, precision,
+                          chunk_size, interpret_on_cpu)
+    return loss.reshape(lead)
+
+
+FP8_WEIGHT_ROW = 'ledger 8548'
+
+
+class Fp8WeightCase(NamedTuple):
+    """Facts deciding whether `fp8_weight_product` runs the inline-decoding Mosaic GEMM mainloop."""
+    tile: tiling.Tiles | None
+    whole: bool
+    interpret: bool
+
+
+FP8_WEIGHT: selection.Op[Fp8WeightCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+    selection.Kernel('mosaic', (
+        selection.Requirement(
+            'launch', lambda case: case.tile is not None,
+            "no legal Mosaic FP8-packed tile holds this shape on the target", FP8_WEIGHT_ROW),
+        selection.Requirement(
+            'sharding', lambda case: case.whole,
+            "automatic mesh axes keep decoded XLA outside per-shard launch", FP8_WEIGHT_ROW),
+        selection.Requirement(
+            'measured', lambda case: case.interpret,
+            "no receipt yet has Mosaic FP8-packed beat decoded GEMM (pending M-NG-6)",
+            FP8_WEIGHT_ROW, kind='measured'),
+    )),
+    selection.Kernel('xla', (), generic=True),
+))
+
+def _fp8_factor(scale: jax.Array, sizes: jax.Array, count: int, dense: bool) -> jax.Array:
+    if dense or scale.ndim == 0:
+        return scale
+    if scale.ndim == 1:
+        return jnp.repeat(scale, sizes, total_repeat_length=count)[:, None]
+    return jnp.repeat(scale, sizes, axis=0, total_repeat_length=count)
+
+
+def _fp8_packed(rows: jax.Array, words: jax.Array, sizes: jax.Array, fmt: str,
+                launch: grouped_matmul.MosaicFp8PackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
+    """Inline-decoding FP8 weight product in fp32 (`fp8_weight_product`, row 8548), differentiable at every
+    order through `generation.linear_tangent`."""
+    form = Fp8Weights(words, jnp.ones((), jnp.float32), jnp.zeros((8,), jnp.uint8), fmt=fmt)
+
+    def decoded(packed_words: jax.Array) -> jax.Array:
+        matrices = Fp8Weights(packed_words, jnp.ones((), jnp.float32), form.form, fmt=fmt).decoded()
+        return matrices[0] if dense else matrices
+
+    def kernel(r: jax.Array, w: jax.Array, s: jax.Array, *, interpret: bool) -> jax.Array:
+        bank = Fp8Weights(w, jnp.ones((), jnp.float32), form.form, fmt=fmt)
+        return launch(r, bank, s, (), (), None, None, None, out_dtype='float32', trans_rhs=False,
+                      interpret=interpret, dense=dense, exact_sums=False)
+
+    def portable(r: jax.Array, w: jax.Array, s: jax.Array) -> jax.Array:
+        matrices = decoded(w)
+        return (jax.lax.dot(r, matrices, preferred_element_type=jnp.float32) if dense
+                else jax.lax.ragged_dot(r, matrices, s, preferred_element_type=jnp.float32))
+
+    def forward(r: jax.Array, w: jax.Array, s: jax.Array):
+        return _dispatched(kernel, portable, interpret, r, w, s), ()
+
+    def backward(saved, operands, cotangent, live):
+        del saved
+        r, w, s = operands
+        matrices = decoded(w)
+        parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+        d_rows = functools.reduce(jnp.add, [
+            gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
+                 precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
+        leaves = (d_rows.astype(r.dtype), zero_from_primal(w), zero_from_primal(s))
+        return tuple(leaves[index] for index in live)
+
+    differentiable = contracted("test_an_fp8_weight_product_holds_every_order")(
+        generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
+    return differentiable(rows, words, sizes)
+
+
+def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Array | None = None, *,
+                       out_dtype=None, interpret_on_cpu: bool = False) -> jax.Array:
+    """`lhs @ weights` for free-layout FP8 `weights` (`formats.Fp8Weights`, rows 3733, 8548): decodes staged
+    uint32 E4M3/E5M2 words inline in the GEMM mainloop via `bits.E4M3_BFLOAT16_FORM`/`E5M2_BFLOAT16_FORM` on
+    sm80/sm90, multiplies in bfloat16 with fp32 accumulation, applies `weights.scale`, and rounds once."""
+    from jax.core import Tracer
+
+    if not isinstance(weights.form, Tracer):
+        weights.checked()
+    rows = lhs.astype(jnp.bfloat16)
+    dense = group_sizes is None
+    words = jnp.asarray(weights.words if not dense else weights.words[None])
+    sizes = jnp.asarray([rows.shape[0]], jnp.int32) if dense else group_sizes.astype(jnp.int32)
+    launch = grouped_matmul.MosaicFp8PackedGmm()
+
+    def _spec(operand):
+        return jax.ShapeDtypeStruct(jnp.shape(operand), jnp.result_type(operand))
+
+    bank_spec = jax.tree.map(_spec, Fp8Weights(words, jnp.ones((), jnp.float32), weights.form,
+                                               fmt=weights.fmt))
+    bound = launch.bind(_spec(rows), bank_spec, _spec(sizes), (), (), None, None, None,
+                        out_dtype='float32', trans_rhs=False, interpret=interpret_on_cpu,
+                        dense=dense, exact_sums=False)
+    assumed = (generation.interpreted_target()
+               if xla_products.interpreted(interpret_on_cpu) else None)
+    with generation.assumed(assumed) if assumed is not None else contextlib.nullcontext():
+        tile = _planned(launch, bound)
+        case = Fp8WeightCase(tile, not automatic_axes(), interpret_on_cpu)
+        if selection.select(FP8_WEIGHT, case).kernel == 'mosaic':
+            summed = _fp8_packed(rows, words, sizes, weights.fmt, launch, interpret_on_cpu, dense=dense)
+        else:
+            summed = gemm(rows, weights.decoded(jnp.bfloat16), group_sizes, out_dtype=jnp.float32,
+                          precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
+            assert isinstance(summed, jax.Array)
+    factor = _fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], dense)
+    target_dtype = lhs.dtype if out_dtype is None else out_dtype
+    return (summed * factor).astype(target_dtype)
+
 
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
            prologue_operands: tuple = (), out_dtype, precision: PrecisionLike = None,
@@ -1921,20 +2244,24 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     return outs if several else outs[0]
 
 
+@dataclasses.dataclass(frozen=True)
+class _ProloguedTangent:
+    """Picklable custom-JVP tangent rule for `_prologued`, avoiding local closures/lambdas that break
+    GPU-tier prepare serialization."""
+    prologue: Callable
+    prologue_jvp: Callable
+
+    def __call__(self, primals, tangents):
+        return _prologued(self.prologue, self.prologue_jvp)(*primals), self.prologue_jvp(*primals)(*tangents)
+
+
 def _prologued(prologue, prologue_jvp):
     """`prologue`, its derivative `prologue_jvp`'s where given (`gemm`): one derivative contract for
     forward mode, which takes it, reverse mode, which transposes it, and every higher order."""
     if prologue is None or prologue_jvp is None:
         return prologue
-
-    def tangent(primals, tangents):
-        return prologued(*primals), prologue_jvp(*primals)(*tangents)
-
-    # The fused kernel's derivative glue (`derivatives.KernelGlue`): the producer's own derivative, true and
-    # rewritten as any other math, written once for the prologue the kernel applies to its tiles.
-    prologued = contracted("test_a_gemm_prologue_holds_every_order")(
-        declared_tangent(KernelGlue(), lambda lhs, *sides: prologue(lhs, *sides), tangent))
-    return prologued
+    return contracted("test_a_gemm_prologue_holds_every_order")(
+        declared_tangent(KernelGlue(), prologue, _ProloguedTangent(prologue, prologue_jvp)))
 
 
 def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand):
@@ -2117,11 +2444,13 @@ def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
 
 def _committed_device(operands):
     """A process-local device of concrete `operands` when every committed leaf shares one platform
-    (including homogeneous multi-host sharding), or None if uncommitted, empty, or mixed-platform."""
+    (including homogeneous multi-host sharding), or None if uncommitted, traced, empty, or mixed-platform."""
+    from jax.core import Tracer
+
     devices = {
         device
         for leaf in jax.tree.leaves(operands)
-        if isinstance(leaf, jax.Array) and leaf.committed
+        if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer) and leaf.committed
         for device in leaf.devices()
     }
     platforms = {device.platform for device in devices}

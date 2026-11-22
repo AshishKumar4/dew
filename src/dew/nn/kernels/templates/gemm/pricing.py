@@ -7,23 +7,23 @@ wave (`balanced_tail`, `handoff_steps`, `fixes_up`)."""
 import dataclasses
 import math
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, tail as tail_of
+from dew.nn.kernels.templates import base, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
 
 if TYPE_CHECKING:
     from dew.nn.kernels.templates.gemm.tiling import Tiles
 
 
-def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
-    """The bundle a tile runs on: the one it names (`Tiles.family`, `bundles.named`), for a consumer's share
-    of the tile's rows and the columns its accumulators hold (`tile_columns`, `mosaic.Issuer.specialized`)."""
-    # The GPU it is priced for, as its search composed it (row 11885).
-    family = bundles.named(tiles.family, dtype, generation.gpu_target())
+def family_of(tiles: "Tiles", dtype, target: generation.GpuTarget | None = None) -> mosaic.Family:
+    """The bundle a tile runs on: the one it names (`Tiles.family`, `bundles.named`) for `target` (the active
+    GPU `generation.gpu_target()` where None), specialized for a consumer's share of the tile's rows and the
+    columns its accumulators hold (`tile_columns`, `mosaic.Issuer.specialized`, rows 11885, 12011)."""
+    family = bundles.named(tiles.family, dtype, generation.gpu_target() if target is None else target)
     return family.specialized(tiles.share, tile_columns(tiles, family))
 
 
@@ -54,7 +54,7 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
     tensor, shared = rates.tensor, rates.shared
     if tensor is None:
         return None
-    family = family_of(tiles, jnp.bfloat16)
+    family = family_of(tiles, jnp.bfloat16, target)
     columns = tile_columns(tiles, family)
     products = 2 * tiles.block_m * columns * tiles.block_k / tensor
     moved = step_shared_bytes(tiles, family, itemsizes, decoded)
@@ -98,23 +98,23 @@ def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[fl
     return moved
 
 
-def merges(tiles: "Tiles", dtype, *, dense: bool) -> bool:
+def merges(tiles: "Tiles", dtype, *, dense: bool, target: generation.GpuTarget | None = None) -> bool:
     """Whether a launch at `tiles` would balance its last wave over the programs, each adding another's
     partial (`tail.balanced`), where its registers hold the merge (`grouped_matmul._Mosaic.balanced`): a dense
     call of one product (`dense`), its products on one CTA (`not family.pairs_product`: Hopper's 2-CTA
     multicast cluster pairs two independent tiles and balances across cluster pairs), and its depth unsplit,
     on a family that fixes a tile up across programs (`fixes_up`)."""
-    family = family_of(tiles, dtype)
-    return dense and tiles.splits == 1 and not family.pairs_product and fixes_up(tiles, dtype)
+    family = family_of(tiles, dtype, target)
+    return dense and tiles.splits == 1 and not family.pairs_product and fixes_up(tiles, dtype, target)
 
 
-def fixes_up(tiles: "Tiles", dtype) -> bool:
+def fixes_up(tiles: "Tiles", dtype, target: generation.GpuTarget | None = None) -> bool:
     """Whether a tile's steps may be walked by several programs at `tiles`, each leaving its partial and the
     last to arrive adding them (`mosaic.Family.fixed_up`): its family's, where its consumers hold the tile's
     accumulator in registers, which `fixed_up` leaves and adds whole; not tcgen05's, whose accumulator stays
     in tensor memory (`Issuer.tensor_columns`), read out a chunk of columns at a time; nor a ping-pong tile's,
     whose consumers each finish their own tiles, which no last wave's partials share."""
-    family = family_of(tiles, dtype)
+    family = family_of(tiles, dtype, target)
     return family.fixes_up and not family.tensor_columns(tiles.block_n, 1) and not tiles.pingpong
 
 
@@ -147,22 +147,19 @@ def _partial_merge_steps(tiles: "Tiles", family: mosaic.Family, grid: tuple[int,
                          pairs: int, traffic: tail_of.Traffic) -> float:
     """Device-memory time (in MMA steps) for `mosaic.Family.fixed_up` to move each peer program's fp32
     partial across SMs through the tail workspace (`k_t - 1` peer partials written and read back per shared
-    tile, matching `split_walk`'s 2x partial passes at `traffic.bandwidth`)."""
+    tile, counted directly from `Tail`'s interior off-tile-boundary partition cuts without allocations,
+    row 12027)."""
     waves, rem = divmod(grid[0] * grid[1], pairs)
     if waves == 0 or rem == 0 or steps == 0:
         return 0.0
     iterations = rem * steps
-    parts = min(pairs, iterations)
-    bounds = np.arange(parts + 1) * iterations // parts
-    tiles_idx = np.arange(rem)
-    counts = (np.searchsorted(bounds, (tiles_idx + 1) * steps, side="left")
-              - (np.searchsorted(bounds, tiles_idx * steps, side="right") - 1))
-    extra_partials = int(np.maximum(counts - 1, 0).sum())
+    candidate = tail_of.Tail(waves, iterations, min(pairs, iterations), steps)
+    extra_partials = sum(1 for p in range(1, candidate.partitions)
+                         if (p * candidate.iterations // candidate.partitions) % candidate.steps != 0)
     if extra_partials == 0:
         return 0.0
     partial_bytes = tile_rows(tiles, family) * tile_columns(tiles, family) * 4
     return (2 * extra_partials * partial_bytes / traffic.bandwidth) / traffic.step_seconds
-
 
 def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: tuple[int, int], target,
                   programs: int, *, dtype=jnp.bfloat16) -> tail_of.Tail | None:
@@ -177,7 +174,7 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
     pairs = programs // tiles.cluster
     if step is None or rate is None or pairs <= 0:
         return None
-    family = family_of(tiles, dtype)
+    family = family_of(tiles, dtype, target)
     left, right = itemsizes
     mp = (target.multiprocessors // tiles.cluster) if target.multiprocessors else pairs
     traffic = tail_of.Traffic(grid, tiles.grid_block_n, tile_rows(tiles, family) * tiles.block_k * left,
@@ -192,9 +189,9 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
                target, programs: int, *, dense: bool = True) -> tail_of.Tail | None:
     """The one balanced-tail decision for a dense GEMM over `(m, n, k)` `extents` at `tiles` on `target`:
     shared by planner (`grouped_matmul._Mosaic`) and kernel (`mosaic_gpu._dense_tail`, row 11945)."""
-    if not merges(tiles, dtype, dense=dense):
+    if not merges(tiles, dtype, dense=dense, target=target):
         return None
-    family = family_of(tiles, dtype)
+    family = family_of(tiles, dtype, target)
     m, n, k = extents
     grid = (-(-m // tile_rows(tiles, family)), -(-n // tile_columns(tiles, family)))
     return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
@@ -426,3 +423,49 @@ def walk_seconds(tiles: "Tiles", contraction: dict) -> float:
     other walk's where the device states no rate (`split_walk`)."""
     walk = split_walk(dataclasses.replace(tiles, swapped=False), **contraction)
     return math.inf if walk is None else walk.seconds(tiles.splits)
+
+
+@dataclasses.dataclass(frozen=True)
+class TilesTemplate(base.Template["Tiles"]):
+    """Shared `Template[Tiles]` lifecycle for GEMM-family templates (`MosaicSyrk`, `MosaicLinearCE`):
+    staged bytes, register budget, shared memory per program, legality, pinnability, and eligibility with
+    explicit `target` threading (`family_of(..., target)`, `report.refused(..., target)`)."""
+
+    name: ClassVar[str] = "mosaic"
+    GENERATES: ClassVar[bool] = True
+    ROWS: ClassVar[tuple[str, ...]] = ("x",)
+
+    def _supports_ba(self, ba) -> bool:
+        raise NotImplementedError
+
+    def candidate(self, ba, config: "Tiles", target) -> bool:
+        raise NotImplementedError
+    def launch_of(self, ba, config: "Tiles", target=None) -> resources.Launch:
+        raise NotImplementedError
+
+    def staged_bytes(self, ba, config: "Tiles", target) -> int:
+        family = family_of(config, ba.arguments["x"].dtype, target)
+        return resources.shared_bytes(family, self.launch_of(ba, config, target).scope(config.stages))
+
+    def register_budget(self, config: "Tiles", target: generation.GpuTarget | None = None) -> int:
+        family = family_of(config, jnp.bfloat16, self.launch_target() if target is None else target)
+        return family.registers(config.warpgroups) if family.budgets_registers else 0
+
+    def program_shared(self, config: "Tiles", target) -> int:
+        return resources.program_shared(generation.shared_budget(target), config.programs)
+
+    def legal(self, ba, config: "Tiles", target) -> bool:
+        if not self.candidate(ba, config, target):
+            return False
+        family = family_of(config, ba.arguments["x"].dtype, target)
+        launch = dataclasses.replace(self.launch_of(ba, config, target),
+                                     floor=config.stages, most=config.stages)
+        return resources.plan([launch], family, target, programs=config.programs) is not None
+
+    def eligible(self, ba, target) -> bool:
+        if not self._supports_ba(ba):
+            return False
+        budgeted = not generation.tpu(target) or target.scoped_vmem is not None
+        if not budgeted or self.derived(ba, target) is None:
+            return False
+        return target != self.launch_target() or self.holds(ba)

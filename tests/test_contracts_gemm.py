@@ -927,3 +927,92 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
         _, pull = jax.vjp(lambda operand, t=transpose: gemm.symmetric_gram(operand, transpose=t), small_x)
         (dx_big,) = pull(big_dy)
         np.testing.assert_array_equal(np.asarray(dx_big), np.asarray([[[2.0 ** 126]]], jnp.float32))
+
+    # Native Mosaic SYRK VJP contract (row 12036): bf16 under assumed sm90 + chosen mosaic + interpret_on_cpu,
+    # directly exercising `_symmetric_gram_bwd` and `_symmetric_poly_bwd`.
+    (x_bf,) = normal_draw(11948, (1, 64, 64), scale=EDGES[edge])
+    (d_bf,) = normal_draw(11949, (1, 64, 64), scale=EDGES[edge])
+    (c_bf,) = normal_draw(11950, (1, 64, 64))
+    sym_bf = 0.5 * (x_bf + jnp.swapaxes(x_bf, -1, -2))
+    d_sym_bf = 0.5 * (d_bf + jnp.swapaxes(d_bf, -1, -2))
+    (_, p_bf) = normal_draw(11951, (1,), (3,), scale=EDGES[edge])
+    (_, dp_bf) = normal_draw(11952, (1,), (3,), scale=EDGES[edge])
+
+    def native_gram_bf(operand):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            return gemm.symmetric_gram(operand.astype(jnp.bfloat16), out_dtype=jnp.bfloat16,
+                                       interpret_on_cpu=True)
+
+    def plain_gram_bf(operand):
+        x = operand.astype(jnp.bfloat16)
+        return jax.lax.dot_general(x, x, (((2,), (2,)), ((0,), (0,))),
+                                   preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+
+    assert_contract(native_gram_bf, (x_bf,), (d_bf,), c_bf, f"symmetric_gram native mosaic bf16 {edge}",
+                    truth_fn=plain_gram, plain_fn=plain_gram_bf, without=FORWARD_ORDERS)
+
+    def native_poly_bf(operand, poly):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            return gemm.symmetric_polynomial(operand.astype(jnp.bfloat16), poly, out_dtype=jnp.bfloat16,
+                                             interpret_on_cpu=True)
+
+    def plain_poly_bf(operand, poly):
+        x = operand.astype(jnp.bfloat16)
+        sq = jax.lax.dot_general(x, x, (((2,), (1,)), ((0,), (0,))), preferred_element_type=jnp.float32)
+        p = poly.astype(jnp.float32)
+        return (p[0] * jnp.eye(64, dtype=jnp.float32) + p[1] * x.astype(jnp.float32) + p[2] * sq).astype(
+            jnp.bfloat16)
+
+    def truth_poly_bf(operand, poly):
+        sq = jax.lax.dot_general(operand, operand, (((2,), (1,)), ((0,), (0,))))
+        return poly[0] * jnp.eye(64, dtype=operand.dtype) + poly[1] * operand + poly[2] * sq
+
+    assert_contract(native_poly_bf, (sym_bf, p_bf), (d_sym_bf, dp_bf), c_bf,
+                    f"symmetric_polynomial native mosaic bf16 {edge}",
+                    truth_fn=truth_poly_bf, plain_fn=plain_poly_bf, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_linear_cross_entropy_holds_every_reverse_order(edge):
+    """`gemm.linear_cross_entropy` (chunked online-softmax forward and recomputing Barron-derivative VJP):
+    every reverse order, under a nested jit and a scan, finite wherever float64 is a normal float32 and
+    wherever plain dense `categorical.cross_entropy` is (row 6103)."""
+    from dew.nn import categorical
+
+    targets = jnp.asarray([0, 3, 5, 2, 1, 7, 4, 6], jnp.int32)
+    x, weight, bias = normal_draw(6103, (8, 12), (10, 12), (10,), scale=EDGES[edge])
+    dx, dw, db = normal_draw(6104, (8, 12), (10, 12), (10,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6105, (8,))
+
+    def fused(rows, w, b):
+        return gemm.linear_cross_entropy(rows, w, targets, bias=b, softcap=30.0, chunk_size=4)
+
+    def plain(rows, w, b):
+        raw = rows @ w.T + b[None, :]
+        return categorical.cross_entropy(30.0 * jnp.tanh(raw / 30.0), targets)
+
+    assert_contract(fused, (x, weight, bias), (dx, dw, db), cotangent, f"linear cross-entropy {edge}",
+                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_fp8_weight_product_holds_every_order(edge):
+    """`gemm.fp8_weight_product` (free-layout staged FP8 weights decoded inline via
+    `bits.E4M3_BFLOAT16_FORM`, `generation.linear_tangent`): every order in `lhs`, under a nested jit and a
+    scan, finite wherever float64 is a normal float32 and wherever the decoded product is (row 8548)."""
+    from dew.nn.kernels import formats
+
+    raw_w = normal_draw(8548, (64, 64), scale=1.0)[0]
+    weights = formats.Fp8Weights.of(raw_w, fmt="e4m3", scale=jnp.float32(0.5))
+    decoded = weights.decoded(jnp.bfloat16)
+    (x,) = normal_draw(8549, (64, 64), scale=EDGES[edge])
+    (dx,) = normal_draw(8550, (64, 64), scale=EDGES[edge])
+    (cotangent,) = normal_draw(8551, (64, 64))
+
+    def product(rows):
+        return gemm.fp8_weight_product(rows, weights, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def plain(rows):
+        return jax.lax.dot(rows.astype(jnp.bfloat16), decoded, preferred_element_type=jnp.float32)
+    assert_contract(product, (x,), (dx,), cotangent, f"fp8 weight product {edge}",
+                    truth_fn=plain, plain_fn=plain)

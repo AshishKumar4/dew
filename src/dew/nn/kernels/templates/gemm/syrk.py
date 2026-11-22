@@ -28,7 +28,6 @@ from jax.extend.mlir.dialects import arith as mgpu_arith, vector as mgpu_vector
 
 from dew.nn.kernels import generation, grouped_launch, tuning
 from dew.nn.kernels.templates import (
-    base,
     bundles,
     cost as unit_cost,
     mosaic,
@@ -49,6 +48,7 @@ from dew.nn.kernels.templates.gemm.mosaic_gpu import (
     row_unit,
 )
 from dew.nn.kernels.templates.gemm.pricing import (
+    TilesTemplate,
     epilogue_registers,
     family_of,
     granular_tile,
@@ -567,7 +567,7 @@ def syrk_registers(tiles: Tiles, dtype, out_dtype, *, transpose: bool, polynomia
                    target) -> int | None:
     """Consumer thread register count for `syrk` at `tiles` on `target` (`resources.tile_registers` +
     shared `pricing.epilogue_registers`, row 11982)."""
-    family = family_of(tiles, dtype)
+    family = family_of(tiles, dtype, target)
     if not family.budgets_registers or generation.tpu(target):
         return None
     columns = tile_columns(tiles, family)
@@ -582,7 +582,7 @@ def syrk_launch_of(tiles: Tiles, shape: tuple[int, int, int], dtype, out_dtype, 
                    polynomial: bool, target, interpret: bool = False) -> resources.Launch:
     """Resource planner `Launch` for `syrk` at `tiles` on `target` (`resources.plan`)."""
     _, m, k = shape
-    family = family_of(tiles, dtype)
+    family = family_of(tiles, dtype, target)
     tile_side = tile_rows(tiles, family)
     m_pad = -(-m // tile_side) * tile_side
     k_target = max(k, m_pad) if polynomial else k
@@ -645,15 +645,15 @@ def derive_syrk(shape: tuple[int, int, int], dtype, out_dtype, target, *, transp
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicSyrk(base.Template[Tiles]):
-    """SYRK (`syrk`) on the shared `Template`/`KernelOp` certification path (`report.launching`,
+class MosaicSyrk(TilesTemplate):
+    """SYRK (`syrk`) on the shared `TilesTemplate`/`KernelOp` certification path (`report.launching`,
     `report.refused`), deriving legal square super-tiles and stepping past spilling tiles."""
 
-    name: ClassVar[str] = "mosaic"
-    GENERATES: ClassVar[bool] = True
     KERNEL: ClassVar[str] = SYRK
-    ROWS: ClassVar[tuple[str, ...]] = ("x",)
     config_cls: ClassVar[type[Tiles]] = Tiles
+
+    def _supports_ba(self, ba) -> bool:
+        return supports_out_dtype(ba.arguments["out_dtype"])
 
     def _shape(self, ba) -> tuple[int, int, int]:
         x = ba.arguments["x"]
@@ -667,22 +667,11 @@ class MosaicSyrk(base.Template[Tiles]):
                               polynomial=ba.arguments["poly_coeffs"] is not None,
                               target=target, interpret=ba.arguments["interpret"])
 
-    def staged_bytes(self, ba, config: Tiles, target) -> int:
-        family = family_of(config, ba.arguments["x"].dtype)
-        return resources.shared_bytes(family, self.launch_of(ba, config, target).scope(config.stages))
-
     def registers(self, ba, config: Tiles, target=None) -> int | None:
         target = generation.gpu_target() if target is None else target
         return syrk_registers(config, ba.arguments["x"].dtype, ba.arguments["out_dtype"],
                               transpose=ba.arguments["transpose"],
                               polynomial=ba.arguments["poly_coeffs"] is not None, target=target)
-
-    def register_budget(self, config: Tiles) -> int:
-        family = family_of(config, jnp.bfloat16)
-        return family.registers(config.warpgroups) if family.budgets_registers else 0
-
-    def program_shared(self, config: Tiles, target) -> int:
-        return resources.program_shared(generation.shared_budget(target), config.programs)
 
     def candidate(self, ba, config: Tiles, target) -> bool:
         x = ba.arguments["x"]
@@ -709,28 +698,12 @@ class MosaicSyrk(base.Template[Tiles]):
         return not (ba.arguments["transpose"] and specialized.operands_in_registers
                     and config.block_k % specialized.transposed_rows != 0)
 
-    def legal(self, ba, config: Tiles, target) -> bool:
-        if not self.candidate(ba, config, target):
-            return False
-        family = family_of(config, ba.arguments["x"].dtype)
-        launch = dataclasses.replace(self.launch_of(ba, config, target),
-                                     floor=config.stages, most=config.stages)
-        return resources.plan([launch], family, target, programs=config.programs) is not None
-
     def derived(self, ba, target) -> Tiles | None:
         return derive_syrk(self._shape(ba), ba.arguments["x"].dtype, ba.arguments["out_dtype"], target,
                            transpose=ba.arguments["transpose"],
                            polynomial=ba.arguments["poly_coeffs"] is not None,
                            interpret=ba.arguments["interpret"],
                            refused=lambda candidate: report.refused(self, ba, candidate, target), ba=ba)
-
-    def eligible(self, ba, target) -> bool:
-        if not supports_out_dtype(ba.arguments["out_dtype"]):
-            return False
-        budgeted = not generation.tpu(target) or target.scoped_vmem is not None
-        if not budgeted or self.derived(ba, target) is None:
-            return False
-        return target != self.launch_target() or self.holds(ba)
 
     def _fwd(self, x: jax.Array, poly_coeffs: jax.Array | None = None, *, transpose: bool = False,
              out_dtype: str = "bfloat16", interpret: bool = False, config: Tiles,

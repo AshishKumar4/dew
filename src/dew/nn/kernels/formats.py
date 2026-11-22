@@ -25,17 +25,20 @@ NVFP4_STAGE = packed.NVFP4_STEP
 16-byte row (a TMA copy's least)."""
 
 
+def _staged_rows(depth: int, group: int, code_width: int, depth_fn, label: str) -> np.ndarray:
+    """Shared staged-depth permutation for packed weight matrices (`staged_rows`, `fp8_staged_rows`)."""
+    if depth % group:
+        raise ValueError(f"a {label} matrix's depth is whole {group}-deep groups, not {depth}")
+    groups, within = np.divmod(np.arange(depth), group)
+    word, code = np.divmod(within, 32 // code_width)
+    return depth_fn(groups, word, code)
+
+
 def staged_rows(depth: int) -> np.ndarray:
     """The depth each code of the staged order holds (`NvFp4`): packed row `8w + j` of a group (word `w`'s
     code `j`) holds the depth `packed.nvfp4_staged_depth` gives it, so a stage's word rows decode, code by
     code, into its sixteen-row depth slices, the block of one scale each (the mainloop's stage decode)."""
-    group = packed.NVFP4_GROUP
-    if depth % group:
-        raise ValueError(f"an NVFP4 matrix's depth is whole {group}-deep groups, not {depth}")
-    groups, within = np.divmod(np.arange(depth), group)
-    word, code = np.divmod(within, 32 // bits.E2M1.width)
-    return packed.nvfp4_staged_depth(groups, word, code)
-
+    return _staged_rows(depth, packed.NVFP4_GROUP, bits.E2M1.width, packed.nvfp4_staged_depth, "NVFP4")
 
 def form_version(encoder: str, order: np.ndarray) -> np.ndarray:
     """The 8-byte digest of an `NvFp4` encoding: its bit-form `encoder` (`bits.BitForm.version`) and the
@@ -211,6 +214,7 @@ def _staged_words(codes, xp=jnp):
     return xp.swapaxes(bits.packed(xp.swapaxes(nibbles, -1, -2), bits.E2M1, xp), -1, -2)
 
 
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class MxFp8:
     """An MXFP8 operand (OCP MX: E4M3 codes, a power-of-two E8M0 scale every 32 depths, `product.MXFP8`):
@@ -259,18 +263,108 @@ class MxFp8:
 
     def decoded(self, dtype=jnp.float32) -> jax.Array:
         """Its values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each code times
-        its block's scale, an E8M0 byte 0xFF's block NaN (OCP MX 5.4.1: E8M0's one non-number)."""
-        held = jax.lax.bitcast_convert_type(self.scales, jnp.uint8)
-        exponents = jnp.repeat(held.astype(jnp.int32) - 127, formats_of.MXFP8.depth, axis=-1)
-        # Each E8M0 scale applied as its exponent (`precision.power2`, in normal powers of two): a scale
-        # below float32's least normal (2**-127 for inputs near 2**-120) would read as zero where a device
-        # flushes subnormals, though the value it scales to is normal; a subnormal value rounds once where
-        # the backend keeps subnormals (`jnp.ldexp` flushed it). Scaled at least in float32 (`power2`), then
-        # in `dtype` once, so a narrow one's range is its own.
-        values = power2(self.codes.astype(dtype), exponents).astype(dtype)
-        return jnp.where(exponents == 0xFF - 127, jnp.asarray(jnp.nan, dtype), values)
+        its block's E8M0 scale decoded through `bits.E8M0_SCALE_FORM` (OCP MX 5.4.1, row 9040), preserving
+        both `0x00` (`2^-127`) without FTZ flush and `0xFF` NaN."""
+        wide = jnp.promote_types(dtype, jnp.float32)
+        scales_f32, subnormal = e8m0_scales(self.scales)
+        rep_scale = jnp.repeat(scales_f32.astype(wide), formats_of.MXFP8.depth, axis=-1)
+        rep_sub = jnp.repeat(subnormal, formats_of.MXFP8.depth, axis=-1)
+        codes = self.codes.astype(wide)
+        # For 0x00 (2^-127), split into two normal powers (0.5 * 2^-126) so FTZ hardware never flushes the
+        # scale before multiplying normal codes (`448 * 2^-127 = 1.75 * 2^-119` stays normal).
+        sub_vals = (codes * jnp.asarray(0.5, wide)) * jnp.asarray(2.0 ** -126, wide)
+        return jnp.where(rep_sub, sub_vals, codes * rep_scale).astype(dtype)
 
 
+def e8m0_scales(scales: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Decode E8M0 `scales` via `bits.e8m0_decoded` into float32 powers (`2^(e-127)` for `1..254`, NaN
+    for `0xFF`, `2^-127` for `0x00`) plus the boolean mask of `0x00` subnormal blocks (row 9040)."""
+    held = jax.lax.bitcast_convert_type(scales, jnp.uint8).astype(jnp.uint32)
+    return bits.e8m0_decoded(held), (held & jnp.uint32(0xFF)) == 0
+
+FP8_STAGE = packed.FP8_STEP
+"""Depth unit of free-layout FP8 weight staging (`Fp8Weights`, 64 depths = 16 uint32 words per column)."""
+
+
+def fp8_staged_rows(depth: int) -> np.ndarray:
+    """Depth permutation for `Fp8Weights` (`packed.fp8_staged_depth`): word `w` (`0..15`) of each 64-depth
+    group holds codes `0..3` at depths `16 * code + w`, so inline decode writes four contiguous 16-depth
+    bfloat16 slices per group (row 8548)."""
+    return _staged_rows(depth, packed.FP8_GROUP, bits.E4M3.width, packed.fp8_staged_depth, "FP8 weight")
+
+def _fp8_minifloat(fmt: str) -> tuple[bits.Minifloat, jnp.dtype]:
+    if fmt == "e4m3":
+        return bits.E4M3, jnp.dtype(jnp.float8_e4m3fn)
+    if fmt == "e5m2":
+        return bits.E5M2, jnp.dtype(jnp.float8_e5m2)
+    raise ValueError(f"Fp8Weights format must be 'e4m3' or 'e5m2', got {fmt!r}")
+
+
+def fp8_form_version(fmt: str) -> np.ndarray:
+    """8-byte digest identifying the free-layout encoder and staged order for `Fp8Weights` (`fmt`)."""
+    minifloat, _ = _fp8_minifloat(fmt)
+    form, _ = bits.fp8_form(minifloat)
+    return form_version(form.version, fp8_staged_rows(FP8_STAGE))
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class Fp8Weights:
+    """Free-layout FP8 weight matrix `[..., depth, width]` packed 4 codes per `uint32` word in the GEMM
+    staged depth order (`fp8_staged_rows`) via `bits.E4M3_BFLOAT16_FORM` or `bits.E5M2_BFLOAT16_FORM` for
+    sm80 GEMM mainloop decode (row 8548): `words` `[..., width, depth // 4]` uint32, per-tensor/per-column
+    `scale` fp32, encoder `form` version bytes, and `fmt` static metadata."""
+
+    words: jax.Array | np.ndarray
+    scale: jax.Array | np.ndarray
+    form: jax.Array | np.ndarray
+    fmt: str = dataclasses.field(metadata={"static": True}, default="e4m3")
+
+    @classmethod
+    def of(cls, weights: jax.Array | np.ndarray, *, fmt: str = "e4m3",
+           scale: jax.Array | np.ndarray | float = 1.0) -> "Fp8Weights":
+        """Quantize/pack `weights` (`[..., depth, width]`, `depth % 64 == 0`) into staged `Fp8Weights`."""
+        minifloat, fp8_dtype = _fp8_minifloat(fmt)
+        source = jnp.asarray(weights)
+        if source.ndim < 2 or source.shape[-2] % FP8_STAGE != 0:
+            raise ValueError(f"Fp8Weights expects depth divisible by {FP8_STAGE}, got {source.shape}")
+        scale_arr = jnp.asarray(scale, jnp.float32)
+        if source.dtype == fp8_dtype:
+            codes = jax.lax.bitcast_convert_type(source, jnp.uint8).astype(jnp.uint32)
+        else:
+            scaled = (source.astype(jnp.float32) / scale_arr).astype(jnp.float32)
+            codes = bits.encoded(jax.lax.bitcast_convert_type(scaled, jnp.uint32), minifloat)
+        staged = codes[..., fp8_staged_rows(source.shape[-2]), :]
+        packed_words = bits.fp8_packed(jnp.swapaxes(staged, -1, -2), minifloat)
+        return cls(packed_words, scale_arr, fp8_form_version(fmt), fmt=fmt)
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return jnp.dtype(jnp.bfloat16)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        *groups, width, words = self.words.shape
+        return (*groups, 4 * words, width)
+
+    def checked(self) -> "Fp8Weights":
+        """Verify stored `form` version matches this Dew's checked-in encoder (`fp8_form_version`)."""
+        expected = fp8_form_version(self.fmt)
+        stored = np.asarray(self.form, np.uint8)
+        if stored.shape[-1:] != expected.shape or not np.all(stored == expected):
+            raise ValueError(f"Fp8Weights({self.fmt}) form version mismatch; repack from source weights")
+        return self
+
+    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
+        """Decode `words` back to `[..., depth, width]` in `dtype`, multiplied by `scale`."""
+        minifloat, _ = _fp8_minifloat(self.fmt)
+        words = jnp.asarray(self.words)
+        *batches, width, wdepth = words.shape
+        flat = words.reshape(-1, width, wdepth)
+        inv = np.argsort(fp8_staged_rows(wdepth * 4))
+        decoded = jax.vmap(lambda w: bits.fp8_codes(w.T, minifloat, jnp.float32)[inv])(flat)
+        out = decoded.reshape(*batches, wdepth * 4, width) * jnp.asarray(self.scale, jnp.float32)
+        return out.astype(dtype)
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
     """Block-scaled codes' values in `dtype`: each code times its `block` depths' E4M3 scale, read by the one
     decode of a block scale's (`bits.scales_decoded`, row 8675), exact in float32 (an E2M1 code times an E4M3
@@ -279,6 +373,7 @@ def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax
     return codes.astype(dtype) * jnp.repeat(held.astype(dtype), block, axis=-1)
 
 
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class NvFp4Block:
     """An NVFP4 operand as Blackwell's block-scaled tensor cores read it (row 4519's NVFP4 arm): `codes`

@@ -275,8 +275,8 @@ def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
         a = gram(matrices)
         scale = jax.lax.rsqrt(jnp.clip(jnp.abs(a).sum(axis=-1), min=_FIRST_STEP_EPS))
         side = scale[..., None, :] if tall else scale[..., :, None]
-        return stepped(matrices * side, a * scale[..., :, None] * scale[..., None, :], triple)
-
+        # Symmetric outer scale keeps `a` bitwise symmetric for native SYRK upper-triangle mirror (row 12024).
+        return stepped(matrices * side, a * (scale[..., :, None] * scale[..., None, :]), triple)
     def schatten(matrices: jax.Array, triple: jax.Array) -> jax.Array:
         a = gram(matrices, conjugate=False)
         scale = jax.lax.rsqrt(jnp.clip(jnp.linalg.norm(a, axis=(-2, -1), keepdims=True), min=_FIRST_STEP_EPS))

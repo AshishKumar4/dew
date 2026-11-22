@@ -1441,7 +1441,6 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         tail_deep = mosaic_gpu._dense_tail(tile_64x256, jnp.bfloat16, (8192, 4096, 28672), (2, 2), 216,
                                            balanced=True)
         assert tail_deep is None
-        assert not gmm._merges(ba_deep, tile_64x256, sm80)
         assert not gmm.balanced(ba_deep, tile_64x256, sm80)
         # Single-wave tail (waves=1, rem=40, 0 drift): planner produces one Tail plan passed straight to
         # emitter via `_stated` without re-pricing.
@@ -1453,8 +1452,6 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         tail_1w = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (2048, 1024, 4096), (2, 2), 216,
                                          balanced=stated_1w["balanced"])
         assert tail_1w is stated_1w["balanced"] and tail_1w is not None
-        assert tgmm._merges(ba_1w, tile_1w, sm80)
-        assert tgmm._balances(ba_1w, tile_1w, sm80)
         assert tgmm.balanced(ba_1w, tile_1w, sm80)
     # Multi-wave nonzero-tail check-1 witness: 320x128 -> grid=(5, 2)=10 tiles on 4 programs -> waves=2,
     # rem=2 (nonzero tail!). At l2=64KB and memory_rate=120GB/s, persistent L2 drift flips the tail decision
@@ -1625,3 +1622,147 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         assert not rec.get("error"), rec
         assert rec["kernels"], rec
         assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+def test_explicit_target_derivation_sm120_and_refusal_under_mismatched_ambient_gpu():
+    """Deriving and pricing `MosaicGmm` for an explicit `target` reads that target's bundle (`MmaFed` 60
+    held regs on sm120 vs 65 on sm100) and explicit-target refusals regardless of the ambient GPU, with no
+    `_with_target` override (rows 12011, 11889)."""
+    from dew.nn.kernels.templates import report
+
+    gmm = grouped_matmul.MosaicGmm()
+    assert not hasattr(gmm, "_with_target")
+    sm120 = generation.gpu_target("sm120")
+    sm86 = generation.gpu_target("sm86")
+    x = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((1, 4096, 4096), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    ba = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+
+    with generation.assumed("sm120"):
+        expected_tile = gmm.derived(ba, sm120)
+        assert expected_tile is not None
+        expected_regs = gmm.registers(ba, expected_tile, sm120)
+
+    for ambient in ("sm90", "sm100"):
+        with generation.assumed(ambient):
+            got_tile = gmm.derived(ba, sm120)
+            assert got_tile == expected_tile
+            assert gmm.registers(ba, expected_tile, sm120) == expected_regs
+
+    # Explicit-target refusal recorded under sm86 is honored when deriving for sm86 under ambient sm90.
+    with report.refusals():
+        with generation.assumed("sm86"):
+            first = gmm.derived(ba, sm86)
+            assert first is not None
+            sm86_id = report._identity(gmm, ba, sm86)
+        report.refuse([(sm86_id, first, frozenset({gmm.KERNEL}))])
+        with generation.assumed("sm90"):
+            stepped = gmm.derived(ba, sm86)
+            assert stepped != first
+
+
+@pytest.mark.parametrize(("offset", "after_cast"), [(False, False), (True, False), (False, True)])
+def test_stream_rms_norm_gemm_holds_check_1_and_lowers(offset: bool, after_cast: bool):
+    """`gemm.stream_rms_norm_gemm` pre-pass + GEMM prologue forward and backward hold check 1 against
+    `norms.rms_normalized` + `dot`, and lower through Mosaic GPU on sm80/sm90 (row 6104)."""
+    from dew.nn.norms import rms_normalized
+
+    m, k, n = 64, 64, 64
+
+    def draw(seed):
+        rng = np.random.default_rng(6104 + seed)
+        return (
+            jnp.asarray(rng.standard_normal((m, k)) / np.sqrt(k), jnp.bfloat16),
+            jnp.asarray(rng.standard_normal((m, k)) / np.sqrt(k), jnp.bfloat16),
+            jnp.asarray(rng.uniform(0.8, 1.2, size=(k,)), jnp.float32),
+            jnp.asarray(rng.standard_normal((k, n)) / np.sqrt(k), jnp.bfloat16),
+            jnp.asarray(rng.standard_normal((m, k)), jnp.bfloat16),
+            jnp.asarray(rng.standard_normal((m, n)), jnp.bfloat16),
+        )
+
+    def run_dew(x, branch, scale, rhs, ds, dy):
+        def fn(a, b, s, w):
+            return gemm.stream_rms_norm_gemm(a, b, s, w, offset=offset, after_cast=after_cast)
+
+        outs, pull = jax.vjp(fn, x, branch, scale, rhs)
+        return outs, pull((ds, dy))
+
+    def run_ref(x, branch, scale, rhs, ds, dy, *, dtype=jnp.bfloat16, wide=jnp.float32):
+        def fn(a, b, s, w):
+            stream = (a.astype(wide) + b.astype(wide)).astype(dtype)
+            normed = rms_normalized(stream, s, 1e-6, dtype, scale_offset=offset,
+                                    scale_after_cast=after_cast, fp32_statistics=True, implementation="xla")
+            y = jax.lax.dot(normed, w, preferred_element_type=wide).astype(dtype)
+            return stream, y
+
+        outs, pull = jax.vjp(fn, x.astype(dtype), branch.astype(dtype), scale.astype(wide), rhs.astype(dtype))
+        return outs, pull((ds.astype(dtype), dy.astype(dtype)))
+
+    assert_as_exact(
+        jax.jit(run_dew), jax.jit(run_ref), draw,
+        f"stream_rms_norm_gemm offset={offset} after_cast={after_cast}", seeds=SEEDS,
+        truth_fn=functools.partial(run_ref, dtype=jnp.float64, wide=jnp.float64),
+    )
+
+    for gpu in ("sm80", "sm90"):
+        if generation.compile_only_gpus(gpu):
+            mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
+            xs = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+            bs = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+            ss = jax.ShapeDtypeStruct((256,), jnp.float32)
+            ws = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+            with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh),
+                  generation.chosen(grouped_matmul="mosaic")):
+                jax.jit(lambda a, b, s, w: gemm.stream_rms_norm_gemm(
+                    a, b, s, w, offset=offset, after_cast=after_cast)).trace(xs, bs, ss, ws).lower(
+                    lowering_platforms=("cuda",))
+
+
+def test_derivation_honors_carved_out_resource_budgets():
+    """`derivation.derived` accepts carved-out `shared_budget` and `max_consumers` limits below the device
+    whole budget (row 1762)."""
+    from dew.nn.kernels.templates import bundles, resources
+    from dew.nn.kernels.templates.gemm import derivation
+
+    sm90 = generation.gpu_target("sm90")
+    gmm = grouped_matmul.MosaicGmm()
+    x = jax.ShapeDtypeStruct((2048, 2048), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((1, 2048, 2048), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    ba = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+    layouts = bundles.groups("sm90", jnp.bfloat16, stated=True)[0]
+    carved_smem = 96 * 1024
+    tile = derivation.derived(
+        layouts, rows=2048, depth=2048, width=2048, dtype=jnp.bfloat16,
+        multiprocessors=sm90.multiprocessors or 132, target=sm90,
+        candidate=lambda t: gmm.candidate(ba, t, sm90),
+        launch_of=lambda t: gmm.launch_of(ba, t, dataclasses.replace(sm90, shared_limit=carved_smem)),
+        grouped=False, dense=True, shared_budget=carved_smem, max_consumers=1,
+    )
+    assert tile is not None
+    assert tile.warpgroups == 1
+    assert gmm.staged_bytes(ba, tile, sm90) <= resources.program_shared(carved_smem, tile.programs)
+
+
+def test_prologued_custom_jvp_is_picklable():
+    """`gemm._prologued` uses a top-level picklable `_ProloguedTangent` and passes `prologue` directly
+    without a local `<lambda>`, avoiding GPU-tier prepare serialization failures."""
+    import operator
+    import pickle
+
+    tangent_rule = gemm._ProloguedTangent(operator.add, functools.partial(jax.jvp, operator.add))
+    restored = pickle.loads(pickle.dumps(tangent_rule))
+    assert restored.primal is tangent_rule.primal
+    assert restored.prologue_jvp.func is tangent_rule.prologue_jvp.func
+    assert restored.prologue_jvp.args == tangent_rule.prologue_jvp.args
+    wrapped = gemm._prologued(operator.add, functools.partial(jax.jvp, operator.add))
+    assert wrapped.fun.__name__ != "<lambda>"
+    x = jnp.asarray([[1.0, 2.0], [3.0, 4.0]], jnp.float32)
+    y = jnp.asarray([[0.5, 1.5], [2.5, 3.5]], jnp.float32)
+    dx = jnp.ones_like(x)
+    dy = jnp.full_like(y, 2.0)
+    np.testing.assert_array_equal(np.asarray(wrapped(x, y)), np.asarray(x + y))
+    primal_out, tangent_out = restored((x, y), (dx, dy))
+    np.testing.assert_array_equal(np.asarray(primal_out), np.asarray(x + y))
+    np.testing.assert_array_equal(np.asarray(tangent_out), np.asarray(dx + dy))

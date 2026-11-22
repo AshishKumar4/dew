@@ -30,7 +30,8 @@ from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
-            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False) -> Tiles | None:
+            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
+            shared_budget: int | None = None, max_consumers: int | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -94,6 +95,9 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       cluster's tiles one program's.
 
     None where no tile holds."""
+    if shared_budget is not None:
+        limit = min(target.shared_limit, shared_budget) if target.shared_limit else shared_budget
+        target = dataclasses.replace(target, shared_limit=limit)
     # The facts the layouts share (their instruction family's); each layout's registers bound the shapes.
     family = layouts[0]
     columns = _derived_columns(family, width, dtype, units[1])
@@ -127,9 +131,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # further consumers would compute padding alone; where groups average a role's rows, a routing's groups
     # past it keep the further consumers' rows real. Row 3622, H100 (FS-3622-AB1/AB2-h100): one consumer ran
     # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
-    most = min(family.consumers, CONSUMERS)
+    most = min(family.consumers, CONSUMERS if max_consumers is None else min(CONSUMERS, max_consumers))
     whole = rows >= family.role_rows if grouped else ragged or rows % (family.role_rows * most) == 0
-    # The most consumers the call takes, a cooperative tile holding each consumer's registers so its
     # balanced side, and with it each operand's reads a FLOP, at least one consumer's (CUTLASS's split, 2-7%
     # faster on every H100 scoreboard row); where no tile of theirs holds, one. Each at the most programs
     # that hold its tile.

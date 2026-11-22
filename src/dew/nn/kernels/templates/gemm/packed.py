@@ -6,10 +6,7 @@ scale, exactly, into bfloat16: into shared-memory buffers its products read as t
 the left operand they take from registers, the staged order the warpgroup MMA's fragment, so no decoded stage
 reaches shared memory."""
 
-import contextlib
-import contextvars
 import dataclasses
-import functools
 from typing import Any
 
 import jax
@@ -19,7 +16,6 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
-from dew.nn.kernels import launches
 from dew.nn.kernels.templates import inline_forms, product as product_formats, resources
 
 NVFP4_GROUP = 128
@@ -39,6 +35,28 @@ NVFP4_STEP = 256
 """The depth an NVFP4 matrix's step decodes (`gmm`'s `scales`): two 128-depth groups of its staged order, so
 each column's block scales are a 16-byte row, a copy's least."""
 
+FP8_GROUP = 64
+"""Dew: the depths an FP8 free-layout weight matrix's staged order groups (`fp8_staged_depth`): sixteen uint32
+words a column (a 64-byte cp.async/TMA row), each word's four codes decoding into sixteen-depth slices."""
+
+FP8_STEP = 64
+"""Minimum depth step for inline FP8 weight decode in the GEMM mainloop (`mosaic_gpu.gmm`'s `packed_fp8`,
+row 8548): one 64-depth group of sixteen uint32 words per column, fitting sm80 `mma.sync`'s 64-deep steps."""
+
+
+def fp8_staged_depth(group, word, code):
+    """Dew: the depth `formats.fp8_staged_rows` gives word `word`'s code `code` of 64-depth `group`."""
+    return FP8_GROUP * group + 16 * code + word
+
+
+def fp8_minifloat(fmt: str) -> bits.Minifloat:
+    """Resolve `'e4m3'` / `'e5m2'` to its `bits.Minifloat` descriptor."""
+    if fmt == "e4m3":
+        return bits.E4M3
+    if fmt == "e5m2":
+        return bits.E5M2
+    raise ValueError(f"packed FP8 format must be 'e4m3' or 'e5m2', got {fmt!r}")
+
 
 def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_lhs: bool, depth: int,
           width: int) -> None:
@@ -54,29 +72,23 @@ def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_l
                          f"{tiles}")
 
 
-CONSUMER = "wgmma"
-"""Consumer name in `bits.BitTransform.fragments` read by the packed warpgroup-MMA decode (algebra.md §7.4,
-row 11984)."""
-
-
-def consumer_layout(transform: bits.BitTransform = bits.NVFP4_BFLOAT16):
-    """The register fragment layout declared by `transform.fragments` for `CONSUMER`, resolved lazily from
-    `mosaic_sm90.WGMMA.layout` (rows 8676, 11984). Refuses a transform naming no entry for `CONSUMER`."""
-    entry = transform.fragments.get(CONSUMER)
-    if entry is None:
-        raise ValueError(f"{transform.name}: no fragment layout declared for consumer {CONSUMER!r}")
-    if entry != "wgmma":
-        raise ValueError(f"{transform.name}: unsupported consumer fragment layout {entry!r}")
-    from dew.nn.kernels.templates import mosaic_sm90
-
-    return mosaic_sm90.WGMMA.layout
-
+def fp8_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, transpose_lhs: bool,
+              depth: int, width: int) -> None:
+    """Refuse a free-layout FP8 packed weight call (`gmm`'s `packed_fp8`, row 8548) its decode cannot take:
+    words `[groups, width, depth // 4]` uint32 read transposed in 64-deep steps and 64-column tiles with no
+    prologue, pair, cluster, split, or swap (epilogue allowed so per-tensor/column scale fuses)."""
+    fp8_minifloat(fmt)
+    if (not transpose_rhs or rhs.dtype != jnp.uint32 or rhs.shape[1:] != (width, depth // 4)
+            or depth % FP8_GROUP or tiles.block_k % FP8_STEP or tiles.block_n % 64
+            or prologue is not None or paired is not None or transpose_lhs
+            or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
+        raise ValueError(f"a packed FP8({fmt}) matrix {rhs.shape} is read transposed in {FP8_STEP}-deep "
+                         f"steps and 64-col tiles with no prologue, pair, cluster or split, not {tiles}")
 
 def rows_supported(family) -> bool:
     """Whether `family`'s products read an NVFP4 matrix decoded in registers (`rows_decoded`): its register
-    fragment layout matches the consumer layout declared by `bits.NVFP4_BFLOAT16.fragments`."""
-    return family.layout == consumer_layout()
-
+    bundle name is declared in `bits.NVFP4_BFLOAT16.fragments` (row 12038)."""
+    return family.name in bits.NVFP4_BFLOAT16.fragments
 
 def refused(lhs, rhs, scales, tiles, family, *, packed_rows: bool, dense: bool, transpose_rhs: bool,
             transpose_lhs: bool, hooked: tuple, depth: int, width: int) -> None:
@@ -106,15 +118,14 @@ def rows_taken(lhs, scales, tiles, family, *, dense: bool, transpose_rhs: bool, 
                          f"split, not by {tiles}")
 
 
-def decoding(decoded: list, tiles, wg, interpret: bool) -> "Decoding | None":
+def decoding(decoded: list, tiles, wg, interpret: bool, *, fp8_fmt: str | None = None) -> "Decoding | None":
     """Dew: consumer `wg`'s decode of a packed matrix's stages into `decoded`'s buffers (`gmm_allocations`'),
     shared or its own (`shared_decode`); None for a matrix of no words."""
     if not decoded:
         return None
     if shared_decode(tiles, interpret=interpret):
-        return Decoding(decoded[0], wg, tiles.warpgroups)
-    return Decoding(decoded[0].at[wg], 0, 1)
-
+        return Decoding(decoded[0], wg, tiles.warpgroups, fp8_fmt=fp8_fmt)
+    return Decoding(decoded[0].at[wg], 0, 1, fp8_fmt=fp8_fmt)
 
 def shared_decode(tiles, *, interpret) -> bool:
     """Dew: whether a packed matrix's consumers share its decoded stages, each decoding its share of the
@@ -130,15 +141,17 @@ def shared_decode(tiles, *, interpret) -> bool:
 class Decoding:
     """Dew: a consumer's decode of a packed matrix's stages (`_gmm_step`'s): its `buffers` (`[stages,
     columns, depth]` bfloat16), and with `consumers` sharing them, its own share of the columns (`wg`'s),
-    after which they meet (`met`)."""
+    after which they meet (`met`). Decodes NVFP4 when `fp8_fmt` is None, or free-layout FP8 (`'e4m3'` /
+    `'e5m2'`) when set (row 8548)."""
 
     buffers: Any
     wg: Any
     consumers: int
+    fp8_fmt: str | None = None
 
-    def decode(self, index, slots, interpret: bool):
-        """Step `index`'s stage of words and scales (`slots`'), this consumer's share of it, decoded into
-        its buffer, which it returns."""
+    def decode(self, index, slots, interpret: bool, *, layout=None):
+        """Step `index`'s stage of words (and NVFP4 scales) (`slots`'), this consumer's share of it, decoded
+        into its buffer, which it returns."""
         if self.consumers > 1:
             # A tile's first step restarts the buffers' rotation (`index` is the tile's own): every consumer
             # has drained its last tile's products, which read them, before any decodes into them.
@@ -146,8 +159,12 @@ class Decoding:
         buffer = self.buffers.at[index % self.buffers.shape[0]]
         columns = buffer.shape[0] // self.consumers
         mine = pl.ds(self.wg * columns, columns) if self.consumers > 1 else pl.ds(0, buffer.shape[0])
-        words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // 128)]
-        stage_decoded(words, slots['scales'].at[mine], buffer.at[mine], interpret)
+        if self.fp8_fmt is not None:
+            words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // FP8_GROUP)]
+            stage_decoded_fp8(words, buffer.at[mine], self.fp8_fmt, interpret, layout=layout)
+        else:
+            words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // NVFP4_GROUP)]
+            stage_decoded(words, slots['scales'].at[mine], buffer.at[mine], interpret, layout=layout)
         return buffer
 
     def met(self) -> None:
@@ -164,33 +181,34 @@ DECODE_BARRIER = 15
 past Mosaic GPU's own (0, the block's; 1 on, a warpgroup's)."""
 
 
-def stage_decoded(words, scales, out, interpret: bool) -> None:
+def stage_decoded(words, scales, out, interpret: bool, *, layout=None) -> None:
     """Dew: a stage of an NVFP4 matrix (`words`, each 128 depths' `[columns, 16]` uint32 in the staged order,
     `formats.staged_rows`; `scales` `[columns, depth / 16]` E4M3) decoded into `out` (`[columns, depth]`
     bfloat16), each code's sixteen-depth slice where the staged order puts it (`lanes`)."""
-    for group, code, lane in lanes(words, scales, interpret):
+    for group, code, lane in lanes(words, scales, interpret, layout=layout):
         out[:, pl.ds(nvfp4_staged_depth(group, 0, code), product_formats.NVFP4.depth)] = lane
 
 
-def rows_decoded(words, scales, interpret: bool) -> jax.Array:
+def rows_decoded(words, scales, interpret: bool, *, layout=None) -> jax.Array:
     """Dew: a stage of an NVFP4 matrix's rows (`stage_decoded`'s, its columns the products' rows: a swapped
     product's left operand, row 5387) decoded into registers, `[rows, depth]` bfloat16 in the warpgroup MMA's
     fragment layout: each code's slice concatenated in the depths' own order, which is the staged order's
     (`nvfp4_staged_depth`: a group's code `c` holds its depths `16c` to `16c + 15`, a word's place among
     them), and in which a thread holds of each sixteen depths the words it loaded (a fragment's two adjacent
     columns of each eight), so no value moves between threads."""
-    return jnp.concatenate([lane for _, _, lane in lanes(words, scales, interpret)], axis=1)
+    return jnp.concatenate([lane for _, _, lane in lanes(words, scales, interpret, layout=layout)], axis=1)
 
 
-def lanes(words, scales, interpret: bool):
+def lanes(words, scales, interpret: bool, *, layout=None):
     """Dew: each code's sixteen-depth slice of a stage (`[columns, 16]` bfloat16), with its group and code,
     group by group: each 128 depths' sixteen words a column give, code by code, its eight slices
     (`bits.NVFP4_BFLOAT16_FORM`'s registers, each split into its two bfloat16 lanes, `_nvfp4_lanes`), each
     times its block's scale over `bits.NVFP4_OWED`, exactly: every value of an E2M1 code times a power-of-two
-    scale within bfloat16's range. Its registers lie in the warpgroup MMA's fragment layout, in which a
+    scale within bfloat16's range. Its registers lie in the issuing family's fragment `layout`, in which a
     column's scale is a column vector and a lane's slice a contiguous store (the strided layout found no
     assignment for this decode); interpreted, arrays."""
-    layout = None if interpret else consumer_layout()
+    layout = None if interpret else layout
+
     def loaded(ref):
         return ref[...] if layout is None else plgpu.load(ref, layout=layout, optimized=False)
     owed = bits.scales_decoded(jax.lax.bitcast_convert_type(loaded(scales), jnp.uint8)) * jnp.float32(
@@ -216,41 +234,17 @@ def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:
             for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
 
 
-_EPILOGUE_LAYOUT: contextvars.ContextVar[Any] = contextvars.ContextVar("gemm_epilogue_layout", default=None)
-"""Active GPU accumulator register layout while tracing a compiled GEMM epilogue (`encode_tile`)."""
-
-
-@contextlib.contextmanager
-def epilogue_layout(layout):
-    """Bind `layout` as the active compiled-epilogue register layout for `encode_tile` (row 8547)."""
-    token = _EPILOGUE_LAYOUT.set(layout)
-    try:
-        yield
-    finally:
-        _EPILOGUE_LAYOUT.reset(token)
-
-
-_MINIFLOAT_DTYPES = {bits.E4M3: jnp.dtype(jnp.float8_e4m3fn), bits.E5M2: jnp.dtype(jnp.float8_e5m2)}
-
-
-def encode_tile(x: jax.Array, minifloat: bits.Minifloat) -> jax.Array:
-    """Encode fp32 tile `x` into `minifloat` codes via `bits.encode_form`: inline PTX
-    (`inline_forms.registers`) inside a compiled GPU epilogue, or `BitForm.traced` when interpreted or
-    running outside a GPU kernel (row 8547)."""
-    words = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    form = bits.encode_form(minifloat)
-    layout = _EPILOGUE_LAYOUT.get() if launches.interpreting() is False else None
-    codes = (form.traced(words)[0] if layout is None
-             else inline_forms.registers(form, words, layout)[0]).astype(jnp.uint8)
-    target_dtype = _MINIFLOAT_DTYPES.get(minifloat)
-    return jax.lax.bitcast_convert_type(codes, target_dtype) if target_dtype is not None else codes
-
-
-def _quantized_epilogue(minifloat: bits.Minifloat, acc: jax.Array,
-                        scale: jax.Array | None = None) -> jax.Array:
-    return encode_tile(acc if scale is None else acc * scale, minifloat)
-
-
-def quantize_epilogue(minifloat: bits.Minifloat):
-    """GEMM epilogue packing fp32 accumulators to `minifloat` codes (`bits.encode_form`, row 8547)."""
-    return functools.partial(_quantized_epilogue, minifloat)
+def stage_decoded_fp8(words, out, fmt: str, interpret: bool, *, layout=None) -> None:
+    """Decode a stage of free-layout FP8 words (`[columns, 16]` uint32 per 64-depth group) into `out`
+    (`[columns, depth]` bfloat16) via `bits.E4M3_BFLOAT16_FORM` / `bits.E5M2_BFLOAT16_FORM` (row 8548)."""
+    minifloat = fp8_minifloat(fmt)
+    form, shift = bits.fp8_form(minifloat)
+    active = None if interpret else layout
+    for group, group_words in enumerate(words):
+        loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
+                                                                    optimized=False)
+        decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
+        lanes_bf16 = [bits.restored(half, jnp.bfloat16, shift=shift) for register in decoded
+                      for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
+        for code, lane in enumerate(lanes_bf16):
+            out[:, pl.ds(fp8_staged_depth(group, 0, code), 16)] = lane

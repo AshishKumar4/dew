@@ -125,6 +125,86 @@ def a_fused_projection_trains_its_producer_and_epilogue():
                         "fused projection producer and epilogue update", seeds=8, truth_fn=reference)
 
 
+def native_syrk_holds_check_1_on_this_gpu(polynomial: bool, transpose: bool):
+    """Native Mosaic SYRK (`gemm.symmetric_gram` / `gemm.symmetric_polynomial`) holds check 1 forward and
+    backward at production widths against XLA dot_general from float64 truth (rows 11941, 5972)."""
+    from dew import newton_schulz as ns
+    from dew.nn.kernels import gemm
+
+    shape = (2, 256, 256) if polynomial else ((2, 512, 256) if transpose else (2, 256, 512))
+    coeffs_host = np.asarray(ns.NEWTON_SCHULZ, np.float32)
+
+    def draw(seed):
+        rng = np.random.default_rng(11941 + seed)
+        arr = rng.normal(size=shape) / np.sqrt(shape[-1])
+        if polynomial:
+            arr = 0.5 * (arr + np.swapaxes(arr, -1, -2))
+        return (arr.astype(jnp.bfloat16), rng.normal(size=(2, 256, 256)).astype(jnp.bfloat16))
+
+    def run_dew(x, cot):
+        def fn(a):
+            if polynomial:
+                return gemm.symmetric_polynomial(a, jnp.asarray(coeffs_host, jnp.float32))
+            return gemm.symmetric_gram(a, transpose=transpose)
+
+        with generation.chosen(grouped_matmul="mosaic"):
+            y, pull = jax.vjp(fn, x)
+            return y, pull(cot)[0]
+
+    def run_plain(x, cot, *, dtype=jnp.float32, out_dtype=jnp.bfloat16):
+        def fn(a):
+            if polynomial:
+                sq = jax.lax.dot_general(a, a, (((2,), (1,)), ((0,), (0,))), preferred_element_type=dtype)
+                c = jnp.asarray(coeffs_host, dtype)
+                return (c[0] * jnp.eye(256, dtype=dtype) + c[1] * a.astype(dtype) + c[2] * sq).astype(
+                    out_dtype)
+            axis = 1 if transpose else 2
+            return jax.lax.dot_general(a, a, (((axis,), (axis,)), ((0,), (0,))),
+                                       preferred_element_type=dtype).astype(out_dtype)
+
+        y, pull = jax.vjp(fn, x.astype(out_dtype))
+        return y, pull(cot.astype(out_dtype))[0]
+
+    assert_as_exact(jax.jit(run_dew), jax.jit(run_plain), draw,
+                    f"native syrk poly={polynomial} tr={transpose}", seeds=4,
+                    truth_fn=functools.partial(run_plain, dtype=jnp.float64, out_dtype=jnp.float64))
+
+
+def native_hopper_cluster2_balanced_tail_holds_check_1():
+    """Native Hopper `cluster=2` dense forward with balanced tail holds check 1 against XLA dot_general
+    from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151)."""
+    from dew.nn.kernels import gemm
+
+    def draw(seed):
+        rng = np.random.default_rng(10151 + seed)
+        return ((rng.normal(size=(2048, 2560)) / np.sqrt(2560)).astype(jnp.bfloat16),
+                (rng.normal(size=(2560, 8192)) / np.sqrt(2560)).astype(jnp.bfloat16))
+
+    def dew_fn(x, w):
+        with generation.chosen(grouped_matmul="mosaic"):
+            return gemm.gemm(x, w, out_dtype=jnp.bfloat16)
+
+    def plain(x, w, *, wide=jnp.float32, out=jnp.bfloat16):
+        return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
+
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x2560x8192",
+                    seeds=4, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
+def _syrk_and_tail_cells():
+    return [
+        *(Cell(f"native Mosaic SYRK holds check 1: {name} poly={poly} tr={tr}",
+               functools.partial(native_syrk_holds_check_1_on_this_gpu, poly, tr), name,
+               fault="native SYRK upper-triangle mirror store (row 11941)" if not poly and not tr else None,
+               native={"launch": "syrk", "poly": str(poly), "transpose": str(tr)})
+          for name in ("sm90", "sm80")
+          for poly, tr in ((False, False), (False, True), (True, False))),
+        Cell("native Hopper cluster=2 balanced tail holds check 1",
+             native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
+             native={"launch": "cluster2 tail", "pass": "forward"}),
+    ]
+
+
 PARTIAL_TILE = "a TMA copy of a partial tile, which reads zeros and clips stores where the interpreter pads"
 """Why a width no tile divides stays on the GPU (the GEMM lane, 11-11)."""
 
@@ -248,6 +328,7 @@ def test_the_gemm_kernels_run_on_this_gpu():
                       else None),
                native={"launch": "nvfp4 packed"})
           for name in ("sm90", "sm80") for edge in contracts_gemm.EDGES),
+        *_syrk_and_tail_cells(),
         *(Cell(f"the warpgroup scan walks the recurrence: {positions} positions"
                f"{' reversed' if reverse else ''}{' exclusive' if exclusive else ''}",
                functools.partial(warpgroup_scan.the_scan_walks_the_recurrence_on_this_gpu, positions, reverse,

@@ -14,6 +14,7 @@ from jax._src.pallas.mosaic_gpu import (
 
 from dew.nn.derivatives import marked_call_p
 from dew.nn.kernels import generation, launches
+from dew.nn.kernels.templates import bundles
 from dew.nn.programs import equations
 
 
@@ -95,18 +96,27 @@ def _unsqueezed(hook, positions: tuple, tiles: int, *arguments):
 NO_HOOKS = Hooks()
 
 
-def _lowers(hook, tiles: tuple, sides, rules) -> bool:
+def _epilogue_layout(dtype, target):
+    """Accumulator register layout of `target`'s primary GPU bundle for `dtype`, or None on TPU/unbudgeted."""
+    if generation.tpu(target):
+        return None
+    groups = bundles.groups(target.generation, dtype, stated=True, tpu=False)
+    if not groups or not groups[0]:
+        return None
+    family = groups[0][0]
+    return family.layout if family.budgets_registers else None
+
+
+def _lowers(hook, tiles: tuple, sides, rules, *, layout=None) -> bool:
     """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on its `tiles` and its
     side tiles: Mosaic GPU's, at warpgroup semantics, have none for a transpose, which Triton's lowering
     takes. A marked span (`derivatives.marked_call_p`) lowers as its body, whose primitives are read."""
     if hook is None:
         return True
-    from dew.nn.kernels.templates.gemm import packed
+    from dew.nn.kernels.templates.gemm import quantized
 
     # Traced as a launch's body traces it, on tiles (`launches.tracing_body`).
-    layout = packed.consumer_layout() if rules is mosaic_gpu_lowering.mosaic_lowering_rules[
-        plgpu_core.WGxWG_SEMANTICS] else None
-    with launches.tracing_body(interpret=False), packed.epilogue_layout(layout):
+    with launches.tracing_body(interpret=False), quantized.epilogue_layout(layout):
         traced = jax.make_jaxpr(hook)(*tiles, *sides)
     return all(equation.primitive in rules or equation.primitive is marked_call_p
                for equation in equations(traced.jaxpr))
@@ -123,7 +133,8 @@ def lowering_rules(target) -> dict:
 def hook_lowers(hook, tiles: tuple, target) -> bool:
     """Whether `target`'s Mosaic launches take `hook` on `tiles` (`_lowers`, `lowering_rules`): a caller's
     hook asked before it is bound to a launch (`dew.nn.gated_mlp`'s gated product)."""
-    return _lowers(hook, tiles, (), lowering_rules(target))
+    dtype = tiles[0].dtype if tiles else jnp.bfloat16
+    return _lowers(hook, tiles, (), lowering_rules(target), layout=_epilogue_layout(dtype, target))
 
 
 def hooks_lower(ba, dtype, target) -> bool:
@@ -137,6 +148,7 @@ def hooks_lower(ba, dtype, target) -> bool:
                 for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)]
 
     return (_lowers(hooks.before(), (jax.ShapeDtypeStruct((128, 128), dtype),),
-                    tiles('prologue_operands', hooks.prologue_axes), rules)
+                    tiles('prologue_operands', hooks.prologue_axes), rules, layout=None)
             and _lowers(hooks.after(), (jax.ShapeDtypeStruct((128, 128), jnp.float32),) * hooks.accumulators,
-                        tiles('epilogue_operands', hooks.epilogue_axes), rules))
+                        tiles('epilogue_operands', hooks.epilogue_axes), rules,
+                        layout=_epilogue_layout(dtype, target)))
