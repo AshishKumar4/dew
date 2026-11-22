@@ -21,6 +21,7 @@ from dew.data.sources.base import (
     Shard,
     ShardManifest,
     Source,
+    Stated,
     View,
     _indexed_manifest,
     _uncounted,
@@ -91,7 +92,7 @@ class RecordSlice(View[Source]):
             raise ValueError(f"{self.describe()} exceeds the source's {records} records")
         return self.start, stop
 
-    def _own(self) -> Mapping[str, Callable[[], object]]:
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
         return {"held_out": lambda: self.start} if self.start else {}
 
     def lengths(self) -> np.ndarray | None:

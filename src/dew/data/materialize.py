@@ -70,7 +70,7 @@ from dew.data.pipeline import (
     with_children,
 )
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
+from dew.data.sources.base import Read, Rows, ShardManifest, Source, Stated, View, _uncounted
 from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
 
 _log = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ class _Memory(View[Source]):
         """Its source's facts, the counts only where it ran no stage over the source's rows."""
         return _uncounted(facts) if self.ran else facts
 
-    def _own(self) -> Mapping[str, Callable[[], object]]:
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
         """The counts it measured."""
         own = {key: (lambda value=value: value) for key, value in self.facts.items()}
         return {**own, "rows": lambda: len(self.held), "accepted": lambda: len(self.held)}

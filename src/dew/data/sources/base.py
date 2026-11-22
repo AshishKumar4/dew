@@ -22,7 +22,7 @@ import dataclasses
 import hashlib
 import itertools
 import logging
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, TypeGuard, runtime_checkable
 
 from dew._records import JSON, integer, json_value
@@ -130,6 +130,10 @@ def stated(source: Source) -> Mapping[str, object]:
     from dew.data.pipeline import Stated
 
     return source.stated() if isinstance(source, Stated) else {}
+
+
+type Stated = int | float | str | bool | None | Sequence[Stated] | Mapping[str, Stated]
+"""A fact a store or a view states of itself (`Source.metadata`): a count, a name, or those nested."""
 
 
 def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:
@@ -372,7 +376,7 @@ class View[S: Source]:
         where its rows are not its store's (`_uncounted`)."""
         return facts if self.rows in ("read", "described") else _uncounted(facts)
 
-    def _own(self) -> Mapping[str, Callable[[], object]]:
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
         """The facts it states of its own over its store's, each by the read that states it: the one place
         a view states them, read only where asked (`asked`)."""
         return {}

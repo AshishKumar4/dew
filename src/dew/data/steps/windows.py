@@ -16,7 +16,7 @@ import numpy as np
 from dew._records import boolean, finite, integer, json_value, listed, record, text
 from dew.batch import Batch
 from dew.data.pipeline import ACCOUNTS, CONSUMED, DOCUMENT, Documents, Windows
-from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
+from dew.data.sources.base import Read, Rows, ShardManifest, Stated, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import aligned
 
@@ -96,7 +96,7 @@ class WindowSource(View[TokenFiles]):
         del read
         return IndexedWindows({"text": self.tokens}, self.length, self.stride, "int32")
 
-    def _own(self) -> Mapping[str, Callable[[], object]]:
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
         return {"rows": lambda: len(self.records("indexed")),
                 "valid_targets": lambda: len(self.records("indexed")) * self.length}
 
