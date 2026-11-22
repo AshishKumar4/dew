@@ -243,8 +243,9 @@ _PRICED: contextvars.ContextVar[list | None] = contextvars.ContextVar('fused_gem
 
 def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, float | None, bool]:
     """`region`'s seconds on `target`, fused and unfused, from one model (`templates.cost`): the launch's
-    units overlapped at the whole device's rates (its products in their tensor mode, its operands, captured
-    arrays and outputs in device memory), plus its fixed launch (`GpuTarget.launch_seconds`), with its
+    seconds as a step's launch is priced (`cost.seconds`: its units overlapped at the whole device's rates,
+    its products in their tensor mode, its operands, captured arrays and outputs in device memory, or its
+    in-kernel span where longer, and its fixed launch, `GpuTarget.launch_seconds`), with its
     producer's element stage and its consumers' work in it, beside XLA's program of the producer's row or
     depth values where it has a prologue (a norm's statistics); and unfused, XLA's program forming the
     operand whole and writing it, the plain launch writing the product at its result dtype, then XLA's
@@ -254,18 +255,13 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     prices, an accurate sine, is no free work). Work at a rate the target leaves unread is the arms' alike
     but for a form's own (an accurate exp's integer operations on a GPU whose integer rate is unread, a
     B200's), which bars no fusion. None where the target states no tensor rate."""
-    rates = cost.rates(target, device=True)
-    if rates.tensor is None:
+    if cost.rates(target, device=True).tensor is None:
         return None, None, False
     product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands,
                                         precision=region.precision, on=target)
     operands = region.operand_bytes
     written = region.rows * region.width * jnp.dtype(region.result).itemsize
-    launch = target.launch_seconds or 0.0
     xla = algebra_cost.fused(target)
-
-    def launched(work: cost.Work) -> float:
-        return max(cost.units(work, rates)[0]) + launch
 
     def counted(body: jax_core.Jaxpr | None, forms: Mapping | None = None) -> cost.Work:
         # A program's work counted as a kernel's body is (`emission.emitted`): each operation of the CUDA
@@ -290,10 +286,10 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     # Fused, the consumers' special functions in the forms the launch compiles; in XLA's fusion, one MUFU an
     # element.
     launch_fused = product + counted(region.consumers, region.forms) + prologue + cost.Work(
-        device_bytes=operands + region.captured_bytes + region.output_bytes)
-    launch_unfused = product + cost.Work(device_bytes=operands + written)
-    fused_seconds = sides + launched(launch_fused)
-    unfused_seconds = forming + launched(launch_unfused)
+        device_bytes=operands + region.captured_bytes + region.output_bytes, kernels=1.0)
+    launch_unfused = product + cost.Work(device_bytes=operands + written, kernels=1.0)
+    fused_seconds = sides + cost.seconds(launch_fused, target)
+    unfused_seconds = forming + cost.seconds(launch_unfused, target)
     fused_work, unfused_work = fused_work + launch_fused, unfused_work + launch_unfused
     if region.consumers is not None:
         chain = counted(region.consumers) + cost.Work(
