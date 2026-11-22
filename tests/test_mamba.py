@@ -15,11 +15,9 @@ from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 from selective_support import (
     DIFFERENTIATED,
     FAINT_BESIDE_THE_LARGEST,
-    LONG_AXES,
     NEAR_THE_LARGEST,
     RATES_PAST_THE_RANGE,
     faint_beside_the_largest,
-    long_draw,
     near_the_largest,
     rate_past_the_range,
     recurred,
@@ -31,7 +29,7 @@ from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 
 from dew.interop import Pretrained
 from dew.nn.mixers.mamba import Mamba, selective_scan
-from dew.nn.ssm import affine_states
+from dew.nn.ssm import UNROLLED, affine_states
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 TINY = ROOT / 'mamba-tiny'
@@ -115,68 +113,6 @@ def test_an_affine_scans_faint_values_beside_float32s_largest_are_as_exact_as_th
     assert_as_exact(jax.jit(arm(scan)), exact, draw,
                     f"an affine scan beside float32's largest, {case}, along axis {axis}", seeds=FEWEST_SEEDS,
                     truth_fn=exact)
-
-
-@pytest.mark.parametrize('length', LONG_AXES)
-def test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence(length):
-    """Mamba's affine scan (`ssm.affine_states`) over an axis longer than a block (`long_draw`): its states,
-    every gradient and its decays' gradient of the writes' cotangent along a direction, on par from float64
-    with the recurrence a token at a time (`recurred`, check 1)."""
-    def scan(decay, write, entering):
-        return affine_states(decay, write, entering, axis=1)
-
-    def reference(decay, write, entering):
-        return recurred(decay, write, entering, axis=1)
-
-    def second(fn):
-        def run(decay, write, entering, cotangent):
-            def along(decay):
-                _, pull = jax.vjp(lambda write: fn(decay, write, entering), write)
-                return jnp.sum(pull(cotangent)[0] * 0.25)
-
-            return with_gradients(fn)(decay, write, entering, cotangent), jax.grad(along)(decay)
-
-        return run
-
-    exact = jax.jit(second(reference))
-    assert_as_exact(jax.jit(second(scan)), exact, functools.partial(long_draw, length),
-                    f"an affine scan over {length} tokens", seeds=FEWEST_SEEDS, truth_fn=exact)
-
-
-@pytest.mark.parametrize('length', LONG_AXES)
-def test_an_affine_scans_second_order_past_a_block_is_zero_where_it_is_structurally(length):
-    """Mamba's affine scan over decays of one half, writes of 1/8 from 5/8, its states' cotangents one but
-    1.75 2^127 at the last two tokens of the last whole block: its writes' cotangent's derivative, a quarter
-    of it summed, along the first token's decay, zero, as the recurrence's a token at a time, where a scan
-    of blocks' transpose met an overflowing cotangent with its last carry's zero, NaN (the head review of
-    84cf35dfe)."""
-    decay, write = jnp.full((length, 1), 0.5, jnp.float32), jnp.full((length, 1), 0.125, jnp.float32)
-    end = length // 64 * 64
-    cotangent = jnp.ones((length, 1), jnp.float32).at[end - 2:end].set(1.75 * 2.0 ** 127)
-
-    entering = jnp.full((1,), 0.625, jnp.float32)
-
-    def along(decay):
-        _, pull = jax.vjp(lambda write: affine_states(decay, write, entering, axis=0), write)
-        return jnp.sum(pull(cotangent)[0] * 0.25)
-
-    assert float(jax.grad(along)(decay)[0, 0]) == 0.0
-
-
-@pytest.mark.parametrize('length', LONG_AXES)
-def test_an_affine_scan_over_a_long_axis_takes_empty_lanes(length):
-    """Mamba's affine scan over an axis longer than a block, of no lanes: its states empty of its shape, where
-    blocks laid by `-1` divided by an empty lane's zero (the head review of 84cf35dfe)."""
-    empty = jnp.zeros((length, 0), jnp.float32)
-    assert affine_states(empty, empty, jnp.zeros((0,), jnp.float32), axis=0).shape == (length, 0)
-
-
-@pytest.mark.parametrize('length', LONG_AXES)
-def test_an_affine_scan_over_a_long_axis_takes_a_narrower_entering_state(length):
-    """Mamba's affine scan over an axis longer than a block, from a bf16 state entering float32 decays and
-    writes: its states float32, where a scan's carry kept the entering bf16 (the head review of 84cf35dfe)."""
-    decay, write = jnp.full((length, 4), 0.5, jnp.float32), jnp.full((length, 4), 0.25, jnp.float32)
-    assert affine_states(decay, write, jnp.ones((4,), jnp.bfloat16), axis=0).dtype == jnp.float32
 
 
 def test_an_affine_scans_second_derivative_beside_float32s_largest_is_as_exact_as_the_recurrence():
@@ -345,6 +281,18 @@ def test_a_document_start_drops_the_state_entering_it():
 DECODE_SEEDS = 8
 """The layer's cached decode's declared check-1 seeds against its parallel forward at each step's width,
 sized by `seeds_for` on armada."""
+
+
+@pytest.mark.parametrize('chunk', [0, UNROLLED + 1])
+def test_a_chunk_outside_its_straight_line_block_is_refused(chunk):
+    """A chunk of no tokens, or past the tokens `ssm.affine_states` runs straight-line (`ssm.UNROLLED`, row
+    8796), refused by a Mamba layer as it is built and by its scan (`selective_scan`) called alone."""
+    mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=chunk)
+    with pytest.raises(ValueError):
+        mixer.init(jax.random.key(0), jnp.zeros((1, 4, 8)))
+    x = jnp.zeros((1, 2 * UNROLLED + 2, 4))
+    with pytest.raises(ValueError):
+        selective_scan(x, x, jnp.zeros((4, 2)), x[..., :2], x[..., :2], jnp.zeros((4,)), chunk_size=chunk)
 
 
 def test_the_layer_decodes_as_it_prefills():
