@@ -111,13 +111,13 @@ class _Memory(View[Source]):
         return self.held
 
     def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """Its source's facts, the counts only where it ran no stage over the source's rows."""
-        return _uncounted(facts) if self.ran else facts
+        """Its source's facts, the counts only where it ran no stage over the source's rows, then the
+        counts it measured, held already."""
+        return {**(_uncounted(facts) if self.ran else facts), **self.facts}
 
     def _own(self) -> Mapping[str, Callable[[], Stated]]:
-        """The counts it measured."""
-        own = {key: (lambda value=value: value) for key, value in self.facts.items()}
-        return {**own, "rows": lambda: len(self.held), "accepted": lambda: len(self.held)}
+        """Its rows, as it holds them."""
+        return {"rows": lambda: len(self.held), "accepted": lambda: len(self.held)}
 
     def lengths(self) -> np.ndarray | None:
         return self.measured
