@@ -623,7 +623,7 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
                                 jnp.zeros((1, 1, 1, width), jnp.float64)], axis=2)
 
     assert_as_exact(jax.jit(ours), as_given(reference), draw,
-                    "finished split merge preserves subnormal initial mass", seeds=1)
+                    "finished split merge preserves subnormal initial mass", seeds=FEWEST_SEEDS)
 
 def test_resumable_split_merge_preserves_subnormal_initial_mass():
     """Row 10818: `algebra.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps its

@@ -291,7 +291,7 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
                 jnp.ones((*query.shape[:2], 4), jnp.float64))
 
     assert_as_exact(jax.jit(ours), as_given(reference), drawing(queries, keys, jnp.float32),
-                    "padding query and sink", seeds=1)
+                    "padding query and sink", seeds=8)
 
 SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi": ("alibi",),
                "temperature": ("temperature",), "key-bias": ("key",), "tile-bias": ("tile",),
@@ -521,7 +521,7 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
     with jax.enable_x64(new_val=True):
         wide_fn = jax.jit(functools.partial(run, wide=True))
         f32_fn = jax.jit(functools.partial(run, wide=False))
-        assert_as_exact(wide_fn, f32_fn, draw, "wide alibi parameter", seeds=1)
+        assert_as_exact(wide_fn, f32_fn, draw, "wide alibi parameter", seeds=8)
         import tier_wire
         if not tier_wire.preparing():
             assert wide_fn(*draw(0))[0].dtype == jnp.float64
@@ -645,7 +645,7 @@ def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
         _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
         return pull(dout)[0]
 
-    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "many small fp16 cotangents", seeds=1)
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "many small fp16 cotangents", seeds=8)
 
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype):
@@ -714,7 +714,7 @@ def test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv():
                           zeros)
         return pull(dout)[0]
 
-    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "fp32 weight below subnormal", seeds=1)
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "fp32 weight below subnormal", seeds=8)
 
 
 def test_a_small_fp16_cotangent_channel_beside_a_large_one_still_sums_into_dv():
@@ -735,7 +735,7 @@ def test_a_small_fp16_cotangent_channel_beside_a_large_one_still_sums_into_dv():
         _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
         return pull(dout)[0]
 
-    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "small fp16 cotangent channel", seeds=1)
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "small fp16 cotangent channel", seeds=8)
 
 
 def test_a_small_fp16_cotangent_beside_a_large_one_still_reaches_its_key():
@@ -756,7 +756,7 @@ def test_a_small_fp16_cotangent_beside_a_large_one_still_reaches_its_key():
         _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
         return pull(dout)[0]
 
-    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "small fp16 cotangent beside large", seeds=1)
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "small fp16 cotangent beside large", seeds=8)
 
 
 def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
@@ -781,7 +781,7 @@ def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
         _, pull = jax.vjp(lambda v: template.reference(query, key, v, spans, scale=1.0), value)
         return pull(dout)[0]
 
-    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "fp16 weight below subnormal", seeds=1)
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "fp16 weight below subnormal", seeds=8)
 
 def test_the_backward_resumes_queries_that_read_no_key():
     """A resumed partial over causal keys that begin at row starts (the second row's first queries see
