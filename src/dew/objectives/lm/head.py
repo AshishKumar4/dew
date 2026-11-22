@@ -13,7 +13,7 @@ more (`dew.training.memory.recompute_more`), reading the head the objective repo
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, Literal
 
 from flax import linen as nn
@@ -115,6 +115,19 @@ class HeadedObjective(Objective[Loss, Effects]):
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         return (self.head_program(self.model),)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # A model set in another's place, as a caller swaps one (a checkpoint's ranking), holds a head no
+        # trace has read: taken to be one matrix until one reads it (`_read_head`; row 11741's review).
+        if name == "model" and vars(self).get("model", value) is not value:
+            super().__setattr__("_head_matrix", True)
+        super().__setattr__(name, value)
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        # A module put in the model's place for a rung (`recompute_more`) holds the head the model held.
+        read = self._head_matrix
+        super().substitute(modules)
+        self._head_matrix = read
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.

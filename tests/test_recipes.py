@@ -149,18 +149,14 @@ def test_the_mixture_recipe_counts_each_sources_targets():
 @pytest.mark.mesh
 def test_the_mixture_recipe_counts_each_sources_targets_over_known_documents():
     """recipes/lm/mixture.py's count over three sources whose every document holds a known number of
-    targets (3, 5 and 7) is each source's targets among the first 24 documents its token mix draws: each
-    draw the source furthest below its share of the targets drawn (`WEIGHTS`), the first of equals, as the
-    token mix states it draws (`dew.data.mixing.TokenDeficit`; row 11750: a source counted zero, or a mix
-    of equal documents, passed)."""
+    targets (3, 5 and 7), named otherwise than its keys, is each source's targets among the first 24
+    documents its token mix draws: each draw the source furthest below its share of the targets drawn
+    (`WEIGHTS`, 70/20/10), the first of equals, as the token mix states it draws
+    (`dew.data.mixing.TokenDeficit`): 19 web documents, 3 code and 2 chat (row 11750: a source counted
+    zero, or a mix of equal documents, passed; its review: a source named otherwise counted zero)."""
     recipe = load("mixture", "recipes/lm")
     per = {"web": 3, "code": 5, "chat": 7}
     parts = {name: Memory([{"text": np.arange(1, count + 2, dtype=np.int32)} for _ in range(64)])
-             .read("memory").named(name) for name, count in per.items()}
-    drawn = dict.fromkeys(per, 0)
-    for _ in range(24):
-        total = sum(drawn.values())
-        name = max(per, key=lambda name: recipe.WEIGHTS[name] * total - drawn[name])
-        drawn[name] += per[name]
-    assert recipe.main(recipe.Args(show=24), parts) == drawn
+             .read("memory").named(f"source {name}") for name, count in per.items()}
+    assert recipe.main(recipe.Args(show=24), parts) == {"web": 57, "code": 15, "chat": 14}
 

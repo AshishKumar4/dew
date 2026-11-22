@@ -1000,6 +1000,10 @@ def test_a_run_saved_before_its_retired_and_unsettable_fields_loads_as_it_traine
     path.write_text(json.dumps({**earlier, "fields": {**today["fields"], "trainer": trainer,
                                                       "loop_message_additive": True}}))
     assert LMRunConfig.load(str(path)).loop_message_additive is None
+    # A trainer recorded by its class, as a subclass's is: its retired field taken off inside its record.
+    named = {"class": "dew.config.trainer:TrainerConfig", "fields": trainer}
+    path.write_text(json.dumps({**earlier, "fields": {**today["fields"], "trainer": named}}))
+    assert LMRunConfig.load(str(path)).trainer == LMRunConfig().trainer
     for record, additive in ((earlier, False), (today, True)):
         stated = {**record, "fields": {**record["fields"], "loop_message_additive": additive}}
         assert earlier_run(stated)["fields"]["loop_message_additive"] is additive, (record is today, additive)

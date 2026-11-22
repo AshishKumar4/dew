@@ -44,15 +44,15 @@ def sources(tok) -> dict[str, Pipeline]:
                revision="8e72b18ab4a29b52fbd6a39c1441f67d09633ade")
     conversations = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft", columns=("messages",),
                         revision="8049631c405ae6576f93f445c6b8166f76f5505a")
-    return {"web": web.read("streamed").map(text.tokenize(tok, eos=True)).named("web"),
-            "code": code.read("streamed").map(text.tokenize(tok, field="content", eos=True)).named("code"),
-            "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text")
-            .named("chat")}
+    return {"web": web.read("streamed").map(text.tokenize(tok, eos=True)),
+            "code": code.read("streamed").map(text.tokenize(tok, field="content", eos=True)),
+            "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text")}
 
 
 def mixed(parts: dict[str, Pipeline]) -> Pipeline:
-    """The three sources (`sources`) mixed at `WEIGHTS` by valid target tokens, unpacked."""
-    return mix([parts[name] for name in WEIGHTS], list(WEIGHTS.values()), by="tokens")
+    """The three sources (`sources`) mixed at `WEIGHTS` by valid target tokens, unpacked, each named by its
+    key, which its metrics are labelled by (`data/weighed_tokens/<source>`)."""
+    return mix([parts[name].named(name) for name in WEIGHTS], list(WEIGHTS.values()), by="tokens")
 
 
 def build(batch: int, seed: int = 0) -> Pipeline:

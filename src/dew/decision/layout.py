@@ -1253,9 +1253,14 @@ class SegmentLayout(Layout):
             return built([]), []
         rest = len(built([()] * len(copies)).tokens)
         # A joint row caps every copy that states no budget of its own (`max_state_tokens`).
-        counts = allocated([len(own) for own in ids], copies, self.max_len - rest, self.max_state_tokens)
+        counts = allocated([len(own) for own in ids], copies, self.max_len - rest, self._state_caps(copies))
         kept = [_kept(own, count, copy.keep) for own, count, copy in zip(ids, counts, copies, strict=True)]
         return built(kept), [(len(own), len(held)) for own, held in zip(ids, kept, strict=True)]
+
+    def _state_caps(self, copies: "Sequence[State]") -> list[int | None]:
+        """Each copy's cap in its own tokens: its own (`max_tokens`), or a joint row's (`max_state_tokens`)
+        where it gives none; the one cap a row's cut reads, whole or in pieces (`allocated`)."""
+        return [self.max_state_tokens if copy.max_tokens is None else copy.max_tokens for copy in copies]
 
     def _cut(self, built: Callable[[Sequence[str]], Rendered], texts: Sequence[str],
              copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, list[tuple[int, int]], int]:
@@ -1273,8 +1278,9 @@ class SegmentLayout(Layout):
         counts = [len(encoder.encode(text, add_special_tokens=False)) if text else 0 for text in texts]
         full = built(list(texts))
         # A copy kept whole is never cut, so its cap sends no row down the cutting path.
-        capped = any(copy.keep != "all" and copy.max_tokens is not None and copy.max_tokens < count
-                     for copy, count in zip(copies, counts, strict=True))
+        caps = self._state_caps(copies)
+        capped = any(copy.keep != "all" and cap is not None and cap < count
+                     for copy, cap, count in zip(copies, caps, counts, strict=True))
         if len(full.tokens) <= self.max_len and not capped:
             return full, [(count, count) for count in counts], 0
         if not isinstance(encoder, Offsets):
@@ -1283,7 +1289,7 @@ class SegmentLayout(Layout):
         offsets = [encoder.offsets(text) if text else ([], [], []) for text in texts]
         rest = len(built([""] * len(copies)).tokens)
         lengths = [len(own) for own, _, _ in offsets]
-        kept = allocated(lengths, copies, self.max_len - rest, self.max_state_tokens)
+        kept = allocated(lengths, copies, self.max_len - rest, caps)
 
         def piece(at: int, count: int | None = None) -> str:
             # A copy's first (or last) `count` tokens, at the character boundary their offsets give.
@@ -1296,10 +1302,9 @@ class SegmentLayout(Layout):
             return text[:ends[count - 1]] if copy.keep != "end" else text[starts[len(own) - count]:]
 
         def own_fits(at: int, count: int) -> bool:
-            # A capped copy's slice, re-encoded alone, holds no more than its cap, its own or the joint
-            # row's (`allocated`'s): a slice at a character boundary may encode to more tokens than it was
-            # counted by.
-            cap = self.max_state_tokens if copies[at].max_tokens is None else copies[at].max_tokens
+            # A capped copy's slice, re-encoded alone, holds no more than its cap (`_state_caps`): a slice at
+            # a character boundary may encode to more tokens than it was counted by.
+            cap = caps[at]
             sliced = piece(at, count)
             return cap is None or not sliced or len(encoder.encode(sliced, add_special_tokens=False)) <= cap
 
@@ -1322,7 +1327,7 @@ class SegmentLayout(Layout):
         # character a cut keeps: its walk stops at the first that overflows (row 11739's review: it
         # walked a long state's every prefix, each encoded whole).
         # Its tokens the byte vocabulary's own: a subclass encoding otherwise (merging bytes) may not grow.
-        grows = isinstance(encoder, ByteTokenizer) and type(encoder).encode is ByteTokenizer.encode
+        grows = getattr(encoder.encode, "__func__", None) is ByteTokenizer.encode
         for at, copy in enumerate(copies):
             if len(laid.tokens) > self.max_len or copy.keep == "all":
                 continue
@@ -1695,13 +1700,11 @@ class State:
 
 
 def allocated(lengths: Sequence[int], copies: "Sequence[State]", room: int,
-              default_cap: int | None = None) -> list[int]:
+              caps: Sequence[int | None]) -> list[int]:
     """How many of its own tokens each copy of the state keeps of `room` (`dew.data.tokens.share_tokens`):
     a copy kept whole (`keep="all"`) all of its `lengths`, whatever its cap, and the others what is
-    left, each at most its own cap (`max_tokens`, or `default_cap` where it gives none)."""
-    return share_tokens(lengths, room, caps=[default_cap if copy.max_tokens is None else copy.max_tokens
-                                             for copy in copies],
-                        whole=[copy.keep == "all" for copy in copies])
+    left, each at most its cap (`caps`, `SegmentLayout._state_caps`)."""
+    return share_tokens(lengths, room, caps=list(caps), whole=[copy.keep == "all" for copy in copies])
 
 
 def _least_kept(pairs: Sequence[tuple[int, int]]) -> tuple[int, int]:

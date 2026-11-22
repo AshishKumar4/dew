@@ -39,9 +39,10 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     by today's names (`dew.data.records.earlier_chains`); an encoder or conditioner by the import path it
     has now (`dew._records.moved_paths`, row 5996); a decision layout of a class it was before by the
     segment layout it is now, wherever the record holds it (`dew._records.earlier_layout`, row 6140); a
-    source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550); a trainer's retired
-    `export_model` taken off (`earlier_exported`, row 11636); and a looped decoder's `loop_message_additive`
-    true read as unset where it could not be unset (`earlier_loop_messages`, row 11742).
+    source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550); and wherever it holds
+    a run or trainer, a trainer's retired `export_model` taken off and a looped decoder's
+    `loop_message_additive` true read as unset where it could not be unset (`earlier_retired`, rows 11636,
+    11742).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
@@ -50,8 +51,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved)))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
-    earlier = earlier_loop_messages(earlier_exported(earlier_packed_experts(earlier)),
-                                    additive_unset=additive)
+    earlier = earlier_retired(earlier_packed_experts(earlier), additive_unset=additive)
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
@@ -67,33 +67,52 @@ it and reads `Layout()` as unset (`earlier_trainer_layout`), where one written s
 ADDITIVE_UNSETTABLE = "additive_unsettable"
 """The key beside a run record's fields (`RunConfig.record`) that says it states `loop_message_additive` as
 this Dew does, unset as null: a record written while it could not be unset (true its default) lacks it and
-reads its true as unset (`earlier_loop_messages`), where one written since keeps a stated true (row 11742)."""
+reads its true as unset (`earlier_retired`), where one written since keeps a stated true (row 11742)."""
 
 MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE)
 """Every key a run record holds beside its fields, each saying how it states a field (`RunConfig.record`)."""
 
 
-def earlier_exported(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record whose trainer states `export_model`, the field that wrote each persistent step's
-    model beside it (row 11636): taken off, `dew export` the one export since, every earlier record
-    stating it false but where a run chose it. Carried to 1.0 (ledger 1552)."""
-    fields = record.get("fields")
-    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
-    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or "export_model" not in trainer:
+def earlier_retired(record: object, *, additive_unset: bool, root: bool = True) -> object:
+    """A saved run's record with each run and trainer it holds, the root and every one a field holds as its
+    class record, in today's shapes: a trainer's `export_model`, the field that wrote each persistent step's
+    model beside it (row 11636), taken off, `dew export` the one export since; and a looped decoder's
+    `loop_message_additive` true read as unset where the record could not leave it unset (no
+    `ADDITIVE_UNSETTABLE`, `additive_unset` false; row 11742), every such record writing true for its
+    default, a checkpoint's choice kept, its false a choice. A record written since states its own. Untyped
+    data passes as it is. Carried to 1.0 (ledger 1552)."""
+    from dew.config import DecoderRunConfig, RunConfig
+    from dew.config.trainer import TrainerConfig
+
+    if isinstance(record, list):
+        return [earlier_retired(value, additive_unset=additive_unset, root=False) for value in record]
+    if not isinstance(record, Mapping):
         return record
-    return {**record, "fields": {**fields, "trainer": {key: value for key, value in trainer.items()
-                                                       if key != "export_model"}}}
+    walked = {key: earlier_retired(value, additive_unset=additive_unset, root=False)
+              for key, value in record.items()}
+    named = registry.class_record(walked)
+    kind = _recorded_class(named[0]) if named is not None else (RunConfig if root else None)
+    fields = dict(named[1] if named is not None else walked.get("fields", {}))
+    if kind is None or not isinstance(fields, Mapping):
+        return walked
+    if issubclass(kind, TrainerConfig):
+        fields.pop("export_model", None)
+    if issubclass(kind, RunConfig) and isinstance(trainer := fields.get("trainer"), Mapping) and (
+            registry.class_record(trainer) is None):
+        fields["trainer"] = {key: value for key, value in trainer.items() if key != "export_model"}
+    if (issubclass(kind, DecoderRunConfig) and not additive_unset
+            and fields.get("loop_message_additive") is True):
+        fields["loop_message_additive"] = None
+    return {**walked, "fields": fields}
 
 
-def earlier_loop_messages(record: Mapping[str, object], *, additive_unset: bool) -> Mapping[str, object]:
-    """A saved run's record stating `loop_message_additive` true where it could not be left unset (no
-    `ADDITIVE_UNSETTABLE` beside its fields, `additive_unset` false, row 11742): every such record wrote true
-    for its default, a checkpoint's choice kept, so it reads unset; its false a choice, kept. A record
-    written since states its own, true or unset. Carried to 1.0 (ledger 1552)."""
-    fields = record.get("fields")
-    if additive_unset or not isinstance(fields, Mapping) or fields.get("loop_message_additive") is not True:
-        return record
-    return {**record, "fields": {**fields, "loop_message_additive": None}}
+def _recorded_class(name: str) -> type | None:
+    """The class a record names, a run's alias or an import path, where it resolves to one; None else."""
+    try:
+        member = registry.runs[name] if ":" not in name else registry.imported(name)
+    except (KeyError, ValueError, ImportError):
+        return None
+    return member if isinstance(member, type) else None
 
 
 def earlier_packed_experts(record: Mapping[str, object]) -> Mapping[str, object]:
