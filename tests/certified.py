@@ -1207,14 +1207,13 @@ def _pair_held(params, operands, results, fmt) -> list[np.ndarray]:
 def _pair_and_plain_held(params, operands, results, fmt) -> list[np.ndarray]:
     """A one-pass compensated sum's `(hi, lo, plain)` (`precision.summed_total`'s reduction of `(values,
     residuals, values)`): its pair as a compensated sum's (`_pair_held`) over its first two arrays, and its
-    plain sum as any sum of its third's terms is (`_terms_hold`, in any order of their additions)."""
+    plain sum as a plain reduction's of its third (`_reduced_sum`: any order of its terms' additions, an
+    empty axis's +0) where it starts at the reduction's zero, +0; any other start breaks it."""
     arrays, initial = operands[:3], operands[3:]
-    flushes = lane().flushes
-    axes = tuple(params["dimensions"])
     paired = _pair_held(params, [*arrays[:2], *initial[:2]], results[:2], fmt)
-    terms = _flattened(np.moveaxis(_read(arrays[2], flushes), axes, range(-len(axes), 0)), len(axes))
-    started = np.broadcast_to(_read(initial[2], flushes), (*terms.shape[:-1], 1))
-    plain = _terms_hold(results[2], np.concatenate([started, terms], -1), fmt, flushes)
+    started = np.asarray(initial[2])
+    zero = _bits(started) == _bits(np.zeros_like(started))
+    plain = _reduced_sum({"axes": params["dimensions"]}, [arrays[2]], results[2], fmt) & zero
     return [*paired, plain]
 
 
