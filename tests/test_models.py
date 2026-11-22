@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from flax import linen as nn
 from flax.core import freeze, unfreeze
 from model_support import moved
@@ -98,7 +99,9 @@ def a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
     model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1,
                         norm_num_groups=8)
     host, device = jax.devices("cpu")[0], jax.devices()[0]
-    with jax.default_device(host):
+    # A GPU tier part's prepare assumes its GPU, under which the encoder's attention would take Mosaic GPU,
+    # which lowers on no CPU (row 11834).
+    with ahead_on_the_host(wherever=True):
         variables = jax.tree.map(np.asarray, model.init(jax.random.key(0), np.zeros((1, 17, 17, 3),
                                                                                    np.float32)))
 
