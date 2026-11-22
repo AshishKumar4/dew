@@ -1030,7 +1030,8 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
             forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
             for prompt, tokens, prompt_rows in parts.values()])}
 
-    axes = model_axes(model)
+    with ahead_on_the_host():
+        axes = model_axes(model)
 
     def dew(index, order):
         # Each order's weights placed alone, and gone from the device when the call returns.
