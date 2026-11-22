@@ -32,6 +32,7 @@ import logging
 import math
 import types
 from collections.abc import Callable, Collection, Hashable, Sequence
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +45,9 @@ from jax.extend.core import create_call_primitive
 
 from dew import _cache
 from dew.nn import programs
+
+if TYPE_CHECKING:
+    from dew.algebra.fusion import Recorded
 
 _log = logging.getLogger(__name__)
 
@@ -468,13 +472,23 @@ def _evaluating() -> bool:
 SPANS_HELD = 4096
 """The most marked spans' programs a process holds (`_SPANS`), the least recently used dropped first."""
 
+class _HeldSpan(NamedTuple):
+    """A marked span's traced program (`_traced_span`): it, its outputs' structure, its known zeros and what
+    its trace reported (`fusion.Recorded`)."""
+
+    closed: jax_core.ClosedJaxpr
+    structure: object
+    zeros: object
+    record: Recorded
+
+
 class _Spans:
     """The marked spans' held programs (`_SPANS`), registered with JAX's caches, so `jax.clear_caches`
     forgets them as it forgets its own (row 10762's review: a user clearing caches to free memory kept
     them)."""
 
     def __init__(self) -> None:
-        self.held: collections.OrderedDict[Hashable, tuple] = collections.OrderedDict()
+        self.held: collections.OrderedDict[Hashable, _HeldSpan | None] = collections.OrderedDict()
 
     def cache_clear(self) -> None:
         self.held.clear()
@@ -525,20 +539,21 @@ def _traced_span(key: Hashable | None, trace: Callable, returned: dict) -> tuple
         return closed, returned["structure"], returned["zeros"]
     from dew.algebra.fusion import recorded
 
-    fresh = {}
+    fresh: dict[str, _HeldSpan] = {}
 
-    def made() -> tuple[object, ...]:
+    def made() -> _HeldSpan | None:
         closed, record = recorded(trace)
-        fresh["traced"] = (closed, returned["structure"], returned["zeros"], record)
-        # A program that may not be held is kept as no program (`_holdable`), so no later call takes it.
-        return fresh["traced"] if _holdable(closed) else ()
+        fresh["traced"] = _HeldSpan(closed, returned["structure"], returned["zeros"], record)
+        # A program that may not be held is kept as none (`_holdable`), so no later call takes it.
+        return fresh["traced"] if _holdable(closed) else None
 
     entry = _cache.holding(_SPANS.held, key, made, SPANS_HELD,
-                           still=lambda entry: bool(entry) and entry[3].still())
+                           still=lambda entry: entry is not None and entry.record.still())
     # A trace made here is this call's, held or not; a held one taken is its first trace's.
-    closed, structure, zeros, record = fresh.get("traced", entry)
-    record.replay()
-    return closed, structure, zeros
+    taken = fresh.get("traced") or entry
+    assert taken is not None
+    taken.record.replay()
+    return taken.closed, taken.structure, taken.zeros
 
 
 def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hashable | None:
