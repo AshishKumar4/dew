@@ -1115,8 +1115,7 @@ def _gpt_oss_projected():
 
 @COMPILES_ON_CPU
 @lowers("sm80")
-@pytest.mark.parametrize("form", ("forward", "input gradient", "kernel gradient"))
-def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds(form):
+def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     """An A100's GEMM, its forward and its gradients at the gate's tiles, issues each cp.async copy without a
     source size (`cp.async`'s `src-size`, a bounds check a transfer): its launch extends every operand its
     blocks read past, so its specs promise their copies in bounds (`mosaic_sm80`'s `oob_fill_mode`), where a
@@ -1125,7 +1124,8 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds(form):
     from kernel_compile import PTX, compile_mosaic_kernels
 
     with report.refusals():
-        cases = [each.case for each in _gate_cases("sm80", form)]
+        cases = [each.case for form in ("forward", "input gradient", "kernel gradient")
+                 for each in _gate_cases("sm80", form)]
         found = compile_mosaic_kernels(cases, "sm80")
     modules = [kernel["module"] for record in found for kernel in record.get("kernels", ())]
     copies = [line for module in modules for line in PTX.get(module, "").splitlines() if "cp.async.c" in line]

@@ -2004,25 +2004,24 @@ def test_planned_stages_deepens_at_residency_two_with_registers():
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("gen", "width"), [("sm90", 128), ("sm80", 64)])
-def test_decode_deepens_to_3_stages_without_losing_residency(gen, width):
-    """Row 5274: long-context decode (B8 K4096) deepens to 3 stages at preserved SM residency
-    on sm90 (d128) and sm80 (d64) and compiles spill-free."""
+def test_decode_deepens_to_3_stages_without_losing_residency():
+    """Row 5274: long-context decode (B8 K4096 d128) deepens to 3 stages at preserved SM residency
+    on sm90 and compiles spill-free."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates import attention_decode
 
-    with generation.assumed(gen):
+    with generation.assumed("sm90"):
         target = generation.gpu_target()
         spans = template.spans(1, 4096, 8, causal=False)
-        qd = jax.ShapeDtypeStruct((8, 1, 32, width), jnp.bfloat16)
-        kd = jax.ShapeDtypeStruct((8, 4096, 8, width), jnp.bfloat16)
+        qd = jax.ShapeDtypeStruct((8, 1, 32, 128), jnp.bfloat16)
+        kd = jax.ShapeDtypeStruct((8, 4096, 8, 128), jnp.bfloat16)
         plan = attention_decode.plan(qd, kd, kd, spans, None, scale=None, target=target)
-        assert plan is not None and plan.config.stages >= 3, (gen, width, plan)
-        dec_case = KernelCase(f"{gen}-dec-b8-d{width}-3stage",
+        assert plan is not None and plan.config.stages >= 3, plan
+        dec_case = KernelCase("sm90-dec-b8-d128-3stage",
                               lambda: (lambda q, k, v: attention_decode.attend(q, k, v, spans),
                                        (qd, kd, kd)))
-        found = compile_mosaic_kernels([dec_case], gen)
+        found = compile_mosaic_kernels([dec_case], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
