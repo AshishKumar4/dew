@@ -563,7 +563,7 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     stages = (*routes, *([found.epilogue] if found.epilogue is not None else []))
     # A neighbour joins the kernel only where the kernel with it keeps its residency (KERNEL-TEMPLATES-13, row
     # 9032: `fused_gemm.Analysis.resident`); refused for it, the region is still weighed without its stages.
-    # Fused where it is the cheaper (`fused_gemm.Analysis.cheaper`: its work at no rate no more than XLA's).
+    # Fused where it is the cheaper (`fused_gemm.Analysis.cheaper`: no more work no rule prices than XLA's).
     return RegionDecision(all(map(kernel, stages)) and found.cheaper and found.resident, launchable, launched)
 
 

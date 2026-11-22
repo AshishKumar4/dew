@@ -157,8 +157,7 @@ class Analysis:
     fused_seconds: float | None = None
     unfused_seconds: float | None = None
     cheaper: bool = False
-    """Whether fused is the cheaper (`priced`): fewer seconds, and no more work at a rate the target states
-    none of."""
+    """Whether fused is the cheaper (`priced`): fewer seconds, and no more work no rule prices."""
     refused: str | None = None
     """Why a kernel the call names (`generation.chosen`) refuses the region, as `fused` would raise
     (`selection.KernelRefused`); None where nothing named refuses."""
@@ -250,10 +249,11 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     depth values where it has a prologue (a norm's statistics); and unfused, XLA's program forming the
     operand whole and writing it, the plain launch writing the product at its result dtype, then XLA's
     fusion of the consumers reading it (`algebra.cost.fused`), each XLA program as the algebra prices it
-    (`algebra.program.priced`). Beside them, whether fused is the cheaper: fewer seconds, and no more work at
-    a rate the target states none of (`algebra.cost.carries_no_more`: a special function a launch compiles in
-    a form no count prices, an accurate sine, is no free work). None where the target states no tensor
-    rate."""
+    (`algebra.program.priced`). Beside them, whether fused is the cheaper: fewer seconds, and no more work no
+    rule prices (`cost.Work.unpriced_operations`: a special function a launch compiles in a form no count
+    prices, an accurate sine, is no free work). Work at a rate the target leaves unread is the arms' alike
+    but for a form's own (an accurate exp's integer operations on a GPU whose integer rate is unread, a
+    B200's), which bars no fusion. None where the target states no tensor rate."""
     rates = cost.rates(target, device=True)
     if rates.tensor is None:
         return None, None, False
@@ -300,8 +300,7 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
             device_bytes=written + region.captured_bytes + region.output_bytes, kernels=1.0)
         unfused_seconds += xla(chain)
         unfused_work += chain
-    no_more = algebra_cost.carries_no_more(cost.units(fused_work, rates)[1],
-                                           cost.units(unfused_work, rates)[1])
+    no_more = fused_work.unpriced_operations <= unfused_work.unpriced_operations
     return fused_seconds, unfused_seconds, fused_seconds < unfused_seconds and no_more
 
 
