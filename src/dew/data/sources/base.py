@@ -363,15 +363,20 @@ class View[S: Source]:
     def metadata(self) -> Mapping[str, object]:
         own = {key: read() for key, read in self._own().items()}
         stated = {key: value for key, value in own.items() if value is not None}
-        return {**self._viewed(self.source.metadata()), **stated}
+        return {**self._viewed(self._inherited().metadata()), **stated}
 
     def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
         """Those of its facts named by `keys`: its store's asked alone (`asked`), taken as `metadata` takes
         all of them (`_viewed`), and those of its own asked, each read alone (`_own`; row 11638's review: a
         view's own facts were dropped, then read whole for any key)."""
         own = {key: read() for key, read in self._own().items() if key in keys}
-        stored = {key: value for key, value in self._viewed(asked(self.source, keys)).items() if key in keys}
+        stored = {key: value for key, value in self._viewed(asked(self._inherited(), keys)).items()
+                  if key in keys}
         return {**stored, **{key: value for key, value in own.items() if value is not None}}
+
+    def _inherited(self) -> Source:
+        """The source whose facts it states its own over (`_viewed`): its store, where it states no other."""
+        return self.source
 
     def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Its store's facts as it states them (`facts`, all of them or those asked), its counts dropped
