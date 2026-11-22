@@ -848,7 +848,8 @@ TURNED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=Tru
 writes, and the state's first key pairs turned each token (`Hooks.turns`), two pairs unturned."""
 
 
-@pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
+@pytest.mark.parametrize('packed', [pytest.param(False, id='one sequence'), pytest.param(
+    True, id='packed', marks=pytest.mark.check1_shards(seeds=32, per_task=8))])
 def test_a_turned_call_on_the_template_is_on_par_with_the_portable_math_interpreted(packed):
     """A state that turns its key pairs (`TURNED`) through the chunked op on the template, its queries and
     keys turned into their documents' frames and its turns' gradient in the crossing form
@@ -857,7 +858,7 @@ def test_a_turned_call_on_the_template_is_on_par_with_the_portable_math_interpre
     7419), its queries, keys, values and write gate in bf16 under the run's fast forms, as the template's fast
     backward trains it (`mainloop_backward.fast_backward_form`). Both arms take the turns' gradient from one
     crossing form (`turned.turn_gradient`), which the recurrence a token at a time holds
-    (test_recurrence_chunk's turned states), not this pair (row 7971)."""
+    (test_recurrence_chunk's turned states), not this pair (row 7971); packed, four tasks (row 6745)."""
     def on(route, operands, starts=None):
         return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
 

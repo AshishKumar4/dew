@@ -158,9 +158,9 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
     first token, which enters a zero state and no previous token's write; `valid` `[B, S]` the real tokens,
     a padded slot a zero step that neither turns, decays nor writes the state, the carried token the last
     real one. A token's ranks are the op's tokens in turn, its decay on its first (`chunk_size` counts
-    them); each rank's output takes the ranks the op read it before or after the recurrence does
-    (`_rank_terms`). Returns `(output [B, S, R, H, P], Carried)` in `at_least_fp32` of the operands'
-    dtype."""
+    them); the op reads each apart from its token's own writes (`Hooks.reads` 'apart'), and each rank's
+    output takes every rank's own write at `gamma` beside it (`_rank_terms`). Returns `(output [B, S, R, H,
+    P], Carried)` in `at_least_fp32` of the operands' dtype."""
     batch, length, _, heads, _ = x.shape
     work, operand, dt, lam, real = _stepped(x, dt, B, C, lam, valid)
     # A document's first token enters no state: its turn and decay act on nothing, so neither enters the
