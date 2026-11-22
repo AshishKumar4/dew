@@ -2017,7 +2017,8 @@ def test_decode_deepens_to_3_stages_without_losing_residency():
         spans = template.spans(1, 4096, 8, causal=False)
         qd = jax.ShapeDtypeStruct((8, 1, 32, 128), jnp.bfloat16)
         kd = jax.ShapeDtypeStruct((8, 4096, 8, 128), jnp.bfloat16)
-        work, rows, row_spans, whole = attention_decode.planned(qd, kd, kd, spans, template.Hooks())
+        work, rows, row_spans, whole = attention_decode.planned(
+            jnp.zeros(qd.shape, qd.dtype), kd, kd, spans, template.Hooks())
         assert work is not None and work["plain"].config.stages >= 3, work
         cfg = work["plain"].config
         op, args = attention_mosaic._forward_call(
