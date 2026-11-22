@@ -438,12 +438,13 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
 
         return super().pinnable(ba, config) and not report.refused(self, ba, config, self.launch_target())
 
-    def _refused(self, ba, config: tiling.Tiles) -> bool:
-        # Refused past its producer's ladder: spilling at the rung it settles on (`producers.settled`).
+    def _refused(self, ba, config: tiling.Tiles, target) -> bool:
+        # Refused on `target` past its producer's ladder: spilling at the rung it settles on
+        # (`producers.settled`).
         from .templates import report
         from .templates.gemm import producers
 
-        return report.refused(self, ba, producers.settled(self, ba, config), self.launch_target())
+        return report.refused(self, ba, producers.settled(self, ba, config), target)
 
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
@@ -630,7 +631,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
                 or (family.pairs_product and ba.arguments['interpret'])
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
-                or not self._divides(ba, config) or self._refused(ba, config)):
+                or not self._divides(ba, config) or self._refused(ba, config, target)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
         # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
@@ -1577,7 +1578,7 @@ class MosaicTgmm(_Mosaic):
             return tile
         split = dataclasses.replace(sliced, splits=splits)
         # A split a compile of this process found spilling (`report.refused`) gives way to the call's own.
-        return tile if self._refused(ba, split) else split
+        return tile if self._refused(ba, split, target) else split
 
     def _balances(self, ba, tile: tiling.Tiles, target) -> bool:
         """Whether the call's last wave runs balanced over the programs (`tail.balanced`), which it

@@ -1660,6 +1660,14 @@ def test_splash_compiles_for_a_v5e_with_libtpu():
     assert not [record for record in found if "error" in record], found
 
 
+def _grouped_call(launch, *, width: int = 4096):
+    """`launch` bound to a grouped GEMM of 8 experts' 2048 x `width` bf16 matrices over 4096 tokens."""
+    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
+    weights = jax.ShapeDtypeStruct((8, 2048, width), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
+    return launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+
+
 def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kernel():
     """The same operand shapes and tile can lower for different device capacities in one process. A
     refusal belongs to the target that generated it; rate-only differences do not change that tile's code."""
@@ -1668,10 +1676,7 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
     from dew.nn.kernels.templates import report
 
     launch = grouped_matmul.MosaicGmm()
-    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
-    weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
-    arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    arguments = _grouped_call(launch)
     target = generation.TARGETS["sm90"]
     with report.refusals(), generation.assumed(target):
         tile = launch.derived(arguments, target)
@@ -1706,10 +1711,7 @@ def test_a_derivation_for_a_target_reads_that_targets_refusals():
     from dew.nn.kernels.templates import report
 
     launch = grouped_matmul.MosaicGmm()
-    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
-    weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
-    arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    arguments = _grouped_call(launch)
     b200 = generation.TARGETS["sm100"]
     with report.refusals():
         # The B200's identity of the launch, as a B200's certification records its refusal.
@@ -1728,12 +1730,8 @@ def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
     from dew.nn.kernels.templates import report
 
     launch = grouped_matmul.MosaicGmm()
-    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
-    weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
-    arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
-    other = launch.bind(x, jax.ShapeDtypeStruct((8, 2048, 2048), jnp.bfloat16), sizes, out_dtype="bfloat16",
-                        trans_rhs=False, interpret=False)
+    arguments = _grouped_call(launch)
+    other = _grouped_call(launch, width=2048)
     target = generation.TARGETS["sm90"]
     with report.refusals(), generation.assumed(target):
         tile = launch.derived(arguments, target)

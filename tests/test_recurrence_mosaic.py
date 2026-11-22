@@ -1144,8 +1144,7 @@ def test_a_launch_spilling_at_every_rung_refuses_the_tiles_that_plan_it_alike():
         tiles = template.MOSAIC.derived(bound, target)
         shallower = dataclasses.replace(tiles, stages=tiles.stages - 1)
         assert not template.MOSAIC._refused(bound, shallower, target)
-        spilled = {'recurrence_reverse'}
-        identity = report._identity(template.MOSAIC, bound, generation.gpu_target())
+        spilled, identity = {'recurrence_reverse'}, report._identity(template.MOSAIC, bound, target)
         report.refuse([(identity, tiles, spilled)])
         held, *upper, foot = template.MOSAIC.rungs(bound, tiles)
         # Its foot refused alone (a config pinned there) leaves the rungs above it unasked: nothing spent.
