@@ -1321,7 +1321,8 @@ class SegmentLayout(Layout):
         # vocabulary encodes a text as its characters' bytes, so its rows and slices grow with every
         # character a cut keeps: its walk stops at the first that overflows (row 11739's review: it
         # walked a long state's every prefix, each encoded whole).
-        grows = isinstance(encoder, ByteTokenizer)
+        # Its tokens the byte vocabulary's own: a subclass encoding otherwise (merging bytes) may not grow.
+        grows = isinstance(encoder, ByteTokenizer) and type(encoder).encode is ByteTokenizer.encode
         for at, copy in enumerate(copies):
             if len(laid.tokens) > self.max_len or copy.keep == "all":
                 continue
