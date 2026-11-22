@@ -123,7 +123,7 @@ from interop_support import (
     transformers_model,
 )
 from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
-from reference_error import as_given, assert_as_exact, declared_seeds, recording
+from reference_error import ahead_arm, as_given, assert_as_exact, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -315,14 +315,18 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     def loss(params, ids):
         return dew_next_token_loss(loaded, params, ids)
 
-    with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
-        both = jax.jit(jax.value_and_grad(loss, has_aux=True)).trace(
-            loaded.variables["params"], jax.ShapeDtypeStruct(ids.shape, ids.dtype)).lower().compile()
+    # One program of the logits and the gradients, compiled under the policy as a run under it compiles,
+    # through the arms' own path (`ahead_arm`): a GPU tier part's prepare holds it, its run launches it
+    # (row 11744: compiled here ahead, its executable was no arm's, so the prepare kept none).
+    def step(ids):
+        return jax.value_and_grad(loss, has_aux=True)(loaded.variables["params"], ids)
 
-    # Compiled once under the policy, as a run under it compiles: the gate runs it as given.
+    stepped = ahead_arm(jax.jit(step), f"float32 {fixture} logits and gradients, its step")
+
     @as_given
     def ours(ids):
-        (_, logits), grads = both(loaded.variables["params"], jnp.asarray(ids, jnp.int32))
+        with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
+            (_, logits), grads = stepped(np.asarray(ids, np.int32))
         return {"logits": np.asarray(logits, np.float64),
                 **{name: np.asarray(layout.export({"params": grads}), np.float64).reshape(named[name].shape)
                    for name, layout in layouts.items()}}

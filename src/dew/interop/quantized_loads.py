@@ -88,10 +88,10 @@ def input_quantization(model: nn.Module, variables: Variables, layouts: tuple[We
 def bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables: Variables
                ) -> dict[tuple[str, ...], tuple[str | None, ...]]:
     """`table` (a model's drawn axes, `decoder_axes`) with each packed bank's leaves (`with_banks`) at its
-    dense matrix's axes as the bank lays them out (`quantization.expert_leaf_axes`, a Linear's kernel's
-    `quantization.dense_leaf_axes`), by their fields' paths (`dew.nn.sharding.parameter_path`), as
-    placement reads a leaf's."""
-    from dew.quantization import QUANTIZATION, dense_leaf_axes, expert_leaf_axes
+    dense matrix's axes as the bank lays them out (`NvFp4.leaf_axes`, an expert bank's and a Linear's
+    kernel's alike), by their fields' paths (`dew.nn.sharding.parameter_path`), as placement reads a
+    leaf's."""
+    from dew.quantization import QUANTIZATION
 
     banks = {path: bank for path, bank in flatten_dict(
         dict(variables.get(QUANTIZATION, {})), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()
@@ -102,8 +102,7 @@ def bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables
         if dense is None:
             continue
         names = [member.name for member in dataclasses.fields(bank)]
-        leaves = dense_leaf_axes(dense) if len(bank.scale.shape) == 0 else expert_leaf_axes(bank, dense)
-        for name, axes in zip(names, leaves, strict=True):
+        for name, axes in zip(names, bank.leaf_axes(dense), strict=True):
             held[(QUANTIZATION, *path, name)] = axes
     return held
 
@@ -146,8 +145,7 @@ def _kernel_of(layout: WeightLayout, bank: NvFp4) -> bool:
     """Whether `layout` binds a Linear's kernel `[in, out]` from the source's `[out, in]` weight `bank`
     packs, transposed whole (a layer whose kernel holds more axes, a DenseGeneral's heads, reads no packed
     matrix)."""
-    depth, width = 8 * bank.words.shape[-1], bank.words.shape[-2]
-    return (layout.transpose == (1, 0) and tuple(layout.shape) == (width, depth)
+    return (layout.transpose == (1, 0) and tuple(layout.shape) == tuple(reversed(bank.shape))
             and layout.paths[0][-1] == "kernel")
 
 

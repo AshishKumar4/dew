@@ -550,24 +550,11 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
 
 def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
     """The logical axes of each leaf of an expert bank's `matrix` (`dew.nn.dense.packed_matrix`), its own
-    `[experts, in, out]` being `axes`: one leaf, the matrix; a packed bank's four (`NvFp4`), its words and
-    block scales `[experts, out, in / 8 or in / 16]`, its tensor scales `[experts]` and its form's version
-    bytes, whole on every device, in its leaves' order."""
+    `[experts, in, out]` being `axes`: one leaf, the matrix; a packed bank's as its format lays them out
+    (`NvFp4.leaf_axes`)."""
     from dew.nn.kernels.formats import NvFp4
 
-    if not isinstance(matrix, NvFp4):
-        return [tuple(axes)]
-    experts, inputs, outputs = axes
-    return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,), (None,)]
-
-
-def dense_leaf_axes(axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
-    """The logical axes of each leaf of a dense layer's packed kernel (`dew.nn.dense.packed_matrix`), its
-    own kernel's being `axes` (a Linear's `[in, out]`): its words' and block scales' `[out, in / 8 or
-    in / 16]`, its tensor scale a scalar and its form's version bytes whole on every device, in its leaves'
-    order."""
-    inputs, outputs = axes
-    return [(outputs, inputs), (outputs, inputs), (), (None,)]
+    return matrix.leaf_axes(axes) if isinstance(matrix, NvFp4) else [tuple(axes)]
 
 
 def decoded_banks(variables: Variables) -> Variables:

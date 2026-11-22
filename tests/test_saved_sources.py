@@ -823,12 +823,13 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     """A multimodal LM run whose loop passes messages (`Loop.messages`), which no family's layout writes,
     releases in Dew's own layout (`released_run`), which loads back (`Pretrained.from_saved`'s wrapper
     branch) as the run's model: its towers' and decoder's weights the run's, its loop the run's messages;
-    its export is refused, stating why, and a change of its merges' rank refused on the reloaded bundle,
-    whose merges it holds, not draws (row 10839)."""
-    from saved_run_kinds import multimodal
+    its export is refused, as the source's own loop is once it gains the same messages, which exports
+    without them; and a change of its merges' rank refused on the reloaded bundle, whose merges it holds,
+    not draws (rows 10839, 11755)."""
+    from saved_run_kinds import MULTIMODAL, multimodal
 
     from dew.interop import Pretrained
-    from dew.nn.cross_pass import MESSAGES_UNWRITTEN, CrossPass
+    from dew.nn.cross_pass import CrossPass
     from dew.nn.multimodal import MultimodalTransformer
 
     looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop_steps=2, loop_layers=(0, 2),
@@ -838,9 +839,16 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     assert isinstance(loaded.model, MultimodalTransformer)
     assert loaded.model.loop is not None and loaded.model.loop.messages == CrossPass(block_size=1)
     leaves_alike(loaded.variables["params"], state.variables["params"])
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(ValueError):
         loaded.export()
-    assert refused.value.args == (MESSAGES_UNWRITTEN,)
+    # The control: the run's source, looped as the run is, exports; gaining the run's messages, it is
+    # refused as the run's release is, so the messages are what no family's format writes.
+    source = Pretrained.load(MULTIMODAL, dtype="float32")
+    looping = source.with_model(source.model.with_passes(2, (0, 2)), key=0)
+    assert looping.export()
+    messaged = source.with_model(source.model.with_passes(2, (0, 2), messages=CrossPass(block_size=1)), key=0)
+    with pytest.raises(ValueError):
+        messaged.export()
     with pytest.raises(ValueError):
         loaded.with_model(loaded.model.with_passes(messages=CrossPass(block_size=1, rank=8)), key=0)
 
