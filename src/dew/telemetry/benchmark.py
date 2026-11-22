@@ -328,12 +328,11 @@ class DeviceTime:
 
     def program(self, fn: Callable, evicted: bool) -> Callable:
         """`fn`'s timed program (`kernels`): its call, behind an eviction where `evicted` (`behind`), compiled
-        without command buffers (`options_of(UNGRAPHED_FLAG)`), once a session."""
+        without command buffers (`dew.nn.kernels.options.UNGRAPHED_OPTIONS`), once a session."""
         if (fn, evicted) not in self._joined:
-            from dew.nn.kernels.options import owned_program
+            from dew.nn.kernels.options import UNGRAPHED_OPTIONS, owned_program
 
-            self._joined[fn, evicted] = owned_program(behind(fn) if evicted else fn,
-                                                      step=options_of(UNGRAPHED_FLAG))
+            self._joined[fn, evicted] = owned_program(behind(fn) if evicted else fn, step=UNGRAPHED_OPTIONS)
         return self._joined[fn, evicted]
 
     def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:
