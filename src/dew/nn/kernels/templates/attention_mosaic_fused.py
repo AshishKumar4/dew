@@ -211,10 +211,18 @@ def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged
         family.staged(narrowed, staged.at[0])
         return weights, slopes, seen
 
-    q_lhs = by_power(family.tile_of(q_slot), walk.spec.prescale) if walk.scaled else q_slot
-    (weights, slopes, seen), dp = family.product_pair(
-        q_lhs, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)),
-        (tiles.block_q, tiles.block_k), between=stage_weights)
+    shape = (tiles.block_q, tiles.block_k)
+    if walk.scaled:
+        s = family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale),
+                                     k_smem.transpose((1, 0)))
+        staged_out: list = []
+        dp = family.product(do_slot, v_smem.transpose((1, 0)), shape,
+                            then=lambda: staged_out.append(stage_weights(s)))
+        weights, slopes, seen = staged_out[0]
+    else:
+        (weights, slopes, seen), dp = family.product_pair(
+            q_slot, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)),
+            shape, between=stage_weights)
     dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     part = _cotangent_part(walk, weights, dp, anchor, delta, slopes, seen, q_slot.dtype)
     cotangents_staged = staged.at[1]
