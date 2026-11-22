@@ -731,15 +731,14 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
     return frozenset(refused)
 
 
-def settled_trace[T](trace: Callable[[], T]) -> T:
+def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
     """`trace()`'s value, within a block certifying aside (`certifying_aside`) the launches it reached settled
-    before it is lowered (`settled_aside`) and the program traced afresh for as long as they refuse a config
-    it took, each refused launch's derivation stepping past it (a trace's key holds the refusals,
-    `options.held_context`): a program lowers once, at the configs its certification settled, as one
-    certified in turn does, where lowering at a refused rung lowered the step twice (a B200's recurrent
-    reverse launch spilling at its first rung, FS-ASIDE-SM100). A trace that takes a config refused before
-    again (a derivation reading no refusal, a pin's) is its compile's to read (`settled`). Outside such a
-    block, `trace()`'s."""
+    before it is lowered (`settled_aside`) and the program traced afresh (`retrace()`, past any trace cache
+    holding the config) for as long as they refuse a config it took, each refused launch's derivation stepping
+    past it: a program lowers once, at the configs its certification settled, as one certified in turn does,
+    where lowering at a refused rung lowered the step twice (a B200's recurrent reverse launch spilling at its
+    first rung, FS-ASIDE-SM100C). A trace that takes a config refused before again (a derivation reading no
+    refusal, a pin's) is its compile's to read (`settled`). Outside such a block, `trace()`'s."""
     aside = _ASIDE.get()
     value = trace()
     if aside is None:
@@ -747,7 +746,7 @@ def settled_trace[T](trace: Callable[[], T]) -> T:
     seen: set = set()
     while (refused := settled_aside(aside)) and not refused <= seen:
         seen |= refused
-        value = trace()
+        value = retrace()
     return value
 
 

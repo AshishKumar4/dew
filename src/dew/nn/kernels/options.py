@@ -618,7 +618,8 @@ class OuterProgram:
             return self.function(*args, **kwargs)
         return jax.jit(traced, **self.arguments)
 
-    def _traced(self, jitted: jax.stages.Wrapped, args: tuple, kwargs: dict) -> jax.stages.Traced:
+    def _traced(self, jitted: jax.stages.Wrapped, args: tuple, kwargs: dict
+                ) -> tuple[jax.stages.Traced, jax.stages.Wrapped]:
         """`jitted`'s trace of a call, its program the algebra pass's (`algebra.rewritten_program`), so its
         lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
         §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
@@ -626,19 +627,27 @@ class OuterProgram:
         switch is in JAX's trace context, so a held program traces afresh as it changes. A program called
         within the trace is part of this one, which the pass reads whole (`_nested`). Within a block
         certifying aside, the launches an outermost program's trace reaches settle before it is lowered, the
-        program traced afresh past a refused config (`report.settled_trace`), so it lowers once; a program
-        traced within another's (a launch's own, as its capture traces it) settles nothing mid-trace."""
+        program traced afresh past a refused config by a jit of its own, past JAX's trace cache (`_jitted`;
+        `report.settled_trace`), so it lowers once; a program traced within another's (a launch's own, as its
+        capture traces it) settles nothing mid-trace. Beside its trace, the jit that made it."""
         from dew.nn.kernels.templates import report
 
         outermost = not _PASSING.get()
         token = _PASSING.set(True)
+        made = jitted
+
+        def retraced() -> jax.stages.Traced:
+            nonlocal made
+            made = self._jitted()
+            return made.trace(*args, **kwargs)
+
         try:
             trace = functools.partial(jitted.trace, *args, **kwargs)
-            traced = report.settled_trace(trace) if outermost else trace()
+            traced = report.settled_trace(trace, retraced) if outermost else trace()
             rewritten = algebra.rewritten_program(traced.jaxpr)
             if rewritten is traced.jaxpr:
-                return traced
-            return algebra.program.traced_as(traced, rewritten)
+                return traced, made
+            return algebra.program.traced_as(traced, rewritten), made
         finally:
             _PASSING.reset(token)
 
@@ -843,8 +852,8 @@ class OuterProgram:
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on
         the thread that keeps it, each relowering with its jit kept in `relowered`."""
-        fresh = self._jitted()
-        relowering = self._traced(fresh, args, kwargs).lower()
+        traced, fresh = self._traced(self._jitted(), args, kwargs)
+        relowering = traced.lower()
         relowered.append((fresh, relowering))
         return relowering
 
@@ -989,7 +998,9 @@ class OuterProgram:
         return self.trace(*args, **kwargs).lower()
 
     def trace(self, *args, **kwargs) -> jax.stages.Traced:
-        return self._traced(self.jitted, args, kwargs)
+        # A trace a settle made afresh (`_traced`) is the program's from here on, as a relowering's is.
+        traced, self.jitted = self._traced(self.jitted, args, kwargs)
+        return traced
 
     def key_of(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
