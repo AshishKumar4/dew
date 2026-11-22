@@ -144,6 +144,7 @@ __all__ = [
     "stochastic_bf16",
     "summed_once",
     "summed_pairs",
+    "summed_total",
     "twice_scaled",
     "two_product",
     "two_sum",
@@ -1856,8 +1857,7 @@ def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
     algebra pass must not cancel."""
     wide = values.astype(at_least_fp32(values.dtype))
-    pair = summed_pairs((wide, jnp.zeros_like(wide)), axes)
-    return compensated_total(pair, jnp.sum(wide, axes)).astype(values.dtype)
+    return summed_total((wide, jnp.zeros_like(wide)), axes).astype(values.dtype)
 
 
 def summed_pairs(pair: tuple[jax.Array, jax.Array], axes: Sequence[int]) -> tuple[jax.Array, jax.Array]:
@@ -1870,6 +1870,22 @@ def summed_pairs(pair: tuple[jax.Array, jax.Array], axes: Sequence[int]) -> tupl
     is taken out before the reduction: XLA:GPU's simplifier (post117) rewrote a pair reduction over such an
     axis into one bitcast of a single array's shape and refused its own program (a RET_CHECK of
     `ShapeUtil::Compatible`, row 10674)."""
+    return _summed(pair, axes, plain=False)
+
+
+def summed_total(pair: tuple[jax.Array, jax.Array], axes: Sequence[int]) -> jax.Array:
+    """Double-float `(hi, lo)` pairs summed over `axes` and read as every compensated sum is
+    (`compensated_total`): the pairs (`summed_pairs`) and the plain sum of their `hi`, the total's inf or
+    NaN where it reaches one, carried in one XLA reduction, the input read once. A plain sum beside the
+    pairs' reduction read it again: XLA fused it into its consumer, a second pass over Nemotron-H 30B's
+    SSD scores' gradient (`f32[4096, 4096]`, 69 us of an A100's training step, M-JS-204-a100)."""
+    return compensated_total(*_summed(pair, axes, plain=True))
+
+
+def _summed(pair: tuple[jax.Array, jax.Array], axes: Sequence[int], *, plain: bool) -> tuple:
+    """`summed_pairs`' `(hi, lo)`, and where `plain` the plain sum of the pairs' `hi` beside them in the
+    same reduction, `((hi, lo), plain)`: the pairs combined by `renormalized_add`, the plain sums
+    added."""
     hi, lo = pair
     if hi.shape != lo.shape or hi.dtype != lo.dtype:
         raise ValueError(f"a pair's limbs share one shape and dtype, not {hi.dtype}{list(hi.shape)} and "
@@ -1885,8 +1901,18 @@ def summed_pairs(pair: tuple[jax.Array, jax.Array], axes: Sequence[int]) -> tupl
         zero = jnp.zeros((), hi.dtype)
         if not kept:
             # Each pair combined once with the reduction's zero, as a reduction over its one element is.
-            return renormalized_add((jnp.zeros_like(hi), jnp.zeros_like(lo)), (hi, lo))
-        return jax.lax.reduce((hi, lo), (zero, zero), renormalized_add, kept)
+            summed = renormalized_add((jnp.zeros_like(hi), jnp.zeros_like(lo)), (hi, lo))
+            return (summed, jnp.zeros_like(hi) + hi) if plain else summed
+        if not plain:
+            return jax.lax.reduce((hi, lo), (zero, zero), renormalized_add, kept)
+        *summed, total = jax.lax.reduce((hi, lo, hi), (zero, zero, zero), _paired_and_plain, kept)
+        return tuple(summed), total
+
+
+def _paired_and_plain(left, right):
+    """`summed_total`'s combine: two `(hi, lo, plain)` accumulators' pairs by `renormalized_add`, their plain
+    sums added."""
+    return (*renormalized_add(left[:2], right[:2]), left[2] + right[2])
 
 
 def compensates_loops() -> bool:
