@@ -824,15 +824,16 @@ class MosaicForward(_Mainloop[Tiles]):
         return None
 
     def _deepened(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
-                  refused: Set[Tiles] = frozenset()) -> Tiles:
-        """Deepen a compute-bound TMA forward's ring up to `max(consumers, 2) + 1` stages at its residency
-        via `resources.plan` (rows 5272, 4839, 10948, 10962)."""
+                  refused: Set[Tiles] = frozenset(), want: int | None = None) -> Tiles:
+        """Deepen a forward ring at its residency via `resources.plan`: compute-bound TMA and cp.async
+        forwards up to `max(consumers, 2) + 1`, and streaming decode walks via `streaming` up to `want`
+        (rows 5272, 5274, 4839, 10948, 10962)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if family.feeds_itself or not family.budgets_registers or streams(query, target):
+        if not family.budgets_registers or (want is None and streams(query, target)):
             return config
-        want = min(max(config.consumers, 2) + 1, -(-_keys(ba) // config.block_k))
-        if want <= config.stages:
+        cap = min(max(config.consumers, 2) + 1, -(-_keys(ba) // config.block_k)) if want is None else want
+        if cap <= config.stages:
             return config
         base_resident = self.resident(ba, config, target)
         products = self._products(ba, config, target)
@@ -840,7 +841,7 @@ class MosaicForward(_Mainloop[Tiles]):
             family, lambda s: self._scope(ba, dataclasses.replace(config, stages=s), target,
                                           products=products),
             target, consumers=config.consumers, registers=self.registers(ba, config),
-            floor=config.stages, most=want, resident=base_resident)
+            floor=config.stages, most=cap, resident=base_resident)
         for stages in range(planned, config.stages, -1):
             candidate = self._launchable(ba, dataclasses.replace(config, stages=stages), target)
             if (candidate is not None and candidate not in refused
@@ -977,16 +978,20 @@ class MosaicForward(_Mainloop[Tiles]):
                                                               parts=self.parts))
                         if self.keys % extent == 0)
                     if launched is not None]
+        picked = config
         for candidate in dividing:
             held = self.resident(ba, candidate, target)
             if held * self._staged_keys(ba, candidate) >= in_flight:
-                return candidate
-        # Where none keeps the stream in flight, the largest dividing tile before a derived one that does not
-        # divide the keys: a GH200's bounded decode at 192-key tiles over 32768 padded its cache, 84.5 of its
-        # 134 us a step at width 128 (M-ET-70), where its 128-key walk alone is 49.5.
-        if self.keys % config.block_k and dividing:
-            return dividing[-1]
-        return config
+                picked = candidate
+                break
+        else:
+            # Where none keeps the stream in flight, the largest dividing tile before a derived one that does
+            # not divide the keys: a GH200's bounded decode at 192-key tiles over 32768 padded its cache,
+            # 84.5 of its 134 us a step at width 128 (M-ET-70), where its 128-key walk alone is 49.5.
+            if self.keys % config.block_k and dividing:
+                picked = dividing[-1]
+        want = min(3, -(-_keys(ba) // picked.block_k) // 2)
+        return self._deepened(ba, picked, target, want=want)
 
     def streamed(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The programs a multiprocessor runs at once to keep its share of the device's stream in flight at
