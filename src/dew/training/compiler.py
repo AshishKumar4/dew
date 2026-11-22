@@ -66,6 +66,7 @@ from dew.training.phase_passes import Holding, PhasePasses, SampledPasses
 from dew.training.planning import (
     Candidate,
     FitSearch,
+    Lower,
     Planned,
     PlanRefused,
     Rung,
@@ -1247,7 +1248,7 @@ class StepCompiler[L, E]:
 
     @contextlib.contextmanager
     def _lowering_at(self, stepping: Stepping, state: TrainState, batch: Batch,
-                     cap: Planned) -> Iterator[Callable[[int, bool, int | None], Candidate]]:
+                     cap: Planned) -> Iterator[Lower]:
         """The lowering of the step the objective's count runs at the cap's plan `cap`, at a split, narrow
         copies and group (`FitSearch.lower`): the cap's rung over this count's modules (its remat, head and
         options, its passes this count's), its split and the cap's narrow copies, traced on its mesh; the one

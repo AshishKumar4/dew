@@ -567,6 +567,7 @@ def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
         step.drawn(interval, index, state)
         state, *_ = step(state, batch)
     assert {count: plan.split for count, plan in step.plans.items()} == dict.fromkeys(range(1, CAP + 1), 2)
+    free(monkeypatch, (max(once, halves) + whole) // 2)
     alone = phased_trainer(model.with_passes(1), 0, None)
     start, _, _ = alone.place()
     alone.compile(start, batch)
