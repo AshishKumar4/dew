@@ -1998,21 +1998,20 @@ def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_d
         q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
-        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, shapes, scale=1.0,
+        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, shapes, scale=None,
                                                    natural=attention_mosaic.NATURAL, accurate=False)
         cfg = op.derived(op.bind(*args, interpret=False), target)
         assert cfg is not None and not cfg.fused, cfg
         def backward(query, key, value, dout, residuals):
             with tuning.pinned({attention_mosaic.MosaicBackward: cfg}):
                 grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                                  residuals=residuals, scale=1.0, accurate=False)
+                                                  residuals=residuals, scale=None, accurate=False)
             return grads.query, grads.key, grads.value
         found = compile_mosaic_kernels([KernelCase("sm90-overlapped-dkv-det-d128",
                                                    lambda: (backward, (q, k, k, q, shapes)))], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
         assert any(kernel["kernel"] == "attention_dkv"
                    for kernel in found[0].get("kernels", ())), found
-
 
 @COMPILES_ON_CPU
 def test_decode_deepens_to_3_stages_without_losing_residency():
@@ -2068,23 +2067,31 @@ def test_forward_registers_charges_prescale_only_when_non_unit(gen):
         spans = template.spans(512, 512, 1, causal=True)
         q = jax.ShapeDtypeStruct((1, 512, 4, 256), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((1, 512, 2, 256), jnp.bfloat16)
+        op_folded, _ = attention_mosaic._forward_call(
+            q, k, k, spans, None, scale=None, natural=False)
         op_scaled, _ = attention_mosaic._forward_call(
-            q, k, k, spans, None, scale=None, natural=attention_mosaic.NATURAL)
+            q, k, k, spans, None, scale=None, natural=True)
         op_unit, _ = attention_mosaic._forward_call(
-            q, k, k, spans, None, scale=1.0, natural=attention_mosaic.NATURAL)
+            q, k, k, spans, None, scale=1.0, natural=True)
+        reg_folded = op_folded.registered(q, k, (), template.Kept.NONE)
         reg_scaled = op_scaled.registered(q, k, (), template.Kept.NONE)
         reg_unit = op_unit.registered(q, k, (), template.Kept.NONE)
+        assert not reg_folded.prescaled and reg_folded.rewalk_prescaled
         assert reg_scaled.prescaled and not reg_unit.prescaled
         family = program.bundle(gen, jnp.bfloat16)
+        wide_reg_folded = dataclasses.replace(reg_folded, width=576, value_width=128)
         wide_reg_scaled = dataclasses.replace(reg_scaled, width=576, value_width=128)
         wide_reg_unit = dataclasses.replace(reg_unit, width=576, value_width=128)
         tiles = program.Tiles(64, 64, 2, 1, family.name)
         if family.budgets_registers and program.query_swizzle(family) is None:
             scaled_regs = wide_reg_scaled.at(family, tiles)
+            folded_regs = wide_reg_folded.at(family, tiles)
             unit_regs = wide_reg_unit.at(family, tiles)
-            assert scaled_regs is not None and unit_regs is not None and scaled_regs > unit_regs
+            assert scaled_regs is not None and folded_regs is not None and unit_regs is not None
+            assert scaled_regs > unit_regs and folded_regs == unit_regs
         def forward_scaled(query, key, value):
-            return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.NONE)
+            return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.NONE,
+                                            natural=True)
         found = compile_mosaic_kernels(
             [KernelCase(f"{gen}-prescaled-d256", lambda: (forward_scaled, (q, k, k)))], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

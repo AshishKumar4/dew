@@ -144,15 +144,8 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     coords = (coords_of(k_first) if masked is None
               else coords_of(k_first, read=walk.places_read(masked=masked)))
     overlapped: tuple | None = None
-    if _splits_scores(walk):
+    if masked is not None and _splits_scores(walk):
         def between(s):
-            if is_whole is not None:
-                def weights_for(*, is_masked: bool):
-                    exps, w, sl, sn = _score_weights(walk, coords, (), s, peak, prior, masked=is_masked)
-                    return exps, w, sl, (jnp.ones(s.shape, jnp.bool_) if sn is None else sn)
-                return lax.cond(is_whole, functools.partial(weights_for, is_masked=False),
-                                functools.partial(weights_for, is_masked=True))
-            assert masked is not None
             return _score_weights(walk, coords, (), s, peak, prior, masked=masked)
 
         overlapped, dp = family.product_pair(
