@@ -294,6 +294,7 @@ CASES = (
     ('sm80', '64', 'mha', 'causal', 'plain', 'two', 'bfloat16', 'accurate'),
     ('sm90', '64', 'gqa-8-4', 'causal', 'key-bias', 'two', 'bfloat16', 'fast'),
     ('sm80', '64', 'gqa-8-2', 'documents', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm80', '256', 'gqa-8-4', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
 )
 """The cells' cases, each its axis values in `AXES`' order: the cases ledger rows name and every pair of axis
 values the route serves (`kernel_matrix.covering("attention")`, regenerated where the axes or the route's

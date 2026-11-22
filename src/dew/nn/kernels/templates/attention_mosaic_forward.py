@@ -67,6 +67,7 @@ from dew.nn.kernels.templates.attention import (
     sums_units,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    BlockPlan,
     ForwardRegisters,
     Tiles,
     TileWalk,
@@ -84,6 +85,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     approximate,
     bundle_of,
+    forward_block_plan,
     forward_reduces,
     head_layout,
     head_slice,
@@ -95,6 +97,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     launch_scope,
     modelled,
     param_types,
+    powered_in_kernel,
     query_swizzle,
     reducing,
     refused,
@@ -334,25 +337,31 @@ def _plain_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     # branch, its plain launch's maxima the guard's (`algebra.walked_launches`).
     family = bundle_of(walk["tiles"], query.dtype)
     # A value of the keys' columns rewalks in the guard's branch: its launch reads no value array in place.
-    in_place = family.rewalks and not walk.get("in_key") and (
-        masked or (hooks.output_mod is None and _copy_costs_more(query, value)))
+    in_place = rewalks_in_place(family, query, value, masked=masked,
+                                has_output_mod=hooks.output_mod is not None,
+                                in_key=bool(walk.get("in_key")))
     spec, launch, finished = _inference_walk(query, key, value, spans, hooks, masked=masked, flagged=in_place,
                                              **walk)
     return spec, launch, finished, in_place
 
 
-def _copy_costs_more(query: jax.Array, value: jax.Array) -> bool:
-    """Whether a call's guard rewalks in place (`algebra.walked_launches`' `in_place`, a masked launch every
-    call) rather than in a branch, whose common side copies the plain launch's output into its result: where
-    that copy, its bytes read and written at the device's bandwidth, costs more than the masked launch and
-    its two block-map fusions at the device's launch cost (`GpuTarget.memory_rate`, `launch_seconds`); the
-    branch where either fact is unmeasured."""
-    target = generation.gpu_target()
-    if target.memory_rate is None or target.launch_seconds is None:
+def rewalks_in_place(family: mosaic.Family, query, value, *, masked: bool = False,
+                     has_output_mod: bool = False, in_key: bool = False,
+                     target: generation.GpuTarget | None = None) -> bool:
+    """Whether an inference forward walk's natural rewalk runs in place (`masked=True`, rows 10677, 11852):
+    shared by `_plain_walk` and `MosaicForward._relaunched` so emission and register planning agree."""
+    if not family.rewalks or in_key:
+        return False
+    if masked:
+        return True
+    if has_output_mod:
+        return False
+    gpu = generation.gpu_target() if target is None else target
+    if gpu.memory_rate is None or gpu.launch_seconds is None:
         return False
     rows = query.shape[0] * query.shape[1] * query.shape[2]
     copied = 2 * rows * value.shape[-1] * jnp.dtype(query.dtype).itemsize
-    return copied / target.memory_rate > 3 * target.launch_seconds
+    return copied / gpu.memory_rate > 3 * gpu.launch_seconds
 
 
 class _Flags(NamedTuple):
@@ -554,24 +563,6 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     maximum, total = (array[:, :, :queries] for array in rows_of[0])
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
-class BlockPlan(NamedTuple):
-    """How a forward value-column block runs (`forward_block_plan`): whether an inference call splits its
-    output hook into XLA past the block launches (`split`), the block launch's `out_dtype`, and whether an
-    output hook runs inside the kernel (`output_hook`). Shared by legality, residency, and emission
-    (row 9542)."""
-    split: bool
-    out_dtype: object
-    output_hook: bool
-
-
-def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
-                       training: bool) -> BlockPlan:
-    """Derive hook placement and block `out_dtype` from the call's value-column partition (`value_columns`):
-    an inference call whose columns split into multiple blocks runs its `output_mod` in XLA past the launches
-    and emits fp32 per block (row 9542)."""
-    split = not training and has_output_mod and value_columns(total_v, columns) < total_v
-    return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split)
-
 
 def column_slices(total: int, columns: int | None, *, whole: bool = True) -> list[tuple[int | None, int]]:
     """The `(first, width)` partition of `total` value columns walked `columns` at a time (`value_columns`):
@@ -755,7 +746,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         query = prologued(query, hooks.query_mod, hooks.query_params)
         hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
     # The padded query stays unscaled until `_rewalked` decides per launch (plain or natural rewalk, which
-    # may switch families) whether its consumers take the power in their stage (`_powered_in_kernel`) or
+    # may switch families) whether its consumers take the power in their stage (`powered_in_kernel`) or
     # XLA multiplies before the launch (row 5274).
     call = padded_call(query, key, value, spans, hooks,
                        _block(tiles), table, by_position=True,
@@ -790,20 +781,6 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return call, spec, operands, read, taken, hooks
 
 
-def _powered_in_kernel(family: mosaic.Family, dtype, hooks: Hooks, *, parts: int = 1) -> bool:
-    """Whether a launch's consumers take its query's power of two in their stage (`_query_of`, its form's
-    `prescale`): under a query prologue, or for a single-part 16-bit query on an NVIDIA GPU family that
-    fixes up its stages (`family.fixes_up`, not `places_on_role`, not TPU `mxu`). On explicit-swizzle
-    families (`query_swizzle` not None) scales via `across.scale_smem`; on inferred-swizzle families
-    (`wgmma`, `tcgen05.chunks`) scales via `family.tile_of(q_smem)`, eliminating the 43-46 us global
-    `by_power(query)` pass before sm90 forward/training natural rewalks (row 5272, M-NA-3)."""
-    if parts != 1:
-        return False
-    if hooks.query_mod is not None:
-        return True
-    return jnp.dtype(dtype).itemsize == 2 and family.fixes_up and not family.places_on_role
-
-
 def folded_form(form: str, keys: int, *, ids: bool, dtype, width: int, scale: float | None, natural: bool,
                 score_mod, subtracted: bool, **fields) -> tuple[algebra.Forward, float]:
     """A forward's form (`algebra.Forward`, `fields` its others) at the scale its launch takes, and the power
@@ -823,10 +800,11 @@ def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, ta
               family: mosaic.Family, parts: int = 1) -> tuple[jax.Array, algebra.Forward]:
     """A launch's query operand and form: updates the natural rewalk's scale and prescale where the plain
     launch folded `taken` into its scale, then applies `form.prescale` outside the launch iff `family` does
-    not apply it in the query stage (`_powered_in_kernel`), so a cross-family rewalk never scales twice."""
+    not apply it in the query stage (`powered_in_kernel`), so a cross-family rewalk never scales twice."""
     if taken != 1.0 and form.natural != spec.natural:
         form = dataclasses.replace(form, scale=form.scale / taken, prescale=taken)
-    if form.prescale == 1.0 or _powered_in_kernel(family, query.dtype, hooks, parts=parts):
+    if form.prescale == 1.0 or powered_in_kernel(
+            family, query.dtype, has_query_mod=hooks.query_mod is not None, parts=parts):
         return query, form
     return by_power(query, form.prescale), form
 class _Read(NamedTuple):
@@ -1182,7 +1160,7 @@ def _status_stored(family: mosaic.Family, spec: algebra.Forward, state: algebra.
 def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded, hooks: Hooks,
               hooked: _Hooked, place: tuple, first, *, interpret: bool = False):
     """A consumer's query block loaded from `q_view` into its stage, taken under the query prologue or by
-    the launch's power of two where `_powered_in_kernel` (`_prologued`, `across.scale_smem`, `spec`'s
+    the launch's power of two where `powered_in_kernel` (`_prologued`, `across.scale_smem`, `spec`'s
     `prescale`), and held (`Family.held`); or an fp32 call's parts (`MosaicForward.parts`, `q_view` their
     `rings.Pieces`, whose prologue its caller took) one above the other, a copy and a barrier each, read
     where they lie (`_Program.parted`)."""
@@ -1191,7 +1169,8 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
         family.loaded(((q_view, q_smem, q_loaded),))
         if hooks.query_mod is not None:
             _prologued(family, hooks.query_mod, hooks, hooked.query, place, first, q_smem, spec.prescale)
-        elif spec.prescale != 1.0 and _powered_in_kernel(family, q_smem.dtype, hooks, parts=program.parts):
+        elif spec.prescale != 1.0 and powered_in_kernel(
+                family, q_smem.dtype, has_query_mod=hooks.query_mod is not None, parts=program.parts):
             swizzle = query_swizzle(family)
             if swizzle is not None:
                 across.scale_smem(q_smem, spec.prescale, swizzle=swizzle, interpret=interpret)
@@ -1584,14 +1563,12 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
-        elif (hooks.output_mod is None and keep is None and family.budgets_registers
-              and state.acc.shape[-1] > 128):
-            # Chunk wide (>128) register epilogues by `stores.staged_columns` into `stage`, then flush once
-            # through `family.stored` so `state.acc` and `output` fit without spilling (rows 5272, 10864).
+        elif (chunk := BlockPlan(split=False, out_dtype=out_view.dtype,
+                                 output_hook=hooks.output_mod is not None).epilogue_chunk(
+                family, state.acc.shape[-1], out_view.dtype, masked=keep is not None, kept=False)):
+            # so `state.acc` and `output` fit without spilling (rows 5272, 10864).
             width = state.acc.shape[-1]
-            chunk = stores.staged_columns(width, (out_view.dtype,))
             maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
-
             def write_chunks(smem):
                 for col in range(0, width, chunk):
                     sl = pl.ds(col, chunk)
@@ -1966,8 +1943,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
                      column_width=column_width, shared_by=shared_by,
                      certified=certified, flags=flags,
                      walk_rows=None if walks is None else walks.granule, parts=parts,
-                     registers=None if registered is None else registered.at(family, tiles, peaks=peaks,
-                                                                              columns=column_width),
+                     registers=None if registered is None else registered.at(
+                         family, tiles, peaks=peaks, columns=column_width, masked=keeping is not None),
                      value_columns=value_columns, decides=decides, tmem_columns=tmem_columns,
                      products=products)
 
@@ -2210,7 +2187,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
-                                in_key=value_columns is not None, splits=splits)
+                                in_key=value_columns is not None, splits=splits, table=read.table)
     grid = (heads, batch, queries // pair * splits)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
@@ -2334,7 +2311,7 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, group: 
 
 def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
                   value_width: int, tiles: Tiles, *, peaks: bool, training: bool, counted: bool,
-                  shared_by: int, in_key: bool, splits: int = 1) -> tuple:
+                  shared_by: int, in_key: bool, splits: int = 1, table=None) -> tuple:
     """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): its walk's
     statement, its work its emission's (`stated`), and the model's products it owns (`modelled`): the
     forward's two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of
@@ -2343,11 +2320,14 @@ def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, valu
     bounds by its trip, and a rare call's scaled op (`MosaicForward.scaled`), whose branch it takes where it
     is the larger, either counting work every step that runs at most rarely. A launch whose values are its
     keys' columns (`in_key`, `MosaicForward.in_key`) reads one stream, the key buffer counted once: a
-    statement, as the launch's arrays reach it under `tuning.lowered_once`'s jit as distinct tracers."""
+    statement, as the launch's arrays reach it under `tuning.lowered_once`'s jit as distinct tracers. A
+    paged launch also streams its gather `table` operand once (row 11737)."""
     batch, queries, heads, width = query.shape
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
     streamed = (query, key) if in_key else (query, key, value)
+    if table is not None:
+        streamed = (*streamed, table)
     cost = (stated(spec, batch, heads, *streamed,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
                                       common=family.feeds_itself, splits=splits)) if counted

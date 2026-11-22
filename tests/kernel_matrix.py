@@ -13,7 +13,7 @@ cells to its supported pairs (`covered`). A TPU tier runs `TPU_FLOWS`. Nothing h
 import functools
 import importlib
 import itertools
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 
 import gpu_flow
 import jax.numpy as jnp
@@ -348,12 +348,16 @@ def served(family: str, combination: tuple[tuple[str, str], ...]) -> bool:
     return module.served(dict(combination)) if hasattr(module, "served") else supported(family, combination)
 
 
-def supported_pairs(family: str) -> set[tuple[tuple[str, str], tuple[str, str]]]:
+def supported_pairs(
+        family: str, *,
+        already: Collection[tuple[tuple[str, str], tuple[str, str]]] = (),
+) -> set[tuple[tuple[str, str], tuple[str, str]]]:
     """Every pair of axis values (each an axis and its value) that some combination the route serves holds.
     A combination whose pairs are all held already adds none whatever its route does, so it is not asked
     (`supported` traces a step): the set is the same, each pair asked of the combinations until one serves
-    it."""
-    pairs = set()
+    it. Pairs already in `already` (e.g. a family's declared cells, row 11649) seed the seen set so
+    combinations adding no uncovered pair skip tracing."""
+    pairs = set(already)
     for combination in combinations(AXES[family]):
         holds = gpu_flow.held(combination, values=False)
         if not holds <= pairs and supported(family, tuple(combination.items())):

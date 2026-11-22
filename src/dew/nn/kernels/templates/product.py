@@ -241,6 +241,34 @@ def parts(dtype) -> int:
 EXACT_PARTS = parts(jnp.float32)
 """The bf16 parts that hold an fp32 value's whole significand (`formed`): three, 8 bits each of its 24."""
 
+_BF16_PARTS: dict[tuple[str, bool], int] = {}
+
+
+def bf16_part_count(dtype=jnp.float32, *, accurate: bool = True) -> int:
+    """bf16 parts for `dtype` operands via `dew.algebra.error.product_precision` (rows 5473, 11943).
+
+    Non-fp32 operands return `parts(dtype)`. For fp32, resolves the cheapest bf16-split dot algorithm on
+    the active target (`stated=programs.dot_algorithms(operand)` so GPU and TPU targets both resolve
+    cleanly) and returns `DotArithmetic.parts` (3 when `accurate=True`, 1 when `accurate=False`)."""
+    operand = jnp.dtype(dtype)
+    if operand != jnp.float32:
+        return parts(operand)
+    from dew.algebra.error import product_precision
+
+    target = generation.gpu_target()
+    key = (target.generation or generation.placed_platform(), accurate)
+    if key not in _BF16_PARTS:
+        chosen = product_precision(
+            64, 64, 64, operand,
+            stated=programs.dot_algorithms(operand),
+            admits=lambda p: (a := programs.dot_arithmetic(p, operand, operand)) is not None
+            and a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
+            and not a.imprecise and a.operations >= (6 if accurate else 1))
+        arith = programs.dot_arithmetic(chosen, operand, operand)
+        assert arith is not None, chosen
+        _BF16_PARTS[key] = arith.parts
+    return _BF16_PARTS[key]
+
 
 def bf16_parts(x: jax.Array, count: int, *, saturating: int) -> Iterator[jax.Array]:
     """fp32 `x` as `count` bf16 parts, largest first, each the last's remainder rounded (exact) and formed

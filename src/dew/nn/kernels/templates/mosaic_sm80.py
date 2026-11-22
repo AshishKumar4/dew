@@ -447,6 +447,9 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         del scratch, interpret
         return value.sum(axis=0)
 
+    def left_of(self, ref) -> jax.Array:
+        return self._left(ref)
+
     def _left(self, lhs):
         """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's (an
         accumulator's) cast, in registers where each warp holds whole rows of it or no relay tile is bound,
@@ -454,7 +457,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         whole, a sync after each so no warp reads a column not yet stored or stores over one another still
         reads."""
         if not isinstance(lhs, jax.Array):
-            return plgpu.load(lhs, layout=self.lhs, optimized=self._matrix_loads)
+            return plgpu.load(lhs, layout=self.lhs, optimized=self.rows_loaded)
         value = lhs.astype(self.dtype)
         if self.relay is None or not self.relay_bytes(*value.shape):
             # Unbound, the cast is Mosaic's own, which crosses warps only where its layouts allow.
@@ -488,6 +491,24 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         which Mosaic GPU's layout inference found no layout (tf32-mini at 9d77b39e7), its threads loading
         their elements themselves."""
         return self.dtype.itemsize <= 2
+
+    @property
+    def rows_loaded(self) -> bool:
+        """Whether 16-bit left operands load by `ldmatrix`: only where each warp holds whole rows
+        (`rows_whole`); fewer row warps read element-wise, as the relay path does."""
+        return self._matrix_loads and self.rows_whole
+
+    def _store_staged(self, value: jax.Array, buffer) -> None:
+        cast = value.astype(buffer.dtype)
+        if self.rows_whole or launches.interpreting():
+            buffer[...] = cast
+            return
+        # Unoptimized store is not bracketed by automatic barriers like `buffer[...] =`: the sync before
+        # keeps a warp from overwriting a column another still reads (WAR), and the sync after keeps a
+        # subsequent read from preceding every warp's store (RAW).
+        mosaic.synced(interpret=False)
+        plgpu.store(buffer, cast, optimized=False)
+        mosaic.synced(interpret=False)
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
         if pending:
