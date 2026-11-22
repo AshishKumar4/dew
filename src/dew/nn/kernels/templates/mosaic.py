@@ -85,26 +85,26 @@ def cluster_index(cluster: int) -> jax.Array | int:
 
 
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
-           interpret, family: str, name: str | None = None, scratch: tuple = (),
-           approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
-           model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1,
-           prefetched: Callable | None = None, model: resources.RegisterModel | None = None) -> Callable:
+           interpret, family: str, compiled: plgpu.CompilerParams, name: str | None = None,
+           scratch: tuple = (), cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
+           model_flops: int | None = None, prefetched: Callable | None = None,
+           model: resources.RegisterModel | None = None) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
-    checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
-    with its register `model` where given (`report.named`), a launch lowered once for every call of its
-    facts (`tuning.lowered_once`), its `cost` the hardware's work and `model_flops` the model's share of it,
-    its L2 `prefetched` views issued before its wait (`dependent`)."""
+    checked against the mesh it runs in (`launches.kernel`), compiled with `compiled` (its family's,
+    `Transport.compiled_with`, its residency `min_blocks_per_sm`), named as the launch tracing it reports
+    `name` with its register `model` where given (`report.named`), a launch lowered once for every call of
+    its facts (`tuning.lowered_once`), its `cost` the hardware's work and `model_flops` the model's share of
+    it, its L2 `prefetched` views issued before its wait (`dependent`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     launched = bodies.dependent(entry, interpret, prefetched=prefetched)
     built = launches.kernel(launched, name=name or family, out_type=outputs.structs(out_type), grid=grid,
                             grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
                             scratch_types=scratch,
-                            compiler_params=compiler_params(approx_math=approx_math, resident=resident,
-                                                            reduction_scratch=reduction_scratch),
+                            compiler_params=compiled,
                             interpret=bodies.interpreted(interpret),
                             kernel_name=report.named(name, model=model),
                             cost_estimate=emission.built_with(cost), **clustered)
-    return checked(emission.costed(built, cost), name or family, resident, model_flops,
+    return checked(emission.costed(built, cost), name or family, compiled.min_blocks_per_sm, model_flops,
                    moves=model is None or model.moves, out_type=out_type)
 
 

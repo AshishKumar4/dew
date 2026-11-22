@@ -245,7 +245,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
         # view prefetched ahead of a wait (a GPU's dependent launch); its compiler holds its values, no
         # register budget (`budgets_registers`).
-        del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, tmem, moves
+        del reducing_warpgroups, resident, model_flops, registers, producer, shared, tmem, moves
         del reduces
         if prefetched is not None:
             raise NotImplementedError("a TPU program is launched after the last; nothing is prefetched ahead")
@@ -286,7 +286,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 in_specs=[pl.BlockSpec(memory_space=space) for space in spaces],
                 out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (len(outputs) + len(aliased)),
                 input_output_aliases={at: len(outputs) + k for k, at in enumerate(places)},
-                compiler_params=pltpu.CompilerParams(dimension_semantics=semantics),
+                compiler_params=dataclasses.replace(self.compiled_with(approx_math=approx_math),
+                                                    dimension_semantics=semantics),
                 interpret=pltpu.InterpretParams() if interpret else False,
                 cost_estimate=emission.built_with(cost))(*values)
             for at, added in zip(places, written[len(outputs):], strict=True):

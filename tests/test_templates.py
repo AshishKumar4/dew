@@ -75,7 +75,8 @@ def test_a_tensor_memory_launch_refuses_an_automatic_mesh_axis():
         output[...] = source[...]
 
     launch = mosaic.kernel(copy, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), grid=(1,),
-                           grid_names=("programs",), warpgroups=2, family=RINGS.name, interpret=True)
+                           grid_names=("programs",), warpgroups=2, family=RINGS.name,
+                           compiled=mosaic.compiler_params(), interpret=True)
     # A launch is built once for every call of its facts; each call checks the mesh it runs in.
     with jax.sharding.use_abstract_mesh(mesh), pytest.raises(ValueError):
         launch(jnp.zeros((128,), jnp.float32))

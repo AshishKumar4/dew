@@ -174,7 +174,8 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
                 jax.ShapeDtypeStruct((rows, value_heads, value_width), out_dtype))
     launched = mosaic.kernel(entry, out_type=out_type,
                              grid=(rows, value_heads // block.heads, value_width // block.columns),
-                             grid_names=("rows", "heads", "columns"), warpgroups=halves, resident=resident,
+                             grid_names=("rows", "heads", "columns"), warpgroups=halves,
+                             compiled=mosaic.compiler_params(resident=resident),
                              interpret=interpret, family=family.name, name="recurrence_step",
                              scratch=(plgpu.SMEM((block.heads, 3 + hooks.own_weight, key_width), jnp.float32),
                                       plgpu.SMEM((halves, 2, scan.THREADS // scan.WARP), jnp.float32),

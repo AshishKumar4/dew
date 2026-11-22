@@ -698,7 +698,8 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, programs),
                              grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
-                             name="selective_scan_backward", resident=scan.resident, scratch=scratch)
+                             compiled=mosaic.compiler_params(resident=scan.resident),
+                             name="selective_scan_backward", scratch=scratch)
 
     def accumulated(refs):
         """The launch's outputs written to `refs`, B's and C's gradients added to theirs from zero, one ref
