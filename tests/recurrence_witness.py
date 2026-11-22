@@ -1111,6 +1111,17 @@ def assert_keys_gated_witnessed(lane: Lane, heads: int = 1) -> None:
     assert_refusals(ungated, UNGATED_SHARES)
 
 
+def assert_inference_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness of a bf16 forward no gradient follows, with the delta rule and without it (its keys
+    taking the write gate), at its own tiles (`Tiles.forward`): its states then output launches, no walk
+    forming the output in one (rows 5668, 7877), every record inside its step's enclosure (`recorded`'s
+    `inference`)."""
+    operands = draw(0, "mild", heads=heads)
+    for run in (recorded(*operands, inference=True), recorded(*operands, delta=False, inference=True)):
+        for name, inside in witness(run, lane).items():
+            assert np.all(inside), (name, float(np.mean(inside)))
+
+
 PARTS_SHARES = {"h": 0.9, "c": 0.9, "o": 0.8}
 """The least share of each record at which an fp32 call whose values are held in parts, run at bf16 instead,
 is refused: its stored memories and corrected values (99% of them over two draws, interpreted at 5dd8e1788)
