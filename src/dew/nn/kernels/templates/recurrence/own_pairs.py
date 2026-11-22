@@ -25,6 +25,7 @@ from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, pair_s
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
+    Operand,
     chunk_liveness,
     f32,
     finished_form,
@@ -458,7 +459,10 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, factored, memor
     # The block a multiprocessor holds most programs of, at its registers and its shared memory: by its
     # registers alone, an sm86's 99 KB held none of its 32-key block's 106 KB (row 5282). It issues no
     # products, so a product's depth steps it (`key_block`'s `contracted`), as the forward's.
-    keys = key_block(call, functools.partial(_key_own_held, call), functools.partial(_key_own_staged, call),
+    # The finished queries' and keys' form, one binding the block's fit and the launch read.
+    summed = finished_form(call, once=call.group == 1)
+    keys = key_block(call, functools.partial(_key_own_held, call),
+                     functools.partial(_key_own_staged, call, summed=summed),
                      functools.partial(_keypair_streams, call), contracted=True)
     steps = width // keys
 
@@ -520,8 +524,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, factored, memor
                            prologue=lambda: own_zeroed(call, shifts))
 
     tiles = _keypair_streams(call, keys)
-    staging, landing = _key_own_staged(call, keys)
-    summed = finished_form(call, once=call.group == 1)
+    staging, landing = _key_own_staged(call, keys, summed=summed)
     fp32_rows, summed_rows = square.shape(call.heads * width), summed.shape(call.heads * width)
     betas = jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32)
     out_type = (summed_rows, summed_rows, fp32_rows, betas)
@@ -549,13 +552,13 @@ def _keypair_streams(call: Call, keys: int) -> dict:
                          gates=((chunk, keys), gates), lows=((chunk, keys), gates))
 
 
-def _key_own_staged(call: Call, keys: int) -> tuple:
+def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:
     """`key_pairs_own`'s staging at key block `keys`: its shifted reads' tile (`own_staging`; its moved
     gradients shifted in registers, `shifted_up`), and a key block's landings: the fp32 one every gradient
-    but the finished queries' and keys' lands in, and theirs in `finished_form`'s where it is narrower
+    but the finished queries' and keys' lands in, and theirs in their form `summed` where it is narrower
     (the fp32 one where it is not, each store waiting before the landing's next), what the launch allocates
     being what `key_block` fits (row 11953)."""
-    square, summed = fp32_operand(call), finished_form(call, once=call.group == 1)
+    square = fp32_operand(call)
     landing = {"block": square.landing(call.chunk, keys)}
     if summed.stored != square.stored:
         landing["summed"] = summed.landing(call.chunk, keys)
