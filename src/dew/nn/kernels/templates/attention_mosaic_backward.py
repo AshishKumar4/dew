@@ -8,6 +8,7 @@ import dataclasses
 
 import jax.numpy as jnp
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_gradient as gradient,
@@ -107,7 +108,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     # The dK/dV launch on its own layout (`BackwardTiles.dkv`).
     dkv_tiles = tiles.dkv
     dkv_walk = dataclasses.replace(walk, program=dataclasses.replace(
-        program, family=backward_family(bundles.named(dkv_tiles.family, query.dtype), dkv_tiles),
+        program, family=backward_family(bundles.named(dkv_tiles.family, query.dtype, generation.gpu_target()),
+                                        dkv_tiles),
         tiles=dkv_tiles),
         consumers=dkv_tiles.consumers)
     # The dK/dV launch's readers by its own blocks where it has them (`BackwardTiles.dkv_blocks`).

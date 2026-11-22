@@ -20,6 +20,7 @@ from kernel_compile import gate_generations, stated_outputs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     across,
+    assembled,
     bundles,
     emission,
     handoffs,
@@ -284,7 +285,9 @@ def test_consumers_staging_over_their_rings_write_only_past_every_consumers_read
     p, x = _fed_operands()
     # A race is recorded and the kernel runs on (`on_race="warn"`), so each arm reads the detector's verdict.
     races = plgpu.InterpretGPUParams(detect_races=True, on_race="warn")
-    (parts,) = _fed_staged_over_rings(p, x, interpret=races, ordered=True)
+    # Each arm is run whole before its verdict is read: a dispatch returns before the kernel ran, and the
+    # detector's state is the last kernel's.
+    (parts,) = jax.block_until_ready(_fed_staged_over_rings(p, x, interpret=races, ordered=True))
     assert not interpreter.get_races().races_found
     np.testing.assert_array_equal(np.asarray(parts).sum(axis=0), _fed_expected(p, x)[0])
     jax.block_until_ready(_fed_staged_over_rings(p, x, interpret=races, ordered=False))
@@ -511,7 +514,7 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
     pair = mosaic_sm100.PAIR
     assert (pair.cluster, pair.pairs_product, pair.widest_product) == (2, True, 128)
     assert (mosaic_sm100.RINGS.cluster, mosaic_sm100.RINGS.pairs_product) == (1, False)
-    assert bundles.named("tcgen05.pair", jnp.bfloat16) is pair
+    assert bundles.named("tcgen05.pair", jnp.bfloat16, None) is pair
     assert pair in bundles.groups("sm100", jnp.bfloat16, stated=True)[0]
     assert pair not in [family for group in bundles.groups("sm90", jnp.bfloat16, stated=True)
                         for family in group]
@@ -550,7 +553,7 @@ def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
         stated = resources.register_model(WGMMA, 2, 168)
         with report.launching(op, bound, Tiles(16, 16, 2, 1, family="wgmma")):
             name = report.named("attention", model=stated)
-        kernel, launch, _ = report.kernel_of(name)
+        kernel, launch, _ = assembled.kernel_of(name)
         assert kernel == "attention" and report.traced(launch).kernels == {"attention": stated}
         assert report.named("attention", model=stated) == "attention"
 
@@ -612,12 +615,14 @@ def test_a_joined_warpgroup_role_takes_its_weights_share_of_the_raised_registers
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
-    largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
-    whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes each walk
-    apart (mma.sync's emit_pipeline)."""
+    largest of them, every barrier 8 bytes, a named CTA barrier none (the block's hardware barrier,
+    `plgpu.CtaBarrier`, a packed decode's consumers' meet); a tile scoped after its walks beside the program's
+    on a family whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes
+    each walk apart (mma.sync's emit_pipeline)."""
     from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90, resources
 
-    program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3))
+    program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3),
+               plgpu.CtaBarrier(num_arrivals=2))
     walks = ((plgpu.SMEM((2, 1024), jnp.bfloat16),), (plgpu.SMEM((4, 1024), jnp.bfloat16),))
     scope = resources.Scope(program=program, walks=walks, after=(((512,), jnp.float32),))
     # 400 bytes -> 1 KiB; walks 4 KiB and 8 KiB -> 8 KiB; 3 barriers; the after tile's 2 KiB.
@@ -2052,7 +2057,7 @@ def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_cop
     as many slots as steps, also planned inside a jit's trace over a mesh of its own. That the plan is the
     kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`: its
     planned shared bytes against those the compiled kernel asks for)."""
-    family = bundles.named("mma.sync", jnp.bfloat16)
+    family = bundles.named("mma.sync", jnp.bfloat16, None)
     streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 1)
 
     def walked(steps: int | None = None) -> tuple[list, list]:

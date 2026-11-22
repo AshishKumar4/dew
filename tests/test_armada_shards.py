@@ -258,6 +258,33 @@ def test_a_sites_map_tasks_are_cut_by_what_their_records_say_they_paid_whatever_
         ("test_site.draws-0-4", 300.0), ("test_site.draws-4-12", 320.0), ("test_site.draws-12-20", 320.0)]
 
 
+def test_a_sites_heavy_units_are_a_task_alone_and_its_light_ones_merge_by_each_spans_own_cost(ci):
+    """A site whose units cost unlike is cut by each measured span's own seconds a unit (`costs.timed`'s
+    `unit-<start>-<stop>`, `Cost.cut`), its declared per_task a ceiling: a rung walk whose first three places
+    took 190 s each and the rest 60 s, past two targets of 120 s with a 10 s setup, draws each heavy place in
+    a task alone and three light ones a task, where a cut at the spans' median rate held every task to three
+    places, the heavy ones' a 580 s task (row 8611: the mark capped at two a task by hand)."""
+    timings = {"site.setup": 10.0, "site.unit": 60.0,
+               **{f"site.unit-{unit}-{unit + 1}": 190.0 for unit in range(3)}}
+    cost = ci.costs.recorded("site", timings, weighed=False)
+    mark = ci.costs.Mark(units=18, per_task=6, line=1, timed=18)
+    spans = ci.cut_draws(mark, {False: cost, True: None}, 120.0)
+    assert spans == [(0, 1), (1, 2), (2, 3), (3, 6), (6, 9), (9, 12), (12, 15), (15, 18)]
+    assert max(cost.seconds(start, stop) for start, stop in spans) <= 120.0 * ci.costs.SITE_TARGETS
+    # Its median rate alone, as before each span's was kept: every task three places, the first 580 s.
+    median = ci.costs.Cost(10.0, 60.0)
+    assert ci.cut_draws(mark, {False: median, True: None}, 120.0)[0] == (0, 3)
+    # A span measured past the bound draws each of its units alone, never one beside a neighbour's: its rate
+    # is its units' mean, and a 60 s unit beside a 190 s one read at 125 s each would join the next span's
+    # 60 s unit, the cut swinging between two that both pass the bound.
+    swung = ci.costs.recorded("site", {"site.setup": 10.0, "site.unit": 60.0, "site.unit-0-2": 125.0,
+                                       "site.unit-2-3": 60.0}, weighed=False)
+    assert swung.cut(0, 3, 6, 240.0) == [(0, 1), (1, 2), (2, 3)]
+    # A weighed check's spans are its own: the unweighted check's rates are no weighed unit's.
+    weighed = ci.costs.recorded("site", {**timings, "site.weighed_unit": 30.0}, weighed=True)
+    assert weighed is not None and weighed.spans == ()
+
+
 def test_a_sites_cost_counts_what_its_map_tasks_paid_between_draws_and_their_weighed_draws_apart(ci):
     """A site's cost from its map tasks' records (`costs.timed`), each a label's draws within its task's
     planned span: a task's setup is all it paid outside its draws, so a layout compiled between two labels'
@@ -274,7 +301,8 @@ def test_a_sites_cost_counts_what_its_map_tasks_paid_between_draws_and_their_wei
         drawn((0, 4), (0, 4), 30.0, 8.0), drawn((0, 4), (0, 4), 88.0, 12.0),
         # A weighed task drawing the plan's units 20 to 22, written at its check's own 0 to 2.
         drawn((20, 22), (0, 2), 40.0, 30.0)], units=20)
-    assert found == {"task.setup": 60.0, "task.unit": 5.0, "task.weighed_unit": 15.0}
+    assert found == {"task.setup": 60.0, "task.unit": 5.0, "task.weighed_unit": 15.0, "task.unit-0-4": 5.0,
+                     "task.weighed_unit-20-22": 15.0}
 
 
 def test_a_sites_cost_counts_what_its_draws_paid_once_with_its_setup(ci):
@@ -295,10 +323,11 @@ def test_a_sites_cost_counts_what_its_draws_paid_once_with_its_setup(ci):
         drawn((5, 6), 60.0, 310.0, first=310.0, compiled=300.0, weighing=0.0),
         # A weighed task of four units: 30 s of weighing, a first draw of 40 s and three later of 10 s.
         drawn((20, 24), 50.0, 100.0, first=40.0, compiled=25.0, weighing=30.0)], units=20)
-    assert found == {"task.setup": 350.0, "task.unit": 10.0, "task.weighed_unit": 10.0}
+    assert found == {"task.setup": 350.0, "task.unit": 10.0, "task.weighed_unit": 10.0, "task.unit-0-5": 10.0,
+                     "task.unit-5-6": 10.0, "task.weighed_unit-20-24": 10.0}
     alone = ci.costs.timed("task", [drawn((0, 1), 60.0, 310.0, first=310.0, compiled=310.0, weighing=0.0)],
                            units=20)
-    assert alone == {"task.setup": 60.0, "task.unit": 310.0}
+    assert alone == {"task.setup": 60.0, "task.unit": 310.0, "task.unit-0-1": 310.0}
 
 
 def test_a_map_tasks_record_says_its_first_draw_and_the_compiles_within_it(monkeypatch, tmp_path):
@@ -354,8 +383,8 @@ def test_a_weighed_sites_units_are_map_tasks_of_their_own_past_its_unweighted_on
                                        "@pytest.mark.check1_shards(seeds=4, per_task=8, conditioning=2, "
                                        "conditioning_per_task=3)\n"
                                        "def test_site():\n    pass\n"})
-    assert ci.sites("tests/test_site.py") == {"test_site": ci.Mark(units=20, per_task=8, line=2, timed=4,
-                                                                   weighed=10, weighed_per_task=3)}
+    assert ci.sites("tests/test_site.py") == {
+        "test_site": ci.costs.Mark(units=20, per_task=8, line=2, timed=4, weighed=10, weighed_per_task=3)}
     entries = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12" and entry["split"]]
     spans = [(0, 4), (4, 12), (12, 20), (20, 23), (23, 26), (26, 29), (29, 30)]
     maps = [entry for entry in entries if "after" not in entry]
@@ -389,15 +418,16 @@ def test_a_mark_the_plan_cannot_read_from_its_tests_decorator_is_refused(ci, tmp
             ci.plan(30.0, {})
     written(tmp_path, {"test_site.py": f"import pytest\nmesh = layout.shards\n"
                                        f"@pytest.mark.shards(units=20, per_task=8)\n{test}"})
-    assert ci.sites("tests/test_site.py") == {"test_site": ci.Mark(units=20, per_task=8, line=3, timed=20)}
+    assert ci.sites("tests/test_site.py") == {
+        "test_site": ci.costs.Mark(units=20, per_task=8, line=3, timed=20)}
     written(tmp_path, {"test_site.py": "import pytest\nclass TestSite:\n"
                                        "    @pytest.mark.check1_shards(seeds=4, per_task=8)\n"
                                        "    def test_site(self):\n        pass\n"
                                        "    @pytest.mark.shards(units=30, per_task=8)\n"
                                        "    def test_work(self):\n        pass\n"})
     assert ci.sites("tests/test_site.py") == {
-        "TestSite.test_site": ci.Mark(units=20, per_task=8, line=3, timed=4),
-        "TestSite.test_work": ci.Mark(units=30, per_task=8, line=6, timed=30)}
+        "TestSite.test_site": ci.costs.Mark(units=20, per_task=8, line=3, timed=4),
+        "TestSite.test_work": ci.costs.Mark(units=30, per_task=8, line=6, timed=30)}
     judges = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12" and "after" in entry]
     assert [(entry["split"], len(entry["after"])) for entry in judges] == [("TestSite.test_site", 3),
                                                                           ("TestSite.test_work", 4)]
@@ -448,7 +478,7 @@ def test_a_generated_cell_is_a_site_its_files_check1_shards_literal_declares(ci,
     6444)."""
     written(tmp_path, {"test_site.py": GENERATED})
     assert ci.sites("tests/test_site.py") == {
-        "test_form[heavy-one]": ci.Mark(units=staged_units(128), per_task=16, line=2, timed=128)}
+        "test_form[heavy-one]": ci.costs.Mark(units=staged_units(128), per_task=16, line=2, timed=128)}
     judges = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12" and "after" in entry]
     assert [entry["split"] for entry in judges] == ["test_form[heavy-one]"]
     for entry in ('"test_form[heavy one]": {"seeds": 128, "per_task": 16}',
@@ -482,8 +512,8 @@ def test_a_marked_parameter_is_a_site_of_its_own_whose_tasks_run_it_alone(ci, tm
     recorded = {"tests/test_site.py::test_form[plain]": 1.0}
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(recorded))
     assert ci.sites("tests/test_site.py") == {
-        "test_form[one]": ci.Mark(units=staged_units(2), per_task=8, line=8, timed=2),
-        "test_form[two-rated]": ci.Mark(units=staged_units(4), per_task=8, line=9, timed=4)}
+        "test_form[one]": ci.costs.Mark(units=staged_units(2), per_task=8, line=8, timed=2),
+        "test_form[two-rated]": ci.costs.Mark(units=staged_units(4), per_task=8, line=9, timed=4)}
     entries = planned(ci, 30.0)
     judges = {entry["split"]: entry for entry in entries.values() if "after" in entry}
     assert sorted(judges) == ["test_form[one]", "test_form[two-rated]"]
@@ -601,7 +631,10 @@ def test_site():
         ("3.12:tests/test_site.py#test_site", 0, ["tests/test_site.py::test_site"])]
     task = ci.site_task("3.12", "tests/test_site.py", "test_site")
     costs = {key: seconds for key, seconds in row["timings"].items() if key != row["name"]}
-    assert sorted(costs) == [ci.costs.costed(task, "setup"), ci.costs.costed(task, "unit")]
+    spans = [entries[name]["split"].rpartition(".draws-")[2].split("-") for name in judge["after"]]
+    words = ["setup", "unit",
+             *(ci.costs.span_word(int(start), int(stop), weighed=False) for start, stop in spans)]
+    assert sorted(costs) == sorted(ci.costs.costed(task, word) for word in words)
     assert all(seconds > 0 for seconds in costs.values()), costs
     shutil.rmtree(inputs / "job/0")
     assert entry_task(ci, monkeypatch, judge, out, inputs=inputs) == 0

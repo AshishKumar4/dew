@@ -4,7 +4,8 @@
 # the fetched fixtures' pins (tools/fetched_fixtures.py), the complexity record (complexity.json), the generated
 # API pages, installer, site colors, model list, examples and live model pin, the lazy packages' import
 # surfaces (tools/gen_exports.py), the tested Python versions, pyright, and duplicate code
-# (tools/duplicates.py), read as text and as structure. PYTHON names the interpreter of the test suite's
+# (tools/duplicates.py), read as text and as structure, and the attribute reads of the tests a change touches
+# (tools/test_types.py). PYTHON names the interpreter of the test suite's
 # environment (tools/install_environment.sh); default: python. BASE is the ref SLOP020's ratchet holds the
 # inventory to; default: origin/main. A lane runs it before every LAND, and CI's lint job runs it as is.
 # Usage, from the checkout: sh tools/check.sh [--changed | --gate NAME | --list]

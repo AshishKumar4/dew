@@ -442,7 +442,8 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
 
     def pinnable(self, ba, config) -> bool:
         from .templates import report
-        return super().pinnable(ba, config) and not report.refused(self, ba, config)
+
+        return super().pinnable(ba, config) and not report.refused(self, ba, config, self.launch_target())
 
     @staticmethod
     @contextlib.contextmanager
@@ -454,10 +455,13 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
             yield
 
     def _refused(self, ba, config: tiling.Tiles, target) -> bool:
+        # Refused on `target` past its producer's ladder: spilling at the rung it settles on
+        # (`producers.settled`, settled under `target` until it takes one, row 11885).
         from .templates import report
         from .templates.gemm import producers
         with self._with_target(target):
-            return report.refused(self, ba, producers.settled(self, ba, config))
+            return report.refused(self, ba, producers.settled(self, ba, config), target)
+
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole

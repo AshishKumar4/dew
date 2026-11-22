@@ -68,7 +68,7 @@ def test_a_run_updating_in_its_backward_moves_as_its_step_would(edge):
                           without=REVERSE_ONLY)
 
 
-def stream(salt: int, seed: int, at: int, *, fixture: int | None = None) -> int | list[int]:
+def draw_stream(salt: int, seed: int, at: int, *, fixture: int | None = None) -> int | list[int]:
     """The seed of a contract cell's draw `at` at seed `seed` (`normal_draw`'s, NumPy's): seed zero's its
     fixture's (`fixture`, by default `salt + at`: the cell's own inputs, their streams as its contract was
     measured), a later seed's `[salt, seed, at]` (`SeedSequence` entropy), each of the cell's draws a stream
@@ -276,21 +276,21 @@ def plain_ssd(x, dt, a, b, c, skip, state):
 def delta_rule_draw(salt: int, seed: int, scale: float, *, key_heads: int, value_heads: int, width: int,
                     length: int, per_key: bool, unit_keys: bool = False):
     """A delta rule's operands `(query, key, value, g, beta, state)`, their direction and the outputs'
-    cotangents, a cell's draws 0 to 2 at `seed` (`stream`, its `salt`): queries, values and memory at
+    cotangents, a cell's draws 0 to 2 at `seed` (`draw_stream`, its `salt`): queries, values and memory at
     `scale`, keys at it or of unit norm, a log decay in (-inf, 0) a head or a key dimension, write gates in
     (0, 1)."""
     query, key, value, decay, gate, state = normal_draw(
-        stream(salt, seed, 0), (1, length, key_heads, width), (1, length, key_heads, width),
+        draw_stream(salt, seed, 0), (1, length, key_heads, width), (1, length, key_heads, width),
         (1, length, value_heads, width), (1, length, value_heads, *((width,) if per_key else ())),
         (1, length, value_heads),
         (1, value_heads, width, width))
     key = key / jnp.linalg.norm(key, axis=-1, keepdims=True) if unit_keys else key * scale
     primals = (query * scale, key, value * scale, -jax.nn.softplus(decay), jax.nn.sigmoid(gate),
                state * scale)
-    drawn = normal_draw(stream(salt, seed, 1), *(x.shape for x in primals))
+    drawn = normal_draw(draw_stream(salt, seed, 1), *(x.shape for x in primals))
     direction = tuple(along * (scale if at in (0, 2, 5) or (at == 1 and not unit_keys) else 1.0)
                       for at, along in enumerate(drawn))
-    cotangent = normal_draw(stream(salt, seed, 2), value.shape, state.shape)
+    cotangent = normal_draw(draw_stream(salt, seed, 2), value.shape, state.shape)
     return primals, direction, cotangent
 
 
@@ -357,7 +357,7 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
     def draw(seed, scale):
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
             2661 + per_key, seed, scale, key_heads=2, value_heads=2, width=64, length=64, per_key=per_key)
-        cotangent = normal_draw(stream(2661 + per_key, seed, 3, fixture=2663), value.shape)[0]
+        cotangent = normal_draw(draw_stream(2661 + per_key, seed, 3, fixture=2663), value.shape)[0]
         return (query, key, value, g, beta), direction[:5], cotangent
 
     memory = jnp.zeros((1, 2, 64, 64), jnp.float32)
@@ -402,7 +402,7 @@ def test_the_template_rule_holds_its_orders(edge, taken):
                    beta.astype(jnp.bfloat16))
         direction = tuple(along.astype(operand.dtype)
                           for along, operand in zip(direction, primals, strict=False))
-        return primals, direction, normal_draw(stream(2664, seed, 3, fixture=2665), value.shape)[0]
+        return primals, direction, normal_draw(draw_stream(2664, seed, 3, fixture=2665), value.shape)[0]
 
     def rule(*operands):
         with generation.chosen(gated_delta_rule="mosaic_gpu"):
@@ -826,12 +826,12 @@ def test_a_turned_template_call_holds_every_order(edge, taken):
     forward mode through its launch's own tangent (row 8573), an order set a case (`ORDER_SETS`)."""
     shapes = ((1, 40, 1, 6),) * 2 + ((1, 40, 1, 2),)
     def draw(seed, scale):
-        operands = normal_draw(stream(7419, seed, 0), *shapes, scale=scale)
-        turns = np.random.default_rng(stream(7419, seed, 1, fixture=7419)).uniform(-3.0, 3.0, (1, 40, 1, 2))
-        turn = jnp.asarray(turns, jnp.float32)
-        return ((*operands, turn), normal_draw(stream(7419, seed, 2, fixture=7420), *shapes, (1, 40, 1, 2),
-                                               scale=scale),
-                normal_draw(stream(7419, seed, 3, fixture=7421), (1, 40, 1, 2), (1, 1, 6, 2)))
+        operands = normal_draw(draw_stream(7419, seed, 0), *shapes, scale=scale)
+        turns = np.random.default_rng(draw_stream(7419, seed, 1, fixture=7419))
+        turn = jnp.asarray(turns.uniform(-3.0, 3.0, (1, 40, 1, 2)), jnp.float32)
+        direction = normal_draw(draw_stream(7419, seed, 2, fixture=7420), *shapes, (1, 40, 1, 2), scale=scale)
+        return ((*operands, turn), direction,
+                normal_draw(draw_stream(7419, seed, 3, fixture=7421), (1, 40, 1, 2), (1, 1, 6, 2)))
     ones, decays = jnp.ones((1, 40, 1), jnp.float32), jnp.full((1, 40, 1), -0.05, jnp.float32)
 
     def launch(context, query, key, value, g, beta, state, skip, entry, turning):

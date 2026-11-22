@@ -1,4 +1,4 @@
-"""A kernel's machine code as nvdisasm lists it (`report.binaries` reads it where it decodes a binary): the
+"""A kernel's machine code as nvdisasm lists it (`assembled.binaries` reads it where it decodes a binary): the
 disassembler, a cubin's listing, the roles a spill stands in, the registers its roles reconfigure to, whether
 it issues tensor-memory ops, and what it breaks of the SASS rules."""
 
