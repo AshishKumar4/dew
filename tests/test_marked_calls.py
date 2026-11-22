@@ -386,3 +386,30 @@ def test_a_marked_span_closing_over_its_enclosing_traces_value_is_traced_as_it_i
 
     out = jax.jit(scaled)(jnp.ones(3), jnp.full(3, 2.0))
     np.testing.assert_array_equal(np.asarray(out), np.full(3, 2.0, np.float32))
+
+
+def test_a_bound_flax_modules_statement_runs_none_of_its_setup():
+    """A Flax module bound to its variables (a layer within its model's `init` or `apply`) has no statement:
+    its identity is its variables' as well as its fields, and stating it ran its `setup`, which a second run
+    of found its submodules' names in use (train 1169: a held span's statement over a model's layer raised
+    `NameInUseError` in 49 cells). Nothing of it runs."""
+    import flax.linen as nn
+
+    from dew._stated import Unestablished, stated
+
+    made = []
+
+    class Made(nn.Module):
+        def setup(self):
+            made.append(None)
+            self.dense = nn.Dense(2)
+
+        def __call__(self, x):
+            return self.dense(x)
+
+    variables = Made().init(jax.random.key(0), jnp.ones((1, 3)))
+    made.clear()
+    bound = Made().bind(variables)
+    with pytest.raises(Unestablished):
+        stated(bound, "a bound module")
+    assert made == []
