@@ -1573,15 +1573,15 @@ about it is an estimate.
   its own evaluation. Windows of four steps into three found nothing further (2026-11-06, one round within
   its bounds). Whether its PTX beats the compiler's lowering of `encoded` is its consumer's measurement
   (sm80's FP8 and FP4 epilogue, row 3733).
-- **Decodes searched** (2026-11-06, the tool's `e4m3-decode-*`, `e5m2-decode-*` and `e8m0` references): an
-  FP8 word's four codes into two bfloat16 pairs in their natural byte order take 13 steps a register (11
-  issues on the ALU, two IMADs placing two fields in one multiply), from a seed of 15 or 16; the free layout's
-  linear form takes 2 a register (the linear search, a shift and a masked XOR), so a consumer of FP8 weights
-  would store them in its free layout once (`BitForm.encoded` where it packs them), as NVFP4's does, and no natural-order form is
-  checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8 steps: no
-  cheaper program within the windows (none found within the search's budgets: windows of at most three
-  inputs, bounded rounds and solver timeouts; not a proof that none exists). Neither has a consumer yet (sm80's
-  FP8 weights, sm100's MX): what this section says a consumer does with them is the design, not built.
+- **Decodes searched** (2026-11-06, the tool's `e4m3-decode-*`, `e5m2-decode-*` and `e8m0` references): an FP8
+  word's four codes into two bfloat16 pairs in their natural byte order take 13 steps a register (11 issues on
+  the ALU, two IMADs placing two fields in one multiply), from a seed of 15 or 16; the free layout's linear
+  form takes 2 a register (the linear search, a shift and a masked XOR), so a consumer of FP8 weights would
+  store them in its free layout once (`BitForm.encoded` where it packs them), as NVFP4's does, and no natural-
+  order form is checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8
+  steps: no cheaper program within the windows (none found within the search's budgets: windows of at most
+  three inputs, bounded rounds and solver timeouts; not a proof that none exists). Neither has a consumer yet
+  (sm80's FP8 weights, sm100's MX): what this section says a consumer does with them is the design, not built.
 - **Not in the linear search**: PRMT and LOP3's other tables as a register's combiner. A register's LOP3
   must zero its other bits, and a three-way XOR with a mask takes four operands, which LOP3 does not; a
   byte selection adds nothing a free layout's encoder does not, and a fixed layout's byte moves are the
@@ -1609,20 +1609,20 @@ Agreed with the GEMM template's owner (2026-11-03):
   two together, the format's integer decode
   (`bits.decoded`) on every code.
 - Each decode a template takes is declared and checked in once, in `dew.algebra.bits`, the one source the
-  engine's and the consumer's tests prove: `NVFP4_BFLOAT16`, eight E2M1 codes of a word in their natural
-  order (code `i` at bits `4i`, a byte's low nibble the earlier element) into four bfloat16 pairs, each the
-  code's value times 2^-126, and its form `NVFP4_BFLOAT16_FORM`, the search's at shifts of up to 6 places.
-  The codec stores the codes in the form's layout once, where it packs them (`bits.packed` applies the
-  form's encoder to an e2m1 word, `BitForm.encoded` a naturally packed word's), so a consumer receives
-  stored words and never encodes again; its portable path reads a word
-  tile `[r, c]` back as `[r, 8c]` elements in depth order (`BitForm.values`). The scaled codec a GEMM takes
-  is declared beside the form: `nvfp4_quantized(x)` gives a tile's stored words, its block scales (e4m3, one
-  for each sixteen along the depth) and its tensor scale, and `nvfp4_decoded(words, scales)` the tile in
-  bfloat16, each value its code times its block scale over `NVFP4_OWED` (2^8), exactly: the code is
-  restored to float32 from the form's decode (the code times 2^-126) by integer exponent arithmetic,
-  multiplied by the block scale over 2^8 in float32 and narrowed to bfloat16, every such product within its
-  range, and the epilogue's fp32 scale takes the owed factor with the tensor scale. An E2M1 subnormal (±0.5) decodes to a bfloat16 subnormal, so
-  the portable path scales it in integer exponent arithmetic, never through a lane that flushes subnormals.
+  engine's and the consumer's tests prove: `NVFP4_BFLOAT16`, eight E2M1 codes of a word in their natural order
+  (code `i` at bits `4i`, a byte's low nibble the earlier element) into four bfloat16 pairs, each the code's
+  value times 2^-126, and its form `NVFP4_BFLOAT16_FORM`, the search's at shifts of up to 6 places. The codec
+  stores the codes in the form's layout once, where it packs them (`bits.packed` applies the form's encoder to
+  an e2m1 word, `BitForm.encoded` a naturally packed word's), so a consumer receives stored words and never
+  encodes again; its portable path reads a word tile `[r, c]` back as `[r, 8c]` elements in depth order
+  (`BitForm.values`). The scaled codec a GEMM takes is declared beside the form: `nvfp4_quantized(x)` gives a
+  tile's stored words, its block scales (e4m3, one for each sixteen along the depth) and its tensor scale, and
+  `nvfp4_decoded(words, scales)` the tile in bfloat16, each value its code times its block scale over
+  `NVFP4_OWED` (2^8), exactly: the code is restored to float32 from the form's decode (the code times 2^-126)
+  by integer exponent arithmetic, multiplied by the block scale over 2^8 in float32 and narrowed to bfloat16,
+  every such product within its range, and the epilogue's fp32 scale takes the owed factor with the tensor
+  scale. An E2M1 subnormal (±0.5) decodes to a bfloat16 subnormal, so the portable path scales it in integer
+  exponent arithmetic, never through a lane that flushes subnormals.
 - The consumer records the form it takes: its encoder and the encoder's version (`BitForm.version`, a digest
   of its encoder, in the checkpoint, a load refusing words of another), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
   and its issues by pipe (`BitForm.issues`). `Work` holds no

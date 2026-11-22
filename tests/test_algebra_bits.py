@@ -80,6 +80,54 @@ def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order()
     np.testing.assert_array_equal(got, expected)
 
 
+def test_a_decoded_value_restored_narrow_is_its_float32_restoring_rounded_once():
+    """`bits.restored` in float16 and bfloat16 is its float32 restoring rounded once to the format, at every
+    16-bit pattern, a NaN as a NaN: formed in float32 and cast, where a fraction field cast to float16 first
+    overflowed (the half code, `0x0040`, read as infinity, not 0.5: row 8660's head review)."""
+    def restorings(patterns):
+        narrowed = (bits.restored(patterns, dtype) for dtype in (jnp.float16, jnp.bfloat16))
+        return bits.restored(patterns), *narrowed
+
+    narrow, *made_each = (np.asarray(x) for x in ahead_arm(jax.jit(restorings), "restorings narrowed")(
+        np.arange(1 << 16, dtype=np.uint32)))
+    for dtype, made in zip((jnp.float16, jnp.bfloat16), made_each, strict=True):
+        numbers = ~np.isnan(narrow)
+        np.testing.assert_array_equal(np.isnan(made.astype(np.float32)), ~numbers)
+        np.testing.assert_array_equal(made[numbers].view(np.uint16),
+                                      narrow[numbers].astype(dtype).view(np.uint16))
+
+
+def test_a_decoded_value_restored_wide_is_its_float32_restoring_widened():
+    """`bits.restored` in float64, a float64 truth's, is its float32 restoring widened exactly (NumPy's
+    widening on the host, a float32 subnormal kept), bit for bit, at every 16-bit pattern, a NaN as a NaN:
+    one definition of the decoded value at every dtype (row 8661)."""
+    patterns = np.arange(1 << 16, dtype=np.uint32)
+    with jax.enable_x64(new_val=True):
+        narrow, wide = (np.asarray(x) for x in ahead_arm(jax.jit(
+            lambda pattern: (bits.restored(pattern), bits.restored(pattern, jnp.float64))),
+            "restorings widened")(patterns))
+    assert wide.dtype == np.float64
+    numbers = ~np.isnan(narrow)
+    np.testing.assert_array_equal(np.isnan(wide), ~numbers)
+    np.testing.assert_array_equal(wide[numbers].view(np.uint64),
+                                  narrow[numbers].astype(np.float64).view(np.uint64))
+
+
+def test_a_decoded_value_restored_narrow_is_of_the_dtype_asked_for():
+    """`bits.restored` in bfloat16 is bfloat16, its every pattern's float32 restoring cast: the dtype a caller
+    asks for is the one returned (row 8661's review)."""
+    def asked_and_cast(pattern):
+        return bits.restored(pattern, jnp.bfloat16), bits.restored(pattern).astype(jnp.bfloat16)
+
+    narrow, cast = ahead_arm(jax.jit(asked_and_cast), "a restoring asked narrow")(
+        np.arange(1 << 16, dtype=np.uint32))
+    assert narrow.dtype == jnp.bfloat16
+    cast = np.asarray(cast)
+    numbers = ~np.isnan(cast.astype(np.float32))
+    np.testing.assert_array_equal(np.isnan(np.asarray(narrow, np.float32)), ~numbers)
+    np.testing.assert_array_equal(np.asarray(narrow)[numbers].view(np.uint16), cast[numbers].view(np.uint16))
+
+
 def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
     """An NVFP4 tile (`nvfp4_decoded`): every code in every place of a word, under E4M3 block scales from the
     least subnormal to the largest, decodes to the code times its block's scale over `NVFP4_OWED`, exactly,
