@@ -250,6 +250,23 @@ def test_a_seeded_streamed_mix_of_raw_parquet_stores_reads_no_schema_to_compile(
     assert SCHEMAS_READ
 
 
+def test_a_view_over_a_raw_parquet_store_states_its_asked_facts_reading_no_schema(tmp_path):
+    """A view over a raw Parquet store (a record slice of it, as a holdout cuts one) asked for the tokenizer
+    contract's facts, none of which its schema states, answers none, reading no schema; asked for its
+    class names, it answers its store's, read off its schema (`asked`; row 11638: a view asked off all its
+    store's facts, its schema read for each)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.holdout import RecordSlice
+    from dew.data.sources.base import TOKENIZER_CONTRACT, asked
+
+    pq.write_table(pa.table({"x": list(range(8))}), tmp_path / "rows.parquet")
+    view = RecordSlice(SchemaCounted(str(tmp_path / "rows.parquet")), 2)
+    SCHEMAS_READ.clear()
+    assert asked(view, TOKENIZER_CONTRACT) == {} and SCHEMAS_READ == []
+    assert asked(view, ("class_names",)) == {"class_names": {}} and SCHEMAS_READ
+
 def test_a_position_saved_under_plan_16_of_a_store_stating_lengths_resumes_under_17(tmp_path):
     """A store whose files state each row's length (a `length` column), read whole with no packing: a
     position its read saved under plan 16, which recorded every store's lengths, resumes under this Dew's

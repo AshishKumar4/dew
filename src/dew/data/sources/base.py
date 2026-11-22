@@ -360,6 +360,12 @@ class View[S: Source]:
         facts = self.source.metadata()
         return facts if self.rows in ("read", "described") else _uncounted(facts)
 
+    def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
+        """Those of its facts named by `keys`, asked of its store alone (`asked`), counts dropped as
+        `metadata` drops them."""
+        facts = asked(self.source, keys)
+        return facts if self.rows in ("read", "described") else _uncounted(facts)
+
     def stated(self) -> Mapping[str, object]:
         return _uncounted(stated(self.source)) if self.rows == "selected" else {}
 
@@ -416,6 +422,26 @@ def _indexed_manifest(source: Source, uri: str, rows: int,
         _IndexedSlice(source) if reader is None else reader,
         index_ordered=True,
     )
+
+
+@runtime_checkable
+class AsksFacts(Protocol):
+    """A store that can state some of its facts without the work of stating them all (a raw Parquet store's,
+    which opens no file for a fact its schema cannot state, `dew.data.sources.Files.asked`)."""
+
+    def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
+        """Those of its facts (`Source.metadata`) named by `keys`."""
+        ...
+
+
+def asked(source: Source, keys: Iterable[str]) -> Mapping[str, object]:
+    """Those of `source`'s facts named by `keys`: as it states them where it can ask for them alone
+    (`AsksFacts`), else off all of them (`Source.metadata`); the one read a compile asks some facts of a
+    store by (row 11638)."""
+    wanted = frozenset(keys)
+    if isinstance(source, AsksFacts):
+        return source.asked(wanted)
+    return {key: value for key, value in source.metadata().items() if key in wanted}
 
 
 @runtime_checkable
