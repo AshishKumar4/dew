@@ -25,6 +25,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - The wgmma consumer's register model against ptxas on the GEMM gate's sm90 tiles. [8723]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
+- The recurrence suite's wall: every case within CI's group target. [11684, 11686, 11689, 11690, 11691, 11696, 11698]
+- 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 891 s (a check-1 site: its longest draws task 854 s (1 draws),…. [11692]
+- 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 756 s (a check-1 site: its longest draws task 722 s (1 draws),…. [11695]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -51,7 +54,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [9780, 10839, 5625]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [9780, 5625]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -84,10 +87,10 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
+- Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
-- Released checkpoints judged on GPUs. [1703]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - One token layout, and every layout and placement trains and serves. [1903]
 - Every model comparison on check 1. [2300, 3722, 5212]
