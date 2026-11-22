@@ -266,6 +266,11 @@ class Offsets(Protocol):
         after its last."""
         ...
 
+    def longest_token(self) -> int:
+        """The most characters one of its tokens covers: by as many tokens a text's encoding, cut where it
+        is, can shrink as its cut grows (a merge across the cut; `SegmentLayout._cut`'s bound)."""
+        ...
+
 
 def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
     values = ids.tolist() if isinstance(ids, TokenArray) else ids
@@ -305,6 +310,10 @@ class ByteTokenizer:
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
         return bytes(_token_row(ids)).decode("utf-8", errors="replace")
+
+    def longest_token(self) -> int:
+        """One character a token: a byte covers no more than its character."""
+        return 1
 
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """`text`'s bytes, each covering its character."""
@@ -408,6 +417,16 @@ class HFTokenizer:
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
+
+    def longest_token(self) -> int:
+        """The longest of its vocabulary's tokens as it spells them, a byte-level one's a character a byte,
+        so no fewer than the characters it covers: read once."""
+        return self._longest_token
+
+    @functools.cached_property
+    def _longest_token(self) -> int:
+        tokens = self.tokenizer.convert_ids_to_tokens(list(range(self.vocab_size)))
+        return max((len(token) for token in tokens if isinstance(token, str)), default=1)
 
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """`text`'s ids and each token's character span, by the fast tokenizer's offsets; a slow
