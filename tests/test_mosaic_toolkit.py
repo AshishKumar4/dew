@@ -612,12 +612,14 @@ def test_a_joined_warpgroup_role_takes_its_weights_share_of_the_raised_registers
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
-    largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
-    whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes each walk
-    apart (mma.sync's emit_pipeline)."""
+    largest of them, every barrier 8 bytes, a named CTA barrier none (the block's hardware barrier,
+    `plgpu.CtaBarrier`, a packed decode's consumers' meet); a tile scoped after its walks beside the program's
+    on a family whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes
+    each walk apart (mma.sync's emit_pipeline)."""
     from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90, resources
 
-    program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3))
+    program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3),
+               plgpu.CtaBarrier(num_arrivals=2))
     walks = ((plgpu.SMEM((2, 1024), jnp.bfloat16),), (plgpu.SMEM((4, 1024), jnp.bfloat16),))
     scope = resources.Scope(program=program, walks=walks, after=(((512,), jnp.float32),))
     # 400 bytes -> 1 KiB; walks 4 KiB and 8 KiB -> 8 KiB; 3 barriers; the after tile's 2 KiB.
