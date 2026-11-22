@@ -298,18 +298,7 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
     def interceptor(next_fun, args, kwargs, context):
         output = next_fun(*args, **kwargs)
         module = context.module
-        path = "/".join(module.path)
-        # A model applied in parts (`component`) names its modules by their path in its variables too.
-        part = _COMPONENT.get()
-        paths = (path, "/".join((*part, *module.path))) if part else (path,)
-        named = any(fnmatch.fnmatchcase(name, glob)
-                    for glob in modules for name in (type(module).__name__, *paths))
-        # A stacked run of layers (`layers_3_7`, a pipeline stage's `stages/layers_j`) is any of the layers
-        # the log names its entries by: a glob over one of them takes the run, and the log keeps that layer's
-        # entries alone (`flattened`).
-        candidate = any(any_layer(each) != each
-                        and fnmatch.fnmatchcase(any_layer(each), any_layer(glob, pattern=True))
-                        for each in paths for glob in modules)
+        named, candidate = _named(module, modules)
         if context.method_name != "__call__" or not (named or candidate):
             return output
         if not module.is_mutable_collection(INSPECTED):
@@ -350,8 +339,44 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         leaves[index] = tapped(first, module.get_variable(PROBES, PROBE), where, scale, histogram)
         return jax.tree.unflatten(tree, leaves)
 
-    with nn.intercept_methods(interceptor):
-        yield
+    token = _WATCHED.set((*_WATCHED.get(), modules))
+    try:
+        with nn.intercept_methods(interceptor):
+            yield
+    finally:
+        _WATCHED.reset(token)
+
+
+_WATCHED: contextvars.ContextVar[tuple[tuple[str, ...], ...]] = contextvars.ContextVar("watched_modules",
+                                                                                       default=())
+"""Each open `watching` block's globs, innermost last: the method interceptors Dew's watches install."""
+
+
+def _named(module: nn.Module, modules: tuple[str, ...]) -> tuple[bool, bool]:
+    """Whether a glob of `modules` names `module`, by its class name or its path (`layers_3/attn`, and a
+    model applied in parts, `component`, its path in its variables too), and whether one names a layer of
+    the stacked run it is (`layers_3_7`, a pipeline stage's `stages/layers_j`: any of the layers the log
+    names its entries by, the log keeping that layer's alone, `flattened`)."""
+    path = "/".join(module.path)
+    part = _COMPONENT.get()
+    paths = (path, "/".join((*part, *module.path))) if part else (path,)
+    named = any(fnmatch.fnmatchcase(name, glob)
+                for glob in modules for name in (type(module).__name__, *paths))
+    candidate = any(any_layer(each) != each
+                    and fnmatch.fnmatchcase(any_layer(each), any_layer(glob, pattern=True))
+                    for each in paths for glob in modules)
+    return named, candidate
+
+
+def watches() -> int:
+    """How many of the method interceptors installed are Dew's watches (`watching`)."""
+    return len(_WATCHED.get())
+
+
+def watched(module: nn.Module) -> bool:
+    """Whether an open watch (`watching`) intercepts `module`'s own calls: a glob of one names it or a layer
+    of the run it is (row 11820: a watch of the MLPs leaves a cross-pass merge to its own rules)."""
+    return any(any(_named(module, modules)) for modules in _WATCHED.get())
 
 
 def kept(inspected: Mapping, modules: tuple[str, ...]) -> set[tuple[str, ...]]:

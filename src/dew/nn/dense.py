@@ -66,7 +66,7 @@ def watched_or_owned(module: nn.Module) -> bool:
     the module's scope): a quantization scope of Dew's (`INTERCEPTED`) or a direct Qwix provider's
     (`providing`: any of its ops, at any path its rules name, may be a rule's), a Flax method interceptor
     installed (`intercepting`: a watch's), or its caller capturing its calls' outputs (`observed`)."""
-    return INTERCEPTED.value or providing() or intercepting() or observed(module)
+    return INTERCEPTED.value or providing() or intercepting(module) or observed(module)
 
 
 def providing() -> bool:
@@ -85,21 +85,35 @@ def providing() -> bool:
         interceptions.enable_interception(providers)
 
 
-def intercepting() -> bool:
-    """Whether a Flax method interceptor is installed (`nn.intercept_methods`, Flax's own stack): any of them
-    may intercept a module's own call, which a rule standing in for the call would bypass (a joined
-    projection's, base review 760be77fe F1: an interceptor zeroing `v_proj`'s output, the joined layer
-    returned it; a recomputed merge's)."""
+def intercepting(module: nn.Module | None = None) -> bool:
+    """Whether a Flax method interceptor may intercept `module`'s own call (`nn.intercept_methods`, Flax's
+    own stack), which a rule standing in for the call would bypass (a joined projection's, base review
+    760be77fe F1: an interceptor zeroing `v_proj`'s output, the joined layer returned it; a recomputed
+    merge's): one not Dew's watches' (node perturbation's, a caller's own), or a watch naming `module`
+    (`inspection.watched`; row 11820: a watch of the MLPs leaves a merge to its own rules). Without a
+    module, any interceptor installed."""
     from flax.linen import module as flax_module
 
-    return bool(flax_module._global_interceptor_stack)
+    from dew.nn import inspection
+
+    installed = len(flax_module._global_interceptor_stack)
+    if module is None or installed > inspection.watches():
+        return bool(installed)
+    return inspection.watched(module)
 
 
 def observed(module: nn.Module) -> bool:
-    """Whether a caller reads `module`'s own calls' outputs as Flax captures every module's (its
-    `intermediates` collection open: `capture_intermediates`); a caller intercepting them is
-    `intercepting`'s (a watch's, node perturbation's)."""
-    return module.is_mutable_collection('intermediates')
+    """Whether a caller keeps `module`'s own calls' outputs as Flax captures a module's (its
+    `intermediates` collection open and the capture's filter, `capture_intermediates`', taking its call;
+    row 11820: a capture of the layers' states leaves a merge to its own rules); a caller intercepting
+    them is `intercepting`'s (a watch's, node perturbation's)."""
+    from flax.linen import module as flax_module
+
+    if not module.is_mutable_collection('intermediates'):
+        return False
+    captures = flax_module._context.capture_stack
+    keep = captures[-1] if captures else None
+    return bool(keep) and keep(module, "__call__")
 
 
 def intercepted() -> bool:

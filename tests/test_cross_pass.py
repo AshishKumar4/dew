@@ -541,11 +541,12 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
     from dew.optim import OptimConfig
     from dew.training import MeshSpec, Trainer
     from dew.training.ahead import compile_ahead
+    from dew.training.inspection import Inspection
 
     devices = 2
     spec = CrossPass(block_size=2, rank=64)
 
-    def live_past_args(steps: int, messages: CrossPass | None) -> int:
+    def live_past_args(steps: int, messages: CrossPass | None, inspection=None) -> int:
         model = CausalTransformer(
             vocab_size=512, emb_features=MIXER_WIDTH, num_layers=4, num_heads=8, head_dim=MIXER_HEAD,
             mlp_features=4 * MIXER_WIDTH, max_seq_len=MIXER_LENGTH, dtype="bfloat16",
@@ -555,20 +556,28 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
                           OptimConfig(optimizer="adamw", learning_rate=1e-3).build(None),
                           key=jax.random.key(0),
                           mesh=MeshSpec(fsdp=devices).build(compile_only_gpus("sm90", devices, 2**36)),
-                          layout=STEP_LAYOUT, split=1)
+                          layout=STEP_LAYOUT, split=1, inspection=inspection)
         ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
-        return ahead.live_bytes - ahead.argument_bytes
+        if inspection is None:
+            return ahead.live_bytes - ahead.argument_bytes
+        # A run that inspects samples its watches in a step of its own, compiled ahead beside its step.
+        memory = ahead.sampled.executable.memory
+        return memory.live - memory.argument
 
-    msg_two, msg_six = live_past_args(2, spec), live_past_args(6, spec)
     plain_two, plain_six = live_past_args(2, None), live_past_args(6, None)
-    msg_growth, plain_growth = msg_six - msg_two, plain_six - plain_two
+    plain_growth = plain_six - plain_two
     # Four added passes each hold beyond a message-free loop's its saved bf16 bank [B/fsdp, S, blocks, D]
     # and that bank's one summed cotangent: two banks a pass.
     added_banks = 4 * (MIXER_ROWS // devices) * MIXER_LENGTH * 2 * MIXER_WIDTH * 2
-    assert msg_growth <= plain_growth + 2 * added_banks, (
-        f"cross-pass live growth {msg_growth} B exceeded plain growth {plain_growth} B + "
-        f"2 * added_banks {2 * added_banks} B "
-        f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
+    # So too where the step watches its MLPs (row 11820: a watch of other modules leaves the merges to their
+    # own rules), its sampled step the one compiled.
+    for inspection in (None, Inspection(modules=("MLP",), every=1)):
+        msg_two, msg_six = live_past_args(2, spec, inspection), live_past_args(6, spec, inspection)
+        msg_growth = msg_six - msg_two
+        assert msg_growth <= plain_growth + 2 * added_banks, (
+            f"cross-pass live growth {msg_growth} B, watching {inspection}, exceeded plain growth "
+            f"{plain_growth} B + 2 * added_banks {2 * added_banks} B "
+            f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
 
 
 @pytest.mark.parametrize("watch", ["captured", "inspected"])
