@@ -905,7 +905,7 @@
 ],
 "tests/test_bf16_reference.py": [
 "tests/test_bf16_reference.py::test_a_decoder_is_as_exact_as_its_reference[mixtral-tiny-bfloat16]",
-"tests/test_bf16_reference.py::test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16"
+"tests/test_bf16_reference.py::test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16[conditioned]"
 ],
 "tests/test_block_diffusion.py": [
 "tests/test_block_diffusion.py::test_a_canvas_reads_its_cache_alike_paged_or_dense[int8]",
@@ -1097,7 +1097,9 @@
 ],
 "tests/test_contracts_algebra.py": [
 "tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[grad of grad]",
-"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[jvp of grad, nested jit]"
+"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[jvp of grad, nested jit]",
+"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[jvp of grad, remat]",
+"tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[jvp of grad, scanned]"
 ],
 "tests/test_contracts_attention.py": [
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-first orders]",
