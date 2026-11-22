@@ -587,16 +587,13 @@ def _sown_switch(index, branches, module, *operands):
 def _shaped_like(value, shape):
     """`value` (a branch's collections) in `shape`'s tree (the pass's, `jax.eval_shape`'s): each entry
     `value` holds at a place of `shape` kept, each it lacks zeros of its shape."""
-    if isinstance(shape, Mapping):
-        held = value if isinstance(value, Mapping) else {}
-        return type(shape)({key: _shaped_like(held.get(key), each) for key, each in shape.items()})
-    if isinstance(shape, (tuple, list)):
-        held = value if isinstance(value, (tuple, list)) else ()
-        return type(shape)(_shaped_like(held[index] if index < len(held) else None, each)
-                           for index, each in enumerate(shape))
-    if shape is None:
-        return None
-    return jnp.zeros(shape.shape, shape.dtype) if value is None else value
+    held = dict(jax.tree_util.tree_leaves_with_path(value))
+
+    def kept(path, each):
+        found = held.get(path)
+        return jnp.zeros(each.shape, each.dtype) if found is None else found
+
+    return jax.tree_util.tree_map_with_path(kept, shape)
 
 
 def _handed_on(model, exited, last, threshold: float) -> jax.Array:
