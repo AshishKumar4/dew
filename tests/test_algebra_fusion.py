@@ -381,19 +381,24 @@ def test_a_neighbour_costing_the_launch_a_program_stays_outside_it():
             (route.choice, route.kernel) for route in found]
 
 
-@pytest.mark.parametrize(("function", "fuses"), [(jnp.exp2, True), (jnp.sin, False)], ids=["exp2", "sin"])
-def test_a_consumer_its_launch_prices_no_work_of_is_never_fused_for_free(function, fuses):
+@pytest.mark.parametrize(("function", "target", "fuses"),
+                         [(jnp.exp2, "sm90", True), (jnp.sin, "sm90", False), (jnp.exp, "sm100", True),
+                          (jnp.exp, "sm120", True)],
+                         ids=["exp2-sm90", "sin-sm90", "exp-sm100", "exp-sm120"])
+def test_a_consumer_its_launch_prices_no_work_of_is_never_fused_for_free(function, target, fuses):
     """A projection's consumer is fused where its price says fused wins and its launch carries no more work
-    at no rate than XLA's fusion of it (`algebra.cost.cheaper`'s rule). On an H100 whose template a call
-    names: an exp2 after the product, one MUFU either way, is its epilogue; a sine, which the launch compiles
-    in an accurate form no count prices (`emission.ACCURATE_FORMS`) where XLA's fusion is counted one MUFU an
-    element, stays XLA's after it, where the fused arm took it for no time (train 1165's F2). Shapes only."""
+    no rule prices than XLA's fusion of it. On a GPU whose template a call names: an exp2 after the product,
+    one MUFU either way, is its epilogue on an H100; a sine, which the launch compiles in an accurate form no
+    count prices (`emission.ACCURATE_FORMS`) where XLA's fusion is counted one MUFU an element, stays XLA's
+    after it, where the fused arm took it for no time (train 1165's F2); an exp on a B200 or an RTX 50, whose
+    accurate form's integer operations run at a rate their facts leave unread, is its epilogue, where those
+    counted as unpriced kept every exp, SiLU and GELU off the launch (ReviewFSGemmRegs' P2). Shapes only."""
     x, w = jax.ShapeDtypeStruct((8192, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((1024, 4096), jnp.bfloat16)
 
     def projected(x, w):
         return function((x @ w).astype(jnp.float32)).astype(jnp.bfloat16)
 
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as found:
+    with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"), generation.routes() as found:
         jax.jit(algebra.rewritten(projected, kernels=True)).trace(x, w)
     fused = any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found)
     assert fused == fuses, [(route.choice, route.kernel) for route in found]
