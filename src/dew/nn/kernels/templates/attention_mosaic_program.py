@@ -2219,6 +2219,14 @@ STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total",
 the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
 
 
+def streamed_statistics_order(count: int | None = None, *, anchored: bool = True) -> tuple[str, ...]:
+    """The first `count` (or all) per-query statistics streamed in priority order, excluding `chosen` when
+    `not anchored` (row 11710)."""
+    names = (STATISTICS_STREAM_ORDER if anchored
+             else tuple(name for name in STATISTICS_STREAM_ORDER if name != "chosen"))
+    return names if count is None else names[:count]
+
+
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
                   products: list, held: list, vectors: int, *, accurate: bool, slopes: int) -> int:
     """`backward_registers`' dQ consumer's: its dQ sums (and the accurate form's keyed sums) carried, its

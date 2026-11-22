@@ -2113,7 +2113,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 (((tiles.block_k, width), jnp.float32),
                  ((tiles.block_k, value_width), jnp.float32),
                  ((tiles.block_q, width), jnp.float32),
-                 *step_live_tiles(tiles.block_q, tiles.block_k, backward=True, accurate=self.accurate))))))
+                 *step_live_tiles(tiles.block_q, tiles.block_k, backward=True, accurate=self.accurate,
+                                  dropped=ba.arguments["drop"] is not None))))))
             for layout, tiles, allocations, reduces in launches]
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,

@@ -54,6 +54,7 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _score_params,
     _score_weights,
     _scores,
+    _splits_scores,
 )
 
 DQ_ROWS = ("residual", "mass", "keyed_mass", "keyed_shift")
@@ -142,10 +143,8 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     is_whole = whole(index) if masked is None else None
     coords = (coords_of(k_first) if masked is None
               else coords_of(k_first, read=walk.places_read(masked=masked)))
-    overlap = (family.products_overlap and not family.operands_in_registers and not walk.interpret
-               and not walk.accurate and not walk.dropped and not walk.kinds and walk.spec.score_mod is None)
     overlapped: tuple | None = None
-    if overlap:
+    if _splits_scores(walk):
         def between(s):
             if is_whole is not None:
                 def weights_for(*, is_masked: bool):

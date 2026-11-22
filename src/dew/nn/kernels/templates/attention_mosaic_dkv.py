@@ -59,13 +59,13 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
     _dq_added,
-    _read,
     _relay_tiles,
     _relayed,
     _score_cotangents,
     _score_params,
     _score_weights,
     _scores,
+    _splits_scores,
 )
 
 
@@ -193,11 +193,18 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     read = walk.places_read(masked=masked)
     fused = add_dq is not None
     coords = coords_of(q_first, shape=shape, read=read)
-    if (family.products_overlap and not family.operands_in_registers and not walk.interpret
-            and not walk.accurate and not walk.dropped and not walk.kinds):
-        narrowed, logits, pieces = _overlapped_dkv_scores(
-            walk, (k_smem, v_smem), (logits_slot, do_slot), shape, coords, rows_of(q_first, count),
-            (do_slot.dtype, q_slot.dtype), logits_stage=logits_stage, one_part=fused, masked=masked)
+    rows = rows_of(q_first, count)
+    dtypes = (do_slot.dtype, q_slot.dtype)
+    if _splits_scores(walk):
+        def between(s):
+            if logits_stage is not None:
+                walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
+            return _score_weights(walk, coords, (), s, rows[0], rows[1], masked=masked)
+
+        scored_weights, dp = family.product_pair(
+            k_smem, logits_slot.transpose((1, 0)), v_smem, do_slot.transpose((1, 0)), shape, between=between)
+        narrowed, logits, pieces = _weighed(walk, coords, (), scored_weights, dp, rows, dtypes,
+                                            one_part=fused, masked=masked, split=True)
     else:
         s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
                                     v_smem, do_slot.transpose((1, 0)), shape)
@@ -206,9 +213,8 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
             walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
         # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
         # (spilled 1184 bytes at 64 x 64, one consumer).
-        narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s, slots=slots), s, dp,
-                                            rows_of(q_first, count),
-                                            (do_slot.dtype, q_slot.dtype), one_part=fused, masked=masked)
+        narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s, slots=slots), s, dp, rows,
+                                            dtypes, one_part=fused, masked=masked)
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = issued_into(family, dv_acc, narrowed if isinstance(narrowed, tuple) else (narrowed,), do_columns,
@@ -404,44 +410,22 @@ class _PlacedDq:
         rings.drained((self.stages[3][role],), steps * len(self.pieces()), REDUCED)
 
 
-def _overlapped_dkv_scores(walk: _Backward, resident: tuple, slots: tuple, shape: tuple[int, int],
-                           coords: algebra.Coords, rows: tuple, dtypes: tuple, *, logits_stage,
-                           one_part: bool, masked: bool = True) -> tuple:
-    """Keys-first overlapped S/dP scores via `product_pair(..., between=...)` (row 5272): releases
-    `logits_stage` and runs `S` softmax + weight narrowing while `dP = V dOᵀ` runs on Tensor Cores."""
-    family = walk.program.family
-    (k_smem, v_smem), (logits_slot, do_slot) = resident, slots
-    values, queries = dtypes
-    peak, total, anchor, delta = (_read(row) for row in rows[:4])
-
-    def between(s):
-        if logits_stage is not None:
-            family.turn(logits_stage[2], walk.consumers, wait=False)
-        exponentials, weights, slopes, seen = _score_weights(walk, coords, (), s, peak, total, masked=masked)
-        narrowed = (algebra.value_weights(exponentials, weights, values, walk.dropped) if one_part
-                    else algebra.value_parts(weights, values))
-        return narrowed, weights, slopes, seen
-
-    (narrowed, weights, slopes, seen), dp = family.product_pair(
-        k_smem, logits_slot.transpose((1, 0)), v_smem, do_slot.transpose((1, 0)), shape, between=between)
-    cotangents = _score_cotangents(coords, weights, dp, anchor, delta, seen)
-    logits, pieces = gradient.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
-    if one_part:
-        parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
-        logits = mosaic.unscaled_part(*parts)
-    return narrowed, logits, pieces
-
 def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,
-             one_part: bool, masked: bool = True) -> tuple:
+             one_part: bool, masked: bool = True, split: bool = False) -> tuple:
     """A keys-first tile's: its weights narrowed for dV in the output cotangents' dtype
     (`algebra.value_weights`, the dropped ones, `algebra.drawn`; the dQ program's sums take them
     undropped), its pulled score cotangents and its hook's pieces (`gradient.pulled`), from its products `s`
-    and `dp` under its queries' statistics `rows`, its coordinates and its hook's parameters (`_scores`);
-    the cotangents the fast form's one part in the queries' dtype where the launch takes it from the
-    registers (`one_part`, the fused launch's), narrowed as they are formed."""
+    (or `_score_weights`' tuple when `split=True`) and `dp` under its queries' statistics `rows`, its
+    coordinates and its hook's parameters (`_scores`); the cotangents the fast form's one part in the
+    queries' dtype where the launch takes it from the registers (`one_part`, the fused launch's), narrowed as
+    they are formed."""
     values, queries = dtypes
-    exponentials, weights, cotangents, slopes, seen = _scores(
-        walk, coords, params, s, dp, *rows, masked=masked)
+    if split:
+        exponentials, weights, slopes, seen = s
+        cotangents = _score_cotangents(coords, weights, dp, rows[2], rows[3], seen)
+    else:
+        exponentials, weights, cotangents, slopes, seen = _scores(
+            walk, coords, params, s, dp, *rows, masked=masked)
     logits, pieces = gradient.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
     if one_part:
         parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
