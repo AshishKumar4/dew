@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, tail as tail_of
 
 if TYPE_CHECKING:
@@ -19,7 +20,8 @@ if TYPE_CHECKING:
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
     """The bundle a tile runs on: the one it names (`Tiles.family`, `bundles.named`), for a consumer's share
     of the tile's rows and the columns its accumulators hold (`tile_columns`, `mosaic.Issuer.specialized`)."""
-    family = bundles.named(tiles.family, dtype)
+    # The GPU it is priced for, as its search composed it (row 11885).
+    family = bundles.named(tiles.family, dtype, generation.gpu_target())
     return family.specialized(tiles.share, tile_columns(tiles, family))
 
 

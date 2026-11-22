@@ -1081,7 +1081,7 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
         first = template.MOSAIC.derived(bound, target)
-        report.refuse([(report._identity(template.MOSAIC, bound), first, {kernel})])
+        report.refuse([(report._identity(template.MOSAIC, bound, generation.gpu_target()), first, {kernel})])
         stepped = template.MOSAIC.derived(bound, target)
         taken = template.MOSAIC.fits(bound, target)
         legal = stepped is not None and template.MOSAIC.legal(bound, stepped, target)
@@ -1144,7 +1144,8 @@ def test_a_launch_spilling_at_every_rung_refuses_the_tiles_that_plan_it_alike():
         tiles = template.MOSAIC.derived(bound, target)
         shallower = dataclasses.replace(tiles, stages=tiles.stages - 1)
         assert not template.MOSAIC._refused(bound, shallower, target)
-        spilled, identity = {'recurrence_reverse'}, report._identity(template.MOSAIC, bound)
+        spilled = {'recurrence_reverse'}
+        identity = report._identity(template.MOSAIC, bound, generation.gpu_target())
         report.refuse([(identity, tiles, spilled)])
         held, *upper, foot = template.MOSAIC.rungs(bound, tiles)
         # Its foot refused alone (a config pinned there) leaves the rungs above it unasked: nothing spent.
@@ -1193,7 +1194,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
         # The run's launch bound as the run binds it, its identity the lowering's.
         bound = template.MOSAIC.bind(*operands, None, None, firsts=None, skip=None, recomputed=True,
                                      **options)
-        assert report._identity(template.MOSAIC, bound) == identity
+        assert report._identity(template.MOSAIC, bound, generation.gpu_target()) == identity
         # Each derived tiles refused with every rung of its ladder at once (`Mosaic.rungs`): refused a rung a
         # derivation, the walk derived 355 times, 281 s (row 6551), 598 s once a ladder's foot took a program
         # fewer (row 6855).
@@ -1512,7 +1513,8 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
             handed = report.refusal_entries()
         with report.refusals(), generation.assumed('sm90'):
             report.refuse(handed)
-            assert report.spilled_in(template.MOSAIC, bound, tiles) == {kernel: roles}
+            roles_spilled = report.spilled_in(template.MOSAIC, bound, tiles, generation.gpu_target())
+            assert roles_spilled == {kernel: roles}
     assert keys[0] != keys[1]
 
 

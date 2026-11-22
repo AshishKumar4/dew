@@ -511,7 +511,7 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
     pair = mosaic_sm100.PAIR
     assert (pair.cluster, pair.pairs_product, pair.widest_product) == (2, True, 128)
     assert (mosaic_sm100.RINGS.cluster, mosaic_sm100.RINGS.pairs_product) == (1, False)
-    assert bundles.named("tcgen05.pair", jnp.bfloat16) is pair
+    assert bundles.named("tcgen05.pair", jnp.bfloat16, None) is pair
     assert pair in bundles.groups("sm100", jnp.bfloat16, stated=True)[0]
     assert pair not in [family for group in bundles.groups("sm90", jnp.bfloat16, stated=True)
                         for family in group]
@@ -2052,7 +2052,7 @@ def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_cop
     as many slots as steps, also planned inside a jit's trace over a mesh of its own. That the plan is the
     kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`: its
     planned shared bytes against those the compiled kernel asks for)."""
-    family = bundles.named("mma.sync", jnp.bfloat16)
+    family = bundles.named("mma.sync", jnp.bfloat16, None)
     streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 1)
 
     def walked(steps: int | None = None) -> tuple[list, list]:

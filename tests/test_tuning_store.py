@@ -372,9 +372,10 @@ def test_a_hook_is_traced_once_while_it_lives_under_one_configuration():
     gc.collect()
     assert released() is None
     hooked = _HookedKernel(prologue=shared)
-    whole = report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))))
-    assert whole == report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))))
-    assert whole != report._identity(hooked, hooked.bind(TILE, _Hooks(scaling(4.0), (0,))))
+    target = generation.gpu_target()
+    whole = report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))), target)
+    assert whole == report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))), target)
+    assert whole != report._identity(hooked, hooked.bind(TILE, _Hooks(scaling(4.0), (0,))), target)
 
     def drawing(tile):
         return tile + jax.random.bits(jax.random.key(0), tile.shape).astype(tile.dtype)
@@ -428,7 +429,7 @@ def test_a_retained_score_hook_keys_each_run_precisions_program(forms):
             held = op.identified("score_mod", contextual)
             assert held == direct
             programs.append(held)
-            identities.append(report._identity(op, bound))
+            identities.append(report._identity(op, bound, generation.gpu_target()))
             with report.launching(op, bound, Tiles(16, 16, 2, 1, family="wgmma")):
                 names.append(report.named("attention"))
             value = contextual(jnp.ones((1, 1)), None, None)
@@ -496,7 +497,7 @@ def test_hooks_with_distinct_outputs_have_distinct_program_and_launch_keys(facto
     for hook in hooks:
         launch = _HookedKernel(prologue=hook)
         bound = launch.bind(TILE, _Hooks(None, ()))
-        identities.append(report._identity(launch, bound))
+        identities.append(report._identity(launch, bound, generation.gpu_target()))
         with report.launching(launch, bound, 1):
             names.append(report.named("hooked"))
     assert direct[0] != direct[1]

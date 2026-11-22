@@ -162,7 +162,8 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
     `report.stored_key`; None where the installation has no seal."""
     rates = cost.rates(target, device=False)
     return report.stored_key(
-        op_provenance(op, ba.arguments), report._identity(op, ba), target.generation, target.device_kind,
+        op_provenance(op, ba.arguments), report._identity(op, ba, target), target.generation,
+        target.device_kind,
         target.multiprocessors, target.launch_seconds, rates._asdict(), tuning.encoded(candidates))
 
 
@@ -856,7 +857,7 @@ class MosaicForward(_Mainloop[Tiles]):
                  "output_params", "initial", "drop", "table", "sources", "scales", "query_params")
         operands = tuple(tuning.shapes(ba.arguments[name]) for name in names)
         residuals = ba.arguments["residuals"]
-        identity = report._identity(self, ba)
+        identity = report._identity(self, ba, target)
 
         def priced(*args):
             return self._main_launch(*args, residuals=residuals, interpret=False, config=config,
@@ -1064,7 +1065,7 @@ class MosaicForward(_Mainloop[Tiles]):
             launched = dataclasses.replace(config, relaunch_k=tiles.block_k,
                                            relaunch_consumers=tiles.consumers,
                                            relaunch_columns=tiles.columns)
-            if not any(NATURAL_NAME in kernel for kernel in report.refused_at(self, ba, launched)):
+            if not any(NATURAL_NAME in kernel for kernel in report.refused_at(self, ba, launched, target)):
                 return launched
         return None
 
@@ -1088,7 +1089,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                            relaunch_q=relaunch.block_q, relaunch_k=relaunch.block_k,
                                            relaunch_consumers=relaunch.consumers,
                                            relaunch_columns=relaunch.columns)
-            if not any(NATURAL_NAME in kernel for kernel in report.refused_at(self, ba, launched)):
+            if not any(NATURAL_NAME in kernel for kernel in report.refused_at(self, ba, launched, target)):
                 return launched
             refused.add(fallback)
         return None

@@ -565,7 +565,8 @@ def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
         first = template.MOSAIC.derived(bound, target)
-        base, identity = template._base(first), report._identity(template.MOSAIC, bound)
+        base = template._base(first)
+        identity = report._identity(template.MOSAIC, bound, generation.gpu_target())
         # The base refused first, whose ladder its rungs then are (`rungs` walks a refused config's).
         report.refuse([(identity, base, {kernel})])
         rungs = list(template.MOSAIC.rungs(bound, base))

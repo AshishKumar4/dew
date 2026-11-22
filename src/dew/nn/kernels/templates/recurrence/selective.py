@@ -899,7 +899,7 @@ class Selective(base.Template[Tiles]):
         # A launch whose compile found a kernel spilling steps the tile that sets that kernel's registers: the
         # backward's tokens. The forward's registers no tile sets (its chunk's loop is rolled, `UNROLLED`), so
         # a forward spill, or a backward's at one token, leaves no config.
-        while spilled := report.refused_at(self, ba, tiles):
+        while spilled := report.refused_at(self, ba, tiles, target):
             backward = all(name.startswith("selective_scan_backward") for name in spilled)
             if not backward or tiles.positions == 1:
                 return None

@@ -112,7 +112,7 @@ class Template[Config: Hashable](tuning.KernelOp):
         assembler's verdict (`tuning`'s certification, a program's compile, `report.settled`), not a
         model's, and a generated kernel spills nothing."""
         return (self.staged_bytes(ba, config, target) <= self.program_shared(config, target)
-                and not report.refused(self, ba, config))
+                and not report.refused(self, ba, config, target))
 
     def ranks_alone(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the launch's derivation takes its ranking's first legal config for `ba` on `target`
@@ -212,10 +212,10 @@ class Template[Config: Hashable](tuning.KernelOp):
         takes (its legality's other rules, or a fixed space)."""
         if not self._typed(config):
             return f"it is no {self.config_cls.__name__}"
-        if report.refused(self, ba, config):
+        target = self.launch_target()
+        if report.refused(self, ba, config, target):
             return ("its kernel spilled or serialized its warpgroup MMAs where a compile of this process "
                     "assembled it")
-        target = self.launch_target()
         staged, shared = self.staged_bytes(ba, config, target), self.program_shared(config, target)
         if staged > shared:
             return (f"its programs stage {staged} bytes of shared memory, past the {shared} a program of it "
@@ -240,7 +240,7 @@ class Template[Config: Hashable](tuning.KernelOp):
     def exhausted(self, ba: tokamax.BoundArguments) -> report.Exhausted:
         # A call no config fits refuses as fitting does (`unfitted`), naming what it stages; one
         # certification refused every config of, as any launch's does.
-        if report.refused_any(self, ba):
+        if report.refused_any(self, ba, self.launch_target()):
             return super().exhausted(ba)
         return self.unfitted(ba, self.launch_target())
 

@@ -319,20 +319,20 @@ class Miss:
         return " and ".join(reasons) or "is refused"
 
 
-def _identity(op, arguments: tokamax.BoundArguments) -> str:
+def _identity(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None") -> str:
     """A launch's identity apart from its config, the same in every process: its op as its picks name it
     (`tuning._identity`) and its arguments exactly, its arrays by their own shapes and dtypes (no key's
     bucket: two launches a key shares compile two kernels), its hooks, the op's and its arguments', by what
     they compute as their parts tell it (`tuning.KernelOp.identified`: every launch reads it, so it traces
-    nothing), and the target capacities that size its generated program. Clock rates are not code inputs
-    once its config is chosen: an attached device and its compile-only target may report different rates
-    while emitting exactly that config."""
+    nothing), and the capacities of the `target` it is for that size its generated program (its caller's:
+    a derivation's own, a template's `launch_target`, the GPU in effect; None for no GPU's). Clock rates are
+    not code inputs once its config is chosen: an attached device and its compile-only target may report
+    different rates while emitting exactly that config."""
     def described(name, value):
         if name in op.HOOKS:
             return op.identified(name, value)
         return jax.tree.map(lambda leaf: (tuple(leaf.shape), str(leaf.dtype)) if hasattr(leaf, "dtype")
                             and hasattr(leaf, "shape") else leaf, value)
-    target = generation.gpu_target()
     hardware = ((generation.device_generation(),) if target is None else
                 (target.generation, target.multiprocessors, target.shared_limit))
     # The tuner imports this module: read at a call.
@@ -350,7 +350,8 @@ def _digest(text: str) -> str:
 def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterator[None]:
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
     the same in every process, and their binaries name the launch (`Binary.launched`, `traced`)."""
-    token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
+    token = _TRACING.set(_Pending(lambda: _identity(op, arguments, generation.gpu_target()),
+                                  type(op).__name__, config,
                                   lambda: op.padded(arguments, config), op.emitted,
                                   reverse=_PULLED.get() and op.CARRIES_DERIVATIVE,
                                   provenance=lambda: op_provenance(op, arguments.arguments)))
@@ -527,7 +528,7 @@ def derivation_inputs(op, arguments: tokamax.BoundArguments, target
     again, and whether the run asked XLA for
     deterministic ops, which a launch's legality reads (a fused attention backward's atomic dQ sums,
     `attention_mosaic.MosaicBackward`), so a flag flipped within a process derives it again."""
-    identity = _identity(op, arguments)
+    identity = _identity(op, arguments, target)
     return identity, target, refusals_of(identity), deterministic_ops_requested()
 
 
@@ -546,23 +547,26 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]
         return found
 
 
-def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
-    """Whether a compile of this process refused `op`'s launch of `arguments` at `config`: a kernel of it
-    spilled or serialized its warpgroup MMAs (`refused_at`). A template's legality reads it, so its derivation
-    takes the next config."""
-    return bool(refused_at(op, arguments, config))
+def refused(op, arguments: tokamax.BoundArguments, config: Hashable,
+            target: "generation.GpuTarget | None") -> bool:
+    """Whether a compile of this process refused `op`'s launch of `arguments` at `config` on `target`: a
+    kernel of it spilled or serialized its warpgroup MMAs (`refused_at`). A template's legality reads it, so
+    its derivation takes the next config."""
+    return bool(refused_at(op, arguments, config, target))
 
 
-def refused_any(op, arguments: tokamax.BoundArguments) -> bool:
-    """Whether a compile of this process refused any config of `op`'s launch of `arguments` (`refused`)."""
-    return bool(refusals_of(_identity(op, arguments)))
+def refused_any(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None") -> bool:
+    """Whether a compile of this process refused any config of `op`'s launch of `arguments` on `target`
+    (`refused`)."""
+    return bool(refusals_of(_identity(op, arguments, target)))
 
 
-def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
-    """The names of `op`'s kernels a compile of this process refused at `config` for `arguments`
+def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable,
+               target: "generation.GpuTarget | None") -> frozenset[str]:
+    """The names of `op`'s kernels a compile of this process refused at `config` for `arguments` on `target`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    return names(dict(refusals_of(_identity(op, arguments))).get(config, ()))
+    return names(dict(refusals_of(_identity(op, arguments, target))).get(config, ()))
 
 
 def names(kernels: Iterable[Refused]) -> frozenset[str]:
@@ -570,12 +574,13 @@ def names(kernels: Iterable[Refused]) -> frozenset[str]:
     return frozenset(kernel for kernel, _ in kernels)
 
 
-def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable) -> dict[str, tuple[str, ...]]:
+def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable,
+               target: "generation.GpuTarget | None") -> dict[str, tuple[str, ...]]:
     """The roles each of `op`'s kernels a compile refused at `config` for `arguments` spilled in, as its
     refusal states them (`Refused`), by kernel name: what a launch's ladder steps it by (row 6744). A kernel
     whose roles its compile left unread is absent; one read and spilling none (its warpgroup MMAs serialized
     alone) states `()`."""
-    found = dict(refusals_of(_identity(op, arguments))).get(config, ())
+    found = dict(refusals_of(_identity(op, arguments, target))).get(config, ())
     return {kernel: roles for kernel, roles in found if roles is not None}
 
 
@@ -587,7 +592,7 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     roles each kernel's spill stood in where the compile read them (`Binary.spilled_in`), kept with it
     (`Refused`) for its ladder (`spilled_in`)."""
     roles = spilled_in or {}
-    _record((_identity(op, arguments), config), None,
+    _record((_identity(op, arguments, generation.gpu_target()), config), None,
             frozenset((kernel, roles.get(kernel)) for kernel in kernels))
 
 
@@ -804,7 +809,7 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
 
 def _refused_before(op, arguments: tokamax.BoundArguments) -> bool:
     """Whether `op`'s launch of `arguments` had a config refused in this context (`refused_launches`)."""
-    identity = _identity(op, arguments)
+    identity = _identity(op, arguments, generation.gpu_target())
     return any(refused == identity for refused, _, _ in refused_launches())
 
 
@@ -844,14 +849,14 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     from dew.nn.kernels import tuning
 
     reverse = _PULLED.get() and op.CARRIES_DERIVATIVE
-    key = (_identity(op, arguments), config, device.id, device.device_kind, reverse)
+    key = (_identity(op, arguments, generation.gpu_target()), config, device.id, device.device_kind, reverse)
     with _GUARD:
         if key in _CERTIFIED:
             return _CERTIFIED[key].refused
         if key in _UNCERTIFIED:
             return None
     provenance = op_provenance(op, arguments.arguments)
-    stored = _verdict_key(_identity(op, arguments), config, reverse, provenance)
+    stored = _verdict_key(_identity(op, arguments, generation.gpu_target()), config, reverse, provenance)
     verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (), device, read=True).refused
@@ -1009,7 +1014,7 @@ def missed(op, arguments: tokamax.BoundArguments, config: Hashable, refused: Seq
     """Each of `refused`'s kernels (`certified`'s, at `config`) recorded as a miss (`misses`), as `settled`
     records a compile's: `stepped` where its launch's derivation took another config after its refusal
     (`refuse_launch`), not where it had none left."""
-    launch = Launch(_identity(op, arguments), type(op).__name__, config)
+    launch = Launch(_identity(op, arguments, generation.gpu_target()), type(op).__name__, config)
     _recorded([(None, binary, launch) for binary in refused], stepped=stepped)
 
 
@@ -1072,8 +1077,8 @@ def _lowered_launch(op, arguments: tokamax.BoundArguments, config: Hashable, dev
         def certified(*operands):
             return (pulled_back if reverse else launch)(*operands)
 
-        certified.__name__ = certified.__qualname__ = _certification_name(type(op).__name__,
-                                                                          _identity(op, arguments), config,
+        identity = _identity(op, arguments, generation.gpu_target())
+        certified.__name__ = certified.__qualname__ = _certification_name(type(op).__name__, identity, config,
                                                                           reverse)
         lowered = owned_program(certified).trace(*specs).lower()
     return lowered, *_lowered_kernels(lowered)

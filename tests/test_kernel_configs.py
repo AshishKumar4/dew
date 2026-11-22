@@ -1675,14 +1675,14 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
     target = generation.TARGETS["sm90"]
     with report.refusals(), generation.assumed(target):
         tile = launch.derived(arguments, target)
-        report.refuse([(report._identity(launch, arguments), tile, {"dew_gmm"})])
-        assert report.refused(launch, arguments, tile)
+        report.refuse([(report._identity(launch, arguments, generation.gpu_target()), tile, {"dew_gmm"})])
+        assert report.refused(launch, arguments, tile, generation.gpu_target())
         with generation.assumed(dataclasses.replace(target, clock_hz=1.98e9)):
-            assert report.refused(launch, arguments, tile)
+            assert report.refused(launch, arguments, tile, generation.gpu_target())
         with generation.assumed(dataclasses.replace(target, multiprocessors=64)):
-            assert not report.refused(launch, arguments, tile)
+            assert not report.refused(launch, arguments, tile, generation.gpu_target())
         with generation.assumed(dataclasses.replace(target, shared_limit=128 * 1024)):
-            assert not report.refused(launch, arguments, tile)
+            assert not report.refused(launch, arguments, tile, generation.gpu_target())
 
 
 def test_a_trace_held_by_its_state_is_held_in_any_recordings_scope():
@@ -1738,11 +1738,11 @@ def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
     with report.refusals(), generation.assumed(target):
         tile = launch.derived(arguments, target)
         with generation.recording() as reads:
-            assert not report.refused(launch, arguments, tile)
+            assert not report.refused(launch, arguments, tile, target)
         assert reads and generation.still(reads)
-        report.refuse([(report._identity(launch, other), launch.derived(other, target), {"dew_gmm"})])
+        report.refuse([(report._identity(launch, other, target), launch.derived(other, target), {"dew_gmm"})])
         assert generation.still(reads)
-        report.refuse([(report._identity(launch, arguments), tile, {"dew_gmm"})])
+        report.refuse([(report._identity(launch, arguments, target), tile, {"dew_gmm"})])
         assert not generation.still(reads)
 
 

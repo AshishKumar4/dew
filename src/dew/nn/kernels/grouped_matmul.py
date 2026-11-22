@@ -436,14 +436,14 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         # registers (stored before tiles stated them) is in no space of the launch's (`tuning._pick`).
         from .templates import report
 
-        return super().pinnable(ba, config) and not report.refused(self, ba, config)
+        return super().pinnable(ba, config) and not report.refused(self, ba, config, self.launch_target())
 
     def _refused(self, ba, config: tiling.Tiles) -> bool:
         # Refused past its producer's ladder: spilling at the rung it settles on (`producers.settled`).
         from .templates import report
         from .templates.gemm import producers
 
-        return report.refused(self, ba, producers.settled(self, ba, config))
+        return report.refused(self, ba, producers.settled(self, ba, config), self.launch_target())
 
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`

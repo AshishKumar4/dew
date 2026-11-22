@@ -656,7 +656,7 @@ def test_a_spill_steps_the_kernel_that_spilled():
     target = generation.gpu_target('sm90')
     with generation.assumed(target):
         derived = selective.SELECTIVE.derived(bound, target)
-        identity = report._identity(selective.SELECTIVE, bound)
+        identity = report._identity(selective.SELECTIVE, bound, generation.gpu_target())
         with report.refusals():
             report.refuse([(identity, derived, {'selective_scan_backward'})])
             stepped = selective.SELECTIVE.derived(bound, target)
