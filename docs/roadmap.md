@@ -10,7 +10,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851]
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 11814]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010]
 - The kernel challenge's lessons in the templates. [5271]
 - 4B Real-Token MFU Breakthrough from Existing Profiles. [11941, 11942]
 - Cached and block visibility on the template's spans. [1495, 245]
