@@ -6,12 +6,12 @@ binding its name to the object its module defines; and ruff's gate passes it. (T
 no type checker; the pyright gate reads src/dew's own packages.)"""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-TOOL = REPO / "tools" / "gen_exports.py"
 
 PACKAGE = '''"""A lazy package."""
 
@@ -64,8 +64,8 @@ def tree(root: Path) -> Path:
 
 
 def generate(root: Path, *arguments: str) -> int:
-    return subprocess.run([sys.executable, str(TOOL), *arguments, str(root / "sparx")], capture_output=True,
-                          text=True, timeout=120).returncode
+    return subprocess.run([sys.executable, "-m", "tools.gen_exports", *arguments, str(root / "sparx")],
+                          capture_output=True, text=True, timeout=120, cwd=REPO).returncode
 
 
 def consumed(root: Path, reading: str) -> dict:
@@ -115,8 +115,8 @@ def test_a_package_exporting_its_own_module_binds_it_from_a_relative_path(tmp_pa
     package = root / "sparx" / "__init__.py"
     package.write_text(package.read_text().replace('"area": "sparx.measures"',
                                                    '"area": "sparx.measures", "measures": "sparx.measures"'))
-    done = subprocess.run([sys.executable, str(TOOL), "sparx"], cwd=root, capture_output=True, text=True,
-                          timeout=120)
+    done = subprocess.run([sys.executable, "-m", "tools.gen_exports", "sparx"], cwd=root, capture_output=True,
+                          text=True, timeout=120, env={**os.environ, "PYTHONPATH": str(REPO)})
     assert done.returncode == 0, done.stderr
     script = ("import importlib, sys, typing\ntyping.TYPE_CHECKING = True\nimport sparx\n"
               "print(sparx.measures is importlib.import_module('sparx.measures'),\n"

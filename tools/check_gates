@@ -37,7 +37,7 @@ model-pin	"$PYTHON" site/scripts/gen_pin.py --check
 landing-programs	"$PYTHON" site/snippets/cells.py --check
 models	JAX_PLATFORMS=cpu "$PYTHON" site/scripts/gen_models.py --check
 examples	"$PYTHON" site/scripts/gen_examples.py --check
-exports	"$PYTHON" tools/gen_exports.py --check
+exports	"$PYTHON" -m tools.gen_exports --check
 hf-metadata	JAX_PLATFORMS=cpu "$PYTHON" -m tools.gen_hf_metadata --check
 pythons	"$PYTHON" tools/armada/ci.py pythons --check
 # pyright runs on Node, whose default heap limit follows the machine's memory: 2,240 MiB on an armada medium
@@ -47,12 +47,12 @@ pyright	NODE_OPTIONS=--max-old-space-size=8192 uvx pyright@1.1.406 --pythonpath 
 # Every script under tools/ type-checked in the environment it runs in: Dew's, its COHORTS' reference releases,
 # or its PEP 723 header's (tools/check_tool_types.py, row 7933), each verdict kept by its key; six shards, as
 # Dew's own tools alone took 1713 s in one, past a gate's deadline.
-tool-types-1	"$PYTHON" tools/check_tool_types.py --shard 1/6
-tool-types-2	"$PYTHON" tools/check_tool_types.py --shard 2/6
-tool-types-3	"$PYTHON" tools/check_tool_types.py --shard 3/6
-tool-types-4	"$PYTHON" tools/check_tool_types.py --shard 4/6
-tool-types-5	"$PYTHON" tools/check_tool_types.py --shard 5/6
-tool-types-6	"$PYTHON" tools/check_tool_types.py --shard 6/6
+tool-types-1	"$PYTHON" -m tools.check_tool_types --shard 1/6
+tool-types-2	"$PYTHON" -m tools.check_tool_types --shard 2/6
+tool-types-3	"$PYTHON" -m tools.check_tool_types --shard 3/6
+tool-types-4	"$PYTHON" -m tools.check_tool_types --shard 4/6
+tool-types-5	"$PYTHON" -m tools.check_tool_types --shard 5/6
+tool-types-6	"$PYTHON" -m tools.check_tool_types --shard 6/6
 # Main still holds structural copies (ledger 896-1287, 1309), so a checkout is held to adding none to origin/main's,
 # whose history a shallow checkout fetches first; main holds no text copy, so any fails.
 duplicate-text	"$PYTHON" tools/duplicates.py --reading=text $duplicate_roots
