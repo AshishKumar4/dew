@@ -153,9 +153,11 @@ class Stepping[LossT, EffectsT]:
     window_of: Callable[[TrainState, Candidate, int, Accumulation | None], TrainState]
 
 
-KEPT_CANDIDATES = 4
+KEPT_CANDIDATES = 32
 """The traced steps a process keeps for a trainer built anew to read (`candidate_for`), the latest: each
-holds its lowered module."""
+holds its lowered module, its batch as shapes, no buffer or executable. A fit's ladder traces up to 15 (a
+streamed decoder's layout choice on stand-in H100s, row 8411), so 32 keep two fits' whole, a resumed or
+refit run's, where 4 kept none and each fit traced its ladder again."""
 
 _CANDIDATES: collections.OrderedDict[Hashable, Candidate] = collections.OrderedDict()
 _KEEPING = threading.Lock()
