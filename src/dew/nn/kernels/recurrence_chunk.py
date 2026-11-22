@@ -339,12 +339,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             wide, own = _read_once(value, work)
             fused = kernel == 'mosaic_gpu' and not hooks.delta
             if kernel == 'mosaic_gpu':
-                out, final = _on_template(query, key, own, g, beta, state, skip if fused else None, turn,
-                                          starts=starts, firsts=firsts, forked=carried,
-                                          max_segments=max_segments, scale=scale, delta=hooks.delta,
-                                          wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
-                                          apart=apart, group=hooks.group, values_gated=values_gated,
-                                          unit_keys=unit_keys)
+                out, final = _on_template(hooks, query, key, own, g, beta, state, skip if fused else None,
+                                          turn, starts=starts, firsts=firsts, forked=carried,
+                                          max_segments=max_segments, scale=scale, wide=fused_wide,
+                                          rounded=rounded, values_gated=values_gated, unit_keys=unit_keys)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
@@ -1617,13 +1615,15 @@ def _launched_template(context, query, key, value, g, beta, state, skip, entry, 
     return template_rule(query, key, value, g, beta, state, starts, firsts, skip, forked=forked, **options)
 
 
-def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, firsts, forked, scale: float,
-                 apart: int, group: int, **options):
+def _on_template(hooks: recurrence.Hooks, query, key, value, g, beta, state, skip, turn, *, starts, firsts,
+                 forked, scale: float, **options):
     """The chunked op's `(output, final memory)` on the template (`template_rule`, a turned call's through
-    `_turned_or_plain`), its readout's `group` (`Hooks.group`) whole in every chunk."""
-    launch = functools.partial(_launched_template, scale=scale, apart=apart, **options)
+    `_turned_or_plain`): its launches' readout apart (`Hooks.apart`) and its chunks' readout group whole in
+    each (`Hooks.group`) one hooks' own, so the launch's mask and the turned frame cannot disagree."""
+    launch = functools.partial(_launched_template, scale=scale, apart=hooks.apart, delta=hooks.delta,
+                               bound=hooks.inverse_bound, **options)
     return _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, starts=starts,
-                            firsts=firsts, forked=forked, scale=scale, group=group)
+                            firsts=firsts, forked=forked, scale=scale, group=hooks.group)
 
 
 def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, turn, *, starts, firsts, forked,
