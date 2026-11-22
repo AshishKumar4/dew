@@ -1366,7 +1366,8 @@ def finished_form(call: Call, once: bool) -> Operand:
     `once`, nothing added to it after, and they are given whole, as the backward returns it; else fp32
     (`fp32_operand`), which a later sum or the parts take. The one rule of the backward's finished stores:
     the queries' and keys' sums (`mainloop_backward._query_key`, Kimi delta attention's
-    `own_pairs.key_pairs_own`) and Kimi delta attention's values' (`key_backward._key_values_back`). Stored
+    `own_pairs.key_pairs_own`), the gated values' (`mainloop_backward._reverse_values`) and Kimi delta
+    attention's values' (`key_backward._key_values_back`). Stored
     fp32, each was rounded in XLA: Nemotron-H 30B's 38 us of an A100's training, Kimi Linear's 100 of its
     training's 1723 MB of XLA traffic and its three fp32 parts' sum (rows 5668, 5260, 11955)."""
     return call.given if once and call.given.parts == 1 else fp32_operand(call)

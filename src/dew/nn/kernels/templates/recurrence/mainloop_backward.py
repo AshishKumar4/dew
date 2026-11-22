@@ -1198,8 +1198,7 @@ def _reverse_values(call: Call, *, gates: bool) -> Operand:
     the call's own result (`_query_key` streams none): the operands' form, rounded once in the walk where an
     XLA pass narrowed the fp32 tile after it (30 us of Nemotron-H 30B's SSD training on an H100, FS-WHY3).
     Otherwise `_value_grads`', which later launches read."""
-    whole = gates and not call.delta and call.given.parts == 1
-    return call.given if whole else _value_grads(call)
+    return finished_form(call, once=True) if gates and not call.delta else _value_grads(call)
 
 
 def _score_grads(call: Call) -> Operand:

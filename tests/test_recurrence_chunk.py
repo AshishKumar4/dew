@@ -1446,10 +1446,11 @@ def test_a_turned_forked_documents_arithmetic_reads_only_its_ancestors(case):
     def run(forked):
         return chunk_on('xla', TURNED, forked, chunk_size=CHUNK)[0]
 
-    together = run(_forked_rows(operands, rows, length))
-    changed = run(_forked_rows(redrawn, rows, length))
-    assert not np.array_equal(np.asarray(together[:, shared:]), np.asarray(changed[:, shared:]))
-    np.testing.assert_array_equal(np.asarray(together[:, :shared]), np.asarray(changed[:, :shared]))
+    together, changed = (np.asarray(run(_forked_rows(x, rows, length))) for x in (operands, redrawn))
+    # Each later document its own change, one's hiding none of another's; the shared ones' bits, signed zeros.
+    for first, last in itertools.pairwise((*(start for start in row[0] if start >= shared), length)):
+        assert not np.array_equal(together[:, first:last], changed[:, first:last]), (first, last)
+    assert np.array_equal(together[:, :shared].view(np.uint8), changed[:, :shared].view(np.uint8))
 
 
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))

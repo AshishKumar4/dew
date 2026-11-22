@@ -319,8 +319,9 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension at exact
     products (the accurate forms, `mainloop.per_key_refusal`); and on a GPU where its launches at those
     tiles pass the device's shared memory (an fp32 call's solve on an A100's block), whose arithmetic the
-    CPU interprets."""
-    (operands,) = draw(dtype, 0, **geometry(case))
+    CPU interprets. Drawn on the host: a GPU tier's prepare runs no program on its device (row 7869)."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        (operands,) = draw(dtype, 0, **geometry(case))
     if formed(forms, taken)(operands, hooks):
         return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
@@ -334,10 +335,9 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
         return None
     narrowest = mainloop.Tiles(family.narrowest_columns(jnp.bfloat16), 1, chunk=64)
     if mainloop.family_of() is not None:
-        shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
-                  for x in (operands.query, operands.key, operands.value, operands.log_decay, operands.beta,
-                            operands.state, operands.starts)]
-        *given, starts = shapes
+        *given, starts = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (
+            operands.query, operands.key, operands.value, operands.log_decay, operands.beta, operands.state,
+            operands.starts)]
         launches = template.planned(*given, tiles=narrowest, family=family, starts=starts)
         if max(launch.shared for launch in launches) > generation.shared_budget(template.Mosaic.launched()):
             return None

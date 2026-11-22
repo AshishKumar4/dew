@@ -373,6 +373,15 @@ def walk_roles(family: mosaic.Family) -> int:
     return min(family.consumers, 2) if family.warpgroups(1) > 1 else 1
 
 
+def _spread(held: int, programs: int, target: generation.GpuTarget) -> int:
+    """The programs of a launch holding `held` a multiprocessor of `target` runs at once: no more than its
+    `programs` spread over the device's multiprocessors where it knows them, as a launch's blocks go to its
+    multiprocessors in turn (`Mosaic._running`'s states launch, `Mosaic._output_hides`' output)."""
+    if target.multiprocessors is None:
+        return held
+    return min(held, -(-programs // target.multiprocessors))
+
+
 @dataclasses.dataclass(frozen=True)
 class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`mosaic_rule`), its config
@@ -973,11 +982,19 @@ class Mosaic(base.Template[mainloop.Tiles]):
         def held(tiles: mainloop.Tiles) -> bool:
             return tiles not in refused and self._product_holds(ba, tiles, target, training=training)
 
-        legal = [tiles for tiles in (mainloop.Tiles(block, 1, None if width == block else width, walkers,
-                                                    chunk=chunk) for width in widths) if held(tiles)]
-        if not legal:
+        # Widest first: the first legal width whose output launch hides latency, else the first legal.
+        widest = shallowest = None
+        for width in widths:
+            tiles = mainloop.Tiles(block, 1, None if width == block else width, walkers, chunk=chunk)
+            if not held(tiles):
+                continue
+            widest = widest or tiles
+            if self._output_hides(ba, tiles, target, training=training):
+                shallowest = tiles
+                break
+        shallowest = shallowest or widest
+        if shallowest is None:
             return None
-        shallowest = next((tiles for tiles in legal if self._output_hides(ba, tiles, target)), legal[0])
         states = self._states(ba, shallowest, target, training=training)
         order = resources.hidden(family, states.consumers)
         deeper = (dataclasses.replace(shallowest, stages=stages)
@@ -988,20 +1005,19 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return max(rings, key=lambda tiles: order(self._running(ba, tiles, target, training=training),
                                                   tiles.stages))
 
-    def _output_hides(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
-                      target: generation.GpuTarget) -> bool:
+    def _output_hides(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
+                      *, training: bool) -> bool:
         """Whether the output launch at `tiles` hides any latency on `target`: more than one program a
         multiprocessor running at once (as `_running` counts the states launch's) or a ring more than one
-        deep.
-        One program one deep, the widest legal block held Kimi Linear's output on an A100 latency-bound:
+        deep, in the product's plan `_product_fits` reads (a training call's forward where `training`). One
+        program one deep, the widest legal block held Kimi Linear's output on an A100 latency-bound:
         375.0 us of its training against 287.6 at a block of 64, two programs (the 27B gated delta net's
         257.1 against 205.6); on a GH200 the 27B's one program two deep at 128 ran 84.2 us against 89.9 at
         64's two one deep, a narrower block hiding no more (M-JS-219)."""
-        [output] = [launch for launch in self.launches(ba, tiles, target, backward=False)
+        [output] = [launch for launch in self.launches(ba, tiles, target, backward=False,
+                                                       training_forward=training)
                     if launch.name.split("__")[0].endswith("output")]
-        running = output.resident if target.multiprocessors is None else min(
-            output.resident, -(-output.programs // target.multiprocessors))
-        return running > 1 or output.stages > 1
+        return _spread(output.resident, output.programs, target) > 1 or output.stages > 1
 
     def _running(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget, *,
                  training: bool = False) -> int:
@@ -1013,10 +1029,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         deep (the 27B's 0.943 against 0.916), where the one deep ring narrowed the block to 16 at 0.752
         (1.193, gdn-pins-a100-3b0d2267d)."""
         held = self.states_held(ba, tiles, target, training=training)
-        if target.multiprocessors is None:
-            return held
-        programs = self._states(ba, tiles, target, training=training).programs
-        return min(held, -(-programs // target.multiprocessors))
+        return _spread(held, self._states(ba, tiles, target, training=training).programs, target)
 
     def neighbours(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> list[mainloop.Tiles]:
         """The tiles the opt-in tuner times beside the derived `config` (`variants`; the gate holds at each):
