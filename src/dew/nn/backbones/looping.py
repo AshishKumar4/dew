@@ -343,10 +343,22 @@ class _Passes:
     run_block: Callable = dataclasses.field(init=False)
     """One pass of the block (`_passed`), checkpointed under `remat` outside decode."""
 
+    exit_outputs: bool = dataclasses.field(init=False)
+    """Whether a scanned pass's exit leaves its normed output: where the exits are sown or chosen by a
+    threshold, or the gate's parameters made (`_sown_exits`)."""
+    exit_states: bool = dataclasses.field(init=False)
+    """Whether a scanned pass's exit leaves its exit state: where a threshold chooses among them
+    (`_handed_on`), the only reader of the state itself."""
+
     def __post_init__(self):
-        self.span = self.loop.layers or (0, self.model.num_layers)
-        self.shared = SharedPassView(self.span) if self.loop.shared_cache else None
-        self.run_block = nn.remat(self.pass_block) if self.loop.remat and not self.decode else self.pass_block
+        model, loop = self.model, self.loop
+        self.span = loop.layers or (0, model.num_layers)
+        self.shared = SharedPassView(self.span) if loop.shared_cache else None
+        self.run_block = nn.remat(self.pass_block) if loop.remat and not self.decode else self.pass_block
+        self.exit_states = (loop.exiting and loop.exit_threshold is not None
+                            and not model.is_mutable_collection(EXITS))
+        self.exit_outputs = loop.exiting and (self.exit_states or model.is_mutable_collection(EXITS)
+                                              or model.is_initializing())
 
     @property
     def loop(self) -> Loop:
@@ -415,9 +427,10 @@ class _Passes:
         out, bank = run(model, x, bank, **self.inputs)
         return _stepped(loop, out, x, self.injected), bank
 
-    def stepped(self, module, carry, theta, *, exit_stop: bool, enter_stop: bool):
+    def stepped(self, module, carry, theta, *, exit_stop: bool, enter_stop: bool, block=None):
         """One later pass inside the scan over its step's collections: the exit of the pass before it
-        where every pass exits (its exit state and its normed output, the scan's outputs), then its block."""
+        where every pass exits (its exit state and its normed output, the scan's outputs where read:
+        `exit_states`, `exit_outputs`), then its block (`block`, `run_block` where None)."""
         x, bank = carry
         loop = self.loop
         _, end = self.span
@@ -427,8 +440,9 @@ class _Passes:
             output = module.exit_states(leaving)
             normed = output if end == module.num_layers and module.normed_output else None
         x, bank = self.entering(module, x, bank, stop=enter_stop, normed=normed, theta=theta)
-        out, bank = self.run_block(module, x, bank, **self.inputs)
-        return (_stepped(loop, out, x, self.injected), bank), (leaving, output)
+        out, bank = (block or self.run_block)(module, x, bank, **self.inputs)
+        exits = (leaving if self.exit_states else None, output if self.exit_outputs else None)
+        return (_stepped(loop, out, x, self.injected), bank), exits
 
     def scanned(self, x, bank, steps: range, *, exit_stop: bool, enter_stop: bool, passes=None):
         """The later passes `steps` under one scan over their collections (`PassStack`): each pass's what
@@ -478,7 +492,7 @@ class _Passes:
         # Each pass's own θ row, if it holds one, and its step.
         (x, bank), (leavings, outputs) = run(model, (x, bank), (
             _theta(model, loop, steps, rows=True), jnp.arange(steps.start, steps.stop, dtype=jnp.int32)))
-        if loop.exiting:
+        if self.exit_outputs:
             valid = None if passes is None else jnp.arange(steps.start, steps.stop) < passes
             self.exited.extend(_sown_exits(model, leavings, outputs, valid))
         return x, bank
@@ -496,24 +510,33 @@ class _Passes:
         the static cut's passes are (`fixed`); else run. Each branch of `lax.cond`/`lax.switch` runs alone
         and its transpose alone, so a skipped pass or one before the cut costs nothing backward, and the
         block's program is traced once a branch."""
+        # The pass checkpointed whole, its branch among them, not its block within the branch: the scan
+        # saves each step's entering carry alone, as a loop of every pass saves its block's.
         def run(module, carry):
-            return self.stepped(module, carry, theta, exit_stop=False, enter_stop=False)
+            return self.stepped(module, carry, theta, exit_stop=False, enter_stop=False,
+                                block=self.pass_block)
 
         def skip(module, carry):
             x, _ = carry
-            leaving = jnp.zeros_like(x) if self.loop.exiting else None
-            return carry, (leaving, None if leaving is None else module.exit_states(leaving))
+            zero = jnp.zeros_like(x)
+            output = module.exit_states(zero) if self.exit_outputs else None
+            return carry, (zero if self.exit_states else None, output)
 
-        if self.loop.backprop_steps is None:
-            return nn.cond(step < passes, run, skip, module, carry)
+        def branched(module, carry, step, passes):
+            if self.loop.backprop_steps is None:
+                return nn.cond(step < passes, run, skip, module, carry)
 
-        def held_back(module, carry):
-            return jax.lax.stop_gradient(run(module, jax.lax.stop_gradient(carry)))
+            def held_back(module, carry):
+                return jax.lax.stop_gradient(run(module, jax.lax.stop_gradient(carry)))
 
-        cut = passes - self.loop.backprop_steps
-        carry = jax.tree.map(lambda leaf: jnp.where(step == cut, jax.lax.stop_gradient(leaf), leaf), carry)
-        index = jnp.where(step >= passes, 0, jnp.where(step < cut, 1, 2))
-        return nn.switch(index, (skip, held_back, run), module, carry)
+            cut = passes - self.loop.backprop_steps
+            carry = jax.tree.map(lambda leaf: jnp.where(step == cut, jax.lax.stop_gradient(leaf), leaf),
+                                 carry)
+            index = jnp.where(step >= passes, 0, jnp.where(step < cut, 1, 2))
+            return nn.switch(index, (skip, held_back, run), module, carry)
+
+        stepping = nn.remat(branched) if self.loop.remat else branched
+        return stepping(module, carry, step, passes)
 
 
 def _handed_on(model, exited, last, threshold: float) -> jax.Array:
@@ -528,11 +551,12 @@ def _handed_on(model, exited, last, threshold: float) -> jax.Array:
 
 
 def _sown_exits(model, leavings, outputs, valid) -> list[tuple[jax.Array, jax.Array]]:
-    """The scanned passes' exits (`_Passes.scanned`), their exit states `leavings` and normed outputs
-    `outputs` stacked on a leading pass axis, sown into `exits` in pass order as `_sown_exit` sows each:
-    their gate logits (where the loop gates its exits) and the states the head reads; with `valid` (a
-    count given per call), whether each pass ran, sown beside them (`valid`), a skipped pass's exit
-    computed from a zero state. Their `(state, gate logit)` pairs for a threshold's choice (`_exited`)."""
+    """The scanned passes' exits (`_Passes.scanned`), their exit states `leavings` (None where no threshold
+    reads them) and normed outputs `outputs` stacked on a leading pass axis, sown into `exits` in pass order
+    as `_sown_exit` sows each: their gate logits (where the loop gates its exits) and the states the head
+    reads; with `valid` (a count given per call), whether each pass ran, sown beside them (`valid`), a
+    skipped pass's exit computed from a zero state. Their `(state, gate logit)` pairs for a threshold's
+    choice (`_exited`)."""
     logits = model.early_exit_gate(outputs) if model.loop.exit_gate else None
     if not model.is_initializing():
         for index in range(outputs.shape[0]):
@@ -541,7 +565,7 @@ def _sown_exits(model, leavings, outputs, valid) -> list[tuple[jax.Array, jax.Ar
             model.sow(EXITS, 'states', model.head_states(outputs[index]))
             if valid is not None:
                 model.sow(EXITS, 'valid', valid[index])
-    return [] if logits is None else list(zip(leavings, logits, strict=True))
+    return [] if logits is None or leavings is None else list(zip(leavings, logits, strict=True))
 
 
 def _sown_exit(model, leaving):
