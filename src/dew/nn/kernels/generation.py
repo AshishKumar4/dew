@@ -1461,6 +1461,21 @@ def routes(*, alone: bool = False) -> Iterator[list[Route]]:
         yield collected.found
 
 
+def route_marks() -> tuple[tuple[_Routes, int], ...]:
+    """Each open `routes` block's collection beside how many routes it holds now: where a trace that may be
+    abandoned begins (`withdrawn`)."""
+    from dew import _cache
+
+    return tuple((collected, len(collected.found)) for collected in _cache.KERNEL_ROUTES.value)
+
+
+def withdrawn(marks: tuple[tuple[_Routes, int], ...]) -> None:
+    """The routes each collection of `marks` (`route_marks`) recorded since, dropped: an abandoned trace's,
+    whose program none runs (a trace a settle refused, `report.settled_trace`)."""
+    for collected, held in marks:
+        del collected.found[held:]
+
+
 def reported(found: Sequence[Route]) -> None:
     """Report `found`, routes a trace's dispatches reported, again, each as its dispatch did (`published`): a
     trace held and reused (`dew.algebra.fusion`'s regions, a decision cached by its key) reports the routes it

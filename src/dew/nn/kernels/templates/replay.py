@@ -104,7 +104,10 @@ def replayed(closed, mesh: jax.sharding.Mesh, reverse: bool, device, name: str
     specs = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=NamedSharding(
         mesh, PartitionSpec() if manual or getattr(aval, "sharding", None) is None else aval.sharding.spec))
         for aval in operands]
-    with meshless(mesh):
+    # Lowered for `device`, its default device too: a Triton kernel's lowering reads an abstract GPU's
+    # architecture off it (`pallas.triton.gpu_info`), and the pool's thread holds no default of the trace's
+    # (JAX's config is each thread's own; the capture's context copies its context variables alone).
+    with meshless(mesh), jax.default_device(device):
         lowered = owned_program(certified).trace(*specs).lower()
     modules, lowered_key = report._lowered_kernels(lowered)
     target = report.verdict_target(device)
