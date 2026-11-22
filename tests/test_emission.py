@@ -642,6 +642,20 @@ def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_f
     assert beside[1] == alone[1] + 256 / rates.cuda
 
 
+@pytest.mark.parametrize("generation_name", ["sm75", "sm80", "sm86", "sm89", "sm90", "sm100", "sm120"])
+@pytest.mark.parametrize("field", ["integer_operations", "integer_multiply_adds"])
+def test_a_gpus_integer_work_is_priced_on_every_cuda_generation(field, generation_name):
+    """128 integer operations (the ALU's add, shift, logic and comparison) or integer multiply-adds (the FMA
+    pipe's IMAD) cost a multiprocessor time on every CUDA generation from Turing to consumer Blackwell, none
+    of them left at no rate: the CUDA C++ Best Practices Guide 13.5's §12.1.1 Table 5 states 64 a clock for
+    shift, logic and mad.lo.s32 on compute capabilities 7.5 to 12.1 alike, where a B200's and an RTX PRO
+    6000's were unread, their packed NVFP4 decode and integer multiplies priced at nothing (rows 11806,
+    11843)."""
+    rates = cost.rates(generation.gpu_target(generation_name), device=False)
+    seconds, unpriced = cost.units(Work(**{field: 128}), rates)
+    assert sum(seconds) > 0 and not any(unpriced), (seconds, unpriced)
+
+
 @pytest.mark.parametrize("longest, span", [(None, 10 / 3), (4, 4)])
 def test_a_launchs_span_is_its_longest_programs_walk_where_its_programs_walk_unequal_shares(longest, span):
     """A launch of three programs walking ten steps among them: its span, the dependent steps on its critical
