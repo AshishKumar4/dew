@@ -732,9 +732,10 @@ def test_a_teacher_with_another_tokenizer_of_the_same_size_is_refused(tmp_path):
 
 
 def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
-    """A distillation whose student's head is tiled computes its full KL's gradient holding no
-    `[B, S, vocab]` logits of either model, where whole its program holds them (row 9067: both whole
-    logits tensors were materialized whatever the rung said)."""
+    """A distillation whose student's head is tiled, by the tile rung or as its student was stated
+    (`head_tile`), computes its full KL's gradient holding no `[B, S, vocab]` logits of either model, where
+    whole its program holds them (row 9067: both whole logits tensors were materialized whatever the rung
+    said; row 10978's confirm review: a student stated tiled beside a whole teacher read both whole)."""
     arrays = fixture()
     objective, params = fixture_objective(arrays)
     batch = fixture_batch(arrays)
@@ -764,7 +765,9 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
 
     tiled, _ = fixture_objective(arrays)
     assert tiled.tile_head((3, vocab)) is not None
+    stated, _ = fixture_objective(arrays, student_type=functools.partial(LMObjective, head_tile=(3, vocab)))
     assert holds_whole(gradient(objective)) and not holds_whole(gradient(tiled))
+    assert not holds_whole(gradient(stated))
 
 
 def _kl_heads(vocab: int, width: int, rows: int, positions: int):

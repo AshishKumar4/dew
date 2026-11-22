@@ -190,6 +190,10 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
                                  "temperature above 0, beta at least 0")
         self.student = student
         self.teacher = teacher
+        if (tile := head_tile_of(student)) is not None:
+            # The teacher's head at the student's tile, as the tile rung moves both (`tile_head`), so a
+            # student stated tiled reads both heads a slice at a time from its first step (`_reads_heads`).
+            teacher.restore_head(tile, fused=False)
         self.alpha, self.temperature, self.beta = alpha, temperature, beta
         self.features = tuple((teacher_layer, student_layer) for teacher_layer, student_layer in features)
         if not self.features and beta:

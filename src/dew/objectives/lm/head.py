@@ -13,7 +13,7 @@ more (`dew.training.memory.recompute_more`), reading the head the objective repo
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, Literal
 
 from flax import linen as nn
@@ -99,6 +99,14 @@ class HeadedObjective(Objective[Loss, Effects]):
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         return (self.head_program(self.model),)
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        # A module put in the model's place (a remat rung's, `recompute_more`) holds the head it held: what a
+        # trace found of that head is kept for it (`head_program`).
+        before = self.model
+        super().substitute(modules)
+        if (known := self._head_matrices.get(id(before))) is not None and self.model is not before:
+            self._head_matrices[id(self.model)] = (self.model, known[1])
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.
