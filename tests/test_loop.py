@@ -891,7 +891,6 @@ def test_a_count_of_passes_given_per_call_counts_and_weighs_the_routers_as_a_loo
     (`router_moments` over `router_scores`), a skipped call's left out by whether it ran (`ROUTER_RAN`),
     where expert 0 took every slot of it; the counts exactly, the floats a sum of the same terms."""
     from dew.nn.moe import ROUTER_COLLECTION
-    from dew.objectives.base import Batch
     from dew.objectives.routing import router_counts, router_moments, router_scores, router_z_terms
 
     mixture = Mixture(experts=4, top_k=2, bias=True)
@@ -899,7 +898,7 @@ def test_a_count_of_passes_given_per_call_counts_and_weighs_the_routers_as_a_loo
     fixed = capped.clone(loop=Loop(2, step_norm=False, layers=(1, 3)))
     ids = tokens(rng)
     variables = nn.unbox(capped.init(rng, ids))
-    batch = Batch({"text": ids})
+    batch = {"text": ids}
 
     def read(model, **given):
         _, sown = model.apply(variables, ids, mutable=[ROUTER_COLLECTION, "moe"], **given)
