@@ -559,7 +559,8 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
     msg_two, msg_six = live_past_args(2, spec), live_past_args(6, spec)
     plain_two, plain_six = live_past_args(2, None), live_past_args(6, None)
     msg_growth, plain_growth = msg_six - msg_two, plain_six - plain_two
-    # Four added passes save four bf16 banks [B/fsdp, S, blocks, D] beyond a message-free loop.
+    # Four added passes each hold beyond a message-free loop's its saved bf16 bank [B/fsdp, S, blocks, D]
+    # and that bank's one summed cotangent: two banks a pass.
     added_banks = 4 * (MIXER_ROWS // devices) * MIXER_LENGTH * 2 * MIXER_WIDTH * 2
     assert msg_growth <= plain_growth + 2 * added_banks, (
         f"cross-pass live growth {msg_growth} B exceeded plain growth {plain_growth} B + "

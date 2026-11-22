@@ -141,12 +141,12 @@ class CrossPassMerge(nn.Module):
 
 
 def _pass_bank(x, bank):
+    """`(x, bank)` as they are, the identity `tie_bank` forms the reverse of."""
     return x, bank
 
 
 def tie_bank(x, bank):
-    """Identity on `(x, bank)` in forward; in reverse mode binds `d_bank` to `d_x` through
-    `portable_formed`, forcing each layer's / message block's bank cotangent into one running
-    accumulator before the layer below runs instead of holding all sites' `[B, S, blocks, D]`
-    cotangents live simultaneously until the end of the pass."""
+    """`x` and a pass's `bank` as they are; in reverse mode each a cotangent formed before the layers below
+    run (`portable_formed`): the bank's summed over the layers above in one accumulator, rather than every
+    merge site's `[B, S, blocks, D]` cotangent held live to the pass's end (row 11713)."""
     return portable_formed(_pass_bank)(x, bank)
