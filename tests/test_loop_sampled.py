@@ -331,17 +331,22 @@ def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
     draws there, a call a fit drew for (`drawn`) running the fit's; with no fit to wait for them as it ends,
     it compiles no count off its loop (the review of rows 7959, 8067: by-hand calls left a thread compiling
     every count past their caller's end)."""
+    from dew.telemetry.compiles import Compiles
+
     batch = token_batch()
     sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, split=2)
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep) and step.split == 2
     drawn = []
-    for _ in range(3):
-        state, *_ = step(state, batch)
-        drawn += step.counts
+    with Compiles("step") as compiles:
+        for _ in range(3):
+            state, *_ = step(state, batch)
+            drawn += step.counts
     assert drawn == [TRAINED.count(words(sampled.key), position) for position in range(6)]
-    # No fit waits for counts compiling off the loop as a caller's calls end, so these compiled none.
+    # No fit waits for counts compiling off the loop as a caller's calls end: each count drawn below the
+    # cap compiled on the loop as it was first drawn, and no other.
+    assert compiles.count == len({count for count in drawn if count < CAP}), compiles.programs
     assert not [thread for thread in threading.enumerate() if thread.name.startswith("dew-later-counts")]
     step.drawn(Interval(time.time(), None, microbatches=40), int(state.step), state)
     step(state, batch)
