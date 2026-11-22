@@ -853,13 +853,16 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
 
 
 def _traced_for(device) -> bool:
-    """Whether the trace calling a launch places it on `device`'s generation (`generation.placed_device`), so
-    Mosaic GPU lowers that trace's kernels for the device (its architecture inferred from that placement): its
-    call is replayed for `device` (`capture`). A trace placed elsewhere (on its host, whose placement Mosaic
-    GPU lowers for Hopper's TMA copies: an A100 step's captured kernels failed to lower for sm80,
+    """Whether the trace calling a launch lowers its Mosaic GPU kernels for `device`: the architecture
+    Mosaic GPU infers where the trace runs (`mosaic.gpu.utils.get_arch`, from its abstract mesh's device or
+    the default device, Hopper's where neither states one) is the device's capability, so its call is
+    replayed for `device` (`capture`). A trace lowering for another (an A100 step traced on its host with its
+    generation assumed, whose kernels took Hopper's TMA copies and failed to lower for sm80,
     FS-ASIDE-EVERY80C) certifies its launch in turn, the launch traced for the device (`_lowered_launch`)."""
-    return (generation.device_target(generation.placed_device()).generation
-            == generation.device_target(device).generation)
+    from jax.experimental.mosaic.gpu import utils as mosaic_utils
+
+    arch = mosaic_utils.get_arch()
+    return (arch.major, arch.minor) == generation.capability(generation.device_target(device).generation)
 
 
 def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> None:
