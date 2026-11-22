@@ -474,10 +474,11 @@ EngineProvider = Literal["sglang", "vllm"]
 """Provider names for SGLang and vLLM, which expose engine-specific token rollout controls."""
 
 ENGINE_PROVIDERS: tuple[EngineProvider, ...] = get_args(EngineProvider)
+"""Each engine provider (`EngineProvider`), in its declared order."""
+
 _ENGINE_ONLY = f"provider={' or '.join(repr(provider) for provider in ENGINE_PROVIDERS)}"
 """What a control an OpenAI server lacks requires: an engine's provider (`ENGINE_PROVIDERS`), each named once
 there (row 8647)."""
-"""Each engine provider (`EngineProvider`), in its declared order."""
 
 
 def _engine_stops(sampling: Sampling, provider: EngineProvider) -> Mapping[str, JSON]:

@@ -812,3 +812,30 @@ def exported_tensors(directory: Path) -> dict[str, bytes]:
     return {name: (str(array.dtype), array.shape, array.tobytes())
             for path in sorted(directory.glob("*.safetensors")) for name, array in load_file(path).items()}
 
+
+@pytest.mark.mesh(devices=8)
+def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_its_run(tmp_path):
+    """A multimodal LM run whose loop passes messages (`Loop.messages`), which no family's layout writes,
+    releases in Dew's own layout (`released_run`), which loads back (`Pretrained.from_saved`'s wrapper
+    branch) as the run's model: its towers' and decoder's weights the run's, its loop the run's messages;
+    its export is refused, stating why, and a change of its merges' rank refused on the reloaded bundle,
+    whose merges it holds, not draws (row 10839)."""
+    from saved_run_kinds import multimodal
+
+    from dew.interop import Pretrained
+    from dew.nn.cross_pass import MESSAGES_UNWRITTEN, CrossPass
+    from dew.nn.multimodal import MultimodalTransformer
+
+    looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop_steps=2, loop_layers=(0, 2),
+                                 loop_messages=True, loop_message_block_size=1)
+    state, _ = trained(looped, tmp_path, "messaged", trainer={"checkpoint_final": True})
+    loaded = Pretrained.load(str(released_run(tmp_path / "runs" / "messaged")), dtype="float32")
+    assert isinstance(loaded.model, MultimodalTransformer)
+    assert loaded.model.loop is not None and loaded.model.loop.messages == CrossPass(block_size=1)
+    leaves_alike(loaded.variables["params"], state.variables["params"])
+    with pytest.raises(ValueError) as refused:
+        loaded.export()
+    assert refused.value.args == (MESSAGES_UNWRITTEN,)
+    with pytest.raises(ValueError):
+        loaded.with_model(loaded.model.with_passes(messages=CrossPass(block_size=1, rank=8)), key=0)
+
