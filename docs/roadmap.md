@@ -12,6 +12,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 11814]
 - The kernel challenge's lessons in the templates. [5271]
+- 4B Real-Token MFU Breakthrough from Existing Profiles. [11941, 11942]
 - Cached and block visibility on the template's spans. [1495, 245]
 - Performance measurements. [569, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
@@ -48,6 +49,8 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
+- Owner-approved Audit 4 API cleanup. [11937]
+- Owner-approved Audit 4 API cleanup. [11938]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -57,6 +60,9 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
+- Owner-approved Audit 4 API cleanup. [11933]
+- Owner-approved Audit 4 API cleanup. [11934]
+- Owner-approved Audit 4 API cleanup. [11935]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -65,6 +71,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Data
 
+- Owner-approved Audit 4 API cleanup. [11936]
 - Training and serving efficiency. [5292]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353]
 - A device-plan search whose devices hold no plan walks the whole remat/head ladder before refusing. [8541]
@@ -72,6 +79,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
+- Owner-approved Audit 4 API cleanup. [11939]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
@@ -80,6 +88,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
+- Owner-approved (2026-11-22): retire the last two `Algebra()`-tagged custom VJPs in `src/dew/nn/ngpt.py:91` (`join`) and `src/dew/nn/ngpt.py:160`…. [11940]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
