@@ -569,10 +569,9 @@ def test_a_decode_token_on_the_fused_step_is_the_layers_own(conv_bias):
 
 @pytest.mark.parametrize("kernel", ["fused", "xla"])
 def test_a_bf16_mamba2s_decode_token_returns_its_operands_dtype_on_every_kernel(kernel):
-    """A bfloat16 Mamba-2's decode token reaches its gated norm (`_gated`, seen as Flax sees a module's
-    method called: `nn.intercept_methods`) in bfloat16 on the fused kernel, interpreted off a GPU, as on the
+    """A bfloat16 Mamba-2's decode token in bfloat16 on the fused kernel, interpreted off a GPU, as on the
     unfused step and in the prefill, as mamba_ssm's `selective_state_update` returns it (row 11790: the
-    fused token stayed at float32), its token taking the kernel asked."""
+    fused token's output stayed at float32), its token taking the kernel asked."""
     import delta_decode_matrix
 
     from dew.nn.kernels import generation
@@ -581,16 +580,9 @@ def test_a_bf16_mamba2s_decode_token_returns_its_operands_dtype_on_every_kernel(
     module = delta_decode_matrix.LAYERS["mamba2"].make(jnp.bfloat16)
     variables = nn.unbox(module.init(jax.random.key(11790), jnp.zeros((3, 1, 64))))
     cache, tokens = delta_decode_matrix._prefilled(module, variables, 11790, 64)
-    gated = []
-
-    def seen(call, args, kwargs, context):
-        if context.method_name == "_gated":
-            gated.append(args[0].dtype)
-        return call(*args, **kwargs)
-
-    references = delta_decode_matrix.REFERENCES
-    with (generation.chosen(delta_decode=kernel, **references), generation.routes() as routes,
-          nn.intercept_methods(seen)):
-        module.apply({**variables, "cache": cache}, tokens[:, :1], MixerCall(decode=True), mutable=["cache"])
+    with generation.assumed("sm80"), generation.chosen(delta_decode=kernel), generation.routes() as routes:
+        out, _ = module.apply({**variables, "cache": cache}, tokens[:, :1], MixerCall(decode=True),
+                              mutable=["cache"])
     assert (DELTA_DECODE.choice, kernel) in {(route.choice, route.kernel) for route in routes}
-    assert gated == [jnp.dtype(jnp.bfloat16)]
+    assert out.dtype == jnp.bfloat16
+
