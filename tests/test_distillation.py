@@ -811,7 +811,6 @@ def test_a_full_kl_over_a_vocabulary_split_head_differentiates_gathering_no_stat
     head is gathered whole inside the token split, which a whole row reads, and its gradient summed back
     onto its shards (row 10978: the tiled KL closed over the head, outside the split's own gather). Its
     values' agreement with the whole logits' is the reference test's."""
-    import math
 
     from jax.sharding import NamedSharding, PartitionSpec as P
     from sharded import collectives
@@ -835,8 +834,9 @@ def test_a_full_kl_over_a_vocabulary_split_head_differentiates_gathering_no_stat
         compiled = jax.jit(run).lower(*placed).compile()
         values = compiled(*placed)
     assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(values))
-    gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
-    assert not any(math.prod(shape) >= rows * positions * width for shape in gathered), gathered
+    # The heads are gathered whole, `[vocab, width]`; the states never.
+    gathered = {shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes}
+    assert not gathered & {(rows, positions, width), (rows * positions, width)}, gathered
 
 
 @pytest.mark.mesh(devices=4)
@@ -845,7 +845,6 @@ def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_groups_own_tok
     as a DiLoCo step runs its groups' losses (`dew.training.diloco`), runs with no all-gather of a group's
     states, each group's tokens split over the axes left (row 10978: the tiled KL's map named every axis
     of the mesh, DiLoCo's manual one too)."""
-    import math
 
     from jax.sharding import PartitionSpec as P
     from sharded import collectives
@@ -862,8 +861,9 @@ def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_groups_own_tok
                                          out_specs=P(DILOCO_AXIS), check_vma=False)).lower(*states).compile()
         grouped = compiled(*states)
     assert grouped.shape == (rows, positions) and bool(jnp.all(jnp.isfinite(grouped)))
-    gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
-    assert not any(math.prod(shape) >= rows * positions * width // 2 for shape in gathered), gathered
+    # A group's states, `[rows / 2, positions, width]`, are never gathered; its heads may be.
+    gathered = {shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes}
+    assert not gathered & {(rows // 2, positions, width), (rows // 2 * positions, width)}, gathered
 
 
 def test_a_distillation_beside_a_model_scoring_through_more_than_its_head_tiles_nothing_and_trains():
