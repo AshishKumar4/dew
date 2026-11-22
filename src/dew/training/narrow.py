@@ -131,6 +131,11 @@ def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.
     return program_reads(jax.make_jaxpr(loss)(params, *rest), params).casts
 
 
+def _names(path) -> tuple:
+    """A leaf's path as names: a mapping's keys, an attribute's names, a sequence's indices."""
+    return tuple(getattr(key, "key", getattr(key, "name", getattr(key, "idx", key))) for key in path)
+
+
 class Reads(NamedTuple):
     """How a program reads the leaves of a tree it takes first (`program_reads`), each by its path: those
     whose one use is a cast to a narrower float dtype, with that dtype (`casts`), and every one it reads at
@@ -151,9 +156,12 @@ def program_reads(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] =
     # effectful equation whatever reads it. Only the counting reads it: the step runs `closed` as traced.
     live, _ = partial_eval.dce_jaxpr(closed.jaxpr, used_outputs=[True] * len(closed.jaxpr.outvars),
                                      instantiate=True)
-    held = [(tuple(key.key for key in path)[len(within):], leaf, var)
+    # Every leaf bound to its input in order, those under `within` kept: a leaf of another collection is
+    # never named past it, whatever its path's keys (row 11730: a packed checkpoint's `quantization`, NvFp4's
+    # attributes, raised before a step).
+    held = [(_names(path)[len(within):], leaf, var)
             for (path, leaf), var in zip(leaves, live.invars[:len(leaves)], strict=True)
-            if tuple(key.key for key in path)[:len(within)] == within]
+            if _names(path[:len(within)]) == within]
     weights = frozenset(var for _, _, var in held)
     casts = {}
     for path, leaf, var in held:
@@ -172,7 +180,7 @@ def narrowed(variables: Variables, paths: dict[tuple[str, ...], jnp.dtype]) -> V
     `variables` (`compute`'s tree)."""
     chosen = select(variables, lambda path: path[0] == "params" and path[1:] in paths)
     return jax.tree_util.tree_map_with_path(
-        lambda path, leaf: leaf.astype(paths[tuple(key.key for key in path)[1:]]), chosen)
+        lambda path, leaf: leaf.astype(paths[_names(path)[1:]]), chosen)
 
 
 def forward_variables(variables: Variables, compute: Variables | None) -> Variables:
@@ -207,7 +215,7 @@ def held_copies(compute: Variables | None) -> dict[tuple[str, ...], jnp.dtype]:
     dtype: the plan of the program that made them, none for a state that holds none."""
     if compute is None:
         return {}
-    return {tuple(key.key for key in path)[1:]: jnp.dtype(leaf.dtype)
+    return {_names(path)[1:]: jnp.dtype(leaf.dtype)
             for path, leaf in jax.tree_util.tree_flatten_with_path(compute)[0]}
 
 
