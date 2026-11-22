@@ -892,7 +892,7 @@ def test_a_full_kl_distillation_of_an_adapted_student_plans_on_no_head_tile(monk
         student = LMObjective(decoder(), LENGTH, ema_decay=None, adaptation=adapted)
         teacher = LMObjective(decoder(continuum=None), LENGTH, ema_decay=None)
         return Trainer(DistillationObjective(student, teacher), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0))
+                       mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0))
 
     batch = {TEXT_KEY: jax.random.randint(jax.random.key(1), (2, LENGTH + 1), 1, VOCAB)}
     first = trainer()
