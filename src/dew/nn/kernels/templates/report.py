@@ -658,15 +658,17 @@ def certifying(device) -> Iterator[None]:
 
 @dataclasses.dataclass(frozen=True)
 class _AsideLaunch:
-    """A launch certified aside (`certifying_aside`): what `certified` read of it, and, once the block's
-    trace reached its call (`capture`), its replay's kernels to come (`replay.replayed`: its kernels, their
-    verdict's key, and whether that verdict was read back)."""
+    """A launch certified aside (`certifying_aside`): what `certified` read of it, the abstract mesh its call
+    traced under (`mesh`: a `shard_map`'s manual axes, which its derivation reads where it settles,
+    `settled_aside`), and, once the block's trace reached its call (`capture`), its replay's kernels to come
+    (`replay.replayed`: its kernels, their verdict's key, and whether that verdict was read back)."""
     op: "KernelOp"
     arguments: tokamax.BoundArguments
     config: Hashable
     reverse: bool
     device: Hashable
     stored: str | None
+    mesh: jax.sharding.AbstractMesh
     kernels: Future | None = None
 
 
@@ -734,8 +736,12 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
             refused.add(key)
             refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
                           {binary.kernel: binary.spilled_in for binary in spilling})
-            missed(each.op, each.arguments, each.config, spilling,
-                   stepped=each.op.remaining(each.arguments) is not None)
+            # Its derivation as its call made it, under the mesh it traced under: a launch inside a
+            # `shard_map` settled past it derives on its manual axes (a block-sparse attention's step, whose
+            # derivation outside them refused the automatic data axis, train 1176).
+            with jax.sharding.use_abstract_mesh(each.mesh):
+                stepped = each.op.remaining(each.arguments) is not None
+            missed(each.op, each.arguments, each.config, spilling, stepped=stepped)
     return frozenset(refused)
 
 
@@ -745,24 +751,22 @@ def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
     holding the config) for as long as they refuse a config it took, each refused launch's derivation stepping
     past it: a program lowers once, at the configs its certification settled, as one certified in turn does,
     where lowering at a refused rung lowered the step twice (a B200's recurrent reverse launch spilling at its
-    first rung, FS-ASIDE-SM100C). Each trace's routes are its own (`generation.routes(alone=True)`), the one
-    kept reported as its dispatches did (`generation.reported`): an abandoned trace's routes are no program's.
-    A trace that takes a config refused before again (a derivation reading no refusal, a pin's) is its
-    compile's to read (`settled`). Outside such a block, `trace()`'s."""
+    first rung, FS-ASIDE-SM100C). Each trace runs in the caller's own context, which JAX keys its trace cache
+    on, so a later trace of the program there takes it (train 1176's review: traced within a routes block of
+    its own, each compiled program was traced again outside it); an abandoned trace's routes are withdrawn
+    from the blocks that recorded them (`generation.withdrawn`). A trace that takes a config refused before
+    again (a derivation reading no refusal, a pin's) is its compile's to read (`settled`). Outside such a
+    block, `trace()`'s."""
     aside = _ASIDE.get()
     if aside is None:
         return trace()
-
-    def traced(attempt: Callable[[], T]) -> tuple[T, list]:
-        with generation.routes(alone=True) as found:
-            return attempt(), found
-
-    value, found = traced(trace)
+    marks = generation.route_marks()
+    value = trace()
     seen: set = set()
     while (refused := settled_aside(aside)) and not refused <= seen:
         seen |= refused
-        value, found = traced(retrace)
-    generation.reported(found)
+        generation.withdrawn(marks)
+        value = retrace()
     return value
 
 
@@ -851,7 +855,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
         # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
-        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored)
+        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored,
+                                          jax.sharding.get_abstract_mesh())
         aside.awaiting[(_launched(key[0], config, reverse), reverse)] = key
         return ()
     # Its verdict where its kernels' was stored however their Dew tree named it (`_lowered_verdict_key`),
