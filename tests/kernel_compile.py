@@ -129,6 +129,11 @@ class Report:
     Triton kernel's launch states none."""
     kind: str = "mosaic_gpu"
     """The compiler that produced the binary (`assembled.Binary.kind`: `mosaic_gpu` or `triton`)."""
+    planned: bool = True
+    """Whether a launch plan states the kernel's resources, which the gate holds its binary to: its register
+    cap, its planner's shared bytes and its producer's registers, and the PTX the gate compiles it from (a
+    Mosaic GPU kernel's); a Pallas-Triton kernel's compile picks them, its cubin's own its whole evidence,
+    read as `reports` makes it (row 9719: each consumer branched on `kind`)."""
     index: str | None = None
     """XLA uniquification suffix (`assembled.Binary.index`) where a second cubin shares `(kernel, launch)`."""
 
@@ -152,9 +157,9 @@ class Report:
                  else "serializes its warpgroup MMAs") + f" ({code})" for code in self.losses)
         if self.sass:
             return "its machine code holds " + "; ".join(self.sass)
-        if self.registers is not None and self.cap is None and self.kind != "triton":
-            # A Mosaic kernel's with no thread count and no raise: its allocation judged against nothing (row
-            # 6670). A Triton kernel's launch states no register bound to judge it by: its compile picks them.
+        if self.registers is not None and self.cap is None and self.planned:
+            # A planned kernel's with no thread count and no raise: its allocation judged against nothing (row
+            # 6670).
             return f"its reports state no register cap its launch runs at for its {self.registers} registers"
         if self.registers is not None and self.cap is not None and self.registers > self.cap:
             return f"{self.registers} registers a thread, above its launch's {self.cap}"
@@ -229,7 +234,7 @@ def reports(estimates: dict[str, str], binaries: list[assembled.Binary],
             sass=tuple(binary.sass or ()), launched=binary.launched,
             binary_registers=binary.registers, binary_spilled=binary.spills,
             threads=binary.threads, decreased=binary.decreased, raised=binary.raised,
-            kind="triton", index=binary.index))
+            kind="triton", planned=False, index=binary.index))
     return found_reports
 
 
@@ -743,7 +748,7 @@ def inherited(kernel: dict, compiled: dict[str, dict], generation: str) -> dict:
     and so printed no PTX, that compile's. A kernel neither covers takes its executable's binary's where this
     process's builds are every build `generation`'s GPUs run (`_assembles_for`), its verdict then theirs;
     elsewhere it keeps them unread, another compiler's verdict no evidence of the GPU's."""
-    if kernel.get("kind") == "triton" and kernel["registers"] is not None and kernel["spilled"] is not None:
+    if not kernel["planned"] and kernel["registers"] is not None and kernel["spilled"] is not None:
         return {**kernel, "ptxas": "its executable's binary"}
     name = report.launch_name(kernel["kernel"], kernel["launch"])
     if name in compiled:
@@ -912,14 +917,15 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             # its schedule lowers to (`producer_failures`).
             record["stated_models"] = {
                 report.launch_name(kernel["kernel"], kernel["launch"]): stated.record() for kernel in kernels
-                if kernel.get("kind") != "triton" and kernel["launched"] is not None
+                if kernel["planned"] and kernel["launched"] is not None
                 and (launch := report.traced(kernel["launched"])) is not None
                 and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
             printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
             for kernel in record["kernels"]:
-                if kernel.get("kind") == "triton":
+                if not kernel["planned"]:
+                    # Its cubin its evidence, read as it was made: no PTX of it to dump.
                     kernel["dumped"] = True
                     programs = 1
                 else:
@@ -960,11 +966,11 @@ def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[s
             if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
             cased = record.get("models", {}).get(found_kernel.kernel)
-            stated = (None if found_kernel.kind == "triton"
+            stated = (None if not found_kernel.planned
                       else cased if cased is not None or not traced_models
                       else record.get("stated_models", {}).get(found_kernel.traced))
             unplanned = stated is None or stated["shared"] is None
-            if traced_models and found_kernel.kind != "triton" and unplanned:
+            if traced_models and found_kernel.planned and unplanned:
                 # A settled case plans its shared bytes by its launch's traced model alone: none, or one
                 # stating no shared bytes, is no evidence its allocation is the plan's.
                 failed.append(f"{record['name']}: {found_kernel.kernel} states no traced model's shared "
@@ -984,7 +990,7 @@ def producer_failures(found: list[dict]) -> list[str]:
     for record in found:
         for kernel in record.get("kernels", ()):
             found_kernel = _report(kernel)
-            if found_kernel.kind == "triton":
+            if not found_kernel.planned:
                 continue
             stated = record.get("stated_models", {}).get(found_kernel.traced,
                                                           record.get("models", {}).get(found_kernel.kernel))
