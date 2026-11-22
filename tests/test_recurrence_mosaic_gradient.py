@@ -130,9 +130,9 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     `key_backward`) against recorded fla-core's (`fla_sites`: chunk_gated_delta_rule's, chunk_kda's), from
     the forward's memories kept, under a remat rung that recomputes them (`recomputing`) recomputed, or under
     a checkpoint saving the delta rule's names kept by them. A call the template refuses is checked refused
-    and its gradient on the mainloop's rule (`on_the_mainloop`). A gradient the fast backward does not take,
-    an fp32 call's outside the run's fast forms (`mainloop_backward.fast_backward_form`) or one whose launches
-    the device does not hold (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector
+    and its gradient on the mainloop's rule (`on_the_mainloop`). A gradient the fast backward does not take
+    (`mainloop_backward.fast_backward_form`) or one whose launches the device does not hold
+    (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector
     gives it the port or the portable math, whose check 1
     test_recurrence_chunk holds (row 1926: no kernel falls back inside itself)."""
     hooks = case_hooks(case)
@@ -461,24 +461,47 @@ def test_a_saved_fp32_gradient_under_the_highest_precision_runs_the_numbers_its_
 
 
 @INTERPRETS
-@pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
-def test_an_fp32_turned_call_on_the_template_trains_as_the_portable_math_interpreted(packed):
-    """Mamba-3's turned form (`TURNED`) in fp32 (three bf16 parts under the accurate forms, row 7673) trains
-    on the recurrence template's fast backward, output, final memory and every operand's gradient on par
-    with the portable math from float64 (check 1)."""
+@pytest.mark.parametrize(("form", "packed"), [
+    pytest.param("turned", False, id="turned-one sequence"),
+    pytest.param("turned", True, id="turned-packed"),
+    pytest.param("scalar delta", False, id="scalar delta-one sequence"),
+    pytest.param("scalar delta", True, id="scalar delta-packed"),
+    pytest.param("rated", False, id="rated-one sequence"),
+    pytest.param("rated", True, id="rated-packed", marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+])
+def test_an_fp32_call_on_the_template_trains_as_the_portable_math_under_the_accurate_forms_interpreted(
+        form, packed, request):
+    """An fp32 call the fast backward takes in three bf16 parts under the accurate forms
+    (`mainloop_backward.fast_backward_form`): Mamba-3's turned form (`TURNED`, row 7673), the gated delta
+    rule's decay a head and Mamba2's rated scan (row 9700), each, where the template takes it, trains on the
+    recurrence template's fast backward, output, final memory and every operand's gradient on par with the
+    portable math from float64 (check 1); one it takes none of (the gated delta rule's at its draws' widths,
+    no config whose launches the device holds) refused. The rated scan's packed rate gradient, a head's sum
+    over every token, was inconclusive at 40 seeds (its pooled ratio 1.33 in [0.73, 1.89]): 128."""
+    from map_judge import marked_seeds
     from test_recurrence_chunk import assert_packed_on_par
-    from test_recurrence_mosaic import LENGTH, TURNED, hooked_draw
+    from test_recurrence_mosaic import LENGTH, REFUSED, TURNED, hooked_draw, taken
+    from test_recurrence_stability import SITES
+
+    hooks = TURNED if form == "turned" else SITES[form]
 
     def on(route, operands, starts=None):
-        return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
+        return chunk_on(route, hooks, dataclasses.replace(operands, starts=starts))
 
     def drawn(seed):
-        (operands,) = hooked_draw(TURNED, packed=False, seed=seed)
+        (operands,) = hooked_draw(hooks, packed=False, seed=seed)
         return operands, cotangents(operands, seed)
 
+    marked = request.node.get_closest_marker("check1_shards")
+    (sample, _) = drawn(0)
+    if not formed("accurate", taken)(sample, hooks):
+        with pytest.raises(REFUSED):
+            formed("accurate", jax.eval_shape)(functools.partial(on, "mosaic_gpu"), sample)
+        return
     assert_packed_on_par(formed("accurate", functools.partial(on, "mosaic_gpu")),
-                         functools.partial(on, "xla"), drawn, f"{TURNED} fp32 on the template",
-                         packed=packed, documents=((0, 24, 40), (10, 48)), length=LENGTH, seeds=8)
+                         functools.partial(on, "xla"), drawn, f"{form} fp32 on the template",
+                         packed=packed, documents=((0, 24, 40), (10, 48)), length=LENGTH,
+                         seeds=marked_seeds(request) if marked else 8)
 
 
 @COMPILES_ON_CPU

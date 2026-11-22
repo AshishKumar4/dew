@@ -70,13 +70,13 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     at mamba_ssm's rounding (`prepared`), held to recorded mamba_ssm's bf16 case, else its intermediates in
     fp32's three parts as its forward holds them (lightning attention's, a write gate's, the SSD's under the
     accurate forms), held to the portable math; either in fp32 under the run's fast forms (`rounded`), its
-    operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the delta rule, which no
-    recording holds, a decay a key dimension without it, an fp32 call's three parts (the accurate forms, or a
-    form without the delta rule on its route, `recurrence_chunk.chunk_rounding`), and a bf16 call's held in
-    three parts whose output is fp32 (`wide`: an epilogue reads it, Mamba2's gated norm), its gradient fp32
-    where the launches read it in bf16 (rounded so, Mamba2's step's gradient under its norm was 2.2e-3 from
-    float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes each
-    sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
+    operands in two bf16 parts (`mainloop.FAST_PARTS`), or in three under the accurate forms, held to the
+    portable math (tests/test_recurrence_mosaic_gradient.py, row 9700). An fp16 call without the delta
+    rule, which no recording holds, a decay a key dimension without it or in fp32's three parts, and a bf16
+    call's held in three parts whose output is fp32 (`wide`: an epilogue reads it, Mamba2's gated norm), its
+    gradient fp32 where the launches read it in bf16 (rounded so, Mamba2's step's gradient under its norm was
+    2.2e-3 from float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes
+    each sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
     dtype = jnp.dtype(dtype)
     if per_key and dtype == jnp.float32 and not rounded:
         return False
