@@ -101,7 +101,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post120,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post121,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too.
@@ -177,7 +177,8 @@ Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pi
 - A Mosaic GPU kernel's facts state the bytes ptxas says its launch spilled, which Dew's certification reads; a kernel whose PTX lets ptxas spill to shared memory states none measured.
 - XLA's reduction over degenerate dimensions alone, a variadic or a mixed-precision one among them, is its inputs, each result its own (upstream 405d628d8b): XLA's simplifier rewrote such a reduction into a bitcast of one array's shape and refused its own program (a RET_CHECK of `ShapeUtil::Compatible`), a compensated pair sum over a one-element axis on an A100.
 - A scatter's indices are flattened in their own integer type, and a mixed-precision dot multiplies in one: under deterministic ops XLA:GPU's scatter expansion multiplied 32-bit indices by 64-bit strides, a dot its emitter could not translate (a RET_CHECK in `mlir_kernel_emitter`), which failed a paged decode's gathered reference and Pallas Triton attention's backward.
-- A Pallas interpreter's thread map compiles its body once for all its threads and for every trace of one text, keyed by its structure.
+- A Pallas interpreter's thread map compiles its body once for all its threads and for every trace of one text, keyed by its structure, which it walks once per body (a walk at each call of an interpreted kernel's thread map made each grid step pay it: an interpreted recurrence test 3 to 4.5 times slower).
+- A complex dot under an explicit algorithm multiplies its real and imaginary parts: under `jax.default_matmul_precision('F32_F32_F32')` JAX converted a complex64 dot's operands to float32, dropping their imaginary parts without a warning (row 7191).
 - XLA:CPU's collectives wait for the last one before them to complete, not to start (upstream bd5b6fb67b): a CPU program of collectives in loops over a mesh aborted on a rendezvous timeout.
 - A compiled program's peak live buffers (`Compiled.peak_live()`) read HLO's own opcode names.
 - The Pallas fuser carries a cast of a value's type along manual mesh axes (`pvary`) through a fused stage's blocks, so a fused epilogue in a `shard_map` that checks variance reads a value each device holds its own of; such a cast read as scalar prefetch is refused.
