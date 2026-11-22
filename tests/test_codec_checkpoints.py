@@ -120,11 +120,12 @@ PACKED_ATTENTION = ("q_proj", "k_proj", "v_proj", "o_proj")
 """The attention's Linears `_w4a16_qwen3` stores as W4A16_NVFP4 too where asked, beside their biases."""
 
 
-def _w4a16_qwen3(directory: Path, attention: bool = False) -> Path:
+def _w4a16_qwen3(directory: Path, attention: bool = False, head: bool = False) -> Path:
     """A one-layer Qwen3 whose MLP's Linears ModelOpt stores as W4A16_NVFP4 (`quant_algo`, the layers whose
     scales are stored): U8 pairs of drawn codes, drawn E4M3 block scales and a float32 global scale, each
     depth one NVFP4 stage (256, `formats.NVFP4_STAGE`); its attention bf16, or with `attention` W4A16 too
-    and biased (`attention_bias`, Qwen2's), its norms and tied embedding bf16."""
+    and biased (`attention_bias`, Qwen2's), its norms and embedding bf16, the embedding its tied head, or
+    with `head` an untied output head of its own stored W4A16."""
     import ml_dtypes
     from safetensors.numpy import save_file
 
@@ -152,8 +153,10 @@ def _w4a16_qwen3(directory: Path, attention: bool = False) -> Path:
                    for name in PACKED_ATTENTION}
         tensors |= {f"{layer}self_attn.{name}.bias": dense(packed[f"self_attn.{name}"][0])
                     for name in PACKED_ATTENTION}
-    for name, (outputs, inputs) in packed.items():
-        stem = f"{layer}{name}.weight"
+    stems = {f"{layer}{name}.weight": shape for name, shape in packed.items()}
+    if head:
+        stems["lm_head.weight"] = (96, width)
+    for stem, (outputs, inputs) in stems.items():
         tensors[stem] = rng.integers(0, 256, (outputs, inputs // 2)).astype(np.uint8)
         scales = rng.uniform(0.25, 4, (outputs, inputs // 16))
         tensors[stem + "_scale"] = scales.astype(ml_dtypes.float8_e4m3fn)
@@ -161,7 +164,7 @@ def _w4a16_qwen3(directory: Path, attention: bool = False) -> Path:
     config = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": width,
               "intermediate_size": inner, "num_hidden_layers": 1, "num_attention_heads": heads,
               "num_key_value_heads": kv, "head_dim": head, "hidden_act": "silu", "vocab_size": 96,
-              "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "tie_word_embeddings": True,
+              "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "tie_word_embeddings": not head,
               "attention_bias": attention, "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
               "layer_types": ["full_attention"], "dtype": "bfloat16",
               "quantization_config": {"quant_method": "modelopt", "quant_algo": "W4A16_NVFP4",
@@ -249,4 +252,20 @@ def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refu
     for module in ("q_proj", "gate_proj"):
         with pytest.raises(ValueError):
             packed.adapt(LoRA(rank=2, modules=(module,)), key=0)
+
+
+def test_a_packed_output_heads_vocabulary_rows_are_its_decoded_values(tmp_path):
+    """A ModelOpt source whose untied output head is stored W4A16, served packed (`packed_weights`): the
+    rows a reader of the vocabulary takes from its head (`vocabulary_rows`, a joint schema head's draw and
+    readout among them) are the head's decoded values, as the same model over its banks decoded gives
+    them, bit for bit, no dense head held beside the packed one (row 11740)."""
+    from dew.quantization import QUANTIZATION, decoded_banks
+
+    loaded = Pretrained.load(_w4a16_qwen3(tmp_path / "source", head=True), dtype="float32",
+                             attention_impl="reference", packed_weights=True)
+    assert "lm_head" in loaded.variables[QUANTIZATION] and "lm_head" not in loaded.variables["params"]
+    rows = type(loaded.model).vocabulary_rows
+    decoded = decoded_banks(loaded.variables)
+    np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, method=rows)),
+                                  np.asarray(loaded.model.apply(decoded, method=rows)))
 

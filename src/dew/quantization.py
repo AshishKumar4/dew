@@ -74,7 +74,7 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
-from dew.nn.dense import QUANTIZATION, _contractions, _linear_site
+from dew.nn.dense import QUANTIZATION, _contractions, _linear_site, packed_matrix
 from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
 from dew.nn.fake_quant import (
     E2M1_MAX,
@@ -371,11 +371,19 @@ class LinearProducts(nn.Module):
     and continuum level, MLA's absorbed projection and an in-context memory's heads read them."""
 
     def applied_kernel(self, name: str) -> jax.Array:
-        """The kernel the submodule `name` multiplies its input by on this call: its own. A method
+        """The kernel the submodule `name` multiplies its input by on this call: its own, a packed one's
+        values decoded where it holds one (`dew.nn.dense.packed_matrix`: each code times its block's scale
+        times the matrix's, `NvFp4.decoded` times its factor, held nowhere, row 11740). A method
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update, and a
         frozen FP8 site's is its codes decoded. `get_variable` hands back the box the kernel was drawn in
         (`nn.with_logical_partitioning`)."""
-        return meta.unbox(getattr(self, name).get_variable("params", "kernel"))
+        from dew.nn.kernels.formats import NvFp4
+
+        module = getattr(self, name)
+        kernel = packed_matrix(module, "kernel", lambda: module.get_variable("params", "kernel"))
+        if isinstance(kernel, NvFp4):
+            return kernel.decoded().astype(jnp.float32) * kernel.factor
+        return meta.unbox(kernel)
 
     def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
         """Whether this call computes the submodule `name`, or a module under it, other than as a linear
