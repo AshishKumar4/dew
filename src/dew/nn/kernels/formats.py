@@ -87,9 +87,8 @@ class NvFp4:
         checkpoint's NVFP4 weight, its codes packed in the staged order, K-major. NumPy codes, scales and
         scale give a NumPy matrix (packed on the host, nothing copied to a device: a load places each
         expert shard's itself)."""
-        depth = codes.shape[-2]
-        if depth % NVFP4_STAGE:
-            raise ValueError(f"an NVFP4 matrix's depth is whole {NVFP4_STAGE}s, not {depth}")
+        if (why := unstaged(codes.shape[-2])) is not None:
+            raise ValueError(f"an NVFP4 matrix: {why}")
         host = isinstance(codes, np.ndarray) and isinstance(scales, np.ndarray)
         xp = np if host and not isinstance(scale, jax.Array) else jnp
         words = _staged_words(codes, xp)
