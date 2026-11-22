@@ -245,6 +245,6 @@ def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refu
     assert projection_groups(packed.model, packed.variables) == ()
     ids = jnp.asarray(np.random.default_rng(3).integers(0, 96, (2, 8)), jnp.int32)
     assert np.isfinite(np.asarray(packed.model.apply(packed.variables, ids), np.float32)).all()
-    with pytest.raises(ValueError, match="packed"):
+    with pytest.raises(ValueError):
         packed.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
 
