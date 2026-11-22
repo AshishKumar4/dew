@@ -1105,10 +1105,11 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
 
 
 def head_divergence(hidden, head: OutputTable, reference, reference_head: OutputTable, kept, temperature, *,
-                    tile: tuple[int, int]) -> jax.Array:
+                    tile: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
     """Each position's `KL(q || p)`, `[B, S]`: `p` the categorical of `head`'s logits of the final states
     `hidden`, `q` of `reference_head`'s of `reference` (a frozen teacher's, which take no gradient), both over
-    `temperature` (a scalar or `[B, S]`), the reference's logits 0 at a position `kept` leaves out.
+    `temperature` (a scalar or `[B, S]`); and `kept` where the reference's logits are all finite too, the
+    reference's logits 0 at a position it leaves out, whose KL is so finite (row 10984).
 
     Each row is taken whole over the vocabulary through `dew.nn.categorical.kl_divergence`, whose derivative
     (arXiv:2610.31642, eq. 9) reads a whole row (`q`'s most probable class, the rows' difference's mean
@@ -1161,12 +1162,17 @@ def head_divergence(hidden, head: OutputTable, reference, reference_head: Output
         def one(at):
             start = at * per
             own, theirs = (logits(start, *side) for side in sides)
-            held = jnp.where(jax.lax.dynamic_slice_in_dim(kept, start, per, axis=1)[..., None], theirs, 0)
+            finite = (jax.lax.dynamic_slice_in_dim(kept, start, per, axis=1)
+                      & jnp.all(jnp.isfinite(theirs), axis=-1))
+            held = jnp.where(finite[..., None], theirs, 0)
             over = jax.lax.dynamic_slice_in_dim(temperatures, start, per, axis=1)[..., None]
-            return kl_divergence(own / over, held / over)
+            return kl_divergence(own / over, held / over), finite
 
-        divergence = jax.lax.map(one, jnp.arange(chunks))
-        return jnp.moveaxis(divergence, 0, 1).reshape(rows, chunks * per)[:, :positions]
+        def positioned(values: jax.Array) -> jax.Array:
+            return jnp.moveaxis(values, 0, 1).reshape(rows, chunks * per)[:, :positions]
+
+        divergence, finite = jax.lax.map(one, jnp.arange(chunks))
+        return positioned(divergence), positioned(finite)
 
     columns = _Columns.of(head, work)
     reference_table = (jax.lax.stop_gradient(other),
@@ -1191,7 +1197,7 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
 
 @overload
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, column_logits: None, *,
-                  predict: bool, reference: tuple[jax.Array, _Columns]) -> jax.Array: ...
+                  predict: bool, reference: tuple[jax.Array, _Columns]) -> tuple[jax.Array, jax.Array]: ...
 
 
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, column_logits, *,
@@ -1204,7 +1210,7 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
     and gathers the head whole. `targets` may be a tuple of arrays whose leading `[batch, length]`
     dimensions are alike, split alike. A `reference`, a second head's vocabulary-major table and its
     per-column terms (`head_divergence`'s), is gathered whole as the head is, `head` takes it last and
-    returns one per-token array."""
+    returns two per-token arrays."""
     sums = column_logits is None and reference is None
     operands = (hidden, table, targets, excluded, cap, columns, *(() if reference is None else (reference,)))
     spec = token_spec(jax.tree.leaves(targets)[0].shape)
@@ -1278,7 +1284,7 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
         vocabulary, features = (entry or None for entry in held(table))
         return P(naming(vocabulary), features), jax.tree.map(lambda terms: P(naming(vocabulary)), columns)
 
-    outputs = spec if reference is not None else (spec, spec if predict else None, spec)
+    outputs = (spec, spec) if reference is not None else (spec, spec if predict else None, spec)
     inputs = (P(naming(spec[0]), *spec[1:], None), placed(table, columns)[0], spec, P(), P(),
               placed(table, columns)[1], *(() if reference is None else (placed(*reference),)))
     return jax.shard_map(local, in_specs=inputs,

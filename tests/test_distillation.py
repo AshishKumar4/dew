@@ -784,9 +784,29 @@ def _kl_heads(vocab: int, width: int, rows: int, positions: int):
     def divergence(student_table, teacher_table, student_states, teacher_states):
         student, teacher = (OutputTable(table, vocab_major=False) for table in (student_table, teacher_table))
         return head_divergence(student_states, student, teacher_states, teacher,
-                               jnp.ones(student_states.shape[:2], bool), 2.0, tile=(3, vocab))
+                               jnp.ones(student_states.shape[:2], bool), 2.0, tile=(3, vocab))[0]
 
     return tables, states, divergence
+
+
+def test_a_tiled_full_kl_leaves_out_the_positions_whose_teacher_logits_are_not_finite():
+    """The tiled full KL (`chunked.head_divergence`) gives, beside each position's KL, whether the teacher's
+    logits there are all finite: a teacher head with a column at -inf, whose cross entropy stays finite,
+    leaves every position out, its KL finite, as the whole logits' policy leaves them out and counts them
+    (`distill/teacher_nonfinite`); a finite head leaves none out (row 10984: the tiled KL read only the
+    teacher's losses, and trained on such positions uncounted)."""
+    from dew.nn.protocols import OutputTable
+    from dew.objectives.lm.chunked import head_divergence
+
+    vocab, width, rows, positions = 16, 8, 2, 5
+    tables, states, _ = _kl_heads(vocab, width, rows, positions)
+    student = OutputTable(tables[0], vocab_major=False)
+    kept = jnp.ones((rows, positions), bool)
+    for bias, held in ((jnp.zeros(vocab), True), (jnp.zeros(vocab).at[3].set(-jnp.inf), False)):
+        teacher = OutputTable(tables[1], vocab_major=False, bias=bias)
+        divergence, finite = head_divergence(states[0], student, states[1], teacher, kept, 2.0,
+                                             tile=(3, vocab))
+        assert bool(jnp.all(finite == held)) and bool(jnp.all(jnp.isfinite(divergence))), (held, finite)
 
 
 @pytest.mark.mesh(devices=4)
