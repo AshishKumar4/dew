@@ -19,9 +19,9 @@ the algebra pass's fusion on ("pass") or off ("nopass").
 `gated`: a gated MLP's three products at a model's MLP shape (`cell["model"]`, its `DENSE` down projection's
 widths), SwiGLU, fused on the GEMM template's hooks (`dew.nn.gated_mlp.fused_products`: the gated product
 the paired product's epilogue, the down product's prologue; `implementation` "fused") or apart, each product
-the template's launch with the gated product between ("apart"), its forward (`cell["kind"]` "forward") or
-its forward and the gradients of its input and three kernels ("train"): the fused MLP's receipt a
-`gated_mlp.FUSED_CELLS` cell is declared from (row 1958).
+the template's launch with a gated MLP's gated product between (`activations.gated_product`, "apart"), its
+forward (`cell["kind"]` "forward") or its forward and the gradients of its input and three kernels
+("train"): the fused MLP's receipt a `gated_mlp.FUSED_CELLS` cell is declared from (row 1958).
 
     {"builder": "tools/timing_cases.py:gated", "cells": [{"model": "qwen3.5-4b", "kind": "train"}],
      "arms": [{"name": "fused", "implementation": "fused"}, {"name": "apart", "implementation": "apart"}]}
@@ -159,13 +159,15 @@ def gated(cell: dict, implementation: str) -> tuple:
     kernels = tuple(jnp.asarray(rng.normal(size=shape) / np.sqrt(shape[0]), jnp.bfloat16)
                     for shape in ((width, hidden), (width, hidden), (hidden, width)))
     dy = jnp.asarray(rng.normal(size=(TOKENS, width)), jnp.bfloat16)
-    hook = activations.gated_hook("swiglu")
+    # The gated product apart as a gated MLP takes it (`dew.nn.mlp`): the generation's measured kernel, a
+    # Pallas SwiGLU where one is (row 12030: XLA's hook timed an arm no model runs).
+    product = activations.gated_product("swiglu")
 
     def mlp(x, gate, up, down):
         if implementation == "fused":
             return fused_products(x, (gate, up, down), "swiglu")
         projected = [gemm.gemm(x, kernel, None, out_dtype=jnp.bfloat16) for kernel in (gate, up)]
-        return gemm.gemm(hook(*projected), down, None, out_dtype=jnp.bfloat16)
+        return gemm.gemm(product(*projected), down, None, out_dtype=jnp.bfloat16)
 
     def trained(x, gate, up, down, dy):
         out, pulled = jax.vjp(mlp, x, gate, up, down)
