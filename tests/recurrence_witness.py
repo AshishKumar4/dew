@@ -24,7 +24,8 @@ row of the memory decayed by its own.
 
 Each enclosure is `interval_certificates`' outward interval arithmetic under the native contracts; this
 module adds each log decay's base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensated
-scan, `recurrence_algebra.prefix`), then the kernel's own roundings of its differences."""
+scan, `recurrence_algebra.prefix`; under a decay a key dimension the template's scan's high half alone, half
+an fp32 unit further, `Exponents.of`), then the kernel's own roundings of its differences."""
 
 import dataclasses
 import functools
@@ -91,21 +92,27 @@ zero exponent bits, `float_bits.exact_power2`)."""
 @dataclasses.dataclass(frozen=True)
 class Exponents:
     """A chunk's positions' base-2 log decays from its start, `log2(e) cumsum(g)` (`exact`, float64 within
-    2^-50 of it), and how far the kernel's prefix may lie from each (`bound`, `EXPONENT_BOUND`)."""
+    2^-50 of it), and how far the kernel's prefix may lie from each (`bound`: `EXPONENT_BOUND`, and a key
+    dimension's rounding)."""
     exact: np.ndarray
     bound: np.ndarray
 
     @classmethod
     def of(cls, g) -> "Exponents":
         """A chunk's exponents of its log decays `g` `[C]` (a head's) or `[C, Dk]` (a key dimension's, each
-        column its own prefix: the intra launch's scan of the same exact terms, `algebra.scanned_prefix`,
-        its doubling's adds as many as the associative scan's)."""
+        column its own prefix: the prefix launch's scan of the same exact terms, `intra._prefix`, a running
+        compensated sum or a doubling, its adds within the associative scan's bound). A key dimension's
+        prefix is the scan's sum rounded to one fp32, its high half alone: half an fp32 unit of the sum
+        further, a subnormal one's at least."""
         g = np.asarray(g, np.float64)
         columns = g.reshape(len(g), -1)
         exact = np.array([[math.fsum(columns[:s + 1, j]) for j in range(columns.shape[1])]
                           for s in range(len(g))]).reshape(g.shape) * LOG2E
         spanned = np.cumsum(np.abs(g), axis=0) * LOG2E * (1 + 2.0 ** -40)
-        return cls(exact, EXPONENT_BOUND * spanned + 2.0 ** -50 * np.abs(exact))
+        bound = EXPONENT_BOUND * spanned + 2.0 ** -50 * np.abs(exact)
+        if g.ndim == 2:
+            bound = bound + 2.0 ** -24 * (np.abs(exact) + bound) + 2.0 ** -150
+        return cls(exact, bound)
 
     def raised(self, lane: Lane) -> Iv:
         """`algebra.raised(hi, lo)` at each position: the decay from the chunk's start."""
@@ -435,7 +442,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     system = where(_lags(size) > 0, pairs(writes), zeros)
     w, c, values = solved_step(step, raised, lane)
     exact, bound = exponents.exact, exponents.bound
-    # `range_decay`: the difference of the compensated prefixes, then `raised`'s fraction.
+    # `range_decay`: the prefixes' difference, compensated, then `raised`'s fraction.
     spread = bound[-1][None, :] + bound + 2.0 ** -46 * (np.abs(exact[-1])[None, :] + np.abs(exact)) + FRACTION
     reach = exp2(outward(exact[-1][None, :] - exact - spread, exact[-1][None, :] - exact + spread), lane)
     written = staged(fp32(mul(point(step.k), reach), lane), lane)

@@ -168,8 +168,9 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
     return pair
 
 
-def raised(whole, part):
-    """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer
+def raised(whole, part=0.0):
+    """`exp2(whole + part)` of a compensated base-2 exponent (`part` zero where it is one fp32: a decay a key
+    dimension's rounded prefix, `intra._prefix`) to fp32's resolution at any size: its integer
     `n = floor(whole)` an exact power of two (`precision.power2`) and its
     fraction `(whole - n) + part`, near [0, 1), through exp2. The exponent rounded to one fp32 lost up to half
     its ulp, 1.9e-6 near -43 (a pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the
@@ -204,6 +205,13 @@ def decayed(rows, rows_lo, columns, columns_lo):
                    (column_whole[None, :], column_fraction[None, :]))
 
 
+def halves(prefix: tuple) -> tuple:
+    """A decay's prefix `(hi, lo)` as its two halves: a compensated pair as given (a decay a head's,
+    `prefix`), a rounded sum `(hi,)` with a zero low half (a decay a key dimension's, the template's
+    `intra._prefix`)."""
+    return prefix if len(prefix) == 2 else (*prefix, 0.0)
+
+
 def range_decay(later, later_low, earlier, earlier_low):
     """`exp2(later - earlier)` of a compensated prefix's halves at two positions (broadcasting): `raised` of
     their difference, compensated (`compensated_add`), so no rounding of the halves' difference reaches
@@ -219,10 +227,11 @@ PAIR_CEILING = 120.0
 which every caller masks) stay finite."""
 
 
-def separated(hi, lo):
+def separated(hi, lo=0.0):
     """A compensated base-2 exponent `(hi, lo)` as its whole part and fraction `(n, f)`: `n` the integer
-    `floor(hi)` (`hi` itself past 2^23, where every fp32 is one), `f` what `hi` holds past it and `lo`, the
-    form whose differences are exact at any size (`between`). Once a call, where its prefix is cumulated."""
+    `floor(hi)` (`hi` itself past 2^23, where every fp32 is one), `f` what `hi` holds past it and `lo` (zero
+    where the exponent is one fp32, a decay a key dimension's rounded prefix), the form whose differences are
+    exact at any size (`between`). Once a call, where its prefix is cumulated."""
     whole = _floor(hi)
     return whole, (hi - whole) + lo
 
@@ -872,16 +881,17 @@ def band_masked(band: jax.Array, *, strict: bool, scale: float) -> jax.Array:
     return jnp.where(lane > 0, band, 0.0) if strict else band * scale
 
 
-def key_decayed_write(key, gate, low, last, last_low):
-    """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` over both prefix
-    halves, in the keys' arithmetic: the write the memory takes (`carried`)."""
-    return key * range_decay(last, last_low, gate, low)
+def key_decayed_write(key, gates: tuple, last: tuple):
+    """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` of its prefix
+    `gates` and the chunk's last token's `last` (each its halves, `halves`), their difference exact
+    (`range_decay`), in the keys' arithmetic: the write the memory takes (`carried`)."""
+    return key * range_decay(*halves(last), *halves(gates))
 
 
 def key_gated(query, gates: tuple, scale: float):
     """A key block's queries gated by their decays to the chunk's start and scaled, `scale q exp2(g)`
-    (`gates` the prefix's halves, `raised`), rounded to the queries' dtype: `key_decayed_output`'s left
-    operand, as fla's chunk_gla output kernel scales its gated queries."""
+    (`gates` the prefix's halves, `raised`; the template's one, `intra._prefix`), rounded to the queries'
+    dtype: `key_decayed_output`'s left operand, as fla's chunk_gla output kernel scales its gated queries."""
     return (query * raised(*gates) * scale).astype(query.dtype)
 
 
@@ -1021,9 +1031,10 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
                      summed: Callable[[list], jax.Array], *, emit: Callable[[str, jax.Array], None],
                      columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of a decay a key dimension's backward (`templates.recurrence.key_backward`), its
-    queries `query` and keys `key` `[C, BK]`, their prefix halves from the chunk's start `gates` `[C, BK]` and
-    the chunk's last token's `last` as a row's vectors, and each value block `j`'s memory entered `entered(j)`
-    and its gradient leaving `leaving(j)` `[BK, BV]`: over the value blocks `dq = scale exp2(g) do h^T`, `dk =
+    queries `query` and keys `key` `[C, BK]`, their prefix from the chunk's start `gates` `[C, BK]` and the
+    chunk's last token's `last` as a row's vectors (each its halves, `halves`; the template's one,
+    `intra._prefix`), and each value block `j`'s memory entered `entered(j)` and its gradient leaving
+    `leaving(j)` `[BK, BV]`: over the value blocks `dq = scale exp2(g) do h^T`, `dk =
     exp2(g_last - g) v_new dh^T`, the weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw'); then
     `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log decay's
     terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's `sum(k dk)` on its last token, and `(dA,
@@ -1036,7 +1047,7 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     at once, spilled 744 bytes a thread on an H100 (kda-gate3 at ee3734584). `columns`, where given, sums a
     tile's columns (the mainloop's, `summed_pairs`')."""
     decays = raised(*gates)
-    to_last = range_decay(*(half[None, :] for half in last), *gates)
+    to_last = range_decay(*halves(tuple(half[None, :] for half in last)), *halves(gates))
     # Each sum in turn, the log decay's terms gathered as each one's term is formed, so one sum and its
     # terms are live at a time: the three sums at once, beside the terms every one fed, spilled 240 bytes a
     # thread on an H100 (kda-gate5 at db546905d); the weights' first, 232 (kda-gate8 at b1e1fcb9b).
