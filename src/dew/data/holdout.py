@@ -11,6 +11,7 @@ from typing import ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 
+from dew import _records
 from dew.batch import Batch
 from dew.data.dataset import Records
 from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, _shard_inputs, _source_ids
@@ -306,8 +307,12 @@ class SelectedGeneration(View[Source]):
     def _own(self) -> Mapping[str, Callable[[], Stated]]:
         """This part's rows and its generation's count rules, each read only where asked (row 11910: its
         own fact policy beside its view's)."""
+        def rules() -> Stated:
+            stated = _GenerationSource(self.generation).metadata().get("count_rules")
+            return None if stated is None else _records.json_value(stated, "count rules")
+
         return {"rows": lambda: len(self._dense), "accepted_rows": lambda: len(self._dense),
-                "count_rules": lambda: _GenerationSource(self.generation).metadata().get("count_rules")}
+                "count_rules": rules}
 
     def stated(self) -> Mapping[str, object]:
         return _uncounted(stated(self.source))
