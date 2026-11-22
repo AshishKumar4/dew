@@ -2083,7 +2083,7 @@ def test_forward_registers_charges_prescale_only_when_non_unit(gen):
         wide_reg_folded = dataclasses.replace(reg_folded, width=576, value_width=128)
         wide_reg_scaled = dataclasses.replace(reg_scaled, width=576, value_width=128)
         wide_reg_unit = dataclasses.replace(reg_unit, width=576, value_width=128)
-        tiles = program.Tiles(64, 64, 2, 1, family.name)
+        tiles = program.Tiles(64, 64, 2, 1, family=family.name)
         if family.budgets_registers and program.query_swizzle(family) is None:
             scaled_regs = wide_reg_scaled.at(family, tiles)
             folded_regs = wide_reg_folded.at(family, tiles)

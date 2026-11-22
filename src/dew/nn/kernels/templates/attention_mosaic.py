@@ -1931,11 +1931,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         (rows 4839, 5272, 10948, 10962)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if not family.budgets_registers:
+        if not family.budgets_registers or not config.fused:
             return config
         q_block = config.dkv_blocks[0] if config.dkv_blocks is not None else config.block_q
-        q_steps = -(-query.shape[1] // q_block)
-        steps = q_steps if config.fused else min(q_steps, -(-ba.arguments["key"].shape[1] // config.block_k))
+        steps = -(-query.shape[1] // q_block)
         cap = 3 if config.dkv_blocks is not None else max(config.consumers, 2) + 1
         want = min(cap, steps)
         if want <= config.stages:
