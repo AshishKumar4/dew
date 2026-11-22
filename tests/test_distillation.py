@@ -878,30 +878,26 @@ def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_groups_own_tok
 
 def test_a_full_kl_distillation_of_an_adapted_student_plans_on_no_head_tile(monkeypatch):
     """A full-KL distillation whose student adapts in context (`ChunkAdaptation`, which scores through more
-    than its head, `predicts_by_head`), fit on devices with no room for its first step at its own rung,
-    plans past it compiling no rung twice and none of them a head tile: its step reads both models' whole
-    logits whatever their heads' tile (row 10997: the tile rung tiled both heads and reported a move, a
-    compile of the same program)."""
+    than its head, `predicts_by_head`), fit on devices with room for no step, walks its whole ladder without
+    a head tile and compiling no rung twice: its step reads both models' whole logits whatever their heads'
+    tile (row 10997: the tile rung tiled both heads and reported a move, a compile of the same program)."""
     from test_chunk_adaptation import LENGTH, VOCAB, decoder
-    from test_plan import free, needs
+    from test_plan import free
 
     from dew.objectives.lm.adaptation import ChunkAdaptation
+    from dew.training.planning import PlanRefused
 
-    def trainer() -> Trainer:
-        adapted = ChunkAdaptation(window=1, rate=0.5)
-        student = LMObjective(decoder(), LENGTH, ema_decay=None, adaptation=adapted)
-        teacher = LMObjective(decoder(continuum=None), LENGTH, ema_decay=None)
-        return Trainer(DistillationObjective(student, teacher), optax.sgd(0.1), key=jax.random.key(0),
-                       mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0))
-
+    student = LMObjective(decoder(), LENGTH, ema_decay=None, adaptation=ChunkAdaptation(window=1, rate=0.5))
+    teacher = LMObjective(decoder(continuum=None), LENGTH, ema_decay=None)
+    trainer = Trainer(DistillationObjective(student, teacher), optax.sgd(0.1), key=jax.random.key(0),
+                      mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0))
     batch = {TEXT_KEY: jax.random.randint(jax.random.key(1), (2, LENGTH + 1), 1, VOCAB)}
-    first = trainer()
-    room = needs(monkeypatch, first, run=lambda: first.fit(fixed(batch), steps=1)) - 1
-    free(monkeypatch, room)
-    planned = trainer()
-    planned.fit(fixed(batch), steps=1)
-    rungs = [json.dumps(probe, sort_keys=True, default=str) for probe in planned.plan["probes"]]
-    assert all(probe["head_tile"] is None for probe in planned.plan["probes"]), rungs
+    free(monkeypatch, 1)
+    with pytest.raises(PlanRefused) as refused:
+        trainer.fit(fixed(batch), steps=1)
+    rungs = [json.dumps({"split": probe.split, **probe.rung}, sort_keys=True, default=str)
+             for probe in refused.value.probes]
+    assert len(rungs) > 1 and all(probe.rung["head_tile"] is None for probe in refused.value.probes), rungs
     assert len(set(rungs)) == len(rungs), rungs
 
 
