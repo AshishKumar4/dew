@@ -156,10 +156,10 @@ def test_a_load_reads_each_tensor_by_name_from_its_checkpoint(source, loaded, tm
 
 
 def test_the_transformers_forward_refuses_packed_experts(source):
-    """`packed_experts` serves the expert banks of a decoder Dew translates; the transformers forward
+    """`packed_weights` serves the expert banks of a decoder Dew translates; the transformers forward
     loads its weights dense, so a load asking for both is refused, not loaded dense silently."""
     with pytest.raises(ValueError):
-        Pretrained.load(source[0], fallback="torchax", dtype="float32", packed_experts=True)
+        Pretrained.load(source[0], fallback="torchax", dtype="float32", packed_weights=True)
 
 
 def test_a_checkpoint_transformers_converts_is_refused_where_it_lacks_a_parameter(tmp_path):

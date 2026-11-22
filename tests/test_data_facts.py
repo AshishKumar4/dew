@@ -1,13 +1,15 @@
 """A dataset's facts (`Dataset.facts`), read without opening a reader: what its stores state, then what
 each step makes of them, in order. They say what the first batch the chain makes holds."""
 
+import itertools
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 from token_support import write_token_corpus
 
-from dew.data import Loading, Memory, from_iter, mix, presets, text
+from dew.data import Files, Loading, Memory, from_iter, mix, presets, text
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 
@@ -208,3 +210,79 @@ def test_host_flips_jitters_crops_and_captions_keep_the_images_shape_their_steps
     cropped = pictures.pipe(presets.images, 16, batch=None, caption=images.caption("a photo")).map(
         images.CenterCrop(8))
     assert cropped.facts()["fields"]["image"] == [8, 8, 3]
+
+
+SCHEMAS_READ: list[str] = []
+"""Each store whose files' schema a `SchemaCounted` read, by its URL."""
+
+
+class SchemaCounted(Files):
+    """A file store that notes each read of its files' schema (`SCHEMAS_READ`)."""
+
+    @property
+    def arrow(self):
+        SCHEMAS_READ.append(str(self.url))
+        return Files.arrow.func(self)
+
+
+def test_a_seeded_streamed_mix_of_raw_parquet_stores_reads_no_schema_to_compile(tmp_path):
+    """A seeded mix of raw Parquet stores read as streams compiles reading none of its members' schemas,
+    whose facts its plan asks nothing of: the tokenizer contract's facts no raw store's schema states, a
+    stream pins no member's facts, its shards are named by its files' paths, and its lengths are a fact of
+    a plan that packs by them alone (plan version 17; row 9009: compiling read each member's schema four
+    times); its read opens the members it draws."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.pipeline import Pipeline
+
+    for name in ("a", "b"):
+        pq.write_table(pa.table({"x": list(range(8))}), tmp_path / f"{name}.parquet")
+    members = [Pipeline(SchemaCounted(str(tmp_path / f"{name}.parquet")), name=name) for name in ("a", "b")]
+    SCHEMAS_READ.clear()
+    loader = compile(mix(members, seed=3).batch(2), read="streamed", loading=Loading(workers=0))
+    assert SCHEMAS_READ == []
+    stream = loader.train(DataPartition())
+    try:
+        next(stream)
+    finally:
+        stream.close()
+    assert SCHEMAS_READ
+
+
+def test_a_position_saved_under_plan_16_of_a_store_stating_lengths_resumes_under_17(tmp_path):
+    """A store whose files state each row's length (a `length` column), read whole with no packing: a
+    position its read saved under plan 16, which recorded every store's lengths, resumes under this Dew's
+    plan (17), which records them only where a step packs by them, onto the rows after (row 9009's review:
+    the earlier plan's derived facts were compared with this Dew's)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.pipeline import Pipeline
+    from dew.data.plan import DECIDED, described_under
+
+    pq.write_table(pa.table({"x": list(range(12)), "length": [3] * 12}), tmp_path / "rows.parquet")
+
+    def loader():
+        return compile(Pipeline(Files(str(tmp_path / "rows.parquet"))).batch(2), read="streamed",
+                       loading=Loading(workers=0))
+
+    def read(stream, count) -> list[int]:
+        return [int(value) for batch in itertools.islice(stream, count) for value in batch["x"]]
+
+    # Its plan described as plan 16 describes it, every store's lengths among its facts, and saved as 16's.
+    with described_under(DECIDED):
+        saving = loader().train(DataPartition())
+        try:
+            assert read(saving, 2) == [0, 1, 2, 3]
+            position = json.loads(saving.get_state())
+        finally:
+            saving.close()
+    position["dew_data_plan"]["version"] = DECIDED
+    saved = json.dumps(position).encode()
+    resumed = loader().train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert read(resumed, 2) == [4, 5, 6, 7]
+    finally:
+        resumed.close()

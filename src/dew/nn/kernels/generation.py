@@ -1066,7 +1066,7 @@ def built_target(generation: str, multiprocessors: int | None = None, memory: in
                                memory=memory or target.memory)
 
 
-def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
+def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
     its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;

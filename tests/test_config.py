@@ -92,9 +92,9 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_names_eigh
 
     config = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
                        trainer=TrainerConfig(steps=1))
-    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 16
+    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 17
     saved = config.resumed().record()
-    assert RunConfig.read(saved).data_plan_version == 16
+    assert RunConfig.read(saved).data_plan_version == 17
     earlier = {**saved, "fields": {name: value for name, value in saved["fields"].items()
                                    if name != "data_plan_version"}}
     directory = tmp_path / "planned"
@@ -982,3 +982,22 @@ def test_a_run_stating_the_default_layout_saves_and_loads_it_stated(tmp_path):
     unset = RunConfig(data=images_of("tfds://oxford_flowers102", 32))
     path.write_text(json.dumps(unset.record()))
     assert RunConfig.load(str(path)).trainer.layout is None
+
+
+def test_a_run_saved_with_its_experts_packed_loads_with_its_weights_packed(tmp_path):
+    """A run saved while `SourceOptions.packed_weights` was `packed_experts` (row 8550) loads with its
+    source's weights packed as it trained, its record read under today's name (`earlier_packed_experts`)."""
+    from dew.data import presets
+    from dew.data.sources.tokens import TokenFiles
+    from dew.interop.source_options import SourceOptions
+
+    record = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
+                       trainer=TrainerConfig(steps=1), source=SourceOptions(packed_weights=True)).record()
+    source = dict(record["fields"]["source"])
+    source["packed_experts"] = source.pop("packed_weights")
+    directory = tmp_path / "packed"
+    directory.mkdir()
+    earlier = {**record, "fields": {**record["fields"], "source": source}}
+    (directory / "run.json").write_text(json.dumps(earlier))
+    assert RunConfig.load(str(directory)).source.packed_weights is True
+

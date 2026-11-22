@@ -128,8 +128,10 @@ def a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
 
         return as_given(evaluated)
 
+    # A site's label its batch's too: the flow's four cells share one store (rows 7858, 7859: batch 4's
+    # sites would replace batch 1's).
     assert_as_exact(evaluate(np.float32, device), evaluate(np.float32, host), draw,
-                    "VAE encoder VJP" if backward else "VAE encode", seeds=ENCODER_SEEDS,
+                    f"VAE {'encoder VJP' if backward else 'encode'}, batch {batch}", seeds=ENCODER_SEEDS,
                     truth_fn=evaluate(np.float64, host))
 
 

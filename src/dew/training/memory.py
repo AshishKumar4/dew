@@ -301,6 +301,13 @@ def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> 
     return records[0] if len(records) == 1 else records or None
 
 
+def remat_stated[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
+    """Whether any module the objective trains sets its own remat (`recompute_record`), which a run
+    compiles at alone: its ladder is its head's rungs (`dew.training.planning.FitSearch.ladder`)."""
+    record = recompute_record(objective)
+    return any(entry is not None for entry in (record if isinstance(record, list) else [record]))
+
+
 def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defaults: bool, *,
                                  narrow: bool, ns_group: int | None = None) -> dict[str, JSON]:
     """The rung of the fit ladder a step compiles at, as a checkpoint records

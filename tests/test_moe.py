@@ -415,7 +415,7 @@ def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
 
 def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
     """An expert layer whose matrices are packed NVFP4 banks in its `QUANTIZATION` collection, no parameter
-    beside them (a served 4-bit checkpoint's, row 4516: `quantization.expert_matrix`), multiplied as NVFP4
+    beside them (a served 4-bit checkpoint's, row 4516: `dew.nn.dense.packed_matrix`), multiplied as NVFP4
     products (`gemm.nvfp4_product`): on par with the layer holding the banks' values as dense parameters in
     the same compute dtype, bf16 (check 1, truth the values in float64)."""
     from arm_arithmetic import float64_held
@@ -475,15 +475,15 @@ def test_a_scanned_runs_stacked_packed_banks_are_read_at_its_layer_as_that_layer
 
 
 def test_packed_banks_decode_into_the_parameters_an_export_writes():
-    """A served layer's packed banks decoded for an export or a merge (`quantization.decoded_expert_banks`):
+    """A served layer's packed banks decoded for an export or a merge (`quantization.decoded_banks`):
     each its values exactly, as the layer's `params` under its name, and the bank gone from `QUANTIZATION`;
     the layer applied to them reads what the packed layer reads, to the dense product's rounding."""
     from packed_experts import packed_banks
 
-    from dew.quantization import QUANTIZATION, decoded_expert_banks
+    from dew.quantization import QUANTIZATION, decoded_banks
 
     bank, values = packed_banks(2, 256, 256, seed=3)
-    decoded = decoded_expert_banks({"params": {"router": {"kernel": jnp.zeros((4, 2))}},
+    decoded = decoded_banks({"params": {"router": {"kernel": jnp.zeros((4, 2))}},
                                     QUANTIZATION: {"experts": {"up_proj": {"kernel": bank}}}})
     assert QUANTIZATION not in decoded
     np.testing.assert_array_equal(np.asarray(decoded["params"]["experts"]["up_proj"]["kernel"]), values)
@@ -493,14 +493,14 @@ def test_packed_banks_decode_into_the_parameters_an_export_writes():
 def test_a_runs_stacked_packed_banks_decode_as_each_layers_bank_does():
     """A scanned run's packed banks stacked on its layer axis, as a banked store holds them for serving
     (`dew.inference.banks`: `[layers, experts, in, out]`), decoded for an export
-    (`quantization.decoded_expert_banks`, before the export reads the layers apart): each layer's values
+    (`quantization.decoded_banks`, before the export reads the layers apart): each layer's values
     exactly as its bank alone decodes, over every leading axis."""
     from packed_experts import packed_banks
 
-    from dew.quantization import QUANTIZATION, decoded_expert_banks
+    from dew.quantization import QUANTIZATION, decoded_banks
 
     layers = [packed_banks(2, 256, 256, seed=seed) for seed in (3, 4)]
     stacked = jax.tree.map(lambda *fields: np.stack(fields), *(bank for bank, _ in layers))
-    decoded = decoded_expert_banks({QUANTIZATION: {"experts": {"up_proj": {"kernel": stacked}}}})
+    decoded = decoded_banks({QUANTIZATION: {"experts": {"up_proj": {"kernel": stacked}}}})
     np.testing.assert_array_equal(np.asarray(decoded["params"]["experts"]["up_proj"]["kernel"]),
                                   np.stack([values for _, values in layers]))
