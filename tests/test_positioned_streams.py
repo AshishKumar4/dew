@@ -166,3 +166,18 @@ def test_a_positioned_stream_of_fewer_records_than_its_readers_is_refused(tmp_pa
     with pytest.raises(ValueError):
         next(data.train(DataPartition(index=0, count=2)))
 
+
+@pytest.mark.parametrize("records", [3, 64, 65, 200])
+def test_a_positioned_streams_store_is_cut_into_as_many_shards_as_its_records_allow(tmp_path, records):
+    """A positioned stream's store of a few hundred bytes is cut into one shard a record, or, past 64
+    records, into 64 shards at the least, each of whole records in order: so many readers read it at once
+    (row 11637's review: 65 records were cut into 33 shards of two, short of 34 readers)."""
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(records)))
+    files = Files(str(path))
+    files.provision()
+    shards = files.positioned_manifest().shards
+    assert len(shards) >= min(records, 64), len(shards)
+    assert [(shard.start, shard.stop) for shard in shards] == [
+        (start, min(start + shards[0].rows, records)) for start in range(0, records, shards[0].rows)]
+

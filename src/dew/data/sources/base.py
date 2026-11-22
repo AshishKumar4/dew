@@ -424,13 +424,14 @@ def materialized(source: Source) -> TypeGuard[Materialized]:
 
 
 def _indexed_manifest(source: Source, uri: str, rows: int,
-                      reader: ShardOpener | None = None) -> ShardManifest:
+                      reader: ShardOpener | None = None, count: int | None = None) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
     at most `rows` records, each `Shard` named by the record it starts at,
     which no copy of the source names otherwise, wherever it is, and read at
     `uri` as that slice of its indexed records (`_IndexedSlice`), or by
-    `reader`, which reads the same slice with less than `source` to pickle."""
-    count = len(source.records("indexed"))
+    `reader`, which reads the same slice with less than `source` to pickle; `count` its records, where its
+    caller counted them."""
+    count = len(source.records("indexed")) if count is None else count
     return ShardManifest(
         tuple(
             Shard(f"records:{start}", uri, start, min(start + rows, count), min(rows, count - start))

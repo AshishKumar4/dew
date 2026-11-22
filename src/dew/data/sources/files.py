@@ -951,15 +951,19 @@ class Files(Dataset):
         # Named by its files' places (`_places`), which every host that mounted them anywhere names alike, as
         # a digest of them, of one length however many files it holds.
         places = "\n".join(self._places[url] for url in self.paths)
-        count = len(self.records("indexed"))
+        # Counted by one read of its index, closed (`_indexed_rows`), which the manifest is cut by.
+        count = self._indexed_rows() or 0
         # Fixed ranges of whole records, of about `shard_bytes` each and at least `PARTS` of them where it
         # holds as many records, which no count of readers or workers cuts otherwise, so every read keys its
         # fill and replays a published one by the same shards (row 11637: one shard cut by the count of
         # readers asking named parts no other topology's fill found). A position saved over a store cut
         # otherwise is refused by its shards, as any store cut anew is (`ShardManifest`'s `shards` fact).
+        # Rounded down by `PARTS`, so a store of as many records holds as many shards at the least (row
+        # 11637's review: 65 records of two rows a shard were 33).
         rows = max(1, min(-(-count * self.shard_bytes // max(self.preparation_bytes(), 1)),
-                          -(-count // self.PARTS)))
-        return _indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}", rows)
+                          count // self.PARTS))
+        return _indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}", rows,
+                                 count=count)
 
     PARTS = 64
     """The fewest shards a positioned stream's store is cut into where it holds as many records
