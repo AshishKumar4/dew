@@ -120,11 +120,12 @@ PACKED_ATTENTION = ("q_proj", "k_proj", "v_proj", "o_proj")
 """The attention's Linears `_w4a16_qwen3` stores as W4A16_NVFP4 too where asked, beside their biases."""
 
 
-def _w4a16_qwen3(directory: Path, attention: bool = False) -> Path:
+def _w4a16_qwen3(directory: Path, attention: bool = False, untied: float | None = None) -> Path:
     """A one-layer Qwen3 whose MLP's Linears ModelOpt stores as W4A16_NVFP4 (`quant_algo`, the layers whose
     scales are stored): U8 pairs of drawn codes, drawn E4M3 block scales and a float32 global scale, each
     depth one NVFP4 stage (256, `formats.NVFP4_STAGE`); its attention bf16, or with `attention` W4A16 too
-    and biased (`attention_bias`, Qwen2's), its norms and tied embedding bf16."""
+    and biased (`attention_bias`, Qwen2's), its norms and embedding bf16, the embedding its tied head, or
+    with `untied` an output head of its own stored W4A16 under that tensor scale."""
     import ml_dtypes
     from safetensors.numpy import save_file
 
@@ -152,16 +153,29 @@ def _w4a16_qwen3(directory: Path, attention: bool = False) -> Path:
                    for name in PACKED_ATTENTION}
         tensors |= {f"{layer}self_attn.{name}.bias": dense(packed[f"self_attn.{name}"][0])
                     for name in PACKED_ATTENTION}
-    for name, (outputs, inputs) in packed.items():
-        stem = f"{layer}{name}.weight"
+    stems = {f"{layer}{name}.weight": shape for name, shape in packed.items()}
+    if untied is not None:
+        stems["lm_head.weight"] = (96, width)
+    for stem, (outputs, inputs) in stems.items():
         tensors[stem] = rng.integers(0, 256, (outputs, inputs // 2)).astype(np.uint8)
         scales = rng.uniform(0.25, 4, (outputs, inputs // 16))
+        if stem == "lm_head.weight":
+            # Its first value 1.5 (E2M1's code 3) under a block scale of 0.25: a product of more bits than a
+            # subnormal holds under a tensor scale near the least normal; its 17th 6 (code 7) and 19th 1
+            # (code 2) under a block scale of 128: past float32's largest finite under one of 2^119 and of
+            # 2^122 (row 11740's review).
+            tensors[stem][0, 0] = (tensors[stem][0, 0] & 0xF0) | 3
+            scales[0, 0] = 0.25
+            tensors[stem][0, 8] = (tensors[stem][0, 8] & 0xF0) | 7
+            tensors[stem][0, 9] = (tensors[stem][0, 9] & 0xF0) | 2
+            scales[0, 1] = 128
         tensors[stem + "_scale"] = scales.astype(ml_dtypes.float8_e4m3fn)
-        tensors[stem + "_scale_2"] = np.asarray(rng.uniform(0.002, 0.02), np.float32)
+        overall = untied if stem == "lm_head.weight" else rng.uniform(0.002, 0.02)
+        tensors[stem + "_scale_2"] = np.asarray(overall, np.float32)
     config = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": width,
               "intermediate_size": inner, "num_hidden_layers": 1, "num_attention_heads": heads,
               "num_key_value_heads": kv, "head_dim": head, "hidden_act": "silu", "vocab_size": 96,
-              "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "tie_word_embeddings": True,
+              "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "tie_word_embeddings": untied is None,
               "attention_bias": attention, "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
               "layer_types": ["full_attention"], "dtype": "bfloat16",
               "quantization_config": {"quant_method": "modelopt", "quant_algo": "W4A16_NVFP4",
@@ -249,4 +263,67 @@ def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refu
     for module in ("q_proj", "gate_proj"):
         with pytest.raises(ValueError):
             packed.adapt(LoRA(rank=2, modules=(module,)), key=0)
+
+
+WITNESSES = {2.0 ** -124: {}, 2.0 ** -126 * (1 + 7 * 2.0 ** -23): {(0, 0): 0x00300003},
+             2.0 ** 119: {(0, 16): 0x7F800000}, 2.0 ** 122: {(0, 16): 0x7F800000, (0, 18): 0x7F800000}}
+"""A packed head's tensor scales, each with the values whose bits it fixes (`_w4a16_qwen3`'s planted ones):
+1.5 times 0.25 near the least normal, once rounded (twice, `0x00300002`); 6 times 128 times 2^119, 1.5 2^128,
+and 1 times 128 times 2^122, 2^129, infinities (row 11740's review: a NaN and 2^127)."""
+
+
+@pytest.mark.parametrize("overall", list(WITNESSES), ids=["a power of two", "near the least normal",
+                                                         "past the largest", "its factor past it"])
+def test_a_packed_output_heads_vocabulary_rows_are_its_decoded_values(tmp_path, overall):
+    """A ModelOpt source whose untied output head is stored W4A16, served packed (`packed_weights`): the
+    rows a reader of the vocabulary takes from its head (`vocabulary_rows`, a joint schema head's draw and
+    readout among them) are the head's values its stored codes, block scales and tensor scale state, each
+    product rounded once, as the same model over its banks decoded gives them, no dense head held beside the
+    packed one (row 11740). Under its tensor scale (`overall`) its planted values' bits are `WITNESSES`':
+    float32 subnormals, which XLA's CPU multiply would flush, a product rounded twice would miss, and
+    infinities past the largest finite (row 11740's review)."""
+    from dew.quantization import QUANTIZATION, decoded_banks
+
+    source = _w4a16_qwen3(tmp_path / "source", untied=overall)
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", packed_weights=True)
+    assert "lm_head" in loaded.variables[QUANTIZATION] and "lm_head" not in loaded.variables["params"]
+    stored = {name: np.asarray(value) for name, value in read_weights(source).items()}
+    codes = stored["lm_head.weight"]
+    values = E2M1_VALUES[np.stack([codes & 15, codes >> 4], axis=-1).reshape(codes.shape[0], -1)]
+    scales = np.repeat(stored["lm_head.weight_scale"].astype(np.float32), 16, axis=-1)
+    # Each code times its block's scale is exact in float32, and numpy's multiply by the tensor scale rounds
+    # it once, a subnormal kept, an overflow an infinity.
+    with np.errstate(over="ignore"):
+        expected = values * scales * stored["lm_head.weight_scale_2"]
+    for where, bits in WITNESSES[overall].items():
+        assert expected.view(np.uint32)[where] == bits
+    tiny = np.finfo(np.float32).tiny
+    assert overall > 1 or np.any((expected != 0) & (np.abs(expected) < tiny))
+    rows = type(loaded.model).vocabulary_rows
+    for variables in (loaded.variables, decoded_banks(loaded.variables)):
+        np.testing.assert_array_equal(np.asarray(loaded.model.apply(variables, method=rows)).view(np.uint32),
+                                      expected.view(np.uint32))
+
+
+def test_a_packed_matrixs_non_finite_products_are_ieees():
+    """A packed matrix's values under a non-finite tensor scale, each product IEEE's (`packed_values`): an
+    infinite scale times a zero code a NaN, times any other an infinity of their sign, a NaN scale's values
+    NaNs; and the classification read off the operands' bits where a float32 multiply would flush a
+    subnormal first (XLA's CPU, row 11795): a bfloat16 `0x0001` times -inf is -inf, +inf times float32
+    `0x00000001` is +inf, in either order of finite and infinite."""
+    from dew.nn.kernels.formats import NvFp4
+    from dew.quantization import _product_rounded, packed_values
+
+    codes = np.zeros((256, 2), np.float32)
+    codes[1, 0], codes[2, 0] = 1.5, -6.0
+    ones = np.ones((16, 2), np.float32).astype(jnp.float8_e4m3fn)
+    values = np.asarray(packed_values(NvFp4.of(codes, ones, -np.inf)))
+    assert np.isnan(values[0, 0]) and values[1, 0] == -np.inf and values[2, 0] == np.inf
+    assert np.isnan(np.asarray(packed_values(NvFp4.of(codes, ones, np.nan)))).all()
+    tiny = np.uint32(1).view(np.float32)
+    subnormal = jax.lax.bitcast_convert_type(jnp.asarray([1], jnp.uint16), jnp.bfloat16)
+    infinite = jnp.asarray([np.inf], jnp.bfloat16)
+    for value, scale, expected in ((subnormal, -np.inf, 0xFF800000), (infinite, tiny, 0x7F800000)):
+        got = _product_rounded(value, jnp.asarray(scale, jnp.float32), 8)
+        assert np.asarray(got).view(np.uint32)[0] == expected
 

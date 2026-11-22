@@ -111,7 +111,7 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
     mma.sync family's). Its operands at the indices `device` are refs in device memory, each read and write
     of them its bytes' device traffic (a Triton launch's blocks, which its loads and stores move: the decode
     merge's, `merged._channel_block`). Its special functions in `forms` where given (a Mosaic GPU kernel's,
-    `_forms`), else one MUFU an element each (`operation_work`)."""
+    `forms_of`), else one MUFU an element each (`operation_work`)."""
     roles = []
     for index in range(warpgroups):
         counted = _Counting(axis, index, forms=forms)
@@ -902,7 +902,7 @@ def launch_work(kernel, stated: Stated) -> Work:
     times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
     steps its longest program walks (`Stated.longest`, else their mean), and one kernel. Its cost
     estimate's (`_estimate`) and a step's price (`work_of`, `attention_decode.priced_step`) alike."""
-    forms = _forms(kernel)
+    forms = forms_of(kernel.params["compiler_params"])
     programs = launch_programs(kernel)
     if kernel.primitive is mpmd.mpmd_map_p:
         (mesh,) = kernel.params["meshes"]
@@ -932,22 +932,15 @@ _WORKS: "weakref.WeakKeyDictionary[jax_core.Jaxpr, Work]" = weakref.WeakKeyDicti
 launch's lowering cache holds (`tuning.lowered_once`) answers with the body it traced once."""
 
 
-def _forms(kernel) -> Mapping | None:
-    """The special functions' forms a kernel equation's compile lowers them to: a Mosaic GPU kernel's
-    approximate forms where its compiler parameters ask `approx_math`, its accurate ones elsewhere; None for
-    another backend's (a Mosaic TPU or Triton kernel), counted by `operation_work`'s one rule."""
-    held = kernel.params["compiler_params"]
-    if isinstance(held, Mapping):
-        held = held.get("mosaic_gpu")
+def forms_of(compiler_params) -> Mapping | None:
+    """The special functions' forms a kernel compiled with `compiler_params` lowers them to (a kernel
+    equation's own, `launch_work`; a launch's family's, `Family.compiled_with`): a Mosaic GPU kernel's
+    approximate forms where they ask `approx_math`, its accurate ones elsewhere; None for another backend's (a
+    Mosaic TPU or Triton kernel), counted by `operation_work`'s one rule."""
+    held = compiler_params.get("mosaic_gpu") if isinstance(compiler_params, Mapping) else compiler_params
     if not isinstance(held, gpu_core.CompilerParams):
         return None
-    return special_forms(held.approx_math)
-
-
-def special_forms(approx_math: bool) -> Mapping:
-    """The special functions' forms a Mosaic GPU kernel compiled with or without `approx_math` lowers them
-    to: `APPROXIMATE_FORMS` or `ACCURATE_FORMS`."""
-    return APPROXIMATE_FORMS if approx_math else ACCURATE_FORMS
+    return APPROXIMATE_FORMS if held.approx_math else ACCURATE_FORMS
 
 
 def _body(kernel) -> jax_core.Jaxpr:

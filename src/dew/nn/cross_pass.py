@@ -28,7 +28,9 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .attention_residuals import DepthAttention
+from .attention_residuals import DepthAttention, depth_attended
+from .dense import watched_or_owned
+from .derivatives import portable_formed
 from .flops import projection_flops
 from .norms import unweighted_rmsnorm
 from .precision import at_least_fp32
@@ -108,18 +110,46 @@ class CrossPassMerge(nn.Module):
 
     def __call__(self, read: jax.Array, bank: jax.Array) -> jax.Array:
         """`read` `[B, S, D]` with `bank` `[B, S, blocks, D]` merged in, in `read`'s dtype."""
-        wide = at_least_fp32(read.dtype)
-        highest = jax.lax.Precision.HIGHEST
+        controller = (self.input_down, self.message_down, self.gain, self.forget,
+                      *((self.added,) if self.spec.additive else ()))
+        if watched_or_owned(self) or watched_or_owned(self.depth):
+            # A merge a quantization may own (a rule over its depth mixture's path among them) or a caller
+            # watches, it or its depth mixture, runs as it is.
+            return _merged(read, self.depth(bank.astype(at_least_fp32(read.dtype))), controller, self.spec,
+                           self.norm_eps)
+        # The read's and the bank's cotangents leave only with the merge's parameters' gradients formed,
+        # its fp32 states recomputed from its operands in the reverse mode (`portable_formed`): XLA otherwise
+        # puts the controller's low-rank products' and the depth query's gradients off to the step's end,
+        # holding those states live across layers and an exit-gated loop's unrolled passes (row 11713).
+        spec, eps, depth = self.spec, self.norm_eps, self.depth
 
-        def times(x, kernel):
-            return jnp.matmul(x, kernel.astype(wide), precision=highest)
+        def merged(read, bank, parameters):
+            scale, kernel, *controller = parameters
+            mixed = depth_attended(bank.astype(at_least_fp32(read.dtype)), scale, kernel,
+                                   norm_eps=depth.norm_eps, normalize_values=depth.normalize_values)
+            return _merged(read, mixed, controller, spec, eps)
+        return portable_formed(merged)(read, bank, (self.depth.scale, self.depth.kernel, *controller))
 
-        u = read.astype(wide)
-        message = unweighted_rmsnorm(self.depth(bank.astype(wide)), self.norm_eps, implementation='xla')
-        sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(self.norm_eps, wide))
-        state = times(u / sigma, self.input_down) + times(message, self.message_down)
-        sent = jnp.tanh(times(state, self.gain)) * message
-        if self.spec.additive:
-            sent = sent + jnp.tanh(times(state, self.added))
-        kept = (1 - jnp.tanh(times(state, self.forget))) * u
-        return (kept + (sigma * sent if self.spec.scale_by_input_rms else sent)).astype(read.dtype)
+
+def _merged(read: jax.Array, mixed: jax.Array, controller, spec: CrossPass, eps: float) -> jax.Array:
+    """`CrossPassMerge`'s merge of `read` `[B, S, D]` with the bank's depth mixture `mixed` `[B, S, D]` by
+    its `controller` (input and message down projections, gain, forget, and an additive's added), in
+    `read`'s dtype."""
+    input_down, message_down, gain, forget, *added = controller
+    wide = at_least_fp32(read.dtype)
+    highest = jax.lax.Precision.HIGHEST
+
+    def times(x, kernel):
+        return jnp.matmul(x, kernel.astype(wide), precision=highest)
+
+    u = read.astype(wide)
+    message = unweighted_rmsnorm(mixed, eps, implementation='xla')
+    sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(eps, wide))
+    state = times(u / sigma, input_down) + times(message, message_down)
+    sent = jnp.tanh(times(state, gain)) * message
+    if added:
+        sent = sent + jnp.tanh(times(state, added[0]))
+    kept = (1 - jnp.tanh(times(state, forget))) * u
+    return (kept + (sigma * sent if spec.scale_by_input_rms else sent)).astype(read.dtype)
+
+

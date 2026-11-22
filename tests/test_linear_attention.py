@@ -1034,13 +1034,18 @@ def test_the_decode_step_keeps_the_kernel_contract_on_a_mesh_for_each_decay(form
                           seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
 
 
+def fused_layer(heads, width, dtype) -> GatedDeltaNet:
+    """A gated delta net of `heads` value heads over half as many key heads, `width` wide, in `dtype`."""
+    return GatedDeltaNet(emb_features=64, num_k_heads=heads // 2, num_v_heads=heads, head_k_dim=width,
+                         head_v_dim=width, dtype=dtype)
+
+
 def fused_case(heads, width, rows, dtype, held, seed: int = 0):
-    """A gated delta net of `heads` value heads over half as many key heads, `width` wide, and its
-    cache after a 5-token prefill of `rows` rows in `dtype` with its recurrent state `held`, and the
-    next token: the layer's own conv, gates, update and gated norm unfused, and the decode token's
-    inputs as the fused step takes them (`fused_step`); the hidden states and the weights `seed`'s."""
-    layer = GatedDeltaNet(emb_features=64, num_k_heads=heads // 2, num_v_heads=heads, head_k_dim=width,
-                          head_v_dim=width, dtype=dtype)
+    """`fused_layer` and its cache after a 5-token prefill of `rows` rows in `dtype` with its recurrent
+    state `held`, and the next token: the layer's own conv, gates, update and gated norm unfused, and the
+    decode token's inputs as the fused step takes them (`fused_step`); the hidden states and the weights
+    `seed`'s."""
+    layer = fused_layer(heads, width, dtype)
     hidden = jax.random.normal(jax.random.key(7 + 2 * seed), (rows, 6, 64), jnp.float32).astype(dtype)
     variables = nn.unbox(layer.init(jax.random.key(8 + 2 * seed), hidden[:, :1]))
     variables = {**variables, "params": {**variables["params"], "A_log": jnp.linspace(-1.0, 1.0, heads),
@@ -1114,7 +1119,7 @@ def test_the_fused_decode_step_computes_the_layers_token(computed, held):
     token reads its output back in bf16, its projections' dtype, before the norm, as its unfused token
     does (row 6963). A GPU's widths are its flow's (tests/test_gpu_recurrence.py)."""
     heads, width, rows = 4, 128, 3
-    layer = fused_case(heads, width, rows, computed, held)[0]
+    layer = fused_layer(heads, width, computed)
     wide = layer.clone(dtype=jnp.float64)
     step = MixerCall(decode=True)
 
@@ -1151,8 +1156,7 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     step needs before the first token."""
     from dew.nn.kernels.generation import assumed, chosen
 
-    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=128, head_v_dim=128,
-                           dtype=jnp.bfloat16)
+    module = fused_layer(4, 128, jnp.bfloat16)
     x = jnp.zeros((2, 1, 64), jnp.bfloat16)
     unfused = jax.eval_shape(lambda: nn.unbox(module.init(jax.random.key(0), x, MixerCall(decode=True))))
     with assumed("sm80"), chosen(delta_decode="fused"):

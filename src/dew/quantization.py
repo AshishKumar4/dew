@@ -74,7 +74,7 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
-from dew.nn.dense import QUANTIZATION, _contractions, _linear_site
+from dew.nn.dense import QUANTIZATION, _contractions, _linear_site, packed_matrix
 from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
 from dew.nn.fake_quant import (
     E2M1_MAX,
@@ -371,11 +371,17 @@ class LinearProducts(nn.Module):
     and continuum level, MLA's absorbed projection and an in-context memory's heads read them."""
 
     def applied_kernel(self, name: str) -> jax.Array:
-        """The kernel the submodule `name` multiplies its input by on this call: its own. A method
+        """The kernel the submodule `name` multiplies its input by on this call: its own, a packed one's
+        values decoded where it holds one (`dew.nn.dense.packed_matrix`: each code times its block's scale
+        times the matrix's, `NvFp4.decoded` times its factor, held nowhere, row 11740). A method
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update, and a
         frozen FP8 site's is its codes decoded. `get_variable` hands back the box the kernel was drawn in
         (`nn.with_logical_partitioning`)."""
-        return meta.unbox(getattr(self, name).get_variable("params", "kernel"))
+        from dew.nn.kernels.formats import NvFp4
+
+        module = getattr(self, name)
+        kernel = packed_matrix(module, "kernel", lambda: module.get_variable("params", "kernel"))
+        return packed_values(kernel) if isinstance(kernel, NvFp4) else meta.unbox(kernel)
 
     def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
         """Whether this call computes the submodule `name`, or a module under it, other than as a linear
@@ -550,24 +556,56 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
 
 def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
     """The logical axes of each leaf of an expert bank's `matrix` (`dew.nn.dense.packed_matrix`), its own
-    `[experts, in, out]` being `axes`: one leaf, the matrix; a packed bank's four (`NvFp4`), its words and
-    block scales `[experts, out, in / 8 or in / 16]`, its tensor scales `[experts]` and its form's version
-    bytes, whole on every device, in its leaves' order."""
+    `[experts, in, out]` being `axes`: one leaf, the matrix; a packed bank's as its format lays them out
+    (`NvFp4.leaf_axes`)."""
     from dew.nn.kernels.formats import NvFp4
 
-    if not isinstance(matrix, NvFp4):
-        return [tuple(axes)]
-    experts, inputs, outputs = axes
-    return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,), (None,)]
+    return list(matrix.leaf_axes(axes).values()) if isinstance(matrix, NvFp4) else [tuple(axes)]
 
 
-def dense_leaf_axes(axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
-    """The logical axes of each leaf of a dense layer's packed kernel (`dew.nn.dense.packed_matrix`), its
-    own kernel's being `axes` (a Linear's `[in, out]`): its words' and block scales' `[out, in / 8 or
-    in / 16]`, its tensor scale a scalar and its form's version bytes whole on every device, in its leaves'
-    order."""
-    inputs, outputs = axes
-    return [(outputs, inputs), (outputs, inputs), (), (None,)]
+def packed_values(matrix: NvFp4) -> jax.Array:
+    """A packed matrix's values, float32 (`[..., depth, width]`): each code times its block's scale times the
+    matrix's (`NvFp4.decoded`, whose values owe `bits.NVFP4_OWED`, times its stored tensor scale), the exact
+    product rounded once, a subnormal among them and an overflow an infinity (`_product_rounded`). The one
+    decode of a packed matrix's values, a Linear's applied kernel's (`LinearProducts.applied_kernel`, row
+    11740's review) and an export's (`decoded_banks`)."""
+    from dew.algebra.bits import NVFP4_OWED
+
+    return _product_rounded(matrix.decoded(), jnp.asarray(matrix.scale, jnp.float32)[..., None, None],
+                            round(math.log2(NVFP4_OWED)))
+
+
+def _product_rounded(values: jax.Array, scale: jax.Array, owed: int) -> jax.Array:
+    """`values` (bfloat16) times `scale` (float32, broadcast against them) times `2^owed`, rounded once to
+    nearest even into float32: the exact product's significand (8 bits times 24, under 2^32) formed in
+    integer arithmetic on their fields and rounded once (`float_bits.rounded_float32`), however far below
+    the least normal, and past the largest finite an infinity of the product's sign; a non-finite operand's
+    product IEEE's, read off the operands' bits. A float32 multiply rounds a result below the least normal
+    twice where its operands' significands are wider than the result's (to 24 bits, then to the
+    subnormal's), or flushes it (XLA's CPU, row 4023): 1.5 times
+    0.25 times 2^-126 (1 + 7 2^-23) is 3145730.625 2^-149, `0x00300003` once rounded, `0x00300002` twice;
+    and the owed power applied to `scale` alone first overflows a finite product's factor (row 11740's
+    review)."""
+    from dew.nn.float_bits import raw_fields, rounded_float32
+
+    _, sign_v, biased_v, fraction_v = (field.astype(jnp.uint32) for field in raw_fields(values))
+    _, sign_f, biased_f, fraction_f = raw_fields(scale)
+    # Each a whole significand times a power of two, a subnormal's at the least normal's exponent: a
+    # bfloat16's of 8 bits, a float32's of 24.
+    lead = np.uint32(1 << 23)
+    whole_v = jnp.where(biased_v > 0, fraction_v | np.uint32(1 << 7), fraction_v)
+    whole_f = jnp.where(biased_f > 0, fraction_f | lead, fraction_f)
+    product = whole_v * whole_f
+    exponent = ((jnp.maximum(biased_v.astype(jnp.int32), 1) - 134)
+                + (jnp.maximum(biased_f.astype(jnp.int32), 1) - 150) + owed)
+    # A non-finite operand's product as IEEE's, classified on the operands' bits (row 11795): a NaN where
+    # either is one or an infinity meets a zero, else an infinity of the product's sign.
+    infinite_v, infinite_f = (biased_v == 0xFF) & (fraction_v == 0), (biased_f == 0xFF) & (fraction_f == 0)
+    zero_v, zero_f = (biased_v == 0) & (fraction_v == 0), (biased_f == 0) & (fraction_f == 0)
+    nan = (((biased_v == 0xFF) & ~infinite_v) | ((biased_f == 0xFF) & ~infinite_f)
+           | (infinite_v & zero_f) | (infinite_f & zero_v))
+    return rounded_float32((sign_v << np.uint32(16)) ^ sign_f, product, exponent,
+                           infinite=infinite_v | infinite_f, nan=nan)
 
 
 def decoded_banks(variables: Variables) -> Variables:
@@ -576,7 +614,7 @@ def decoded_banks(variables: Variables) -> Variables:
     before their experts), a Linear's kernel `[..., in, out]`, each value its
     code times its block's scale times its matrix's, exactly (`NvFp4.decoded` times its factor), the bank
     gone from `QUANTIZATION`: the float tree an export or a merge takes, as `decoded_frozen_fp8` decodes a
-    frozen FP8 site."""
+    frozen FP8 site, each bank's values `packed_values`', on the host's CPU."""
     from dew.nn.kernels.formats import NvFp4
 
     held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
@@ -584,10 +622,8 @@ def decoded_banks(variables: Variables) -> Variables:
     banks = {path: bank for path, bank in held.items() if isinstance(bank, NvFp4)}
     if not banks:
         return variables
-    # Multiplied on the host: an MXFP4 group under the 0x00 byte holds float32 subnormals, which XLA's CPU
-    # arithmetic flushes to zero.
-    dense = {path: np.asarray(bank.decoded(), np.float32)
-             * np.asarray(bank.factor, np.float32)[..., None, None] for path, bank in banks.items()}
+    with jax.default_device(jax.devices("cpu")[0]):
+        dense = {path: np.asarray(packed_values(bank)) for path, bank in banks.items()}
     rest = {path: leaf for path, leaf in held.items() if path not in banks}
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
     decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **dense})

@@ -32,7 +32,6 @@ from dew.batch import (
     merge,
     shifted_span,
     sown_calls,
-    sown_nodes,
     token_layout,
 )
 from dew.nn.moe import (
@@ -125,12 +124,9 @@ class ExpertBalance:
         coordinates column.
         """
         documents = token_layout(fields)[1]
-        # The routers a loss term reads, alone: the balance loss's those that record their scores beside their
-        # choice, the z-loss's those that record their log partition. A router that records its choice alone
-        # (a routing replay's record, Gemma 4's) is read by none, and stays a router no term balances.
-        balancing([*(path for path, _ in sown_nodes(routing, ROUTER_SCORES, ROUTER_INDICES)
-                     if self.aux_loss_alpha is not None),
-                   *(path for path, _ in sown_nodes(routing, ROUTER_LOG_Z) if self.router_z_loss)])
+        # The routers a loss term reads, alone, reported by the terms that read them (`_balance_loss`,
+        # `router_z_terms`): a router that records its choice alone (a routing replay's record, Gemma 4's) is
+        # read by none, and stays a router no term balances.
         statistics: Ratio | RoutedStatistics = prediction
         reported: dict[str, jax.Array | Pooled] = {}
         if self.aux_loss_alpha is not None:
@@ -173,6 +169,8 @@ class ExpertBalance:
         if not routers:
             raise ValueError("aux_loss_alpha requires a model with a mixture whose routers record their "
                              "scores")
+        balancing(path for path, _ in routers)
+        routers = [call for _, call in routers]
         documents = token_layout(fields)[1]
         laid = fields.get(COORDINATES_FIELD)
         max_segments = laid.max_segments if isinstance(laid, Coordinates) else None
@@ -363,8 +361,12 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax
     are `batch`'s rows' (`Objective.row_mean`).
     """
     terms = []
+    calls = sown_calls(routing, ROUTER_LOG_Z)
+    # A z-loss of a weight balances each router it reads (`dew.nn.moe.balancing`); one of none, none.
+    if weight:
+        balancing(path for path, _ in calls)
     # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
-    for _, (log_z,) in sown_calls(routing, ROUTER_LOG_Z):
+    for _, (log_z,) in calls:
         valid = _router_queries(log_z.shape, queries, documents)
         dtype = at_least_fp32(log_z.dtype)
         total = Objective.row_mean(jnp.where(valid, jnp.square(log_z.astype(dtype)), 0), batch).total
@@ -391,7 +393,9 @@ def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
     return RouterMoments(summed.total, counts, positions, indices.shape[-1])
 
 
-def router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
-    """Collect every router call's sown (scores, indices), in the tree's key order, a router's calls in the
-    order they ran (`sown_calls`)."""
-    return [(scores, indices) for _, (scores, indices) in sown_calls(routing, ROUTER_SCORES, ROUTER_INDICES)]
+def router_scores(routing: Variables) -> list[tuple[tuple, tuple[jax.Array, jax.Array]]]:
+    """Every router call that sowed its scores beside its choice, its path and its `(scores, indices)`, in
+    the tree's key order, a router's calls in the order they ran (`sown_calls`): the one selector of the
+    routers a loss over scores reads, a router recording its choice alone (a routing replay's record) none
+    of them (row 11808)."""
+    return sown_calls(routing, ROUTER_SCORES, ROUTER_INDICES)

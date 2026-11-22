@@ -77,7 +77,7 @@ from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations, is_protocol
 
 from dew import _records
-from dew._records import JSON, boolean, integer, json_value, real, strings_of, text
+from dew._records import JSON, boolean, class_record, integer, json_value, real, strings_of, text
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -832,17 +832,6 @@ def owned_built(record: JSON, *, called: bool, what: str) -> Configured:
                          f"trusts{called_so} (trust=, --trust)")
     with _reading(_records.record(record, what)):
         return _built(member, named[1], dtypes=False)
-
-
-def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
-                  ) -> tuple[str, Mapping[str, object]] | None:
-    """The class a class record, `{"class": ..., "fields": {...}}`, names and
-    its fields (a record with no fields may leave them out); None for a
-    mapping that is not one."""
-    name, fields = value.get("class"), value.get("fields", {})
-    if set(value) <= {"class", "fields"} and isinstance(name, str) and isinstance(fields, Mapping):
-        return name, fields
-    return None
 
 
 @dataclasses.dataclass

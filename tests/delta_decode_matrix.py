@@ -25,7 +25,7 @@ from flax import linen as nn
 from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import FEWEST_SEEDS, assert_as_exact
-from test_linear_attention import fused_case
+from test_linear_attention import fused_case, fused_layer
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
@@ -109,9 +109,8 @@ def _drawn_of(make):
 
 
 LAYERS = {
-    "gated delta net": Layer(lambda dtype=jnp.bfloat16: fused_case(4, 128, 3, dtype, jnp.float32)[0],
-                             _delta_net, "recurrent_state", (3, 4, 128, 128), holds_bf16=True, normed=True,
-                             groups=2),
+    "gated delta net": Layer(lambda dtype=jnp.bfloat16: fused_layer(4, 128, dtype), _delta_net,
+                             "recurrent_state", (3, 4, 128, 128), holds_bf16=True, normed=True, groups=2),
     "kimi delta attention": Layer(_kimi, _drawn_of(_kimi), "recurrent_state", (3, 2, 128, 128),
                                   holds_bf16=False, normed=True, groups=2),
     "mamba2": Layer(_mamba2, _drawn_of(_mamba2), "ssm_state", (3, 4, 128, 64), holds_bf16=False,

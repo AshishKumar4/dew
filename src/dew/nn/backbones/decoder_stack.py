@@ -36,6 +36,7 @@ from dew.nn.protocols import StagedStacks
 
 from .. import in_backward
 from ..cross_pass import CrossPass
+from ..derivatives import formed_together
 from ..host_memory import fetched, fetched_at, on_host
 from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
@@ -460,6 +461,12 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
     forward that keeps intermediates, through host-resident banks scans with
     the fetch mapped onto each row under remat (`run_stack`)."""
     for run, (first, count), remat in zip(runs, groups, remats, strict=True):
+        if prior_bank is not None and not decode:
+            # `x`'s cotangent leaves each run only with the bank's formed (`formed_together`): the bank's
+            # cotangent summed over the layers above in one accumulator before the layers below run, rather
+            # than every merge site's `[B, S, blocks, D]` one held live to the pass's end (row 11713); every
+            # run a pass's bank reaches is one of these, its message blocks' among them (row 11821).
+            x, prior_bank = formed_together(x, prior_bank)
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         periodic = isinstance(run, PipelineStage)
         store = kv_store if count == 1 or specs[first].kv_shared else None
@@ -469,13 +476,13 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 # The layer axis, split into repeats of the period, scans over the repeats.
                 inputs = jax.tree.map(functools.partial(_by_repeat, len(run.specs)), inputs)
 
-        def step(layer, carry, per_layer_input, store):
+        def step(layer, carry, per_layer_input, store, *, bank=prior_bank):
             # A provider writes its keys and values into the store it is given; inside a lifted
             # transform the writes come back explicitly, as `DecoderBlock.__call__`'s remat returns
             # them, so no tracer of the transform leaks through the dict.
             written = None if store is None else dict(store)
             # A looped pass's bank (`dew.nn.cross_pass`), which every layer of the run reads alike.
-            banked = {} if prior_bank is None else {'prior_bank': prior_bank}
+            banked = {} if bank is None else {'prior_bank': bank}
             out = layer(carry, train=train, decode=decode, kv_store=written,
                         per_layer_input=per_layer_input, attention_metadata=attention_metadata, **banked)
             changes = {} if written is None or store is None else {
