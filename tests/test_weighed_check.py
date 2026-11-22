@@ -439,6 +439,22 @@ def test_a_torch_powers_scale_covers_the_power_at_its_converted_exponent(format,
     assert np.all(erred <= scale)
 
 
+def test_a_torch_powers_move_near_float64s_largest_is_a_finite_distance():
+    """A narrowed exponent's power near float64's largest moves its result by the two powers' distance, a
+    float64 itself (the review of 3606, F1): a bfloat16 3 * 2^62 to the 16 - 1/32, its exponent taken as 16,
+    is 2^1015.4 where its kernel's is 2^1017.4, and the minimum of it and 1 its program takes is weighed
+    finitely where the distance divided by u overflowed, a move past every float to the minimum's -inf."""
+    torch = pytest.importorskip("torch")
+    from _dew_torch.rounding import rounding_scale as torch_scale
+
+    narrow = torch.tensor([3 * 2.0 ** 62], dtype=torch.bfloat16)
+    wide, exponent, one = narrow.to(torch.float64), 16 - 1 / 32, torch.ones(1, dtype=torch.float64)
+    value, scale = torch_scale(lambda: torch.minimum(torch.pow(wide, exponent), one), 2.0 ** -8)
+    erred = np.abs(torch.minimum(torch.pow(narrow, exponent), one.to(narrow.dtype)).to(torch.float64).numpy()
+                   - value)
+    assert np.all(erred <= scale)
+
+
 @pytest.mark.parametrize("power", [-1, -2, -3, 2, 5])
 def test_an_integer_powers_scale_covers_its_chain_and_a_negative_ones_reciprocal(power):
     """`lax.integer_pow` lowers to its chain of multiplications, and a negative power to the reciprocal of
