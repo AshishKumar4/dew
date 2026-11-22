@@ -367,14 +367,18 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         x = model.stack(x, span=(end, layers), train=train, decode=decode, **inputs)
     if loop.exit_threshold is None or model.is_mutable_collection(EXITS):
         return x
-    # Each token's exit pass, 1-based, written where a caller opens `EXIT_PASSES` (a write nothing reads
-    # otherwise): the choice its state is taken by, the last pass where no earlier one exits it (one pass
-    # of a loop exits every token there).
-    chosen = jnp.ones(x.shape[:2], jnp.int32)
+    return _handed_on(model, exited, x, loop.exit_threshold)
+
+
+def _handed_on(model, exited, last, threshold: float) -> jax.Array:
+    """The state a loop under an exit threshold hands on (`_exited`), each token's exit pass, 1-based,
+    written where a caller opens `EXIT_PASSES` (a write nothing reads otherwise): the choice its state is
+    taken by, the last pass where no earlier one exits it, so one pass of a loop exits every token there."""
+    chosen = jnp.ones(last.shape[:2], jnp.int32)
     if exited:
-        x, chosen = _exited(exited, x, loop.exit_threshold)
+        last, chosen = _exited(exited, last, threshold)
     model.sow(EXIT_PASSES, 'chosen', chosen)
-    return x
+    return last
 
 
 def _sown_exit(model, leaving):
