@@ -381,6 +381,34 @@ def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
     lowered_for(_inline_decode(FORMS[name]()), (words,), generation).compile()
 
 
+def test_a_kernel_inlining_a_forms_decode_counts_the_forms_work():
+    """A kernel that inlines a form's decode (`inline_forms.registers`, a body its emission count cannot read)
+    counts the form's work over its words (`BitForm.work`, row 5386: the decode's issues in the one cost
+    vocabulary, `templates.cost.Work`), its ALU's issues integer operations and its FMA pipe's operations,
+    where the count refused the body as unpriced; traced alone, nothing compiled or run."""
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    from dew.nn import programs
+    from dew.nn.kernels.templates import emission, inline_forms
+    from dew.nn.kernels.templates.cost import Stated
+
+    form, shape = bits.NVFP4_BFLOAT16_FORM, (64, 16)
+
+    def body(words_ref, out_ref):
+        words = plgpu.layout_cast(words_ref[...], plgpu.Layout.WGMMA)
+        out_ref[...] = inline_forms.registers(form, words, plgpu.Layout.WGMMA)[0]
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(shape, jnp.uint32), num_threads=1,
+                          thread_name="wg")
+    traced = jax.make_jaxpr(launch)(jnp.zeros(shape, jnp.uint32)).jaxpr
+    (kernel,) = [equation for equation in programs.equations(traced)
+                 if equation.primitive.name in ("mpmd_map", "pallas_call")]
+    counted = emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
+    stated = form.work(shape[0] * shape[1])
+    assert (counted.integer_operations, counted.operations) == (stated.integer_operations, stated.operations)
+    assert stated.integer_operations > 0
+
+
 MINIFLOATS = {"e4m3": (bits.E4M3, ml_dtypes.float8_e4m3fn), "e5m2": (bits.E5M2, ml_dtypes.float8_e5m2),
               "e2m1": (bits.E2M1, ml_dtypes.float4_e2m1fn)}
 """Each encode's minifloat and ml_dtypes' type of it, the reference's."""
