@@ -144,36 +144,41 @@ largest, `M`, its orthogonal `1.5 2^104 - M` formed over the scaled row (an unsc
 to -inf there, the review of 36155cc41)."""
 
 
+def _apg_guided(conditional, unconditional, scale):
+    """APG at eta 0 with no clipping guiding `conditional` against `unconditional` at `scale`, one step's
+    clean prediction: a module's function over values alone, which a statement holds, so a GPU tier part's
+    prepare compiles it (a closure over the guidance's process held an object no statement holds)."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
+                               {"prediction": unconditional})
+    walk = APG(scale, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
+    x = jnp.zeros_like(conditional)
+    # At alpha=0 and sigma=1 DirectPredictionTransform's clean prediction is the raw one.
+    return walk.step(x, jnp.ones(1), 0, walk.init(x))[0][0]
+
+
 def apg_holds_its_projection_at_its_ranges_edges():
     """APG at eta 0 with no clipping over each of `APG_EDGES` (a conditional, an unconditional and a scale)
     guides as Diffusers' float64 projection of the float32 direction does, its orthogonal component rounded
     to float32 then scaled and added in float32, bit for bit, on every device: the lane of `2^-7` beside
     `2^120` `+2^-7`, where a CPU flushed its scaled 2^-128 and guided `-2^-7` and a GPU kept it (row 9710),
     and every lane of the second finite. Compiled as one program (`ahead_arm`), a GPU numerics cell too
-    (tests/test_gpu_numerics.py)."""
+    (tests/test_gpu_numerics.py), every edge's run before any is judged, so a GPU tier part's prepare,
+    whose arms give zeros, prepares each (the first edge's judgment ended it, the second unprepared)."""
     from reference_error import ahead_arm
 
-    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
-
-    def guided(conditional, unconditional, scale):
-        denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
-                                   {"prediction": unconditional})
-        walk = APG(scale, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
-        x = jnp.zeros_like(conditional)
-        # At alpha=0 and sigma=1 DirectPredictionTransform's clean prediction is the raw one.
-        return walk.step(x, jnp.ones(1), 0, walk.init(x))[0][0]
-
-    for name, (conditional, unconditional, scale) in APG_EDGES.items():
-        conditional, unconditional = (np.asarray([value], np.float32)
-                                      for value in (conditional, unconditional))
-        found = np.asarray(ahead_arm(jax.jit(functools.partial(guided, scale=scale)), f"APG at {name}")(
-            conditional, unconditional))
+    edges = {name: (*(np.asarray([value], np.float32) for value in (conditional, unconditional)), scale)
+             for name, (conditional, unconditional, scale) in APG_EDGES.items()}
+    found = {name: np.asarray(ahead_arm(jax.jit(functools.partial(_apg_guided, scale=scale)),
+                                        f"APG at {name}")(conditional, unconditional))
+             for name, (conditional, unconditional, scale) in edges.items()}
+    for name, (conditional, unconditional, scale) in edges.items():
         direction = (conditional - unconditional).astype(np.float64)
         along = conditional.astype(np.float64)
         orthogonal = (direction - (direction @ along.T) / (along @ along.T) * along).astype(np.float32)
         expected = unconditional + np.float32(scale) * orthogonal
         assert np.all(np.isfinite(expected)), name
-        np.testing.assert_array_equal(found.view(np.uint32), expected.view(np.uint32), err_msg=name)
+        np.testing.assert_array_equal(found[name].view(np.uint32), expected.view(np.uint32), err_msg=name)
 
 
 def test_apg_holds_its_projection_at_its_ranges_edges():

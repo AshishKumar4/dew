@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_terms, kept
+from attention_oracle import attention_terms, kept, traced_attention_terms
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
@@ -32,6 +32,7 @@ from test_attention_template import (
     SEEDS,
     SOFTCAP,
     STARTS,
+    arguments,
     block_groups,
     case_keep,
     cross_documents,
@@ -807,13 +808,16 @@ def an_fp16_call_on_an_h100_is_on_par(case):
 
 
 def _terms(case: dict):
-    """The float64 terms of `case`'s output and gradients, its sinks' among them (`attention_terms`), over
-    the keys it keeps (its spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw
-    `(query, key, value, sinks, dout)`."""
-    keep = case_keep(case)[:, None]
+    """The float64 terms of `case`'s output and gradients, its sinks' among them (`traced_attention_terms`),
+    over the keys it keeps (its spans as a JAX mask), under its sinks and softcap, a traceable function of a
+    draw `(query, key, value, sinks, dout)` for GPU prepare."""
+    queries, keys = geometry(case)
 
     def terms(query, key, value, sinks, dout):
-        found = attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap"))
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
+        keep = template.dense(spans)[:, None]
+        found = traced_attention_terms(query, key, value, dout, keep, sinks=sinks,
+                                       softcap=case.get("softcap"))
         # The sinks' gradient, which a call without sinks holds as None.
         return (*found, None) if sinks is None else tuple(found)
 

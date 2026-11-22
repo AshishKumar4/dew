@@ -338,3 +338,81 @@ def test_a_readout_refuses_what_it_cannot_read():
         LabelReadout(32, GROUPED).validate_rows(rows)
     with pytest.raises(ValueError):
         SlotReadout(32, (66, 67, 68)).validate_rows(rows)
+
+
+def _exit_passes(gates: np.ndarray, threshold: float) -> np.ndarray:
+    """Each token's 1-based exit pass from every pass's exit-gate logit `[P, B, L]` under `threshold`, as
+    Ouro's forward chooses it: the first pass whose cumulative exit probability reaches it, the last where
+    none before it does."""
+    hazard = 1 / (1 + np.exp(-gates[:-1].astype(np.float64)))
+    kept = np.cumprod(np.concatenate([np.ones_like(hazard[:1]), 1 - hazard[:-1]]), axis=0)
+    reached = np.cumsum(hazard * kept, axis=0) >= threshold
+    return np.where(reached.any(axis=0), reached.argmax(axis=0) + 1, len(gates))
+
+
+@pytest.mark.parametrize("head", ["labels", "slots"])
+def test_a_served_looped_readout_reports_the_pass_each_answer_cue_exited_at(head):
+    """A readout of labels over a looped backbone served under an exit threshold reports each answer's
+    1-based exit pass at its cue (`exit_pass`, row 11714): the pass Ouro's rule chooses from the gate's
+    logits there, read apart from the forward (`pass_logits`), different cues exiting at different passes;
+    a loop of one pass reports 1. A strict server, a backbone with no threshold and a slot head, whose
+    answers read their options' lines too, report none."""
+    bodies = [{"state": " ".join(np.random.default_rng([0x1714, seed]).choice(
+        ["one", "two", "three", "four", "five", "six"], 6)),
+        "questions": {"team": {"type": "choice", "instructions": QUESTION.instructions,
+                               "criteria": {option: option for option in QUESTION.options}}}}
+        for seed in range(6)]
+    readout = {"labels": LabelReadout(32, ids()),
+               "slots": SlotReadout(32, tuple(label for (label,) in ids()), head_dim=8)}[head]
+    from dew.decision import Question
+
+    looped = backbone().with_passes(3, (0, 2), exit_gate=True)
+    objective = DecisionObjective(looped, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  head=readout)
+    drawn = objective.init(jax.random.key(0))
+
+    def gate_moved(path, leaf):
+        # A gate drawn off its zeros, so the cues' exit chances differ.
+        if "early_exit_gate" not in jax.tree_util.keystr(path):
+            return leaf
+        return leaf + 2.0 * jax.random.normal(jax.random.key(len(str(path))), leaf.shape, leaf.dtype)
+
+    variables = {**drawn, "params": jax.tree_util.tree_map_with_path(gate_moved, drawn["params"])}
+    # Each body laid out as its server lays it out (`Question.from_wire`, the layout's rows).
+    batch = DecisionInputs.collate(
+        [LAYOUT.rows(TOKENIZER, SPECIALS, body["state"], {name: Question.from_wire(wire)
+                                                         for name, wire in body["questions"].items()})[0]
+         for body in bodies], SPECIALS.pad)
+    _, gates, _ = objective.model.pass_logits(variables, batch)
+    cues = np.stack([np.take_along_axis(np.asarray(gate)[..., 0], np.asarray(batch.readout), axis=1)[:, 0]
+                     for gate in gates])
+    first = 1 / (1 + np.exp(-cues[0].astype(np.float64)))
+    threshold = float(np.median(first))
+    expected = _exit_passes(cues, threshold)
+
+    def served(backbone_, **fields):
+        """`bodies`' responses from a task over `backbone_`, as its server answers them (`systemone`)."""
+        from dew.decision.task import Decide
+
+        task = Decide(DecisionModel(backbone_, readout), variables, LAYOUT, TOKENIZER, SPECIALS)
+        return task.systemone(bodies, **fields)
+
+    def without_exits(responses):
+        def bare(answer):
+            return {key: value for key, value in answer.items() if key != "exit_pass"}
+        return [{**response, "answers": {name: bare(answer) for name, answer in response["answers"].items()}}
+                for response in responses]
+
+    gated = looped.with_passes(exit_threshold=threshold)
+    reporting = served(gated)
+    if head == "slots":
+        assert all("exit_pass" not in response["answers"]["team"] for response in reporting)
+        return
+    assert [response["answers"]["team"]["exit_pass"] for response in reporting] == expected.tolist()
+    assert len(set(expected.tolist())) > 1
+    once = served(looped.with_passes(1, exit_threshold=threshold))
+    assert [response["answers"]["team"]["exit_pass"] for response in once] == [1] * len(bodies)
+    # Strict Jev and a loop with no threshold: the same responses but for the field, which neither holds.
+    for response in (*served(gated, strict=True), *served(looped)):
+        assert "exit_pass" not in response["answers"]["team"]
+    assert served(gated, strict=True) == without_exits(reporting)

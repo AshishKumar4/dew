@@ -406,13 +406,15 @@ def test_a_window_reads_invalid_where_any_of_its_steps_went_non_finite_not_only_
 def test_a_benchmarks_rows_reach_a_tracker_after_its_cases_one_step_a_case(tmp_path):
     """`--tracked` logs each case's row, its numbers by its architecture, into a tracker once every case is
     measured, one step a case in order: an operational run's MFU and step time where a training run's land
-    (row 285); a row's text and flags are no metric."""
+    (row 285); a row's text and flags are no metric, and a row whose steps went non-finite is logged not at
+    all (row 11745)."""
     from dew.training.tracker import LocalTracker
 
     step = load("benchmark_step")
     rows = [{"architecture": "simple_dit", "ms_per_step": 12.5, "mfu": 0.31, "device_kind": "cpu",
-             "fixed_batch": False},
-            {"architecture": "unet", "ms_per_step": 30.0, "mfu": None, "devices": 1}]
+             "fixed_batch": False, "finite": True},
+            {"architecture": "unet", "ms_per_step": 30.0, "mfu": None, "devices": 1, "finite": True},
+            {"architecture": "dit", "ms_per_step": 8.0, "mfu": 0.5, "finite": False}]
     step.tracked(rows, LocalTracker(tmp_path))
     assert LocalTracker(tmp_path).scalars() == [
         (0, {"simple_dit/ms_per_step": 12.5, "simple_dit/mfu": 0.31}),

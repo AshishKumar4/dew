@@ -1048,9 +1048,11 @@ class CausalTransformer(LinearProducts):
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
                  attention_key_valid=None,
                  right_padded: bool = False, coordinates: Coordinates | None = None,
-                 conditioning: Mapping[str, jax.Array] | None = None, progress: Progress | None = None):
+                 conditioning: Mapping[str, jax.Array] | None = None, progress: Progress | None = None,
+                 routed_experts=None, routed=None):
         # The call's token layout, converted once (`token_coordinates`): the trunk and the
-        # prediction depths read its coordinates alone.
+        # prediction depths read its coordinates alone. A routing replay (`routed_experts`, `routed`) as
+        # `hidden_and_mtp_inputs` reads it.
         coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
                                         valid=attention_mask, positions=positions, right_padded=right_padded)
         x, prediction = self.hidden_and_mtp_inputs(
@@ -1059,7 +1061,7 @@ class CausalTransformer(LinearProducts):
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
             attention_key_runs=attention_key_runs, attention_key_valid=attention_key_valid,
             coordinates=coordinates, conditioning=conditioning,
-            progress=progress)
+            progress=progress, routed_experts=routed_experts, routed=routed)
         if self.is_initializing() and self.dspark is not None:
             decoder_drafts.reach(self, tokens, x.dtype)
         if self.is_initializing() and self.mtp:

@@ -229,7 +229,7 @@ def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs
         depth, left_issuer.lhs_fragment_depth(depth, swizzle=lhs.swizzle), retained=lhs.retained)
     right_depth = right_issuer.operand_live_depth(
         depth, right_issuer.rhs_fragment_depth(depth, transposed=rhs.transposed, swizzle=rhs.swizzle),
-        retained=rhs.retained)
+        retained=rhs.retained, transposed=rhs.transposed)
     fragments = ([(rows * family.lhs_copies, left_depth, lhs.dtype)] * lhs.parts
                  + [(right_depth, columns * family.rhs_copies, rhs.dtype)] * rhs.parts)
     # A value staged into shared memory dies before its product loads the fragments back.

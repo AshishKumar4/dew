@@ -57,24 +57,26 @@ def drawn_on_the_host[S, R](inputs_of: Callable[[S], R], seed: S, *, held: bool 
     nothing there (a draw or a weight load made there left its cell unprepared, rows 8074, 8635, 10552). The
     arrays, committed to no device, then go where the run reads them; with `held`, fetched to the host as
     NumPy's (`jax.device_get`), as a matrix a cell's every program closes over or a flow's prepare pickles
-    is held (row 10831: its inline copies)."""
-    with jax.default_device(jax.devices("cpu")[0]):
+    is held (row 10831: its inline copies). Drawn in the host's context (`ahead_on_the_host`) wherever the
+    test runs: the host's CPU and its own kernels."""
+    with ahead_on_the_host(wherever=True):
         made = inputs_of(seed)
     return jax.device_get(made) if held else made
 
 
 @contextlib.contextmanager
-def ahead_on_the_host() -> Iterator[None]:
+def ahead_on_the_host(*, wherever: bool = False) -> Iterator[None]:
     """Where a GPU tier part's prepare runs a test (`tier_wire.preparing`), whose default device is a
     compile-only GPU that computes nothing, the host's CPU as its default device and the host's own kernels
     (no GPU `generation.assumed`) while held; elsewhere the test's own: the context of what a cell computes
     before its first check-1 site (a load, an export, a behavioral decode), so its prepare reaches its
-    sites, where `drawn_on_the_host` draws on the host wherever the test runs (rows 11424-11619)."""
+    sites (rows 11424-11619). With `wherever`, the host's whatever runs the test: a draw's
+    (`drawn_on_the_host`), the gate's one host context (row 11678)."""
     import tier_wire
 
     from dew.nn.kernels import generation
 
-    if not tier_wire.preparing():
+    if not wherever and not tier_wire.preparing():
         yield
         return
     with jax.default_device(jax.devices("cpu")[0]), generation.assumed(None):

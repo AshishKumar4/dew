@@ -21,27 +21,15 @@ def _merged(outputs, totals, anchors):
     return means.merged_output(outputs, totals, anchors, windows.Units(), 0)
 
 
-_SHARING = {
-    "its first orders and its gradient's derivatives": ("first orders", "grad of grad", "jvp of grad"),
-    "its second forward derivative and its staged orders": ("second jvp", "second orders, staged")}
-CELLS = {**_SHARING, "its other orders": tuple(name for name in ORDER_SETS
-                                               if all(name not in names for names in _SHARING.values()))}
-"""The contract's order sets (`contract_support.ORDER_SETS`, the one partition of its orders) in three cells:
-the first orders beside the gradient's two derivatives, which share its programs; the second forward
-derivative beside the staged orders; and every other (the scanned one, and any set added), so no order goes
-untaken (row 10676: a second hand partition of the orders). A cell of the first orders, the nested and the
-scanned took 205 s, past the group's bound, and the six sets a cell each compiled their shared programs six
-times over, 640 s in all (rows 9806, 10132, 10685)."""
-
-
-@pytest.mark.parametrize("taken", CELLS)
+@pytest.mark.parametrize("taken", ORDER_SETS)
 def test_the_convex_mean_holds_every_order(taken):
     """The merge of finished states (`means.merged_output`, its derivative the law's own over scaled values,
     `dew.algebra.scaled`'s `applied` and `_split` within it): every order, forward and reverse, under a nested
     jit and a scan, in the outputs, the totals and the anchors, finite wherever its own float64 run is a
     normal float32 and the plain mean is, its outputs and totals at each edge (`EDGES`): the law runs in
-    float64 too, its construct of its operands' format. The order sets `taken` names (`CELLS`), at every
-    edge, each order's programs compiled once a cell (`contract_support._mesh_program`)."""
+    float64 too, its construct of its operands' format. The order set `taken` (`ORDER_SETS`), at every edge,
+    each order's programs compiled once a cell (`contract_support._mesh_program`): a cell an order set, where
+    sets sharing a cell took 246 to 264 s (row 11720)."""
     outputs, totals, anchors = normal_draw(6096, (3, 4, 8), (3, 4), (3, 4))
     along = normal_draw(6097, (3, 4, 8), (3, 4), (3, 4))
     (cotangent,) = normal_draw(6098, (4, 8))
@@ -49,7 +37,7 @@ def test_the_convex_mean_holds_every_order(taken):
         primals = (outputs * scale, (jnp.abs(totals) + 0.25) * scale, anchors)
         direction = (along[0] * scale, along[1] * scale, along[2])
         assert_contract(_merged, primals, direction, cotangent, f"the convex mean {edge}", plain_fn=_plain,
-                        taking=tuple(order for named in CELLS[taken] for order in ORDER_SETS[named]))
+                        taking=ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

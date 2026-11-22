@@ -21,7 +21,7 @@ import types
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, TypedDict, Unpack
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack
 
 import jax
 import numpy as np
@@ -101,8 +101,26 @@ class JitArguments(TypedDict, total=False):
 
 _log = logging.getLogger("dew.kernels")
 
-_PROGRAMS: weakref.WeakSet[OuterProgram] = weakref.WeakSet()
-"""Every program alive (`OuterProgram`), whose executables `release` drops."""
+class Releasing(Protocol):
+    """What keeps compiled programs alive for the process, or lowerings whose live modules key JAX's
+    loaded executables of them: a program (`OuterProgram`) or a cache of lowerings (a trainer's kept traced
+    steps, `dew.training._candidates`), which `release` asks to let them go."""
+
+    def released(self) -> None: ...
+
+
+_HOLDERS: weakref.WeakSet[Releasing] = weakref.WeakSet()
+"""Every holder alive (`held_until_release`), whose executables and lowerings `release` drops."""
+_HOLDERS_LOCK = threading.Lock()
+"""Held as a holder is added and as `release` takes its snapshot of them: a set walked as another thread adds
+to it raises (row 8411's review)."""
+
+
+def held_until_release(holder: Releasing) -> None:
+    """Register `holder` for `release`, held weakly: a program as it is made, a cache as it first keeps a
+    lowering."""
+    with _HOLDERS_LOCK:
+        _HOLDERS.add(holder)
 
 type Taken = Mapping[str, Callable[[], jax.stages.Compiled]]
 """Executables compiled ahead or kept by another process (`dew.training.ahead`), each loaded on demand, by
@@ -512,12 +530,16 @@ _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_p
 
 def release() -> None:
     """Drop every live program's compiled executables (`OuterProgram.released`) and the process's held ones
-    (`held`), as `jax.clear_caches` drops jit's own: XLA:CPU maps each executable's code into the process,
-    and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache JAX
-    clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
+    (`held`), as `jax.clear_caches` drops jit's own, and what else keeps a lowering whose live module keys
+    JAX's loaded executable of it (`held_until_release`): XLA:CPU maps each executable's code into the
+    process, and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache
+    JAX clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
     compiles again at its next call."""
-    for program in list(_PROGRAMS):
-        program.released()
+    # A snapshot taken under the lock, each holder asked outside it: none waits on the set with its own lock.
+    with _HOLDERS_LOCK:
+        holders = list(_HOLDERS)
+    for holder in holders:
+        holder.released()
     unhold()
 
 
@@ -602,7 +624,7 @@ class OuterProgram:
         self._shaped: collections.OrderedDict[Hashable, tuple[jax.stages.Compiled, str | None]] = (
             collections.OrderedDict())
         self._compiling = threading.Lock()
-        _PROGRAMS.add(self)
+        held_until_release(self)
 
     def released(self) -> None:
         """Drop every executable it keeps (`release`), each compiled again at its next call."""

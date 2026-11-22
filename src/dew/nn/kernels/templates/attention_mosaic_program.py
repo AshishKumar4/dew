@@ -2136,6 +2136,11 @@ class ForwardRegisters:
     prologue: tuple | None = None
     """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
     parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
+    prescaled: bool = False
+    """Whether the plain launch applies non-unit query `prescale` in-kernel."""
+    rewalk_prescaled: bool = False
+    """Whether the natural rewalk applies non-unit query `prescale` in-kernel."""
+
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
         """A consumer's registers at `tiles` on `family`: its walk's over the values' columns its launch
@@ -2145,8 +2150,14 @@ class ForwardRegisters:
         if not family.budgets_registers:
             return None
         width = _width(self.width, family, self.dtype)
-        before = (0 if self.prologue is None
-                  else prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue))
+        in_kernel_prescale = self.prescaled or (tiles.natural_form and self.rewalk_prescaled)
+        if self.prologue is not None:
+            before = prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue)
+        elif (in_kernel_prescale and self.parts == 1 and jnp.dtype(self.dtype).itemsize == 2
+              and family.fixes_up and not family.places_on_role and query_swizzle(family) is None):
+            before = resources.live_registers(family, [], [(tiles.block_q, width, self.dtype)])
+        else:
+            before = 0
         if peaks:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
         value_width = value_columns(_width(self.value_width, family, self.dtype), columns or tiles.columns)
@@ -2218,49 +2229,13 @@ STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total",
 """Stream priority for per-query statistics (`STATISTICS`): `peak`, `total`, and `delta` first so
 the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
 
-@functools.cache
-def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool) -> int:
-    """Peak live 2D score-tile arrays in the traced attention algebra step (`jax.make_jaxpr`, row 10965)."""
-    from dew.nn.kernels.templates import attention_backward_algebra as bwd_algebra
 
-    tile = (8, 8)
-    s_in, row = jax.ShapeDtypeStruct(tile, jnp.float32), jax.ShapeDtypeStruct((tile[0],), jnp.float32)
-    q_pos = jax.ShapeDtypeStruct((tile[0], 1), jnp.int32)
-    k_pos = jax.ShapeDtypeStruct((1, tile[1]), jnp.int32)
-    spec = algebra.Forward("causal", 64, ids=False, scale=1.0 / 8.0, natural=natural_form, headroom=scaled)
-    if backward:
-        def backward_step(s, dp, peak, total, anchor, delta, q, k):
-            seen = algebra.seen(spec, algebra.Coords(q, k), s)
-            exps, weights, ds = bwd_algebra.softmax_cotangents(s, dp, peak, total, anchor, delta, seen=seen)
-            return algebra.value_weights(exps, weights, jnp.bfloat16), ds.astype(jnp.bfloat16)
-        jaxpr = jax.make_jaxpr(backward_step)(s_in, s_in, row, row, row, row, q_pos, k_pos).jaxpr
-    else:
-        def forward_step(s, m, l_val, q, k):
-            mod = algebra.modify(spec, s, algebra.Coords(q, k), (), masked=True)
-            new_m, alpha = algebra.peak(spec, m, mod)
-            w = algebra.weights(spec, mod, new_m)
-            if scaled:
-                exp = jnp.ones((tile[0],), jnp.int32)
-                held = algebra.Scaled(exp, exp, lambda shift: algebra.weights(spec, mod, new_m - shift))
-                return (*algebra.at_scale(w, held), new_m, alpha)
-            return w.astype(jnp.bfloat16), algebra.total(l_val, alpha, w), new_m
-        jaxpr = jax.make_jaxpr(forward_step)(s_in, row, row, q_pos, k_pos).jaxpr
-    def is_tile(v):
-        return not isinstance(v, jax_core.Literal) and getattr(v.aval, "shape", None) == tile
-    last_use = {v: pos for pos, eqn in enumerate(jaxpr.eqns) for v in eqn.invars if is_tile(v)}
-    last_use.update({v: len(jaxpr.eqns) for v in jaxpr.outvars if is_tile(v)})
-    live = {v for v in jaxpr.invars if is_tile(v)}
-    peak = len(live)
-    for pos, eqn in enumerate(jaxpr.eqns):
-        live.update(v for v in eqn.outvars if is_tile(v))
-        peak = max(peak, len(live))
-        live = {v for v in live if last_use.get(v, -1) > pos}
-    return peak
-def step_live_tiles(block_q: int, block_k: int, *, backward: bool = False, natural_form: bool = False,
-                    scaled: bool = False) -> tuple:
-    """Live `(block_q, block_k)` fp32 score tiles in TPU VMEM derived from the traced step (row 10965)."""
-    count = _traced_step_tile_count(backward=backward, natural_form=natural_form, scaled=scaled)
-    return (((block_q, block_k), jnp.float32),) * count
+def streamed_statistics_order(count: int | None = None, *, anchored: bool = True) -> tuple[str, ...]:
+    """The first `count` (or all) per-query statistics streamed in priority order, excluding `chosen` when
+    `not anchored` (row 11710)."""
+    names = (STATISTICS_STREAM_ORDER if anchored
+             else tuple(name for name in STATISTICS_STREAM_ORDER if name != "chosen"))
+    return names if count is None else names[:count]
 
 
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
