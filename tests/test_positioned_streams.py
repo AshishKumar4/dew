@@ -7,6 +7,7 @@ import itertools
 import json
 
 import numpy as np
+import pytest
 
 from dew.data import Files
 from dew.data.compile import compile
@@ -99,3 +100,84 @@ def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_s
     again = values()
     assert first == again == [(index, index) for index in range(12)]
     assert count == 12 and len(numbered) == count
+
+
+def _numbered(log: str, index, row):
+    """`row` with the index a positioned stream numbered it by, the index written to `log`: what a worker
+    process numbered, which its parent reads."""
+    with open(log, "a") as written:
+        written.write(f"{int(index)}\n")
+    return {**row, "at": np.int64(index)}
+
+
+def test_a_positioned_fill_by_two_shares_of_two_workers_is_replayed_by_one_reader(tmp_path):
+    """An indexed JSONL store of a few rows read by a stream that numbers its rows before its cache: two
+    shares of two worker processes each fill its cache, every row numbered, and one reader in the process
+    then reads it back from the published generation, numbering none again: every topology reads the same
+    fixed shards (row 11637: one shard cut by the readers' count named parts no other topology's fill
+    found)."""
+    import functools
+
+    from dew.data.cache import Cache
+    from dew.data.compile import compile, iterate
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(12)))
+    files = Files(str(path))
+    files.provision()
+    cache = Cache(str(tmp_path / "cache"))
+    log = tmp_path / "numbered"
+    log.touch()
+    chain = Pipeline(files).map_with_index(functools.partial(_numbered, str(log)), identity="numbered@1")
+    data = compile(chain.cache(cache).batch(2), read="streamed", loading=Loading(workers=2, threads=1,
+                                                                                 read_buffer=1))
+    filled = []
+    for index in range(2):
+        reader = data.train(DataPartition(index=index, count=2))
+        try:
+            filled += [(int(at), int(id_)) for batch in (next(reader) for _ in range(6))
+                       for at, id_ in zip(batch["at"], batch["id"], strict=True)]
+        finally:
+            reader.close()
+    numbered = log.read_text().split()
+    alone = iterate(chain.cache(cache), read="streamed", loading=Loading(workers=0))
+    replayed = sorted((int(row["at"]), int(row["id"])) for row in alone)
+    assert sorted(filled) == replayed == [(index, index) for index in range(12)]
+    assert set(map(int, numbered)) == set(range(12)) and log.read_text().split() == numbered
+
+
+def test_a_positioned_stream_of_fewer_records_than_its_readers_is_refused(tmp_path):
+    """A positioned stream over a store of three records read by two shares of two workers is refused before
+    it reads, as any store of fewer shards than its readers is: each share steps in lockstep with the
+    others, which a share with no records cannot."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(3)))
+    files = Files(str(path))
+    files.provision()
+    chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)},
+                                           identity="numbered@1").batch(1)
+    data = compile(chain, read="streamed", loading=Loading(workers=2, threads=1, read_buffer=1))
+    with pytest.raises(ValueError):
+        next(data.train(DataPartition(index=0, count=2)))
+
+
+@pytest.mark.parametrize("records", [3, 64, 65, 200])
+def test_a_positioned_streams_store_is_cut_into_as_many_shards_as_its_records_allow(tmp_path, records):
+    """A positioned stream's store of a few hundred bytes is cut into one shard a record, or, past 64
+    records, into 64 shards at the least, each of whole records in order: so many readers read it at once
+    (row 11637's review: 65 records were cut into 33 shards of two, short of 34 readers)."""
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(records)))
+    files = Files(str(path))
+    files.provision()
+    shards = files.positioned_manifest().shards
+    assert len(shards) >= min(records, 64), len(shards)
+    assert [(shard.start, shard.stop) for shard in shards] == [
+        (start, min(start + shards[0].rows, records)) for start in range(0, records, shards[0].rows)]
+

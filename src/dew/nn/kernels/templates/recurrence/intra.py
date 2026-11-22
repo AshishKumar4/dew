@@ -89,10 +89,11 @@ def _intra_solve(system, taken, call: Call):
 
 
 @building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_prefix_halves"))
-def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
+def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool, halves=None):
     """`(Aqk [R, HV * C], A [R, HV * C] where the call `solves`, hi, lo [R, HV * Dk])` of each chunk and value
     head under a decay a key dimension: the decay's prefix halves (`call.gates`, `algebra.prefix`'s pair)
-    from the laid decay `g` `[R, HV * Dk]` fp32, which every later launch reads (`_prefix_halves`), then the
+    from the laid decay `g` `[R, HV * Dk]` fp32, which every later launch reads (`_prefix_halves`; `halves`
+    where given, a training forward's kept for its backward, `chunk_forward.kept_forward`), then the
     scores as `call.held` and the keys' system where it `solves` (`systems`' form, the write-gated keys'
     pairs, strict), which `_intra_solve` inverts, in one walk sharing every factor (`_sub_chunk_walk`): each
     pair of sub-chunks' decay factored (`algebra.key_block_pairs`), their products on the tensor cores
@@ -100,7 +101,7 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     products = ("scores", "system") if solves else ("scores",)
     # The decay's prefix halves a launch of their own on the call's bundle (fla_kda's chunk_local_cumsum), the
     # walk of the pairs reading them on the sub-chunk's (`_sub_chunk_walk`).
-    hi, lo = _prefix_halves(g, taken, call)
+    hi, lo = _prefix_halves(g, taken, call) if halves is None else halves
     return (*_sub_chunk_walk(q, k, hi, lo, beta, taken, sub_chunked(call), scale=scale, products=products),
             hi, lo)
 
