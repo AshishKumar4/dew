@@ -248,7 +248,7 @@ def _loglinear_parts(shape: Shape, given: dict) -> tuple:
         # Scaled by one, as fla's kernel is unscaled.
         return (log_linear.log_linear_attention(q, k, v, g, scales, scale=1.0),)
 
-    return inputs, template, {}, {}, (given['do'],)
+    return inputs, template, {}, {}, (given['do'].astype(jnp.bfloat16),)
 
 
 def _lightning_parts(shape: Shape, given: dict) -> tuple:
@@ -264,7 +264,7 @@ def _lightning_parts(shape: Shape, given: dict) -> tuple:
     def template(q, k, v, g):
         return chunk(LIGHTNING, Chunk(q, k, v, log_decay=g), chunk_size=shape.chunk)
 
-    return inputs, template, {}, {}, (given['do'], given['dfinal'])
+    return inputs, template, {}, {}, (given['do'].astype(jnp.bfloat16), given['dfinal'])
 
 
 def _gated_parts(shape: Shape, given: dict) -> tuple:
@@ -286,12 +286,15 @@ def _gated_parts(shape: Shape, given: dict) -> tuple:
     def hand(q, k, v, g, beta):
         return fla_rule(q, k, v, g, beta, scale=shape.key_width ** -0.5)
 
-    return inputs, template, {'hand': hand}, {}, (given['do'], given['dfinal'])
+    return inputs, template, {'hand': hand}, {}, (given['do'].astype(jnp.bfloat16), given['dfinal'])
 
 
 def forward_backward(fn):
     """`fn`'s forward and backward of `cotangents`, which are an argument: `program` keeps each function it
-    compiled, and a closure over them would keep every shape's until the sweep ended."""
+    compiled, and a closure over them would keep every shape's until the sweep ended. The builders give the
+    output's cotangent in the output's bf16 as the torch arms take theirs, outside the timed call: given in
+    fp32, its cast was a launch of every timed call (100 of Kimi delta attention's training's 1723 MB of XLA
+    traffic on an A100, row 5260), which no torch arm paid."""
     import jax
 
     def run(cotangents, *args):
