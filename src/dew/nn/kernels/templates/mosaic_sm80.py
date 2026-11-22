@@ -296,9 +296,15 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
         # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`), one
         # instruction's at the narrowest swizzle (a stream staged so by `streams`' `swizzles`: D64's K in
-        # QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, census80). An ordinary one slices
-        # its rows' 8-row tiles.
-        return self._staged_depth(depth, swizzle) if transposed else self.fragment_depth(depth)
+        # QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, census80), each instruction's slice
+        # dying as its product issues: live the tile less the slice its first product consumes, an ordinary
+        # one's lookahead at a 32-deep step (a transposed matrix's input gradient held as its forward is at
+        # 32 deep and 24-40 registers past it at 64, FS-5634-DX-sm80/-sm86). An ordinary one slices its rows'
+        # 8-row tiles.
+        instruction = self.fragment_depth(depth)
+        if not transposed:
+            return instruction
+        return max(instruction, self._staged_depth(depth, swizzle) - instruction)
 
     def lhs_fragment_depth(self, depth: int, *, swizzle: int | None = None) -> int:
         # A whole tile of the swizzle its stage takes: one instruction's depth where it is staged plain or
