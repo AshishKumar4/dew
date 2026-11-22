@@ -1482,8 +1482,10 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         step_s = pricing.step_seconds(tile_mw, small_sm80, (2, 2))
         assert step_s is not None
         traffic = tail_mod.Traffic((5, 2), 2, 64 * 32 * 2, 64 * 32 * 2, step_s, 4, 120e9, 64 * 1024)
-        # Without persistent drift, tail.balanced accepts the 2-tile tail; with drift, dense_tail refuses it.
-        assert tail_mod.balanced(10, 4, 4, traffic) is not None
+        # Unscoped, tail.balanced accepts the 2-tile tail; scoped (mma.sync's walk launched persistent), the
+        # whole waves' drift refuses it, as dense_tail does.
+        assert tail_mod.balanced(10, 4, 4, traffic, handoff_steps=0.0, scoped=False, partial_bytes=0)
+        assert tail_mod.balanced(10, 4, 4, traffic, handoff_steps=0.0, scoped=True, partial_bytes=0) is None
         assert pricing.dense_tail(tile_mw, jnp.bfloat16, (320, 128, 128), (2, 2), small_sm80, 4) is None
         assert_as_exact(native, jax.jit(plain), draw, "sm80 multi-wave nonzero-tail dense dX", seeds=SEEDS,
                         truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
