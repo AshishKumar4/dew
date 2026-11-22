@@ -98,7 +98,7 @@ ONCE_ATEN = frozenset({"add", "add_", "sub", "sub_", "mul", "mul_", "div", "div_
 ULPS_ATEN = {"exp": "exp", "log": "log", "log1p": "log1p", "expm1": "expm1", "sigmoid": "logistic",
              "tanh": "tanh", "erf": "erf", "rsqrt": "rsqrt"}
 """Each elementary aten operation by the name of its bound in `ULPS`."""
-POWER_ATEN = {0: 0, 1: 0, 2: 1, -1: 1, 3: 2, -2: 2}
+POWER_ATEN: dict[float, int] = {0: 0, 1: 0, 2: 1, -1: 1, 3: 2, -2: 2}
 """The roundings of torch's CPU power at the scalar exponents its kernel computes otherwise than by a library
 power (aten/src/ATen/native/cpu/PowKernel.cpp: `x**0` and `x**1` made and copied, `x * x`, `1 / x`,
 `x * x * x`, `1 / (x * x)`); at any other exponent, and a tensor's, a library power within one ulp (SLEEF's
@@ -151,8 +151,9 @@ def _tapped():
             if isinstance(computed, (tuple, list)):
                 if name == "convolution_backward":
                     weights = _convolution_backward_weights(func, args, kwargs)
-                    return type(computed)(part if part is None else self.tapped(part, self.unit * weight)
-                                        for part, weight in zip(computed, weights, strict=True))
+                    return type(computed)(part if part is None or weight is None
+                                          else self.tapped(part, self.unit * weight)
+                                          for part, weight in zip(computed, weights, strict=True))
                 # Several results of one operation: no other rule weighs them apart.
                 if any(isinstance(part, torch.Tensor) and part.is_floating_point() for part in computed):
                     raise ValueError(f"the rounding scale has no rule for aten.{name}'s several results: "
