@@ -9,7 +9,7 @@ import dataclasses
 import logging
 from collections.abc import Mapping
 
-import jax.numpy as jnp
+import jax
 import numpy as np
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -102,7 +102,7 @@ def bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables
         if dense is None:
             continue
         names = [member.name for member in dataclasses.fields(bank)]
-        leaves = dense_leaf_axes(dense) if jnp.ndim(bank.scale) == 0 else expert_leaf_axes(bank, dense)
+        leaves = dense_leaf_axes(dense) if len(bank.scale.shape) == 0 else expert_leaf_axes(bank, dense)
         for name, axes in zip(names, leaves, strict=True):
             held[(QUANTIZATION, *path, name)] = axes
     return held
@@ -133,8 +133,11 @@ def packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, obje
             packed = _mxfp4_bank(tensors, name)
         else:
             parts = quantization.as_nvfp4(tensors, name)
+            # A load that reads no values holds the bank's shapes (`jax.eval_shape`), as it holds a weight's.
+            packing = (NvFp4.of if all(isinstance(part, np.ndarray) for part in parts or ())
+                       else lambda *parts: jax.eval_shape(NvFp4.of, *parts))
             packed = ("its codec reads it as no NVFP4" if parts is None else
-                      _staged(parts[0].shape[0]) or (NvFp4.of(*parts), tuple(reversed(parts[0].shape))))
+                      _staged(parts[0].shape[0]) or (packing(*parts), tuple(reversed(parts[0].shape))))
         if isinstance(packed, str):
             _log.warning("packed_weights: %s stays dense: %s", name, packed)
             continue
@@ -149,7 +152,7 @@ def _kernel_of(layout: WeightLayout, bank: NvFp4) -> bool:
     """Whether `layout` binds a Linear's kernel `[in, out]` from the source's `[out, in]` weight `bank`
     packs, transposed whole (a layer whose kernel holds more axes, a DenseGeneral's heads, reads no packed
     matrix)."""
-    depth, width = 8 * np.shape(bank.words)[-1], np.shape(bank.words)[-2]
+    depth, width = 8 * bank.words.shape[-1], bank.words.shape[-2]
     return (layout.transpose == (1, 0) and tuple(layout.shape) == (width, depth)
             and layout.paths[0][-1] == "kernel")
 
@@ -196,7 +199,7 @@ def with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: M
     bound = {layout.name: layout for layout in layouts}
     for name, bank in banks.items():
         layout = bound.get(name)
-        dense = jnp.ndim(bank.scale) == 0
+        dense = len(bank.scale.shape) == 0
         if layout is None or len(layout.paths) != 1 or layout.paths[0][0] != "params" or (
                 layout.concatenate is not None or layout.expert_index is not None or layout.padded
                 or layout.chunks) or (

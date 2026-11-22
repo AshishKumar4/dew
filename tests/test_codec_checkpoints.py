@@ -116,11 +116,15 @@ E2M1_VALUES = np.asarray([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3,
 PACKED_MLP = ("gate_proj", "up_proj", "down_proj")
 """The Linears `_w4a16_qwen3` stores as ModelOpt W4A16_NVFP4."""
 
+PACKED_ATTENTION = ("q_proj", "k_proj", "v_proj", "o_proj")
+"""The attention's Linears `_w4a16_qwen3` stores as W4A16_NVFP4 too where asked, beside their biases."""
 
-def _w4a16_qwen3(directory: Path) -> Path:
+
+def _w4a16_qwen3(directory: Path, attention: bool = False) -> Path:
     """A one-layer Qwen3 whose MLP's Linears ModelOpt stores as W4A16_NVFP4 (`quant_algo`, the layers whose
     scales are stored): U8 pairs of drawn codes, drawn E4M3 block scales and a float32 global scale, each
-    depth one NVFP4 stage (256, `formats.NVFP4_STAGE`); its attention, norms and tied embedding bf16."""
+    depth one NVFP4 stage (256, `formats.NVFP4_STAGE`); its attention bf16, or with `attention` W4A16 too
+    and biased (`attention_bias`, Qwen2's), its norms and tied embedding bf16."""
     import ml_dtypes
     from safetensors.numpy import save_file
 
@@ -141,9 +145,15 @@ def _w4a16_qwen3(directory: Path) -> Path:
                layer + "self_attn.k_proj.weight": dense(kv * head, width),
                layer + "self_attn.v_proj.weight": dense(kv * head, width),
                layer + "self_attn.o_proj.weight": dense(width, heads * head)}
-    shapes = ((inner, width), (inner, width), (width, inner))
-    for name, (outputs, inputs) in zip(PACKED_MLP, shapes, strict=True):
-        stem = f"{layer}mlp.{name}.weight"
+    packed = {f"mlp.{name}": shape for name, shape in zip(
+        PACKED_MLP, ((inner, width), (inner, width), (width, inner)), strict=True)}
+    if attention:
+        packed |= {f"self_attn.{name}": tensors[f"{layer}self_attn.{name}.weight"].shape
+                   for name in PACKED_ATTENTION}
+        tensors |= {f"{layer}self_attn.{name}.bias": dense(packed[f"self_attn.{name}"][0])
+                    for name in PACKED_ATTENTION}
+    for name, (outputs, inputs) in packed.items():
+        stem = f"{layer}{name}.weight"
         tensors[stem] = rng.integers(0, 256, (outputs, inputs // 2)).astype(np.uint8)
         scales = rng.uniform(0.25, 4, (outputs, inputs // 16))
         tensors[stem + "_scale"] = scales.astype(ml_dtypes.float8_e4m3fn)
@@ -152,7 +162,7 @@ def _w4a16_qwen3(directory: Path) -> Path:
               "intermediate_size": inner, "num_hidden_layers": 1, "num_attention_heads": heads,
               "num_key_value_heads": kv, "head_dim": head, "hidden_act": "silu", "vocab_size": 96,
               "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "tie_word_embeddings": True,
-              "attention_bias": False, "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+              "attention_bias": attention, "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
               "layer_types": ["full_attention"], "dtype": "bfloat16",
               "quantization_config": {"quant_method": "modelopt", "quant_algo": "W4A16_NVFP4",
                                       "producer": {"name": "modelopt", "version": "0.47.0"}}}
@@ -215,4 +225,26 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
         parts = (stem, stem + "_scale", stem + "_scale_2")
         assert_same_stored_tensors({part: np.asarray(exported[part]) for part in parts},
                                    {part: stored[part] for part in parts})
+
+
+def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refuses_an_adapter(tmp_path):
+    """A ModelOpt W4A16 source with its biased attention packed too (Qwen2's `attention_bias`, row 8550's
+    review): its load without values (`weights=False`, a resume's) holds the tree a load of its values holds,
+    every packed kernel's leaves at their shapes and dtypes; served, its attention's projections pack into
+    no group (each member's kernel is packed, its bias a parameter), its logits finite; and an adapter over
+    a packed kernel is refused by name."""
+    from dew.lora import LoRA
+    from dew.nn.projections import projection_groups
+
+    source = _w4a16_qwen3(tmp_path / "source", attention=True)
+    packed, shaped = (Pretrained.load(source, dtype="bfloat16", attention_impl="reference",
+                                      packed_weights=True, weights=read) for read in (True, False))
+    assert jax.tree.structure(shaped.variables) == jax.tree.structure(packed.variables)
+    for held, shape in zip(jax.tree.leaves(packed.variables), jax.tree.leaves(shaped.variables), strict=True):
+        assert (np.shape(held), np.dtype(held.dtype)) == (tuple(shape.shape), np.dtype(shape.dtype))
+    assert projection_groups(packed.model, packed.variables) == ()
+    ids = jnp.asarray(np.random.default_rng(3).integers(0, 96, (2, 8)), jnp.int32)
+    assert np.isfinite(np.asarray(packed.model.apply(packed.variables, ids), np.float32)).all()
+    with pytest.raises(ValueError, match="packed"):
+        packed.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
 
