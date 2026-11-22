@@ -609,11 +609,10 @@ def _reverse(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, call: C
     chunk leaves as `call.memories`, the corrected values' gradient in `_reverse_values`' form (their own
     output's, `local`, `_local_back`'s, and the memory's, `algebra.reverse_carried`) and each row's initial
     memory's gradient, fp32, each sequence's chunks from its last over a value block, the states launch's
-    (`tiles.block_v`; fla's dhu). `q`, `k`, `w`, `do`, `local` and `v` are laid as the forward's, `beta`
-    `[HV, R]`, and `prefix` the decay's (`chunk_forward._Run`'s); `dht` `[B * HV * Dk, Dv]` fp32 each row's
-    final memory's gradient. A program walks `tiles.walkers` value blocks of its sequence and head, one a
-    consumer role, as the states launch does.
-    Without the delta rule `w` is None and the memory's gradient takes no `w^T dv`
+    (`tiles.block_v`; fla's dhu). `q`, `k`, `w`, `do`, `local` and `v` are laid as the forward's, `beta` `[HV,
+    R]` and `prefix` the decay's; `dht` `[B * HV * Dk, Dv]` fp32 each row's final memory's gradient. A program
+    walks `tiles.walkers` value blocks of its sequence and head, one a consumer role, as the states launch
+    does. Without the delta rule `w` is None and the memory's gradient takes no `w^T dv`
     (`algebra.reverse_carried`); nothing was corrected but the values gated, `u = v beta`, and where `v` and
     `beta` are given the walk gates them: `dv` is the values' own, `du beta`, and a fourth output `[Dv / BV,
     HV, R]` fp32 each value block's part of beta's, `sum(v du)` over its columns, from the tile the walk holds
@@ -621,10 +620,10 @@ def _reverse(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, call: C
     `[HV]` fp32 there, `dv` takes `D do` too and a fifth output the skip's, `sum(v do)`, as that kernel forms
     `dD`. Under a decay a key dimension `memory` is the memories each chunk enters (`call.memories`), and a
     fourth output `[Dv / BV, chunks * HV * Dk]` fp32 each value block's part of the memory decay's gradient
-    `sum(h dh)` (`algebra.key_memory_decay`) from the memory's gradient the walk holds, its key rows a
-    tile's (kda-lower5-sm90 at 6e03eb57e: where the keys' columns met them, no layout held). A forked call's
-    `table` returns its slots' gradients (`Returning`): the gradient of the memory each chunk takes up, an
-    output after the rest (`table_returned`'s first; its stored slots' sums no caller reads)."""
+    `sum(h dh)` (`algebra.key_memory_decay`) from the memory's gradient the walk holds, its key rows a tile's
+    (kda-lower5-sm90 at 6e03eb57e: where the keys' columns met them, no layout held). A forked call's `table`
+    returns its slots' gradients (`Returning`): the gradient of the memory each chunk takes up, an output
+    after the rest (`table_returned`'s first; its stored slots' sums no caller reads)."""
     gates, skips = v is not None, skip is not None
     chunk, width, value_width, family = call.chunk, call.width, call.value_width, call.family
     grads = _reverse_values(call, gates=gates)
@@ -715,16 +714,23 @@ def _reverse(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, call: C
                                         lambda role: walked + role * bv, bv, row,
                                         lambda role: roled(role)[1]["table"]))
 
-    # The keys take the place of weights without the delta rule, and the keys and the prefix that of values
-    # a walk gates none of: operands no step reads.
-    inputs = (q, k, k if w is None else w, do, local, *prefix, dht, sequences)
+    operands, walks = _reverse_operands(q, k, w, do, local, prefix, dht, sequences, v, beta, skip, memory,
+                                        table)
     launched = _reverse_launched(program, call, tiles, batch, sequences.shape[0], gates=gates, skips=skips,
-                                 table=table, walks=len(inputs) - 1)(
-        *inputs, k if v is None else v, prefix[0] if beta is None else beta,
-        *(() if skip is None else (skip.astype(jnp.float32),)), *(() if memory is None else (memory,)),
-        *(() if table is None else table.returning))
+                                 table=table, walks=walks)(*operands)
     # A forked call's stored slots' gathered gradients the walk alone reads.
     return launched[:-1] if returns == 2 else launched
+
+
+def _reverse_operands(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, skip, memory,
+                      table: Table | None) -> tuple[tuple, int]:
+    """`_reverse`'s launch's operands in order, and the index among them of its walks' table (`sequences`,
+    `sequence_live`'s). The keys take the place of weights without the delta rule, and the keys and the
+    prefix that of values a walk gates none of: operands no step reads."""
+    walked = (q, k, k if w is None else w, do, local, *prefix, dht, sequences)
+    return (*walked, k if v is None else v, prefix[0] if beta is None else beta,
+            *(() if skip is None else (skip.astype(jnp.float32),)), *(() if memory is None else (memory,)),
+            *(() if table is None else table.returning)), len(walked) - 1
 
 
 def _reverse_carried(call: Call, slots, grad: list, out: Parts, columns, issue: Issuer, prefix: tuple, h,

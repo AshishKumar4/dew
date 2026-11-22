@@ -168,7 +168,7 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
     return pair
 
 
-def raised(whole, part=0.0):
+def raised(whole, part: jax.Array | float = 0.0):
     """`exp2(whole + part)` of a compensated base-2 exponent (`part` zero where it is one fp32: a decay a key
     dimension's rounded prefix, `intra._prefix`) to fp32's resolution at any size: its integer
     `n = floor(whole)` an exact power of two (`precision.power2`) and its
@@ -227,7 +227,7 @@ PAIR_CEILING = 120.0
 which every caller masks) stay finite."""
 
 
-def separated(hi, lo=0.0):
+def separated(hi, lo: jax.Array | float = 0.0):
     """A compensated base-2 exponent `(hi, lo)` as its whole part and fraction `(n, f)`: `n` the integer
     `floor(hi)` (`hi` itself past 2^23, where every fp32 is one), `f` what `hi` holds past it and `lo` (zero
     where the exponent is one fp32, a decay a key dimension's rounded prefix), the form whose differences are
