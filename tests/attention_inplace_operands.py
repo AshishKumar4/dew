@@ -19,8 +19,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_matrix import operands, terms_of
-from attention_oracle import kept
+from attention_matrix import operands
+from attention_oracle import kept, traced_attention_terms
 from reference_error import assert_as_exact
 from test_attention_mosaic import ON_HOPPER
 
@@ -56,17 +56,14 @@ def _route(causal: bool, implementation: AttentionImpl = "template"):
     return step
 
 
-def _terms(keep, heads: int = HEADS):
-    """The gradients' float64 terms (`terms_of`, without the output's) over the keys each query keeps: a
-    causal query that keeps few keys has a dQ that cancels toward zero in float64, held to its terms'
-    rounding, not to its own size."""
-    terms = terms_of(keep, heads)
+def _terms(keep, *, output: bool = False):
+    """The float64 terms (`traced_attention_terms`) over the keys each query keeps: traceable under
+    `jax.make_jaxpr` during GPU prepare, returning `(out, dq, dk, dv)` when `output` else `(dq, dk, dv)`."""
+    def terms(query, key, value, dout):
+        found = traced_attention_terms(query, key, value, dout, jnp.asarray(keep)[None, None])
+        return tuple(found) if output else tuple(found[1:])
 
-    def gradients(*drawn):
-        return terms(*drawn)[1:]
-
-    return gradients
-
+    return terms
 
 @ON_HOPPER
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
@@ -167,4 +164,4 @@ def a_span_calls_one_launch_is_on_par_on_an_h100(name: str) -> None:
 
     assert_as_exact(jax.jit(ours), jax.jit(_spanned(width, "reference")[0]),
                     operands(width, HEADS, 2, jnp.bfloat16),
-                    f"span call one launch {name}", seeds=SEEDS, terms=terms_of(keep, HEADS))
+                    f"span call one launch {name}", seeds=SEEDS, terms=_terms(keep, output=True))

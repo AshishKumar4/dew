@@ -26,7 +26,7 @@ from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from jax.sharding import Mesh
 from kernel_compile import compile_mosaic_kernels, mosaic_failures
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import (
     BACKWARD_SEEDS,
@@ -543,7 +543,7 @@ def _gradient_terms(spans: template.KeySpans | Callable[[], template.KeySpans],
             return (*found[1:4], *hooks)
         assert traced_terms is not None, "a hooked call's parameters' terms trace its reference"
         with jax.enable_x64(new_val=True):
-            _, traced = traced_terms(*widened((query, key, value, dout, *hooks)))
+            _, traced = traced_terms(query, key, value, dout, *hooks)
         return (*found[1:4], *traced[3:])
 
     return terms

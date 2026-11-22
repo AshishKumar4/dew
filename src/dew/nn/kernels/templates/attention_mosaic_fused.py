@@ -36,6 +36,7 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _dq_added,
     _parts_dq,
     _rescaled_parts,
+    _splits_scores,
     _tile_scores,
 )
 
@@ -190,9 +191,22 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
         return _sixteen_step(walk, k_smem, staged, add_dq, slots, carry, accumulators, q_first, _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
             masked=masked, whole_operands=True))
+    cotangents_staged = staged.at[1]
+    if masked is not None and not walk.scaled and _splits_scores(walk):
+        _, part = _tile_scores(
+            walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
+            masked=masked,
+            on_weights=lambda narrowed: family.staged(narrowed, staged.at[0]),
+            after_weights=lambda: family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot))
+        family.staged(part, cotangents_staged)
+        dq = family.product(
+            cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]),
+            then=lambda: family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot),
+            pending=1)
+        add_dq(q_first, dq)
+        return carry, (dk_acc, dv_acc)
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
                                   whole(index), shape, masked=masked)
-    cotangents_staged = staged.at[1]
     # Stage P and dS under one proxy fence so narrowed and part free before products (`dq_and_dkv`).
     with family.staged_together():
         family.staged(narrowed, staged.at[0])

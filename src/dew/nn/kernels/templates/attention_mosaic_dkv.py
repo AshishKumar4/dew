@@ -201,10 +201,12 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
                 walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
             return _score_weights(walk, coords, (), s, rows[0], rows[1], masked=masked)
 
-        scored_weights, dp = family.product_pair(
+        (exponentials, weights, slopes, seen), dp = family.product_pair(
             k_smem, logits_slot.transpose((1, 0)), v_smem, do_slot.transpose((1, 0)), shape, between=between)
-        narrowed, logits, pieces = _weighed(walk, coords, (), scored_weights, dp, rows, dtypes,
-                                            one_part=fused, masked=masked, split=True)
+        cotangents = _score_cotangents(coords, weights, dp, rows[2], rows[3], seen)
+        narrowed, logits, pieces = _weighed(
+            walk, coords, (), None, None, rows, dtypes, one_part=fused, masked=masked,
+            scored=(exponentials, weights, cotangents, slopes, seen))
     else:
         s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
                                     v_smem, do_slot.transpose((1, 0)), shape)
@@ -411,21 +413,17 @@ class _PlacedDq:
 
 
 def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,
-             one_part: bool, masked: bool = True, split: bool = False) -> tuple:
+             one_part: bool, masked: bool = True, scored: tuple | None = None) -> tuple:
     """A keys-first tile's: its weights narrowed for dV in the output cotangents' dtype
     (`algebra.value_weights`, the dropped ones, `algebra.drawn`; the dQ program's sums take them
     undropped), its pulled score cotangents and its hook's pieces (`gradient.pulled`), from its products `s`
-    (or `_score_weights`' tuple when `split=True`) and `dp` under its queries' statistics `rows`, its
-    coordinates and its hook's parameters (`_scores`); the cotangents the fast form's one part in the
-    queries' dtype where the launch takes it from the registers (`one_part`, the fused launch's), narrowed as
-    they are formed."""
+    and `dp` under its queries' statistics `rows`, its coordinates and its hook's parameters (`_scores`, or
+    an already-formed `_scores` 5-tuple `scored`); the cotangents the fast form's one part in the queries'
+    dtype where the launch takes it from the registers (`one_part`, the fused launch's), narrowed as they are
+    formed."""
     values, queries = dtypes
-    if split:
-        exponentials, weights, slopes, seen = s
-        cotangents = _score_cotangents(coords, weights, dp, rows[2], rows[3], seen)
-    else:
-        exponentials, weights, cotangents, slopes, seen = _scores(
-            walk, coords, params, s, dp, *rows, masked=masked)
+    exponentials, weights, cotangents, slopes, seen = (
+        _scores(walk, coords, params, s, dp, *rows, masked=masked) if scored is None else scored)
     logits, pieces = gradient.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
     if one_part:
         parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)

@@ -2136,6 +2136,11 @@ class ForwardRegisters:
     prologue: tuple | None = None
     """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
     parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
+    prescaled: bool = False
+    """Whether the plain launch applies non-unit query `prescale` in-kernel."""
+    rewalk_prescaled: bool = False
+    """Whether the natural rewalk applies non-unit query `prescale` in-kernel."""
+
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
         """A consumer's registers at `tiles` on `family`: its walk's over the values' columns its launch
@@ -2145,10 +2150,11 @@ class ForwardRegisters:
         if not family.budgets_registers:
             return None
         width = _width(self.width, family, self.dtype)
+        in_kernel_prescale = self.prescaled or (tiles.natural_form and self.rewalk_prescaled)
         if self.prologue is not None:
             before = prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue)
-        elif (self.parts == 1 and jnp.dtype(self.dtype).itemsize == 2 and family.fixes_up
-              and not family.places_on_role and query_swizzle(family) is None):
+        elif (in_kernel_prescale and self.parts == 1 and jnp.dtype(self.dtype).itemsize == 2
+              and family.fixes_up and not family.places_on_role and query_swizzle(family) is None):
             before = resources.live_registers(family, [], [(tiles.block_q, width, self.dtype)])
         else:
             before = 0

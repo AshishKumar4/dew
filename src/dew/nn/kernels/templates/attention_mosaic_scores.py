@@ -4,6 +4,7 @@ forward's statistics (`_scores`)."""
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -154,22 +155,28 @@ def _read(value):
 
 def _splits_scores(walk: _Backward) -> bool:
     """Whether a backward tile's scores split into `_score_weights` (inside `product_pair`'s `between`) and
-    `_score_cotangents` (rows 11707, 11715): undropped fast-form walks without score-hook parameters."""
-    return not walk.accurate and not walk.dropped and not walk.kinds
+    `_score_cotangents` (rows 11707, 11715): undropped fast-form walks without score-hook parameters on
+    overlapping shared-memory issuers (keeping synchronous issuers on `_scores`)."""
+    family = walk.program.family
+    return (family.products_overlap and not family.operands_in_registers and not walk.interpret
+            and not walk.accurate and not walk.dropped and not walk.kinds)
 
 
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                  coords: algebra.Coords | functools.partial[algebra.Coords], whole,
-                 shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
+                 shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False,
+                 on_weights: Callable[[jax.Array], None] | None = None,
+                 after_weights: Callable[[], None] | None = None
                  ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
     (`_fused_step`'s, `_coop_step`'s): its `S` and `dP` products (issued through `product_pair`, overlapping
     `_score_weights` with `dP` where `_splits_scores` and `masked is not None`), masked where `masked`, or
-    where it is None chosen at run time, unmasked where every query sees the tile `whole`. Returns its
-    weights narrowed for dV (`algebra.value_weights`), a dropping call's dropped (`algebra.drawn`), and its
-    score cotangents through the hook (`gradient.pulled`), one part in the operands' dtype (dK's and dQ's);
-    with `whole_operands` (fp16's, `algebra.running_parts`), both fp32: the normalized weights, dropped, and
-    the scaled cotangents."""
+    where it is None chosen at run time, unmasked where every query sees the tile `whole`. When `on_weights`
+    and `after_weights` are supplied on an overlapped step, stages narrowed `P` during `dP` and issues `dV`
+    before computing `dS`. Returns its weights narrowed for dV (`algebra.value_weights`), a dropping call's
+    dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`), one part in
+    the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`), both fp32:
+    the normalized weights, dropped, and the scaled cotangents."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
@@ -179,10 +186,15 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     tile_coords = _read(coords)
     if not walk.scaled and masked is not None and _splits_scores(walk):
         def between(s):
-            return _score_weights(walk, tile_coords, (), s, rows[0], rows[1], masked=masked)
+            exps, w, sl, sn = _score_weights(walk, tile_coords, (), s, rows[0], rows[1], masked=masked)
+            if on_weights is not None and not whole_operands:
+                on_weights(algebra.value_weights(exps, w, do_slot.dtype, walk.dropped))
+            return exps, w, sl, sn
 
         (exponentials, weights, slopes, seen), dp = family.product_pair(
             q_slot, held, do_slot, values_t, shape, between=between)
+        if after_weights is not None and not whole_operands:
+            after_weights()
         cotangents = _score_cotangents(tile_coords, weights, dp, rows[2], rows[3], seen)
         cotangents = gradient.pulled(cotangents, slopes, seen, ())[0]
     else:
@@ -362,7 +374,8 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool,
     spec = algebra.Forward("causal", 64, ids=False, scale=1.0 / 8.0, natural=natural_form, headroom=scaled)
     if backward:
         anchor_tile = jax.ShapeDtypeStruct(tile, jnp.bool_)
-        def backward_step(s, dp, peak, total, anchor, delta, q, k, at_anchor):
+        keep_tile = jax.ShapeDtypeStruct(tile, jnp.float32)
+        def backward_step(s, dp, peak, total, anchor, delta, q, k, at_anchor, keep):
             seen = algebra.seen(spec, algebra.Coords(q, k), s)
             anchored = accurate or dropped
             forms = derived_cotangents(keys_first=False, dropped=dropped, masked=True,
@@ -370,13 +383,13 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool,
             tiles = {"logits": s, "products": dp, "peak": peak, "total": total, "anchor": anchor,
                      "delta": delta, "seen": seen}
             if dropped:
-                tiles["keep"] = s
+                tiles["keep"] = keep
             if anchored:
                 tiles["at_anchor"] = at_anchor
             exps, weights, ds = forms.mapped(tiles)
             return algebra.value_weights(exps, weights, jnp.bfloat16, dropped), ds.astype(jnp.bfloat16)
         jaxpr = jax.make_jaxpr(backward_step)(
-            s_in, s_in, row, row, row, row, q_pos, k_pos, anchor_tile).jaxpr
+            s_in, s_in, row, row, row, row, q_pos, k_pos, anchor_tile, keep_tile).jaxpr
     else:
         def forward_step(s, m, l_val, q, k):
             mod = algebra.modify(spec, s, algebra.Coords(q, k), (), masked=True)

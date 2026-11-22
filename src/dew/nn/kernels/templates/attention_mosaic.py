@@ -1279,6 +1279,9 @@ class MosaicForward(_Mainloop[Tiles]):
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
+        spec, taken = folded_form(self.form, self.keys, ids=False, dtype=query.dtype, width=query.shape[-1],
+                                  scale=self.scale, natural=self._natural(query), score_mod=self.score_mod,
+                                  subtracted=self.subtracted)
         return ForwardRegisters(query.dtype, query.shape[-1], value.shape[-1], residuals is Kept.SPLIT,
                                 self._natural(query), params, self.parts,
                                 self._scales(table, sources, scales, computed), codes=scales is not None,
@@ -1290,7 +1293,8 @@ class MosaicForward(_Mainloop[Tiles]):
                                 weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
                                 scaled_products=scaled_drop(computed, drop, initial),
                                 prologue=(None if self.query_mod is None
-                                          else (self.query_mod, self.query_kinds, self.query_dtypes)))
+                                          else (self.query_mod, self.query_kinds, self.query_dtypes)),
+                                prescaled=spec.prescale != 1.0, rewalk_prescaled=taken != 1.0)
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
