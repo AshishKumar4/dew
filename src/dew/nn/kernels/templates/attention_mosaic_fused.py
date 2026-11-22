@@ -215,10 +215,8 @@ def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged
     if walk.scaled:
         s = family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale),
                                      k_smem.transpose((1, 0)))
-        staged_out: list = []
-        dp = family.product(do_slot, v_smem.transpose((1, 0)), shape,
-                            then=lambda: staged_out.append(stage_weights(s)))
-        weights, slopes, seen = staged_out[0]
+        dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
+        weights, slopes, seen = stage_weights(s)
     else:
         (weights, slopes, seen), dp = family.product_pair(
             q_slot, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)),
