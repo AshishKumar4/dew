@@ -6,7 +6,10 @@ scale, exactly, into bfloat16: into shared-memory buffers its products read as t
 the left operand they take from registers, the staged order the warpgroup MMA's fragment, so no decoded stage
 reaches shared memory."""
 
+import contextlib
+import contextvars
 import dataclasses
+import functools
 from typing import Any
 
 import jax
@@ -16,6 +19,7 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
+from dew.nn.kernels import launches
 from dew.nn.kernels.templates import inline_forms, product as product_formats, resources
 
 NVFP4_GROUP = 128
@@ -51,12 +55,27 @@ def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_l
 
 
 CONSUMER = "wgmma"
-"""The consumer the packed decode writes its registers for: the warpgroup MMA's register operand, whose
-fragment layout the transform declares (`bits.NVFP4_BFLOAT16.fragments`)."""
+"""Consumer name in `bits.BitTransform.fragments` read by the packed warpgroup-MMA decode (algebra.md §7.4,
+row 11984)."""
 
-FRAGMENT = getattr(plgpu.Layout, bits.NVFP4_BFLOAT16.fragments[CONSUMER].upper())
-"""The register layout the decode writes and its family's products read: the transform's declared
-fragment for `CONSUMER`, not one the decode chooses (algebra.md 7.4, row 6101)."""
+
+def consumer_layout(transform: bits.BitTransform = bits.NVFP4_BFLOAT16):
+    """The register fragment layout declared by `transform.fragments` for `CONSUMER`, resolved lazily from
+    `mosaic_sm90.WGMMA.layout` (rows 8676, 11984). Refuses a transform naming no entry for `CONSUMER`."""
+    entry = transform.fragments.get(CONSUMER)
+    if entry is None:
+        raise ValueError(f"{transform.name}: no fragment layout declared for consumer {CONSUMER!r}")
+    if entry != "wgmma":
+        raise ValueError(f"{transform.name}: unsupported consumer fragment layout {entry!r}")
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    return mosaic_sm90.WGMMA.layout
+
+
+def rows_supported(family) -> bool:
+    """Whether `family`'s products read an NVFP4 matrix decoded in registers (`rows_decoded`): its register
+    fragment layout matches the consumer layout declared by `bits.NVFP4_BFLOAT16.fragments`."""
+    return family.layout == consumer_layout()
 
 
 def refused(lhs, rhs, scales, tiles, family, *, packed_rows: bool, dense: bool, transpose_rhs: bool,
@@ -79,7 +98,7 @@ def rows_taken(lhs, scales, tiles, family, *, dense: bool, transpose_rhs: bool, 
     decoded operand as any)."""
     if (not dense or lhs.dtype != jnp.uint32 or scales.shape != (lhs.shape[0], 8 * lhs.shape[1] // 16)
             or not transpose_rhs or tiles.block_k % NVFP4_STEP or tiles.block_m // tiles.warpgroups != 64
-            or family.layout != FRAGMENT or any(hook is not None for hook in hooked)
+            or not rows_supported(family) or any(hook is not None for hook in hooked)
             or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
         raise ValueError(f"an NVFP4 matrix's rows {lhs.shape} with scales {scales.shape} are a dense "
                          f"product's, its matrix read transposed, in 256-deep steps and 64 rows a "
@@ -171,8 +190,7 @@ def lanes(words, scales, interpret: bool):
     scale within bfloat16's range. Its registers lie in the warpgroup MMA's fragment layout, in which a
     column's scale is a column vector and a lane's slice a contiguous store (the strided layout found no
     assignment for this decode); interpreted, arrays."""
-    layout = None if interpret else FRAGMENT
-
+    layout = None if interpret else consumer_layout()
     def loaded(ref):
         return ref[...] if layout is None else plgpu.load(ref, layout=layout, optimized=False)
     owed = bits.scales_decoded(jax.lax.bitcast_convert_type(loaded(scales), jnp.uint8)) * jnp.float32(
@@ -196,3 +214,43 @@ def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:
     decoded = form.traced(words) if layout is None else inline_forms.registers(form, words, layout)
     return [bits.restored(half) for register in decoded
             for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
+
+
+_EPILOGUE_LAYOUT: contextvars.ContextVar[Any] = contextvars.ContextVar("gemm_epilogue_layout", default=None)
+"""Active GPU accumulator register layout while tracing a compiled GEMM epilogue (`encode_tile`)."""
+
+
+@contextlib.contextmanager
+def epilogue_layout(layout):
+    """Bind `layout` as the active compiled-epilogue register layout for `encode_tile` (row 8547)."""
+    token = _EPILOGUE_LAYOUT.set(layout)
+    try:
+        yield
+    finally:
+        _EPILOGUE_LAYOUT.reset(token)
+
+
+_MINIFLOAT_DTYPES = {bits.E4M3: jnp.dtype(jnp.float8_e4m3fn), bits.E5M2: jnp.dtype(jnp.float8_e5m2)}
+
+
+def encode_tile(x: jax.Array, minifloat: bits.Minifloat) -> jax.Array:
+    """Encode fp32 tile `x` into `minifloat` codes via `bits.encode_form`: inline PTX
+    (`inline_forms.registers`) inside a compiled GPU epilogue, or `BitForm.traced` when interpreted or
+    running outside a GPU kernel (row 8547)."""
+    words = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
+    form = bits.encode_form(minifloat)
+    layout = _EPILOGUE_LAYOUT.get() if launches.interpreting() is False else None
+    codes = (form.traced(words)[0] if layout is None
+             else inline_forms.registers(form, words, layout)[0]).astype(jnp.uint8)
+    target_dtype = _MINIFLOAT_DTYPES.get(minifloat)
+    return jax.lax.bitcast_convert_type(codes, target_dtype) if target_dtype is not None else codes
+
+
+def _quantized_epilogue(minifloat: bits.Minifloat, acc: jax.Array,
+                        scale: jax.Array | None = None) -> jax.Array:
+    return encode_tile(acc if scale is None else acc * scale, minifloat)
+
+
+def quantize_epilogue(minifloat: bits.Minifloat):
+    """GEMM epilogue packing fp32 accumulators to `minifloat` codes (`bits.encode_form`, row 8547)."""
+    return functools.partial(_quantized_epilogue, minifloat)
