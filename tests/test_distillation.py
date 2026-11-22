@@ -671,14 +671,18 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
         DistillationObjective(student, wider, divergence="selected")
 
 
+@pytest.mark.parametrize("tiled", [False, True], ids=["whole", "tiled"])
 @pytest.mark.parametrize("scores", [True, False], ids=["scores and states", "states alone"])
-def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on(scores):
+def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on(scores, tiled):
     """A teacher whose paired layers' states, and its scores too or not, are NaN at one position (row
     0's last) leaves that position out of every distillation term, the soft one and the features': the
     loss and the student's gradient (its projections' included) equal, bit for bit, those the intact
-    teacher gives with that position's label padded out, and the excluded weight is reported."""
+    teacher gives with that position's label padded out, and the excluded weight is reported. With the
+    heads tiled its scores are its final states, which the full KL reads a slice at a time (row 10984)."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, alpha=1.0)
+    if tiled:
+        assert objective.tile_head(TILE) is not None
     batch = fixture_batch(arrays)
     padded = {TEXT_KEY: batch[TEXT_KEY].at[0, SEQ].set(META["pad_id"])}
     original = objective.teacher.predict
@@ -692,6 +696,10 @@ def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on(s
         hidden = tuple(failed(state) for state in prediction.hidden)
         if not scores:
             return statistics, aux, dataclasses.replace(prediction, hidden=hidden)
+        if prediction.logits is None:
+            assert prediction.final is not None
+            return statistics, aux, dataclasses.replace(
+                prediction, final=failed(prediction.final), losses=failed(prediction.losses), hidden=hidden)
         return statistics, aux, dataclasses.replace(
             prediction, logits=failed(prediction.logits), losses=failed(prediction.losses), hidden=hidden)
 
