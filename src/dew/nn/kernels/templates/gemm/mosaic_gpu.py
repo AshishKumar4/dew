@@ -561,7 +561,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             _gmm_stepped_at, family=family, tiles=tiles, prologue=(prologue, prologue_axes),
             matrices=matrices, transpose=(transpose_lhs, transpose_rhs), interpret=bool(interpret),
             mx=mx_scales is not None, packed_rows=packed_rows, chosen=None if when is None else chained,
-            scaled=(step_scales is not None, scale_per, block_n))
+            scaled=(step_scales is not None, scale_per, block_n), exact_sums=exact_sums)
 
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
             def issue(wg, tile, walk, *, active):
@@ -572,11 +572,11 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 if active and not rewritten:
                     _fixed_loaded(family, prologue_gmems, prologue_axes, fixed, fixed_refs, fixed_barriers,
                                   wg=wg, rows=pl.ds(row_start, block_m))
-                step = stepped_at(wg, tile, fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
-                                  read_tiles=_reads(prologue_gmems, prologue_axes, read, group, g),
-                                  decoded=packing.decoding(decoded, tiles, wg, bool(interpret)))
+                step, prefetch = stepped_at(wg, tile, fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
+                                            read_tiles=_reads(prologue_gmems, prologue_axes, read, group, g),
+                                            decoded=packing.decoding(decoded, tiles, wg, bool(interpret)))
                 # The unrouted rows, and a slot past the last tile, multiply nothing: zeros.
-                return _walked_products(family, walk, step, part, accumulators, exact_sums)
+                return _walked_products(family, walk, step, part, accumulators, exact_sums, prefetch)
 
             def finish(wg, tile, accs, store, *, active):
                 if (tail is not None or when is not None) and not active:
@@ -661,17 +661,36 @@ def _chained_walked(chained: tuple, tiles: Tiles, dtype, transpose_lhs: bool, de
 
 def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: tuple, matrices: dict,
                     transpose: tuple, interpret: bool, mx: bool, packed_rows: bool, scaled: tuple,
-                    chosen=None, **refs) -> Callable:
+                    exact_sums: bool, chosen=None, **refs) -> tuple[Callable, Callable | None]:
     """Dew: consumer `wg`'s step of `tile` (`_gmm_step`), `refs` its side tiles: its share of the rows, its
-    idleness and its first step the tile's, its scaling at its column tile."""
+    idleness and its first step the tile's, its scaling at its column tile; and the walk's prefetch of its
+    slots (`_gmm_prefetch`) where `prefetches` says its walk reads one and every consumer's products issue
+    unconditionally (no idleness), None elsewhere."""
     rows = pl.ds(tiles.share_row(wg), tiles.share)
     (hook, hook_axes), (transpose_lhs, transpose_rhs) = prologue, transpose
-    return functools.partial(
-        _gmm_step, family=family, prologue=hook, prologue_axes=hook_axes, mine_rows=rows,
-        idle=_idle(tiles, tile[0], tile[1], wg), transpose_rhs=transpose_rhs, matrices=matrices,
-        interpret=interpret, first=tile[3], transpose_lhs=transpose_lhs, block_scaled=mx,
-        packed_rows=packed_rows, scaling=_gmm_scaling(scaled[0], scaled[1], scaled[2], tile[2], rows),
-        chosen=chosen, **refs)
+    idle = _idle(tiles, tile[0], tile[1], wg)
+    step = functools.partial(
+        _gmm_step, family=family, prologue=hook, prologue_axes=hook_axes, mine_rows=rows, idle=idle,
+        transpose_rhs=transpose_rhs, matrices=matrices, interpret=interpret, first=tile[3],
+        transpose_lhs=transpose_lhs, block_scaled=mx, packed_rows=packed_rows,
+        scaling=_gmm_scaling(scaled[0], scaled[1], scaled[2], tile[2], rows), chosen=chosen, **refs)
+    prefetching = idle is None and prefetches(
+        family, matrices=len(matrices), prologue=hook, scaled=refs.get('decoded') is not None or mx,
+        chained=chosen is not None, interpret=interpret,
+        transposed=(transpose_lhs or packed_rows, transpose_rhs),
+        summed=exact_sums and not family.sums_in_persist)
+    return step, _gmm_prefetch(family, matrices, rows) if prefetching else None
+
+
+def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, chained: bool,
+               interpret: bool, transposed: tuple[bool, bool], summed: bool) -> bool:
+    """Dew: whether a `gmm` walk of these facts reads a step's first fragments under the step before's last
+    product (`_gmm_prefetch`, `Transport.prefetches_fragments`): a plain step's, one matrix of rows as staged
+    (no prologue), unscaled and undecoded, no chained products, compiled, its rows and its matrix read
+    untransposed, its products summed by the tensor cores (no running sum of its own), as its walk decides
+    (`_gmm_stepped_at`)."""
+    return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
+            and not interpret and not any(transposed) and not summed)
 
 
 def _gmm_streamed(paired, scales, joined, bounded: "Chained | None" = None) -> tuple[dict, tuple, int]:
@@ -1544,15 +1563,16 @@ def _summed(family: mosaic.Family, tiles: Tiles, exact_sums: bool) -> dict:
     return {'summed': family.summed_window(tiles.block_k)} if exact_sums and family.sums_in_persist else {}
 
 
-def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int, exact_sums: bool) -> tuple:
+def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int, exact_sums: bool,
+                     prefetch: Callable | None = None) -> tuple:
     """Dew: a cooperative `gmm` consumer's `count` products over its steps (`walk`, `step` a `_gmm_step`
     whose operands it reads), each into an fp32 tile of `shape`: as the tensor cores add, or with
     `exact_sums` each step's product summed apart and added into the running sum by an IEEE add, as
     `_walked_gradient`'s: an FP8 product's running sum promoted into fp32 every step, Hopper's FP8 tensor
     cores summing within one in a narrower accumulator (testing.md, FP8 products). A family whose persist
-    sums the windows itself (`mosaic.Family.sums_in_persist`, `_summed`) walks the steps plainly."""
+    sums the windows itself (`mosaic.Family.sums_in_persist`, `_summed`) walks the steps plainly, with
+    `prefetch` where given (`_gmm_stepped_at`)."""
     if not exact_sums or family.sums_in_persist:
-        prefetch = _gmm_prefetch(family, step)
         _, accs = walk(step, None, (shape,) * count, **({} if prefetch is None else {'prefetch': prefetch}))
         return accs
 
@@ -1680,29 +1700,20 @@ def _rows_of(slots, matrices: dict, mine_rows, transpose_lhs: bool) -> dict:
             for name, stream in matrices.items()}
 
 
-def _gmm_prefetch(family: mosaic.Family, step: functools.partial) -> Callable | None:
-    """Dew: the walk's prefetch of a `_gmm_step`'s slots (`Transport.prefetches_fragments`): its one product's
-    first fragments (`Issuer.first_fragments`), read under the step before's last product, for a plain step
-    alone (one matrix, its rows as staged, every consumer's products issued unconditionally, a compiled
-    launch), its rows and its matrix read untransposed: the prefetch reads the left operand an instruction's
-    granule at a time (`products_across`), which took a transposed left's kernel gradient 7% slower on an A100
-    than its whole-swizzle-tile reads (FS-DENSE-AB1), and an input gradient's transposed matrix, prefetched,
-    ran Llama-3-8B's and Qwen3-32B's gate_up input gradients 1.33x and 1.28x slower with an output other than
-    the unprefetched walk's (M-FS-53-a100), where every forward ran faster, its output the same (0.954x
-    geomean); None elsewhere, its steps walked as they were."""
-    keywords = step.keywords
-    plain = (len(keywords['matrices']) == 1 and keywords['prologue'] is None and keywords['idle'] is None
-             and keywords.get('decoded') is None and not keywords['packed_rows']
-             and not keywords['block_scaled'] and keywords['chosen'] is None and not keywords['interpret']
-             and not keywords['transpose_lhs'] and not keywords['transpose_rhs'])
-    if not (family.prefetches_fragments and plain):
-        return None
+def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows) -> Callable:
+    """Dew: the walk's prefetch of a plain `_gmm_step`'s slots (`Transport.prefetches_fragments`;
+    `_gmm_stepped_at` decides which are): its one product's first fragments (`Issuer.first_fragments`) of its
+    `rows`, read under the step before's last product, its rows and its matrix read untransposed: the
+    prefetch reads the left operand an instruction's granule at a time (`products_across`), which took a
+    transposed left's kernel gradient 7% slower on an A100 than its whole-swizzle-tile reads (FS-DENSE-AB1),
+    and an input gradient's transposed matrix, prefetched, ran Llama-3-8B's and Qwen3-32B's gate_up input
+    gradients 1.33x and 1.28x slower with an output other than the unprefetched walk's (M-FS-53-a100), where
+    every forward ran faster, its output the same (0.954x geomean)."""
+    (name,) = matrices
 
     def prefetch(slots):
-        matrices = keywords['matrices']
-        (name,) = matrices
-        rows_of = _rows_of(slots, matrices, keywords['mine_rows'], keywords['transpose_lhs'])
-        oriented = _oriented(slots, matrices, keywords['transpose_rhs'])
+        rows_of = _rows_of(slots, matrices, rows, transpose_lhs=False)
+        oriented = _oriented(slots, matrices, transpose_rhs=False)
         return family.first_fragments(rows_of[name], oriented[name])
 
     return prefetch

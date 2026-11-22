@@ -14,6 +14,7 @@ from generation_support import lowers
 
 from dew import algebra
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import report
 from dew.nn.precision import Numerics
 
 
@@ -381,6 +382,29 @@ def test_a_neighbour_costing_the_launch_a_program_stays_outside_it():
             (route.choice, route.kernel) for route in found]
 
 
+@pytest.mark.parametrize(("function", "target", "fuses"),
+                         [(jnp.exp2, "sm90", True), (jnp.sin, "sm90", False), (jnp.exp, "sm100", True),
+                          (jnp.exp, "sm120", True)],
+                         ids=["exp2-sm90", "sin-sm90", "exp-sm100", "exp-sm120"])
+def test_a_consumer_its_launch_prices_no_work_of_is_never_fused_for_free(function, target, fuses):
+    """A projection's consumer is fused where its price says fused wins and its launch carries no more work
+    no rule prices than XLA's fusion of it. On a GPU whose template a call names: an exp2 after the product,
+    one MUFU either way, is its epilogue on an H100; a sine, which the launch compiles in an accurate form no
+    count prices (`emission.ACCURATE_FORMS`) where XLA's fusion is counted one MUFU an element, stays XLA's
+    after it, where the fused arm took it for no time (train 1165's F2); an exp on a B200 or an RTX 50, whose
+    accurate form's integer operations run at a rate their facts leave unread, is its epilogue, where those
+    counted as unpriced kept every exp, SiLU and GELU off the launch (ReviewFSGemmRegs' P2). Shapes only."""
+    x, w = jax.ShapeDtypeStruct((8192, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((1024, 4096), jnp.bfloat16)
+
+    def projected(x, w):
+        return function((x @ w).astype(jnp.float32)).astype(jnp.bfloat16)
+
+    with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"), generation.routes() as found:
+        jax.jit(algebra.rewritten(projected, kernels=True)).trace(x, w)
+    fused = any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found)
+    assert fused == fuses, [(route.choice, route.kernel) for route in found]
+
+
 def normed_and_terms(x, scale, w, *terms):
     """An RMS norm feeding a bf16 projection (the norm the product's prologue, as a measured cell times it)
     whose consumers add float32 arrays of its product's shape (`terms`)."""
@@ -511,25 +535,29 @@ def test_a_gated_product_of_no_product_stays_its_region():
 
 
 def named_rows(x, w):
-    """A sine of rows named for remat before it, then their product: a name on a prologue's value."""
+    """An exp2 of rows named for remat before it, then their product: a name on a prologue's value."""
     from jax.ad_checkpoint import checkpoint_name
 
-    return jnp.sin(checkpoint_name(x, "rows")) @ w
+    return jnp.exp2(checkpoint_name(x, "rows")) @ w
 
 
 @pytest.mark.compiles_at_run(reason="a template's certification compiles its configs as the call traces, "
                                    "no check-1 site")
 def test_a_name_on_a_products_rows_stays_outside_its_prologue():
     """A remat name on the value a product's prologue reads (`named_rows`) bounds the prologue, which still
-    fuses the sine after it on an H100 whose template a call names: a producer's stage runs no name (a name
-    pulled into it was refused there, and the sine's operand formed whole)."""
+    fuses the exp2 after it on an H100 whose template a call names: a producer's stage runs no name (a name
+    pulled into it was refused there, and the exp2's operand formed whole). Its launch is certified as an
+    H100's start certifies it, against a compile-only one, and a config is taken. (An accurate sine, whose
+    form no count prices, is no free fused work, `test_a_consumer_its_launch_prices_no_work_of_is_never_
+    fused_for_free`; a frame its range reduction keeps refuses no config, test_kernel_spills, row 9649.)"""
     shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    [device] = generation.compile_only_gpus("sm90")
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), \
-            generation.routes() as found:
+            report.certifying(device), generation.routes() as found:
         traced = jax.jit(algebra.rewritten(named_rows, kernels=True)).trace(*shapes)
     assert any(route.choice == "gemm_prologue" and route.kernel == "fused" for route in found), [
         (route.choice, route.kernel) for route in found]
-    assert not [equation for equation in traced.jaxpr.jaxpr.eqns if equation.primitive is jax.lax.sin_p]
+    assert not [equation for equation in traced.jaxpr.jaxpr.eqns if equation.primitive is jax.lax.exp2_p]
 
 
 @pytest.mark.mesh(devices=2)
