@@ -195,7 +195,8 @@ def _layer_of(path) -> int:
 def _recorded(sown, layers: int) -> np.ndarray:
     """The experts a forward's routers chose (their 'router' collection's `indices`), `[B, S, layers,
     top_k]`, a layer that routes nothing zeros, which it never reads."""
-    chosen = {_layer_of(path): np.asarray(value) for path, value in
+    # Each router's record a tuple of its one call's indices (flax's `sow`).
+    chosen = {_layer_of(path): np.asarray(value[0]) for path, value in
               jax.tree_util.tree_flatten_with_path(sown, is_leaf=lambda node: isinstance(node, tuple))[0]}
     first = next(iter(chosen.values()))
     return np.stack([chosen.get(layer, np.zeros_like(first)) for layer in range(layers)], axis=2)
