@@ -1889,3 +1889,38 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
 
         found = compile_mosaic_kernels([KernelCase(f"{gen}-fused-d128-3stage", _make)], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_stored_key_preserves_verdict_key_digest_and_launch_programs_matches_grid():
+    """Row 10678: `report._verdict_key` rebuilt on `report.stored_key` keeps the exact SHA-256 digest for
+    existing stored verdicts, and `emission.launch_programs` reads both `mpmd_map` and `pallas_call` grids."""
+    import hashlib
+    import json
+    import types
+
+    from jax._src.pallas import mpmd
+    from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
+    from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
+
+    from dew._code import provenance_code
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates import attention_mosaic_program as program, emission, report
+
+    installed = seal().digest
+    if installed is not None:
+        for identity, cfg, reverse in (
+            ("attn-fwd-1", program.Tiles(64, 64, 2, 2, family="wgmma"), False),
+            ("attn-bwd-2", program.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma"), True),
+        ):
+            expected_stated = [provenance_code(report.__name__, None), installed.hex(), report._assemblers(),
+                               identity, tuning.encoded(cfg), reverse, _keyed_environment()]
+            expected = hashlib.sha256(json.dumps(expected_stated, sort_keys=True).encode()).hexdigest()
+            assert report._verdict_key(identity, cfg, reverse, None) == expected
+
+    mpmd_eq = types.SimpleNamespace(primitive=mpmd.mpmd_map_p,
+                                    params={"meshes": (types.SimpleNamespace(grid=(32, 2, 16)),)})
+    pallas_eq = types.SimpleNamespace(primitive=object(),
+                                      params={"grid_mapping": types.SimpleNamespace(grid=(8, 4, 10))})
+    assert emission.launch_programs(mpmd_eq) == 1024
+    assert emission.launch_programs(pallas_eq) == 320
+

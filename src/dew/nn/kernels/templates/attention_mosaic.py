@@ -8,8 +8,6 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 
 import dataclasses
 import functools
-import hashlib
-import json
 import math
 from collections.abc import Callable, Hashable, Iterable, Sequence, Set
 from typing import ClassVar, Literal, overload
@@ -17,9 +15,8 @@ from typing import ClassVar, Literal, overload
 import jax
 import jax.numpy as jnp
 import tokamax
-from jax._src.pallas import mpmd
 
-from dew._code import op_provenance, provenance_code
+from dew._code import op_provenance
 from dew._devices import deterministic_ops_requested
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
@@ -146,30 +143,14 @@ def _column_blocks_of(family: mosaic.Family, dtype, value_width: int) -> list[in
     return [None, *resources.halved_blocks(whole, unit)]
 
 
-def _launch_programs(kernel) -> int:
-    """The programs launched by `kernel` (`mpmd_map` or `pallas_call`), its grid's product."""
-    if kernel.primitive is mpmd.mpmd_map_p:
-        (mesh,) = kernel.params["meshes"]
-        return math.prod(mesh.grid)
-    return math.prod(kernel.params["grid_mapping"].grid)
-
-
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
                 target: generation.GpuTarget) -> str | None:
-    """What decides `op`'s priced consumer count on `target` (`tuning.stored_choice`), keyed as
-    `report._verdict_key` is; None where the installation has no seal."""
-    from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
-    from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
-
-    installed = seal().digest
-    if installed is None:
-        return None
+    """What decides `op`'s priced consumer count on `target` (`tuning.stored_choice`), keyed through
+    `report.stored_key`; None where the installation has no seal."""
     rates = cost.rates(target, device=False)
-    stated = [provenance_code(report.__name__, op_provenance(op, ba.arguments)), installed.hex(),
-              report._identity(op, ba), target.generation, target.device_kind, target.multiprocessors,
-              target.launch_seconds, rates._asdict(), tuning.encoded(candidates), _keyed_environment()]
-    return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
-
+    return report.stored_key(
+        op_provenance(op, ba.arguments), report._identity(op, ba), target.generation, target.device_kind,
+        target.multiprocessors, target.launch_seconds, rates._asdict(), tuning.encoded(candidates))
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                              tiles: Callable[[int, int, int], Config],
@@ -778,10 +759,11 @@ class MosaicForward(_Mainloop[Tiles]):
             return False
         # wgmma's P·V depth (`block_k`) must be a multiple of V's swizzle tile (`swizzle_for(val_columns)`):
         # 64 for >=64-column V blocks, 32 for 32-column V blocks (row 6508).
+        staged = jnp.bfloat16 if self.parts > 1 else query.dtype
         if (self.parts > 1 and not family.operands_in_registers
                 and walked_unit(family, query.dtype, self.parts) < family.walked_rows
                 and config.block_k % swizzling.swizzle_columns(
-                    query.dtype, swizzling.swizzle_for(query.dtype, val_columns))):
+                    staged, swizzling.swizzle_for(staged, val_columns))):
             return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
@@ -874,7 +856,7 @@ class MosaicForward(_Mainloop[Tiles]):
             work = emission.work_of(kernel)
             if work is None:
                 return None
-            total += cost.launch_seconds(work, _launch_programs(kernel), target, resident=resident)
+            total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident)
         return total
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget) -> Tiles:
