@@ -2023,6 +2023,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
+    def for_generation(self, generation_name: str) -> "Family":
+        """The bundle as a device of `generation_name` runs it (`bundles.groups`, its composition for that
+        device): itself, where nothing of it is measured per device."""
+        del generation_name
+        return self
+
     holds_keys = False
     """Whether its programs hold a block of keys, a key a row, and walk the queries a tile a step (a
     keys-first placement's, `placed.KEYS`); every other family's hold queries and walk the keys

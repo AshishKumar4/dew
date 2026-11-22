@@ -19,7 +19,9 @@ the attention mainloop's); every other template's Mosaic launch is ineligible on
 next route by legality."""
 
 import dataclasses
-from collections.abc import Callable
+import types
+from collections.abc import Callable, Mapping
+from typing import ClassVar
 
 import jax.numpy as jnp
 
@@ -43,13 +45,24 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
 
     name = "mma.sync.fed"
     consumers = 2
-    held_registers = 65
-    """mma.sync's measured whole (`MmaIssuer`'s 40) and the 25 its consumer-fed launches held past it on a
-    B200: ptxas's least register cap less the model over every recurrence gate launch at base e346aa4af72
-    (FS-CENSUSFED-100d), at most +25 (key_values_back), +24 (states), +22 (keys_back, values_back), +17
-    (query_key), where the same launches on cp.async held at most +21 and an RTX PRO 6000's at most +7
-    (FS-CENSUSFED-120): the ring each consumer fills, its slots, barrier phases and copy coordinates live
-    in its own registers, warpgroup MMA's producer's uniform ones."""
+    held_registers: int = 65
+    """mma.sync's measured whole (`MmaIssuer`'s 40) and what its consumer-fed launches held past it, on the
+    device its composition is for (`for_generation`, `HELD_ON`); the largest of them where a family is named
+    outside a device's composition (`named`), which no device's launch exceeds: the ring each consumer fills,
+    its slots, barrier phases and copy coordinates live in its own registers, warpgroup MMA's producer's
+    uniform ones."""
+
+    HELD_ON: ClassVar[Mapping[str, int]] = types.MappingProxyType({"sm100": 65, "sm120": 60})
+    """Its held registers by device, ptxas's least register cap less the model at mma.sync's bare 40 over
+    every recurrence gate launch: a B200's at most +25 (key_values_back; +24 states, +22 keys_back and
+    values_back, +17 query_key; base e346aa4af72, FS-CENSUSFED-100d); an RTX PRO 6000's at most +20, the
+    Nemotron-H SSD backward's local launch at an output block of 80 (+8 GDN keys_back, +4 local_back and SSD
+    scores_back, every other launch 4-150 under; main 92d830f84, FS-CENSUSFED-120-TRAIN), at which its SSD
+    backward derives at value blocks of 16 and 32 (row 11810), where 65 held none."""
+
+    def for_generation(self, generation_name: str) -> "MmaFed":
+        held = self.HELD_ON.get(generation_name, self.held_registers)
+        return self if held == self.held_registers else dataclasses.replace(self, held_registers=held)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -152,8 +165,9 @@ def groups(generation_name: str, dtype, *, stated: bool = False, scoped: bool = 
                                 and generation.capability(generation_name) is None):
         return ()
     launch = Launch(stated=stated, scoped=scoped, tpu=tpu, produced=produced, walked=walked)
-    found = (tuple(family for family in (composition.build(jnp.dtype(dtype))
-                                         for composition in COMPOSITIONS[issuer] if composition.takes(launch))
+    found = (tuple(family.for_generation(generation_name)
+                   for family in (composition.build(jnp.dtype(dtype))
+                                  for composition in COMPOSITIONS[issuer] if composition.takes(launch))
                    if legal(family, architecture))
              for issuer in architecture.issuers)
     return tuple(group for group in found if group)
@@ -205,7 +219,8 @@ def layouts(generation_name: str, dtype, rows: int | None = None, *, stated: boo
 
 def named(name: str, dtype) -> mosaic.Family:
     """The bundle named `name` (`mosaic.Family.name`, a launch's tile's) for operands of `dtype`: the
-    composition declared so (`COMPOSITIONS`)."""
+    composition declared so (`COMPOSITIONS`), as no one device runs it (`mosaic.Family.for_generation`: a
+    term measured per device at the largest any holds, `MmaFed.held_registers`)."""
     for compositions in COMPOSITIONS.values():
         for composition in compositions:
             if (family := composition.build(jnp.dtype(dtype))).name == name:
