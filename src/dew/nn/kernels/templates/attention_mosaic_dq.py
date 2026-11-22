@@ -141,6 +141,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     k_first = (index if tile is None else tile(index)) * tiles.block_k
     overlap = (family.products_overlap and not family.operands_in_registers and not walk.interpret
                and not walk.accurate and not walk.dropped and not walk.kinds and walk.spec.score_mod is None)
+    overlapped: tuple | None = None
     if overlap:
         def between(s):
             if masked is None:
@@ -154,7 +155,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
             exps, w, sl, _ = _score_weights(walk, coords, (), s, peak, prior, masked=masked)
             return exps, w, sl
 
-        (overlapped_exps, overlapped_weights, overlapped_slopes), dp = family.product_pair(
+        overlapped, dp = family.product_pair(
             q, k_slot.transpose((1, 0)), do, slots["values"].transpose((1, 0)), shape, between=between)
         slots.release("values")
         s, params = dp, ()
@@ -174,10 +175,10 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         # Only the segmented TPU walk (`masked is not None`) passes `read` to skip unneeded coordinate tiles.
         coords = (coords_of(k_first) if masked is None
                   else coords_of(k_first, read=walk.places_read(masked=masked_step)))
-        if overlap:
+        if overlapped is not None:
+            exponentials, overlapped_weights, slopes = overlapped
             seen = algebra.seen(walk.spec, coords, dp) if masked_step else None
             cotangents = _score_cotangents(coords, overlapped_weights, dp, anchor, delta, seen)
-            exponentials, slopes = overlapped_exps, overlapped_slopes
         else:
             scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen,
                              masked=masked_step)

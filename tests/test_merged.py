@@ -619,8 +619,8 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
 
     def reference(p, s, im, it, ia):
         del p, s, im, it, ia
-        return jnp.concatenate([jnp.ones((1, 1, 1, width), jnp.float64),
-                                jnp.zeros((1, 1, 1, width), jnp.float64)], axis=2)
+        return np.concatenate([np.ones((1, 1, 1, width), np.float64),
+                               np.zeros((1, 1, 1, width), np.float64)], axis=2)
 
     assert_as_exact(jax.jit(ours), as_given(reference), draw,
                     "finished split merge preserves subnormal initial mass", seeds=FEWEST_SEEDS)

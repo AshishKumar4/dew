@@ -2025,8 +2025,8 @@ def test_decode_deepens_to_3_stages_without_losing_residency():
             rows, kd, kd, row_spans, whole, scale=None, natural=False,
             out_dtype=jnp.float32 if work["plain"].slices > 1 else None, masked=True,
             splits=work["plain"].slices, subtracted=True)
-        ba = op.bind(*args, residuals=template.Kept.OUTPUT if work["plain"].slices > 1 else template.Kept.NONE,
-                     interpret=False)
+        kept = template.Kept.OUTPUT if work["plain"].slices > 1 else template.Kept.NONE
+        ba = op.bind(*args, residuals=kept, interpret=False)
         assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
         dec_case = KernelCase("sm90-dec-b8-d128-3stage",
                               lambda: (lambda q, k, v: attention_decode.attend(q, k, v, spans),

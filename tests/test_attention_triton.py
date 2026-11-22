@@ -1,6 +1,7 @@
-"""dew.nn.kernels.templates.attention_triton: the template's Pallas Triton forward, at each config it is
-proven over, on par with the template's XLA arithmetic from float64 (check 1) over every call form and
-hook, its residuals too; interpreted on the CPU, compiled on a GPU."""
+"""The attention template's Pallas-Triton mainloop (`attention_triton`): its forward and backward on par with
+`attention.reference` from float64 across every call form, head width and hook, here interpreted and on a GPU
+(tests/test_gpu_attention.py)."""
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -286,10 +287,9 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
 
     def reference(query, key, value):
         del key, value
-        return (jnp.zeros_like(query, jnp.float64),
-                jnp.zeros((*query.shape[:2], 4), jnp.float64),
-                jnp.ones((*query.shape[:2], 4), jnp.float64))
-
+        return (np.zeros(query.shape, np.float64),
+                np.zeros((*query.shape[:2], 4), np.float64),
+                np.ones((*query.shape[:2], 4), np.float64))
     assert_as_exact(jax.jit(ours), as_given(reference), drawing(queries, keys, jnp.float32),
                     "padding query and sink", seeds=8)
 
