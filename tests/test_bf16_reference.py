@@ -181,8 +181,9 @@ def denoise(model, variables, prompt, canvas, **conditioning):
     return logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
 
 
-ROUTED_SEEDS = 16
-"""The routed denoiser site's declared seeds, each forward's."""
+ROUTED_SEEDS = 32
+"""The routed denoiser site's declared seeds, each forward's, sized by `seeds_for` paired on armada (32 at
+each forward, run DG-SIZE)."""
 
 
 def _layer_of(path) -> int:
