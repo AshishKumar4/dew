@@ -116,10 +116,9 @@ def packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, obje
     as its format reads it (`SourceQuantization.as_nvfp4`: an MXFP4 source's expert banks, ModelOpt's
     W4A16_NVFP4 Linears). In each one's place an unread leaf
     of its decoded shape and dtype, which the decoder's translation binds as it binds a load without weights
-    (`unread.Unread`), and `with_banks` replaces. A weight whose depth is no whole NVFP4 stages
-    (`formats.NVFP4_STAGE`), or that its format reads as no NVFP4 (its reason), is decoded as the source
-    states it, and named in the load's log with why, once a load; a source of no quantized weights is
-    refused."""
+    (`unread.Unread`), and `with_banks` replaces. A weight its format reads as no NVFP4 (its reason: its
+    depth no whole NVFP4 stages, `formats.unstaged`, among them) is decoded as the source states it, and
+    named in the load's log with why, once a load; a source of no quantized weights is refused."""
     quantization = source_quantization(config)
     if quantization is None:
         raise ValueError("packed_weights serves a quantized source's 4-bit weights as their codes; this "
@@ -132,7 +131,7 @@ def packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, obje
             # A load that reads no values holds the bank's shapes (`jax.eval_shape`), as it holds a weight's.
             packing = (NvFp4.of if all(isinstance(part, np.ndarray) for part in parts)
                        else lambda *parts: jax.eval_shape(NvFp4.of, *parts))
-            packed = _staged(parts[0].shape[-2]) or (packing(*parts), shape)
+            packed = packing(*parts), shape
         if isinstance(packed, str):
             _log.warning("packed_weights: %s stays dense: %s", name, packed)
             continue
@@ -150,13 +149,6 @@ def _kernel_of(layout: WeightLayout, bank: NvFp4) -> bool:
     depth, width = 8 * bank.words.shape[-1], bank.words.shape[-2]
     return (layout.transpose == (1, 0) and tuple(layout.shape) == (width, depth)
             and layout.paths[0][-1] == "kernel")
-
-
-def _staged(depth: int) -> str | None:
-    """Why a matrix of `depth` inputs is no NVFP4 bank (`formats.NVFP4_STAGE`), or None."""
-    from dew.nn.kernels.formats import NVFP4_STAGE
-
-    return f"its depth {depth} is no whole {NVFP4_STAGE}-deep stages" if depth % NVFP4_STAGE else None
 
 
 def with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: Mapping[str, NvFp4]

@@ -271,12 +271,24 @@ class ScanCase:
                 return all(selection_margins.margin(self.config, selected(tree, ids), shape) > least
                            for tree in (self.variables, self.training))
 
-            # Each seed's clearing draw found once for every site judged over it (`scans_as_the_loop`): its
-            # selections' forwards and margins were a third of a conditioned map task's time drawn again a
-            # site (row 9780).
-            self.draw = functools.cache(selection_margins.clearing(drawn, clears))
+            self.draw = selection_margins.clearing(drawn, clears)
         else:
             self.draw = drawn
+        self.cleared: dict = {}
+
+    def site_draw(self):
+        """`draw` for one site of those judged apart (`scans_as_the_loop`): each seed's draw found once for
+        every site that asks it (its selections' forwards and margins were a third of a conditioned map
+        task's time, drawn again a site, row 9780), and drawn again where this site asks a seed it asked
+        already, as check 1's repeat of a draw to see it repeat asks (`_of_its_seed`, ledger 2641)."""
+        seen: set = set()
+
+        def draw(seed):
+            if seed in seen or seed not in self.cleared:
+                self.cleared[seed] = self.draw(seed)
+            seen.add(seed)
+            return self.cleared[seed]
+        return draw
 
     def computed(self, model, forward, trained):
         """The logits under `forward`, and the loss with its gradients under `trained` and the draw's
@@ -390,7 +402,7 @@ def scans_as_the_loop(shape: str) -> None:
         scanned_site, plain_site, truth_site = (
             as_given(lambda ids, cotangent, run=run, site=site: site_of(run(ids, cotangent), site))
             for run in (at_site() for at_site in held))
-        assert_as_exact(scanned_site, plain_site, case.draw, f"{shape} scanned stack, {site}",
+        assert_as_exact(scanned_site, plain_site, case.site_draw(), f"{shape} scanned stack, {site}",
                         seeds=SCAN_SEEDS[shape], truth_fn=truth_site, conditioning=conditioning,
                         conditioning_scale=case.weighed(site))
 

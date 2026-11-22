@@ -355,8 +355,9 @@ class SourceQuantization:
     """A weight's NVFP4 parts as `dew.nn.kernels.formats.NvFp4.of` packs them, read from its stored ones with
     no value decoded, and the shape it decodes to (`NvFp4Parts`), which a load serves packed
     (`Pretrained.load`'s `packed_weights`, `dew.interop.quantized_loads.packed_banks`, its one reader); else
-    why the weight stays dense, decoded as the format states it. The one statement of a format's packing
-    (row 11644)."""
+    why the weight stays dense, decoded as the format states it, a depth of no whole NVFP4 stages among them,
+    read from its stored shape before any of its values (`dew.nn.kernels.formats.unstaged`). The one
+    statement of a format's packing (row 11644)."""
 
     def tensor_names(self, tensors: Mapping[str, Stored]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
@@ -480,10 +481,15 @@ def _mxfp4_as_nvfp4(tensors: Mapping[str, Stored], name: str) -> NvFp4Parts | st
     """An MXFP4 expert bank's NVFP4 parts (`mxfp4_as_nvfp4`, exactly its values) and the `[experts, in,
     out]` it decodes to (`SourceQuantization.as_nvfp4`); dense where it holds no experts (a 2-D weight's
     blocks) or its experts' group powers span past one tensor scale's reach (`mxfp4_tensor_powers`)."""
+    from dew.nn.kernels.formats import unstaged
+
     blocks, scales = (tensors[name + suffix] for suffix in MXFP4_SUFFIXES)
     if len(blocks.shape) != 4:
         return "it holds no experts"
     experts, outputs, groups, _ = blocks.shape
+    # Its depth read from its blocks' shape before any of its values (gpt-oss's 2880 is no whole stages).
+    if (reason := unstaged(groups * GROUP)) is not None:
+        return reason
     powers = mxfp4_tensor_powers(blocks, scales)
     if powers is None:
         return "its experts' group powers span past one tensor scale's reach"
@@ -1763,12 +1769,16 @@ def _modelopt_as_nvfp4(tensors: Mapping[str, Stored], name: str, *, method: str 
         return f"it is stored as {algo}, whose product quantizes its input"
     if re.search(r'experts\.\d+\.', name):
         return "it is one expert's of a stack"
+    from dew.nn.kernels.formats import unstaged
+
     stored = (unread.held(tensors[part]) for part in (name, *_modelopt_layer_parts(name, 'W4A16_NVFP4')))
     packed = next(stored)
     scale, overall = _modelopt_nvfp4_checked(name, packed, *stored)
     if packed.ndim != 2 or overall.size != 1:
         return "it is no matrix of one tensor scale"
     outputs, inputs = packed.shape[0], packed.shape[1] * 2
+    if (reason := unstaged(inputs)) is not None:
+        return reason
     if not (unread.valued(packed) and unread.valued(scale) and unread.valued(overall)):
         return ((jax.ShapeDtypeStruct((inputs, outputs), np.uint8),
                  jax.ShapeDtypeStruct((inputs // 16, outputs), ml_dtypes.float8_e4m3fn),

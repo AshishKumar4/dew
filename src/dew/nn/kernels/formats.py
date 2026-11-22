@@ -141,6 +141,13 @@ NVFP4_STAGE = packed.NVFP4_STEP
 16-byte row (a TMA copy's least)."""
 
 
+def unstaged(depth: int) -> str | None:
+    """Why a matrix of `depth` inputs is no NVFP4 matrix (`NvFp4`: its depth whole `NVFP4_STAGE`s), or None:
+    what a load asks of a weight's shape before it reads any of its values (row 11643's review: an MXFP4
+    bank's powers and conversion, gigabytes on a host, were made for banks no stage holds)."""
+    return f"its depth {depth} is no whole {NVFP4_STAGE}-deep stages" if depth % NVFP4_STAGE else None
+
+
 def staged_rows(depth: int) -> np.ndarray:
     """The depth each code of the staged order holds (`NvFp4`): packed row `8w + j` of a group (word `w`'s
     code `j`) holds the depth `packed.nvfp4_staged_depth` gives it, so a stage's word rows decode, code by

@@ -341,8 +341,10 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
         return run
 
     assert_as_exact(ours, transformers(reference, contextlib.nullcontext),
-                    token_draw(0x0A3, reference.config.vocab_size, ids.shape), "float32 logits and gradients",
-                    seeds=ACCURATE_SEEDS, truth_fn=transformers(wide, float64))
+                    token_draw(0x0A3, reference.config.vocab_size, ids.shape),
+                    # Its fixture's: both fixtures' cells share one GPU flow's store of sites.
+                    f"float32 {fixture} logits and gradients", seeds=ACCURATE_SEEDS,
+                    truth_fn=transformers(wide, float64))
 
 
 @pytest.mark.parametrize(("name", "stale"), [
