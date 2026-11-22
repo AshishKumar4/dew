@@ -361,15 +361,17 @@ class View[S: Source]:
         return self.source.lengths()
 
     def metadata(self) -> Mapping[str, object]:
-        return {**self._viewed(self.source.metadata()), **{key: read() for key, read in self._own().items()}}
+        own = {key: read() for key, read in self._own().items()}
+        stated = {key: value for key, value in own.items() if value is not None}
+        return {**self._viewed(self.source.metadata()), **stated}
 
     def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
         """Those of its facts named by `keys`: its store's asked alone (`asked`), taken as `metadata` takes
         all of them (`_viewed`), and those of its own asked, each read alone (`_own`; row 11638's review: a
         view's own facts were dropped, then read whole for any key)."""
-        own = self._own()
+        own = {key: read() for key, read in self._own().items() if key in keys}
         stored = {key: value for key, value in self._viewed(asked(self.source, keys)).items() if key in keys}
-        return {**stored, **{key: read() for key, read in own.items() if key in keys}}
+        return {**stored, **{key: value for key, value in own.items() if value is not None}}
 
     def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Its store's facts as it states them (`facts`, all of them or those asked), its counts dropped
@@ -377,8 +379,8 @@ class View[S: Source]:
         return facts if self.rows in ("read", "described") else _uncounted(facts)
 
     def _own(self) -> Mapping[str, Callable[[], Stated]]:
-        """The facts it states of its own over its store's, each by the read that states it: the one place
-        a view states them, read only where asked (`asked`)."""
+        """The facts it states of its own over its store's, each by the read that states it, None where it
+        states none: the one place a view states them, read only where asked (`asked`)."""
         return {}
 
     def stated(self) -> Mapping[str, object]:
