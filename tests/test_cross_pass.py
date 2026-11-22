@@ -571,7 +571,7 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
     added_banks = 4 * (MIXER_ROWS // devices) * MIXER_LENGTH * 2 * MIXER_WIDTH * 2
     # So too where the step watches its MLPs (row 11820: a watch of other modules leaves the merges to their
     # own rules), its sampled step the one compiled.
-    for inspection in (None, Inspection(modules=("MLP",), every=1)):
+    for inspection in (None, Inspection(modules=("*MLP",), every=1)):
         msg_two, msg_six = live_past_args(2, spec, inspection), live_past_args(6, spec, inspection)
         msg_growth = msg_six - msg_two
         assert msg_growth <= plain_growth + 2 * added_banks, (
