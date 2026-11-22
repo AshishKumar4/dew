@@ -630,9 +630,14 @@ def _shaped_like(value, shape):
         return None
     if value is not None:
         return value
-    # Typed as the pass's own entry is, which a zero of its shape alone would differ from: varying over the
-    # manual axes it varies over (a batch-split forward's statistic under `shard_map`, its rows' maxima),
-    # placed as it is on a mesh whose types carry the split.
+    # Any other node (a boxed variable's partitioning, `nn.LogicallyPartitioned`) by its leaves.
+    return jax.tree.map(_zero_like, shape)
+
+
+def _zero_like(shape: jax.ShapeDtypeStruct) -> jax.Array:
+    """A zero typed as the pass's own entry `shape` is, which a zero of its shape alone would differ from:
+    varying over the manual axes it varies over (a batch-split forward's statistic under `shard_map`, its
+    rows' maxima), placed as it is on a mesh whose types carry the split."""
     manual = shape.manual_axis_type
     if manual is not None and manual.varying:
         return jax.lax.pcast(jnp.zeros(shape.shape, shape.dtype), tuple(sorted(manual.varying)), to="varying")
