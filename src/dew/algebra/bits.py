@@ -314,11 +314,6 @@ class BitForm:
         """The stored word of each of `inputs`, as uint64."""
         return _parities(inputs.astype(np.uint64), self.encoder)
 
-    def prepared(self, inputs: jax.Array) -> jax.Array:
-        """The stored word of each of `inputs` (uint32), as JAX computes it (`_parities`'s, in `jax.numpy`):
-        a consumer's prepare step, which stores its weights in the form's layout once."""
-        return _parities(inputs.astype(jnp.uint32), self.encoder, jnp)
-
     @property
     def issues(self) -> dict[Unit, int]:
         """Its instructions on each unit."""
@@ -750,13 +745,14 @@ within bfloat16's range, so the tile is the values over 2^8."""
 
 def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
     """An NVFP4 tile in bfloat16, each value its E2M1 code times its block's E4M3 scale over `NVFP4_OWED`,
-    exactly: `words` `[depth / 8, columns]` uint32, each the stored (`BitForm.prepared`) word of a column's
-    eight consecutive codes along the depth, and `scales` `[depth / 16, columns]` float8_e4m3fn, one for
-    each sixteen (`product.NVFP4.depth`, the format's one statement of its block); `[depth, columns]`: the
-    code restored from its decode (`nvfp4_codes`) times its scale over 2^8 in float32, exact (at most six
-    significant bits) and within bfloat16's normal range, as a GPU's prologue forms it in one multiply per
-    value (`NVFP4_OWED`), a GEMM operand prologue's per stage (the template's matrix-operand hook,
-    algebra.md 7.4)."""
+    exactly: `words` `[depth / 8, columns]` uint32, each the stored word of a column's eight consecutive
+    codes along the depth in their own order, as `nvfp4_quantized` packs them (a GEMM's staged words, whose
+    depths are permuted, are read by `dew.nn.kernels.formats.NvFp4.decoded`), and `scales` `[depth / 16,
+    columns]` float8_e4m3fn, one for each sixteen (`product.NVFP4.depth`, the format's one statement of
+    its block); `[depth, columns]`: the code restored from its decode (`nvfp4_codes`) times its scale over
+    2^8 in float32, exact (at most six significant bits) and within bfloat16's normal range, as a GPU's
+    prologue forms it in one multiply per value (`NVFP4_OWED`), a GEMM operand prologue's per stage (the
+    template's matrix-operand hook, algebra.md 7.4)."""
     codes = nvfp4_codes(words)
     owed = scales_decoded(jax.lax.bitcast_convert_type(scales, jnp.uint8)) * np.float32(1 / NVFP4_OWED)
     return (codes * jnp.repeat(owed, NVFP4.depth, axis=0)).astype(jnp.bfloat16)

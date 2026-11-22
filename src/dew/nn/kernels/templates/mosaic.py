@@ -757,15 +757,19 @@ class Issuer[Accumulator](abc.ABC):
     operand_steps_ahead: int = 0
     """The instruction slices loaded before the slice being consumed finishes."""
 
-    def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False) -> int:
-        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead; a
-        granule of several instructions that another granule of the product follows (`loaded` short of its
-        `depth`) its whole granule, loaded ahead of the later one's first product while the last slice of
-        the one before is in flight; otherwise only its consumed slices within that granule. An sm86 decode
-        step's keys, two granules of 64 at width 128, held at two instructions priced 80 registers where
-        ptxas spilled 12 bytes at 80 and held at 88 (the decode gate red at the promotion's composed tip);
-        one granule at a product's whole depth (a GEMM step's transposed weight at 64) holds at two
-        instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432 cells)."""
+    def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False,
+                           transposed: bool = False) -> int:
+        """An operand's live depth (`loaded` its granule at its storage orientation, `transposed` where its
+        rows are its depth, `rhs_fragment_depth`): a retained value keeps its loaded granule and instruction
+        lookahead; a granule of several instructions that another granule of the product follows (`loaded`
+        short of its `depth`) its whole granule, loaded ahead of the later one's first product while the last
+        slice of the one before is in flight; otherwise only its consumed slices within that granule. An
+        sm86 decode step's keys, two granules of 64 at width 128, held at two instructions priced 80
+        registers where ptxas spilled 12 bytes at 80 and held at 88 (the decode gate red at the promotion's
+        composed tip); one granule at a product's whole depth (a GEMM step's transposed weight at 64) holds
+        at two instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432
+        cells)."""
+        del transposed
         consumed = (1 + self.operand_steps_ahead) * self.fragment_depth(depth)
         if retained:
             return min(depth, max(loaded, consumed))
@@ -858,12 +862,11 @@ class Issuer[Accumulator](abc.ABC):
         bounds them (`resources.held_area`: a TPU core's VMEM); None where registers do."""
         return None
 
-    def value_scratch(self, blocks: dict, outputs: tuple, *, step: tuple = ()) -> tuple:
+    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
         """The `(shape, dtype)` stand-ins of the values it keeps in scratch memory beside a program's
         allocations (`gemm.mosaic_gpu.Allocations.scope`): none where they live in registers."""
-        del blocks, outputs, step
+        del blocks, outputs
         return ()
-
     issues_in_consumers: bool = True
     """Whether a walk's step runs in the consumer that issues its products, so it can prepare their operands
     first: a prologue's rewrite, a kernel gradient's zeroed neighbouring rows, an exactly summed step's own
@@ -1252,10 +1255,12 @@ class Issuer[Accumulator](abc.ABC):
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                     between: Callable = lambda value: value) -> tuple:
         """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
-        (`WgmmaIssuer`), else in turn (`product`)."""
-        return self.product(lhs1, rhs1, shape), self.product(lhs2, rhs2, shape)
+        (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
+        second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""
+        return between(self.product(lhs1, rhs1, shape)), self.product(lhs2, rhs2, shape)
 
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""

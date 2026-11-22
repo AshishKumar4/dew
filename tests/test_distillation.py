@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_forms import dew_path
 from flax import linen as nn
 from flax.traverse_util import unflatten_dict
 from reference_error import as_given, assert_as_exact, widened
@@ -111,7 +112,9 @@ def teacher_forward():
     return jax.jit(lambda variables, ids: dew_outputs(teacher, variables, ids, layers))
 
 
-DISTILLATION_SEEDS = {"terms": 64, "gradient": 16}
+DISTILLATION_SEEDS = {"terms": 64, "gradient": 16, "wide temperature": 8}
+"""Each site's declared seeds; the wide temperature's `seeds_for`'s at the suite's host level, paired with
+its tiled arm."""
 
 TILE = (6, META["student"]["vocab_size"])
 """A tiled head whose full KL takes 3 of a row's positions a slice (`chunked.head_divergence`), which do not
@@ -671,14 +674,18 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
         DistillationObjective(student, wider, divergence="selected")
 
 
+@pytest.mark.parametrize("tiled", [False, True], ids=["whole", "tiled"])
 @pytest.mark.parametrize("scores", [True, False], ids=["scores and states", "states alone"])
-def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on(scores):
+def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on(scores, tiled):
     """A teacher whose paired layers' states, and its scores too or not, are NaN at one position (row
     0's last) leaves that position out of every distillation term, the soft one and the features': the
     loss and the student's gradient (its projections' included) equal, bit for bit, those the intact
-    teacher gives with that position's label padded out, and the excluded weight is reported."""
+    teacher gives with that position's label padded out, and the excluded weight is reported. With the
+    heads tiled its scores are its final states, which the full KL reads a slice at a time (row 10984)."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, alpha=1.0)
+    if tiled:
+        assert objective.tile_head(TILE) is not None
     batch = fixture_batch(arrays)
     padded = {TEXT_KEY: batch[TEXT_KEY].at[0, SEQ].set(META["pad_id"])}
     original = objective.teacher.predict
@@ -692,6 +699,10 @@ def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on(s
         hidden = tuple(failed(state) for state in prediction.hidden)
         if not scores:
             return statistics, aux, dataclasses.replace(prediction, hidden=hidden)
+        if prediction.logits is None:
+            assert prediction.final is not None
+            return statistics, aux, dataclasses.replace(
+                prediction, final=failed(prediction.final), losses=failed(prediction.losses), hidden=hidden)
         return statistics, aux, dataclasses.replace(
             prediction, logits=failed(prediction.logits), losses=failed(prediction.losses), hidden=hidden)
 
@@ -784,9 +795,70 @@ def _kl_heads(vocab: int, width: int, rows: int, positions: int):
     def divergence(student_table, teacher_table, student_states, teacher_states):
         student, teacher = (OutputTable(table, vocab_major=False) for table in (student_table, teacher_table))
         return head_divergence(student_states, student, teacher_states, teacher,
-                               jnp.ones(student_states.shape[:2], bool), 2.0, tile=(3, vocab))
+                               jnp.ones(student_states.shape[:2], bool), 2.0, tile=(3, vocab))[0]
 
     return tables, states, divergence
+
+
+def test_a_tiled_full_kl_leaves_out_the_positions_whose_teacher_logits_are_not_finite():
+    """The tiled full KL (`chunked.head_divergence`) gives, beside each position's KL, whether the teacher's
+    logits there are all finite: a teacher head with a column at -inf, whose cross entropy stays finite,
+    leaves every position out, its KL finite, as the whole logits' policy leaves them out and counts them
+    (`distill/teacher_nonfinite`); a finite head leaves none out (row 10984: the tiled KL read only the
+    teacher's losses, and trained on such positions uncounted)."""
+    from dew.nn.protocols import OutputTable
+    from dew.objectives.lm.chunked import head_divergence
+
+    vocab, width, rows, positions = 16, 8, 2, 5
+    tables, states, _ = _kl_heads(vocab, width, rows, positions)
+    student = OutputTable(tables[0], vocab_major=False)
+    kept = jnp.ones((rows, positions), bool)
+    for bias, held in ((jnp.zeros(vocab), True), (jnp.zeros(vocab).at[3].set(-jnp.inf), False)):
+        teacher = OutputTable(tables[1], vocab_major=False, bias=bias)
+        divergence, finite = head_divergence(states[0], student, states[1], teacher, kept, 2.0,
+                                             tile=(3, vocab))
+        assert bool(jnp.all(finite == held)) and bool(jnp.all(jnp.isfinite(divergence))), (held, finite)
+
+
+def test_a_tiled_full_kl_divides_by_a_wide_temperature_at_its_own_width():
+    """Under x64, float32 states and heads over a float64 temperature float32 rounds (1 + 2**-40, to 1): the
+    tiled full KL (`chunked.head_divergence`) divides by it at float64, as the whole logits' KL divides
+    (`categorical.kl_divergence`), finite, other than at a temperature of 1, and on par with the whole
+    logits' KL at that temperature over drawn heads (check 1; row 10978's review: cast to the states'
+    float32, a float64 temperature of 1e-50 became 0)."""
+    from dew.nn import categorical
+    from dew.nn.protocols import OutputTable
+    from dew.objectives.lm.chunked import head_divergence
+
+    vocab, width, rows, positions = 16, 8, 2, 5
+    wide = 1 + 2.0**-40
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 4)
+        tables = (np.asarray(jax.random.normal(key, (width, vocab)), np.float32) for key in keys[:2])
+        states = (np.asarray(jax.random.normal(key, (rows, positions, width)), np.float32)
+                  for key in keys[2:])
+        return (*tables, *states)
+
+    def tiled(student_table, teacher_table, student_states, teacher_states, temperature=wide):
+        student, teacher = (OutputTable(table, vocab_major=False) for table in (student_table, teacher_table))
+        return head_divergence(student_states, student, teacher_states, teacher,
+                               jnp.ones((rows, positions), bool), jnp.asarray(temperature, jnp.float64),
+                               tile=(3, vocab))[0]
+
+    def whole(student_table, teacher_table, student_states, teacher_states):
+        student, teacher = (OutputTable(table, vocab_major=False) for table in (student_table, teacher_table))
+        over = jnp.asarray(wide, jnp.float64)
+        return categorical.kl_divergence(student.logits(student_states) / over,
+                                         teacher.logits(teacher_states) / over)
+
+    with jax.enable_x64(new_val=True):
+        inputs = draw(0)
+        at_wide, at_one = np.asarray(tiled(*inputs)), np.asarray(tiled(*inputs, temperature=1.0))
+        assert at_wide.dtype == np.float64 and np.all(np.isfinite(at_wide)), at_wide
+        assert not np.array_equal(at_wide, at_one), (at_wide, at_one)
+        assert_as_exact(tiled, dew_path(whole), draw, "the tiled KL over a wide temperature",
+                        seeds=DISTILLATION_SEEDS["wide temperature"])
 
 
 @pytest.mark.mesh(devices=4)

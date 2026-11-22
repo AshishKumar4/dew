@@ -767,6 +767,12 @@ class StagedStacks(Protocol):
 EXITS = "exits"
 """The collection a looped decoder gathers its passes' exits in, where a caller opens it (`Looped`)."""
 
+EXIT_PASSES = "exit_passes"
+"""The collection a looped decoder under an exit threshold (`Loop.exit_threshold`) writes each token's
+1-based exit pass in, `[B, L]` int32, where a caller opens it: the pass the threshold chose, the one whose
+state the forward hands on (row 11714). A caller that opens `EXITS` reads every pass's exit instead, the
+threshold's choice made by none, and so finds nothing here."""
+
 ExitPasses = tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]
 """What a looped decoder's forward gathered of its exits (`Looped.exit_passes`): the states the head reads
 of each pass before the last, and every pass's exit-gate logit (none without a gate)."""

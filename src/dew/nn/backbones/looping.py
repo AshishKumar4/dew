@@ -31,7 +31,7 @@ from flax.core.scope import DenyList
 from dew.batch import sows_appended
 
 from ..precision import at_least_fp32, softplus
-from ..protocols import EXITS
+from ..protocols import EXIT_PASSES, EXITS
 from .decoder_stack import BY_CALL, WRITTEN, Loop, PassView, SharedPassView
 from .layer_names import group_layers
 
@@ -365,9 +365,20 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         x = model.norm(x)
     if end < layers:
         x = model.stack(x, span=(end, layers), train=train, decode=decode, **inputs)
-    if loop.exit_threshold is None or not exited or model.is_mutable_collection(EXITS):
+    if loop.exit_threshold is None or model.is_mutable_collection(EXITS):
         return x
-    return _exited(exited, x, loop.exit_threshold)
+    return _handed_on(model, exited, x, loop.exit_threshold)
+
+
+def _handed_on(model, exited, last, threshold: float) -> jax.Array:
+    """The state a loop under an exit threshold hands on (`_exited`), each token's exit pass, 1-based,
+    written where a caller opens `EXIT_PASSES` (a write nothing reads otherwise): the choice its state is
+    taken by, the last pass where no earlier one exits it, so one pass of a loop exits every token there."""
+    chosen = jnp.ones(last.shape[:2], jnp.int32)
+    if exited:
+        last, chosen = _exited(exited, last, threshold)
+    model.sow(EXIT_PASSES, 'chosen', chosen)
+    return last
 
 
 def _sown_exit(model, leaving):
@@ -383,9 +394,10 @@ def _sown_exit(model, leaving):
     return output, logit
 
 
-def _exited(exited, last, threshold: float):
+def _exited(exited, last, threshold: float) -> tuple[jax.Array, jax.Array]:
     """Each token's exiting pass's state (`exit_choice`), from the earlier passes' `(state, gate logit)`
-    and the last pass's state, which a token none of them exits takes."""
+    and the last pass's state, which a token none of them exits takes, and that pass, 1-based `[B, L]`."""
     choice = exit_choice([logit for _, logit in exited], threshold)
     leaving = jnp.stack([state for state, _ in exited] + [last])
-    return jnp.take_along_axis(leaving, choice[None, ..., None], axis=0)[0]
+    return (jnp.take_along_axis(leaving, choice[None, ..., None], axis=0)[0],
+            choice.astype(jnp.int32) + 1)

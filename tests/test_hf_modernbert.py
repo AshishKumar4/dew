@@ -5,6 +5,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from interop_support import fixture_ids, transformers_arms, transformers_model
 from reference_error import assert_as_exact
 
@@ -87,7 +88,9 @@ def modernbert_states_in_bf16_on_the_gpu_kernels():
     two-sided window off it, which cuDNN refuses; the bf16 states are on par
     with ModernBertModel's own bf16 run over drawn ids (check 1), from the
     float64 twin of its float32 load."""
-    loaded = Pretrained.load(DIRECTORY, dtype='bfloat16', attention_impl='auto')
+    with ahead_on_the_host():
+        # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859).
+        loaded = Pretrained.load(DIRECTORY, dtype='bfloat16', attention_impl='auto')
     reference, truth = transformers_arms(
         transformers_model(DIRECTORY, masked=True, dtype='bfloat16'),
         lambda model, ids: model.model(ids).last_hidden_state,

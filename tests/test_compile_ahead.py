@@ -1065,7 +1065,8 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
 
     def twins(chosen) -> list:
         search.chosen = chosen
-        ladder = search.ladder(start, narrow=False, ns_group=None)
+        ladder = search.ladder(start, narrow=False, ns_group=None, remat_set=search.remat_set,
+                               defaults=search.own_defaults())
         return [rung for rungs in ladder for rung in rungs if rung.xla_defaults]
 
     assert not twins({**(search.required or {}), LIMIT_EXIT: 2**30})

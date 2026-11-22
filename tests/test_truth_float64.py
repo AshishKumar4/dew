@@ -219,19 +219,29 @@ def multiplied(x, weight):
     return x[:, :8] * weight[0]
 
 
-def off_in_its_imaginary_part(x, weight):
-    """`multiplied` with each value's imaginary part a thousandth too large, its real part exact."""
-    out = multiplied(x, weight)
-    return out + jnp.complex64(1j) * (jnp.imag(out) * jnp.float32(1e-3))
+COMPLEX_ARMS = {"elementwise": multiplied, "a product": product}
+"""Complex arms: a product of the values alone, and one that sums products, which check 1 runs on a CPU
+under JAX's F32_F32_F32 preset (`summed_as_run`), whose casts kept only the real parts of a complex
+product's operands until the fork's release that decomposes it (row 7191)."""
 
 
-def test_an_error_in_a_complex_values_imaginary_part_alone_fails():
+def off_in_its_imaginary_part(arm):
+    """`arm` with each value's imaginary part a thousandth too large, its real part exact."""
+    def off(x, weight):
+        out = arm(x, weight)
+        return out + jnp.complex64(1j) * (jnp.imag(out) * jnp.float32(1e-3))
+    return off
+
+
+@pytest.mark.parametrize("name", COMPLEX_ARMS)
+def test_an_error_in_a_complex_values_imaginary_part_alone_fails(name):
     """A complex output is judged by its values' magnitudes: an arm whose real parts are the reference's
-    and whose imaginary parts are a thousandth off fails, where reading the real parts alone passes it.
-    Elementwise: a complex product under JAX's F32_F32_F32 preset, which check 1 runs CPU arms under
-    (`summed_as_run`), loses its imaginary part in both arms (row 7191)."""
+    and whose imaginary parts are a thousandth off fails, where reading the real parts alone passes it,
+    elementwise and through a product's sums."""
+    arm = COMPLEX_ARMS[name]
     with pytest.raises(GateFailure):
-        assert_as_exact(off_in_its_imaginary_part, multiplied, turned, "off in its imaginary part", seeds=8)
+        assert_as_exact(off_in_its_imaginary_part(arm), arm, turned, f"off in its imaginary part, {name}",
+                        seeds=8)
 
 
 @pytest.mark.parametrize("name", INJECTED)

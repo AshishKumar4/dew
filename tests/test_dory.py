@@ -3,7 +3,6 @@ tools/dory_reference.py transcribes its forward and writes tests/fixtures/hf/dor
 tests' reference, and tests/fixtures/hf/dory-1.0-4b holds the released config and what vLLM's
 own engine computes of the release on a GPU (tools/dory_vllm_reference.py)."""
 
-import contextlib
 import dataclasses
 import itertools
 import json
@@ -14,8 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-import tier_wire
-from arm_arithmetic import float64_held
+from arm_arithmetic import ahead_on_the_host, float64_held
 from decision_support import decision_rows
 from float64_terms import float64_forward
 from interop_support import assert_reloads, assert_same_stored_tensors, token_draw
@@ -61,20 +59,6 @@ TINY = FIXTURES / 'dory-tiny'
 RELEASED = FIXTURES / 'dory-1.0-4b'
 REFERENCE = np.load(TINY / 'reference.npz')
 TOOL = load_tool('dory_reference')
-
-
-def ahead_on_the_host():
-    """Where a GPU tier part's prepare runs a test, whose default device is a compile-only GPU that computes
-    nothing, the host's CPU as its default device; elsewhere the test's own: the context of what a cell
-    computes before its first check-1 site (a load, an export, a behavioral decode), so its prepare reaches
-    its sites (rows 11424-11619: every cell computing there first was left unprepared). Its kernels are
-    the host's own (no GPU `generation.assumed`): a GPU's would not run there."""
-    if not tier_wire.preparing():
-        return contextlib.nullcontext()
-    host = contextlib.ExitStack()
-    host.enter_context(jax.default_device(jax.devices("cpu")[0]))
-    host.enter_context(generation.assumed(None))
-    return host
 
 
 def load(**fields):

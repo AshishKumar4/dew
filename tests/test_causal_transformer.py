@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from flax import linen as nn
 from model_support import (
     TINY_DECODER,
@@ -1717,10 +1718,12 @@ def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels():
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     named, plain = model.clone(attention_impl='cudnn'), model.clone(attention_impl='xla')
     wide = float64(model)
-    _, segment_ids, positions = packed_pair(jax.random.key(0))
+    # Its batch's layout made on the host in a GPU tier prepare (`ahead_on_the_host`, rows 7858, 7859).
+    with ahead_on_the_host():
+        _, segment_ids, positions = packed_pair(jax.random.key(0))
+        cotangent = jax.random.normal(jax.random.key(1), (2, SEQ, VOCAB), jnp.float32)
+        valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
     packed = {"positions": positions, "segment_ids": segment_ids}
-    cotangent = jax.random.normal(jax.random.key(1), (2, SEQ, VOCAB), jnp.float32)
-    valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
     prompt = 4
     made, step = decode_steps(model)
     prefill = jax.jit(lambda params, cache, ids: model.apply(

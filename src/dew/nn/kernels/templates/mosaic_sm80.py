@@ -359,8 +359,22 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`), one
         # instruction's at the narrowest swizzle (a stream staged so by `streams`' `swizzles`: D64's K in
         # QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, census80). An ordinary one slices
-        # its rows' 8-row tiles.
+        # its rows' 8-row tiles. Which slices of it stay live is `operand_live_depth`'s.
         return self._staged_depth(depth, swizzle) if transposed else self.fragment_depth(depth)
+
+    def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False,
+                           transposed: bool = False) -> int:
+        # A transposed granule read once (not `retained`) that is its step's whole depth at two
+        # instructions dies a slice at a time as its products issue: one instruction's live, an ordinary
+        # one's lookahead (a transposed matrix's input gradient held as its forward is at a 32-deep step,
+        # FS-5634-DX-sm80/-sm86). Deeper granules keep the rule below: a 64-deep step's input gradient ran
+        # 24-40 registers past its forward, and a recurrence backward's 64-deep transposed reads compiled
+        # spill-free at it (FS-5634-RECUR). A retained one is read again by a later product and keeps its
+        # whole granule (`_query_key_held`).
+        instruction = self.fragment_depth(depth)
+        if transposed and not retained and loaded == depth == 2 * instruction:
+            return instruction
+        return super().operand_live_depth(depth, loaded, retained=retained, transposed=transposed)
 
     def lhs_fragment_depth(self, depth: int, *, swizzle: int | None = None) -> int:
         # A whole tile of the swizzle its stage takes: one instruction's depth where it is staged plain or

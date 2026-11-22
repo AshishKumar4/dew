@@ -34,6 +34,7 @@ from dew.nn.kernels.templates import (
     outputs,
     placed,
     resources,
+    stores,
     swizzling,
 )
 from dew.nn.kernels.templates.attention import (
@@ -496,22 +497,17 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
 
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
                  products: tuple | None = None, over_rings: bool = False,
-                 values: tuple[dict, tuple] | tuple[dict, tuple, tuple] | None = None) -> resources.Scope:
+                 values: tuple[dict, tuple] | None = None) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
     walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
     where its `products` take one (`Family.product_held`, its tensor memory's addresses
     `Issuer.product_addresses`), its issuer's scratch values where `values` are given
-    (`Issuer.value_scratch`: TPU VMEM live tiles, row 10771), with the algebra's reductions' scratch where it
+    (`Issuer.value_scratch`: TPU VMEM live tiles, row 10965), with the algebra's reductions' scratch where it
     `reduces` (a launch reducing its scores, weights or cotangents across warps) and its
     `reducing_warpgroups`' scratch (`resources.Scope`)."""
     scoped, streams, *after = allocations
     after_walks = tuple(after[0]) if after else ()
-    if values is None:
-        scratch = ()
-    elif len(values) == 3:
-        scratch = family.value_scratch(values[0], values[1], step=values[2])
-    else:
-        scratch = family.value_scratch(values[0], values[1])
+    scratch = () if values is None else family.value_scratch(*values)
     if after_walk.uses_over_rings(family, after_walks, over_rings=over_rings):
         added, rest, _ = after_walk.over_rings_plan(streams, after_walks)
         held, walks = family.lifetimes(rest)
@@ -1867,15 +1863,16 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
     return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in chunked]
 
 
-def _wide_wgmma_extra(family: mosaic.Family, block_q: int, value_width: int, *,
-                      residuals: bool) -> list[tuple]:
-    """Wide (>128) register-home Wgmma forward accumulator/staging pressure across the softmax step
-    (spilling 16-32B on cuda12 ptxas at consumers=2's 240-reg cap): 64 f32 cols in training and 112 in
-    inference shifts consumers=2 past 240 while consumers=1 fits 255 with 3 TMA stages (rows 5272, 10890)."""
-    if (not family.operands_in_registers and not family.places_on_role and not scopes_products(family)
-            and value_width > 128):
-        return [(block_q, 64 if residuals else 112, jnp.float32)]
-    return []
+def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, value_width: int, dtype, *,
+                        residuals: bool) -> int:
+    """Wide (>128) inference epilogue's live registers (`attention_mosaic_forward._stored_walk`): chunks
+    `state.acc` by `stores.staged_columns`, holding the fp32 slice/quotient/finished chunk and narrowed
+    output beside carried `state.acc` and its two finished rows `(maximum, denominator)` (row 10964)."""
+    if residuals or family.operands_in_registers or scopes_products(family) or value_width <= 128:
+        return 0
+    chunk = stores.staged_columns(value_width, (dtype,))
+    phase = [(block_q, chunk, jnp.float32)] * 3 + [(block_q, chunk, dtype)]
+    return resources.live_registers(family, carried, phase) + 2 * family.row_registers(block_q, jnp.float32)
 
 
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
@@ -1952,7 +1949,6 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
             step.append((block_k, value_width * family.rhs_copies, dtype))
     masks = _mask_places(family, block_q, block_k)
     step += masks
-    step += _wide_wgmma_extra(family, block_q, value_width, residuals=residuals)
     # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
@@ -1993,9 +1989,10 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     if codes:
         phases += _converted(block_k, value_width if width is None else width, value_width)
-    walked = (max(resources.live_registers(family, carried, *phases, *products), scored)
-              + _held_registers(family, block_q, params, residuals=residuals, natural=natural)
-              + (_started_rows(family, block_q) if started else 0))
+    walked = max(max(resources.live_registers(family, carried, *phases, *products), scored)
+                 + _held_registers(family, block_q, params, residuals=residuals, natural=natural)
+                 + (_started_rows(family, block_q) if started else 0),
+                 _epilogue_registers(family, carried, block_q, value_width, dtype, residuals=residuals))
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
 
 
@@ -2139,6 +2136,11 @@ class ForwardRegisters:
     prologue: tuple | None = None
     """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
     parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
+    prescaled: bool = False
+    """Whether the plain launch applies non-unit query `prescale` in-kernel."""
+    rewalk_prescaled: bool = False
+    """Whether the natural rewalk applies non-unit query `prescale` in-kernel."""
+
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
         """A consumer's registers at `tiles` on `family`: its walk's over the values' columns its launch
@@ -2148,8 +2150,14 @@ class ForwardRegisters:
         if not family.budgets_registers:
             return None
         width = _width(self.width, family, self.dtype)
-        before = (0 if self.prologue is None
-                  else prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue))
+        in_kernel_prescale = self.prescaled or (tiles.natural_form and self.rewalk_prescaled)
+        if self.prologue is not None:
+            before = prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue)
+        elif (in_kernel_prescale and self.parts == 1 and jnp.dtype(self.dtype).itemsize == 2
+              and family.fixes_up and not family.places_on_role and query_swizzle(family) is None):
+            before = resources.live_registers(family, [], [(tiles.block_q, width, self.dtype)])
+        else:
+            before = 0
         if peaks:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
         value_width = value_columns(_width(self.value_width, family, self.dtype), columns or tiles.columns)
@@ -2221,22 +2229,13 @@ STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total",
 """Stream priority for per-query statistics (`STATISTICS`): `peak`, `total`, and `delta` first so
 the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
 
-def tpu_forward_step_tiles(block_q: int, block_k: int, *, natural_form: bool, scaled: bool) -> tuple:
-    """Live `(block_q, block_k)` fp32 score tiles held in TPU VMEM during a forward step
-    (`MxuIssuer.value_scratch(step=...)` bills `VALUES` copies each; 6 + 6 natural/scaled, row 10771)."""
-    base = ("logits", "coords", "shifted", "exponentials", "weights", "rescaled")
-    extra = ("scaled_logits", "small_weights", "small_exp", "guard_mask", "scaled_sum", "restored")
-    count = len(base) + (len(extra) if natural_form or scaled else 0)
-    return (((block_q, block_k), jnp.float32),) * count
 
-
-def tpu_backward_step_tiles(block_q: int, block_k: int) -> tuple:
-    """Live `(block_q, block_k)` fp32 score tiles held in TPU VMEM during a backward step
-    (`MxuIssuer.value_scratch(step=...)` bills `VALUES` copies each; 10 beside 3 fp32 accumulators,
-    v5e 22 MiB, row 10771)."""
-    names = ("logits", "dp", "coords", "mask", "shifted", "exponentials", "weights", "ds",
-             "weights_cast", "ds_cast")
-    return (((block_q, block_k), jnp.float32),) * len(names)
+def streamed_statistics_order(count: int | None = None, *, anchored: bool = True) -> tuple[str, ...]:
+    """The first `count` (or all) per-query statistics streamed in priority order, excluding `chosen` when
+    `not anchored` (row 11710)."""
+    names = (STATISTICS_STREAM_ORDER if anchored
+             else tuple(name for name in STATISTICS_STREAM_ORDER if name != "chosen"))
+    return names if count is None else names[:count]
 
 
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,

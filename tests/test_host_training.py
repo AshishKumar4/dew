@@ -1384,22 +1384,12 @@ def streamed_only() -> int:
     """The allocator limit a stand-in H100 states where the decoder's fresh fit streams its parameters from
     the host, the one plan it holds: midway between what the planner needs of each (`streaming_needs`),
     below the streamed step's need or the state's, whichever is more, above the device plan's rung, at most
-    the least its ladder reaches beneath it. The planner is asserted to stream there, so a change that
-    closes the gap fails here."""
-    from model_support import memory_limited_to
-
-    from dew.training.ahead import stand_in_gpus
-
+    the least its ladder reaches beneath it. Each caller's first fit there asserts that it streams, so a
+    change that closes the gap fails there (row 8411: a fit of its own asserted it, the sixth of a test's)."""
     state, streamed, device = streaming_needs()
     below = max(streamed, state)
     assert below < device, (state, streamed, device)
-    midway = (below + device) // 2
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(midway)):
-        tight = streaming_decoder()
-        tight.fit(streaming_data(), steps=1, log_every=100)
-    assert tight.layout_choice is not None and tight.layout_choice.streams, (below, midway, device,
-                                                                              tight.layout_choice)
-    return midway
+    return (below + device) // 2
 
 
 def test_a_fit_whose_devices_hold_neither_step_searches_the_devices_once_before_placing(caplog):
@@ -1448,6 +1438,7 @@ def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_stat
         with pytest.raises(PlanRefused):
             stated.fit(streaming_data(), steps=1, log_every=100)
     # The one plan its devices hold: laid out as the streamed layout states, through its construction.
+    assert chosen.layout_choice is not None and chosen.layout_choice.streams, chosen.layout_choice
     assert chosen.host_master and chosen.layout == given.layout, chosen.layout_choice
     assert not stated.host_master
     equal(trained.variables, expected.variables)
@@ -1541,7 +1532,9 @@ def test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood(t
     # One Adam for the three runs, so each reads the step the first traced (row 8411).
     cpus, tight, adam = jax.devices("cpu"), memory_limited_to(streamed_only()), optax.adam(.001)
     with assumed_on_cpu("sm90"), stand_in_gpus(cpus, tight):
-        expected = streaming_decoder(optimizer=adam).fit(streaming_data(), steps=3, log_every=100)
+        straight = streaming_decoder(optimizer=adam)
+        expected = straight.fit(streaming_data(), steps=3, log_every=100)
+        assert straight.layout_choice is not None and straight.layout_choice.streams, straight.layout_choice
         streaming_decoder(checkpoints=Checkpoints(str(tmp_path / "run")), optimizer=adam).fit(
             streaming_data(), steps=1, checkpoint_every=1, log_every=100)
     resumed = streaming_decoder(checkpoints=Checkpoints(str(tmp_path / "run")), optimizer=adam)

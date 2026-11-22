@@ -104,16 +104,20 @@ def value_unit(family: mosaic.Family) -> int:
     return family.narrowest_columns(jnp.bfloat16)
 
 
-def values_unit(family: mosaic.Family, *, kept: bool, per_key: bool) -> int:
-    """The step a call's values are padded in on `family`'s bundle: whole value tiles (`value_unit`), which
-    the fast backward's launches step through (`Call.value_block`), but whole tiles (`block_of`) where its
-    fast backward reads what the forward keeps (`kept`) and either the decay is a key dimension's or the
-    family's products read their operands from registers: a decay a key dimension's key memory backward walks
-    key blocks down to 8 rows, whose memories' cp.async copies tile only at whole 128-byte rows, an A100's at
-    a 16-wide value tile refused ('Number of tiles is not a multiple of 4', jsf-narrow80; a per-head launch's
-    memories take a tile's 64 rows); and mma.sync's query-key backward at a 16-wide value tile spilled a
-    160-byte frame at 255 registers on an A100, Nemotron-H 4B's training refused there (M-JS-58)."""
-    whole = per_key or family.operands_in_registers
+def values_unit(family: mosaic.Family, value_width: int, *, kept: bool, per_key: bool) -> int:
+    """The step a call's `value_width` values are padded in on `family`'s bundle: whole value tiles
+    (`value_unit`), which the fast backward's launches step through (`Call.value_block`), but whole tiles
+    (`block_of`) where its fast backward reads what the forward keeps (`kept`) and either the decay is a key
+    dimension's or the family's products read their operands from registers and the values fit one tile. A
+    decay a key dimension's key memory backward walks key blocks down to 8 rows, whose memories' cp.async
+    copies tile only at whole 128-byte rows, an A100's at a 16-wide value tile refused ('Number of tiles is
+    not a multiple of 4', jsf-narrow80; a per-head launch's memories take a tile's 64 rows). mma.sync's
+    query-key backward at a 16-wide value tile spilled on calls within one tile, which walk one value block
+    either way (keys 16 and values 8 wide, 16 and 64 value heads a key head: 255 registers and a 200- to
+    232-byte frame against a stated 232, M-JS-195), where at a whole tile it was refused at derivation; past
+    one tile its whole value tiles keep the padding's work off, Nemotron-H 4B's 80-wide values training in
+    3799.4 us a step on an A100 against 4628.8 at 96 (M-JS-195)."""
+    whole = per_key or (family.operands_in_registers and value_width <= block_of(family))
     return block_of(family) if kept and whole else value_unit(family)
 
 
@@ -123,7 +127,7 @@ def padded_widths(family: mosaic.Family, key_width: int, value_width: int, *, ke
     steps (`values_unit`), and, at chosen `tiles`, to the steps its walks' and output's blocks divide: the
     one derivation a plan's costing (`template._widths`) and the operands its launches allocate
     (`chunk_forward.prepared`) both read."""
-    unit = values_unit(family, kept=kept, per_key=per_key)
+    unit = values_unit(family, value_width, kept=kept, per_key=per_key)
     if tiles is not None:
         unit = math.lcm(unit, tiles.block_v * tiles.walkers, tiles.block_o or tiles.block_v)
     block = block_of(family)

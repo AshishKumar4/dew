@@ -365,12 +365,13 @@ cache of a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 infe
 serves the call as the work list (`_served`)."""
 
 
-DECODE_GATE_BATCHES = _batched_gate(DECODE_GATE, lambda c: (c[0], c[2]), lambda c: (c[1], c[3]))
+DECODE_GATE_BATCHES = _batched_gate(DECODE_GATE, lambda c: (c[0], c[2]), lambda c: (c[1], c[3]),
+                                    max_items=3)
 
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "stored", "items"), DECODE_GATE_BATCHES,
-                         ids=[f"{g}-{s}" for g, s, _ in DECODE_GATE_BATCHES])
+                         ids=[f"{g}-{s}-{i}" for i, (g, s, _) in enumerate(DECODE_GATE_BATCHES)])
 def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, stored, items):
     """A decode step (`attention_decode.attend`: its plain launch at the plan's streaming key tile and
     slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
@@ -472,14 +473,15 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
     assert not failed, "\n".join(failed)
 
 
-FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3])
+FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3],
+                                     max_items=2)
 
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "training", "dtype", "hooks_batch"),
                          FORWARD_GATE_BATCHES,
-                         ids=[f"{g}-{w}-{t.name}-{jnp.dtype(d).name}"
-                              for g, w, t, d, _ in FORWARD_GATE_BATCHES])
+                         ids=[f"{g}-{w}-{t.name}-{jnp.dtype(d).name}-{'+'.join(h)}"
+                              for g, w, t, d, h in FORWARD_GATE_BATCHES])
 def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, dtype,
                                                               hooks_batch):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
@@ -590,7 +592,7 @@ def test_a_short_training_calls_backward_compiles_spill_free_for_an_a100(tokens,
 
 
 BACKWARD_GATE_BATCHES = _batched_gate(BACKWARD_GATE, lambda c: (c[0], c[1], c[2]), lambda c: c[3],
-                                      max_items=2)
+                                      max_items=1)
 
 
 def _check_backward_batch(generation_name: str, width: int, accurate: bool,
@@ -914,6 +916,7 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert all(stored for _, stored, _ in warm), warm
     assert certified(warm) == certified(cold)
 
+@COMPILES_ON_CPU
 def test_a_launchs_stored_verdict_is_not_read_where_another_nvcc_wheel_is_installed(tmp_path):
     """A launch certified by one process is certified again by the next where the installed CUDA nvcc wheels
     differ (another wheel's metadata on its path, its kernels' IR the same): the wheels name the ptxas that
@@ -1089,7 +1092,7 @@ def test_a_refused_launch_states_its_model_beside_the_assemblers_registers():
                   if miss.op == type(op).__name__ and miss.config == config]
         budget = op.register_budget(config)
     assert len(missed) == len(spilling), (missed, spilling)
-    refused_by_ptxas = [(miss.frame or 0) > 0 or (miss.registers or 0) > budget or bool(miss.serialized)
+    refused_by_ptxas = [(miss.spilled or 0) > 0 or (miss.registers or 0) > budget or bool(miss.serialized)
                         for miss in missed]
     assert all(refused_by_ptxas), (missed, budget)
     assert all(miss.modelled is not None and miss.stepped for miss in missed), missed
@@ -1732,7 +1735,11 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
 
 
 @COMPILES_ON_CPU
-def test_sm90_d256_forward_fits_single_launch_without_spills():
+@pytest.mark.parametrize("gen", ["sm90", "sm80"])
+@pytest.mark.parametrize(("label", "residuals"),
+                         [("infer", template.Kept.NONE), ("train", template.Kept.OUTPUT)],
+                         ids=["infer", "train"])
+def test_sm90_d256_forward_fits_single_launch_without_spills(gen, label, residuals):
     """Row 5272: chunking wide (>128) register epilogues lets d256 bf16 causal forward (inference and
     training) derive and compile at `columns=None` (1 launch, 0 spills) on sm90 instead of spilling
     96-112 bytes in `algebra.finish` and falling back to 2-launch `columns=128`."""
@@ -1742,26 +1749,22 @@ def test_sm90_d256_forward_fits_single_launch_without_spills():
     spans = template.spans(4096, 4096, 1, causal=True)
     q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
     k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
-    for gen in ("sm90", "sm80"):
-        with generation.assumed(gen):
-            cases = []
-            for label, residuals in (("infer", template.Kept.NONE), ("train", template.Kept.OUTPUT)):
-                def _make(residuals=residuals):
-                    def forward(query, key, value):
-                        return attention_mosaic.forward(query, key, value, spans, None, residuals=residuals)
-                    return forward, (q, k, k)
-                cases.append(KernelCase(f"{gen}-d256-{label}", _make))
-            found = compile_mosaic_kernels(cases, gen)
-            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-            for record in found:
-                assert any(kernel["kernel"] == "attention_forward"
-                           for kernel in record.get("kernels", ())), record
+    with generation.assumed(gen):
+        def forward(query, key, value):
+            return attention_mosaic.forward(query, key, value, spans, None, residuals=residuals)
+
+        found = compile_mosaic_kernels([KernelCase(f"{gen}-d256-{label}", lambda: (forward, (q, k, k)))],
+                                       gen)
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+        for record in found:
+            assert any(kernel["kernel"] == "attention_forward"
+                       for kernel in record.get("kernels", ())), record
 
 
 @COMPILES_ON_CPU
-def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
+@pytest.mark.parametrize("gen", ["sm80", "sm100"])
+def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100(gen):
     """Row 10682: fused dK/dV at width 64 derives and compiles spill-free on sm80 and sm100."""
-    from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
@@ -1770,53 +1773,44 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
     key = jax.ShapeDtypeStruct((1, queries, 2, 64), jnp.bfloat16)
     shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
                           _residuals(query.shape))
-
-    def backward(q, k, v, dout, residuals):
-        grads = attention_mosaic.backward(q, k, v, spans, None, dout, residuals=residuals, accurate=False)
-        return grads.query, grads.key, grads.value
-
-    for gen in ("sm80", "sm100"):
-        _, _, cfg = _gated_backward(gen, 64, accurate=False)
-        assert cfg is not None and cfg.fused, (gen, cfg)
-        if gen == "sm100":
-            assert cfg.stages >= 3, cfg
-        with generation.assumed(gen):
-            found = compile_mosaic_kernels([
-                KernelCase(f"{gen}-fused-d64", lambda: (backward, (query, key, key, query, shapes))),
-            ], gen)
-            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    _, _, cfg = _gated_backward(gen, 64, accurate=False)
+    assert cfg is not None and cfg.fused, (gen, cfg)
+    if gen == "sm100":
+        assert cfg.stages >= 3, cfg
+    with generation.assumed(gen):
+        case = _fast_backward_compile_case(f"{gen}-fused-d64", query, key, spans, shapes)
+        found = compile_mosaic_kernels([case], gen)
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
 @COMPILES_ON_CPU
-def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compiles_spill_free():
+@pytest.mark.parametrize(("label", "heads", "kv_heads", "width"),
+                         [("sm90-mha-d64", 16, 16, 64), ("sm90-qwen-d128", 32, 8, 128),
+                          ("sm90-qwen-d256", 8, 2, 256)],
+                         ids=["d64", "d128", "d256"])
+def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compiles_spill_free(
+        label, heads, kv_heads, width):
     """Row 5272: compute-bound multi-consumer sm90 forward deepens its TMA ring to `consumers + 1` stages
-    when SMEM holds it without reducing SM residency, and compiles spill-free at d64 and d128."""
+    when SMEM holds it without reducing SM residency, and compiles spill-free at d64, d128 and d256."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         spans = template.spans(4096, 4096, 1, causal=True)
-        cases = []
-        for label, heads, kv_heads, width in (("sm90-mha-d64", 16, 16, 64), ("sm90-qwen-d128", 32, 8, 128),
-                                              ("sm90-qwen-d256", 8, 2, 256)):
-            q = jax.ShapeDtypeStruct((2, 4096, heads, width), jnp.bfloat16)
-            k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
-            op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
-                                                      natural=attention_mosaic.NATURAL)
-            ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
-            cfg = op.derived(ba, target)
-            assert cfg is not None and cfg.stages >= 3, (label, cfg)
-            def _make(q=q, k=k):
-                def forward(query, key, value):
-                    return attention_mosaic.forward(query, key, value, spans, None,
-                                                    residuals=template.Kept.NONE)
-                return forward, (q, k, k)
+        q = jax.ShapeDtypeStruct((2, 4096, heads, width), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
+        op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        cfg = op.derived(ba, target)
+        assert cfg is not None and cfg.stages >= 3, (label, cfg)
 
-            cases.append(KernelCase(label, _make))
-        found = compile_mosaic_kernels(cases, "sm90")
+        def forward(query, key, value):
+            return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.NONE)
+
+        found = compile_mosaic_kernels([KernelCase(label, lambda: (forward, (q, k, k)))], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
 
 def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
     """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) through
@@ -1858,12 +1852,23 @@ def test_derived_one_consumer_heights_are_compared_by_choose():
     assert any({(c.block_q, c.block_k) for c in group} >= {(128, 32), (64, 64)} for group in seen), seen
 
 
+def _fast_backward_compile_case(name: str, q, k, spans, shapes):
+    """Build a `KernelCase` for fast-form Mosaic backward compilation."""
+    from fla_gdn_support import KernelCase
+
+    def backward(query, key, value, dout, residuals):
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                          residuals=residuals, accurate=False)
+        return grads.query, grads.key, grads.value
+
+    return KernelCase(name, lambda: (backward, (q, k, k, q, shapes)))
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("gen", ["sm90", "sm80"])
 def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
     """Row 5272: qwen3-8b d128 fused backward deepens its ring to 3 stages without losing SM residency
     on both sm90 (`wgmma.fed`) and sm80 (`mma.sync` cp.async) and compiles spill-free."""
-    from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed(gen):
@@ -1879,13 +1884,210 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
         cfg = op.derived(ba, target)
         assert cfg is not None and cfg.fused and cfg.stages >= 3, (gen, cfg)
         assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
+        case = _fast_backward_compile_case(f"{gen}-fused-d128-3stage", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], gen)
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
-        def _make():
-            def backward(query, key, value, dout, residuals):
+def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
+    """Row 5272: split `derived_weights` + `derived_from_weights` match `derived_cotangents` bit-for-bit
+    (masked and unmasked), and `streamed_statistics(..., anchored=False)` excludes dead `chosen`."""
+    from dew.nn.kernels.templates import (
+        attention_backward_algebra as bwd_alg,
+        attention_mosaic_fused as fused,
+        attention_mosaic_program as program,
+    )
+
+    rng = jax.random.key(5272)
+    k1, k2, k3, k4, k5 = jax.random.split(rng, 5)
+    logits = jax.random.normal(k1, (64, 64), jnp.float32)
+    products = jax.random.normal(k2, (64, 64), jnp.float32)
+    peak = jnp.max(logits, axis=-1)
+    total = jnp.sum(jnp.exp(logits - peak[:, None]), axis=-1)
+    anchor = jax.random.normal(k3, (64,), jnp.float32)
+    delta = jax.random.normal(k4, (64,), jnp.float32)
+    seen = jax.random.bernoulli(k5, 0.7, (64, 64))
+
+    for masked in (False, True):
+        full_in = {"logits": logits, "products": products, "peak": peak, "total": total,
+                   "anchor": anchor, "delta": delta, **({"seen": seen} if masked else {})}
+        e_ref, w_ref, ds_ref = bwd_alg.derived_cotangents(
+            keys_first=False, dropped=False, masked=masked).mapped(full_in)
+        e_got, w_got = bwd_alg.derived_weights(keys_first=False, accurate=False).mapped(
+            {"logits": logits, "peak": peak, "total": total})
+        ds_in = {"weights": w_got, "products": products, "anchor": anchor, "delta": delta,
+                 **({"seen": seen} if masked else {})}
+        ds_got = bwd_alg.derived_from_weights(keys_first=False, masked=masked).mapped(ds_in)
+        assert jnp.array_equal(e_got, e_ref)
+        assert jnp.array_equal(w_got, w_ref)
+        assert jnp.array_equal(ds_got, ds_ref)
+
+    with generation.assumed("sm90"):
+        family = program.bundle("sm90", jnp.bfloat16)
+        cfg = program.BackwardTiles(64, 64, 2, 2, fused=True, family=family.name)
+        unanchored = fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=False)
+        anchored = fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=True)
+        assert unanchored == 4 and anchored == 5, (unanchored, anchored)
+        assert "chosen" not in program.STATISTICS_STREAM_ORDER[:unanchored]
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
+    """Row 5272: sm90 overlapped fused backward (`_overlapped_fused_step`: S softmax overlapped with dP,
+    dS overlapped with dV, add_dq overlapped with dK) compiles spill-free at d64 and d128."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((2, 4096, 32, width), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, 8, width), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        case = _fast_backward_compile_case(f"sm90-overlapped-fused-d{width}", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
+    """Row 5272: sm90 overlapped shared-keys backward (`attention_dkv_shared`, qwen3.5-0.8b d256) compiles
+    spill-free with `_tile_scores` S/dP overlap and dead `chosen` excluded."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import (
+        attention_mosaic_coop as coop,
+        attention_mosaic_fused as fused,
+        attention_mosaic_program as program,
+    )
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, shapes, scale=1.0,
+                                                   natural=attention_mosaic.NATURAL, accurate=False)
+        cfg = program.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed", shared_keys=True)
+        assert op.takes(op.bind(*args, interpret=False), cfg, target), cfg
+        family = program.bundle_of(cfg, jnp.bfloat16)
+        streamed = fused.streamed_statistics(family, cfg, 256, jnp.bfloat16, cfg.stages, reduced=0,
+                                             allocations_of=coop._coop_allocations, anchored=False)
+        assert streamed > 0 and "chosen" not in program.streamed_statistics_order(streamed, anchored=False)
+        def backward(query, key, value, dout, residuals):
+            with tuning.pinned({attention_mosaic.MosaicBackward: cfg}):
                 grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                                  residuals=residuals, accurate=False)
-                return grads.query, grads.key, grads.value
-            return backward, (q, k, k, q, shapes)
+                                                  residuals=residuals, scale=1.0, accurate=False)
+            return grads.query, grads.key, grads.value
+        from fla_gdn_support import KernelCase
+        found = compile_mosaic_kernels([KernelCase("sm90-overlapped-coop-d256",
+                                                   lambda: (backward, (q, k, k, q, shapes)))], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+        assert any(kernel["kernel"] == "attention_dkv_shared"
+                   for kernel in found[0].get("kernels", ())), found
 
-        found = compile_mosaic_kernels([KernelCase(f"{gen}-fused-d128-3stage", _make)], gen)
+
+@COMPILES_ON_CPU
+def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_deterministic_ops):
+    """Row 5272: sm90 deterministic two-launch keys-first dK/dV (`_splits_scores`) compiles spill-free at
+    d128 with unit prescale."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        def backward(query, key, value, dout, residuals):
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                              residuals=residuals, scale=None, accurate=False)
+            return grads.query, grads.key, grads.value
+        found = compile_mosaic_kernels([KernelCase("sm90-overlapped-dkv-det-d128",
+                                                   lambda: (backward, (q, k, k, q, shapes)))], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+        assert any(kernel["kernel"] == "attention_dkv"
+                   for kernel in found[0].get("kernels", ())), found
+
+
+@COMPILES_ON_CPU
+def test_decode_deepens_to_3_stages_without_losing_residency():
+    """Row 5274: long-context decode (B8 K4096 d128) compiles spill-free at pinned 2- and 3-stage configs
+    with preserved SM residency on sm90."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_decode
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        spans = template.spans(1, 4096, 8, causal=False)
+        qd = jax.ShapeDtypeStruct((8, 1, 32, 128), jnp.bfloat16)
+        kd = jax.ShapeDtypeStruct((8, 4096, 8, 128), jnp.bfloat16)
+        work, rows, row_spans, whole = attention_decode.planned(
+            jnp.zeros(qd.shape, qd.dtype), kd, kd, spans, template.Hooks())
+        assert work is not None, work
+        base = work["plain"].config
+        cfg2 = dataclasses.replace(base, stages=2)
+        cfg3 = dataclasses.replace(base, stages=3)
+        op, args = attention_mosaic._forward_call(
+            rows, kd, kd, row_spans, whole, scale=None, natural=False,
+            out_dtype=jnp.float32 if work["plain"].slices > 1 else None, masked=True,
+            splits=work["plain"].slices, subtracted=True)
+        kept = template.Kept.OUTPUT if work["plain"].slices > 1 else template.Kept.NONE
+        ba = op.bind(*args, residuals=kept, interpret=False)
+        assert op.takes(ba, cfg2, target) and op.takes(ba, cfg3, target)
+        assert op.resident(ba, cfg3, target) == op.resident(ba, cfg2, target)
+        def forward_pinned(cfg):
+            def run(*operands):
+                with tuning.pinned({attention_mosaic.MosaicForward: cfg}):
+                    return op(*operands, residuals=kept, interpret=False)
+            return run
+        cases = [
+            KernelCase("sm90-dec-b8-d128-2stage", lambda: (forward_pinned(cfg2), args)),
+            KernelCase("sm90-dec-b8-d128-3stage", lambda: (forward_pinned(cfg3), args)),
+        ]
+        found = compile_mosaic_kernels(cases, "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("gen", ["sm90", "sm100"])
+def test_forward_registers_charges_prescale_only_when_non_unit(gen):
+    """ReviewNA3532 P2 #6: `ForwardRegisters.at` prices the pre-walk prescale fragment only when
+    `spec.prescale != 1.0`, and wide non-unit prescale forward compiles spill-free on sm90 and sm100."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_mosaic_program as program
+
+    with generation.assumed(gen):
+        spans = template.spans(512, 512, 1, causal=True)
+        q = jax.ShapeDtypeStruct((1, 512, 4, 256), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((1, 512, 2, 256), jnp.bfloat16)
+        op_folded, _ = attention_mosaic._forward_call(
+            q, k, k, spans, None, scale=None, natural=False)
+        op_scaled, _ = attention_mosaic._forward_call(
+            q, k, k, spans, None, scale=None, natural=True)
+        op_unit, _ = attention_mosaic._forward_call(
+            q, k, k, spans, None, scale=1.0, natural=True)
+        reg_folded = op_folded.registered(q, k, (), template.Kept.NONE)
+        reg_scaled = op_scaled.registered(q, k, (), template.Kept.NONE)
+        reg_unit = op_unit.registered(q, k, (), template.Kept.NONE)
+        assert not reg_folded.prescaled and reg_folded.rewalk_prescaled
+        assert reg_scaled.prescaled and not reg_unit.prescaled
+        family = program.bundle(gen, jnp.bfloat16)
+        wide_reg_folded = dataclasses.replace(reg_folded, width=576, value_width=128)
+        wide_reg_scaled = dataclasses.replace(reg_scaled, width=576, value_width=128)
+        wide_reg_unit = dataclasses.replace(reg_unit, width=576, value_width=128)
+        tiles = program.Tiles(64, 64, 2, 1, family=family.name)
+        if family.budgets_registers and program.query_swizzle(family) is None:
+            scaled_regs = wide_reg_scaled.at(family, tiles, peaks=True)
+            folded_regs = wide_reg_folded.at(family, tiles, peaks=True)
+            unit_regs = wide_reg_unit.at(family, tiles, peaks=True)
+            assert scaled_regs is not None and folded_regs is not None and unit_regs is not None
+            assert scaled_regs > unit_regs and folded_regs == unit_regs
+        def forward_scaled(query, key, value):
+            return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.NONE,
+                                            natural=True)
+        found = compile_mosaic_kernels(
+            [KernelCase(f"{gen}-prescaled-d256", lambda: (forward_scaled, (q, k, k)))], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

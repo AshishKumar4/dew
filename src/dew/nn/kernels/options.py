@@ -21,7 +21,7 @@ import types
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, TypedDict, Unpack
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack
 
 import jax
 import numpy as np
@@ -101,8 +101,26 @@ class JitArguments(TypedDict, total=False):
 
 _log = logging.getLogger("dew.kernels")
 
-_PROGRAMS: weakref.WeakSet[OuterProgram] = weakref.WeakSet()
-"""Every program alive (`OuterProgram`), whose executables `release` drops."""
+class Releasing(Protocol):
+    """What keeps compiled programs alive for the process, or lowerings whose live modules key JAX's
+    loaded executables of them: a program (`OuterProgram`) or a cache of lowerings (a trainer's kept traced
+    steps, `dew.training._candidates`), which `release` asks to let them go."""
+
+    def released(self) -> None: ...
+
+
+_HOLDERS: weakref.WeakSet[Releasing] = weakref.WeakSet()
+"""Every holder alive (`held_until_release`), whose executables and lowerings `release` drops."""
+_HOLDERS_LOCK = threading.Lock()
+"""Held as a holder is added and as `release` takes its snapshot of them: a set walked as another thread adds
+to it raises (row 8411's review)."""
+
+
+def held_until_release(holder: Releasing) -> None:
+    """Register `holder` for `release`, held weakly: a program as it is made, a cache as it first keeps a
+    lowering."""
+    with _HOLDERS_LOCK:
+        _HOLDERS.add(holder)
 
 type Taken = Mapping[str, Callable[[], jax.stages.Compiled]]
 """Executables compiled ahead or kept by another process (`dew.training.ahead`), each loaded on demand, by
@@ -512,12 +530,16 @@ _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_p
 
 def release() -> None:
     """Drop every live program's compiled executables (`OuterProgram.released`) and the process's held ones
-    (`held`), as `jax.clear_caches` drops jit's own: XLA:CPU maps each executable's code into the process,
-    and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache JAX
-    clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
+    (`held`), as `jax.clear_caches` drops jit's own, and what else keeps a lowering whose live module keys
+    JAX's loaded executable of it (`held_until_release`): XLA:CPU maps each executable's code into the
+    process, and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache
+    JAX clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
     compiles again at its next call."""
-    for program in list(_PROGRAMS):
-        program.released()
+    # A snapshot taken under the lock, each holder asked outside it: none waits on the set with its own lock.
+    with _HOLDERS_LOCK:
+        holders = list(_HOLDERS)
+    for holder in holders:
+        holder.released()
     unhold()
 
 
@@ -602,7 +624,7 @@ class OuterProgram:
         self._shaped: collections.OrderedDict[Hashable, tuple[jax.stages.Compiled, str | None]] = (
             collections.OrderedDict())
         self._compiling = threading.Lock()
-        _PROGRAMS.add(self)
+        held_until_release(self)
 
     def released(self) -> None:
         """Drop every executable it keeps (`release`), each compiled again at its next call."""
@@ -618,20 +640,36 @@ class OuterProgram:
             return self.function(*args, **kwargs)
         return jax.jit(traced, **self.arguments)
 
-    def _traced(self, jitted: jax.stages.Wrapped, args: tuple, kwargs: dict) -> jax.stages.Traced:
+    def _traced(self, jitted: jax.stages.Wrapped, args: tuple, kwargs: dict
+                ) -> tuple[jax.stages.Traced, jax.stages.Wrapped]:
         """`jitted`'s trace of a call, its program the algebra pass's (`algebra.rewritten_program`), so its
         lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
         §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
         a rule changes lowers from its rewritten program, never traced again (`program.traced_as`). Its
         switch is in JAX's trace context, so a held program traces afresh as it changes. A program called
-        within the trace is part of this one, which the pass reads whole (`_nested`)."""
+        within the trace is part of this one, which the pass reads whole (`_nested`). Within a block
+        certifying aside, the launches an outermost program's trace reaches settle before it is lowered, the
+        program traced afresh past a refused config by a jit of its own, past JAX's trace cache (`_jitted`;
+        `report.settled_trace`), so it lowers once; a program traced within another's (a launch's own, as its
+        capture traces it) settles nothing mid-trace. Beside its trace, the jit that made it."""
+        from dew.nn.kernels.templates import report
+
+        outermost = not _PASSING.get()
         token = _PASSING.set(True)
+        made = jitted
+
+        def retraced() -> jax.stages.Traced:
+            nonlocal made
+            made = self._jitted()
+            return made.trace(*args, **kwargs)
+
         try:
-            traced = jitted.trace(*args, **kwargs)
+            trace = functools.partial(jitted.trace, *args, **kwargs)
+            traced = report.settled_trace(trace, retraced) if outermost else trace()
             rewritten = algebra.rewritten_program(traced.jaxpr)
             if rewritten is traced.jaxpr:
-                return traced
-            return algebra.program.traced_as(traced, rewritten)
+                return traced, made
+            return algebra.program.traced_as(traced, rewritten), made
         finally:
             _PASSING.reset(token)
 
@@ -830,22 +868,14 @@ class OuterProgram:
         read (`report.settled`)."""
         from dew.nn.kernels.templates import report
 
-        with report.certifying_aside() as aside:
-            lowered = self.lower(*args, **kwargs)
-        report.settled_aside(aside)
-        seen: set = set()
-        while (refused := report.refused_in(lowered)) and not refused & seen:
-            seen |= refused
-            with report.certifying_aside() as aside:
-                lowered = self._relowered(args, kwargs, relowered)
-            report.settled_aside(aside)
-        return lowered
+        return report.lowered_aside(lambda: self.lower(*args, **kwargs),
+                                    lambda: self._relowered(args, kwargs, relowered), lambda lowered: lowered)
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on
         the thread that keeps it, each relowering with its jit kept in `relowered`."""
-        fresh = self._jitted()
-        relowering = self._traced(fresh, args, kwargs).lower()
+        traced, fresh = self._traced(self._jitted(), args, kwargs)
+        relowering = traced.lower()
         relowered.append((fresh, relowering))
         return relowering
 
@@ -990,7 +1020,9 @@ class OuterProgram:
         return self.trace(*args, **kwargs).lower()
 
     def trace(self, *args, **kwargs) -> jax.stages.Traced:
-        return self._traced(self.jitted, args, kwargs)
+        # A trace a settle made afresh (`_traced`) is the program's from here on, as a relowering's is.
+        traced, self.jitted = self._traced(self.jitted, args, kwargs)
+        return traced
 
     def key_of(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static

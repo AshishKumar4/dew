@@ -56,7 +56,13 @@ def holding[Key: Hashable, Value](cache: collections.OrderedDict[Key, Value], ke
 
 
 _HOLDING = threading.Lock()
-"""Held while a held value's cache is read or written (`holding`)."""
+"""Held while a held value's cache is read or written (`holding`, `cleared`)."""
+
+
+def cleared(cache: collections.OrderedDict) -> None:
+    """Forget every value `cache` holds (`holding`'s), under the lock its reads and writes take."""
+    with _HOLDING:
+        cache.clear()
 
 VERSION_FILE = "_version.py"
 """The release's version (`dew._version`), which no code of Dew's computes from: no part of its

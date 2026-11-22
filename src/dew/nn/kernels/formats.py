@@ -29,8 +29,8 @@ this Dew's form, so a load refuses them (`NvFp4.checked`; algebra.md 7.4, row 61
 class NvFp4:
     """An NVFP4 matrix `[depth, width]` as the GEMM stores it (row 3621), K-major, each column's depths
     along its row (as a Dense kernel read transposed): its E2M1 codes eight a uint32 in the GEMM's staged
-    depth order (`words`, `[width, depth / 8]`: `staged_rows`, each word the
-    `bits.NVFP4_BFLOAT16_FORM.prepared` word of its eight codes), each sixteen consecutive depths' E4M3
+    depth order (`words`, `[width, depth / 8]`: `staged_rows`, each word the `bits.NVFP4_BFLOAT16_FORM` word
+    of its eight codes, `_staged_words`), each sixteen consecutive depths' E4M3
     scale (`scales`, `[width, depth / 16]`, in the depths' own order), and the tensor's fp32 scale
     (`scale`, a scalar): each value its code times its block's scale times the tensor's. Its depth is whole
     stages (`NVFP4_STAGE`): the mainloop's stage decode reads each column's words and scales as rows a TMA
@@ -87,9 +87,8 @@ class NvFp4:
         checkpoint's NVFP4 weight, its codes packed in the staged order, K-major. NumPy codes, scales and
         scale give a NumPy matrix (packed on the host, nothing copied to a device: a load places each
         expert shard's itself)."""
-        depth = codes.shape[-2]
-        if depth % NVFP4_STAGE:
-            raise ValueError(f"an NVFP4 matrix's depth is whole {NVFP4_STAGE}s, not {depth}")
+        if (why := unstaged(codes.shape[-2])) is not None:
+            raise ValueError(f"an NVFP4 matrix: {why}")
         host = isinstance(codes, np.ndarray) and isinstance(scales, np.ndarray)
         xp = np if host and not isinstance(scale, jax.Array) else jnp
         words = _staged_words(codes, xp)
@@ -139,6 +138,13 @@ class NvFp4:
 NVFP4_STAGE = packed.NVFP4_STEP
 """The depths a stage of the mainloop's NVFP4 decode reads: two groups, so each column's scales are a
 16-byte row (a TMA copy's least)."""
+
+
+def unstaged(depth: int) -> str | None:
+    """Why a matrix of `depth` inputs is no NVFP4 matrix (`NvFp4`: its depth whole `NVFP4_STAGE`s), or None:
+    what a load asks of a weight's shape before it reads any of its values (row 11643's review: an MXFP4
+    bank's powers and conversion, gigabytes on a host, were made for banks no stage holds)."""
+    return f"its depth {depth} is no whole {NVFP4_STAGE}-deep stages" if depth % NVFP4_STAGE else None
 
 
 def staged_rows(depth: int) -> np.ndarray:

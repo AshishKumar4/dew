@@ -152,16 +152,14 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         # Only the segmented TPU walk (`masked is not None`) passes `read` to skip unneeded coordinate tiles.
         coords = (coords_of(k_first) if masked is None
                   else coords_of(k_first, read=walk.places_read(masked=masked_step)))
-        scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen, masked=masked_step)
-        exponentials, _, cotangents, slopes, seen = scored
+        exponentials, _, cotangents, slopes, seen = _scores(
+            walk, coords, params, s, dp, peak, prior, anchor, delta, chosen, masked=masked_step)
         terms, parts, keyed = gradient.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
                                                 prior, scale=walk.grad_scale, kinds=walk.kinds,
                                                 summed=walk.summed, accurate=walk.accurate, rows=True)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
         return row_sums, parts, keyed
-
-    # One walk, its tiles' masks chosen a tile at a time on register-budgeted GPUs (a walk of two loops into
     # one warpgroup accumulator, the first empty, faults on an H100 under jax 0.11.2); segmented on TPU mxu.
     if masked is None:
         rows, scaled, keyed = lax.cond(whole(index), functools.partial(issued, masked_step=False),
@@ -170,7 +168,6 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         rows, scaled, keyed = issued(masked_step=masked)
     dq_acc, *keyed_accs = accumulators
     # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's
-    # branches yield the scaled cotangents alone, not every part.
     parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate, rows=True)
     # dQ's (and the keyed sums') products against the program's share of the keys' columns (`share`).
     k_columns = k_slot.at[:, pl.ds(*share)]

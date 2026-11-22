@@ -1394,7 +1394,7 @@ class Trainer(Generic[Loss, Effects]):
                     # Each batch of a shape the run has not stepped is checked against what the objective
                     # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
                     check_inputs(self, device)
-                known, began = len(compiled), time.perf_counter()
+                known, began, before = len(compiled), time.perf_counter(), interval.compiling
                 with run.startup.phase("compile", "compiling the step", when=not known):
                     train_step, flops, state = self._compiled_for(compiled, state, device, run, interval)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
@@ -1406,11 +1406,11 @@ class Trainer(Generic[Loss, Effects]):
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
-                    interval.waited = 0.0
+                    interval.waited, interval.compiling = 0.0, before
                 elif len(compiled) > known:
-                    # A shape met later compiles inside the interval, which
-                    # reports that time apart from its steps'.
-                    interval.compiling += time.perf_counter() - began
+                    # A shape met later compiles inside the interval, which reports that time apart from
+                    # its steps', its first draw's admissions (`DrawingStep.drawn`) among it.
+                    interval.compiling = before + time.perf_counter() - began
                 with region("train.step"):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
@@ -2325,7 +2325,7 @@ class Trainer(Generic[Loss, Effects]):
         settled_heap(run)  # A step the process held, its fit's start collected all the same.
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current, state), trials.state)
 
     def _saved_checkpoint(
         self,
