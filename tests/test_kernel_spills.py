@@ -919,6 +919,7 @@ def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
 
 
 @COMPILE_ONLY
+@COMPILE_ONLY
 @lowers("sm90")
 def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_gpu_drains_it():
     """A program whose launch spills at its first tile, lowered for an H100 within a block certifying aside,
