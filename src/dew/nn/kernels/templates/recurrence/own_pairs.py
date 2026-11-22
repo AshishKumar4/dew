@@ -410,10 +410,13 @@ def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, hi_ref, lo_ref) -> d
 
 
 def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple,
-                      diagonal=None):
+                      diagonal=None, added: tuple = ((), (), ()), forms: tuple | None = None):
     """A key block's gradients through a chunk's pairs stored at `at` (its row and column) into `refs`
     (`dq`, `dk`, `dg`): the queries', the keys' through the gated keys (`beta k`) and their own, and the log
-    decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`. Where
+    decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`. Each
+    gradient has the fp32 tiles of `added`'s refs at its own place added in turn before it is stored in its
+    form (`forms`, fp32 each where None) through its landing (`smem`, one a gradient): the other launches'
+    parts of a gradient it finishes (`key_backward._key_pairs_back`). Where
     `diagonal` gives a token's own scores pair's gradient `[C, 1]` (scaled), `grads` were summed without
     it and it joins the queries' and keys' gradients alone: the log decay's terms never take it, a token's
     write read by its own query undecayed, its two halves `q (dS k)` and `k (dS q)` equal, each the size of
@@ -421,9 +424,15 @@ def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, opera
     suffix sum, 4e-10 at Kimi Linear's last token where float64's was 2e-17 (row 7906)."""
     (query, key, betas), (d_query, d_keyed, d_key), (row, column) = operands, grads, at
     own_query, own_key = (0.0, 0.0) if diagonal is None else (diagonal * key, diagonal * query)
-    for ref, grad in zip(refs, (d_query + own_query, d_keyed * betas[:, None] + d_key + own_key,
-                                query * d_query + key * (d_keyed * betas[:, None] - d_key)), strict=True):
-        fp32_operand(call).store(ref, grad, row, call.chunk, column, keys, family=call.family, smem=smem)
+    square = fp32_operand(call)
+    forms = (square,) * 3 if forms is None else forms
+    grads = (d_query + own_query, d_keyed * betas[:, None] + d_key + own_key,
+             query * d_query + key * (d_keyed * betas[:, None] - d_key))
+    for ref, grad, others, form, landing in zip(refs, grads, added, forms, smem, strict=True):
+        for other in others:
+            (view,) = square.views(other, row, call.chunk, column, keys)
+            grad = grad + call.family.tile_of(view)
+        form.store(ref, grad, row, call.chunk, column, keys, family=call.family, smem=landing)
     return jnp.sum(d_keyed * key, axis=1)
 
 
@@ -486,8 +495,9 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                 shifted_keys(call, shifts, key, prefix), functools.partial(shifted_up, call),
                 (zero, zero), zero)
             d_betas = d_betas + pairs_back_stored(
-                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys, landing["block"],
-                (query, key, betas), (d_query, d_keyed, d_key), diagonal=strip("scores", scale, 0)[:, None])
+                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys,
+                (landing["block"],) * 3, (query, key, betas), (d_query, d_keyed, d_key),
+                diagonal=strip("scores", scale, 0)[:, None])
 
             @pl.when(index == steps - 1)
             def _():
