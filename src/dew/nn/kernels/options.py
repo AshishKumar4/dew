@@ -625,13 +625,16 @@ class OuterProgram:
         a rule changes lowers from its rewritten program, never traced again (`program.traced_as`). Its
         switch is in JAX's trace context, so a held program traces afresh as it changes. A program called
         within the trace is part of this one, which the pass reads whole (`_nested`). Within a block
-        certifying aside, the launches it reaches settle before it is lowered, the program traced afresh past
-        a refused config (`report.settled_trace`), so it lowers once."""
+        certifying aside, the launches an outermost program's trace reaches settle before it is lowered, the
+        program traced afresh past a refused config (`report.settled_trace`), so it lowers once; a program
+        traced within another's (a launch's own, as its capture traces it) settles nothing mid-trace."""
         from dew.nn.kernels.templates import report
 
+        outermost = not _PASSING.get()
         token = _PASSING.set(True)
         try:
-            traced = report.settled_trace(lambda: jitted.trace(*args, **kwargs))
+            trace = functools.partial(jitted.trace, *args, **kwargs)
+            traced = report.settled_trace(trace) if outermost else trace()
             rewritten = algebra.rewritten_program(traced.jaxpr)
             if rewritten is traced.jaxpr:
                 return traced
