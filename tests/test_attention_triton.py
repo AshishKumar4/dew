@@ -521,7 +521,7 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
     with jax.enable_x64(new_val=True):
         wide_fn = jax.jit(functools.partial(run, wide=True))
         f32_fn = jax.jit(functools.partial(run, wide=False))
-        assert_as_exact(wide_fn, f32_fn, draw, "wide alibi parameter", seeds=8)
+        assert_as_exact(wide_fn, as_given(f32_fn), draw, "wide alibi parameter", seeds=8)
         import tier_wire
         if not tier_wire.preparing():
             assert wide_fn(*draw(0))[0].dtype == jnp.float64
