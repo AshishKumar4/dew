@@ -2015,3 +2015,31 @@ def test_each_probe_of_a_held_plan_states_its_own_headroom(monkeypatch):
     probes = trainer.plan["probes"]
     assert trainer.plan["split"] == 4 and [probe["split"] for probe in probes if not probe["fits"]][-1] == 2
     assert all((probe["headroom"] >= 0) is probe["fits"] for probe in probes), probes
+
+
+
+def test_a_trainer_built_after_the_process_releases_its_programs_traces_its_step_again(monkeypatch):
+    """A trainer built anew reads the step an equal trainer traced over the same shapes (`candidate_for`),
+    tracing fewer programs than it did; once the process releases its programs (`options.release`), which
+    drops the kept steps with the executables their lowerings key, the next traces it again (row 8411's
+    review: the kept steps, 32 of them, outlived a release that dropped every executable but theirs)."""
+    from dew.telemetry.compiles import Compiles
+
+    free(monkeypatch, LIMIT)
+    # One optimizer for every trainer, so each states the step the first traced (`Trainer._step_key`).
+    sgd = optax.sgd(1e-2)
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+
+    def traced() -> int:
+        trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), sgd, key=jax.random.key(0)))
+        state, _, _ = trainer.place()
+        with Compiles("step") as compiles:
+            trainer.compile(state, BATCH)
+        return [program.kind for program in compiles.programs].count("traced")
+
+    first = traced()
+    kept = traced()
+    options.release()
+    again = traced()
+    assert kept < first and kept < again, (first, kept, again)
