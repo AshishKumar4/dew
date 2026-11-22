@@ -51,7 +51,7 @@ from dew.data.storage import (
     on_gcs,
 )
 
-from .base import Read, Shard, ShardManifest, _single_indexed_manifest, preparing, source_record, url_label
+from .base import Read, Shard, ShardManifest, _indexed_manifest, preparing, source_record, url_label
 from .index import ArrayIndex
 
 type Format = Literal[
@@ -936,18 +936,22 @@ class Files(Dataset):
     def positioned_manifest(self) -> ShardManifest:
         """Its shards for a stream that numbers its rows (`dew.data.sources.base.stream_manifest`): a text
         store's records as its offset index lists them (`records`' indexed read), each row at its index
-        there, in parts of whole records each stating its rows, as many as its readers ask
-        (`_single_indexed_manifest`); its own shards (`manifest`) where it holds no such index, or reads
-        its records otherwise (row 9051: its byte ranges state no rows, which a positioned stream needs).
-        Its index, its producer's or one `provision` wrote, is what its indexed read reads, so both reads
-        number the same records alike."""
+        there, in fixed ranges of whole records of about `shard_bytes` each (`_indexed_manifest`), each
+        named by the record it starts at, the shards a fill keys its rows by however many readers and
+        workers read them (row 11637: one shard, cut apart by the readers asking, named its parts no fill
+        found among its shards); its own shards (`manifest`) where it holds no such index, or reads its
+        records otherwise (row 9051: its byte ranges state no rows, which a positioned stream needs). Its
+        index, its producer's or one `provision` wrote, is what its indexed read reads, so both reads number
+        the same records alike."""
         if (self.kind not in ("jsonl", "text", "csv") or self.where is not None or not self.paths
                 or any(infer_compression(url.lower()) for url in self.paths) or not self.supports("indexed")):
             return self.manifest()
         # Named by its files' places (`_places`), which every host that mounted them anywhere names alike, as
         # a digest of them, of one length however many files it holds.
         places = "\n".join(self._places[url] for url in self.paths)
-        return _single_indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}")
+        count = len(self.records("indexed"))
+        rows = max(1, -(-count * self.shard_bytes // max(self.preparation_bytes(), 1)))
+        return _indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}", rows)
 
     def manifest(self) -> ShardManifest:
         """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a fill

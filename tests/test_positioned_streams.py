@@ -7,6 +7,7 @@ import itertools
 import json
 
 import numpy as np
+import pytest
 
 from dew.data import Files
 from dew.data.compile import compile
@@ -68,11 +69,13 @@ def test_a_positioned_streams_shards_are_named_alike_wherever_its_store_is_mount
     assert [shard.id for shard in first.shards] == [shard.id for shard in second.shards]
 
 
-def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_shard(tmp_path):
-    """An indexed JSONL store read by a stream that numbers its rows before its cache, in several shards
-    (two readers): the cache publishes the store's generation once the read has filled every positioned
-    shard, so the next streamed read reads it back, numbering and running nothing (row 9051's confirm
-    review: the fill counted the store's byte ranges, and no seal reached its publication)."""
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_shard(tmp_path, workers):
+    """An indexed JSONL store read by a stream that numbers its rows before its cache, in several shards,
+    by one process or two workers: the cache publishes the store's generation once the read has filled
+    every positioned shard, so the next streamed read reads it back, numbering and running nothing (row
+    9051's confirm review: the fill counted the store's byte ranges, and no seal reached its publication;
+    row 11637: two workers cut its one shard into parts no fill found among its shards)."""
     from dew.data.cache import Cache
     from dew.data.compile import iterate
     from dew.data.dataset import Loading
@@ -91,7 +94,7 @@ def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_s
 
     def values() -> list[tuple[int, int]]:
         chain = Pipeline(files).map_with_index(at, identity="numbered@1").cache(cache)
-        rows = iterate(chain, read="streamed", loading=Loading(workers=0, threads=2, read_buffer=1))
+        rows = iterate(chain, read="streamed", loading=Loading(workers=workers, threads=2, read_buffer=1))
         return sorted((int(row["at"]), int(row["id"])) for row in rows)
 
     first = values()
