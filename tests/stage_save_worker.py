@@ -81,7 +81,6 @@ def _lost(paired, run_dir, local_dir) -> list[int]:
     from dew.training import MeshSpec
 
     replicated = MeshSpec(replicas=2, stage=2)
-    persistent, local = Path(run_dir) / "lost", Path(local_dir) / "lost"
 
     def shares() -> Loader:
         # Each process its share of a step's rows, as a pool over a replicas axis reads them.
@@ -91,18 +90,29 @@ def _lost(paired, run_dir, local_dir) -> list[int]:
         return Loader(train=lambda partition: Replaying(functools.partial(batch_at, partition)), val=None,
                       records=None, batch=BATCH)
 
-    def run(steps: int, resume: str) -> int:
-        kept = Checkpoints(str(persistent), local_directory=str(local), local_every=1)
+    def run(name: str, steps: int, resume: str):
+        kept = Checkpoints(str(Path(run_dir) / name), local_directory=str(Path(local_dir) / name),
+                           local_every=1)
         staged = trainer(decoder(layer_scalar="frozen"), ADAM, replicated, len(paired), checkpoints=kept)
         staged.device_mesh = replicated.build(paired)
-        return int(staged.fit(shares(), steps=steps, checkpoint_every=2, log_every=1, resume=resume,
-                              checkpoint_final=False).step)
+        return staged.fit(shares(), steps=steps, checkpoint_every=2, log_every=1, resume=resume,
+                          checkpoint_final=False)
 
-    first = run(1, "never")
+    def own(state) -> list:
+        # This process's shards of the weights and the optimizer's state, as the step left them.
+        return [np.asarray(shard.data) for leaf in jax.tree.leaves((state.variables, state.opt_state))
+                for shard in leaf.addressable_shards]
+
+    first = int(run("lost", 1, "never").step)
     if jax.process_index() == 1:
-        shutil.rmtree(local / "process1")
+        shutil.rmtree(Path(local_dir) / "lost" / "process1")
     multihost_utils.sync_global_devices("local copy lost")
-    return [first, run(2, "require"), Checkpoints(str(persistent)).latest]
+    resumed = run("lost", 2, "require")
+    # The run no copy of which was lost, two steps of the same rows from the same start: the recovered
+    # run's state equal to it, its weights, its optimizer's state and the rows its data read on to.
+    whole = run("whole", 2, "never")
+    alike = all(np.array_equal(left, right) for left, right in zip(own(resumed), own(whole), strict=True))
+    return [first, int(resumed.step), Checkpoints(str(Path(run_dir) / "lost")).latest, alike]
 
 
 def _handled(mesh, directory) -> tuple[dict, bool]:

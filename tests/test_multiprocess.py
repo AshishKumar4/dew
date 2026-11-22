@@ -792,8 +792,9 @@ def test_a_pipeline_whose_stages_are_each_one_processs_checkpoints_and_resumes(t
     # A value each process puts on its own stage's devices under one name, no checkpoint's row, is refused.
     assert [report["stray_refused"] for report in pool] == [True, True], pool
     # A run of stages copied over a replicas axis, its step 1 on the local tier alone, process 1's copy then
-    # lost: its fit resumes it from process 0's replica, to step 2 the persistent tier holds (row 10897).
-    assert [report["lost"] for report in pool] == [[1, 2, 2]] * 2, pool
+    # lost: its fit resumes it from process 0's replica, to step 2 the persistent tier holds, its state then
+    # the unbroken run's, weights, optimizer and rows alike (rows 10897, 11891).
+    assert [report["lost"] for report in pool] == [[1, 2, 2, True]] * 2, pool
     # The stepped step and the persistent tier's latest after each run: the first ran on the local tier
     # alone, the second resumed from it, the third from the persistent tier's step 2.
     assert [report["steps"] for report in pool] == [[[1, None], [2, 2], [3, 2]]] * 2, pool

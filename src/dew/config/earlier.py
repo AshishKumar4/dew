@@ -101,18 +101,23 @@ def _retired(name: str, fields: Mapping[str, _records.JSON], root: bool,
     kind = _recorded_class(name) or (RunConfig if root else None)
     if kind is None:
         return None
-    migrated = dict(fields)
-    if issubclass(kind, TrainerConfig):
-        migrated.pop("export_model", None)
-    # A trainer recorded flat, by its run's class, is read here; one recorded by its own class as a record.
-    trainer = migrated.get("trainer")
-    if (issubclass(kind, RunConfig) and isinstance(trainer, Mapping) and "export_model" in trainer
-            and _records.class_record(trainer) is None):
+    trainer = fields.get("trainer")
+    # Each retirement asked of the record as it is, the record copied once where one applies (row 11892).
+    exported = issubclass(kind, TrainerConfig) and "export_model" in fields
+    flat = (issubclass(kind, RunConfig) and isinstance(trainer, Mapping) and "export_model" in trainer
+            and _records.class_record(trainer) is None)
+    unset = (issubclass(kind, DecoderRunConfig) and not additive_unset
+             and fields.get("loop_message_additive") is True)
+    if not (exported or flat or unset):
+        return None
+    migrated = {key: value for key, value in fields.items() if not (exported and key == "export_model")}
+    if flat:
+        # A trainer recorded flat, by its run's class, is read here; one by its own class as a record.
+        assert isinstance(trainer, Mapping)
         migrated["trainer"] = {key: entry for key, entry in trainer.items() if key != "export_model"}
-    if (issubclass(kind, DecoderRunConfig) and not additive_unset
-            and migrated.get("loop_message_additive") is True):
+    if unset:
         migrated["loop_message_additive"] = None
-    return None if migrated == dict(fields) else {"class": name, "fields": migrated}
+    return {"class": name, "fields": migrated}
 
 
 def _recorded_class(name: str) -> type | None:
