@@ -276,15 +276,14 @@ def padded_walk(source):
     tokens as long as the reference's, decoded once for the cells that read it (`shared_setup`: the
     speculative walk compared against it decoded it again, 183 s in train 1174's CI, row 11721)."""
     loaded, plain, reference = source
-    ids, prompt = np.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
     steps, pad = reference["generated"].shape[1], 3
     alone = ids[1:, :prompt - pad]
-    tokens = np.stack([ids[0, :prompt], np.pad(alone[0], (pad, 0))])
-    valid = np.arange(prompt)[None] >= np.asarray([[0], [pad]])
-    inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
-    walk = generate(plain, loaded.variables, inputs, steps, key=jax.random.key(1),
-                    sampling=Sampling(temperature=0))
-    return tokens, valid, alone, steps, np.asarray(walk.tokens)
+    tokens = jnp.stack([ids[0, :prompt], jnp.pad(alone[0], (pad, 0))])
+    valid = jnp.arange(prompt)[None] >= jnp.asarray([[0], [pad]])
+    walk = generate(plain, loaded.variables, ModelInputs(tokens, {"attention_mask": valid}), steps,
+                    key=jax.random.key(1), sampling=Sampling(temperature=0))
+    return tokens, valid, alone, steps, walk.tokens
 
 
 @pytest.mark.shared_setup("padded_walk")
@@ -296,10 +295,10 @@ def test_left_padding_changes_no_row(source, padded_walk):
     the padded one what it decodes alone."""
     loaded, plain, reference = source
     _, _, alone, steps, walk = padded_walk
-    by_itself = generate(plain, loaded.variables, ModelInputs(jnp.asarray(alone)), steps,
-                         key=jax.random.key(1), sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(walk[0, -steps:], reference["generated"][0])
-    np.testing.assert_array_equal(walk[1, -steps:], np.asarray(by_itself.tokens)[0, -steps:])
+    by_itself = generate(plain, loaded.variables, ModelInputs(alone), steps, key=jax.random.key(1),
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(walk)[0, -steps:], reference["generated"][0])
+    np.testing.assert_array_equal(np.asarray(walk)[1, -steps:], np.asarray(by_itself.tokens)[0, -steps:])
 
 
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
@@ -396,10 +395,10 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
     walk (`padded_walk`'s), a left-padded row included."""
     loaded, plain, _ = source
     tokens, valid, _, steps, walk = padded_walk
-    inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
-    speculated = generate(plain, loaded.variables, inputs, steps, key=jax.random.key(1),
-                          sampling=Sampling(temperature=0), strategy=Speculative(block=3))
-    np.testing.assert_array_equal(np.asarray(speculated.tokens), walk)
+    speculated = generate(plain, loaded.variables, ModelInputs(tokens, {"attention_mask": valid}), steps,
+                          key=jax.random.key(1), sampling=Sampling(temperature=0),
+                          strategy=Speculative(block=3))
+    np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walk))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
 
 

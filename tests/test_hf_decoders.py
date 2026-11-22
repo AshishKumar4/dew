@@ -306,8 +306,9 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     directory = FIXTURES / fixture
     ids = np.load(directory / "input_ids.npy")
     with ahead_on_the_host():
-        # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859).
-        loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
+        # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859), its
+        # weights host arrays (`on_host`), the step's inputs (`ahead_arm`).
+        loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla", on_host=True)
     reference = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").eval()
     wide = float64_twin(reference)
     named = dict(reference.named_parameters())
@@ -318,8 +319,7 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     # (row 11744: compiled here ahead, its executable was no arm's, so the prepare kept none). It reads the
     # model alone, its variables an input, so one statement names it in the prepare and the run (`arm_role`:
     # the load, whose source is a path, and its weights, placed on one device or another, are none).
-    model = loaded.model
-    variables = jax.tree.map(np.asarray, loaded.variables)
+    model, variables = loaded.model, loaded.variables
 
     def step(variables, ids):
         return jax.value_and_grad(dew_next_token_loss, argnums=2, has_aux=True)(model, variables,
