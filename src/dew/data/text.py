@@ -267,19 +267,6 @@ class Offsets(Protocol):
         ...
 
 
-@runtime_checkable
-class BoundedShrink(Protocol):
-    """A vocabulary that proves by how many tokens at most a text's encoding can shrink as the text grows at
-    its end (a merge across where it was cut): what a layout that cuts a state may stop its walk by
-    (`dew.decision.layout.SegmentLayout._cut`). A vocabulary that proves none (a WordPiece's unknown
-    word, a normalizer's rewrite, an added token's stripping) states none, and the walk reads every cut."""
-
-    def shrink_bound(self) -> int | None:
-        """The most tokens its encoding of a text can lose as the text grows at its end, None where it
-        proves none."""
-        ...
-
-
 def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
     values = ids.tolist() if isinstance(ids, TokenArray) else ids
     if not isinstance(values, Sequence):
@@ -318,11 +305,6 @@ class ByteTokenizer:
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
         return bytes(_token_row(ids)).decode("utf-8", errors="replace")
-
-    def shrink_bound(self) -> int | None:
-        """None lost: each character its own bytes, a text's encoding grows with it; None where a
-        subclass encodes otherwise (merging bytes), which proves its own."""
-        return 0 if type(self).encode is ByteTokenizer.encode else None
 
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """`text`'s bytes, each covering its character."""

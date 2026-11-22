@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import csv
-import dataclasses
 import hashlib
 import io
 import itertools
@@ -941,35 +940,18 @@ class Files(Dataset):
     def positioned_manifest(self) -> ShardManifest:
         """Its shards for a stream that numbers its rows (`dew.data.sources.base.stream_manifest`): a text
         store's records as its offset index lists them (`records`' indexed read), each row at its index
-        there, in one shard of them all, cut for many readers and workers into fixed finer ones of whole
-        records (row 11637: cut by the readers' count, a fill named parts no publication found among its
-        shards); its own shards (`manifest`) where it holds no such index, or reads its
-        records otherwise (row 9051: its byte ranges state no rows, which a positioned stream needs). Its
-        index, its producer's or one `provision` wrote, is what its indexed read reads, so both reads number
-        the same records alike."""
+        there, in parts of whole records each stating its rows, as many as its readers ask
+        (`_single_indexed_manifest`); its own shards (`manifest`) where it holds no such index, or reads
+        its records otherwise (row 9051: its byte ranges state no rows, which a positioned stream needs).
+        Its index, its producer's or one `provision` wrote, is what its indexed read reads, so both reads
+        number the same records alike."""
         if (self.kind not in ("jsonl", "text", "csv") or self.where is not None or not self.paths
                 or any(infer_compression(url.lower()) for url in self.paths) or not self.supports("indexed")):
             return self.manifest()
         # Named by its files' places (`_places`), which every host that mounted them anywhere names alike, as
         # a digest of them, of one length however many files it holds.
         places = "\n".join(self._places[url] for url in self.paths)
-        uri = f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}"
-        count = len(self.records("indexed"))
-        # Its finer shards fixed whatever reads them, each of about `shard_bytes` and as many as `PARTS` at
-        # the least, so a stream of many readers and workers keys its fill by shards its publication reads
-        # as the store's (`ShardManifest.fixed_parts`): its whole-store shard the one a single reader's
-        # fill and every saved plan name (row 11637's review: cut by the readers' count, its fill named
-        # parts of no fixed geometry; as fixed ranges alone, a small store refused two workers).
-        rows = max(1, min(-(-count * self.shard_bytes // max(self.preparation_bytes(), 1)),
-                          -(-count // self.PARTS)))
-        fixed = tuple(Shard(f"{uri}:{start}", uri, start, min(start + rows, count), min(rows, count - start))
-                      for start in range(0, count, rows))
-        whole = _single_indexed_manifest(self, uri)
-        return dataclasses.replace(whole, subdivide=lambda required: fixed, fixed_parts=True)
-
-    PARTS = 64
-    """The fewest finer shards a positioned stream's store is cut into (`positioned_manifest`), so as many
-    readers and workers read it at once."""
+        return _single_indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}")
 
     def manifest(self) -> ShardManifest:
         """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a fill

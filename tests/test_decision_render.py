@@ -444,17 +444,14 @@ def test_a_state_cut_in_a_row_encoded_whole_takes_the_longest_cut_whose_row_fits
     assert list(row(state, len(fitting.tokens)).tokens) == list(fitting.tokens)
 
 
-@pytest.mark.parametrize("merging", [False, True], ids=["bytes", "merging"])
-def test_a_long_state_cut_in_a_row_encoded_whole_encodes_few_cuts_past_its_room(merging):
-    """A question row encoded whole, its state 4000 characters and its room a few dozen, over the byte
-    vocabulary or one that merges a string into one token: the state is cut to the longest that fits, its
-    walk past its share stopping once a longer cut's row overflows by more tokens than its vocabulary
-    proves an encoding can shrink by (`BoundedShrink`: none for bytes, one merge's for the merging one), so
-    the row's offsets are read a few times, not once a character (row 11739's review: each prefix was
-    encoded whole; row 11839: so for every vocabulary but the byte one)."""
+def test_a_long_state_cut_in_a_byte_row_encoded_whole_encodes_few_cuts_past_its_room():
+    """A question row encoded whole over the byte vocabulary, its state 4000 characters and its room a few
+    dozen: the state is cut to the longest that fits, its walk past its share stopping at the first cut that
+    overflows, as every longer byte cut's row is longer still, so the row's offsets are read a few times,
+    not once a character (row 11739's review: each of the state's prefixes was encoded whole)."""
     _, _, _, *question = release().segments
 
-    class Counting(Merging if merging else ByteTokenizer):
+    class Counting(ByteTokenizer):
         """The byte vocabulary, counting the texts it reads the offsets of."""
 
         read = 0
@@ -467,4 +464,4 @@ def test_a_long_state_cut_in_a_row_encoded_whole_encodes_few_cuts_past_its_room(
                                            segments=(Text("S:"), State(), Text("\n"), *question))
     tokenizer = Counting()
     [laid] = layout.rows(tokenizer, SPECIALS, "a" * 4000, {"team": TEAM})
-    assert len(laid.tokens) == 256 and tokenizer.read < 24, (len(laid.tokens), tokenizer.read)
+    assert len(laid.tokens) == 256 and tokenizer.read < 16, (len(laid.tokens), tokenizer.read)

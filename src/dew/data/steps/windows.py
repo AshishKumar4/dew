@@ -7,7 +7,7 @@ share their boundary token so every target is predicted exactly once.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import ClassVar, Protocol
 
 import grain.python as grain
@@ -96,9 +96,9 @@ class WindowSource(View[TokenFiles]):
         del read
         return IndexedWindows({"text": self.tokens}, self.length, self.stride, "int32")
 
-    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        count = len(self.records("indexed"))
-        return {**super()._viewed(facts), "rows": count, "valid_targets": count * self.length}
+    def _own(self) -> Mapping[str, Callable[[], object]]:
+        return {"rows": lambda: len(self.records("indexed")),
+                "valid_targets": lambda: len(self.records("indexed")) * self.length}
 
     def lengths(self) -> np.ndarray | None:
         return None

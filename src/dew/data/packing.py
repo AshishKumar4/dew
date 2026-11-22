@@ -494,12 +494,11 @@ class PackedSource(View[Source]):
     def records(self, read: Read) -> _PackedRows:
         return _PackedRows(self.source.records(read), self.plan)
 
-    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+    def _own(self) -> Mapping[str, Callable[[], object]]:
         return {
-            **super()._viewed(facts),
-            "rows": len(self.plan),
-            "valid_targets": self.plan.at("totals", 0),
-            "zero_target_windows": 0,
+            "rows": lambda: len(self.plan),
+            "valid_targets": lambda: self.plan.at("totals", 0),
+            "zero_target_windows": lambda: 0,
         }
 
     def lengths(self) -> np.ndarray | None:

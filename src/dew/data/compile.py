@@ -420,18 +420,27 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     another)."""
     corpora = [(f"corpus {_name(leaf)}", source)
                for pipeline in pipelines for leaf, source in _leaves(pipeline)]
-    # One read a store, whatever corpora read it (as `_pin_sources` reads each once): a store's facts are
-    # cached unlocked, which two threads reading one store at once would race on (row 11638's review).
-    stores = {id(_store_of(source)): source for _, source in corpora}
+    # Each source read once, those over one store one after another in one thread: a store's facts are
+    # cached unlocked, which two threads reading one store at once, through views or not, would race on
+    # (row 11638's review).
+    sources = {id(source): source for _, source in corpora}
+    stores: dict[int, list[Source]] = {}
+    for source in sources.values():
+        stores.setdefault(id(_store_of(source)), []).append(source)
+
+    def read(over: list[Source]) -> list[tuple[int, Mapping[str, object]]]:
+        return [(id(source), asked(source, TOKENIZER_CONTRACT)) for source in over]
+
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(stores)))) as readers:
-        facts = readers.map(lambda source: asked(source, TOKENIZER_CONTRACT), stores.values())
-        read = dict(zip(stores, facts, strict=True))
-    tokenizer_contract((name, read[id(_store_of(source))]) for name, source in corpora)
+        facts = dict(pair for pairs in readers.map(read, stores.values()) for pair in pairs)
+    tokenizer_contract((name, facts[id(source)]) for name, source in corpora)
 
 
 def _store_of(source: Source) -> Source:
-    """The store a compile's pinned source reads (`_Facts`): itself where it is none."""
-    return source.source if isinstance(source, _Facts) else source
+    """The store `source` reads beneath every view over it, a compile's pinned one among them."""
+    while isinstance(source, View):
+        source = source.source
+    return source
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:

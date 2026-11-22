@@ -24,6 +24,7 @@ from dew.data.sources.base import (
     View,
     _indexed_manifest,
     _uncounted,
+    asked,
     stated,
 )
 from dew.data.sources.codec import content_fingerprint
@@ -90,8 +91,8 @@ class RecordSlice(View[Source]):
             raise ValueError(f"{self.describe()} exceeds the source's {records} records")
         return self.start, stop
 
-    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        return {**super()._viewed(facts), **({"held_out": self.start} if self.start else {})}
+    def _own(self) -> Mapping[str, Callable[[], object]]:
+        return {"held_out": lambda: self.start} if self.start else {}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -299,9 +300,16 @@ class SelectedGeneration(View[Source]):
         return _indexed_manifest(self, self.generation.url, 4096, _Placed(self.generation, self._dense))
 
     def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
-        """Those of its facts (`metadata`) named by `keys`: its facts are its selections' and its
-        generation's, none its source's alone."""
-        return {key: value for key, value in self.metadata().items() if key in keys}
+        """Those of its facts (`metadata`) named by `keys`, each read alone: its selections' asked, its
+        rows counted, its generation's rules read, only where asked (row 11638's review)."""
+        facts = {key: value for key, value in _uncounted(asked(self.selections[0], keys)).items()
+                 if key in keys}
+        own = {"rows": lambda: len(self._dense), "accepted_rows": lambda: len(self._dense)}
+        facts.update({key: read() for key, read in own.items() if key in keys})
+        rules = _GenerationSource(self.generation).metadata() if "count_rules" in keys else {}
+        if "count_rules" in rules:
+            facts["count_rules"] = rules["count_rules"]
+        return facts
 
     def metadata(self) -> Mapping[str, object]:
         """The selections' facts, as uncached (what they hold out included), with this part's rows and
