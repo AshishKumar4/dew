@@ -514,6 +514,32 @@ def test_a_save_of_programs_within_another_keeps_its_program_in_both_and_the_lat
         inner.kept, outer.kept)
 
 
+def test_programs_kept_on_a_large_gpu_load_on_a_smaller_one_admitting_them_and_not_a_byte_short(tmp_path):
+    """A file of programs kept on a GPU states what its programs need of a device (`programs_need`), not the
+    limit of the GPU that kept them (row 8711, as rows 8094 and 8371 for a step compiled ahead): a GPU whose
+    allocator holds that need, far less than the keeper's, takes the file, and one holding a byte less is
+    refused, its difference naming the need."""
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import AheadPrograms, BuildTarget, keeping, stand_in_gpus
+
+    def doubled(values):
+        return values * 2
+
+    devices = jax.devices("cpu")
+    path = tmp_path / "programs.dew-aot"
+    with stand_in_gpus(devices, 2**36) as large, keeping() as programs:
+        owned_program(doubled)(jnp.arange(3.))
+        programs.save(path)
+        keeper = BuildTarget.of(large).memory
+    need = AheadPrograms.load(path).target.memory
+    assert need is not None and keeper is not None and need < keeper, (need, keeper)
+    with stand_in_gpus(devices, need, share=1.0) as small:
+        assert not AheadPrograms.load(path).target.differences(BuildTarget.of(small))
+    with stand_in_gpus(devices, need - 1, share=1.0) as short:
+        refused = AheadPrograms.load(path).target.differences(BuildTarget.of(short))
+    assert len(refused) == 1 and str(need) in refused[0], refused
+
+
 def _doubled(x):
     """A module's function a program compiles (the identity witness's)."""
     return 2 * x
