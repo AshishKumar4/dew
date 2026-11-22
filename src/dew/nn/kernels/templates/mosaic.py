@@ -757,15 +757,19 @@ class Issuer[Accumulator](abc.ABC):
     operand_steps_ahead: int = 0
     """The instruction slices loaded before the slice being consumed finishes."""
 
-    def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False) -> int:
-        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead; a
-        granule of several instructions that another granule of the product follows (`loaded` short of its
-        `depth`) its whole granule, loaded ahead of the later one's first product while the last slice of
-        the one before is in flight; otherwise only its consumed slices within that granule. An sm86 decode
-        step's keys, two granules of 64 at width 128, held at two instructions priced 80 registers where
-        ptxas spilled 12 bytes at 80 and held at 88 (the decode gate red at the promotion's composed tip);
-        one granule at a product's whole depth (a GEMM step's transposed weight at 64) holds at two
-        instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432 cells)."""
+    def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False,
+                           transposed: bool = False) -> int:
+        """An operand's live depth (`loaded` its granule at its storage orientation, `transposed` where its
+        rows are its depth, `rhs_fragment_depth`): a retained value keeps its loaded granule and instruction
+        lookahead; a granule of several instructions that another granule of the product follows (`loaded`
+        short of its `depth`) its whole granule, loaded ahead of the later one's first product while the last
+        slice of the one before is in flight; otherwise only its consumed slices within that granule. An
+        sm86 decode step's keys, two granules of 64 at width 128, held at two instructions priced 80
+        registers where ptxas spilled 12 bytes at 80 and held at 88 (the decode gate red at the promotion's
+        composed tip); one granule at a product's whole depth (a GEMM step's transposed weight at 64) holds
+        at two instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432
+        cells)."""
+        del transposed
         consumed = (1 + self.operand_steps_ahead) * self.fragment_depth(depth)
         if retained:
             return min(depth, max(loaded, consumed))
