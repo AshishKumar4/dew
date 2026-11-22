@@ -2,6 +2,7 @@
 (`dew.nn.derivatives.marked`), which every transform keeps a call of that kind, so the algebra pass reads a
 span's kind from the program it rewrites, its forward, tangent and cotangent alike."""
 
+import functools
 import typing
 
 import jax
@@ -436,3 +437,23 @@ def test_a_local_functions_bound_span_called_again_in_one_state_is_traced_once(m
     jax.jit(lambda x: glued(2.0)(x)).trace(x)
     jax.jit(lambda x: glued(2.0)(x) + 0.0).trace(x)
     assert traced.count("span") == 1
+
+
+
+class Doubled(functools.partial):
+    """A partial doubling what it calls (`test_a_partial_subclass_overriding_its_call_is_stated_apart_from_a_
+    plain_partial`)."""
+
+    def __call__(self, *args, **kwargs):
+        return 2 * super().__call__(*args, **kwargs)
+
+
+def test_a_partial_subclass_overriding_its_call_is_stated_apart_from_a_plain_partial():
+    """A `functools.partial` subclass whose `__call__` is its own (one doubling what it calls) is stated apart
+    from a plain partial of the same function and arguments, its class among its statement: two marked spans
+    over them are two programs (train 1174's return: test_cpu_accumulation's doubled contraction took the
+    plain one's held program, 1x where 2x was asked)."""
+    from dew._stated import stated
+
+    plain = functools.partial(jnp.multiply, 3.0)
+    assert stated(Doubled(jnp.multiply, 3.0), "doubled") != stated(plain, "plain")
