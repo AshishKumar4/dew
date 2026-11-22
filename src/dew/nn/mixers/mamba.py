@@ -64,12 +64,13 @@ from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.sharding import explicit_spec, rows_like
-from dew.nn.ssm import affine_states
+from dew.nn.ssm import UNROLLED, affine_states
 
 CHUNK_SIZE = 64
-"""Tokens per recurrence chunk (`ssm.affine_states`). Each chunk materialises
-its `[B, C, D, N]` decays and writes, so the chunk bounds the scan's memory;
-the output does not depend on it."""
+"""Tokens per recurrence chunk (`ssm.affine_states`), at most its straight-line
+block (`ssm.UNROLLED`). Each chunk materialises its `[B, C, D, N]` decays and
+writes, so the chunk bounds the scan's memory; the output does not depend on
+it."""
 
 
 def _spread(t: jax.Array, channels: int) -> jax.Array:
@@ -236,8 +237,9 @@ class Mamba(nn.Module):
         return self.model_flops(lengths) - ssd_flops(lengths, 1, self.state_size, self.intermediate_size)
 
     def setup(self):
-        if self.chunk_size < 1:
-            raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
+        if not 1 <= self.chunk_size <= UNROLLED:
+            raise ValueError(f"chunk_size counts tokens per chunk, 1 to {UNROLLED} (ssm.affine_states runs a "
+                             f"chunk straight-line), got {self.chunk_size}")
         dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         self.in_proj = dense(2 * self.intermediate_size, use_bias=self.use_bias, name='in_proj',
