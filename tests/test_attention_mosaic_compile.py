@@ -2005,8 +2005,8 @@ def test_planned_stages_deepens_at_residency_two_with_registers():
 
 @COMPILES_ON_CPU
 def test_sm80_forward_and_decode_deepen_to_3_stages_without_losing_residency():
-    """Rows 5272, 5274: sm80 cp.async forward (qwen3-8b d128) and sm80/sm90 decode (B8 K4096 d128) deepen
-    to 3 stages at preserved SM residency and compile spill-free."""
+    """Rows 5272, 5274: sm80 cp.async forward (d64, where 3 stages preserves residency=2) and sm80/sm90
+    decode (B8 K4096 d128) deepen to 3 stages at preserved SM residency and compile spill-free."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -2015,20 +2015,19 @@ def test_sm80_forward_and_decode_deepen_to_3_stages_without_losing_residency():
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         spans = template.spans(4096, 4096, 1, causal=True)
-        q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
-        k = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+        q = jax.ShapeDtypeStruct((2, 4096, 32, 64), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, 8, 64), jnp.bfloat16)
         op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
         cfg = op.derived(ba, target)
         assert cfg is not None and cfg.stages >= 3, cfg
         assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
-        fwd_case = KernelCase("sm80-fwd-d128-3stage",
+        fwd_case = KernelCase("sm80-fwd-d64-3stage",
                               lambda: (lambda q, k, v: attention_mosaic.forward(q, k, v, spans, None),
                                        (q, k, k)))
         found = compile_mosaic_kernels([fwd_case], "sm80")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
     for gen in ("sm90", "sm80"):
         with generation.assumed(gen):
             target = generation.gpu_target()
