@@ -34,7 +34,7 @@ from dew.data import Memory
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import DistillationObjective
-from dew.objectives.base import EMASpec, Step
+from dew.objectives.base import EMASpec, Step, head_tile_of
 from dew.objectives.distillation import PROJECTIONS, TEACHER
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance, RoutedStatistics
@@ -62,13 +62,14 @@ def models():
     return CausalTransformer(**META["student"]), CausalTransformer(**META["teacher"])
 
 
-def fixture_objective(arrays: dict, student_type=LMObjective,
+def fixture_objective(arrays: dict, student_type=LMObjective, teacher_type=LMObjective,
                       **overrides) -> tuple[DistillationObjective, dict]:
-    """The objective over the fixture's variables, its projections included, its student a `student_type`."""
+    """The objective over the fixture's variables, its projections included, its student a `student_type`
+    and its teacher a `teacher_type`."""
     student_model, teacher_model = models()
     student = student_type(student_model, SEQ, pad_id=META["pad_id"], ema_decay=None,
                           variables=tree(arrays, "student/"))
-    teacher = LMObjective(teacher_model, SEQ, ema_decay=None, variables=tree(arrays, "teacher/"))
+    teacher = teacher_type(teacher_model, SEQ, ema_decay=None, variables=tree(arrays, "teacher/"))
     settings = {"alpha": META["alpha"], "temperature": META["temperature"], "beta": META["beta"],
                 "features": [tuple(pair) for pair in META["pairs"]], **overrides}
     objective = DistillationObjective(student, teacher, **settings)
@@ -111,6 +112,10 @@ def teacher_forward():
 
 
 DISTILLATION_SEEDS = {"terms": 64, "gradient": 16}
+
+TILE = (6, META["student"]["vocab_size"])
+"""A tiled head whose full KL takes 3 of a row's positions a slice (`chunked.head_divergence`), which do not
+divide the fixture's 8."""
 """Check 1's declared seeds for the loss's terms and the student's gradient, sized by `seeds_for`
 (2026-10-21, on armada)."""
 
@@ -198,7 +203,7 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind, tiled):
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
     if tiled:
-        assert objective.tile_head((3, META["student"]["vocab_size"])) is not None
+        assert objective.tile_head(TILE) is not None
     ids = jnp.asarray(arrays["tokens"][:, :-1])
     named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss", "distill/kl": "kl_div_at_T",
              "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
@@ -263,17 +268,22 @@ def test_a_float64_distillation_computes_its_terms_in_float64(kind):
                                    roundings=roundings)
 
 
+@pytest.mark.parametrize("tiled", [False, True], ids=["whole", "tiled"])
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
-def test_the_student_gradient_matches_the_reference_cotangents(kind):
+def test_the_student_gradient_matches_the_reference_cotangents(kind, tiled):
     """The gradient with respect to every trainable leaf, the projections
     included, on par with the reference's own float32 run over drawn
     students, teachers and projections (check 1): the truth pulls the
     reference's float64 cotangents at the student's float64 forward back
     through that forward, and the reference pulls its float32 cotangents at
     the float32 forward back through the student in float32, both beside the
-    teacher's forward that Dew runs (`teacher_outputs`)."""
+    teacher's forward that Dew runs (`teacher_outputs`). With the student's head tiled, the full KL's
+    slices of positions do not divide the rows' (`TILE`), so the last slice runs past them (row 10978's
+    review: a tail at temperature 0 left the head's gradient NaN)."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
+    if tiled:
+        assert objective.tile_head(TILE) is not None
     batch = fixture_batch(arrays)
     ids = jnp.asarray(arrays["tokens"][:, :-1])
 
@@ -866,11 +876,40 @@ def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_groups_own_tok
     assert not gathered & {(rows // 2, positions, width), (rows // 2 * positions, width)}, gathered
 
 
-def test_a_distillation_beside_a_model_scoring_through_more_than_its_head_tiles_nothing_and_trains():
-    """A distillation whose student scores through more than its head (an adaptation, which states no final
-    states or head, `predicts_by_head`) moves no head on the tile rung, whose step would read the whole
-    logits as before (row 10997: it tiled both heads and reported a move, a compile the ladder wasted on the
-    same program), and trains, its full KL read off the whole logits (row 10983)."""
+def test_a_full_kl_distillation_of_an_adapted_student_plans_on_no_head_tile(monkeypatch):
+    """A full-KL distillation whose student adapts in context (`ChunkAdaptation`, which scores through more
+    than its head, `predicts_by_head`), fit on devices with no room for its first step at its own rung,
+    plans past it compiling no rung twice and none of them a head tile: its step reads both models' whole
+    logits whatever their heads' tile (row 10997: the tile rung tiled both heads and reported a move, a
+    compile of the same program)."""
+    from test_chunk_adaptation import LENGTH, VOCAB, decoder
+    from test_plan import free, needs
+
+    from dew.objectives.lm.adaptation import ChunkAdaptation
+
+    def trainer() -> Trainer:
+        adapted = ChunkAdaptation(window=1, rate=0.5)
+        student = LMObjective(decoder(), LENGTH, ema_decay=None, adaptation=adapted)
+        teacher = LMObjective(decoder(continuum=None), LENGTH, ema_decay=None)
+        return Trainer(DistillationObjective(student, teacher), optax.sgd(0.1), key=jax.random.key(0),
+                       layout=Layout(min_shard=1, tolerance=1.0))
+
+    batch = {TEXT_KEY: jax.random.randint(jax.random.key(1), (2, LENGTH + 1), 1, VOCAB)}
+    first = trainer()
+    room = needs(monkeypatch, first, run=lambda: first.fit(fixed(batch), steps=1)) - 1
+    free(monkeypatch, room)
+    planned = trainer()
+    planned.fit(fixed(batch), steps=1)
+    rungs = [json.dumps(probe, sort_keys=True, default=str) for probe in planned.plan["probes"]]
+    assert all(probe["head_tile"] is None for probe in planned.plan["probes"]), rungs
+    assert len(set(rungs)) == len(rungs), rungs
+
+
+def test_a_selected_distillation_beside_a_model_scoring_through_more_than_its_head_tiles_its_own():
+    """A distillation that reads the sampled ids' likelihoods alone (`selected`), its teacher scoring
+    through more than its head (`predicts_by_head`), tiles the student's head on the tile rung: each model's
+    own loss scores its head as it trains, the divergence reading no logits (the decline of row 10997 is the
+    full KL's)."""
 
     class Adapted(LMObjective):
         """An LM objective whose prediction, as an adapted model's, states no final states or head."""
@@ -880,9 +919,8 @@ def test_a_distillation_beside_a_model_scoring_through_more_than_its_head_tiles_
             return False
 
     arrays = fixture()
-    objective, params = fixture_objective(arrays, student_type=Adapted)
-    keys = objective.program_key()
-    assert objective.tile_head((3, META["student"]["vocab_size"])) is None
-    assert objective.program_key() == keys
+    objective, params = fixture_objective(arrays, teacher_type=Adapted, divergence="selected")
+    tile = (3, META["student"]["vocab_size"])
+    assert objective.tile_head(tile) is not None and head_tile_of(objective.student) == tile
     loss, _ = objective.scalar_loss(params, fixture_batch(arrays), step_at())
     assert np.isfinite(float(loss))

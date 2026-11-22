@@ -1139,15 +1139,18 @@ def head_divergence(hidden, head: OutputTable, reference, reference_head: Output
         per = max(1, min(positions, tile[0] * tile[1] // table.shape[0] // rows))
         chunks = -(-positions // per)
 
-        def padded(values: jax.Array) -> jax.Array:
-            return jnp.pad(values, ((0, 0), (0, chunks * per - positions), *((0, 0),) * (values.ndim - 2)))
+        def padded(values: jax.Array, value=0) -> jax.Array:
+            return jnp.pad(values, ((0, 0), (0, chunks * per - positions), *((0, 0),) * (values.ndim - 2)),
+                           constant_values=value)
 
         # Each side's operands cast once, not per slice, as `_forward` casts its table.
         sides = ((padded(hidden), table.astype(_operand_dtype(products[0], work)), cap, columns, products[0]),
                  (padded(reference),
                   reference_table[0].astype(_operand_dtype(products[1], at_least_fp32(reference.dtype))),
                   reference_head.softcap, reference_table[1], products[1]))
-        kept, temperatures = padded(kept), padded(temperatures)
+        # The tail past the positions held at temperature 1, its logits finite: its KL is dropped, and over a
+        # temperature of 0 its cotangent, though 0, would reach the head's gradient as 0 / 0.
+        kept, temperatures = padded(kept), padded(temperatures, 1)
 
         def logits(start, states, matrix, cap, columns, product):
             sliced = jax.lax.dynamic_slice_in_dim(states, start, per, axis=1)

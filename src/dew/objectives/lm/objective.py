@@ -1723,9 +1723,13 @@ class LMObjective(TokenScorer):
         return self.adaptation is None
 
     def output_table(self, variables: Variables) -> OutputTable | None:
-        """Its model's head over `variables` as one matrix (`head_table`), where its final states read one."""
-        plain = self.predicts_by_head and reads_states(self.model)
-        return head_table(self.model, variables) if plain else None
+        """Its model's head over `variables` as one matrix (`head_table`), where its final states read one;
+        what the trace finds of the head is kept, as `fused_head` keeps it, which `head_program` reads."""
+        if not (self.predicts_by_head and reads_states(self.model)):
+            return None
+        table = head_table(self.model, variables)
+        self._head_matrices[id(self.model)] = (self.model, table is not None)
+        return table
 
     def predict(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
                 logits: bool = True) -> tuple[Ratio | RoutedStatistics, Aux[Variables], Prediction]:

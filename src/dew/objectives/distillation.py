@@ -278,14 +278,24 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Tile the student's head, the vocabulary head this objective trains, and the teacher's alike, so
         neither model's loss holds its whole logits and the full KL reads both a tile at a time (row 9067);
-        None, moving nothing, where either model scores through more than its head
-        (`Objective.predicts_by_head`), whose loss reads the whole logits whatever its head's tile (row
-        10997)."""
-        if not (self.student.predicts_by_head and self.teacher.predicts_by_head):
-            return None
+        under the full KL, None, moving nothing, where it would still read their whole logits
+        (`_reads_heads`), the step the same program (row 10997)."""
         moved = self.student.tile_head(tile)
         self.teacher.restore_head(head_tile_of(self.student), fused=False)
+        if moved is not None and self.divergence == "full" and not self._reads_heads():
+            # Only a head that kept its whole logits moves, which it keeps again.
+            self.restore_head(None, fused=True)
+            return None
         return moved
+
+    def _reads_heads(self) -> bool:
+        """Whether the full KL reads both models' final states through their heads a slice of positions at a
+        time (`chunked.head_divergence`), the tile rung and the step reading this one answer: each predicts
+        by its head (`Objective.predicts_by_head`) and computes it tiled, as one matrix (`head_tile_of`,
+        which reads what a trace found of the head, `Objective.output_table`); else it reads their whole
+        logits."""
+        return all(model.predicts_by_head and head_tile_of(model) is not None
+                   for model in (self.student, self.teacher))
 
     def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
         self.student.restore_head(tile, fused=fused)
@@ -362,15 +372,15 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         sampled ids' likelihoods alone (`selected`), each loss scoring its head as it trains; with the two
         heads the full KL reads the final states through instead."""
         # The full KL reads every column: a slice of positions at a time from the final states through
-        # both heads where the student's head is tiled and each model's is one matrix
-        # (`Objective.output_table`), else the whole logits (an adapted model scores through more than its
-        # head, row 10983).
+        # both heads where it reads them (`_reads_heads`), else the whole logits (an adapted model scores
+        # through more than its head, row 10983). Each head is read whether or not, so what it is is known
+        # before a tile rung asks.
         student_variables = self.student_variables(params)
         tables = None
-        if self.divergence == "full" and head_tile_of(self.student) is not None:
+        if self.divergence == "full":
             own = self.student.output_table(student_variables)
             theirs = self.teacher.output_table(params[TEACHER])
-            tables = None if own is None or theirs is None else (own, theirs)
+            tables = None if own is None or theirs is None or not self._reads_heads() else (own, theirs)
         whole = self.divergence == "full" and tables is None
         statistics, aux, student = self.student.predict(
             student_variables, batch, self._student_step(step), train=step.training,
