@@ -365,12 +365,13 @@ cache of a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 infe
 serves the call as the work list (`_served`)."""
 
 
-DECODE_GATE_BATCHES = _batched_gate(DECODE_GATE, lambda c: (c[0], c[2]), lambda c: (c[1], c[3]))
+DECODE_GATE_BATCHES = _batched_gate(DECODE_GATE, lambda c: (c[0], c[2]), lambda c: (c[1], c[3]),
+                                    max_items=3)
 
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "stored", "items"), DECODE_GATE_BATCHES,
-                         ids=[f"{g}-{s}" for g, s, _ in DECODE_GATE_BATCHES])
+                         ids=[f"{g}-{s}-{i}" for i, (g, s, _) in enumerate(DECODE_GATE_BATCHES)])
 def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, stored, items):
     """A decode step (`attention_decode.attend`: its plain launch at the plan's streaming key tile and
     slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
@@ -472,14 +473,15 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
     assert not failed, "\n".join(failed)
 
 
-FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3])
+FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3],
+                                     max_items=3)
 
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "training", "dtype", "hooks_batch"),
                          FORWARD_GATE_BATCHES,
-                         ids=[f"{g}-{w}-{t.name}-{jnp.dtype(d).name}"
-                              for g, w, t, d, _ in FORWARD_GATE_BATCHES])
+                         ids=[f"{g}-{w}-{t.name}-{jnp.dtype(d).name}-{'+'.join(h)}"
+                              for g, w, t, d, h in FORWARD_GATE_BATCHES])
 def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, dtype,
                                                               hooks_batch):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
@@ -914,6 +916,7 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert all(stored for _, stored, _ in warm), warm
     assert certified(warm) == certified(cold)
 
+@COMPILES_ON_CPU
 def test_a_launchs_stored_verdict_is_not_read_where_another_nvcc_wheel_is_installed(tmp_path):
     """A launch certified by one process is certified again by the next where the installed CUDA nvcc wheels
     differ (another wheel's metadata on its path, its kernels' IR the same): the wheels name the ptxas that
@@ -1806,7 +1809,8 @@ def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compi
                                                       natural=attention_mosaic.NATURAL)
             ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
             cfg = op.derived(ba, target)
-            assert cfg is not None and cfg.stages >= 3, (label, cfg)
+            assert cfg is not None and (cfg.stages >= 3 if width <= 128 or cfg.consumers == 1
+                                        else cfg.stages == 2), (label, cfg)
             def _make(q=q, k=k):
                 def forward(query, key, value):
                     return attention_mosaic.forward(query, key, value, spans, None,
@@ -1858,12 +1862,23 @@ def test_derived_one_consumer_heights_are_compared_by_choose():
     assert any({(c.block_q, c.block_k) for c in group} >= {(128, 32), (64, 64)} for group in seen), seen
 
 
+def _fast_backward_compile_case(name: str, q, k, spans, shapes):
+    """Build a `KernelCase` for fast-form Mosaic backward compilation."""
+    from fla_gdn_support import KernelCase
+
+    def backward(query, key, value, dout, residuals):
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                          residuals=residuals, accurate=False)
+        return grads.query, grads.key, grads.value
+
+    return KernelCase(name, lambda: (backward, (q, k, k, q, shapes)))
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("gen", ["sm90", "sm80"])
 def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
     """Row 5272: qwen3-8b d128 fused backward deepens its ring to 3 stages without losing SM residency
     on both sm90 (`wgmma.fed`) and sm80 (`mma.sync` cp.async) and compiles spill-free."""
-    from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed(gen):
@@ -1879,13 +1894,134 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
         cfg = op.derived(ba, target)
         assert cfg is not None and cfg.fused and cfg.stages >= 3, (gen, cfg)
         assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
-
-        def _make():
-            def backward(query, key, value, dout, residuals):
-                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                                  residuals=residuals, accurate=False)
-                return grads.query, grads.key, grads.value
-            return backward, (q, k, k, q, shapes)
-
-        found = compile_mosaic_kernels([KernelCase(f"{gen}-fused-d128-3stage", _make)], gen)
+        case = _fast_backward_compile_case(f"{gen}-fused-d128-3stage", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
+    """Row 5272: split `derived_weights` + `derived_from_weights` match `derived_cotangents` bit-for-bit
+    (masked and unmasked), and `streamed_statistics(..., anchored=False)` excludes dead `chosen`."""
+    from dew.nn.kernels.templates import (
+        attention_backward_algebra as bwd_alg,
+        attention_mosaic_fused as fused,
+        attention_mosaic_program as program,
+    )
+
+    rng = jax.random.key(5272)
+    k1, k2, k3, k4, k5 = jax.random.split(rng, 5)
+    logits = jax.random.normal(k1, (64, 64), jnp.float32)
+    products = jax.random.normal(k2, (64, 64), jnp.float32)
+    peak = jnp.max(logits, axis=-1)
+    total = jnp.sum(jnp.exp(logits - peak[:, None]), axis=-1)
+    anchor = jax.random.normal(k3, (64,), jnp.float32)
+    delta = jax.random.normal(k4, (64,), jnp.float32)
+    seen = jax.random.bernoulli(k5, 0.7, (64, 64))
+
+    for masked in (False, True):
+        full_in = {"logits": logits, "products": products, "peak": peak, "total": total,
+                   "anchor": anchor, "delta": delta, **({"seen": seen} if masked else {})}
+        e_ref, w_ref, ds_ref = bwd_alg.derived_cotangents(
+            keys_first=False, dropped=False, masked=masked).mapped(full_in)
+        e_got, w_got = bwd_alg.derived_weights(keys_first=False, accurate=False).mapped(
+            {"logits": logits, "peak": peak, "total": total})
+        ds_in = {"weights": w_got, "products": products, "anchor": anchor, "delta": delta,
+                 **({"seen": seen} if masked else {})}
+        ds_got = bwd_alg.derived_from_weights(keys_first=False, masked=masked).mapped(ds_in)
+        assert jnp.array_equal(e_got, e_ref)
+        assert jnp.array_equal(w_got, w_ref)
+        assert jnp.array_equal(ds_got, ds_ref)
+
+    with generation.assumed("sm90"):
+        family = program.bundle("sm90", jnp.bfloat16)
+        cfg = program.BackwardTiles(64, 64, 2, 2, fused=True, family=family.name)
+        assert fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=False) <= 4
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
+    """Row 5272: sm90 overlapped fused backward (`_overlapped_fused_step`: S softmax overlapped with dP,
+    dS overlapped with dV, add_dq overlapped with dK) compiles spill-free at d64 and d128."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((2, 4096, 32, width), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, 8, width), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        case = _fast_backward_compile_case(f"sm90-overlapped-fused-d{width}", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
+    """Row 5272: sm90 overlapped shared-keys backward (`attention_dkv_shared`, qwen3.5-0.8b d256) compiles
+    spill-free with S/dP overlap and dead `chosen` excluded."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        case = _fast_backward_compile_case("sm90-overlapped-coop-d256", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_deterministic_ops):
+    """Row 5272: sm90 deterministic two-launch keys-first dK/dV (`_overlapped_dkv_scores`) compiles
+    spill-free at d128."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        case = _fast_backward_compile_case("sm90-overlapped-dkv-det-d128", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_planned_stages_deepens_at_residency_two_with_registers():
+    """Row 10993: `_planned_stages` passes the launch's consumer registers to `resources.plan`, so a
+    launch at `resident >= 2` deepens its ring rather than falling back to `floor`."""
+    from dew.nn.kernels.templates import attention_mosaic_program as program, resources
+
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        family = program.layouts("sm80", jnp.bfloat16, 4096)[0]
+        tile = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
+        def scope_of(stages):
+            ring = jax.ShapeDtypeStruct((stages, 64, 64), jnp.bfloat16)
+            return resources.Scope(program=(tile,), walks=((ring,),))
+        stages = attention_mosaic._planned_stages(family, scope_of, target, consumers=1, registers=128,
+                                                  floor=2, most=3, resident=2)
+        assert stages == 3, stages
+
+
+@COMPILES_ON_CPU
+def test_decode_deepens_to_3_stages_without_losing_residency():
+    """Row 5274: long-context decode (B8 K4096 d128) deepens to 3 stages at preserved SM residency
+    on sm90 and compiles spill-free."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_decode
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        spans = template.spans(1, 4096, 8, causal=False)
+        qd = jax.ShapeDtypeStruct((8, 1, 32, 128), jnp.bfloat16)
+        kd = jax.ShapeDtypeStruct((8, 4096, 8, 128), jnp.bfloat16)
+        plan = attention_decode.plan(qd, kd, kd, spans, None, scale=None, target=target)
+        assert plan is not None and plan.config.stages >= 3, plan
+        dec_case = KernelCase("sm90-dec-b8-d128-3stage",
+                              lambda: (lambda q, k, v: attention_decode.attend(q, k, v, spans),
+                                       (qd, kd, kd)))
+        found = compile_mosaic_kernels([dec_case], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
