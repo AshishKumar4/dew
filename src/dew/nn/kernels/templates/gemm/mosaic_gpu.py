@@ -1552,7 +1552,8 @@ def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int
     cores summing within one in a narrower accumulator (testing.md, FP8 products). A family whose persist
     sums the windows itself (`mosaic.Family.sums_in_persist`, `_summed`) walks the steps plainly."""
     if not exact_sums or family.sums_in_persist:
-        _, accs = walk(step, None, (shape,) * count)
+        prefetch = _gmm_prefetch(family, step)
+        _, accs = walk(step, None, (shape,) * count, **({} if prefetch is None else {'prefetch': prefetch}))
         return accs
 
     def exact_step(index, slots, running, accumulators):
@@ -1579,7 +1580,7 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
               fixed_tiles: dict, read_tiles: dict, mine_rows, transpose_rhs: bool, matrices: dict,
               interpret: bool, first=0, summed: bool = False, transpose_lhs: bool = False,
               decoded=None, scaling=None, block_scaled: bool = False, packed_rows: bool = False, idle=None,
-              chosen=None):
+              chosen=None, prefetched=None, boundary: Callable | None = None):
     """Dew: a consumer's step of the cooperative `gmm` (`mosaic.Family.walk`): its half of the rows' slot,
     transformed by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`, a
     depth vector the family does not copy read at step `index` from global memory: `read_tiles`), times each
@@ -1596,13 +1597,16 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
     rows', or the joined rows' for a joined pair's paired matrix: `gmm`'s `joined`). With `idle` (`_idle`),
     its products issued only where its rows meet its group's. With `chosen` (a bounded walk's `Chained`),
     its one matrix's products issued into the accumulator of the product the step falls in alone, from that
-    product's first step on (`Issuer.added_onto`), each product's sum its own (`chained.guarded_walk`)."""
+    product's first step on (`Issuer.added_onto`), each product's sum its own (`chained.guarded_walk`). With
+    `boundary` (the walk's prefetch, `_gmm_prefetch`: a plain step's one product), its product issued from
+    its `prefetched` first fragments, the next step's read under its last (`Issuer.products_across`),
+    returning its carry beside them."""
     read = {name: slots[name] for name in matrices if decoded is None}
     if decoded is not None:
         read['matrix'] = decoded.decode(index, slots, interpret)
         family.published()
         decoded.met()
-    oriented = {name: read[name].transpose((1, 0)) if transpose_rhs else read[name] for name in matrices}
+    oriented = _oriented(read, matrices, transpose_rhs)
     # This warpgroup's half of the rows, held in registers where a step rewrites them: a packed matrix's
     # decoded, or the prologue's transform of its slot.
     left = None
@@ -1629,12 +1633,7 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
                 for total, name in zip(accumulators, matrices, strict=True))
         return nothing, tuple(issued(acc, lambda acc=acc, name=name, left=left: family.register_products(
             acc, (left,), oriented[name])) for acc, name in zip(accumulators, matrices, strict=True))
-    # This warpgroup's half of the rows, the only half its MMA reads (a `[depth, rows]` stage's, transposed).
-    stage = slots['rows']
-    mine = stage.at[:, mine_rows].transpose((1, 0)) if transpose_lhs else stage.at[mine_rows]
-    # Each matrix's rows: the call's, or the joined rows' for the paired matrix (`matrices`' stream).
-    rows_of = {name: mine if stream == 'rows' else slots[stream].at[mine_rows]
-               for name, stream in matrices.items()}
+    rows_of = _rows_of(slots, matrices, mine_rows, transpose_lhs)
     if summed:
         scale = None if scaling is None else scaling(index, slots)
         return nothing, tuple(
@@ -1653,12 +1652,60 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
 
         return nothing, family.issued_one_of(which, accumulators, chosen_issue)
     if block_scaled:
-        return nothing, tuple(family.scaled_products(acc, mine, oriented[name],
+        return nothing, tuple(family.scaled_products(acc, rows_of['matrix'], oriented[name],
                                                      (slots['a_scales'], slots['b_scales']))
                               for acc, name in zip(accumulators, matrices, strict=True))
+    if boundary is not None:
+        ((acc,), (name,)) = accumulators, matrices
+        acc, following = family.products_across(acc, rows_of[name], oriented[name], prefetched, boundary)
+        return (nothing, (acc,)), following
     return nothing, tuple(
         issued(acc, lambda acc=acc, name=name: family.products(acc, rows_of[name], oriented[name]))
         for acc, name in zip(accumulators, matrices, strict=True))
+
+
+def _oriented(read, matrices: dict, transpose_rhs: bool) -> dict:
+    """Dew: a `_gmm_step`'s matrices as its products read them, `read` their slots (a packed matrix's
+    decoded)."""
+    return {name: read[name].transpose((1, 0)) if transpose_rhs else read[name] for name in matrices}
+
+
+def _rows_of(slots, matrices: dict, mine_rows, transpose_lhs: bool) -> dict:
+    """Dew: each of a `_gmm_step`'s matrices' rows: this warpgroup's half of the rows' stage (the only half
+    its MMA reads, a `[depth, rows]` stage's transposed), or the joined rows' for the paired matrix
+    (`matrices`' stream)."""
+    stage = slots['rows']
+    mine = stage.at[:, mine_rows].transpose((1, 0)) if transpose_lhs else stage.at[mine_rows]
+    return {name: mine if stream == 'rows' else slots[stream].at[mine_rows]
+            for name, stream in matrices.items()}
+
+
+def _gmm_prefetch(family: mosaic.Family, step: functools.partial) -> Callable | None:
+    """Dew: the walk's prefetch of a `_gmm_step`'s slots (`Transport.prefetches_fragments`): its one product's
+    first fragments (`Issuer.first_fragments`), read under the step before's last product, for a plain step
+    alone (one matrix, its rows as staged, every consumer's products issued unconditionally, a compiled
+    launch), its rows and its matrix read untransposed: the prefetch reads the left operand an instruction's
+    granule at a time (`products_across`), which took a transposed left's kernel gradient 7% slower on an A100
+    than its whole-swizzle-tile reads (FS-DENSE-AB1), and an input gradient's transposed matrix, prefetched,
+    ran Llama-3-8B's and Qwen3-32B's gate_up input gradients 1.33x and 1.28x slower with an output other than
+    the unprefetched walk's (M-FS-53-a100), where every forward ran faster, its output the same (0.954x
+    geomean); None elsewhere, its steps walked as they were."""
+    keywords = step.keywords
+    plain = (len(keywords['matrices']) == 1 and keywords['prologue'] is None and keywords['idle'] is None
+             and keywords.get('decoded') is None and not keywords['packed_rows']
+             and not keywords['block_scaled'] and keywords['chosen'] is None and not keywords['interpret']
+             and not keywords['transpose_lhs'] and not keywords['transpose_rhs'])
+    if not (family.prefetches_fragments and plain):
+        return None
+
+    def prefetch(slots):
+        matrices = keywords['matrices']
+        (name,) = matrices
+        rows_of = _rows_of(slots, matrices, keywords['mine_rows'], keywords['transpose_lhs'])
+        oriented = _oriented(slots, matrices, keywords['transpose_rhs'])
+        return family.first_fragments(rows_of[name], oriented[name])
+
+    return prefetch
 
 
 def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halved: str, half) -> jax.Array:
