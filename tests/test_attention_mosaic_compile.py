@@ -1965,3 +1965,20 @@ def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
         case = _fast_backward_compile_case("sm90-overlapped-coop-d256", q, k, spans, shapes)
         found = compile_mosaic_kernels([case], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_deterministic_ops):
+    """Row 5272: sm90 deterministic two-launch keys-first dK/dV (`_overlapped_dkv_scores`) compiles
+    spill-free at d128."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed("sm90"):
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        case = _fast_backward_compile_case("sm90-overlapped-dkv-det-d128", q, k, spans, shapes)
+        found = compile_mosaic_kernels([case], "sm90")
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+

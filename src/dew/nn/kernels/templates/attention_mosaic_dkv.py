@@ -30,6 +30,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, Param, by_power, shared_place
+from dew.nn.kernels.templates.attention_backward_algebra import derived_from_weights, derived_weights
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
@@ -59,6 +60,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
     _dq_added,
+    _read,
     _relay_tiles,
     _relayed,
     _score_params,
@@ -187,19 +189,25 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # 2^-10): a stream of their own, or where one passes the block staged a step from the call's own
     # (`BackwardTiles.staged_logits`; a third of the launch at Qwen3-8B, ET-SWAPABL-h100). dK from the call's
     # own, which the power would flush where a query is 2^-126 at the scale 2^-10.
-    s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
-                                v_smem, do_slot.transpose((1, 0)), shape)
-    if logits_stage is not None:
-        # Its share of the staged queries read (the products waited): the next step's stage may be written.
-        walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
-    # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
-    # (spilled 1184 bytes at 64 x 64, one consumer).
     read = walk.places_read(masked=masked)
     fused = add_dq is not None
     coords = coords_of(q_first, shape=shape, read=read)
-    narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s, slots=slots), s, dp,
-                                        rows_of(q_first, count),
-                                        (do_slot.dtype, q_slot.dtype), one_part=fused, masked=masked)
+    if (family.products_overlap and not family.operands_in_registers and not walk.interpret
+            and not walk.accurate and not walk.dropped and not walk.kinds):
+        narrowed, logits, pieces = _overlapped_dkv_scores(
+            walk, (k_smem, v_smem), (logits_slot, do_slot), shape, coords, rows_of(q_first, count),
+            (do_slot.dtype, q_slot.dtype), logits_stage=logits_stage, one_part=fused, masked=masked)
+    else:
+        s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
+                                    v_smem, do_slot.transpose((1, 0)), shape)
+        if logits_stage is not None:
+            # Staged queries read (products waited): next step's stage may be written.
+            walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
+        # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
+        # (spilled 1184 bytes at 64 x 64, one consumer).
+        narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s, slots=slots), s, dp,
+                                            rows_of(q_first, count),
+                                            (do_slot.dtype, q_slot.dtype), one_part=fused, masked=masked)
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = issued_into(family, dv_acc, narrowed if isinstance(narrowed, tuple) else (narrowed,), do_columns,
@@ -393,6 +401,43 @@ class _PlacedDq:
             return
         steps = lax.div(jnp.maximum(hi - lo - role, 0) + placed.TURNS - 1, placed.TURNS)
         rings.drained((self.stages[3][role],), steps * len(self.pieces()), REDUCED)
+
+
+def _overlapped_dkv_scores(walk: _Backward, resident: tuple, slots: tuple, shape: tuple[int, int],
+                           coords: algebra.Coords, rows: tuple, dtypes: tuple, *, logits_stage,
+                           one_part: bool, masked: bool = True) -> tuple:
+    """Keys-first overlapped S/dP scores via `product_pair(..., between=...)` (row 5272): releases
+    `logits_stage` and runs `S` softmax + weight narrowing while `dP = V dOᵀ` runs on Tensor Cores."""
+    family = walk.program.family
+    (k_smem, v_smem), (logits_slot, do_slot) = resident, slots
+    values, queries = dtypes
+    peak, total, anchor, delta = (_read(row) for row in rows[:4])
+    how = walk.how
+    scale = walk.spec.scale if how.factor is None else 1.0
+
+    def between(s):
+        if logits_stage is not None:
+            family.turn(logits_stage[2], walk.consumers, wait=False)
+        seen = algebra.seen(walk.spec, coords, s) if masked else None
+        logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen,
+                                              coords.q_pos, coords.k_pos, (), scale=scale, slopes=True)
+        exponentials, weights = derived_weights(keys_first=True, how=how, accurate=False).mapped(
+            {"logits": logits, "peak": peak, "total": total})
+        narrowed = (algebra.value_weights(exponentials, weights, values, walk.dropped) if one_part
+                    else algebra.value_parts(weights, values))
+        return narrowed, weights, slopes, seen
+
+    (narrowed, weights, slopes, seen), dp = family.product_pair(
+        k_smem, logits_slot.transpose((1, 0)), v_smem, do_slot.transpose((1, 0)), shape, between=between)
+    tiles_ds = {"weights": weights, "products": dp, "anchor": anchor, "delta": delta}
+    if seen is not None:
+        tiles_ds["seen"] = seen
+    cotangents = derived_from_weights(keys_first=True, masked=seen is not None).mapped(tiles_ds)
+    logits, pieces = gradient.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
+    if one_part:
+        parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
+        logits = mosaic.unscaled_part(*parts)
+    return narrowed, logits, pieces
 
 
 def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,
