@@ -566,3 +566,17 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
         f"cross-pass live growth {msg_growth} B exceeded plain growth {plain_growth} B + "
         f"2 * added_banks {2 * added_banks} B "
         f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
+
+
+def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call():
+    """A caller capturing every module's outputs (`capture_intermediates`) sees each merge's depth mixture
+    called, as a merge no one watches computes it through its reverse-mode rule (`portable_formed`, row
+    11713's review): the merge runs as Flax sees it, its logits the unwatched run's."""
+    model = decoder("attention", steps=2)
+    ids = jnp.asarray(np.random.default_rng(11713).integers(0, VOCAB, (2, 12)), jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    logits, captured = model.apply(variables, ids, capture_intermediates=True, mutable=["intermediates"])
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(captured)]
+    assert any("cross_pass" in path and "'depth'" in path for path in paths)
+    np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
+

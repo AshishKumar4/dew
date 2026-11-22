@@ -493,12 +493,10 @@ def _together_tangent(primals, tangents):
     return primals, held
 
 
-formed_together = declared_tangent(KernelGlue(), _together_value, _together_tangent, symbolic_zeros=True)
-"""`value` and `parameters` as they are, a module's reads of them, whose reverse mode returns `value`'s
-cotangent only with the `parameters`' gradients formed (`with_tangents_formed`): what a module computes in
-any way of its own (its products under the quantization a scope rules, its submodules' calls, which
-observers see) is no more than read from these, and the layer below, reading `value`'s cotangent, waits on
-its parameters' gradients, which XLA puts off to the step's end otherwise, holding what they read live
-across layers (row 11713: a cross-pass merge's controller products and its depth query, held live across
-an exit-gated loop's unrolled passes, ~130 GiB on a Qwen3.5-4B step). Identity forward, its reverse mode
-retains no primal."""
+formed_together = contracted("test_a_module_reading_its_parameters_formed_together_holds_every_order")(
+    declared_tangent(KernelGlue(), _together_value, _together_tangent, symbolic_zeros=True))
+"""`value` and `parameters` as they are, whose reverse mode returns `value`'s cotangent only with the
+`parameters`' cotangents formed (`with_tangents_formed`): identity forward, its reverse mode retaining no
+primal. What reads them computes in any way of its own; the layer below, reading `value`'s cotangent, waits
+on the parameters' (row 11713: a loop pass's bank cotangent summed over the layers above in one
+accumulator, `cross_pass.tie_bank`)."""

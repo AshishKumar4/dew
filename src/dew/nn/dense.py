@@ -59,6 +59,18 @@ def packed_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]):
     return make()
 
 
+def watched_or_owned(module: nn.Module) -> bool:
+    """Whether `module`'s calls must run as Flax and a wrapper see them, no rule of Dew's standing in for its
+    computation (`dew.nn.derivatives.portable_formed`, which differentiates a function of arrays apart from
+    the module's scope): a wrapper owning its products (`intercepted`, a Qwix rule matching it among them),
+    a Flax method interceptor installed (`nn.intercept_methods`: a watch's), or its caller capturing its
+    calls' outputs (`capture_intermediates`)."""
+    from flax.linen import module as flax_module
+
+    return (intercepted() or bool(flax_module._global_interceptor_stack)
+            or module.is_mutable_collection('intermediates'))
+
+
 def intercepted() -> bool:
     """Whether a wrapper owns the layer's product, which reaches it as a `jax.lax.dot_general` call: a Dew
     interception scope (`dew.quantization`, `dew.lora`: `dew._cache.INTERCEPTED`), or a Qwix rule matching
