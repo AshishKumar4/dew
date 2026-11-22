@@ -1354,6 +1354,13 @@ def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
         t256 = tiling.Tiles(64, 256, 64, 4, 56, warpgroups=1, family="wgmma")
         # 128 acc + 32 scalar + max(0, max(32, 16) - 32) + 64 held = 224 (live beside output staging)
         assert gmm.registers(ba_two, t256) == 224
+        wide_last = grouped_matmul.Hooks(
+            epilogue=lambda acc: (acc.astype(jnp.bfloat16), acc + 1.0),
+            out_dtypes=("bfloat16", "float32"))
+        ba_wide_last = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                                hooks=wide_last)
+        # While bf16 output 0 stages, fp32 output 1 (128 regs) stays live: 128 + 32 + 128 = 288 > 224.
+        assert gmm.registers(ba_wide_last, t256) == 288
         ba_dw = tgmm.bind(x, jax.ShapeDtypeStruct((4096, 14336), jnp.bfloat16), sizes,
                           out_dtype="float32", interpret=False, dense=False)
         assert tgmm.registers(ba_dw, t256) == 168
@@ -1394,8 +1401,8 @@ def test_tpu_v5e_gemm_derives_legal_vmem_bounded_tiles():
 def test_ampere_multi_wave_dense_dx_runs_non_persistent_and_matches_xla():
     """On Ampere (`mma.sync`, `walks_scoped=True`), multi-wave dense calls skip `_dense_tail` so `launched()`
     runs non-persistent (avoiding persistent L2 drift on deep-K gate_up dX, row 5363; native multi-CTA
-    switch qualified via M-NG-2 on A100, while interpreted mode runs 1 program and verifies partial-row
-    numerical parity against XLA)."""
+    qualification on the tail-only head is pending M-NG-2 A100 measurement, while interpreted mode runs 1
+    program and verifies partial-row numerical parity against XLA)."""
     from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 
     with generation.assumed("sm80"):

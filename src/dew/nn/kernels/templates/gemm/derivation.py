@@ -110,8 +110,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
                                    multiprocessors=multiprocessors, grouped=grouped and not dense)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
-                                      target=target, programs=programs)
-        # The balanced tile: the widest width the area holds at the balanced rows (`_held_widths`), its
+                                      target=target, programs=programs, rows=rows, width=width)
         # rows the most its registers hold there and its stages keep busy, rows short of that balance (the
         # width's held rows, or the balanced side where it holds more) giving way to the next narrower
         # width, so a tile keeps its rows and narrows rather than shortening. mma.sync's one consumer at
@@ -121,8 +120,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         side = _side(layouts, consumers, role, most_rows, columns, rows, target, dtype, steps,
                      padded=grouped and not dense)
         widths = _held_widths(layouts, consumers, columns, role, most_rows, side)
-        return _best_width(widths, held_tile, side, budgets_registers=family.budgets_registers)
-    # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
+        return _best_width(widths, held_tile, side, budgets_registers=family.budgets_registers,
+                           rows=rows, width=width)
     # does a call no cooperative tile holds (a wide epilogue's outputs past a block), and a grouped call
     # whose groups average fewer rows than one role (a decode step's experts, a few routed rows each), whose
     # further consumers would compute padding alone; where groups average a role's rows, a routing's groups
@@ -175,8 +174,8 @@ def _derived_columns(family: mosaic.Family, width: int, dtype, unit_of_call: int
 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], shaped: Callable,
-               candidate: Callable, launch_of: Callable, layouts: tuple, target, programs: int
-               ) -> tuple["Tiles | None", bool]:
+               candidate: Callable, launch_of: Callable, layouts: tuple, target, programs: int,
+               rows: int, width: int) -> tuple["Tiles | None", bool]:
     """`derived`'s tile at a width: the rows its registers hold there (`held_rows`), shortened where its
     stages do not fit, at the first step that plans (a step's depth sets how many steps a tile takes, not
     how many times a FLOP reads each operand); and whether it stages deep enough to stay busy (those its
@@ -202,8 +201,8 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
             if tile.stages >= busy:
                 if family.budgets_registers:
                     return tile, True
-                # VMEM-shared family (`mxu`): minimize 3D tile surface-to-volume ratio (M-FS-45, row 10152).
-                score = _vmem_score(tile)
+                # VMEM-shared family (`mxu`): minimize 3D tile surface-to-volume ratio weighted by padding.
+                score = _vmem_score(tile, rows, width)
                 if best is None or score < best[0]:
                     best = (score, tile)
                 break
@@ -213,14 +212,17 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
     return fallback, False
 
 
-def _vmem_score(tile: Tiles) -> tuple[float, int, int]:
-    """3D tile surface-to-volume ratio `(1/M + 1/N + 1/K)` for VMEM-shared families (M-FS-45, row 10152)."""
-    return (1.0 / tile.block_m + 1.0 / tile.block_n + 1.0 / tile.block_k,
+def _vmem_score(tile: Tiles, rows: int, width: int) -> tuple[float, int, int]:
+    """3D tile surface-to-volume ratio `(1/M + 1/N + 1/K)` weighted by row/column tile-padding waste for
+    VMEM-shared families (M-FS-45, M-NG-2-v5e1, row 10152)."""
+    row_pad = (-(-rows // tile.block_m) * tile.block_m) / max(rows, 1)
+    col_pad = (-(-width // tile.block_n) * tile.block_n) / max(width, 1)
+    return ((1.0 / tile.block_m + 1.0 / tile.block_n + 1.0 / tile.block_k) * row_pad * col_pad,
             -(tile.block_m * tile.block_n), -tile.block_k)
 
 
 def _best_width(widths: list[tuple[int, int]], held_tile: Callable, side: int, *,
-                budgets_registers: bool) -> tuple[Tiles | None, bool]:
+                budgets_registers: bool, rows: int, width: int) -> tuple[Tiles | None, bool]:
     """Pick the best width among `widths`: widest balanced for register-budgeted families, or lowest
     `_vmem_score` for VMEM-shared families."""
     busy_at, fallback = None, None
@@ -228,7 +230,7 @@ def _best_width(widths: list[tuple[int, int]], held_tile: Callable, side: int, *
     for block_n, held_rows in widths:
         tile, staged = held_tile(block_n, held_rows)
         if not budgets_registers and tile is not None and staged:
-            score = _vmem_score(tile)
+            score = _vmem_score(tile, rows, width)
             if best_vmem is None or score < best_vmem[0]:
                 best_vmem = (score, tile)
             continue
