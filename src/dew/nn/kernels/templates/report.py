@@ -831,7 +831,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     aside = _ASIDE.get()
     if aside is not None and key in aside.pending:
         return ()
-    if aside is not None and not _refused_before(op, arguments):
+    if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
         # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
         aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored)
@@ -850,6 +850,16 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         _uncertified_launch(key, op, config, error)
         return None
     return _kept_certification(key, op, config, reverse, kernels, unstored, device).refused
+
+
+def _traced_for(device) -> bool:
+    """Whether the trace calling a launch places it on `device`'s generation (`generation.placed_device`), so
+    Mosaic GPU lowers that trace's kernels for the device (its architecture inferred from that placement): its
+    call is replayed for `device` (`capture`). A trace placed elsewhere (on its host, whose placement Mosaic
+    GPU lowers for Hopper's TMA copies: an A100 step's captured kernels failed to lower for sm80,
+    FS-ASIDE-EVERY80C) certifies its launch in turn, the launch traced for the device (`_lowered_launch`)."""
+    return (generation.device_target(generation.placed_device()).generation
+            == generation.device_target(device).generation)
 
 
 def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> None:
