@@ -67,38 +67,63 @@ def test_a_positioned_streams_shards_are_named_alike_wherever_its_store_is_mount
     first, second = (Files(str(tmp_path / mount / "data" / "rows.jsonl"),
                            shard_bytes=40).positioned_manifest() for mount in ("a", "b"))
     assert [shard.id for shard in first.shards] == [shard.id for shard in second.shards]
+    assert [shard.id for shard in first.parts()] == [shard.id for shard in second.parts()]
+    # One shard of the whole store, as a plan saved under version 17 names it, cut into fixed finer ones
+    # for many readers (row 11637's review: its saved plans' shards changed under one version).
+    assert len(first.shards) == 1 and len(first.parts()) == 8
 
 
-@pytest.mark.parametrize("workers", [0, 2])
-def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_shard(tmp_path, workers):
-    """An indexed JSONL store read by a stream that numbers its rows before its cache, in several shards,
-    by one process or two workers: the cache publishes the store's generation once the read has filled
-    every positioned shard, so the next streamed read reads it back, numbering and running nothing (row
-    9051's confirm review: the fill counted the store's byte ranges, and no seal reached its publication;
-    row 11637: two workers cut its one shard into parts no fill found among its shards)."""
+def _numbered(log: str, index, row):
+    """`row` with the index a positioned stream numbered it by, the index written to `log`: what a worker
+    process numbered, which its parent reads."""
+    with open(log, "a") as written:
+        written.write(f"{int(index)}\n")
+    return {**row, "at": np.int64(index)}
+
+
+@pytest.mark.parametrize("shares", [None, 2], ids=["one pass", "two shares of two workers"])
+def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_shard(tmp_path, shares):
+    """An indexed JSONL store of a few rows, read by a stream that numbers its rows before its cache: by one
+    pass in the process, or by two shares of two worker processes each, its one shard cut into its fixed
+    finer ones: the cache publishes the store's generation once the read has filled every shard it read,
+    so the next read reads it back, numbering nothing again (row 9051's confirm review: the fill counted
+    the store's byte ranges, and no seal reached its publication; row 11637: workers cut its one shard
+    into parts no publication found among its shards; its review: a small store's fixed ranges were one,
+    which two workers refused)."""
+    import functools
+
     from dew.data.cache import Cache
-    from dew.data.compile import iterate
-    from dew.data.dataset import Loading
+    from dew.data.compile import compile, iterate
+    from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
 
     path = tmp_path / "rows.jsonl"
     path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(12)))
-    files = Files(str(path), shard_bytes=40)
+    files = Files(str(path))
     files.provision()
     cache = Cache(str(tmp_path / "cache"))
-    numbered: list[int] = []
-
-    def at(index, row):
-        numbered.append(int(index))
-        return {**row, "at": np.int64(index)}
+    log = tmp_path / "numbered"
+    log.touch()
+    chain = Pipeline(files).map_with_index(functools.partial(_numbered, str(log)), identity="numbered@1")
 
     def values() -> list[tuple[int, int]]:
-        chain = Pipeline(files).map_with_index(at, identity="numbered@1").cache(cache)
-        rows = iterate(chain, read="streamed", loading=Loading(workers=workers, threads=2, read_buffer=1))
-        return sorted((int(row["at"]), int(row["id"])) for row in rows)
+        if shares is None:
+            rows = iterate(chain.cache(cache), read="streamed", loading=Loading(workers=0))
+            return sorted((int(row["at"]), int(row["id"])) for row in rows)
+        data = compile(chain.cache(cache).batch(1), read="streamed",
+                       loading=Loading(workers=2, threads=1, read_buffer=1))
+        read = []
+        for index in range(shares):
+            reader = data.train(DataPartition(index=index, count=shares))
+            try:
+                read += [(int(batch["at"][0]), int(batch["id"][0])) for batch in
+                         (next(reader) for _ in range(12 // shares))]
+            finally:
+                reader.close()
+        return sorted(read)
 
     first = values()
-    count = len(numbered)
+    numbered = log.read_text().split()
     again = values()
     assert first == again == [(index, index) for index in range(12)]
-    assert count == 12 and len(numbered) == count
+    assert sorted(map(int, numbered)) == list(range(12)) and log.read_text().split() == numbered

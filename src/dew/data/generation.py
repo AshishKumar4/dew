@@ -144,7 +144,8 @@ def _filled_manifest(source: Source, completed: Iterable[str]) -> ShardManifest:
     store's own."""
     named = {row[0] for row in map(json.loads, completed) if isinstance(row, list)}
     positioned = stream_manifest(source, positioned=True)
-    return positioned if named and named <= {shard.id for shard in positioned.shards} else source.manifest()
+    held = ({shard.id for shard in positioned.shards}, {shard.id for shard in positioned.parts()})
+    return positioned if named and any(named <= ids for ids in held) else source.manifest()
 
 def _publish(
     cache: Cache,

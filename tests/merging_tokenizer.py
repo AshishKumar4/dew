@@ -15,9 +15,9 @@ class Merging(ByteTokenizer):
         super().__init__()
         self.merged = merged
 
-    def longest_token(self) -> int:
-        """Its merged string's characters, the most one id covers."""
-        return len(self.merged.decode())
+    def shrink_bound(self) -> int | None:
+        """One merge of its string, the most a text growing at its end loses: its bytes but the one id."""
+        return len(self.merged) - 1
 
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """Its ids, each covering its characters, the merged string one id covering all of its."""

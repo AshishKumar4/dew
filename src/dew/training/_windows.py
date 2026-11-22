@@ -1,11 +1,12 @@
 """A training state's accumulation window, built empty (`empty_window`): what a step of a window of
 microbatches pools its gradients, statistics and replayed batches in, which a run's first step of a window
-builds and a step compiled ahead compiles (`dew.training.trainer.Trainer`'s stepping)."""
+builds and a step compiled ahead compiles, as its run states it (`Windowing`)."""
 
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -19,23 +20,36 @@ from dew.training.planning import released
 from dew.training.transaction import batch_statistics_shapes, compact_qk, pooled_by_mean
 
 if TYPE_CHECKING:
-    from dew.objectives.base import Objective
-    from dew.training.trainer import Trainer
+    from dew.distributed.placement import Placement
+    from dew.objectives.base import Aux, Objective
 
 
-def empty_window[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
-                                  shapes, *, window: int, split: int = 1, shape_only=False,
+class Windowing(NamedTuple):
+    """What a run's empty window is built by (`empty_window`): whether its step is a custom one, which holds
+    none (`Trainer.step`); its microbatch's records as the model reads them (`Trainer._model_shapes`);
+    where the state's leaves are placed (`Trainer.shardings`); and whether it samples what it inspects
+    (`PhasePasses.sampled`), whose attention statistics its window keeps compact."""
+
+    custom: bool
+    records: Callable[[Batch], Batch]
+    shardings: Callable[[TrainState], Placement[TrainState]]
+    sampled: bool
+
+
+def empty_window[LossT, EffectsT](windowing: Windowing, state: TrainState, batch: Batch,
+                                  shapes: tuple[LossT, Aux[EffectsT]], *,
+                                  window: int, split: int = 1, shape_only: bool = False,
                                   donor: Accumulation | None = None,
                                   objective: Objective[LossT, EffectsT]) -> TrainState:
-    """`trainer`'s state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty;
-    unchanged under a custom step or a held one that replays such batches (`Accumulation.replays`): a
-    ramp's stage begins with a window (`Ramp.stages`). Under a window of one, the state holds none: an
-    empty one it holds of another split (a phase planned afresh, `StepCompiler.afresh`) is the one its
-    step lets go as it is handed the state (`laid_out`), so the step is planned over the state without
-    it. Built over `donor`, the empty window it replaces, where given: each of its leaves of a new
-    leaf's shape and dtype donated to it, its buffer the new one's, zeroed, the rest released
-    (`taken`)."""
-    if trainer.step is not None:
+    """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty, as
+    `windowing` states its run; unchanged under a custom step or a held one that replays such batches
+    (`Accumulation.replays`): a ramp's stage begins with a window (`Ramp.stages`). Under a window of one,
+    the state holds none: an empty one it holds of another split (a phase planned afresh,
+    `StepCompiler.afresh`) is the one its step lets go as it is handed the state (`laid_out`), so the step
+    is planned over the state without it. Built over `donor`, the empty window it replaces, where given:
+    each of its leaves of a new leaf's shape and dtype donated to it, its buffer the new one's, zeroed, the
+    rest released (`taken`)."""
+    if windowing.custom:
         return state
     if window == 1:
         return state if state.accumulation is None else dataclasses.replace(state, accumulation=None)
@@ -47,7 +61,7 @@ def empty_window[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Trai
         return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
 
     trainable = jax.tree.map(shape, state.variables["params"])
-    records = jax.tree.map(shape, trainer._model_shapes(batch))
+    records = jax.tree.map(shape, windowing.records(batch))
     mutable = (None if shared or aux.variables is None else
                jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
     batch_stats = batch_statistics_shapes(objective, state, records, window, split)
@@ -69,7 +83,7 @@ def empty_window[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Trai
             qk_stats=jax.tree.map(
                 lambda x: jnp.full(x.shape, -jnp.inf, at_least_fp32(x.dtype))
                 if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
-                compact_qk(jax.tree.map(zeros, aux.qk_stats), trainer.phase_passes.sampled is not None)),
+                compact_qk(jax.tree.map(zeros, aux.qk_stats), windowing.sampled)),
             batches=None if shared else buffer(records),
             variables=None if mutable is None else buffer(mutable),
             attempts=None if shared else jnp.zeros((slots,), jnp.int32),
@@ -85,7 +99,7 @@ def empty_window[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Trai
     if kept_window(state.accumulation, pending, read=not shape_only):
         return state
     if not shape_only:
-        placement = trainer.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
+        placement = windowing.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
         # Allocate on the final shards, without a replicated window-sized temporary, over the donor's
         # buffers where the old window's leaves have the new ones' shapes: none allocated twice.
         # The window it replaces: one laid out for another split (`donor`), or the state's own, a ramp's

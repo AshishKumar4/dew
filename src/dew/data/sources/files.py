@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import dataclasses
 import hashlib
 import io
 import itertools
@@ -51,7 +52,7 @@ from dew.data.storage import (
     on_gcs,
 )
 
-from .base import Read, Shard, ShardManifest, _indexed_manifest, preparing, source_record, url_label
+from .base import Read, Shard, ShardManifest, _single_indexed_manifest, preparing, source_record, url_label
 from .index import ArrayIndex
 
 type Format = Literal[
@@ -60,7 +61,7 @@ type Format = Literal[
 
 
 type SchemaFact = dict[str, tuple[str, ...]] | int | list[str] | None
-"""A fact a raw Parquet or Arrow store's schema states (`Files._schema_facts`), None where it states none."""
+"""A fact a raw store states (`Files._raw_facts`), None where it states none."""
 
 
 def _format(url: str) -> Format:
@@ -940,10 +941,9 @@ class Files(Dataset):
     def positioned_manifest(self) -> ShardManifest:
         """Its shards for a stream that numbers its rows (`dew.data.sources.base.stream_manifest`): a text
         store's records as its offset index lists them (`records`' indexed read), each row at its index
-        there, in fixed ranges of whole records of about `shard_bytes` each (`_indexed_manifest`), each
-        named by the record it starts at, the shards a fill keys its rows by however many readers and
-        workers read them (row 11637: one shard, cut apart by the readers asking, named its parts no fill
-        found among its shards); its own shards (`manifest`) where it holds no such index, or reads its
+        there, in one shard of them all, cut for many readers and workers into fixed finer ones of whole
+        records (row 11637: cut by the readers' count, a fill named parts no publication found among its
+        shards); its own shards (`manifest`) where it holds no such index, or reads its
         records otherwise (row 9051: its byte ranges state no rows, which a positioned stream needs). Its
         index, its producer's or one `provision` wrote, is what its indexed read reads, so both reads number
         the same records alike."""
@@ -953,9 +953,23 @@ class Files(Dataset):
         # Named by its files' places (`_places`), which every host that mounted them anywhere names alike, as
         # a digest of them, of one length however many files it holds.
         places = "\n".join(self._places[url] for url in self.paths)
+        uri = f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}"
         count = len(self.records("indexed"))
-        rows = max(1, -(-count * self.shard_bytes // max(self.preparation_bytes(), 1)))
-        return _indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}", rows)
+        # Its finer shards fixed whatever reads them, each of about `shard_bytes` and as many as `PARTS` at
+        # the least, so a stream of many readers and workers keys its fill by shards its publication reads
+        # as the store's (`ShardManifest.fixed_parts`): its whole-store shard the one a single reader's
+        # fill and every saved plan name (row 11637's review: cut by the readers' count, its fill named
+        # parts of no fixed geometry; as fixed ranges alone, a small store refused two workers).
+        rows = max(1, min(-(-count * self.shard_bytes // max(self.preparation_bytes(), 1)),
+                          -(-count // self.PARTS)))
+        fixed = tuple(Shard(f"{uri}:{start}", uri, start, min(start + rows, count), min(rows, count - start))
+                      for start in range(0, count, rows))
+        whole = _single_indexed_manifest(self, uri)
+        return dataclasses.replace(whole, subdivide=lambda required: fixed, fixed_parts=True)
+
+    PARTS = 64
+    """The fewest finer shards a positioned stream's store is cut into (`positioned_manifest`), so as many
+    readers and workers read it at once."""
 
     def manifest(self) -> ShardManifest:
         """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a fill
@@ -1152,17 +1166,24 @@ class Files(Dataset):
 
     def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
         """Those of its facts named by `keys` (`dew.data.sources.base.asked`): a raw Parquet or Arrow store
-        reads only those its schema states (`_schema_facts`), opening no file for a fact it states none of
+        reads only those asked (`_raw_facts`), opening no file for a fact it states none of
         (row 9009: a seeded streamed mix read every member's schema to check the tokenizer contract)."""
-        if self.committed is None and self.kind in ("parquet", "arrow"):
-            facts = {key: read() for key, read in self._schema_facts().items() if key in keys}
+        if self.committed is None:
+            facts = {key: read() for key, read in self._raw_facts().items() if key in keys}
             return {key: value for key, value in facts.items() if value is not None}
         return {key: value for key, value in self._metadata.items() if key in keys}
 
-    def _schema_facts(self) -> dict[str, Callable[[], SchemaFact]]:
-        """A raw Parquet or Arrow store's facts, each by the read that states it, None where its store
-        states none: the one place they are built (`_metadata`, `asked`), its names known with no file
-        opened (row 11638: a list of them beside the builder dropped a key it gained)."""
+    def _raw_facts(self) -> dict[str, Callable[[], SchemaFact]]:
+        """A raw store's facts, each by the read that states it, None where its store states none: the one
+        place they are built (`_metadata`, `asked`), its names known with no file opened, a Parquet or Arrow
+        store's from its schema, a text store's rows from its offset index (row 11638: a list of them
+        beside the builder dropped a key it gained; its review: a text store's index opened for any)."""
+        if self.kind in ("jsonl", "text", "csv"):
+            return {"rows": self._indexed_rows}
+        if self.kind == "files":
+            return {"rows": lambda: len(self.paths)}
+        if self.kind not in ("parquet", "arrow"):
+            return {}
 
         def class_names() -> dict[str, tuple[str, ...]]:
             schema = self.arrow.schema.metadata or {}
@@ -1199,15 +1220,15 @@ class Files(Dataset):
                 raise ValueError("export metadata must be a mapping")
             rules = {"count_rules": self.committed["count_rules"]} if "count_rules" in self.committed else {}
             return {**metadata, **rules, "rows": self.committed["rows"], "format": self.committed["format"]}
-        if self.kind in ("parquet", "arrow"):
-            facts = {key: read() for key, read in self._schema_facts().items()}
-            return {key: value for key, value in facts.items() if value is not None}
-        if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
-            with contextlib.closing(_IndexedLines(self)) as indexed:
-                return {"rows": len(indexed)}
-        if self.kind == "files":
-            return {"rows": len(self.paths)}
-        return {}
+        facts = {key: read() for key, read in self._raw_facts().items()}
+        return {key: value for key, value in facts.items() if value is not None}
+
+    def _indexed_rows(self) -> int | None:
+        """A text store's records as its offset index counts them, None where it holds no index."""
+        if not self.supports("indexed"):
+            return None
+        with contextlib.closing(_IndexedLines(self)) as indexed:
+            return len(indexed)
 
     def lengths(self) -> np.ndarray | None:
         if not self.paths:

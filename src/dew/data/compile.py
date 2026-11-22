@@ -420,9 +420,18 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     another)."""
     corpora = [(f"corpus {_name(leaf)}", source)
                for pipeline in pipelines for leaf, source in _leaves(pipeline)]
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(corpora)))) as readers:
-        facts = list(readers.map(lambda corpus: asked(corpus[1], TOKENIZER_CONTRACT), corpora))
-    tokenizer_contract(zip([name for name, _ in corpora], facts, strict=True))
+    # One read a store, whatever corpora read it (as `_pin_sources` reads each once): a store's facts are
+    # cached unlocked, which two threads reading one store at once would race on (row 11638's review).
+    stores = {id(_store_of(source)): source for _, source in corpora}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(stores)))) as readers:
+        facts = readers.map(lambda source: asked(source, TOKENIZER_CONTRACT), stores.values())
+        read = dict(zip(stores, facts, strict=True))
+    tokenizer_contract((name, read[id(_store_of(source))]) for name, source in corpora)
+
+
+def _store_of(source: Source) -> Source:
+    """The store a compile's pinned source reads (`_Facts`): itself where it is none."""
+    return source.source if isinstance(source, _Facts) else source
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:

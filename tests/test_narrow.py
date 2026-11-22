@@ -965,9 +965,9 @@ def test_a_steps_reads_of_its_parameters_pass_over_another_collections_attribute
 def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_steps_with_its_copies():
     """A fit whose state holds, beside its parameters, a collection of structured leaves its step reads no
     copy of (a packed checkpoint's `quantization`, an NvFp4 weight's attributes), its narrow copies on, plans
-    and steps at a plan keeping its copies, the collection held through the step as it was (row 11730: its
-    first step raised on those attribute paths before it ran; row 11779: its proof read the analysis
-    alone)."""
+    and steps, and the step it runs builds copies of its parameters alone, the collection's leaves held
+    through it as they were (row 11730: its first step raised on those attribute paths before it ran; row
+    11779: its proof read the analysis alone)."""
     from typing import NamedTuple
 
     from token_support import repeated_token_batch
@@ -990,9 +990,16 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
                           layout=Layout(min_shard=1, tolerance=1.0))
         state = trainer.fit(Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None,
                                    records=None, batch=8), steps=1)
-    # Stepped once at a plan keeping its copies, its packed collection held through the step as it was.
-    plan = trainer.plan
-    assert int(state.step) == 1 and isinstance(plan, dict), plan
-    assert [probe["narrow"] for probe in plan["probes"] if probe["fits"]] == [True], plan["probes"]
-    np.testing.assert_array_equal(np.asarray(state.variables["quantization"]["head"].scale), np.ones(4))
+    assert int(state.step) == 1
+    # The step a fit runs, called as compiled, returns the state its copies are built in (a fit's own state
+    # holds none past its end): copies of its parameters alone, the packed collection's two leaves held
+    # through the step as they were.
+    _, batch = _decoder()
+    with chosen(narrow_copies="on"):
+        stepped, *_ = trainer.compile(state, batch)(state, batch)
+    copied = {path[0].key for path, _ in jax.tree_util.tree_flatten_with_path(stepped.compute or {})[0]}
+    assert copied == {"params"}, copied
+    held = stepped.variables["quantization"]["head"]
+    np.testing.assert_array_equal(np.asarray(held.values), np.ones((4, 2), np.uint8))
+    np.testing.assert_array_equal(np.asarray(held.scale), np.ones(4))
 

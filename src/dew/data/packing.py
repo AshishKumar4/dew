@@ -494,9 +494,9 @@ class PackedSource(View[Source]):
     def records(self, read: Read) -> _PackedRows:
         return _PackedRows(self.source.records(read), self.plan)
 
-    def metadata(self) -> Mapping[str, object]:
+    def _facts(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         return {
-            **super().metadata(),
+            **super()._facts(facts),
             "rows": len(self.plan),
             "valid_targets": self.plan.at("totals", 0),
             "zero_target_windows": 0,

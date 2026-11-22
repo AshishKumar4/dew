@@ -90,8 +90,8 @@ class RecordSlice(View[Source]):
             raise ValueError(f"{self.describe()} exceeds the source's {records} records")
         return self.start, stop
 
-    def metadata(self) -> Mapping[str, object]:
-        return {**super().metadata(), **({"held_out": self.start} if self.start else {})}
+    def _facts(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return {**super()._facts(facts), **({"held_out": self.start} if self.start else {})}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -297,6 +297,11 @@ class SelectedGeneration(View[Source]):
     def manifest(self) -> ShardManifest:
         # A worker reads the placed rows alone (`_Placed`), not the store that placed them.
         return _indexed_manifest(self, self.generation.url, 4096, _Placed(self.generation, self._dense))
+
+    def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
+        """Those of its facts (`metadata`) named by `keys`: its facts are its selections' and its
+        generation's, none its source's alone."""
+        return {key: value for key, value in self.metadata().items() if key in keys}
 
     def metadata(self) -> Mapping[str, object]:
         """The selections' facts, as uncached (what they hold out included), with this part's rows and

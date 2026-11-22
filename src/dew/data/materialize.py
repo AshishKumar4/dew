@@ -110,11 +110,10 @@ class _Memory(View[Source]):
     def records(self, read: Read) -> tuple[Batch | bytes, ...]:
         return self.held
 
-    def metadata(self) -> Mapping[str, object]:
+    def _facts(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Its source's facts, the counts only where it ran no stage over the source's rows, then
         the counts it measured."""
-        stated = self.source.metadata()
-        return {**(_uncounted(stated) if self.ran else stated), **self.facts, "rows": len(self.held),
+        return {**(_uncounted(facts) if self.ran else facts), **self.facts, "rows": len(self.held),
                 "accepted": len(self.held)}
 
     def lengths(self) -> np.ndarray | None:

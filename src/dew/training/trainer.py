@@ -145,7 +145,7 @@ from dew.training._fit import (
     waited_read,
 )
 from dew.training._lowering import Lowered
-from dew.training._windows import empty_window
+from dew.training._windows import Windowing, empty_window
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
 from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held, planned_over
@@ -570,7 +570,8 @@ class Trainer(Generic[Loss, Effects]):
         bound = functools.partial
         return Stepping(self._settings(objective), bound(self._step_key, objective, compiler), self.shardings,
                         bound(self._loss_shape, objective=objective), self._staging,
-                        bound(empty_window, self, objective=objective), self._model_batch,
+                        bound(empty_window, self._windowing(), objective=objective),
+                        self._model_batch,
                         self._model_shapes, bound(self._step_body, objective=objective),
                         bound(fetched_state, layout=self.layout), self._traced_on, self._shape,
                         self._validation, self._builds_window, bound(self._window_of, objective=objective))
@@ -913,6 +914,11 @@ class Trainer(Generic[Loss, Effects]):
         return window > 1 and self.step is None and (
             held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
 
+    def _windowing(self) -> Windowing:
+        """What its runs' empty windows are built by (`empty_window`)."""
+        return Windowing(self.step is not None, self._model_shapes, self.shardings,
+                         self.phase_passes.sampled is not None)
+
     def _window_of(self, state: TrainState, candidate: Candidate, window: int,
                    donor: Accumulation | None = None, *,
                    objective: Objective[Loss, Effects] | None = None) -> TrainState:
@@ -920,8 +926,8 @@ class Trainer(Generic[Loss, Effects]):
         (`windowed`), built over `donor`, the empty window it replaces, where given: what a run's first step
         of a window builds, and a run compiled ahead compiles (`dew.training.ahead.started`)."""
         return windowed(lambda state, rows, *, shape_only: empty_window(
-            self, state, rows, candidate.shapes, window=window, split=window // self.accumulation,
-            shape_only=shape_only, donor=donor,
+            self._windowing(), state, rows, candidate.shapes, window=window,
+            split=window // self.accumulation, shape_only=shape_only, donor=donor,
             objective=self.objective if objective is None else objective), state, candidate.micro,
             self.shardings)
 

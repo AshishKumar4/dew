@@ -30,7 +30,7 @@ from typing_extensions import get_protocol_members
 from dew import _records
 from dew._cache import Same
 from dew._records import EARLIER_LAYOUTS, JSON
-from dew.data.text import HFTokenizer, Offsets, Tokenizer
+from dew.data.text import BoundedShrink, HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.decision.renderer import Chunk, Point, Rendered, Unit, render as rendered_chunks, stream_point
@@ -1323,23 +1323,24 @@ class SegmentLayout(Layout):
         # A merge across a cut may let a longer cut fit than the share counted: each copy takes the
         # longest that still fits, its own cap and the row's length both held. A row's encoding, and its
         # slice's, need not grow with its cut (a merge across a later boundary can take fewer tokens than
-        # one across an earlier), by no more tokens than its vocabulary's longest covers characters
-        # (`Offsets.longest_token`), so the walk stops once a longer cut overflows by more (rows 9060,
-        # 11739: it stopped 4 tokens past the room; 11839: it walked a long state's every prefix).
-        slack = encoder.longest_token()
+        # one across an earlier), so the walk reads every longer cut (rows 9060, 11739) but where its
+        # vocabulary proves by how many tokens an encoding can shrink as its text grows (`BoundedShrink`):
+        # there it stops once a longer cut overflows by more (row 11839: it walked a long state's every
+        # prefix; its review: a vocabulary's longest token proves no bound).
+        slack = encoder.shrink_bound() if isinstance(encoder, BoundedShrink) else None
         for at, copy in enumerate(copies):
             if len(laid.tokens) > self.max_len or copy.keep == "all":
                 continue
             for count in range(kept[at] + 1, lengths[at] + 1):
                 if (over := own_over(at, count)) > 0:
-                    if over > slack:
+                    if slack is not None and over > slack:
                         break
                     continue
                 longer = built([piece(other, count if other == at else kept[other])
                                 for other in range(len(copies))])
                 if len(longer.tokens) <= self.max_len:
                     kept[at], laid = count, longer
-                elif len(longer.tokens) > self.max_len + slack:
+                elif slack is not None and len(longer.tokens) > self.max_len + slack:
                     break
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]
