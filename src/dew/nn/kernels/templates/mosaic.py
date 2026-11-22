@@ -1363,6 +1363,11 @@ class Issuer[Accumulator](abc.ABC):
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
 
+    def left_of(self, ref) -> jax.Array:
+        """A product's left operand read straight from shared memory `ref` in the issuer's own operand
+        layout (e.g. a backward step's prescaled queries); defaults to `tile_of` (accumulator's layout)."""
+        return self.tile_of(ref)
+
     def scalar_of(self, ref) -> jax.Array:
         """The scalar at `ref[0]` (a block's index a launch reads from global memory): a GPU thread's load, a
         TPU core's copy into its scalar memory."""
@@ -2051,13 +2056,16 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
         read a block's rows at."""
 
+    def _store_staged(self, value: jax.Array, buffer) -> None:
+        buffer[...] = value.astype(buffer.dtype)
+
     def staged(self, value: jax.Array, buffer) -> Ref:
         """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register
         operand's way to an MMA. Mosaic GPU brackets a store with the warpgroup's barriers (its automatic
         barriers), so every warp's reads of `buffer` are done before it and its writes seen after; the
         family publishes them to its asynchronous readers (`published`), at once or, within
         `staged_together`, with the block's others as it ends."""
-        buffer[...] = value.astype(buffer.dtype)
+        self._store_staged(value, buffer)
         if not _STAGING.get():
             self.published()
         return buffer

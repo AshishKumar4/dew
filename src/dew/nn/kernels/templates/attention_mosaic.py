@@ -51,7 +51,6 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     key_prologue_taken,
     logit_scale,
-    prescale,
     prologued,
     prologues_taken,
 )
@@ -72,6 +71,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     forward_block_plan,
     forward_products,
     logits_ahead,
+    rewalks_in_place,
 )
 from dew.nn.kernels.templates.attention_mosaic_fused import (
     _fused_allocations,
@@ -90,6 +90,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _padded,
     _width,
     backward_bundle,
+    backward_family,
     backward_layouts,
     bundle,
     bundle_of,
@@ -252,8 +253,9 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     # rows at least, where no tile of them all holds.
     top = (held if rows is None and not family.budgets_registers
            else 2 * unit if wide else unit)
-    heights = [h for h in extents(family, dtype, top)
-               if h > unit and padded(h, 1) - padded(unit, 1) <= held // 8]
+    heights = ([] if rows is not None or top <= unit else
+               [h for h in extents(family, dtype, top)
+                if h > unit and padded(h, 1) - padded(unit, 1) <= held // 8])
     heights.append(unit)
     fewer = range(unit - family.rows, 0, -family.rows) if rows is None and few_rows(family, held) else ()
     tiers = (
@@ -394,10 +396,15 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
             return reason
         if ba.arguments["interpret"] and jax.default_backend() != "cpu":
             return Refusal('interpret', "an interpreted Mosaic launch runs in a CPU process alone")
-        if self.derived(ba, target) is None:
+        if not self._has_config(ba, target):
             return Refusal('resources',
                            f"no config of the Mosaic mainloop fits {target.generation}'s block and registers")
         return None
+
+    def _has_config(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Whether any config fits `ba` on `target` (`derived(ba, target) is not None`); `MosaicForward`
+        overrides to check feasibility without tracing kernels through `price_config`."""
+        return self.derived(ba, target) is not None
 
     def uncertified(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Refusal | None:
         """Why the launch the route selected runs no call of `ba` on `target` as the GPU assembles its
@@ -405,7 +412,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         derived in its place), or None: a call the route sends here alone is certified, once it is selected
         (`attention_route._mainloop`), so a call another mainloop takes compiles none of its kernels. A
         process compiling for no GPU certifies none, and its derived config holds."""
-        if self.derived(ba, target) is None:
+        if not self._has_config(ba, target):
             return self.declined(ba, target)
         if not self.holds(ba):
             # Certification refused every config the derivation offers (`tuning`'s exhausted verdict, None).
@@ -566,7 +573,8 @@ class MosaicForward(_Mainloop[Tiles]):
     def _decided_model(self, query, value, score_params, residuals: Kept | None, config: Tiles,
                        table=None, sources=None, scales=None, initial=None, drop=None, *,
                        peaks: bool = False, columns: int | None = None, decides: bool | None = None,
-                       priced: bool = True) -> tuple[bool, ForwardRegisters, int | None]:
+                       priced: bool = True, masked: bool = False,
+                       ) -> tuple[bool, ForwardRegisters, int | None]:
         """Resolve whether `config` decides its scaled walk, its `ForwardRegisters`, and (when `priced`) its
         register count in one pass (row 8843): builds the register facts once and reuses the scaled price so
         planning, residency and emission agree without double-pricing prologues."""
@@ -574,19 +582,19 @@ class MosaicForward(_Mainloop[Tiles]):
         base = self.registered(query, value, score_params, residuals, table, sources, scales, initial, drop)
         if decides is not None:
             model = dataclasses.replace(base, scaled=True) if decides else base
-            count = model.at(family, config, peaks=peaks, columns=columns) if priced else None
+            count = model.at(family, config, peaks=peaks, columns=columns, masked=masked) if priced else None
             return decides, model, count
         computed = query.dtype if scales is not None else value.dtype
         if (not config.natural_form and residuals is not Kept.SPLIT and not self.scaled
                 and self.rounds is None and algebra.headroom(computed)
                 and family.budgets_registers and not family.places_on_role):
             scaled_model = dataclasses.replace(base, scaled=True)
-            scaled_price = scaled_model.at(family, config)
+            scaled_price = scaled_model.at(family, config, masked=masked)
             if scaled_price is None or scaled_price <= self.register_budget(config):
                 count = (None if not priced else scaled_price if not peaks and columns is None
-                         else scaled_model.at(family, config, peaks=peaks, columns=columns))
+                         else scaled_model.at(family, config, peaks=peaks, columns=columns, masked=masked))
                 return True, scaled_model, count
-        count = base.at(family, config, peaks=peaks, columns=columns) if priced else None
+        count = base.at(family, config, peaks=peaks, columns=columns, masked=masked) if priced else None
         return False, base, count
 
     def decided(self, query, value, score_params, residuals: Kept | None, config: Tiles, table=None,
@@ -655,7 +663,7 @@ class MosaicForward(_Mainloop[Tiles]):
                      initial, drop=None, table=None, sources=None, scales=None, query_params=(), *,
                      residuals: Kept, interpret: bool, config: Tiles, pricing: bool = False):
         """The main forward launch at `config` without its guarded rewalk (`_walk_dispatch`): traced by
-        `_price_config` through `tuning.lowered_once` so the winning count's trace is held and reused."""
+        `price_config` through `tuning.lowered_once` so the winning count's trace is held and reused."""
         hooks, spans, decides, family, products, form, scaled = self._walk_setup(
             query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial, drop,
             table, sources, scales, query_params, residuals=residuals, interpret=interpret, config=config,
@@ -803,24 +811,33 @@ class MosaicForward(_Mainloop[Tiles]):
         are written for (its 128 rows a thread each, 64 keys a step: `_derived` gives it one consumer)."""
         return self._tiles(ba, target)
 
+    def _has_config(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Feasibility check without pricing candidates or deepening stages: `declined` and `uncertified`
+        check whether any legal launch exists without tracing kernels through `price_config`."""
+        return self._tiles(ba, target, priced=False) is not None
+
     def _tiles(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, *,
-               skip: mosaic.Family | None = None, refused: Set[Tiles] = frozenset()) -> Tiles | None:
+               skip: mosaic.Family | None = None, refused: Set[Tiles] = frozenset(),
+               priced: bool = True) -> Tiles | None:
         """`derived` over the device's families but `skip` (a family whose natural rewalk runs on another,
-        `_relaunched`), past the configs as they launch in `refused` (a rewalk's tiles a compile refused)."""
+        `_relaunched`), past the configs as they launch in `refused` (a rewalk's tiles a compile refused).
+        With `priced=False`, returns the first legal config without tracing `price_config` or deepening."""
         query = ba.arguments["query"]
         for family in layouts(target.generation, query.dtype, query.shape[1]):
             if family is skip or self.refusal(ba, family) is not None:
                 continue
 
             def fits(config: Tiles) -> bool:
-                return self._launchable(ba, config, target) not in (None, *refused)
+                return self._launchable(ba, config, target, priced=priced) not in (None, *refused)
 
-            choose = functools.partial(self._choose_consumers, ba, target=target)
-            residency = functools.partial(self.resident, ba, target=target)
+            choose = functools.partial(self._choose_consumers, ba, target=target) if priced else None
+            residency = functools.partial(self.resident, ba, target=target) if priced else None
             config = self._searched(ba, family, fits, choose=choose, residency=residency)
             if config is not None:
-                launched = self._launchable(ba, config, target)
-                return None if launched is None else self._deepened(ba, launched, target, refused=refused)
+                launched = self._launchable(ba, config, target, priced=priced)
+                if launched is None or not priced:
+                    return launched
+                return self._deepened(ba, launched, target, refused=refused)
         return None
 
     def _deepened(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
@@ -848,8 +865,8 @@ class MosaicForward(_Mainloop[Tiles]):
                     and self.resident(ba, candidate, target) == base_resident):
                 return candidate
         return config
-    def _price_config(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
-                      ) -> float | None:
+    def price_config(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
+                     ) -> float | None:
         """Price `config`'s main launch on `target` (`cost.launch_seconds` over `emission.work_of`), traced
         through `tuning.lowered_once` under `report.launching` so the winning count's trace is held."""
         names = ("query", "key", "value", "start", "end", "query_ids", "key_ids", "score_params",
@@ -894,7 +911,7 @@ class MosaicForward(_Mainloop[Tiles]):
                 return matched
         prices: dict[Tiles, float] = {}
         for config, full in zip(candidates, launched, strict=True):
-            price = self._price_config(ba, full, target)
+            price = self.price_config(ba, full, target)
             if price is None:
                 return candidates[0]
             prices[config] = price
@@ -938,14 +955,14 @@ class MosaicForward(_Mainloop[Tiles]):
                 return config
         return None
 
-    def _launchable(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
-                    ) -> Tiles | None:
+    def _launchable(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+                    priced: bool = True) -> Tiles | None:
         """`config` as it launches, its natural rewalk's tiles named (`_relaunched`), where that is legal
         (`legal`: a compile's refusal of the launch among its rules, keyed by this config); None where it is
         not or no tile holds the rewalk."""
         if not (self._launch_legal(ba, config, target) and self.proposes(ba, config, target)):
             return None
-        launched = self._relaunched(ba, config, target)
+        launched = self._relaunched(ba, config, target, priced=priced)
         return launched if launched is not None and self.takes(ba, launched, target) else None
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
@@ -990,7 +1007,8 @@ class MosaicForward(_Mainloop[Tiles]):
             # 84.5 of its 134 us a step at width 128 (M-ET-70), where its 128-key walk alone is 49.5.
             if self.keys % config.block_k and dividing:
                 picked = dividing[-1]
-        want = min(3, -(-_keys(ba) // picked.block_k) // 2)
+        slice_tiles = math.ceil(math.ceil(_keys(ba) / self.splits) / picked.block_k)
+        want = min(3, slice_tiles // 2)
         return self._deepened(ba, picked, target, want=want)
 
     def streamed(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
@@ -1029,8 +1047,8 @@ class MosaicForward(_Mainloop[Tiles]):
         per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
         return max(1, config.stages - 1) * config.block_k * per_key
 
-    def _relaunched(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
-                    ) -> Tiles | None:
+    def _relaunched(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+                    priced: bool = True) -> Tiles | None:
         """`config` with its natural rewalk's tiles, a fold's (`Tiles.relaunch`): the largest key tile and the
         most consumers that hold its own registers, each dividing the config's (et-fwdhooks3: at the fold's
         tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
@@ -1042,7 +1060,7 @@ class MosaicForward(_Mainloop[Tiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         family = bundle_of(config, query.dtype)
         if not family.rewalks:
-            return self._rewalked_apart(ba, config, family, target)
+            return self._rewalked_apart(ba, config, family, target, priced=priced)
         decides = self.deciding(ba, config)
         # Its value columns whole first, then in blocks (`_column_blocks_of`): a launch a block (row 2526: at
         # width 256 no tile held the anchored rewalk's whole sums).
@@ -1055,11 +1073,15 @@ class MosaicForward(_Mainloop[Tiles]):
                       for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k, parts=self.parts)
                       if config.block_k % block == 0)
+        in_place = rewalks_in_place(family, query, value, masked=self.masked,
+                                    has_output_mod=self.output_mod is not None,
+                                    in_key=self.reads_key_slot(family), target=target)
         for tiles in relaunches:
             if not (self._launch_legal(ba, tiles, target, decides=decides)
                     and self.proposes(ba, tiles, target,
                                       held=lambda tiles=tiles: self.within(
-                                          self.registers(ba, tiles, decides=decides), tiles))):
+                                          self.registers(ba, tiles, decides=decides, masked=in_place),
+                                          tiles))):
                 continue
             launched = dataclasses.replace(config, relaunch_k=tiles.block_k,
                                            relaunch_consumers=tiles.consumers,
@@ -1069,7 +1091,7 @@ class MosaicForward(_Mainloop[Tiles]):
         return None
 
     def _rewalked_apart(self, ba: tokamax.BoundArguments, config: Tiles, family: mosaic.Family,
-                        target: generation.GpuTarget) -> Tiles | None:
+                        target: generation.GpuTarget, *, priced: bool = True) -> Tiles | None:
         """`config` of a `family` whose program takes no masked rewalk (`Issuer.rewalks`: tcgen05's rows,
         whose consumer gives its issuer a plain walk's weights alone) with its rewalk on the device's register
         family, at the tiles that family's derivation gives the call (`_tiles`), past each a compile refused
@@ -1079,7 +1101,7 @@ class MosaicForward(_Mainloop[Tiles]):
         of the rows where its chunks rewalk had spilled 112 bytes at 64 x 64 on two consumers
         (et-rows-spill). None where no tile holds the rewalk."""
         refused: set[Tiles] = set()
-        while (fallback := self._tiles(ba, target, skip=family, refused=refused)) is not None:
+        while (fallback := self._tiles(ba, target, skip=family, refused=refused, priced=priced)) is not None:
             relaunch = fallback.relaunch if fallback.relaunch_k is not None else dataclasses.replace(
                 fallback, natural_form=True)
             if not (self._launch_legal(ba, relaunch, target) and self.proposes(ba, relaunch, target)):
@@ -1100,26 +1122,19 @@ class MosaicForward(_Mainloop[Tiles]):
         found = (self._relaunched(ba, neighbour, target) for neighbour in super().neighbours(ba, config))
         return tuple(neighbour for neighbour in found if neighbour is not None)
 
-    def _natural(self, query: jax.Array) -> bool:
-        """Whether the call of `query` keeps its logits natural, as its launch decides (`algebra.folds`, at
-        the scale and power of two its queries take, `prescale`): its one form the natural one, no fold to
-        rewalk."""
-        power, scale = prescale(query.dtype, query.shape[3], self.scale)
-        return not algebra.folds(scale, power, natural=self.natural, score_mod=self.score_mod)
-
     def _unrewalked(self, ba: tokamax.BoundArguments) -> bool:
-        """Whether the call walks no natural rewalk: its logits natural (`_natural`), or a fold no logit's
-        reach passes (`algebra.Forward.reaches`: an inference walk's subtracted fold of raw products, which a
-        training forward does not take: its natural rewalk at tiles derived for it, an fp32 call's parts'
-        at width 128 a block of the value columns, where the fold's whole width staged 280,672 bytes),
-        at the scale its launch takes (`attention_mosaic_forward._prepared`)."""
-        query = ba.arguments["query"]
-        if self._natural(query):
-            return True
-        subtracted = self.subtracted and ba.arguments.get("residuals") is not Kept.SPLIT
-        return not folded_form(self.form, self.keys, ids=False, dtype=query.dtype, width=query.shape[3],
-                               scale=self.scale, natural=self.natural, score_mod=self.score_mod,
-                               subtracted=subtracted)[0].reaches
+        """Whether the call walks no natural rewalk: its logits natural (`not spec.base2`), or a fold no
+        logit's reach passes (`not spec.reaches`), at the scale its launch takes (`_folded`, row 11818)."""
+        spec, _ = self._folded(ba.arguments["query"], ba.arguments.get("residuals"))
+        return not spec.base2 or not spec.reaches
+
+    def _folded(self, query, residuals) -> tuple[algebra.Forward, float]:
+        """The call's folded form and folded power (`folded_form`, rows 11789, 11818), shared by `_unrewalked`
+        and `registered` with the same `subtracted` condition as `_launch`."""
+        subtracted = self.subtracted and residuals is not Kept.SPLIT
+        return folded_form(self.form, self.keys, ids=False, dtype=query.dtype, width=query.shape[-1],
+                           scale=self.scale, natural=self.natural, score_mod=self.score_mod,
+                           subtracted=subtracted)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
                      decides: bool | None = None) -> int:
@@ -1156,12 +1171,15 @@ class MosaicForward(_Mainloop[Tiles]):
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
+        masked = self.form != "full" or arguments.get("query_ids") is not None
         tpu_values = (None if family.budgets_registers else (
             {"keys": ((config.block_k, width), query.dtype),
              "values": ((config.block_k, value_width), query.dtype)},
             (((config.block_q, value_width), jnp.float32),
              *step_live_tiles(config.block_q, config.block_k, natural_form=config.natural_form,
-                              scaled=self.scales_in_kernel(ba)))))
+                              scaled=self.scales_in_kernel(ba),
+                              dropped=arguments.get("drop") is not None, dtype=query.dtype,
+                              score_mod=self.score_mod, score_types=self.score_types, masked=masked))))
         return launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
                             products=products, over_rings=True, values=tpu_values)
 
@@ -1258,7 +1276,8 @@ class MosaicForward(_Mainloop[Tiles]):
                 and self.rounds is None and algebra.headroom(computed))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
-                  columns: int | None = None, decides: bool | None = None) -> int | None:
+                  columns: int | None = None, decides: bool | None = None,
+                  masked: bool = False) -> int | None:
         """A consumer's registers at `config`: its walk's (`forward_registers`) over the values' columns
         its launch walks (`columns`, a block of them; the config's own by default), or its peak walk's
         (`peaks`, `peaks_registers`), which a training call takes first; None on a family that budgets
@@ -1269,7 +1288,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                    arguments.get("residuals"), config, arguments.get("table"),
                                    arguments.get("sources"), arguments.get("scales"),
                                    arguments.get("initial"), arguments.get("drop"),
-                                   peaks=peaks, columns=columns, decides=decides)[2]
+                                   peaks=peaks, columns=columns, decides=decides, masked=masked)[2]
 
     def registered(self, query, value, score_params, residuals, table=None, sources=None,
                    scales=None, initial=None, drop=None) -> ForwardRegisters:
@@ -1279,11 +1298,9 @@ class MosaicForward(_Mainloop[Tiles]):
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
-        spec, taken = folded_form(self.form, self.keys, ids=False, dtype=query.dtype, width=query.shape[-1],
-                                  scale=self.scale, natural=self._natural(query), score_mod=self.score_mod,
-                                  subtracted=self.subtracted)
+        spec, taken = self._folded(query, residuals)
         return ForwardRegisters(query.dtype, query.shape[-1], value.shape[-1], residuals is Kept.SPLIT,
-                                self._natural(query), params, self.parts,
+                                not spec.base2, params, self.parts,
                                 self._scales(table, sources, scales, computed), codes=scales is not None,
                                 positions=math.ceil(query.shape[1] / self.per_span)
                                 if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
@@ -1294,7 +1311,9 @@ class MosaicForward(_Mainloop[Tiles]):
                                 scaled_products=scaled_drop(computed, drop, initial),
                                 prologue=(None if self.query_mod is None
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)),
-                                prescaled=spec.prescale != 1.0, rewalk_prescaled=taken != 1.0)
+                                prescaled=spec.prescale != 1.0, rewalk_prescaled=taken != 1.0,
+                                out_dtype=self.out_dtype,
+                                has_output_mod=self.output_mod is not None)
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
@@ -1546,7 +1565,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     if hooks.score_mod is None and hooks.score_params:
         hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
-    parts = algebra.bf16_part_count(accurate=True) if fp32 else 1
+    parts = product.bf16_part_count(accurate=True) if fp32 else 1
     if hooks.query_mod is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
         # program before the launch takes it.
@@ -1760,9 +1779,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # walks its own blocks (`BackwardTiles.dkv_blocks`). The dQ launch streams through a producer
         # (`runs_backward`), which a family whose consumers feed their own rings has not: the one launch
         # there, queries first.
-        if (config.fused and not dkv_family.places_on_role
-                and min(config.block_q, config.block_k) < dkv_family.role_rows):
-            return False
+        if not dkv_family.places_on_role:
+            if (config.fused and min(config.block_q, config.block_k) < dkv_family.role_rows
+                    and min(config.block_q, config.block_k) not in fewer_rows(dkv_family)):
+                return False
+            row_unit = backward_family(dkv_family, config.dkv).transposed_rows
+            if config.block_q % row_unit or config.block_k % row_unit:
+                return False
         dq_family = found.get(config.family)
         if not config.fused and dq_family is not None and split_queries(dq_family):
             return False
@@ -1931,10 +1954,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         (rows 4839, 5272, 10948, 10962)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if not family.budgets_registers or not config.fused:
+        if not family.budgets_registers:
             return config
         q_block = config.dkv_blocks[0] if config.dkv_blocks is not None else config.block_q
-        steps = -(-query.shape[1] // q_block)
+        q_steps = -(-query.shape[1] // q_block)
+        steps = q_steps if config.fused else min(q_steps, -(-ba.arguments["key"].shape[1] // config.block_k))
         cap = 3 if config.dkv_blocks is not None else max(config.consumers, 2) + 1
         want = min(cap, steps)
         if want <= config.stages:
@@ -1998,9 +2022,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             def fused(rows: int, walked: int, consumers: int, shared=shared) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=family.name, **shared)
 
-            if config := derive(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
-                                  overlapped=False):
-                return config
+            for rows in (None, *fewer_rows(family)):
+                if config := derive(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
+                                    overlapped=False, rows=rows, walks=_query_walk(rows)):
+                    return config
         # Where no consumer's registers hold its own keys' whole dK and dV sums, the consumers share
         # one key block, each its share of the columns (FlashAttention 3's width 256: ET-COOP1-h100,
         # 0.68 ms against the two launches' 1.30 at Qwen3-8B's heads 256 wide, causal; where the sums
@@ -2097,8 +2122,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             launches = [(family, config, allocations(family, config, width, dtype, q_stages, **extra),
                          config.shared_keys)]
         else:
+            dkv_stages = min(config.stages, padded_q // config.dkv.block_q)
             launches = [(dkv_family, config.dkv, _dkv_allocations(
-                dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns,
+                dkv_family, config.dkv, width, value_width, dtype, stages=dkv_stages, columns=config.columns,
                 tiled=Kind.TILE in self.score_kinds, params=self.score_types), True)]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
@@ -2108,6 +2134,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The fused launch's warpgroups reserve fp16's running scale's reduction scratch too, as it launches
         # (`reducing`'s `scaled`: `_fused_launch`'s and `_coop_launch`'s).
         scaled = config.fused and staged_parts(dtype) > 1
+        masked = self.form != "full" or ba.arguments.get("query_ids") is not None
         return [(layout, tiles.consumers, launch_scope(
             layout, allocations, reducing(layout, tiles.consumers, self.score_reduces, scaled=scaled),
             reduces=reduces, values=(None if layout.budgets_registers else (
@@ -2117,7 +2144,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                  ((tiles.block_k, value_width), jnp.float32),
                  ((tiles.block_q, width), jnp.float32),
                  *step_live_tiles(tiles.block_q, tiles.block_k, backward=True, accurate=self.accurate,
-                                  dropped=ba.arguments["drop"] is not None))))))
+                                  dropped=ba.arguments["drop"] is not None, dtype=dtype,
+                                  score_mod=self.score_mod, score_types=self.score_types,
+                                  masked=masked))))))
             for layout, tiles, allocations, reduces in launches]
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,

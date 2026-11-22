@@ -687,44 +687,19 @@ on a GPU)."""
 SOFTCAP_PAGED_SEEDS = 8
 """The softcapped paged decode's declared draws (check 1)."""
 
-
-def assert_paged_decode_on_par(model, label: str, *, steps: int = 8, seeds: int = SOFTCAP_PAGED_SEEDS,
-                               ref_impl: str = "auto"):
-    """Assert a paged `CausalTransformer` decode is on par with its compact cache (check 1)."""
-    def decoded(layout, dtype, implementation="auto"):
-        def run(params, tokens):
-            decoder = model(layout, dtype, implementation)
-            found, cache = [], decoder.apply(params, 2, method=CausalTransformer.init_cache,
-                                             mutable=["cache"])[1]["cache"]
-            for step in range(tokens.shape[1]):
-                logits, updated = decoder.apply({**params, "cache": cache},
-                                                tokens[:, step:step + 1], decode=True, mutable=["cache"])
-                cache = updated["cache"]
-                found.append(logits.astype(jnp.promote_types(logits.dtype, jnp.float32)))
-            return jnp.stack(found)
-
-        return jax.jit(run)
-
-    def draw(seed):
-        tokens = jax.random.randint(jax.random.key(seed), (2, steps), 0, 64)
-        return model(KVCache(), "bfloat16").init(jax.random.key(seed + 1000), tokens), tokens
-
-    assert_as_exact(decoded(KVCache(page_size=16), "bfloat16"),
-                    decoded(KVCache(), "bfloat16", ref_impl), draw, label,
-                    seeds=seeds, truth_fn=decoded(KVCache(), "float64", "reference"))
-
-
 def a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache():
     """A bf16 decoder with a logit softcap decodes a paged cache on a GPU (where the step used to raise),
     its logits step by step on par with the compact cache's (check 1), the compact cache's reference
     decode in float64 the truth."""
+    from decode_matrix import assert_paged_decode_on_par
+
     def model(layout, dtype, implementation="auto"):
         # Heads 16 wide, which the paged kernel's geometry takes.
         return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": dtype,
                                     "attn_logit_softcap": 20.0, "kv_cache": layout,
                                     "attention_impl": implementation})
 
-    assert_paged_decode_on_par(model, "softcapped paged decode")
+    assert_paged_decode_on_par(model, "softcapped paged decode", seeds=SOFTCAP_PAGED_SEEDS)
 
 
 @pytest.mark.parametrize("quantized", ["float8_e4m3fn", "int8"])

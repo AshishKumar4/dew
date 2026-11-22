@@ -1365,3 +1365,27 @@ def test_triton_arms_state_without_device_bound_arrays():
             assert arm_role("dew", jax.jit(arm), f"triton-arm-{hook_name}") is not None
             encoded = json.dumps(stated(jax.jit(arm), f"triton-arm-{hook_name}"))
             assert '"jax array"' not in encoded, hook_name
+
+
+@pytest.mark.gpu(reason="runs a Pallas Triton kernel's arithmetic on this GPU")
+def test_triton_kernel_dot_keeps_ieee_fp32_range_in_native_launch():
+    """Rows 11854, 5473: inside a native Pallas Triton GPU launch, `template.kernel_dot` on fp32 operands
+    above `bfloat16.max` (`3.40e38 > 3.3895e38`) keeps IEEE fp32 range and exact product (`1.70e38`),
+    whereas `BF16_BF16_F32_X6` overflows to `inf`."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pltriton
+
+    def body(a_ref, b_ref, out_ref):
+        out_ref[...] = template.kernel_dot(a_ref[...], b_ref[...], interpret=False)
+
+    def ours(a, b):
+        return pl.pallas_call(
+            body, out_shape=jax.ShapeDtypeStruct((16, 16), jnp.float32),
+            compiler_params=pltriton.CompilerParams())(a, b)
+
+    def draw(_seed: int):
+        return (jnp.full((16, 16), np.float32(3.40e38), dtype=jnp.float32),
+                jnp.eye(16, dtype=jnp.float32) * np.float32(0.5))
+
+    assert_as_exact(jax.jit(ours), jax.jit(jnp.matmul), draw,
+                    "triton kernel_dot keeps IEEE fp32 range above bfloat16.max", seeds=1)
