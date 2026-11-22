@@ -276,10 +276,12 @@ def test_a_loop_passing_messages_computes_its_passes_unrolled(case, seeds, reque
         assert np.any(np.asarray(gradients["layers_0"]["mlp"]["down_proj"]["kernel"]) != 0)
 
 
+@pytest.mark.check1_shards(seeds=32, per_task=16)
 def test_a_loop_passing_messages_decodes_as_it_prefills():
     """A hybrid decoder passing messages over three passes, its gates drawn off zero, each pass's cache its
     own, decodes token by token (a prefill of four, then one at a time) what its full passes over each
-    prefix compute, its logits on par with theirs in float64 (check 1)."""
+    prefix compute, its logits on par with theirs in float64 (check 1), its 32 seeds drawn 16 a map task
+    (132 s whole in train 1180's CI, row 11793)."""
     looped = decoder("hybrid", steps=3)
     draw = gated_draw(looped, salt=0xC404)
     made, step = decode_steps(looped)
