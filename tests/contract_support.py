@@ -17,6 +17,7 @@ public call."""
 
 import concurrent.futures
 import contextlib
+import dataclasses
 import functools
 from collections.abc import Callable
 from typing import NamedTuple
@@ -298,35 +299,31 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     def orders_of(f, *drawn):
         return {name: order for name, order in orders(f, *drawn).items() if name in taken}
 
-    def staged(f, *drawn):
-        # Each order run as one program, made once a function and an order (`_mesh_program`), so a cell's
-        # edges, one shape at three scales, compile it once: dispatched op by op, every edge's run compiled
-        # its order's primitives again, most of a cell's 250 s (row 11720).
-        return {name: functools.partial(_mesh_program(f, name), *drawn) for name in orders_of(f, *drawn)}
-
+    # Each arm's run of each order, built once for its compile ahead and its run (`_Run`): each order one
+    # program, made once a function and an order (`_mesh_program`), so a cell's edges, one shape at three
+    # scales, compile it once (dispatched op by op, every edge's run compiled its order's primitives again,
+    # most of a cell's 250 s, row 11720); the mesh's inputs placed on it once.
     given = (primals, direction, cotangent)
-    with jax.enable_x64(new_val=True), on_float64_device():
-        wide_drawn = widened(given)
+    with _on_float64():
+        wide_given = widened(given)
+    in_order = [name for name in orders(fn, *given) if name in taken]
+
+    def runs(f, arguments, context, site):
+        return {name: _Run(_mesh_program(f, name), arguments, context, site(name), name) for name in in_order}
+
+    narrow = runs(fn, given, contextlib.nullcontext, lambda _: label)
+    plainly = {} if plain_fn is None else runs(plain_fn, given, contextlib.nullcontext,
+                                               lambda _: f"{label}, plainly")
+    wide_runs = runs(truth_fn or fn, wide_given, _on_float64, lambda _: f"{label} in float64")
     mesh = _training_mesh()
-    # Each program its runs below take, in their contexts, by the site and order that name a failure.
-    unplaced = contextlib.nullcontext
-    runs = [(_mesh_program(fn, name), given, unplaced, label, name) for name in taken]
-    runs += [(_mesh_program(plain_fn, name), given, unplaced, f"{label}, plainly", name)
-             for name in taken if plain_fn is not None]
-    runs += [(_mesh_program(truth_fn or fn, name), wide_drawn, _on_float64, f"{label} in float64", name)
-             for name in taken]
-    if mesh is not None:
-        runs += [(_mesh_program(fn, name), _placed(mesh, given), functools.partial(jax.set_mesh, mesh),
-                  f"{label}, {name}, on training's mesh of two", name) for name in taken]
-    _compiled_ahead(runs)
-    narrow = staged(fn, *given)
-    plain_orders = {} if plain_fn is None else staged(plain_fn, *given)
-    plain = {name: ran(order, f"{label}, plainly", name) for name, order in plain_orders.items()}
-    with jax.enable_x64(new_val=True), on_float64_device():
-        # Its eager orders, which `float64_signed_sums` walks, and its staged runs.
-        wide = orders_of(truth_fn or fn, *wide_drawn)
-        truths = {name: ran(order, f"{label} in float64", name)
-                  for name, order in staged(truth_fn or fn, *wide_drawn).items()}
+    meshed = {} if mesh is None else runs(fn, _placed(mesh, given), functools.partial(jax.set_mesh, mesh),
+                                         lambda name: f"{label}, {name}, on training's mesh of two")
+    _compiled_ahead([*narrow.values(), *plainly.values(), *wide_runs.values(), *meshed.values()])
+    plain = {name: run() for name, run in plainly.items()}
+    truths = {name: run() for name, run in wide_runs.items()}
+    with _on_float64():
+        # Its eager orders, which `float64_signed_sums` walks where an order has a value to lose.
+        wide = orders_of(truth_fn or fn, *wide_given)
     def held(values, name: str, site: str) -> None:
         """An order's `values` held to the contract: each finite where the same order of the float64 run is a
         normal float32, the plain formula's is finite and no order of its sums overflows."""
@@ -354,16 +351,37 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
         if broken:
             raise LessFinite(broken[0])
 
-    for name, order in narrow.items():
-        held(jax.tree.leaves(ran(order, label, name)), name, label)
-    _on_a_mesh(fn, primals, direction, cotangent, label, truth_fn=truth_fn, taken=taken, draw=draw,
-               seeds=seeds, held=held)
+    for name, run in narrow.items():
+        held(jax.tree.leaves(run()), name, label)
+    if mesh is not None:
+        _on_a_mesh(fn, mesh, meshed, truth_fn=truth_fn, draw=draw, seeds=seeds, held=held)
 
 
-def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken, draw, seeds, held
-               ) -> None:
-    """Each order of `fn` the contract takes (`taken`) on training's mesh of two of this process's devices
-    (`MeshSpec`'s, its data axis two), its inputs placed on it whole: at the cell's own inputs held to the
+@dataclasses.dataclass(frozen=True)
+class _Run:
+    """One order of one arm of a case (`assert_contract`): its program (`_mesh_program`), the fixed arguments
+    and context it runs in, and the site and order that name its failure (`running`), built once for its
+    compile ahead (`_compiled_ahead`) and its run, which lowers alike and finds it compiled."""
+
+    program: Callable
+    arguments: tuple
+    context: Callable
+    site: str
+    name: str
+
+    def lowered(self) -> jax.stages.Lowered:
+        with self.context(), running(self.site, self.name):
+            return self.program.lower(*self.arguments)
+
+    def __call__(self):
+        with self.context():
+            return ran(lambda: self.program(*self.arguments), self.site, self.name)
+
+
+def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
+    """Each order of `fn` the contract takes (`meshed`, each its run on `mesh`, `_Run`) on training's mesh of
+    two of this process's devices (`MeshSpec`'s, its data axis two), its inputs placed on it whole: at the
+    cell's own inputs held to the
     contract itself (`held`, as off the mesh; a split its specs do not fit raises, row 7973's class); and
     where the cell gives its seeded `draw` (a seed's primals, direction and cotangent in its domain, at a
     scale whose values float32 holds: an edge's, which the contract excuses where float64 is no normal
@@ -376,25 +394,18 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
     from arm_forms import as_given, dew_path
     from reference_error import assert_as_exact, seeds_for
 
-    if (mesh := _training_mesh()) is None:
-        return
-    for name in orders(fn, primals, direction, cotangent):
-        if name not in taken:
-            continue
-        site = f"{label}, {name}, on training's mesh of two"
+    for name, run in meshed.items():
+        site = run.site
 
-        # The mesh's run a placement and the program run there (`_mesh_program`), which the gate runs as given
-        # (`as_given`).
-        program = _mesh_program(fn, name)
-
+        # A draw's run a placement and the program run there, which the gate runs as given (`as_given`).
         @as_given
-        def on(primals, direction, cotangent, program=program, name=name, site=site):
+        def on(primals, direction, cotangent, program=run.program, name=name, site=site):
             with jax.set_mesh(mesh):
                 placed = _placed(mesh, (primals, direction, cotangent))
                 return ran(lambda: program(*placed), site, name)
 
         # At the cell's own inputs, the contract itself (`held`), on the mesh as off it.
-        held(jax.tree.leaves(on(primals, direction, cotangent)), name, site)
+        held(jax.tree.leaves(run()), name, site)
         if draw is None:
             continue
 
@@ -436,23 +447,22 @@ def _on_float64():
         yield
 
 
-def _compiled_ahead(runs) -> None:
-    """Each program a case runs (`runs`: its order's program, `_mesh_program`'s, its arguments, the context it
-    runs in, and the site and order that name a failure, `running`) lowered in turn in its context and
-    compiled side by side, so its run, which lowers alike, finds it compiled: a convex mean's narrow, float64
-    and mesh programs of one order, 141,776 operations each, compiled 117 s one after another and 74 s side by
-    side on CI's four cores, the cell's cold run 140 s then 73 s (row 11720)."""
-    lowered = []
-    for program, arguments, context, label, name in runs:
-        with context(), running(label, name):
-            lowered.append((program.lower(*arguments), label, name))
+def _compiled_ahead(runs: list[_Run]) -> None:
+    """Each program a case runs (`runs`, `_Run`) lowered in turn in its context and compiled side by side
+    within this process's compile budget (`report.compile_threads`, each compile in one of its slots,
+    `report.compile_slots`), by JAX's own compile of the lowering, which its run's lowering finds: a convex
+    mean's narrow, float64 and mesh programs of one order, 141,776 operations each, compiled one after
+    another took its cell 140 s cold (row 11720)."""
+    from dew.nn.kernels.templates import report
+
+    lowered = [(run, run.lowered()) for run in runs]
 
     def compiled(each) -> None:
-        program, label, name = each
-        with running(label, name):
+        run, program = each
+        with report.compile_slots().held(background=False), running(run.site, run.name):
             program.compile()
 
-    with concurrent.futures.ThreadPoolExecutor(len(lowered)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(min(len(lowered), report.compile_threads())) as pool:
         list(pool.map(compiled, lowered))
 
 

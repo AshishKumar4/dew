@@ -323,11 +323,12 @@ class BitForm:
     def work(self, words: float = 1) -> Work:
         """What decoding `words` stored words costs, in the one vocabulary every price is told in
         (`templates.cost.Work`, row 5386): each step's issues on its unit (`issues`), the ALU's as integer
-        operations (`Work.integer_operations`) and the FMA pipe's (an IMAD's, beside the fp32 lanes' FFMA) as
-        its operations (`Work.operations`); a step two output registers read counted once, as ptxas
-        computes it once in the kernel's whole PTX (`ptx`)."""
+        operations (`Work.integer_operations`) and the FMA pipe's as integer multiply-adds (IMAD, beside the
+        fp32 lanes' FFMA at its own rate, `Work.integer_multiply_adds`); a step two output registers read
+        counted once, as ptxas computes it once in the kernel's whole PTX (`ptx`)."""
         issues = self.issues
-        return Work(integer_operations=issues[Unit.ALU] * words, operations=issues[Unit.FMA] * words)
+        return Work(integer_operations=issues[Unit.ALU] * words,
+                    integer_multiply_adds=issues[Unit.FMA] * words)
 
     @property
     def live(self) -> int:
@@ -396,9 +397,10 @@ class BitForm:
 
 def priced(work: Work) -> tuple[int, int]:
     """A form's price from its work (`BitForm.work`): its busiest unit's issues, the ALU's integer operations
-    or the FMA pipe's, then all its instructions (`Unit`: one rate), the order the search walks shapes in
-    (`_priced`) and a form is chosen by."""
-    return int(max(work.integer_operations, work.operations)), int(work.integer_operations + work.operations)
+    or the FMA pipe's multiply-adds, then all its instructions (`Unit`: one rate), the order the search walks
+    shapes in (`_priced`) and a form is chosen by."""
+    alu, fma = work.integer_operations, work.integer_multiply_adds
+    return int(max(alu, fma)), int(alu + fma)
 
 
 # LOP3's truth table of `c & (a ^ b)` and of `c & a`, over its operands' tables 0xF0, 0xCC and 0xAA (PTX ISA,
@@ -524,7 +526,7 @@ def _priced(shape: _Shape, registers: int, units: frozenset[Unit]) -> tuple[tupl
     rotations = int(shape.right is BitOp.ROTR)
     on_alu = (shifts if Unit.FMA not in units
               else min(shifts, max(rotations, -(-(shifts - registers) // 2))))
-    return priced(Work(integer_operations=registers + on_alu, operations=shifts - on_alu)), on_alu
+    return priced(Work(integer_operations=registers + on_alu, integer_multiply_adds=shifts - on_alu)), on_alu
 
 
 def _configs(shape: _Shape, reach: int, width: int) -> Iterator[list[_Shift]]:
@@ -748,10 +750,13 @@ def scales_decoded(codes: jax.Array) -> jax.Array:
     """Block scales' E4M3 codes (uint8 or uint32, a code each) as float32, exactly, by the declared
     transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx`, where inline
     assembly runs) and the one restore rule (`float_bits.raised_exactly`, the register's owed 2^120 from its
-    bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane; the NaN code,
-    0x7F, which no block scale holds, reads as 480, as `decoded` reads it)."""
-    (pattern,) = E4M3_SCALE_FORM.traced(codes.astype(jnp.uint32))
-    return raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), jnp.int32(120))
+    bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane); E4M3's two
+    NaN codes, 0x7F and 0xFF, NaN, as a cast of them is, so a block of a NaN scale is NaN wherever it is
+    decoded, where the form's fields read them as 480 and -480 (the review of 3580, F1)."""
+    held = codes.astype(jnp.uint32)
+    (pattern,) = E4M3_SCALE_FORM.traced(held)
+    value = raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), jnp.int32(120))
+    return jnp.where(held & 0x7F == 0x7F, jnp.float32(jnp.nan), value)
 
 
 NVFP4_OWED = 2.0 ** 8

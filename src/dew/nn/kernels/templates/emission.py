@@ -780,12 +780,17 @@ def _operated(primitive, inputs: Sequence, outputs: Sequence) -> Work:
     """An elementwise operation's work, one an output element, a clamp's two (a maximum and a minimum: no
     instruction bounds a value on both sides, and every lowering, XLA's, Mosaic GPU's and Triton's, issues
     both): on the integer units where its operands are integers or predicates (logic, shifts, integer
-    arithmetic and comparisons: the ALU's LOP3, SHF, IADD3, ISETP and PLOP3, `Work.integer_operations`), else
-    on the fp32 lanes. Its last operand's type is its operands' (a select's arms', its predicate first)."""
+    arithmetic and comparisons: the ALU's LOP3, SHF, IADD3, ISETP and PLOP3, `Work.integer_operations`; a
+    multiply the FMA pipe's IMAD, `Work.integer_multiply_adds`, as a bit form's are, `bits.BitForm.work`),
+    else on the fp32 lanes. Its last operand's type is its operands' (a select's arms', its predicate
+    first)."""
     count = sum(_elements(aval) for aval in outputs) * (2 if primitive is lax.clamp_p else 1)
     dtype = jnp.dtype(inputs[-1].dtype)
-    integral = jnp.issubdtype(dtype, jnp.integer) or dtype == jnp.bool_
-    return Work(integer_operations=count) if integral else Work(operations=count)
+    if not (jnp.issubdtype(dtype, jnp.integer) or dtype == jnp.bool_):
+        return Work(operations=count)
+    if primitive is lax.mul_p:
+        return Work(integer_multiply_adds=count)
+    return Work(integer_operations=count)
 
 
 _ARITHMETIC = _OPERATIONS | _REDUCTIONS | SPECIAL_FUNCTIONS | {lax.convert_element_type_p}

@@ -102,8 +102,9 @@ POWER_ATEN = {0: 0, 1: 0, 2: 1, -1: 1, 3: 2, -2: 2}
 """The roundings of torch's CPU power at the scalar exponents its kernel computes otherwise than by a library
 power (aten/src/ATen/native/cpu/PowKernel.cpp: `x**0` and `x**1` made and copied, `x * x`, `1 / x`,
 `x * x * x`, `1 / (x * x)`); at any other exponent, and a tensor's, a library power within one ulp (SLEEF's
-`Sleef_powf*_u10`, glibc's `powf` within 0.82), at most 2u times the result (row 10157: an integer
-exponent was weighed as an integer power's chain, a rounding more each unit of it)."""
+`Sleef_powf*_u10`, glibc's `powf` within 0.82), at most 2u times the result, a scalar exponent's narrowing
+to the operand's format beside it (`_narrowed`; row 10157: an integer exponent was weighed as an integer
+power's chain, a rounding more each unit of it)."""
 CIRCULAR = {"sin", "cos"}
 """The circular functions, whose bound in `ULPS` is XLA's own implementation's: torch computes them on the CPU
 through SLEEF's 1.0-ULP functions (`Sleef_sinf8_u10`, `Sleef_cosf8_u10`: within one unit in the last place),
@@ -159,7 +160,7 @@ def _tapped():
                 return computed
             if not isinstance(computed, torch.Tensor) or not computed.is_floating_point():
                 return computed
-            moved = self.tapped(computed, _weight(name, func, args, kwargs, computed))
+            moved = self.tapped(computed, _weight(name, func, args, kwargs, computed, self.unit))
             if name.endswith("_") and moved is not computed:
                 # An in-place operation's value is its first operand: the move written where it lives.
                 args[0].copy_(moved)
@@ -179,9 +180,10 @@ def _tapped():
     return Tapped
 
 
-def _weight(name: str, func, args, kwargs, computed):
-    """The most one rounding of aten `func` moves its float64 `computed`, in units of u
-    (tests/rounding_bound.py's `_weight`); an operation of no rule refused, naming it."""
+def _weight(name: str, func, args, kwargs, computed, unit: float):
+    """The most one rounding of aten `func` moves its float64 `computed`, in units of `unit`, the u of the
+    format the program computes in (tests/rounding_bound.py's `_weight`); an operation of no rule refused,
+    naming it."""
     import torch
 
     magnitude = computed.abs()
@@ -192,7 +194,18 @@ def _weight(name: str, func, args, kwargs, computed):
     if name in CIRCULAR:
         return 2 * magnitude
     if name == "pow":
-        return POWER_ATEN.get(args[1], 2) * magnitude if isinstance(args[1], (int, float)) else 2 * magnitude
+        exponent = args[1]
+        if not isinstance(exponent, (int, float)):
+            return 2 * magnitude
+        if exponent in POWER_ATEN:
+            return POWER_ATEN[exponent] * magnitude
+        # The scalar exponent narrowed to the operand's format first (PowKernel.cpp), which moves the power by
+        # its move times |log x|, relative, beside the library's rounding.
+        moved = _narrowed(exponent, unit)
+        if not moved:
+            return 2 * magnitude
+        moves = moved * args[0].abs().log().abs() / unit
+        return torch.where(magnitude > 0, (2 + moves) * magnitude, magnitude)
     if name in SUMS_ATEN:
         magnitudes = [arg.abs() if isinstance(arg, torch.Tensor) and arg.is_floating_point() else arg
                       for arg in args]
@@ -201,6 +214,18 @@ def _weight(name: str, func, args, kwargs, computed):
         return summed + magnitude if name == "mean" else summed
     raise ValueError(f"the rounding scale has no rule for aten.{name}: add it to EXACT_ATEN, ONCE_ATEN, "
                      "ULPS_ATEN, CIRCULAR or SUMS_ATEN")
+
+
+def _narrowed(exponent: float, unit: float) -> float:
+    """How far a scalar exponent moves rounded to a format of u `unit` (its significand's bits, `-log2(unit)`,
+    to nearest, ties to even): torch's CPU power converts it to its operand's dtype before it computes (the
+    review of 3580, F6: a bfloat16 4 to the 2 + 2^-7 took its exponent as 2, 2.76u off); none where `unit` is
+    none (an untapped run's) or the exponent is held exactly."""
+    if not unit or not math.isfinite(exponent):
+        return 0.0
+    bits = round(-math.log2(unit))
+    fraction, power = math.frexp(exponent)
+    return abs(exponent - math.ldexp(round(math.ldexp(fraction, bits)), power - bits))
 
 
 def _convolution_backward_weights(func, args, kwargs):

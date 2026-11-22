@@ -332,11 +332,11 @@ def _weight(equation, params, operands, value):
         roundings = abs(power) - 1 + (power < 0) if power else 0
         return roundings * magnitude if roundings else None
     if primitive is jax.lax.pow_p:
-        # A float's power (Adam's bias correction, `1 - b**count`): one `hlo.power` whatever its exponent,
-        # XLA's library power (`POWER`), but a constant exponent of 3, which XLA's simplifier writes as
-        # `x * x * x`, two roundings (of 2 and -1, `x * x` and `1 / x`, one).
-        exponent = jnp.broadcast_to(operands[1], jnp.shape(value))
-        return jnp.where(exponent == 3, 2, POWER) * magnitude
+        # A float's power (Adam's bias correction, `1 - b**count`): one `hlo.power`, XLA's library power
+        # (`POWER`), or, at an exponent XLA's simplifier folds to a constant of 2, 3 or -1 (a constant
+        # expression among them), its products, `x * x * x` the most, two roundings: the larger whatever the
+        # exponent, which the replay reads tapped, a folded constant moved off it (the review of 3580, F2).
+        return max(POWER, 2) * magnitude
     if primitive is jax.lax.reduce_p and params["computation"] in compensating():
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
         # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
