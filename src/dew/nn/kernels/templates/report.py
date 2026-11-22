@@ -1089,8 +1089,16 @@ def capture(key: tuple, closed) -> None:
             _UNCERTIFIED[key] = "its trace placed its operands on meshes of two shapes"
         return
     name = _certification_name(type(each.op).__name__, key[0], each.config, each.reverse)
-    compiling = aside.pool.submit(contextvars.copy_context().run, replayed, closed, mesh, each.reverse,
-                                  each.device, name)
+    # Under the trace's own states, its context variables and what holds per thread beside them
+    # (`_cache.carried`: the GPU `generation.assumed` stands in for, which a pool thread holds none of, so a
+    # replayed derivative's launches derived for no GPU of the trace's: an A100 step's TMA copies).
+    held = _cache.carried()
+
+    def replayed_held() -> tuple[dict, str | None, bool]:
+        with held():
+            return replayed(closed, mesh, each.reverse, each.device, name)
+
+    compiling = aside.pool.submit(contextvars.copy_context().run, replayed_held)
     aside.pending[key] = dataclasses.replace(each, kernels=compiling)
 
 
