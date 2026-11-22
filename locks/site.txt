@@ -1,5 +1,5 @@
 --index-url https://pypi.org/simple
---extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post122/bfba1b57e4052f51/simple/
+--extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post123/ea3888e689ec0e94/simple/
 --extra-index-url https://pypi.dewml.dev/simple
 
 absl-py==2.5.1 \
@@ -1401,8 +1401,8 @@ jaraco-functools==4.6.0 \
     # via
     #   -c locks/cpu.txt
     #   cheroot
-jax==0.12.0.1.post122 \
-    --hash=sha256:10a16811171bb1b6dda41a16101494173abc28504e7aca787d8c4e0fa22c3569
+jax==0.12.0.1.post123 \
+    --hash=sha256:13ee7858f1d781eb121fab13101d84bd78e2a2716855e9324a171c6d6165a7cd
     # via
     #   -c constraints.txt
     #   -c locks/cpu.txt

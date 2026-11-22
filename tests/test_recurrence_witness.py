@@ -66,12 +66,7 @@ def test_an_inference_forward_is_witnessed_at_its_own_tiles(target):
     (`rw.recorded`'s); a tcgen05 call's (an sm100's) solve fused with its application, which stores no
     inverse where nothing is kept (`mainloop._solved`'s `keeps`), so its inverse is the keeping build's."""
     with generation.assumed(target, interpreted=True):
-        operands = rw.draw(0, "mild", heads=2)
-        runs = (rw.recorded(*operands, inference=True), rw.recorded(*operands, delta=False, inference=True))
-        found = [rw.witness(run, rw.interpreted_lane()) for run in runs]
-    for held in found:
-        for name, inside in held.items():
-            assert np.all(inside), (name, float(np.mean(inside)))
+        rw.assert_inference_witnessed(rw.interpreted_lane(), heads=2)
 
 
 def test_two_bf16_parts_of_a_value_sum_within_its_staged_reach():

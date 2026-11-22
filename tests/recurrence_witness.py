@@ -620,8 +620,8 @@ def _route_forward(route, operands: tuple, form: str, *, inference: bool = False
     if trained and not inference:
         trained_forward = jax.jit(lambda *x: jax.vjp(route, *x)[0])
         (o, final), launches = launched(trained_forward, operands, f"training forward, {form}")
-        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                   if isinstance(op, template.Mosaic)]
+        [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
+                            zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
     return o, final, tiles, trained, bound
 
 
@@ -1112,6 +1112,23 @@ def assert_keys_gated_witnessed(lane: Lane, heads: int = 1) -> None:
     for name in KEYS_GATED_RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
     assert_refusals(ungated, UNGATED_SHARES)
+
+
+def assert_inference_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness of a bf16 forward no gradient follows, with the delta rule and without it (its keys
+    taking the write gate), at its own tiles (`Tiles.forward`): its states then output launches, no walk
+    forming the output in one (rows 5668, 7877), every record inside its step's enclosure (`recorded`'s
+    `inference`)."""
+    import tier_wire
+
+    operands = draw(0, "mild", heads=heads)
+    runs = (recorded(*operands, inference=True), recorded(*operands, delta=False, inference=True))
+    # Both runs recorded: a GPU tier's prepare gives each zeros, which judge nothing (row 7882).
+    if tier_wire.preparing():
+        return
+    for run in runs:
+        for name, inside in witness(run, lane).items():
+            assert np.all(inside), (name, float(np.mean(inside)))
 
 
 PARTS_SHARES = {"h": 0.9, "c": 0.9, "o": 0.8}

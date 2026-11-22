@@ -57,7 +57,62 @@ def mode_stage_save(args) -> dict:
     steps = [run(1, resume="never"), run(2), run(3, local=False)]
     return {"process_index": jax.process_index(), "finite": read, "steps": steps, "handled": staged_values,
             "refused": refused, "stray_refused": _stray(mesh.build(paired), args.run_dir),
-            "diagonal": _diagonal(args.local_dir)}
+            "lost": _lost(paired, args.run_dir, args.local_dir)}
+
+
+def _lost(paired, run_dir, local_dir) -> list[int]:
+    """A pipeline whose stages each copy their rows over a replicas axis of one device of each process, each
+    reading its share of a step's rows, its step 1 saved on the local tier alone (`save_local`), process
+    1's local copy then lost, as a replaced host's is, and the run resumed through its fit from that step to
+    the next: the steps each fit stepped to, the lost copy recovered from process 0's replica of every
+    stage's rows (rows 10813, 10814; row 10897: they were proven through their primitives alone)."""
+    import functools
+    import shutil
+    from pathlib import Path
+
+    import jax
+    from affine_run import Replaying
+    from jax.experimental import multihost_utils
+    from test_stage_local import ADAM, BATCH, SEQ, VOCAB, decoder, trainer
+    from token_support import token_rows
+
+    from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader
+    from dew.training import MeshSpec
+
+    replicated = MeshSpec(replicas=2, stage=2)
+
+    def shares() -> Loader:
+        # Each process its share of a step's rows, as a pool over a replicas axis reads them.
+        def batch_at(partition, step: int) -> dict:
+            rows = token_rows(VOCAB, BATCH, SEQ + 1, seed=step)
+            return {name: value[partition.index::partition.count] for name, value in rows.items()}
+        return Loader(train=lambda partition: Replaying(functools.partial(batch_at, partition)), val=None,
+                      records=None, batch=BATCH)
+
+    def run(name: str, steps: int, resume: str):
+        kept = Checkpoints(str(Path(run_dir) / name), local_directory=str(Path(local_dir) / name),
+                           local_every=1)
+        staged = trainer(decoder(layer_scalar="frozen"), ADAM, replicated, len(paired), checkpoints=kept)
+        staged.device_mesh = replicated.build(paired)
+        return staged.fit(shares(), steps=steps, checkpoint_every=2, log_every=1, resume=resume,
+                          checkpoint_final=False)
+
+    def own(state) -> list:
+        # This process's shards of the weights and the optimizer's state, as the step left them.
+        return [np.asarray(shard.data) for leaf in jax.tree.leaves((state.variables, state.opt_state))
+                for shard in leaf.addressable_shards]
+
+    first = int(run("lost", 1, "never").step)
+    if jax.process_index() == 1:
+        shutil.rmtree(Path(local_dir) / "lost" / "process1")
+    multihost_utils.sync_global_devices("local copy lost")
+    resumed = run("lost", 2, "require")
+    # The run no copy of which was lost, two steps of the same rows from the same start: the recovered
+    # run's state equal to it, its weights, its optimizer's state and the rows its data read on to.
+    whole = run("whole", 2, "never")
+    alike = all(np.array_equal(left, right) for left, right in zip(own(resumed), own(whole), strict=True))
+    return [first, int(resumed.step), Checkpoints(str(Path(run_dir) / "lost")).latest, alike]
 
 
 def _handled(mesh, directory) -> tuple[dict, bool]:
@@ -97,44 +152,6 @@ def _handled(mesh, directory) -> tuple[dict, bool]:
     except ValueError:
         refused = True
     return {name: {"shape": list(restored[name].shape), "held": held[name]} for name in held}, refused
-
-
-def _diagonal(directory) -> dict:
-    """An array split over a tensor axis and copied over a data axis, on a 2 x 2 mesh each of whose
-    processes holds one diagonal (process 0 one tensor index on the first data row, the other on the
-    second), written by each process to its own local directory as the local tier writes (`SubmeshArrays`
-    of no primary host and no replica id) and read back from it: whether each process read back every
-    shard it holds (row 10813: Orbax wrote its first shard's replica alone, one of the two indices)."""
-    import jax
-    import numpy as np
-    import orbax.checkpoint as ocp
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from orbax.checkpoint.options import MultiprocessingOptions
-
-    from dew.checkpoints import _handler
-    from dew.checkpoints.submesh import SubmeshArrays
-
-    own = [sorted((device for device in jax.devices() if device.process_index == rank), key=lambda d: d.id)
-           for rank in range(2)]
-    grid = np.asarray([[own[0][0], own[1][0]], [own[1][1], own[0][1]]], dtype=object)
-    placed = NamedSharding(Mesh(grid, ("data", "tensor")), P(None, "tensor"))
-    values = np.arange(8, dtype=np.float32).reshape(2, 4)
-    array = jax.make_array_from_callback(values.shape, placed, lambda index: values[index])
-    me = jax.process_index()
-    multiprocessing = MultiprocessingOptions(primary_host=me, active_processes={me},
-                                             barrier_sync_key_prefix=f"diagonal{me}")
-    registry = ocp.type_handlers.create_type_handler_registry(
-        (jax.Array, SubmeshArrays(primary_host=None, replica_id=None, use_replica_parallel=False)))
-    # The local tier's own handler: OCDBT and Zarr 3 (`Checkpoints._open_local`).
-    handler = _handler(use_ocdbt=True, use_zarr3=True, multiprocessing_options=multiprocessing,
-                       type_handler_registry=registry)
-    path = f"{directory}/diagonal-{me}"
-    with ocp.Checkpointer(handler, multiprocessing_options=multiprocessing) as checkpointer:
-        checkpointer.save(path, {"x": array})
-        restored = checkpointer.restore(path, args=ocp.args.PyTreeRestore(restore_args={
-            "x": ocp.ArrayRestoreArgs(sharding=placed, global_shape=values.shape, dtype=np.float32)}))["x"]
-    return {"held": all(np.array_equal(np.asarray(shard.data), values[shard.index])
-                        for shard in restored.addressable_shards)}
 
 
 def _stray(mesh, directory) -> bool:

@@ -281,23 +281,22 @@ CHECK1_SHARDS = {
 it reads a mark's (tools/armada/ci.py): their seeds and a task's share (`interpreted_cases`)."""
 
 
-def interpreted_cases() -> list:
-    """`CASES`' forwards under the regimes the CPU interprets (`INTERPRETED`), as the test's parameters, each
-    marked to run its seeds as map tasks where `CHECK1_SHARDS` names its node: a form or regime `SITES`,
-    `forms_of` or `INTERPRETED` adds reaches the CPU cell (row 9716)."""
-    test = "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted"
+def interpreted_cases(test):
+    """`test` parametrized by `CASES`' forwards under the regimes the CPU interprets (`INTERPRETED`), each
+    marked to run its seeds as map tasks where `CHECK1_SHARDS` names its node, by `test`'s own name: a form
+    or regime `SITES`, `forms_of` or `INTERPRETED` adds reaches the CPU cell (rows 9716, 11837)."""
     cases = []
     for name, regime, product, forms in CASES:
         if product != 'forward' or regime not in INTERPRETED:
             continue
         ident = '-'.join(part.replace(' ', '_') for part in (name, regime, forms) if part is not None)
-        held = CHECK1_SHARDS.get(f"{test}[{ident}]")
+        held = CHECK1_SHARDS.get(f"{test.__name__}[{ident}]")
         cases.append(pytest.param(name, regime, forms, id=ident,
                                   marks=[pytest.mark.check1_shards(**held)] if held else []))
-    return cases
+    return pytest.mark.parametrize(('name', 'regime', 'forms'), cases)(test)
 
 
-@pytest.mark.parametrize(('name', 'regime', 'forms'), interpreted_cases())
+@interpreted_cases
 def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
     """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
     tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64
