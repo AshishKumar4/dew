@@ -409,38 +409,50 @@ def free_until_placed(monkeypatch, room):
 
 
 def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refused_unplaced(monkeypatch):
-    """A fresh fit on devices with room for its state and for no plan of its step is refused as its search
-    before the state was placed found it, placing nothing of its state, its step lowered once a probe at
-    most: placing the state frees nothing its misses need (`StepCompiler.refuse_unplaced`; row 11712: a 4B
-    step on two H100s, short by 70 GiB, searched its four rungs again once its state was placed, 1.5 h)."""
+    """A fresh fit on devices with room for its state and for no plan of its step, whose start lets no held
+    array go, is refused as its search before the state was placed found it: its initializer never runs on
+    the devices, and its step is lowered once a probe at most (`StepCompiler.refuse_unplaced`; row 11712: a
+    4B step on two H100s, short by 70 GiB, searched its four rungs again once its state was placed, 1.5 h).
+    A start that lets held arrays go, which may free the room a miss needs, places its state and searches
+    again there: refused, its initializer run."""
     from affine_run import Replaying
+    from test_layout_validation import INITIALIZED, Watched
 
     from dew.data.dataset import Loader
 
     rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
     roomy = lm()
     free(monkeypatch, LIMIT)
-    roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    trained = roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     assert roomy.validation is not None
-    state = max(roomy.validation.device_bytes.values())
+    room = max(roomy.validation.device_bytes.values()) + 1024
     options.unhold()
-    room = state + 1024
-    free_until_placed(monkeypatch, room)
+    # Held arrays the start copies, the trained parameters on the device.
+    held = {"params": trained.variables["params"]}
     lowered = []
 
     def lowering(event, seconds, *, fun_name=None, **_):
         if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" and fun_name == "jit(step)":
             lowered.append(seconds)
 
-    jax.monitoring.register_event_duration_secs_listener(lowering)
-    try:
-        with pytest.raises(PlanRefused) as refused:
-            lm().fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
-    finally:
-        jax.monitoring.unregister_event_duration_listener(lowering)
-    in_use = [memory["bytes_in_use"] for memory in refused.value.allocators]
-    assert in_use and max(in_use) < LIMIT - room + state, (in_use, LIMIT - room, state)
-    assert len(lowered) <= len(refused.value.probes), (len(lowered), refused.value.probes)
+    def refused(objective) -> tuple[PlanRefused, list[bool], int]:
+        """The refusal of a fresh fit of `objective`, whether its initializer ran, its step's lowerings."""
+        free_until_placed(monkeypatch, room)
+        INITIALIZED.clear()
+        lowered.clear()
+        jax.monitoring.register_event_duration_secs_listener(lowering)
+        try:
+            with pytest.raises(PlanRefused) as raised:
+                lm(objective=objective).fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+        finally:
+            jax.monitoring.unregister_event_duration_listener(lowering)
+        jax.effects_barrier()
+        return raised.value, list(INITIALIZED), len(lowered)
+
+    alone, ran, count = refused(Watched)
+    assert ran == [] and count <= len(alone.probes), (ran, count, alone.probes)
+    _, ran, _ = refused(functools.partial(Watched, variables=held))
+    assert ran, "a start letting held arrays go placed its state and searched again"
 
 def needs(monkeypatch, trainer, run=None):
     """The bytes the step `trainer` compiles first needs beside what a device holds: the headroom that

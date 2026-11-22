@@ -1003,22 +1003,23 @@ class StepCompiler[L, E]:
         self._unplaced = Unplaced(signature, planned, compiled, keep)
         return signature
 
-    def refuse_unplaced(self, freed: int) -> None:
+    def refuse_unplaced(self, freed: Callable[[], int]) -> None:
         """Refuse a fresh run whose first step fit no plan before its state was placed (`planned_unplaced`)
-        where placing the state frees too little to cover the search's closest miss: the placed devices hold
-        no more room than it read beside the state's bytes but what the held arrays the start copies let go
-        (`freed`, `Start.freed`), so a search on them misses as this one did (row 11712: a 4B step on two
-        H100s, short by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state
-        was placed, 1.5 h). Every process refuses or none does, each reading its own devices' misses; a run
-        not refused searches again on the placed devices (`compile`)."""
+        where placing the state frees no room on any process (`freed`, `Start.freed`: the held arrays the
+        start copies and may let go): its devices then hold, the state placed, the room the search judged
+        every rung and split on beside the state's bytes, so a search there judges each as this one did, the
+        splits its projections passed over among them (row 11712: a 4B step on two H100s, short by 70 GiB of
+        72.71 free at each of four rungs, searched them all again once its state was placed, 1.5 h). A run
+        whose start frees room, or whose search left a miss unmeasured (a compile refused for memory), is
+        searched again on the placed devices (`compile`). Every process refuses or none does; admission is
+        the pool's, so where one process holds no refusal none does."""
         refused, self._refused = self._refused, None
-        shorts = [] if refused is None else [-probe.headroom for probe in refused.probes
-                                             if not probe.fits and isinstance(probe.headroom, int)]
-        if all(from_every_process(bool(shorts) and min(shorts) > freed)):
-            assert refused is not None
-            _log.warning("the step fits no plan before its state is placed, short by %d bytes at the least, "
-                         "which placing it frees no more than %d of: refused without searching again",
-                         min(shorts), freed)
+        if refused is None:
+            return
+        measured = all(probe.fits or isinstance(probe.headroom, int) for probe in refused.probes)
+        if all(from_every_process(measured and freed() == 0)):
+            _log.warning("the step fits no plan before its state is placed, and placing it frees no room: "
+                         "refused without searching again")
             raise refused
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,

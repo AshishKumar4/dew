@@ -1347,7 +1347,7 @@ class Start:
     def freed(self, mesh: Mesh) -> int:
         """The most bytes any of this process's devices of `mesh` can free as the start places the state: the
         held arrays in its own memory the start copies, every one but those it keeps as they are
-        (`_kept_through`), whose sources it may let go once copied; the room its devices gain beside what a
+        (`_kept_through`), whose sources it may let go once copied: room its devices may gain beside what a
         plan read of them before the state was placed (`StepCompiler.refuse_unplaced`)."""
         from dew.training.memory import local_devices
 
