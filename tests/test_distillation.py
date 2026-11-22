@@ -817,6 +817,30 @@ def test_a_tiled_full_kl_leaves_out_the_positions_whose_teacher_logits_are_not_f
         assert bool(jnp.all(finite == held)) and bool(jnp.all(jnp.isfinite(divergence))), (held, finite)
 
 
+def test_a_tiled_full_kl_divides_by_a_wide_temperature_at_its_width_as_the_whole_logits_do():
+    """Under x64, float32 states and heads over a float64 temperature too small for float32 (1e-50): the
+    tiled full KL (`chunked.head_divergence`) divides by it at float64, as the whole logits' KL does
+    (`categorical.kl_divergence`), each finite and float64 (row 10978's review: cast to the states'
+    float32 it became 0, its KL not finite)."""
+    from dew.nn import categorical
+    from dew.nn.protocols import OutputTable
+    from dew.objectives.lm.chunked import head_divergence
+
+    vocab, width, rows, positions = 16, 8, 2, 5
+    keys = jax.random.split(jax.random.key(0), 4)
+    with jax.enable_x64(True):
+        tables = [jax.random.normal(key, (width, vocab), jnp.float32) for key in keys[:2]]
+        states = [jax.random.normal(key, (rows, positions, width), jnp.float32) for key in keys[2:]]
+        student, teacher = (OutputTable(table, vocab_major=False) for table in tables)
+        temperature = jnp.asarray(1e-50, jnp.float64)
+        tiled, _ = head_divergence(states[0], student, states[1], teacher, jnp.ones((rows, positions), bool),
+                                   temperature, tile=(3, vocab))
+        whole = categorical.kl_divergence(student.logits(states[0]) / temperature,
+                                          teacher.logits(states[1]) / temperature)
+    for divergence in (tiled, whole):
+        assert divergence.dtype == jnp.float64 and bool(jnp.all(jnp.isfinite(divergence))), divergence
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("axes", [{}, {"sequence": 2}], ids=["rows", "rows-and-positions"])
 def test_a_tiled_full_kl_over_tokens_split_across_devices_gathers_no_states(axes):

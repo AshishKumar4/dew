@@ -512,13 +512,28 @@ _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_p
 
 def release() -> None:
     """Drop every live program's compiled executables (`OuterProgram.released`) and the process's held ones
-    (`held`), as `jax.clear_caches` drops jit's own: XLA:CPU maps each executable's code into the process,
-    and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache JAX
-    clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
-    compiles again at its next call."""
+    (`held`), as `jax.clear_caches` drops jit's own, and what else keeps a lowering whose live module keys
+    JAX's loaded executable of it (`releasing`): XLA:CPU maps each executable's code into the process, and a
+    program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache JAX clears. A
+    process that compiles on and on (a test suite) frees the mappings this way; each program compiles again
+    at its next call."""
     for program in list(_PROGRAMS):
         program.released()
     unhold()
+    for drop in _RELEASING:
+        drop()
+
+
+_RELEASING: list[Callable[[], None]] = []
+"""What `release` drops beside the programs' executables (`releasing`)."""
+
+
+def releasing[F: Callable[[], None]](drop: F) -> F:
+    """`drop`, a module's dropping of the lowerings it keeps (a trainer's kept traced steps,
+    `dew.training._candidates`), run by every `release`: a kept lowering's live module keys JAX's loaded
+    executable of it, its device code included, for as long as it is kept."""
+    _RELEASING.append(drop)
+    return drop
 
 
 def unhold(key: Hashable | None = None) -> None:

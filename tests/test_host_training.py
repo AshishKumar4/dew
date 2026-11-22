@@ -1438,6 +1438,7 @@ def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_stat
         with pytest.raises(PlanRefused):
             stated.fit(streaming_data(), steps=1, log_every=100)
     # The one plan its devices hold: laid out as the streamed layout states, through its construction.
+    assert chosen.layout_choice is not None and chosen.layout_choice.streams, chosen.layout_choice
     assert chosen.host_master and chosen.layout == given.layout, chosen.layout_choice
     assert not stated.host_master
     equal(trained.variables, expected.variables)
