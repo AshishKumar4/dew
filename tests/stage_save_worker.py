@@ -61,29 +61,41 @@ def mode_stage_save(args) -> dict:
 
 
 def _lost(paired, run_dir, local_dir) -> list[int]:
-    """A pipeline whose stages each copy their rows over a replicas axis of one device of each process, its step 1
-    saved on the local tier alone (`save_local`), process 1's local copy then lost, as a replaced host's
-    is, and the run resumed through its fit from that step to the next: the steps each fit stepped to, the
-    lost copy recovered from process 0's replica of every stage's rows (rows 10813, 10814; row 10897:
-    they were proven through their primitives alone)."""
+    """A pipeline whose stages each copy their rows over a replicas axis of one device of each process, each
+    reading its share of a step's rows, its step 1 saved on the local tier alone (`save_local`), process
+    1's local copy then lost, as a replaced host's is, and the run resumed through its fit from that step to
+    the next: the steps each fit stepped to, the lost copy recovered from process 0's replica of every
+    stage's rows (rows 10813, 10814; row 10897: they were proven through their primitives alone)."""
+    import functools
     import shutil
     from pathlib import Path
 
     import jax
+    from affine_run import Replaying
     from jax.experimental import multihost_utils
-    from test_stage_local import ADAM, decoder, stream, trainer
+    from test_stage_local import ADAM, BATCH, SEQ, VOCAB, decoder, trainer
+    from token_support import token_rows
 
     from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader
     from dew.training import MeshSpec
 
     replicated = MeshSpec(replicas=2, stage=2)
     persistent, local = Path(run_dir) / "lost", Path(local_dir) / "lost"
 
+    def shares() -> Loader:
+        # Each process its share of a step's rows, as a pool over a replicas axis reads them.
+        def batch_at(partition, step: int) -> dict:
+            rows = token_rows(VOCAB, BATCH, SEQ + 1, seed=step)
+            return {name: value[partition.index::partition.count] for name, value in rows.items()}
+        return Loader(train=lambda partition: Replaying(functools.partial(batch_at, partition)), val=None,
+                      records=None, batch=BATCH)
+
     def run(steps: int, resume: str) -> int:
         kept = Checkpoints(str(persistent), local_directory=str(local), local_every=1)
         staged = trainer(decoder(layer_scalar="frozen"), ADAM, replicated, len(paired), checkpoints=kept)
         staged.device_mesh = replicated.build(paired)
-        return int(staged.fit(stream(), steps=steps, checkpoint_every=2, log_every=1, resume=resume,
+        return int(staged.fit(shares(), steps=steps, checkpoint_every=2, log_every=1, resume=resume,
                               checkpoint_final=False).step)
 
     first = run(1, "never")
