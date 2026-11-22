@@ -22,8 +22,6 @@ import sys
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
-from etils import epath
-
 from dew._cache import VERSION_FILE, default_compilation_cache_dir
 from dew._files import write_atomically
 from dew._imports import Walk
@@ -225,11 +223,16 @@ def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ..
     (`dew._cache.default_compilation_cache_dir`) under the tree's digest (`whole_digest`), the Python that
     parsed it and the roots, so a later start of the same tree reads it, walking nothing; one that does not
     name its roots, or names a module the tree has not, is walked again. A directory that cannot be read or
-    written (a read-only home) keeps none, a miss logged: the walk's closure serves the process."""
+    written (a read-only home) keeps none, a miss logged, and a bucket's (gs://) is not written to: the walk's
+    closure serves the process."""
     named = hashlib.sha256(json.dumps(roots).encode()).hexdigest()[:16]
     python = "{}.{}".format(*sys.version_info[:2])
-    # epath: the compilation cache may be a bucket's (gs://), the closure kept there as JAX keeps programs.
-    kept = epath.Path(default_compilation_cache_dir()) / "dew-code" / f"{whole_digest()}-{python}-{named}"
+    cache = default_compilation_cache_dir()
+    if "://" in cache:
+        # A bucket's compilation cache (gs://), whose client fails in ways of its own: a closure is kept on a
+        # local file system alone, and walked again each process elsewhere.
+        return closure(*roots)
+    kept = Path(cache) / "dew-code" / f"{whole_digest()}-{python}-{named}"
     with contextlib.suppress(OSError, ValueError):
         found = json.loads(kept.read_text())
         if isinstance(found, dict) and _sound(found, roots):
