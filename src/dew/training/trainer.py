@@ -2325,7 +2325,7 @@ class Trainer(Generic[Loss, Effects]):
         settled_heap(run)  # A step the process held, its fit's start collected all the same.
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], interval, run.current, trials.state), trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current, state), trials.state)
 
     def _saved_checkpoint(
         self,
