@@ -434,6 +434,8 @@ class PlanRefused(RuntimeError):
         # its misses read (its Newton-Schulz stacks parted, its narrow copies dropped), which a search on
         # more room may choose otherwise (`dew.training.compiler.StepCompiler.refuse_unplaced`).
         self.candidates, self.variants = tuple(candidates), variants
+        # Whether the search began at a rung a record or a resumed checkpoint named (`StepCompiler._planned`).
+        self.recorded_start = False
         gib = 1024 ** 3
         read = [memory for memory in self.allocators if 'bytes_limit' in memory and 'bytes_in_use' in memory]
         said = ""

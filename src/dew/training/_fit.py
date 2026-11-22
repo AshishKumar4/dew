@@ -32,7 +32,15 @@ from jax.sharding import Mesh
 from dew import _position
 from dew._coordination import agreed, agreed_next, agreed_reads, agreed_same, pool_size
 from dew._records import JSON, integers
-from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
+from dew.batch import (
+    CLOSES_WINDOW,
+    CONSUMED_COUNT,
+    EXAMPLES_CONSUMED,
+    VALID_ROWS,
+    Batch,
+    ConsumedCount,
+    Variables,
+)
 from dew.checkpoints import Checkpoints
 from dew.data.compile import Handed, native
 from dew.data.dataset import (
@@ -1333,13 +1341,22 @@ class Start:
     """Whether its build is the one its process keeps for the trainer's refits (`traced_draw`'s, under the
     trainer's step key): only such a build's program a refit reads again (`start_build`)."""
 
+    @property
+    def placed_variables(self) -> Variables:
+        """Its state's variables as shapes at the shardings the start places them at (`shardings`): what a
+        plan before the state is placed reads of their placement (`layer_gathers`, which sizes an FSDP
+        step's gathers by the layers its parameter axes split)."""
+        def placed(leaf, sharding):
+            return (jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
+                    if isinstance(leaf, jax.ShapeDtypeStruct) else leaf)
+
+        return jax.tree.map(placed, self.abstract.variables, self.shardings.variables)
+
     def unplaced(self, mesh: Mesh) -> int:
         """The most bytes any of this process's devices of `mesh` takes as the start places the state: the
         state's as the layout validates it (`held`), none of a field kept in the host's, but for the frozen
-        held arrays it keeps as they are, placed where it keeps them already (`through`), each device's own
-        shards of them, at every path the state holds one at, as the layout counts it (row 11712's review:
-        one input at two paths, which the placed state aliases, was subtracted once); every other held
-        array it copies."""
+        held arrays its build keeps as they are (`_kept_through`), each device's own shards of them, at every
+        path the state holds one at, as the layout counts it; every other held array it copies."""
         from dew.training.memory import local_devices
 
         devices = local_devices(mesh)
@@ -1349,11 +1366,11 @@ class Start:
 
     def freed(self, mesh: Mesh) -> int | None:
         """The most bytes any of this process's devices of `mesh` can free as the start places the state: the
-        held arrays in its own memory the start copies, every one but those it keeps as they are
+        held arrays in its own memory its build copies, every one but those it keeps as they are
         (`_kept_through`), whose sources it may let go once copied: room its devices may gain beside what a
         plan read of them before the state was placed (`StepCompiler.refuse_unplaced`). None, unknown, where
-        the state holds a held array it copies at several paths, which the layout counts at each and the start
-        places once or more (`placed_start`; row 11712's review)."""
+        the state holds a held array it copies at several paths, which the layout counts at each and the
+        build places once or more (`placed_start`'s `held_at`; row 11712's review)."""
         from dew.training.memory import local_devices
 
         kept = self._kept_through()
@@ -1367,16 +1384,19 @@ class Start:
         return max(freed[device.id] for device in devices)
 
     def _kept_through(self) -> dict[int, int]:
-        """Each path of the state (`through`'s index) holding a frozen held array the start keeps as it is,
-        to that array's position among the initializer's leaves: placed where the state keeps it already, in
-        a device's own memory."""
-        from dew.state import apart
-
-        inputs = jax.tree.leaves(self.initializer)
-        where = jax.tree.leaves(apart(self.shardings)[1])
-        return {index: given for index, given in self.through.items()
-                if isinstance(leaf := inputs[given], jax.Array) and leaf.sharding == where[index]
-                and (leaf.sharding.memory_kind or "device") == "device"}
+        """Each path of the state (`through`'s index) its build (`placing`) holds a frozen held array at as
+        it is, to that array's position among the initializer's leaves: the array placed, in a device's own
+        memory, where the build keeps it (`StartBuild.shared`), at a path the build places there; a path of
+        another placement takes a copy of its own (row 11712's review: a model of its own beside the build's
+        named a path kept whose placement the build copies)."""
+        placing = self.placing
+        if placing.frozen is None:
+            return {}
+        inputs, where = jax.tree.leaves(self.initializer), placing.frozen[0]
+        return {index: given for index, given in placing.through.items()
+                if isinstance(leaf := inputs[given], jax.Array)
+                and (leaf.sharding.memory_kind or "device") == "device"
+                and leaf.sharding == placing.shared.get(id(leaf)) == where[index]}
 
     @functools.cached_property
     def placing(self) -> StartBuild:

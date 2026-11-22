@@ -1108,7 +1108,8 @@ class Trainer(Generic[Loss, Effects]):
         (`Start.unplaced`). The fit `run` keeps what it searched over (`FitRun.searched`)."""
         with self.phase_passes.scoped(self, self._compiler):
             run.searched = self._compiler.planned_unplaced(self._stepping(), start.abstract, batch,
-                                                           start.unplaced(self.device_mesh))
+                                                           start.unplaced(self.device_mesh),
+                                                           start.placed_variables)
 
     @ruled
     def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None,
@@ -1754,7 +1755,8 @@ class Trainer(Generic[Loss, Effects]):
             if run.searched != planned_over(batch, self._shape):
                 self._planned_unplaced(run, fresh, batch)
             # Its search's refusal, its layout choice's among them, where placing the state frees no room.
-            self._compiler.refuse_unplaced(run.searched, lambda: fresh.freed(self.device_mesh))
+            self._compiler.refuse_unplaced(run.searched, lambda: fresh.freed(self.device_mesh),
+                                           self.device_mesh)
         return begun
 
     def _whole_validated(self, state: TrainState, batch: Batch, split: int) -> Validation:

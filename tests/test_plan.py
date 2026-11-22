@@ -55,6 +55,7 @@ from dew.registry import mixers
 from dew.state import TrainState, apart
 from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
+from dew.training.compiler import UNPLACED_REFUSED
 from dew.training.distributed import microbatch
 from dew.training.memory import (
     FirstRunFailed,
@@ -461,7 +462,8 @@ def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refus
         assert all(isinstance(probe.headroom, int) and probe.headroom < 0 for probe in refusal.probes)
 
 
-def test_a_fresh_fit_whose_placed_devices_hold_its_step_trains_after_its_unplaced_search_refused(monkeypatch):
+def test_a_fresh_fit_whose_placed_devices_hold_its_step_trains_after_its_unplaced_search_refused(monkeypatch,
+                                                                                                   caplog):
     """A fresh fit whose devices read, before its state is placed, room for its state and for no plan of its
     step, and once it is placed room enough: its search before placing refuses every candidate, the start
     places the state, and the search on the placed devices plans the step, which trains (row 11712's
@@ -492,8 +494,15 @@ def test_a_fresh_fit_whose_placed_devices_hold_its_step_trains_after_its_unplace
 
     monkeypatch.setattr(jax.Device, "memory_stats", memory_stats)
     INITIALIZED.clear()
-    trained = lm(objective=Watched).fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    trainer = lm(objective=Watched)
+    with caplog.at_level(logging.INFO, logger="dew.training.compiler"):
+        trained = trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     jax.effects_barrier()
+    # Refused before the state was placed, then planned on the placed devices: its plan's probes theirs, one
+    # fitting (`StepCompiler.compile`'s own search).
+    assert any(record.msg == UNPLACED_REFUSED for record in caplog.records)
+    plan = trainer.plan
+    assert isinstance(plan, dict) and any(probe["fits"] for probe in plan["probes"]), plan
     assert int(trained.step) == 1 and INITIALIZED
 
 def test_a_fit_of_no_steps_on_devices_holding_no_plan_returns_and_its_trainer_trains_given_room(monkeypatch):
