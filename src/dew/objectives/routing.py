@@ -125,9 +125,12 @@ class ExpertBalance:
         coordinates column.
         """
         documents = token_layout(fields)[1]
-        if self.aux_loss_alpha is not None or self.router_z_loss:
-            balancing(path for marker in (ROUTER_INDICES, ROUTER_LOG_Z)
-                      for path, _ in sown_nodes(routing, marker))
+        # The routers a loss term reads, alone: the balance loss's those that record their scores beside their
+        # choice, the z-loss's those that record their log partition. A router that records its choice alone
+        # (a routing replay's record, Gemma 4's) is read by none, and stays a router no term balances.
+        balancing([*(path for path, _ in sown_nodes(routing, ROUTER_SCORES, ROUTER_INDICES)
+                     if self.aux_loss_alpha is not None),
+                   *(path for path, _ in sown_nodes(routing, ROUTER_LOG_Z) if self.router_z_loss)])
         statistics: Ratio | RoutedStatistics = prediction
         reported: dict[str, jax.Array | Pooled] = {}
         if self.aux_loss_alpha is not None:

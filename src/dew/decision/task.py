@@ -1433,6 +1433,10 @@ class Decide(SavedRunTask, InItsForm):
         images, each a PIL image, encoded image bytes, or a base64 string, bare or as
         a `data:` URL. `strict` answers as Jev's own endpoint does: the request's
         extension fields are dropped and the response holds Jev's fields alone.
+        Otherwise a task whose labels are read at an answer cue (a readout of
+        labels that pools no spans) over a looped backbone under an exit
+        threshold (`Loop.exit_threshold`) adds each answer's `exit_pass`, the
+        1-based pass whose state its cue took, with or without `details`.
 
         With `whole`, a request that the layout could answer only by cutting its
         state, instructions or options is refused instead, naming the maximum

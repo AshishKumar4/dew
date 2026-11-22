@@ -186,37 +186,38 @@ ROUTED_SEEDS = 32
 each forward, run DG-SIZE)."""
 
 
-def _layer_of(path) -> int:
-    """A routed layer's index in its stack, from its sown record's path (`layers_<i>`)."""
-    (index,) = (int(str(getattr(part, "key", part)).removeprefix("layers_")) for part in path
-                if str(getattr(part, "key", part)).startswith("layers_"))
-    return index
-
-
 def _recorded(sown, layers: int) -> np.ndarray:
-    """The experts a forward's routers chose (their 'router' collection's `indices`), `[B, S, layers,
+    """The experts a forward's routers chose (each layer's `ROUTER_INDICES`, `sown_calls`), `[B, S, layers,
     top_k]`, a layer that routes nothing zeros, which it never reads."""
-    # Each router's record a tuple of its one call's indices (flax's `sow`).
-    chosen = {_layer_of(path): np.asarray(value[0]) for path, value in
-              jax.tree_util.tree_flatten_with_path(sown, is_leaf=lambda node: isinstance(node, tuple))[0]}
+    from dew.batch import sown_calls
+    from dew.nn.backbones.layer_names import layer_index
+    from dew.nn.moe import ROUTER_INDICES
+
+    chosen = {next(index for index in map(layer_index, path) if index is not None): np.asarray(indices)
+              for path, (indices,) in sown_calls(sown, ROUTER_INDICES)}
     first = next(iter(chosen.values()))
     return np.stack([chosen.get(layer, np.zeros_like(first)) for layer in range(layers)], axis=2)
 
 
 def _denoised(model, variables, prompt, canvas, rest, routes=None):
-    """`denoise`'s canvas logits, its prompt's routing and its canvas's replayed from `routes` where
-    given, else recorded: `(logits, (prompt's experts, canvas's experts))`."""
+    """`denoise`'s canvas logits, its prompt's routing and its canvas's replayed from `routes` where given;
+    else recorded (the float64 run's), the logits beside that routing: `(logits, (prompt's experts,
+    canvas's experts))`."""
     previous, pixels = (rest[0], None) if rest and rest[0].ndim == 3 else (None, rest[0] if rest else None)
-    layers = model.text.num_layers
     fields = {} if pixels is None else {"image_indices": jnp.where(prompt == 60, 0, -1),
                                          "conditioning": {"pixel_values": pixels}}
+    recording = ["router"] if routes is None else []
     cache = model.apply(variables, prompt.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
     _, held = model.apply({**variables, "cache": cache}, prompt, method=model.encode,
-                          mutable=["cache", "router"], routed_experts=None if routes is None else routes[0],
+                          mutable=["cache", *recording], routed_experts=None if routes is None else routes[0],
                           **fields)
-    logits, sown = model.apply({**variables, "cache": held["cache"]}, canvas, mutable=["router"],
-                               self_conditioning_logits=previous,
-                               routed_experts=None if routes is None else routes[1])
+    called = model.apply({**variables, "cache": held["cache"]}, canvas, mutable=recording or False,
+                         self_conditioning_logits=previous,
+                         routed_experts=None if routes is None else routes[1])
+    if routes is not None:
+        return called
+    logits, sown = called
+    layers = model.text.num_layers
     return logits, (_recorded(held["router"], layers), _recorded(sown["router"], layers))
 
 
@@ -292,7 +293,7 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16(forward):
     @as_given
     def dew(*inputs):
         prompt, canvas, *rest, prompts, canvases = (jnp.asarray(value) for value in inputs)
-        logits = _denoised(narrow, variables, prompt, canvas, rest, (prompts, canvases))[0]
+        logits = _denoised(narrow, variables, prompt, canvas, rest, (prompts, canvases))
         return {"logits": np.asarray(logits.astype(jnp.float32))}
 
     def transformers(network, *inputs):
