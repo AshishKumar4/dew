@@ -28,7 +28,7 @@ from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_
 from dew.distributed.placement import Placement, Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
-from dew.nn.kernels.options import held_context, owned_program, program_key, releasing
+from dew.nn.kernels.options import held_context, held_until_release, owned_program, program_key
 from dew.nn.sharding import Link, Schedule, spread_axes, spread_over
 from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training._lowering import Routed, kernel_report, routed
@@ -155,21 +155,26 @@ class Stepping[LossT, EffectsT]:
 
 KEPT_CANDIDATES = 32
 """The traced steps a process keeps for a trainer built anew to read (`candidate_for`), the latest: each
-holds its lowered module, its batch as shapes and no buffer, whose live module keys JAX's loaded
-executable of it, its device code included, until `dew.nn.kernels.options.release` drops them
-(`_released`). A fit's ladder traces up to 15 (a streamed decoder's layout choice on stand-in H100s, row
-8411), so 32 keep two fits' whole, a resumed or refit run's, where 4 kept none and each fit traced its
-ladder again."""
+holds its lowered module, the step's inputs (its batch, its state) as shapes, though the module may hold
+constants of its own, and its live module keys JAX's loaded executable of it, its device code included,
+until `dew.nn.kernels.options.release` drops them (`_Kept`). A fit's ladder traces up to 15 (a streamed
+decoder's layout choice on stand-in H100s, row 8411), so 32 keep two fits' whole, a resumed or refit run's,
+where 4 kept none and each fit traced its ladder again."""
 
 _CANDIDATES: collections.OrderedDict[Hashable, Candidate] = collections.OrderedDict()
 _KEEPING = threading.Lock()
 
 
-@releasing
-def _released() -> None:
-    """Every kept traced step dropped, as the process releases its programs' executables."""
-    with _KEEPING:
-        _CANDIDATES.clear()
+class _Kept:
+    """The kept traced steps as the process releases its programs (`options.held_until_release`, registered
+    as the first is kept): each dropped with the executables their lowerings key."""
+
+    def released(self) -> None:
+        with _KEEPING:
+            _CANDIDATES.clear()
+
+
+_KEPT = _Kept()
 
 
 def _shaped(tree) -> Hashable:
@@ -225,6 +230,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
+        held_until_release(_KEPT)
         with _KEEPING:
             _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
                                                    spread=spread_axes())

@@ -407,6 +407,28 @@ def free_until_placed(monkeypatch, room):
         "bytes_limit": LIMIT, "bytes_in_use": LIMIT - room + max(0, held(device) - before[device])})
 
 
+
+def test_a_trainer_built_after_the_process_releases_its_programs_traces_its_step_again(monkeypatch):
+    """A trainer built anew reads the step an equal trainer traced over the same shapes (`candidate_for`),
+    tracing none; once the process releases its programs (`options.release`), which drops the kept steps
+    with the executables their lowerings key, the next traces it again (row 8411's review: the kept steps,
+    32 of them, outlived a release that dropped every executable but theirs)."""
+    from dew.telemetry.compiles import Compiles
+
+    free(monkeypatch, LIMIT)
+
+    def traced() -> int:
+        trainer = lm()
+        state, _, _ = trainer.place()
+        with Compiles("step") as compiles:
+            trainer.compile(state, BATCH)
+        return [program.kind for program in compiles.programs].count("traced")
+
+    traced()
+    kept = traced()
+    options.release()
+    assert kept == 0 and traced() > 0, kept
+
 def needs(monkeypatch, trainer, run=None):
     """The bytes the step `trainer` compiles first needs beside what a device holds: the headroom that
     compile left of all of LIMIT free, taken from LIMIT. `run` compiles it; None compiles it for BATCH."""
