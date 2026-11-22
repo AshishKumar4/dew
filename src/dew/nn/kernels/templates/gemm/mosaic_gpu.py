@@ -561,8 +561,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             _gmm_stepped_at, family=family, tiles=tiles, prologue=(prologue, prologue_axes),
             matrices=matrices, transpose=(transpose_lhs, transpose_rhs), interpret=bool(interpret),
             mx=mx_scales is not None, packed_rows=packed_rows, chosen=None if when is None else chained,
-            scaled=(step_scales is not None, scale_per, block_n),
-            summed=exact_sums and not family.sums_in_persist)
+            scaled=(step_scales is not None, scale_per, block_n), exact_sums=exact_sums)
 
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
             def issue(wg, tile, walk, *, active):
@@ -662,7 +661,7 @@ def _chained_walked(chained: tuple, tiles: Tiles, dtype, transpose_lhs: bool, de
 
 def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: tuple, matrices: dict,
                     transpose: tuple, interpret: bool, mx: bool, packed_rows: bool, scaled: tuple,
-                    summed: bool, chosen=None, **refs) -> tuple[Callable, Callable | None]:
+                    exact_sums: bool, chosen=None, **refs) -> tuple[Callable, Callable | None]:
     """Dew: consumer `wg`'s step of `tile` (`_gmm_step`), `refs` its side tiles: its share of the rows, its
     idleness and its first step the tile's, its scaling at its column tile; and the walk's prefetch of its
     slots (`_gmm_prefetch`) where `prefetches` says its walk reads one and every consumer's products issue
@@ -678,7 +677,8 @@ def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: 
     prefetching = idle is None and prefetches(
         family, matrices=len(matrices), prologue=hook, scaled=refs.get('decoded') is not None or mx,
         chained=chosen is not None, interpret=interpret,
-        transposed=(transpose_lhs or packed_rows, transpose_rhs), summed=summed)
+        transposed=(transpose_lhs or packed_rows, transpose_rhs),
+        summed=exact_sums and not family.sums_in_persist)
     return step, _gmm_prefetch(family, matrices, rows) if prefetching else None
 
 
