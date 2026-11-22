@@ -409,3 +409,18 @@ def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=by_layer), {"bank": mixed})
         with pytest.raises(ValueError):
             Checkpoints(str(tmp_path / "sharded_mixed")).restore(sharded_template)
+
+
+def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix():
+    """An NVFP4 product at a decode cell where its packed launch plans a tile (`gemm.NVFP4_CELLS`' H100
+    decode cell) takes the packed launch over whole operands and the matrix decoded once a call where a mesh
+    XLA places splits them (`PackedCase.whole`, `sharding.automatic_axes`), as every GEMM selector's
+    launch reads one device's operands whole (row 11642: a Linear's product forced XLA by hand beside it,
+    and an expert bank's took the packed launch under such a mesh)."""
+    from dew.nn.kernels import selection
+
+    with generation.assumed("sm90"):
+        tile = tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
+        assert selection.select(gemm.NVFP4, gemm.PackedCase(tile, 16)).kernel == "packed"
+        assert selection.select(gemm.NVFP4, gemm.PackedCase(tile, 16, whole=False)).kernel == "xla"
+

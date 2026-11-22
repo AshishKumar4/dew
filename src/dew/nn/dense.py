@@ -19,7 +19,6 @@ flax's own calls broadcast the bias in its storage dtype, where its gradient
 then sums, and offer no step to widen it.
 """
 
-import contextlib
 import functools
 import importlib.util
 import inspect
@@ -35,10 +34,10 @@ from flax.typing import Array
 from dew._cache import INTERCEPTED
 
 from .derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed
-from .kernels import generation, projections
+from .kernels import projections
 from .kernels.formats import NvFp4
 from .precision import accumulated, biased, float32_dot_general, refuse_recipe
-from .sharding import automatic_axes, declared
+from .sharding import declared
 
 QWIX = importlib.util.find_spec("qwix") is not None
 """Whether Qwix is installed (`dew.quantization`'s extra), whose rules a layer's product may fall under."""
@@ -286,11 +285,7 @@ class Dense(_LinearEnvelope, nn.Dense):
                 if self.use_bias else None)
         dtype = self.dtype if self.dtype is not None else jnp.result_type(inputs)
         rows = jnp.reshape(inputs, (-1, width))
-        # Under a mesh XLA places (`sharding.automatic_axes`), the product XLA partitions: the matrix decoded
-        # and multiplied (`gemm.NVFP4`'s 'xla'), where a packed launch would read one device's rows whole.
-        with (generation.chosen(grouped_matmul='xla', nvfp4='xla') if automatic_axes()
-              else contextlib.nullcontext()):
-            summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
+        summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
         if bias is not None:
             summed = summed + jnp.asarray(bias, jnp.float32)
         return jnp.reshape(summed.astype(dtype), (*jnp.shape(inputs)[:-1], self.features))
