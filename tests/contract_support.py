@@ -15,6 +15,8 @@ wrong length), and each of its leaves is finite wherever the same order's float6
 public call."""
 
 
+import concurrent.futures
+import contextlib
 import functools
 from collections.abc import Callable
 from typing import NamedTuple
@@ -244,8 +246,16 @@ def orders(fn, primals, direction, cotangent):
 
 def ran(order, label: str, name: str):
     """`order()`'s leaves as arrays, a failure to run named by the seam and the order that raised it."""
-    try:
+    with running(label, name):
         return jax.tree.map(np.asarray, order())
+
+
+@contextlib.contextmanager
+def running(label: str, name: str):
+    """A failure within, an order's lowering, compile or run, named by the seam and the order that raised
+    it (`ran`, `_compiled_ahead`)."""
+    try:
+        yield
     except Exception as error:
         raise AssertionError(f"{label}: its {name} does not run: {type(error).__name__}: {error}") from error
 
@@ -294,12 +304,25 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
         # its order's primitives again, most of a cell's 250 s (row 11720).
         return {name: functools.partial(_mesh_program(f, name), *drawn) for name in orders_of(f, *drawn)}
 
-    narrow = staged(fn, primals, direction, cotangent)
-    plain_orders = {} if plain_fn is None else staged(plain_fn, primals, direction, cotangent)
+    given = (primals, direction, cotangent)
+    with jax.enable_x64(new_val=True), on_float64_device():
+        wide_drawn = widened(given)
+    mesh = _training_mesh()
+    # Each program its runs below take, in their contexts, by the site and order that name a failure.
+    unplaced = contextlib.nullcontext
+    runs = [(_mesh_program(fn, name), given, unplaced, label, name) for name in taken]
+    runs += [(_mesh_program(plain_fn, name), given, unplaced, f"{label}, plainly", name)
+             for name in taken if plain_fn is not None]
+    runs += [(_mesh_program(truth_fn or fn, name), wide_drawn, _on_float64, f"{label} in float64", name)
+             for name in taken]
+    if mesh is not None:
+        runs += [(_mesh_program(fn, name), _placed(mesh, given), functools.partial(jax.set_mesh, mesh),
+                  f"{label}, {name}, on training's mesh of two", name) for name in taken]
+    _compiled_ahead(runs)
+    narrow = staged(fn, *given)
+    plain_orders = {} if plain_fn is None else staged(plain_fn, *given)
     plain = {name: ran(order, f"{label}, plainly", name) for name, order in plain_orders.items()}
     with jax.enable_x64(new_val=True), on_float64_device():
-        wide_primals, wide_direction, wide_cotangent = widened((primals, direction, cotangent))
-        wide_drawn = (wide_primals, wide_direction, wide_cotangent)
         # Its eager orders, which `float64_signed_sums` walks, and its staged runs.
         wide = orders_of(truth_fn or fn, *wide_drawn)
         truths = {name: ran(order, f"{label} in float64", name)
@@ -351,15 +374,10 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
     (docs/design/testing.md), and a sum it counts twice fails by its own size. Where the cell set its own
     mesh, its orders already run under it."""
     from arm_forms import as_given, dew_path
-    from jax.sharding import NamedSharding, PartitionSpec
     from reference_error import assert_as_exact, seeds_for
 
-    from dew.training import MeshSpec
-
-    if not jax.sharding.get_abstract_mesh().empty:
+    if (mesh := _training_mesh()) is None:
         return
-    mesh = MeshSpec().build(jax.devices()[:2])
-    whole = NamedSharding(mesh, PartitionSpec())
     for name in orders(fn, primals, direction, cotangent):
         if name not in taken:
             continue
@@ -372,7 +390,7 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
         @as_given
         def on(primals, direction, cotangent, program=program, name=name, site=site):
             with jax.set_mesh(mesh):
-                placed = jax.device_put((primals, direction, cotangent), whole)
+                placed = _placed(mesh, (primals, direction, cotangent))
                 return ran(lambda: program(*placed), site, name)
 
         # At the cell's own inputs, the contract itself (`held`), on the mesh as off it.
@@ -391,6 +409,51 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
         truth_of = None if truth_fn is None else truth
         count = seeds_for(off, draw, site, truth_fn=truth_of, dew_fn=on) if seeds is None else seeds
         assert_as_exact(on, off, draw, site, seeds=count, truth_fn=truth_of)
+
+
+def _training_mesh():
+    """Training's mesh of two of this process's devices (`MeshSpec`'s, its data axis two) a case's orders run
+    on (`_on_a_mesh`); None where the cell set its own mesh, under which its orders already run."""
+    from dew.training import MeshSpec
+
+    if not jax.sharding.get_abstract_mesh().empty:
+        return None
+    return MeshSpec().build(jax.devices()[:2])
+
+
+def _placed(mesh, drawn):
+    """A case's inputs `drawn` placed on `mesh` whole, as its orders read them there (`_on_a_mesh`)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    with jax.set_mesh(mesh):
+        return jax.device_put(drawn, NamedSharding(mesh, PartitionSpec()))
+
+
+@contextlib.contextmanager
+def _on_float64():
+    """The float64 run's context (`assert_contract`'s truths): x64 on its float64 device."""
+    with jax.enable_x64(new_val=True), on_float64_device():
+        yield
+
+
+def _compiled_ahead(runs) -> None:
+    """Each program a case runs (`runs`: its order's program, `_mesh_program`'s, its arguments, the context it
+    runs in, and the site and order that name a failure, `running`) lowered in turn in its context and
+    compiled side by side, so its run, which lowers alike, finds it compiled: a convex mean's narrow, float64
+    and mesh programs of one order, 141,776 operations each, compiled 117 s one after another and 74 s side by
+    side on CI's four cores, the cell's cold run 140 s then 73 s (row 11720)."""
+    lowered = []
+    for program, arguments, context, label, name in runs:
+        with context(), running(label, name):
+            lowered.append((program.lower(*arguments), label, name))
+
+    def compiled(each) -> None:
+        program, label, name = each
+        with running(label, name):
+            program.compile()
+
+    with concurrent.futures.ThreadPoolExecutor(len(lowered)) as pool:
+        list(pool.map(compiled, lowered))
 
 
 @functools.lru_cache(maxsize=256)
