@@ -927,7 +927,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             else:
                 self.stage_output(part, smem)
             rows = smem.shape[0]
-            stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
+            # A landing wider than its output rounds each row block as it copies it (`swizzling.narrowed`).
+            wider = jnp.dtype(smem.dtype).itemsize > jnp.dtype(view.dtype).itemsize
+            stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows,
+                              copy=swizzling.narrowed if wider else swizzling.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
     def stage_output(self, value: jax.Array, smem) -> None:
