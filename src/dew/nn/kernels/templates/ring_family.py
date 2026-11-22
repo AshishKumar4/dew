@@ -96,6 +96,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         del scalars
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
+        compiled = self.compiled_with(approx_math=approx_math)
+        assert isinstance(compiled, plgpu.CompilerParams), "a ring family's kernels are Mosaic GPU's"
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers, joined), family=self.name, interpret=interpret,
                       name=name, cluster=cluster, cost=cost, model_flops=model_flops, prefetched=prefetched,
@@ -105,7 +107,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                                                            moves=moves, joined=joined)),
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       compiled=dataclasses.replace(
-                          self.compiled_with(approx_math=approx_math), min_blocks_per_sm=resident,
+                          compiled, min_blocks_per_sm=resident,
                           reduction_scratch_bytes=((self.reduction_scratch if reduces else 0)
                                                    + self.warpgroup_reduction_scratch * reducing_warpgroups)))
 
