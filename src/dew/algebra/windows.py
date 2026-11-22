@@ -447,9 +447,15 @@ def _arrays(operands, axis: int | None):
               if operand.shape[axis] == states and extra else operand for operand in operands]
 
     def load(c):
-        start = c * width
-        sliced = [jax.lax.dynamic_slice_in_dim(operand, start, width, axis)
-                  if operand.shape[axis] == chunks * width else operand for operand in padded]
+        if chunks == 1:
+            # One chunk is the operands whole: no slice is bound, which Pallas's Triton lowering has no rule
+            # for (row 11661).
+            start = 0
+            sliced = padded
+        else:
+            start = c * width
+            sliced = [jax.lax.dynamic_slice_in_dim(operand, start, width, axis)
+                      if operand.shape[axis] == chunks * width else operand for operand in padded]
         index = start + jax.lax.broadcasted_iota(jnp.int32, tuple(width if place == axis else 1
                                                                    for place in range(sliced[0].ndim)), axis)
         return sliced, index < states

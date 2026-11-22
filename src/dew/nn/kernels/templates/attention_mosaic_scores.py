@@ -197,17 +197,23 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     return algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped), part
 
 
-def _score_weights(walk: _Backward, coords: algebra.Coords, params: tuple, s, peak, total, *,
-                   masked: bool):
-    """First half of `_scores` (row 11659): mask, hooked logits + slopes, and derived unnormalized and
-    normalized weights from `s`, `peak`, and `total` (runnable while `dP` is in flight)."""
+def _score_logits(walk: _Backward, coords: algebra.Coords, params: tuple, s, *, masked: bool):
+    """Shared mask and hooked-logits prologue for `_score_weights` and `_scores`."""
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
     logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
                                          coords.k_pos, params,
                                          scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
+    return logits, slopes, seen
+
+
+def _score_weights(walk: _Backward, coords: algebra.Coords, params: tuple, s, peak, total, *,
+                   masked: bool):
+    """First half of `_scores` (row 11659): mask, hooked logits + slopes, and derived unnormalized and
+    normalized weights from `s`, `peak`, and `total` (runnable while `dP` is in flight)."""
+    logits, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
     exponentials, weights = derived_weights(
-        keys_first=bool(coords.keys_first), how=how, accurate=walk.accurate).mapped(
+        keys_first=bool(coords.keys_first), how=walk.how, accurate=walk.accurate).mapped(
             {"logits": logits, "peak": _read(peak), "total": _read(total)})
     return exponentials, weights, slopes, seen
 
@@ -234,11 +240,7 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
                                                              masked=masked)
         cotangents = _score_cotangents(coords, weights, dp, anchor, delta, seen)
         return exponentials, weights, cotangents, slopes, seen
-    seen = algebra.seen(walk.spec, coords, s) if masked else None
-    how = walk.how
-    logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
-                                         coords.k_pos, params,
-                                         scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
+    logits, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
     # A dropping anchor's centre can survive where its tile's product rounds to zero before the
     # multiplier joins it. Take its self-difference as 0, as the accurate form does. The undropped
     # fast form keeps FlashAttention 3's math (the select took 10.8% of fused dK/dV's instructions).
@@ -249,7 +251,7 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
         tiles["keep"] = multiplier
     if seen is not None:
         tiles["seen"] = seen
-    forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, how,
+    forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, walk.how,
                                walk.accurate, anchored=True)
     exponentials, weights, cotangents = forms.mapped(tiles)
     return exponentials, weights, cotangents, slopes, seen
