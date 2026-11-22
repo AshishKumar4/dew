@@ -321,9 +321,10 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
     where the run's own admission refused it; then it counted the weights twice, beside the state and among
     the evaluation's arguments, and refused a GPU the evaluation fitted). A model 1024 wide, its state
     outweighing its step's other bytes: an evaluation of 4 times its step's rows fits where its step does and
-    adds nothing to the need (its weights counted twice, 27 MB more, FS-8710-N-c1ff975583c-4x1024); one of 32
-    times needs more than the step, and the need admits it. With an average the objective keeps (`EMASpec`),
-    the evaluation scores by it: kept on the device, it is the state's; kept in host memory
+    adds nothing to the need (its weights counted twice, 27 MB more, FS-8710-N-c1ff975583c-4x1024); one of 64
+    times needs more than the step, an average kept on the device among its state, and the need admits it.
+    With an average the objective keeps (`EMASpec`), the evaluation scores by it: kept on the device, it is
+    the state's; kept in host memory
     (`Layout(host=("ema",))`), the evaluation fetches it beside the live variables, new bytes the need admits
     in full (its review: a fetched average read as the state's)."""
     from model_support import TINY_DECODER
@@ -360,7 +361,7 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
     four = built(4)[1].built.memory
     # A host-kept average is fetched beside the state, which may raise the need past the step's.
     assert four == plain.built.memory if average != "host" else four >= plain.built.memory
-    _, evaluating = built(32)
+    _, evaluating = built(64)
     weights = sum(leaf.size * leaf.dtype.itemsize
                   for leaf in jax.tree.leaves(jax.eval_shape(trainer.objective.init, jax.random.key(0))))
     evaluations = [evaluating.starts[digest].memory for digest in set(evaluating.starts) - set(plain.starts)]
