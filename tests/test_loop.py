@@ -789,9 +789,10 @@ each pass exits through, the cut a count's last passes leave."""
 
 
 def _scored(model):
-    """`model`'s train-mode logits, the loss of its exits (each exit's mean square, a skipped pass's left out,
-    `ExitPasses.ran`) and the gradient of that and of the logits along `cotangent`: with `count`, the count
-    of passes given per call, a traced argument."""
+    """`model`'s train-mode logits, its exits' states over `COUNTED_CAP` less one passes (a skipped pass's,
+    and those past a smaller loop's, zero: `ExitPasses.ran`), and the gradient of the logits along
+    `cotangent` and of the exits' mean squares: with `count`, the count of passes given per call, a traced
+    argument."""
     def run(tree, ids, cotangent, *count):
         given = {"loop_passes": count[0]} if count else {}
 
@@ -801,14 +802,14 @@ def _scored(model):
             exits = sown.get("exits", {})
             states = tuple(exits.get("states", ()))
             ran = tuple(exits.get("ran", ())) or (True,) * len(states)
-            # In the exits' own width, at least float32's: a float64 truth's in float64.
-            wide = jnp.promote_types(states[0].dtype if states else logits.dtype, jnp.float32)
-            exit_loss = sum((jnp.where(each, jnp.mean(jnp.square(state.astype(wide))), 0)
-                             for each, state in zip(ran, states, strict=True)), jnp.zeros((), wide))
-            return jnp.sum(logits * cotangent.astype(logits.dtype)) + exit_loss, (logits, exit_loss)
+            kept = [jnp.where(each, state, 0) for each, state in zip(ran, states, strict=True)]
+            # The exits a smaller loop leaves, past its own, zero as a skipped pass's are.
+            kept += [jnp.zeros_like(kept[0])] * (COUNTED_CAP - 1 - len(kept)) if kept else []
+            exit_loss = sum((jnp.mean(jnp.square(state)) for state in kept), jnp.zeros((), logits.dtype))
+            return jnp.sum(logits * cotangent.astype(logits.dtype)) + exit_loss, (logits, tuple(kept))
 
-        (_, (logits, exit_loss)), gradients = jax.value_and_grad(loss, has_aux=True)(tree["params"])
-        return {"logits": logits, "exit loss": exit_loss, "gradients": gradients}
+        (_, (logits, exits)), gradients = jax.value_and_grad(loss, has_aux=True)(tree["params"])
+        return {"logits": logits, "exits": exits, "gradients": gradients}
     return run
 
 
@@ -825,10 +826,11 @@ def _capped(name: str):
 def test_a_count_of_passes_given_per_call_runs_as_a_loop_of_that_many(name, count):
     """A loop of `COUNTED_CAP` passes given a count per call (`loop_passes`) runs one compiled program for
     every count (the count its argument, `_capped`) and computes what a loop of that many passes does: its
-    logits, the loss of the exits it sows (`exits`, a skipped pass's left out by `ran`) and every gradient
-    of both, on par from the loop of that many in float64 (check 1), its passes past the count skipped and
-    those before its cut passing no gradient back through their blocks, their exits still training the
-    coda, the norm and the gate; and it sows whether each later pass ran (`ran`)."""
+    logits, the states of the exits it sows (`exits`, a skipped pass's zero by `ran`) and every gradient of
+    the logits and the exits' mean squares, on par from the loop of that many in float64 (check 1), its
+    passes past the count skipped and those before its cut passing no gradient back through their blocks,
+    their exits still training the coda, the norm and the gate; and it sows whether each later pass ran
+    (`ran`)."""
     capped, program = _capped(name)
     loop = capped.loop
     fixed = capped.clone(loop=dataclasses.replace(loop, steps=count, backprop_steps=(
@@ -873,16 +875,20 @@ def test_a_count_of_passes_given_per_call_sows_whether_each_router_ran(rng):
 
 
 def test_a_loop_whose_every_pass_exits_runs_under_a_capture_of_every_method():
-    """A loop of three passes whose every pass exits runs its later passes under one scan, and a capture
-    that keeps every method's output (`capture_intermediates=lambda module, method: True`) captures each of
-    them: a layer's helper that hands it its submodules (`DecoderBlock._joined`) is no module method a
-    capture reads, so no module object enters the scan's outputs."""
+    """A loop of three passes whose every pass exits, under a capture that keeps every method's output
+    (`capture_intermediates=lambda module, method: True`), whose helpers return no array (a layer's resolved
+    kind, the submodules a block's helper hands it): its later passes run one by one, keeping each capture
+    as Flax keeps it, no scan stacking a non-array; a count of passes given per call, which runs every pass
+    under one scan, refuses such a capture."""
     looped = tiny(num_layers=4, loop=Loop(3, layers=(1, 3), exit_gate=True), dtype="float32")
     ids = jnp.zeros((2, 8), jnp.int32)
     variables = looped.init(jax.random.key(0), ids)
     _, captured = looped.apply(variables, ids, train=True, capture_intermediates=lambda module, method: True,
                                mutable=["intermediates"])
     assert "looped" in captured["intermediates"], sorted(captured["intermediates"])
+    with pytest.raises(ValueError):
+        looped.apply(variables, ids, train=True, capture_intermediates=lambda module, method: True,
+                     mutable=["intermediates"], loop_passes=jnp.int32(2))
 
 
 def test_a_loop_whose_every_pass_exits_lowers_its_block_once_whatever_its_count():
