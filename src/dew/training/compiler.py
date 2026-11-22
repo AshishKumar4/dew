@@ -19,7 +19,7 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
-from dew._coordination import agreed_count, from_every_process
+from dew._coordination import agreed, agreed_count, from_every_process
 from dew._records import JSON, boolean, integer, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, Batch, Variables, at_path, placed_at
 from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
@@ -1068,15 +1068,16 @@ class StepCompiler[L, E]:
         there. Refused only where the search measured every candidate a search on the placed devices could
         reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, its rungs'
         variants chosen from no miss (`PlanRefused.variants`), its search begun at the base rung (no record
-        or checkpoint naming one, which a placed search of other shardings may not read; `_recorded_start`),
-        what the start frees known (none where an aliased held array leaves it unknown, `Start.freed`), every
-        miss measured and each beyond that room
-        on some process (a candidate's room is its tightest device's; row 11712: a 4B step on two H100s at its
-        one split, short by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state
-        was placed, 1.5 h). Else the placed devices are searched again (`compile`). Every process decides
-        together; admission is the pool's, so where one process holds no refusal none does."""
+        or checkpoint naming one, which a placed search of other shardings may not read,
+        `PlanRefused.recorded_start`), what the start frees known (none where an aliased held array leaves it
+        unknown, `Start.freed`), every miss measured and each beyond that room on some process (a
+        candidate's room is its tightest device's; row 11712: a 4B step on two H100s at its one split, short
+        by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state was placed,
+        1.5 h). Else the placed devices are searched again (`compile`). Every process decides together, each
+        reading its own devices within one agreement (`agreed`)."""
         kept, self._refused = self._refused, None
-        if kept is None or kept[0] != signature or kept[1].recorded_start:
+        # The search's outcome is every process's (`FitSearch.gather`), and so is the batch it was over.
+        if kept is None or kept[0] != signature:
             return
         refusal = kept[1]
         probes = refusal.probes
@@ -1085,34 +1086,43 @@ class StepCompiler[L, E]:
             return {json.dumps(probe.rung, sort_keys=True) for probe in probes
                     if split is None or probe.split == split}
 
-        whole = (bool(probes) and bool(refusal.candidates) and not refusal.variants
-                 and all(probe.fits or isinstance(probe.headroom, int) for probe in probes)
-                 and all(rungs(split) == rungs() for split in refusal.candidates))
-        room = freed()
-        whole = whole and room is not None
-        devices = local_devices(mesh)
-        # The start's own compile, begun beside the search (`begun`), ended: its scratch held in the
-        # allocators no more, which a reading during it counts (row 11712's review).
-        if begun is not None:
-            futures.wait([begun.attempt])
+        def report() -> tuple[bool, list[bool], int | None]:
+            """This process's answer: whether its search measured every candidate a placed search could
+            reach, whether each candidate misses by more than placing frees here, and what it frees; read
+            within one agreement, so a process whose read fails ends every process's with its error."""
+            whole = (bool(probes) and bool(refusal.candidates) and not refusal.variants
+                     and not refusal.recorded_start
+                     and all(probe.fits or isinstance(probe.headroom, int) for probe in probes)
+                     and all(rungs(split) == rungs() for split in refusal.candidates))
+            room = freed() if whole else None
+            if room is None:
+                # Searched again on the placed devices: the start's compile keeps its overlap.
+                return False, [False] * len(probes), None
+            # The start's own compile, begun beside the search (`begun`), ended: its scratch held in the
+            # allocators no more, which a reading during it counts (row 11712's review).
+            if begun is not None:
+                futures.wait([begun.attempt])
+            devices = local_devices(mesh)
 
-        def beyond(probe: Probe) -> bool:
-            # Its miss read again at each allocator's ceiling, no GPU's free bytes capping a growing pool,
-            # which another process may give back by the time the state is placed (`ceiling_headroom`), by
-            # the terms its executable was admitted by (row 11712's review: a miss read under that cap, the
-            # cap gone by this reading).
-            if room is None or probe.fits or probe.admitted is None:
-                return False
-            margin = ceiling_headroom(devices, *probe.admitted)
-            return margin is not None and -margin > room
+            def beyond(probe: Probe) -> bool:
+                # Its miss read again at each allocator's ceiling, no GPU's free bytes capping a growing
+                # pool, which another process may give back by the time the state is placed
+                # (`ceiling_headroom`), by the terms its executable was admitted by (row 11712's review).
+                if probe.fits or probe.admitted is None:
+                    return False
+                margin = ceiling_headroom(devices, *probe.admitted)
+                return margin is not None and -margin > room
 
-        every = from_every_process([whole, [beyond(probe) for probe in probes]])
+            return True, [beyond(probe) for probe in probes], room
+
+        whole, beyond, room = agreed("a step's refusal before its state is placed", report)
+        every = from_every_process([whole, beyond])
         if len({len(each[1]) for each in every}) != 1:
             return
         blocked = [any(column) for column in zip(*(each[1] for each in every), strict=True)]
         if all(each[0] for each in every) and all(blocked):
             _log.warning("the step fits no plan before its state is placed, each candidate short by more "
-                         "than placing it frees (%d bytes): refused without searching again", room)
+                         "than placing it frees (%s bytes): refused without searching again", room)
             raise refusal
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,

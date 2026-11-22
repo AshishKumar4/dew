@@ -62,7 +62,6 @@ from dew.training.memory import (
     LIMIT_EXIT,
     LiveSet,
     MemoryMiss,
-    admission,
     compile_limit,
     compiled_if_it_fits,
     local_devices,
@@ -75,6 +74,7 @@ from dew.training.memory import (
     remat_stated,
     rung_record,
     step_fits,
+    step_fits_admitted,
     temporaries_factor,
 )
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
@@ -948,10 +948,8 @@ class FitSearch[LossT, EffectsT]:
         """`step_fits` of `executable`, `candidate`'s compiled step or its sampled twin, with the state's
         `unplaced` bytes beside it where the devices hold none of it yet, and the terms it admitted by
         (`admission`), None where its executable states no memory."""
-        held, built = self.held(candidate), candidate.built + (self.unplaced or 0)
-        stats = None if executable is None else compiled_memory(executable)
-        fit, headroom = step_fits(executable, self.mesh, held, built, placed=self.unplaced is None)
-        return fit, headroom, None if stats is None else admission(stats, held, built)
+        return step_fits_admitted(executable, self.mesh, self.held(candidate),
+                                  candidate.built + (self.unplaced or 0), placed=self.unplaced is None)
 
     def held(self, candidate: Candidate) -> int:
         """The bytes the fit check holds beside `candidate`'s step: its own (`Candidate.held`), and the
@@ -1057,6 +1055,7 @@ class FitSearch[LossT, EffectsT]:
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
             fit, headroom, admitted = self.fitting(executable, candidate)
+            judged = executable
             # Its lowering's own key, derived again only where a spill relowered it.
             key = looked if relowered is None or relowered.last is None else self.compiled_key(
                 candidate.lowered, options)
@@ -1094,10 +1093,12 @@ class FitSearch[LossT, EffectsT]:
                                     else SampledStep(lowered[-1], compiled))
                 # Admitted by the plan whichever compiled it, ahead or here (training.md: the sampled step is
                 # admitted by the same memory plan).
-                fit, headroom, admitted = self.fitting(
-                    None if self.sampled is None else self.sampled.executable, candidate)
+                judged = None if self.sampled is None else self.sampled.executable
+                fit, headroom, admitted = self.fitting(judged, candidate)
         seconds = time.perf_counter() - began
-        probe = Probe.read(split, candidate, self.current(), fit, headroom, executable, self.held(candidate))
+        # Its memory the executable's whose fit it states, the sampled step's where it stood for the step:
+        # one measurement its refusal, its diagnostics and its splits' forecast all read.
+        probe = Probe.read(split, candidate, self.current(), fit, headroom, judged, self.held(candidate))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, spent=spent,
                                     admitted=admitted)
         return options, candidate, executable, probe
