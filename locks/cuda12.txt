@@ -1,5 +1,5 @@
 --index-url https://pypi.org/simple
---extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post118/c18887fffd29f454/simple/
+--extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post120/598d634c2652218b/simple/
 --extra-index-url https://pypi.dewml.dev/simple
 
 absl-py==2.5.1 \
@@ -2688,8 +2688,8 @@ jaraco-functools==4.6.0 \
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post118 \
-    --hash=sha256:32a5af925048862d09dfc29565ae3d3399eb5ff1de26122e76b382faaa3e2fa2
+jax==0.12.0.1.post120 \
+    --hash=sha256:bfeb74f3ffeb89881e7a18fa699b187c55b3916a50bbaf86c698f51823f556e2
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -2700,19 +2700,19 @@ jax==0.12.0.1.post118 \
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jax-cuda12-pjrt==0.12.0.1.post118 \
-    --hash=sha256:255916a7653daaa4ae2afae985a0384c1d5895a830ed37cfe641ecb92e9c7ab5 \
-    --hash=sha256:cab3bf179d8dca04e53e353ef98a644b3fccbe95c28d3221db5fc17bb549583b
+jax-cuda12-pjrt==0.12.0.1.post120 \
+    --hash=sha256:7cee32359e4d85acf839056ee10fc13adec229046899b8960145eabda02a5376 \
+    --hash=sha256:a01cb72ddf89c7198235b486f597d7cd6d2e8ef079893ecc7a928ba18eb823e2
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda12-plugin
-jax-cuda12-plugin==0.12.0.1.post118 \
-    --hash=sha256:0ed653fb089ed65655e4203f5d8aab6cffca3c8fe8b741086a0250b70a5d00cd \
-    --hash=sha256:20458690dd0b0e1eeaf163876da8c6f8e8f40dc86ef5feea756ec32a92c074da \
-    --hash=sha256:6752a9d82d95a91dd25c5c02a1ddb7c1beaf672680c3a9f1e331d6dcaceee2a4 \
-    --hash=sha256:8b7abd0d3f062832e4f69424164c39c2df6df6cd38156657949a8da0ac6004ee \
-    --hash=sha256:d1ada215a51a627eaa8c6a3fd579143bdb1d2d220a70afc69f33c0c60bbe1065 \
-    --hash=sha256:d644750bb25c9134f265eb5359452e0886d84f02f3258f444f168eeb61012b9d
+jax-cuda12-plugin==0.12.0.1.post120 \
+    --hash=sha256:070dc58e498b96a6b7beb5153a2f33f69102654f70c5913ea498514e8bceef20 \
+    --hash=sha256:0a7960b2c61c2ebfadecdedf481f53b76fb5a2182dad751cd6b4912820f462ec \
+    --hash=sha256:21da4b874ed6add1c8210b9c12c23d18e94090276d6a06721c3e2bf2a73a40a6 \
+    --hash=sha256:3028f86a6c470ca078a524b07d99916a741127249c99218ae323add22e15102f \
+    --hash=sha256:a179e393c241132669c3b09586aa33458493c4122507431b1aa666f943168aff \
+    --hash=sha256:f95f1848a798f3980d296cb4bd8bcc4253ad3968ba086f36b336f9f21a03429c
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1 ; (platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux' \
     --hash=sha256:00acba6d262f20110289e5d3384cd92298ae362226b66f77f92c518fab55c2c6 \
@@ -2743,13 +2743,13 @@ jaxlib==0.12.0.1 ; (platform_machine != 'aarch64' and platform_machine != 'x86_6
     #   optax
     #   qwix
     #   tokamax
-jaxlib==0.12.0.1.post118 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
-    --hash=sha256:209e69b0f4f5150e1ca8d0b2d4b48a55d11e69653ca7bac189cfb8e0b17f073b \
-    --hash=sha256:4423dd17ffacf6d2a386a759b8a66e15bae6c9597d0740f35cce5e6013055a97 \
-    --hash=sha256:903c4b34dc8d180e650f1b3af1839601731a96faf1c1d19ecfe213994ae6d8fd \
-    --hash=sha256:a2bea97d6d816a9350a6d0275803e2dc89910371258da2b79ea89c9e56b1e944 \
-    --hash=sha256:b2ccc03eec280f8feee8ff06cf513c29a13a0526145154664545a4729c0edb51 \
-    --hash=sha256:d92ae8923fdbaedec6dedfa8bfe6d9455467be492f77d4cd4b7c9cbec5e87c3c
+jaxlib==0.12.0.1.post120 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
+    --hash=sha256:05757c5f11890740e3e6a0f17d83715f35bc15e2a71e8faa7acc73ef35da43d1 \
+    --hash=sha256:50c7c4e516430103ed9d83ed691296c742f60c2bde6a0dd5f84f1db29c843452 \
+    --hash=sha256:a171d7f188aac894944592822667286d12c2f9cc4cda14fa9fc6e69048714691 \
+    --hash=sha256:b56663a4a742a109d0a569c9b1156799680fedb862276f3ae08a8cffa1f39cc9 \
+    --hash=sha256:bc6eb67fedbfa6779882eda359dca2fb1312eec7d82191774a738724320431d2 \
+    --hash=sha256:d43d81296a02f5307d4d88a6dd08dff395391f7d86c91ec7f21985c3dbf727e0
     # via
     #   dewml (pyproject.toml)
     #   jax
@@ -5678,6 +5678,30 @@ pyqwest==0.10.0 \
     # via
     #   connectrpc
     #   e2b
+pystack==1.7.2 ; sys_platform == 'linux' \
+    --hash=sha256:1d9bea3833fe74acece47a904bf1728a01daafae44cb1432e4c94c5312d6869b \
+    --hash=sha256:2871cc243ca3107acd3a095f9793968c51d114ce08ed53d65ffadc999c7a75f0 \
+    --hash=sha256:3aaab546af6def48fb05766d3246263bda3b0932038f510b6c7d23b8c04283db \
+    --hash=sha256:3bb4953a52d7a8bc4c6070a2e5d5935e0755dc90d2a65fdd46ce38864f8aae5f \
+    --hash=sha256:47ef39b1e485dd8bc12b3374dae3015d8a75ab2cfe8e5043d5add03e1686c5d7 \
+    --hash=sha256:4a9dee4b0d85fce2908dd3c38e7f087f3cb9c2547f291a49fedeaa593f6a0eff \
+    --hash=sha256:4d56a628d4563d143548cba77d883f251a413bfd8c98009803b8fadbf61a159b \
+    --hash=sha256:4e0dfc922ed04302f2efa3e4c42c394bc275506a19449c92edd2c92168544e0b \
+    --hash=sha256:51dd476184573252bbf9117d953799772495f1cb7b334027623b959af8980eda \
+    --hash=sha256:54048a6380fe7c71fa5935da53779234c1aa69e0172a7c11c6ced51f550eaae8 \
+    --hash=sha256:5792860ae9f399d142bd52d27496e8f74918c94a4729753b4062f1739db5b077 \
+    --hash=sha256:70cedce62d175bdc50cd6fec12da960f8a64e62f2fd1ed6b6c9455e3669a77be \
+    --hash=sha256:7be8bf148310d23a207f6b2258ed5d2bfe42ef61d5296e9a27cff872b0c6b06f \
+    --hash=sha256:7e19baa3cc8c3f8a6bfaf1ab50796c69093dcb8ec0b1ff06b53c91a72ebe518f \
+    --hash=sha256:97d77c20868c81169da8115a60696aa8d04aab4b0f0446fe1cddda68c2c75bc6 \
+    --hash=sha256:9bfbb44ef1adc1088f7ca4918f3e74a732e964294790dfc9a0bae400dd4f7c46 \
+    --hash=sha256:a33aff7ba0c577f421b42ee5d7a84bdaa06b653e57a00e4911d969c345351994 \
+    --hash=sha256:a93969542cc17a19ae98f964e97bc49f81477e48a6a812c8c11d4d62351d9fd2 \
+    --hash=sha256:ab389cf1955a5e3aeae4728c826a41286627427ad0030b0578f1a51dba9b4423 \
+    --hash=sha256:b9b7af01b09d683f15c77096499a6553871c421752d4bd1bce400396dfe04725 \
+    --hash=sha256:bd087ceafce24beee3c57ab174dc8eb66f8f1b4953ee1b57f3479b3c615e8676 \
+    --hash=sha256:e79198c62ae5e5a99016e264e8fd890026181a09cfa792a834957b2ad499c9e9
+    # via dewml (pyproject.toml)
 pytablewriter==1.2.1 \
     --hash=sha256:7bd0f4f397e070e3b8a34edcf1b9257ccbb18305493d8350a5dbc9957fced959 \
     --hash=sha256:e906ff7ff5151d70a5f66e0f7b75642a7f2dce8d893c265b79cc9cf6bc04ddb4
