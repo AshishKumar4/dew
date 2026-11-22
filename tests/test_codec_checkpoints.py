@@ -159,6 +159,11 @@ def _w4a16_qwen3(directory: Path, attention: bool = False, untied: float | None 
     for stem, (outputs, inputs) in stems.items():
         tensors[stem] = rng.integers(0, 256, (outputs, inputs // 2)).astype(np.uint8)
         scales = rng.uniform(0.25, 4, (outputs, inputs // 16))
+        if stem == "lm_head.weight":
+            # Its first value 1.5 (E2M1's code 3) under a block scale of 0.25: a product of more bits than a
+            # subnormal holds under a tensor scale near the least normal (row 11740's review).
+            tensors[stem][0, 0] = (tensors[stem][0, 0] & 0xF0) | 3
+            scales[0, 0] = 0.25
         tensors[stem + "_scale"] = scales.astype(ml_dtypes.float8_e4m3fn)
         overall = untied if stem == "lm_head.weight" else rng.uniform(0.002, 0.02)
         tensors[stem + "_scale_2"] = np.asarray(overall, np.float32)
@@ -255,24 +260,31 @@ def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refu
             packed.adapt(LoRA(rank=2, modules=(module,)), key=0)
 
 
-def test_a_packed_output_heads_vocabulary_rows_are_its_decoded_values(tmp_path):
+@pytest.mark.parametrize("overall", [2.0 ** -124, 2.0 ** -126 * (1 + 7 * 2.0 ** -23)],
+                         ids=["a power of two", "near the least normal"])
+def test_a_packed_output_heads_vocabulary_rows_are_its_decoded_values(tmp_path, overall):
     """A ModelOpt source whose untied output head is stored W4A16, served packed (`packed_weights`): the
     rows a reader of the vocabulary takes from its head (`vocabulary_rows`, a joint schema head's draw and
     readout among them) are the head's values its stored codes, block scales and tensor scale state, each
     product rounded once, as the same model over its banks decoded gives them, no dense head held beside the
-    packed one (row 11740); under a tensor scale of 2^-124 many of them float32 subnormals, which XLA's CPU
-    multiply would flush (row 11740's review)."""
+    packed one (row 11740). Under its tensor scale (`overall`) many are float32 subnormals, which XLA's CPU
+    multiply would flush, and near the least normal one a product rounded twice would miss (1.5 times 0.25
+    times it: `0x00300003`, twice rounded `0x00300002`, row 11740's review)."""
     from dew.quantization import QUANTIZATION, decoded_banks
 
-    source = _w4a16_qwen3(tmp_path / "source", untied=2.0 ** -124)
+    source = _w4a16_qwen3(tmp_path / "source", untied=overall)
     loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", packed_weights=True)
     assert "lm_head" in loaded.variables[QUANTIZATION] and "lm_head" not in loaded.variables["params"]
     stored = {name: np.asarray(value) for name, value in read_weights(source).items()}
     codes = stored["lm_head.weight"]
     values = E2M1_VALUES[np.stack([codes & 15, codes >> 4], axis=-1).reshape(codes.shape[0], -1)]
     scales = np.repeat(stored["lm_head.weight_scale"].astype(np.float32), 16, axis=-1)
+    # Each code times its block's scale is exact in float32, and numpy's multiply by the tensor scale rounds
+    # it once, a subnormal kept.
     expected = values * scales * stored["lm_head.weight_scale_2"]
     assert np.any((expected != 0) & (np.abs(expected) < np.finfo(np.float32).tiny))
+    if overall != 2.0 ** -124:
+        assert expected.view(np.uint32)[0, 0] == 0x00300003
     rows = type(loaded.model).vocabulary_rows
     for variables in (loaded.variables, decoded_banks(loaded.variables)):
         np.testing.assert_array_equal(np.asarray(loaded.model.apply(variables, method=rows)).view(np.uint32),

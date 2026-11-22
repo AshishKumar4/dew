@@ -289,14 +289,14 @@ def next_token_losses(model, ids):
     return torch.nn.functional.cross_entropy(logits[:, :-1].transpose(1, 2), ids[:, 1:], reduction="none")
 
 
-def dew_next_token_loss(loaded, params, ids):
-    """A loaded Dew model's (`Pretrained.load`) mean cross entropy at each next token of `ids` under `params`,
-    with its logits: the loss whose gradient a decoder's parity holds against transformers'."""
+def dew_next_token_loss(model, variables, params, ids):
+    """A Dew `model`'s mean cross entropy at each next token of `ids` under `params` in place of `variables`'
+    own, with its logits: the loss whose gradient a decoder's parity holds against transformers'."""
     import jax.numpy as jnp
 
     from dew.nn.categorical import token_log_probs
 
-    logits = loaded.model.apply({**loaded.variables, "params": params}, ids)
+    logits = model.apply({**variables, "params": params}, ids)
     return -jnp.mean(token_log_probs(logits[:, :-1], ids[:, 1:])), logits
 
 

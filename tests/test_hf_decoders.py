@@ -113,6 +113,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tier_wire
 from arm_arithmetic import ahead_on_the_host
 from flax import linen as nn
 from interop_support import (
@@ -312,25 +313,34 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     named = dict(reference.named_parameters())
     layouts = {layout.name: layout for layout in loaded.weight_layouts if layout.name in named}
 
-    def loss(params, ids):
-        return dew_next_token_loss(loaded, params, ids)
-
     # One program of the logits and the gradients, compiled under the policy as a run under it compiles,
     # through the arms' own path (`ahead_arm`): a GPU tier part's prepare holds it, its run launches it
-    # (row 11744: compiled here ahead, its executable was no arm's, so the prepare kept none).
-    def step(ids):
-        return jax.value_and_grad(loss, has_aux=True)(loaded.variables["params"], ids)
+    # (row 11744: compiled here ahead, its executable was no arm's, so the prepare kept none). It reads the
+    # model alone, its variables an input, so one statement names it in the prepare and the run (`arm_role`:
+    # the load, whose source is a path, and its weights, placed on one device or another, are none).
+    model = loaded.model
+    variables = jax.tree.map(np.asarray, loaded.variables)
 
-    stepped = ahead_arm(jax.jit(step), f"float32 {fixture} logits and gradients, its step")
-    with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
-        # Its program held at a draw's shape where a GPU tier part prepares (`ahead_arm`), whose prepare runs
-        # no arm of the site below (a host arm's, `as_given`'s): its run launches it there.
-        stepped(np.asarray(ids, np.int32))
+    def step(variables, ids):
+        return jax.value_and_grad(dew_next_token_loss, argnums=2, has_aux=True)(model, variables,
+                                                                               variables["params"], ids)
+
+    label = f"float32 {fixture} logits and gradients, its step"
+    stepped = ahead_arm(jax.jit(step), label)
+    if tier_wire.preparing():
+        from arm_store import armed
+        from store_wire import COMPILED
+
+        # A GPU tier part's prepare runs no arm of the site below (a host arm's, `as_given`'s): its program is
+        # held at a draw's shape here, which the store holds, and its run launches it.
+        with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
+            stepped(variables, np.asarray(ids, np.int32))
+        assert COMPILED.get().holds(armed(label))
 
     @as_given
     def ours(ids):
         with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
-            (_, logits), grads = stepped(np.asarray(ids, np.int32))
+            (_, logits), grads = stepped(variables, np.asarray(ids, np.int32))
         return {"logits": np.asarray(logits, np.float64),
                 **{name: np.asarray(layout.export({"params": grads}), np.float64).reshape(named[name].shape)
                    for name, layout in layouts.items()}}

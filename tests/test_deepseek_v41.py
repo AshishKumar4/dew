@@ -271,19 +271,20 @@ def test_a_sequence_shorter_than_its_candidate_sources_rate_computes_and_trains(
 
 @pytest.fixture(scope="module")
 def padded_walk(source):
-    """The reference's prompt beside its second row cut by three tokens and padded on the left by them, and
-    their greedy walk as long as the reference's: `(inputs, steps, walk)`, decoded once for the cells that
-    read it (`shared_setup`: the speculative walk compared against it decoded it again, 183 s in train
-    1174's CI, row 11721)."""
+    """The reference's prompt beside its second row cut by three tokens and padded on the left by them, as
+    arrays: `(tokens, valid, alone, steps, walk)`, `alone` the cut row unpadded, `walk` the batch's greedy
+    tokens as long as the reference's, decoded once for the cells that read it (`shared_setup`: the
+    speculative walk compared against it decoded it again, 183 s in train 1174's CI, row 11721)."""
     loaded, plain, reference = source
-    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    ids, prompt = np.asarray(reference["input_ids"]), int(reference["decode_prompt"])
     steps, pad = reference["generated"].shape[1], 3
-    tokens = jnp.stack([ids[0, :prompt], jnp.pad(ids[1, :prompt - pad], (pad, 0))])
-    valid = jnp.arange(prompt)[None] >= jnp.asarray([[0], [pad]])
-    inputs = ModelInputs(tokens, {"attention_mask": valid})
+    alone = ids[1:, :prompt - pad]
+    tokens = np.stack([ids[0, :prompt], np.pad(alone[0], (pad, 0))])
+    valid = np.arange(prompt)[None] >= np.asarray([[0], [pad]])
+    inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
     walk = generate(plain, loaded.variables, inputs, steps, key=jax.random.key(1),
                     sampling=Sampling(temperature=0))
-    return inputs, steps, walk
+    return tokens, valid, alone, steps, np.asarray(walk.tokens)
 
 
 @pytest.mark.shared_setup("padded_walk")
@@ -294,13 +295,11 @@ def test_left_padding_changes_no_row(source, padded_walk):
     positions. The full row still decodes the reference's greedy ids, and
     the padded one what it decodes alone."""
     loaded, plain, reference = source
-    _, steps, walk = padded_walk
-    ids, prompt, pad = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"]), 3
-    batched = np.asarray(walk.tokens)[:, -steps:]
-    alone = generate(plain, loaded.variables, ModelInputs(ids[1:, :prompt - pad]), steps,
-                     key=jax.random.key(1), sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(batched[0], reference["generated"][0])
-    np.testing.assert_array_equal(batched[1], np.asarray(alone.tokens)[0, -steps:])
+    _, _, alone, steps, walk = padded_walk
+    by_itself = generate(plain, loaded.variables, ModelInputs(jnp.asarray(alone)), steps,
+                         key=jax.random.key(1), sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(walk[0, -steps:], reference["generated"][0])
+    np.testing.assert_array_equal(walk[1, -steps:], np.asarray(by_itself.tokens)[0, -steps:])
 
 
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
@@ -396,10 +395,11 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
     own token, so Speculative decoding with DSpark's blocks emits the greedy
     walk (`padded_walk`'s), a left-padded row included."""
     loaded, plain, _ = source
-    inputs, steps, walked = padded_walk
+    tokens, valid, _, steps, walk = padded_walk
+    inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
     speculated = generate(plain, loaded.variables, inputs, steps, key=jax.random.key(1),
                           sampling=Sampling(temperature=0), strategy=Speculative(block=3))
-    np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walked.tokens))
+    np.testing.assert_array_equal(np.asarray(speculated.tokens), walk)
     np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
 
 

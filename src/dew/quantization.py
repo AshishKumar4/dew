@@ -565,21 +565,52 @@ def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> l
 
 def packed_values(matrix: NvFp4) -> jax.Array:
     """A packed matrix's values, float32 (`[..., depth, width]`): each code times its block's scale times the
-    matrix's (`NvFp4.decoded` times its `factor`), a subnormal kept where a backend's float32 multiply
-    flushes it (XLA's CPU, row 4023): the decode's bfloat16 values times the factor's significand (exact
-    where the factor is a power of two, an MXFP4 bank's, row 4516; else rounded once in float32's normal
-    range), then its power of two applied from the bits, a result below the least normal rounded there once
-    (`float_bits.lowered_rounded`, `precision.power2`). The one decode of a packed matrix's values, a
-    Linear's applied kernel's (`LinearProducts.applied_kernel`, row 11740's review) and an export's
-    (`decoded_banks`)."""
-    from dew.nn.float_bits import lowered_rounded
-    from dew.nn.precision import power2
+    matrix's (`NvFp4.decoded` times its `factor`), the exact product rounded once, a subnormal among them
+    (`_product_rounded`). The one decode of a packed matrix's values, a Linear's applied kernel's
+    (`LinearProducts.applied_kernel`, row 11740's review) and an export's (`decoded_banks`)."""
+    return _product_rounded(matrix.decoded(), jnp.asarray(matrix.factor, jnp.float32)[..., None, None])
 
-    significand, exponent = jnp.frexp(jnp.asarray(matrix.factor, jnp.float32))
-    significand, exponent = (2 * significand)[..., None, None], (exponent - 1)[..., None, None]
-    scaled = matrix.decoded().astype(jnp.float32) * significand
-    return jnp.where(exponent < 0, lowered_rounded(scaled, jnp.maximum(-exponent, 0)),
-                     power2(scaled, jnp.maximum(exponent, 0)))
+
+def _product_rounded(values: jax.Array, factor: jax.Array) -> jax.Array:
+    """`values` (bfloat16: a significand of 8 bits) times `factor` (float32), finite, rounded once to nearest
+    even into float32 however far below its least normal, in integer arithmetic on their bits: the exact
+    product's significand (8 bits times 24, under 2^32) rounded at its result's last place. A float32
+    multiply rounds a result below the least normal twice where its operands' significands are wider than
+    the result's (rounded to 24 bits, then to the subnormal's), or flushes it (XLA's CPU, row 4023): 1.5 times
+    0.25 times 2^-126 (1 + 7 2^-23) is 3145730.625 2^-149, `0x00300003` once rounded, `0x00300002` twice
+    (row 11740's review)."""
+    from dew.nn.float_bits import raw_fields, widened_exactly
+
+    values = widened_exactly(values, jnp.float32)
+    factor = jnp.broadcast_to(factor.astype(jnp.float32), values.shape)
+    _, sign_v, biased_v, fraction_v = raw_fields(values)
+    _, sign_f, biased_f, fraction_f = raw_fields(factor)
+    # Each a whole significand times a power of two, a subnormal's at the least normal's exponent: a
+    # bfloat16's eight bits are a float32's top eight.
+    lead = np.uint32(1 << 23)
+    whole_v = jnp.where(biased_v > 0, fraction_v | lead, fraction_v) >> np.uint32(16)
+    whole_f = jnp.where(biased_f > 0, fraction_f | lead, fraction_f)
+    product = whole_v * whole_f
+    exponent = ((jnp.maximum(biased_v.astype(jnp.int32), 1) - 134)
+                + (jnp.maximum(biased_f.astype(jnp.int32), 1) - 150))
+    length = 32 - jax.lax.clz(product).astype(jnp.int32)
+    # The result's last place: 24 bits below its leading one, or the least subnormal's.
+    last = jnp.maximum(exponent + length - 24, -149)
+    drop = last - exponent
+    shift = jnp.clip(drop, 1, 31).astype(jnp.uint32)
+    kept = jnp.where(drop <= 0, product << jnp.clip(-drop, 0, 31).astype(jnp.uint32),
+                     jnp.where(drop <= 31, product >> shift, np.uint32(0)))
+    rest = product & ((np.uint32(1) << shift) - np.uint32(1))
+    half = np.uint32(1) << (shift - np.uint32(1))
+    odd = (kept & np.uint32(1)) == np.uint32(1)
+    up = (((drop >= 1) & (drop <= 31) & ((rest > half) | ((rest == half) & odd)))
+          | ((drop == 32) & (product > np.uint32(1 << 31))))
+    kept = kept + up.astype(jnp.uint32)
+    # `kept` at its last place: a normal's 24 bits (its leading one carried into the exponent where rounding
+    # filled it), a subnormal's fewer at the least normal's exponent, whose biased field the sum's carry sets.
+    magnitude = ((last + 150).astype(jnp.uint32) << np.uint32(23)) + kept - lead
+    bits = (sign_v ^ sign_f) | jnp.where(product == 0, np.uint32(0), magnitude)
+    return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
 def decoded_banks(variables: Variables) -> Variables:
