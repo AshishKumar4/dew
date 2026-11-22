@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from arm_forms import ROUNDED
 from fla_sites import the_template_is_as_exact_as_fla
-from generation_support import COMPILES_ON_CPU, runs
+from generation_support import COMPILES_ON_CPU, INTERPRETS, runs
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import ROUTES, chunk_on, cotangents, formed, on_route, routed, token_by_token
 from test_recurrence_mosaic import (
@@ -326,6 +326,7 @@ def _cancelling_group(seed: int, group: int = 16, length: int = 64, width: int =
     return operands, (jnp.asarray(d_out), jnp.zeros((1, group, width, width), jnp.float32))
 
 
+@INTERPRETS
 def test_a_groups_cancelling_scores_gradient_is_rounded_once_on_the_template_interpreted():
     """The template's gradient of a call without the delta rule (a decay a head) at sixteen value heads a key
     head, fp32 under the accurate forms, interpreted off a GPU: where the group's own scores' gradients
@@ -474,6 +475,7 @@ def test_mosaic_held_prices_backward_launches_when_reverse_is_true():
             template.MOSAIC._forwards(ba, tiles, target), family)
         assert template.MOSAIC.held(ba, tiles, reverse=True) == template.MOSAIC._launches_hold(
             template.MOSAIC.launches(ba, tiles, target, backward=True), family)
+@INTERPRETS
 @pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
 def test_an_fp32_turned_call_on_the_template_trains_as_the_portable_math_interpreted(packed):
     """Mamba-3's turned form (`TURNED`) in fp32 (three bf16 parts under the accurate forms, row 7673) trains

@@ -13,11 +13,12 @@ more (`dew.training.memory.recompute_more`), reading the head the objective repo
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, Literal
 
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.nn.protocols import AffineHead, OutputTable, head_table
 from dew.objectives.base import Effects, Loss, Objective, ProgramModule
 from dew.objectives.lm.chunked import Terms, chunked_tile, head_cross_entropy, reads_states
@@ -79,12 +80,26 @@ class HeadedObjective(Objective[Loss, Effects]):
     def fused_head(self, model, params) -> OutputTable | None:
         """`model`'s head as the one matrix a summed loss takes its gradient through in the forward
         (`chunked.fused_head_loss`), None where it keeps the whole logits, is not fused or is no
-        matrix. What the trace finds of the decoder's head is kept, which `head_program` reads."""
+        matrix (`_read_head`)."""
         if self.head_tile is None or not reads_states(model):
             return None
+        head = self._read_head(model, params)
+        return head if self.head_fused else None
+
+    def output_table(self, variables: Variables) -> OutputTable | None:
+        """Its model's head over `variables` as one matrix (`_read_head`), where its prediction's final
+        states read one (`predicts_by_head`)."""
+        if not (self.predicts_by_head and reads_states(self.model)):
+            return None
+        return self._read_head(self.model, variables)
+
+    def _read_head(self, model: nn.Module, params) -> OutputTable | None:
+        """`model`'s head over `params` as one matrix (`head_table`), None where no matrix alone is: past a
+        nonlinear head transform, beside an adapter's factors, in place of a frozen FP8 kernel. What a trace
+        finds of the head is kept, which `head_program` reads (row 11677: two readers recorded it apart)."""
         head = head_table(model, params)
         self._head_matrices[id(model)] = (model, head is not None)
-        return head if self.head_fused else None
+        return head
 
     def head_program(self, model: nn.Module) -> ProgramModule:
         """`model` as a trained module of the step's program with this objective's head: the tile its
@@ -99,6 +114,14 @@ class HeadedObjective(Objective[Loss, Effects]):
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         return (self.head_program(self.model),)
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        # A module put in the model's place (a remat rung's, `recompute_more`) holds the head it held: what a
+        # trace found of that head is kept for it (`head_program`).
+        before = self.model
+        super().substitute(modules)
+        if (known := self._head_matrices.get(id(before))) is not None and self.model is not before:
+            self._head_matrices[id(self.model)] = (self.model, known[1])
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.

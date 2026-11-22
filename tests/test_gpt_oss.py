@@ -149,7 +149,7 @@ def test_expert_biases_are_added_before_the_products_one_rounding():
 def test_gpt_oss_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
     """GPT-OSS's experts whose fused gate-up and down matrices are packed NVFP4 banks in the module's
     `QUANTIZATION` collection, no parameter beside them (a served 4-bit checkpoint's, row 4516:
-    `quantization.expert_matrix`), their biases parameters: on par with the layer holding the banks' values
+    `dew.nn.dense.packed_matrix`), their biases parameters: on par with the layer holding the banks' values
     as dense parameters in the same compute dtype, bf16 (check 1, truth the values in float64), the
     interleaved gate and up read off the packed bank's product as off the dense one's."""
     from arm_arithmetic import float64_held

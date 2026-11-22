@@ -415,7 +415,7 @@ def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
 
 def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
     """An expert layer whose matrices are packed NVFP4 banks in its `QUANTIZATION` collection, no parameter
-    beside them (a served 4-bit checkpoint's, row 4516: `quantization.expert_matrix`), multiplied as NVFP4
+    beside them (a served 4-bit checkpoint's, row 4516: `dew.nn.dense.packed_matrix`), multiplied as NVFP4
     products (`gemm.nvfp4_product`): on par with the layer holding the banks' values as dense parameters in
     the same compute dtype, bf16 (check 1, truth the values in float64)."""
     from arm_arithmetic import float64_held

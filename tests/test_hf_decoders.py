@@ -113,6 +113,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from flax import linen as nn
 from interop_support import (
     assert_decodes_as_it_scores,
@@ -303,7 +304,9 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
 
     directory = FIXTURES / fixture
     ids = np.load(directory / "input_ids.npy")
-    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
+    with ahead_on_the_host():
+        # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859).
+        loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
     reference = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").eval()
     wide = float64_twin(reference)
     named = dict(reference.named_parameters())
@@ -314,7 +317,7 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
 
     with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
         both = jax.jit(jax.value_and_grad(loss, has_aux=True)).trace(
-            loaded.variables["params"], jnp.asarray(ids)).lower().compile()
+            loaded.variables["params"], jax.ShapeDtypeStruct(ids.shape, ids.dtype)).lower().compile()
 
     # Compiled once under the policy, as a run under it compiles: the gate runs it as given.
     @as_given
@@ -338,8 +341,10 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
         return run
 
     assert_as_exact(ours, transformers(reference, contextlib.nullcontext),
-                    token_draw(0x0A3, reference.config.vocab_size, ids.shape), "float32 logits and gradients",
-                    seeds=ACCURATE_SEEDS, truth_fn=transformers(wide, float64))
+                    token_draw(0x0A3, reference.config.vocab_size, ids.shape),
+                    # Its fixture's: both fixtures' cells share one GPU flow's store of sites.
+                    f"float32 {fixture} logits and gradients", seeds=ACCURATE_SEEDS,
+                    truth_fn=transformers(wide, float64))
 
 
 @pytest.mark.parametrize(("name", "stale"), [

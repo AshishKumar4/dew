@@ -858,12 +858,11 @@ class Issuer[Accumulator](abc.ABC):
         bounds them (`resources.held_area`: a TPU core's VMEM); None where registers do."""
         return None
 
-    def value_scratch(self, blocks: dict, outputs: tuple, *, step: tuple = ()) -> tuple:
+    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
         """The `(shape, dtype)` stand-ins of the values it keeps in scratch memory beside a program's
         allocations (`gemm.mosaic_gpu.Allocations.scope`): none where they live in registers."""
-        del blocks, outputs, step
+        del blocks, outputs
         return ()
-
     issues_in_consumers: bool = True
     """Whether a walk's step runs in the consumer that issues its products, so it can prepare their operands
     first: a prologue's rewrite, a kernel gradient's zeroed neighbouring rows, an exactly summed step's own
@@ -1252,10 +1251,12 @@ class Issuer[Accumulator](abc.ABC):
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                     between: Callable = lambda value: value) -> tuple:
         """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
-        (`WgmmaIssuer`), else in turn (`product`)."""
-        return self.product(lhs1, rhs1, shape), self.product(lhs2, rhs2, shape)
+        (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
+        second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""
+        return between(self.product(lhs1, rhs1, shape)), self.product(lhs2, rhs2, shape)
 
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""

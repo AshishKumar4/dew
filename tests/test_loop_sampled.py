@@ -3,6 +3,7 @@
 
 import dataclasses
 import math
+import threading
 import time
 
 import jax
@@ -162,6 +163,18 @@ def test_a_sampled_pass_count_outside_its_law_is_refused(fields):
         SampledPasses(**fields)
 
 
+
+@pytest.fixture(autouse=True)
+def counts_compiled_off_the_loop():
+    """A test that draws a sampled run's counts as a fit does (`DrawingStep.drawn`) ends once the counts it
+    began compiling off the loop are compiled (`dew.training.ahead.LaterCounts`, whose thread a fit waits
+    for as it ends), so none compiles on into the next test."""
+    yield
+    for thread in threading.enumerate():
+        if thread.name.startswith("dew-later-counts"):
+            thread.join()
+
+
 CAP = 3
 """The cap of the trainer cells' law, the passes their tiny looped decoder holds
 (`test_pass_weights.looped`)."""
@@ -209,7 +222,7 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
     programs: dict = {}
     drawn = []
     for index in range(8):
-        step.drawn(interval, index)
+        step.drawn(interval, index, state)
         (count,) = step.counts
         drawn.append(count)
         placement = jax.tree.map(lambda leaf: leaf.sharding, state)
@@ -251,7 +264,7 @@ def test_a_sampled_run_of_an_implicit_loop_in_bf16_reads_its_caps_narrow_copies_
         interval = Interval(time.time(), None, microbatches=0)
         drawn = []
         for index in range(8):
-            step.drawn(interval, index)
+            step.drawn(interval, index, state)
             drawn.extend(step.counts)
             state, loss, *_ = step(state, batch)
             assert np.isfinite(float(loss)), (index, step.counts)
@@ -275,40 +288,79 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     step's microbatches, at the split its step reads."""
     key = jax.random.key(0)
     flops = dict.fromkeys(range(1, CAP + 1))
-    four, two = (DrawingStep({}, flops, split, TRAINED, words(key)) for split in (4, 2))
+    # Every count's plan in hand, so a draw admits none (`DrawingStep.admit`): the draws alone are read.
+    four, two = (DrawingStep(dict.fromkeys(flops), flops, split, TRAINED, words(key)) for split in (4, 2))
     interval = Interval(time.time(), None, microbatches=0)
     drawn = []
     for index in range(10):
-        four.drawn(interval, index)
+        four.drawn(interval, index, None)
         drawn += four.counts
     control = {DISPATCHED_MICROBATCHES: interval.microbatches}
     resumed = Interval.resumed(dict(control), last_saved=10)
     for index in range(10, 15):
-        two.drawn(resumed, index)
+        two.drawn(resumed, index, None)
         drawn += two.counts
     assert drawn == [TRAINED.count(words(key), position) for position in range(50)]
     lacking = Interval.resumed({}, last_saved=7)
-    two.drawn(lacking, 7)
+    two.drawn(lacking, 7, None)
     assert two.counts == [TRAINED.count(words(key), position) for position in (14, 15)]
     assert lacking.microbatches == 16
+
+
+def test_a_sampled_step_admits_each_count_on_its_loop_as_its_draws_first_ask_it():
+    """A run that draws its pass count per microbatch builds its step with no count below its cap admitted:
+    each call admits on the loop the counts it draws that none admitted yet (`DrawingStep.plans`), while
+    from a fit's first draw every count below the cap compiles off the loop (`LaterCounts`), so a count
+    drawn once its compile there is done is admitted compiling no step program on the loop (rows 7959,
+    8067: every count compiled on the loop before the first step)."""
+    from dew.telemetry.compiles import Compiles
+
+    batch = token_batch()
+    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, accumulation=2)
+    state, _, _ = sampled.place()
+    step = sampled.compile(state, batch)
+    assert isinstance(step, DrawingStep) and set(step.plans) == {CAP}
+    interval = Interval(time.time(), None, microbatches=0)
+    step.drawn(interval, 0, state)
+    state, *_ = step(state, batch)
+    first = set(step.plans)
+    for count in range(1, CAP):
+        step.waited(count)
+    with Compiles("step") as compiles:
+        for index in range(1, 32):
+            if len(step.plans) == CAP:
+                break
+            step.drawn(interval, index, state)
+            state, *_ = step(state, batch)
+    assert first < set(step.plans) == set(range(1, CAP + 1)), (first, set(step.plans))
+    assert compiles.count == 0, compiles.programs
 
 
 def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
     """A sampled run's step as `Trainer.compile` returns it, called by hand with no fit drawing for it (a
     script's loop, `dew inspect`'s sampled window), draws each call's counts itself (row 8268): its first
     call's at its state's step's microbatches, each next call's past the last, the counts the run's key
-    draws there, a call a fit drew for (`drawn`) running the fit's."""
+    draws there, a call a fit drew for (`drawn`) running the fit's; with no fit to wait for them as it ends,
+    it compiles no count off its loop (the review of rows 7959, 8067: by-hand calls left a thread compiling
+    every count past their caller's end)."""
+    from dew.telemetry.compiles import Compiles
+
     batch = token_batch()
     sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, split=2)
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep) and step.split == 2
     drawn = []
-    for _ in range(3):
-        state, *_ = step(state, batch)
-        drawn += step.counts
+    with Compiles("step") as compiles:
+        for _ in range(3):
+            state, *_ = step(state, batch)
+            drawn += step.counts
     assert drawn == [TRAINED.count(words(sampled.key), position) for position in range(6)]
-    step.drawn(Interval(time.time(), None, microbatches=40), int(state.step))
+    # No fit waits for counts compiling off the loop as a caller's calls end: each count drawn below the
+    # cap compiled on the loop as it was first drawn, and no other.
+    assert compiles.count == len({count for count in drawn if count < CAP}), compiles.programs
+    assert not [thread for thread in threading.enumerate() if thread.name.startswith("dew-later-counts")]
+    step.drawn(Interval(time.time(), None, microbatches=40), int(state.step), state)
     step(state, batch)
     assert step.counts == [TRAINED.count(words(sampled.key), position) for position in (40, 41)]
 
@@ -423,7 +475,7 @@ def test_a_fixed_and_a_sampled_run_of_one_config_each_trace_their_own_window(sam
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         if isinstance(step, DrawingStep):
-            step.drawn(Interval(time.time(), None, microbatches=0), 0)
+            step.drawn(Interval(time.time(), None, microbatches=0), 0, state)
         step(state, batch)
 
     runs = [{}, {"sampled_passes": TRAINED}]
@@ -476,7 +528,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep)
     interval = Interval(time.time(), None, microbatches=0)
-    flops = step.drawn(interval, 0)
+    flops = step.drawn(interval, 0, state)
     _, _, metrics, *_ = step(state, batch)
     work = counted[TRAINING_FLOPS]
     expected = sum(jnp.sum(jnp.asarray(work[part::2, count - 1]), dtype=jnp.float32)
@@ -495,10 +547,10 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
 
 def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
     """On devices with room for the one-pass step read whole and for the cap's only in two microbatches, a
-    sampled run plans its cap's step at two (`compile`), and admits every other count's at that plan
-    (`StepCompiler.admitted_at`), the one-pass step's at two microbatches where its own search plans it
-    whole: one window, of the cap's split, over every count's step."""
-    from test_plan import LIMIT, free
+    sampled run plans its cap's step at two (`compile`), and admits every other count's at that plan as
+    its draws first ask it (`StepCompiler.admitted_at`), the one-pass step's at two microbatches where its
+    own search plans it whole: one window, of the cap's split, over every count's step."""
+    from test_plan import LIMIT, free, free_until_placed
 
     from dew.nn.kernels import options
 
@@ -520,7 +572,19 @@ def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep) and step.split == 2
+    # From here the devices hold what the steps place, the window and copies the first builds among them,
+    # which an admission over the state its call steps charges once (review of rows 7959, 8067: over the
+    # state as the step was built, its fit check charged them again beside the devices that held them).
+    free_until_placed(monkeypatch, (max(once, halves) + whole) // 2)
+    # Each count admitted as its calls first draw it (`DrawingStep.admit`), until every count is.
+    interval = Interval(time.time(), None, microbatches=0)
+    for index in range(64):
+        if len(step.plans) == CAP:
+            break
+        step.drawn(interval, index, state)
+        state, *_ = step(state, batch)
     assert {count: plan.split for count, plan in step.plans.items()} == dict.fromkeys(range(1, CAP + 1), 2)
+    free(monkeypatch, (max(once, halves) + whole) // 2)
     alone = phased_trainer(model.with_passes(1), 0, None)
     start, _, _ = alone.place()
     alone.compile(start, batch)
@@ -646,3 +710,4 @@ def test_a_sampled_runs_step_compiled_ahead_holds_every_count(tmp_path):
     assert all(loaded.at_count(count).program == program for count, program in programs.items())
     with pytest.raises(ValueError):
         loaded.at_count(CAP)
+

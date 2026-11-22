@@ -155,9 +155,10 @@ def _own_bands(*refs, products: tuple[str, ...], unit_keys: bool) -> None:
         """An output's row's run of words: the queries', or each key times its write strength."""
         if name == "scores":
             return [memref.load(queries_ref, at(row, column)) for column in columns]
-        strength = memref.load(betas_ref, at(row))
-        return [arith.mulf(memref.load(staged_ref, at(0, arith.addi(row, const(pad)), column)), strength)
-                for column in columns]
+        strength = scan.Emitted(memref.load(betas_ref, at(row)))
+        keys = (scan.Emitted(memref.load(staged_ref, at(0, arith.addi(row, const(pad)), column)))
+                for column in columns)
+        return [algebra.gated(key, strength).value for key in keys]
 
     thread = arith.remui(utils.thread_idx(), const(scan.THREADS))
     quad, quarter = arith.divui(thread, const(QUARTERS)), arith.remui(thread, const(QUARTERS))
@@ -223,9 +224,12 @@ def _own_span(row_words, staged_ref, bands_ref, short, long, p, columns, leader,
                 decayed = [arith.select(first, value, arith.mulf(b, a))
                            for value, b, a in zip(values, before[o * run:(o + 1) * run], factor, strict=True)]
                 after += decayed
-                terms = [arith.mulf(d, k) for d, k in zip(decayed, key, strict=True)]
+                pairs = [None] * run
             else:
-                terms = [arith.mulf(arith.mulf(v, k), d) for v, k, d in zip(values, key, decays, strict=True)]
+                decayed, pairs = values, [scan.Emitted(d) for d in decays]
+            # The algebra's own term (`algebra.band_term`), emitted a word at a time.
+            terms = [algebra.band_term(scan.Emitted(r), scan.Emitted(k), d, unit_keys=unit_keys).value
+                     for r, k, d in zip(decayed, key, pairs, strict=True)]
             total = terms[0]
             for term in terms[1:]:
                 total = arith.addf(total, term)

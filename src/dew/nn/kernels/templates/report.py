@@ -947,27 +947,30 @@ def _lowered_verdict_key(calls) -> str | None:
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 
-def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None
-                 ) -> str | None:
-    """What decides a launch's certification for a compile target (the store's file, `verdict_target`,
-    `tuning.stored_verdict`) before it traces, as its stored verdict's key: the launch's `identity`
-    (`_identity`, the same in every process), its config, whether reverse mode runs it, its code
-    (`dew._code.provenance_code`: an edit of it certifies again), the installed JAX, jaxlib and CUDA
-    plugins, whose Mosaic GPU and XLA lower and compile it (the Pallas lowering cache's seal of them), the
-    ptxas that assembles it (`_assemblers`), and the environment a kernel's lowering and compile read (that
-    cache's policy). None where the installation has no seal (an edited or a source install of JAX), whose
-    code no key states: its verdicts are not stored."""
+def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
+    """What decides a stored launch decision (`_verdict_key`, `attention_mosaic._choice_key`) for a compile
+    target before it traces: its code (`dew._code.provenance_code`: an edit of it invalidates the stored
+    entry), the installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the
+    Pallas lowering cache's seal of them), caller-specific `fields`, and the environment a kernel's lowering
+    and compile read (that cache's policy). None where the installation has no seal (an edited or a source
+    install of JAX), whose code no key states: decisions are not stored."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
-
-    from dew.nn.kernels.tuning import encoded
 
     installed = seal().digest
     if installed is None:
         return None
-    stated = [provenance_code(__name__, provenance), installed.hex(), _assemblers(), identity,
-              encoded(config), reverse, _keyed_environment()]
+    stated = [provenance_code(__name__, provenance), installed.hex(), *fields, _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
+
+def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None
+                 ) -> str | None:
+    """What decides a launch's certification for a compile target (`stored_key`, `verdict_target`,
+    `tuning.stored_verdict`) before it traces, including the ptxas that assembles it (`_assemblers`)."""
+    from dew.nn.kernels.tuning import encoded
+
+    return stored_key(provenance, _assemblers(), identity, encoded(config), reverse)
 
 
 @functools.cache

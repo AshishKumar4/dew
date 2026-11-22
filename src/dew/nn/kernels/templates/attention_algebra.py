@@ -2124,13 +2124,11 @@ def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool, rows: bool = F
 
 
 _BF16_PARTS: dict[tuple[str | None, bool], int] = {}
-
 def bf16_part_count(*, accurate: bool) -> int:
     """bf16 parts for fp32 attention products from `dew.algebra.error.product_precision` (row 5473)."""
     from dew.algebra.error import product_precision
     from dew.nn import programs
     from dew.nn.kernels import generation
-
     target = generation.gpu_target()
     key = (target.generation if target is not None else generation.placed_platform(), accurate)
     if key not in _BF16_PARTS:
@@ -2140,9 +2138,9 @@ def bf16_part_count(*, accurate: bool) -> int:
             and a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
             and not a.imprecise and a.operations >= (6 if accurate else 1))
         arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
-        _BF16_PARTS[key] = max(1, (math.isqrt(1 + 8 * arith.operations) - 1) // 2) if arith else 1
+        assert arith is not None, chosen
+        _BF16_PARTS[key] = (math.isqrt(1 + 8 * arith.operations) - 1) // 2
     return _BF16_PARTS[key]
-
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
                       dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool) -> jax.Array:

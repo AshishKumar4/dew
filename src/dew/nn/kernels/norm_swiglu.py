@@ -100,7 +100,7 @@ from ..sharding import automatic_axes, excess_axes, manual_map, on_shards, summe
 from . import generation, tuning
 from .generation import INHERENT, Choice, device_generation
 from .selection import Kernel, Op, Requirement, select
-from .templates import layout
+from .templates import layout, outputs as kernel_outputs
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
@@ -962,18 +962,34 @@ def _scale_sum(partial, correction):
     return compensated_total(summed_pairs((partial, correction), (0,)), jnp.sum(partial, axis=0))
 
 
-def _varying(operands: tuple, outputs):
+def _varying(operands: tuple) -> tuple:
     """`operands` (None where a call has none) each varying over every manual axis any varies over
-    (`sharding.varying_like`), and `outputs` (`jax.ShapeDtypeStruct`s, None where a call has none) of
-    their varying type: a Pallas call states its outputs' types, which a checked `shard_map` reads."""
+    (`sharding.varying_like`): `launches.pallas_call` then types every declared output from them."""
     present = [operand for operand in operands if operand is not None]
     if not any(jax.typeof(operand).mat.varying for operand in present):
-        return operands, outputs
-    lifted = tuple(None if operand is None else varying_like(operand, *present) for operand in operands)
-    mat = jax.typeof(next(operand for operand in lifted if operand is not None)).mat
-    return lifted, jax.tree.map(
-        lambda shape: jax.ShapeDtypeStruct(shape.shape, shape.dtype, manual_axis_type=mat), outputs)
+        return operands
+    return tuple(None if operand is None else varying_like(operand, *present) for operand in operands)
 
+
+class _Out(NamedTuple):
+    """Static output spec for `_launched` (`lowered_once`-hashable): `dims` are `(operand, axis)` pairs,
+    `(operand, axis, divisor)` triples, or constant `int`s, realized as `kernel_outputs.Output` against
+    the launched operands so `launches.pallas_call` declares `output_dims` (rows 10816, 10817)."""
+    dtype: jnp.dtype
+    dims: tuple[int | tuple[int, int] | tuple[int, int, int], ...]
+
+
+def _realize_output(operands: tuple, spec):
+    if spec is None:
+        return None
+    if isinstance(spec, _Out):
+        dims = tuple(
+            dim if isinstance(dim, int)
+            else kernel_outputs.axis(operands[dim[0]], dim[1]) if len(dim) == 2
+            else kernel_outputs.axis(operands[dim[0]], dim[1]) // dim[2]
+            for dim in spec.dims)
+        return kernel_outputs.output(spec.dtype, *dims)
+    return tuple(_realize_output(operands, part) for part in spec)
 
 def _typed(backward, parameters: int = 0):
     """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type and
@@ -1026,9 +1042,10 @@ def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warp
     warps and arithmetic static. In a `shard_map` checking varying axes, its operands are made varying over
     every axis any of them varies over and its outputs vary over them too, as an elementwise primitive's do
     (row 822)."""
-    operands, outputs = _varying(operands, outputs)
+    operands = _varying(operands)
+    out_shape = _realize_output(operands, outputs)
     return launches.pallas_call(
-        functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=outputs,
+        functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=out_shape,
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=1),
         interpret=interpret, name=name,
     )(*operands)
@@ -1053,12 +1070,12 @@ class RmsForward(tuning.KernelOp):
              epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
              interpret: bool, inverse_rounded: bool, weight_first: bool, config: RowsConfig,
              epilogue=None, return_residuals: bool = False):
-        rows, width = x.shape
+        rows = x.shape[0]
         return _launched(
             x, branch, scale, gate, kernel=_rms_forward, name="rms_norm_forward",
-            outputs=(jax.ShapeDtypeStruct((rows, width), jnp.dtype(dtype)),
-                     None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
-                     jax.ShapeDtypeStruct((rows,), jnp.float32)),
+            outputs=(_Out(jnp.dtype(dtype), ((0, 0), (0, 1))),
+                     None if branch is None else _Out(x.dtype, ((0, 0), (0, 1))),
+                     _Out(jnp.dtype(jnp.float32), ((0, 0),))),
             grid=(pl.cdiv(rows, config.rows),),
             warps=config.warps, interpret=interpret, arithmetic=(
                 ('row_block', config.rows), ('epsilon', epsilon), ('offset', offset),
@@ -1095,13 +1112,13 @@ class RmsBackward(tuning.KernelOp):
              dy: jax.Array, ds: jax.Array | None, *, offset: bool, stored: str, after_cast: bool,
              inverse_rounded: bool, activation: str, interpret: bool, config: ReverseConfig,
              weight_first: bool = False, epilogue=None, return_residuals: bool = False):
-        rows, width = x.shape
+        rows = x.shape[0]
         groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
-        partial = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
+        partial = None if scale is None else _Out(jnp.dtype(jnp.float32), (groups, (0, 1)))
         return _launched(
             x, scale, gate, mean_square, dy, ds, kernel=_rms_backward, name="rms_norm_backward",
-            outputs=(jax.ShapeDtypeStruct((rows, width), x.dtype),
-                     None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
+            outputs=(_Out(x.dtype, ((0, 0), (0, 1))),
+                     None if gate is None else _Out(gate.dtype, ((0, 0), (0, 1))),
                      partial, partial),
             grid=(groups,), warps=config.warps, interpret=interpret, arithmetic=(
                 ('row_block', config.rows), ('offset', offset), ('stored', jnp.dtype(stored)),
@@ -1358,7 +1375,7 @@ class SwigluForward(_Elementwise):
     def _fwd(self, gate: jax.Array, up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         return _launch(_swiglu_forward, "swiglu_forward", (gate, up),
-                       jax.ShapeDtypeStruct(gate.shape, gate.dtype), (pl.cdiv(gate.size, config.block),),
+                       _Out(gate.dtype, ((0, 0),)), (pl.cdiv(gate.size, config.block),),
                        config, interpret)
 
 
@@ -1370,7 +1387,7 @@ class SwigluBackward(_Elementwise):
 
     def _fwd(self, gate: jax.Array, up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
-        outputs = (jax.ShapeDtypeStruct(gate.shape, gate.dtype), jax.ShapeDtypeStruct(up.shape, up.dtype))
+        outputs = (_Out(gate.dtype, ((0, 0),)), _Out(up.dtype, ((1, 0),)))
         return _launch(_swiglu_backward, "swiglu_backward", (gate, up, dy), outputs,
                        (pl.cdiv(gate.size, config.block),), config, interpret)
 
@@ -1394,7 +1411,7 @@ class PackedSwigluForward(_Packed):
              return_residuals: bool = False):
         rows, width = gate_up.shape[0], gate_up.shape[1] // 2
         return _launch(_packed_forward, "swiglu_forward", (gate_up,),
-                       jax.ShapeDtypeStruct((rows, width), gate_up.dtype),
+                       _Out(gate_up.dtype, ((0, 0), (0, 1, 2))),
                        (rows, pl.cdiv(width, config.block)), config, interpret)
 
 
@@ -1407,7 +1424,7 @@ class PackedSwigluBackward(_Packed):
     def _fwd(self, gate_up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         return _launch(_packed_backward, "swiglu_backward", (gate_up, dy),
-                       jax.ShapeDtypeStruct(gate_up.shape, gate_up.dtype),
+                       _Out(gate_up.dtype, ((0, 0), (0, 1))),
                        (gate_up.shape[0], pl.cdiv(dy.shape[1], config.block)), config, interpret)
 
 

@@ -769,10 +769,11 @@ def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike, 
 
 def _widened(operands, counts: int = 0) -> list[jax.Array]:
     """`operands` as the float64 operands of their float32 product: each converted to the dtype they
-    multiply in (`products_dtype`), as the product converts them, then widened exactly."""
+    multiply in (`products_dtype`), as the product converts them, then widened exactly, a subnormal from
+    its bits where XLA:CPU's cast flushes it (`widened_exactly`, rows 8966, 9780)."""
     multiplied = operands[:len(operands) - counts]
     dtype = products_dtype(*multiplied)
-    widened = [operand.astype(dtype).astype(jnp.float64) for operand in multiplied]
+    widened = [widened_exactly(operand.astype(dtype), jnp.float64) for operand in multiplied]
     return widened + list(operands[len(multiplied):])
 
 
@@ -1809,10 +1810,17 @@ def compensated_add(left, right):
 def renormalized_add(left, right):
     """`compensated_add`'s arithmetic over pairs whose his no multiply makes in the same fusion (each read as
     one value, `uncontracted`, or a compensated reduction's or scan's accumulator, made by additions alone):
-    the his' TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own:
-    one in a reduction's computation splits the fusions around the program, row 7953). A lo is read once,
-    so a multiply contracted into its addition reads it once too. The combine of a compensated reduction
-    (`summed_pairs`) and a compensated scan (`dew.algebra.scan.compensated`)."""
+    `renormalized_sum`, as one span the algebra pass keeps (`_protected`). The combine of a compensated
+    reduction (`summed_pairs`) and a compensated scan (`dew.algebra.scan.compensated`)."""
+    return renormalized_sum(left, right)
+
+
+def renormalized_sum(left, right):
+    """Two `(hi, lo)` pairs' renormalized sum, over any values `+` and `-` add and subtract (arrays, or a
+    Mosaic GPU kernel's own arithmetic, `templates.scan.compensated_columns`'): the his' TwoSum, then the
+    pair's own over the dropped part and the los in that order, whose operands are additions' (`_two_sum`, no
+    barrier of its own: one in a reduction's computation splits the fusions around the program, row 7953). A
+    lo is read once, so a multiply contracted into its addition reads it once too."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     total, dropped = _two_sum(left_hi, right_hi)
     return _two_sum(total, dropped + left_lo + right_lo)
