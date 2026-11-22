@@ -645,15 +645,27 @@ _ASIDE: contextvars.ContextVar[Aside | None] = _cache.untraced(
 
 
 @contextlib.contextmanager
-def certifying_aside() -> Iterator[Aside]:
+def certifying_aside() -> Iterator[None]:
     """Within the block, a launch whose derivation has refused none of its configs is certified aside
     (`certified`): lowered as the trace reaches it, Python that holds the GIL, and compiled on
     `compile_threads` threads while the trace runs on, XLA and the GPU's assembler releasing it, its config
-    taken as holding until `settled_aside` reads its compile; the block's end waits for every compile. A
-    launch with a refusal certifies in turn, its ladder read as it climbs (`tuning.KernelOp._certified`). A
-    cold start's 47 launches certified in turn took 48 s, 18 of them compiling (M-MC-21b), and every config
-    the gates derive holds (FS-DECISION: an attention forward's 68 and a backward's 45 on sm90), so a
-    refusal's relowering is rare."""
+    taken as holding until the block's end reads its compile (`_settled_aside`), within a settle that records
+    its misses (`settling`), every compile waited for. A launch with a refusal certifies in turn, its ladder
+    read as it climbs (`tuning.KernelOp._certified`). A cold start's 47 launches certified in turn took 48 s,
+    18 of them compiling (M-MC-21b), and every config the gates derive holds (FS-DECISION: an attention
+    forward's 68 and a backward's 45 on sm90), so a refusal's relowering is rare. The one way a caller
+    certifies aside, its steps in order (row 12015); a lowering that relowers past a refusal settles wider
+    (`lowered_aside`)."""
+    with settling():
+        with _aside_block() as aside:
+            yield
+        _settled_aside(aside)
+
+
+@contextlib.contextmanager
+def _aside_block() -> Iterator[Aside]:
+    """A block certifying aside (`certifying_aside`) whose launches its caller settles (`_settled_aside`):
+    its compiles' pool, each compile waited for as it ends."""
     with ThreadPoolExecutor(compile_threads(), thread_name_prefix="dew-certify") as pool:
         aside = Aside(pool)
         token = _ASIDE.set(aside)
@@ -663,14 +675,13 @@ def certifying_aside() -> Iterator[Aside]:
             _ASIDE.reset(token)
 
 
-def settled_aside(aside: Aside) -> frozenset[tuple]:
+def _settled_aside(aside: Aside) -> frozenset[tuple]:
     """Each launch `aside` certified, kept as `certified` keeps one and dropped from the block's pending: a
     launch whose kernels the assembler refuses refused (`refuse_launch`), so a trace that took its config is
     traced afresh (`settled_trace`) and a program lowered at it lowered afresh (`refused_in`), its misses kept
-    for that retry to record (`settling`). The keys of those refused."""
+    for that retry to record (`settling`, which every caller settles within). The keys of those refused."""
     settlement = _SETTLING.get()
-    if settlement is None:
-        raise ValueError("a block certifying aside is settled within `settling`, which records its misses")
+    assert settlement is not None
     refused = set()
     for key, each in list(aside.pending.items()):
         # A launch a derivation certified (a route's eligibility) and no trace called: no program holds it.
@@ -708,7 +719,7 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
 
 def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
     """`trace()`'s value, within a block certifying aside the launches it reached settled before it lowers
-    (`settled_aside`, within `settling`), and traced afresh (`retrace()`, past any trace cache) while they
+    (`_settled_aside`, within `settling`), and traced afresh (`retrace()`, past any trace cache) while they
     refuse a config it took: it lowers once, at the configs its certification settled (FS-ASIDE-SM100C).
     Each trace runs in the caller's context, which JAX's trace cache keys on, so a program compiled ahead is
     found by its trace (row 11766); an abandoned trace's routes are withdrawn (`generation.withdrawn`), a
@@ -721,7 +732,7 @@ def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
         marks = generation.route_marks()
         value = trace()
         seen: set = set()
-        while (refused := settled_aside(aside)) and not refused <= seen:
+        while (refused := _settled_aside(aside)) and not refused <= seen:
             seen |= refused
             generation.withdrawn(marks)
             value = retrace()
@@ -731,7 +742,7 @@ def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
 def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
                      program: Callable[[T], jax.stages.Lowered | None]) -> T:
     """`lower()`'s value, the launches its trace reaches certified aside (`certifying_aside`, settled before
-    it lowers where it traces through `settled_trace`, else as it ends: `settled_aside`), and `relower()`'s
+    it lowers where it traces through `settled_trace`, else as it ends: `_settled_aside`), and `relower()`'s
     afresh for as long as its program (`program`, None where it holds none) launches a refused config
     (`refused_in`), each refused launch's derivation stepping past its config and certifying the next in
     turn: its own certifications' refusals, or another caller's committed after its trace took the config
@@ -742,22 +753,22 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
     64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324); a program's trace alone certifies aside too
     (`OuterProgram.trace`)."""
     with settling():
-        with certifying_aside() as aside:
+        with _aside_block() as aside:
             value = lower()
-        settled_aside(aside)
+        _settled_aside(aside)
         seen: set = set()
         while ((lowered := program(value)) is not None and (refused := refused_in(lowered))
                and not refused & seen):
             seen |= refused
-            with certifying_aside() as aside:
+            with _aside_block() as aside:
                 value = relower()
-            settled_aside(aside)
+            _settled_aside(aside)
     return value
 
 
 @dataclasses.dataclass
 class _Settlement:
-    """A settle's misses (`settled_aside`) by certification key and queueing scope, held until the launch
+    """A settle's misses (`_settled_aside`) by certification key and queueing scope, held until the launch
     holds at another config in that scope's registry (stepped) or the settle ends, recorded in their own
     scope either way (row 11786)."""
 
@@ -893,7 +904,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         return ()
     if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
-        # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
+        # compiled aside (`capture`), the block's end settling it (`_settled_aside`), once a block.
         aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, [reporting])
         aside.awaiting[(_launched(key[0], config, reverse), reverse)] = key
         return ()

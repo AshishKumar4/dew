@@ -884,18 +884,18 @@ def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
 @lowers("sm90")
 def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_gpu_drains_it():
     """A program whose launch spills at its first tile, lowered for an H100 within a block certifying aside,
-    the block drained with a B200 in effect (`report.settled_aside`): the refusal holds for the H100's
-    launch, so the program lowered again for the H100 takes the next tile and misses nothing (row 12031: the
-    drain refused the launch as the B200's, and the H100's lowering took the spilling tile again)."""
+    the block drained with a B200 in effect (`report.certifying_aside`'s end): the refusal holds for the
+    H100's launch, so the program lowered again for the H100 takes the next tile and misses nothing (row
+    12031: the drain refused the launch as the B200's, and the H100's lowering took the spilling tile
+    again)."""
     from dew.nn.kernels.generation import compile_only_gpus
 
     devices, lowered = _paired_step(Uncounted())
     with (report.refusals(), report.certifying(compile_only_gpus("sm90")[0]),
-          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")), report.settling()):
-        with report.certifying_aside() as aside, generation.assumed("sm90"):
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        # Queued for the H100, drained as the block ends with the B200 in effect.
+        with generation.assumed("sm100"), report.certifying_aside(), generation.assumed("sm90"):
             lowered()
-        with generation.assumed("sm100"):
-            report.settled_aside(aside)
         with generation.assumed("sm90"), report.recording() as again:
             lowered()
     assert not again.missed, again.missed
