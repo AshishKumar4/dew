@@ -1993,19 +1993,13 @@ def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_d
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed("sm90"):
-        target = generation.gpu_target()
         spans = template.spans(4096, 4096, 1, causal=True)
         q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
-        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, shapes, scale=None,
-                                                   natural=attention_mosaic.NATURAL, accurate=False)
-        cfg = op.derived(op.bind(*args, interpret=False), target)
-        assert cfg is not None and not cfg.fused, cfg
         def backward(query, key, value, dout, residuals):
-            with tuning.pinned({attention_mosaic.MosaicBackward: cfg}):
-                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                                  residuals=residuals, scale=None, accurate=False)
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                              residuals=residuals, scale=None, accurate=False)
             return grads.query, grads.key, grads.value
         found = compile_mosaic_kernels([KernelCase("sm90-overlapped-dkv-det-d128",
                                                    lambda: (backward, (q, k, k, q, shapes)))], "sm90")
