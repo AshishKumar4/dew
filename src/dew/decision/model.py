@@ -316,7 +316,8 @@ class DecisionModel(HeadedModel):
                                            progress=progress, opened=[*opened, EXITS])
         backbone = self.backbone
         assert isinstance(backbone, Looped), "a looped backbone's exits"
-        earlier, gates = backbone.exit_passes(sown)
+        exited = backbone.exit_passes(sown)
+        earlier, gates = exited.states, exited.logits
         # Every exit through the head, each sowing what the step opened: a QK-Clip bounds the head by the
         # largest logit any scored exit reads, each exit's call kept after the last's (`sows_appended`);
         # a watched module keeps its latest call's summary, the last pass's, as a module run more than once

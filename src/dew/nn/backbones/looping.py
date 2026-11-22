@@ -37,6 +37,7 @@ from flax import linen as nn
 from flax.core import lift
 from flax.core.scope import DenyList
 from flax.linen.transforms import lift_direct_transform
+from jax.sharding import NamedSharding
 
 from dew.batch import sows_appended
 
@@ -504,8 +505,8 @@ class _Passes:
         (x, bank), (leavings, outputs) = run(model, (x, bank), (
             _theta(model, loop, steps, rows=True), jnp.arange(steps.start, steps.stop, dtype=jnp.int32)))
         if self.exit_outputs:
-            valid = None if passes is None else jnp.arange(steps.start, steps.stop) < passes
-            self.exited.extend(_sown_exits(model, leavings, outputs, valid))
+            ran = None if passes is None else jnp.arange(steps.start, steps.stop) < passes
+            self.exited.extend(_sown_exits(model, leavings, outputs, ran))
         return x, bank
 
     def counted(self, x, bank, passes):
@@ -543,7 +544,12 @@ class _Passes:
                 return _sown_switch((step < passes).astype(jnp.int32), (skip, run), module, carry)
 
             def held_back(module, carry):
-                return jax.lax.stop_gradient(run(module, jax.lax.stop_gradient(carry)))
+                # A pass before the cut passes no gradient back through its block, its state stopped where
+                # it leaves; its exit, read from the state stopped where it enters the coda, still trains
+                # the coda, the norm and the gate, as the static cut's exits do (`fixed`).
+                state, exits = self.stepped(module, carry, theta, exit_stop=True, enter_stop=False,
+                                            block=self.pass_block)
+                return jax.lax.stop_gradient(state), exits
 
             index = jnp.where(step >= passes, 0, jnp.where(step < passes - backprop, 1, 2))
             return _sown_switch(index, (skip, held_back, run), module, carry)
@@ -598,7 +604,12 @@ def _shaped_like(value, shape):
                         for index, each in enumerate(shape)])
     if shape is None:
         return None
-    return jnp.zeros(shape.shape, shape.dtype) if value is None else value
+    if value is not None:
+        return value
+    # Placed as the pass's own entry is: a statistic a batch-split forward sows split (its rows' maxima),
+    # which a replicated zero would differ from in type.
+    placed = shape.sharding if isinstance(shape.sharding, NamedSharding) else None
+    return jnp.zeros(shape.shape, shape.dtype, out_sharding=placed)
 
 
 def _handed_on(model, exited, last, threshold: float) -> jax.Array:
@@ -612,11 +623,11 @@ def _handed_on(model, exited, last, threshold: float) -> jax.Array:
     return last
 
 
-def _sown_exits(model, leavings, outputs, valid) -> list[tuple[jax.Array, jax.Array]]:
+def _sown_exits(model, leavings, outputs, ran) -> list[tuple[jax.Array, jax.Array]]:
     """The scanned passes' exits (`_Passes.scanned`), their exit states `leavings` (None where no threshold
     reads them) and normed outputs `outputs` stacked on a leading pass axis, sown into `exits` in pass order
     as `_sown_exit` sows each: their gate logits (where the loop gates its exits) and the states the head
-    reads; with `valid` (a count given per call), whether each pass ran, sown beside them (`valid`), a
+    reads; with `ran` (a count given per call), whether each pass ran, sown beside them (`ran`), a
     skipped pass's exit computed from a zero state. Their `(state, gate logit)` pairs for a threshold's
     choice (`_exited`)."""
     logits = model.early_exit_gate(outputs) if model.loop.exit_gate else None
@@ -625,8 +636,8 @@ def _sown_exits(model, leavings, outputs, valid) -> list[tuple[jax.Array, jax.Ar
             if logits is not None:
                 model.sow(EXITS, 'logits', logits[index])
             model.sow(EXITS, 'states', model.head_states(outputs[index]))
-            if valid is not None:
-                model.sow(EXITS, 'valid', valid[index])
+            if ran is not None:
+                model.sow(EXITS, 'ran', ran[index])
     return [] if logits is None or leavings is None else list(zip(leavings, logits, strict=True))
 
 

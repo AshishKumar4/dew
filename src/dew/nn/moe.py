@@ -169,6 +169,10 @@ def balancing(routers: Iterable[tuple[str, ...]]) -> None:
 ROUTER_INDICES = 'indices'
 ROUTER_SCORES = 'scores'
 ROUTER_LOG_Z = 'log_z'
+ROUTER_RAN = 'ran'
+"""Whether a router's call ran, a bool scalar sown beside its choice: True for every call made, False for
+one a looped pass given a count per call skipped (`dew.nn.backbones.looping`), whose other sows are
+zeros, so a reader of the routers' statistics leaves it out."""
 EXPERT_BIAS_COLLECTION = 'moe'
 EXPERT_BIAS = 'e_score_correction_bias'
 
@@ -473,6 +477,7 @@ class Router(nn.Module):
         # into the tree init returns, where it is not a variable.
         if not self.is_initializing():
             self.sow(ROUTER_COLLECTION, ROUTER_INDICES, indices)
+            self.sow(ROUTER_COLLECTION, ROUTER_RAN, jnp.ones((), bool))
             # The V2 balance loss reads the scores beside the choices.
             self.sow(ROUTER_COLLECTION, ROUTER_SCORES, scores)
             # The router z-loss squares each position's log partition.

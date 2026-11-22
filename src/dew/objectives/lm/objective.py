@@ -1082,7 +1082,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         its predecessor's state where forks give them (`before`), the last pass's from `last` (its losses
         and whether it was right); every pass's exit-gate logit; and, where the last pass's correctness is
         asked for, each pass's."""
-        states, logits = self._looped().exit_passes(gathered)
+        exited = self._looped().exit_passes(gathered)
+        states, logits = exited.states, exited.logits
         if before is not None:
             states = tuple(_predicted(state, before) for state in states)
         losses, correct = last

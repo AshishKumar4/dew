@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -773,9 +773,17 @@ EXIT_PASSES = "exit_passes"
 state the forward hands on (row 11714). A caller that opens `EXITS` reads every pass's exit instead, the
 threshold's choice made by none, and so finds nothing here."""
 
-ExitPasses = tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]
-"""What a looped decoder's forward gathered of its exits (`Looped.exit_passes`): the states the head reads
-of each pass before the last, and every pass's exit-gate logit (none without a gate)."""
+class ExitPasses(NamedTuple):
+    """What a looped decoder's forward gathered of its exits (`Looped.exit_passes`): the states the head
+    reads of each pass before the last, every pass's exit-gate logit (none without a gate), and whether
+    each exit's pass ran (`ran`, a bool scalar each, beside the states): every one where the forward ran
+    all its loop's passes, False for one a count of passes given per call skipped
+    (`dew.nn.backbones.looping.run_loop`'s `passes`), whose exit is a zero state's, which a reader of the
+    exits leaves out."""
+
+    states: tuple[jax.Array, ...]
+    logits: tuple[jax.Array, ...]
+    ran: tuple[jax.Array, ...]
 
 
 @runtime_checkable

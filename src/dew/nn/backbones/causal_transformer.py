@@ -1437,7 +1437,9 @@ class CausalTransformer(LinearProducts):
     def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses:
         """What a forward with `exits` open gathered (`Looped`): a loop of one pass has no earlier pass."""
         exits = collections[EXITS]
-        return tuple(exits.get('states', ())), tuple(exits.get('logits', ()))
+        states = tuple(exits.get('states', ()))
+        ran = tuple(exits.get('ran', ())) or tuple(jnp.ones((), bool) for _ in states)
+        return ExitPasses(states, tuple(exits.get('logits', ())), ran)
 
     def head_states(self, normed):
         """The states the head reads from the final norm's `normed`: divided by `logits_scaling`, in at
