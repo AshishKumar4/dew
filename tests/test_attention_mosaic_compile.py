@@ -2013,6 +2013,7 @@ def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_d
         assert any(kernel["kernel"] == "attention_dkv"
                    for kernel in found[0].get("kernels", ())), found
 
+
 @COMPILES_ON_CPU
 def test_decode_deepens_to_3_stages_without_losing_residency():
     """Row 5274: long-context decode (B8 K4096 d128) compiles spill-free at pinned 2- and 3-stage configs
