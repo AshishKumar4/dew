@@ -326,9 +326,10 @@ def class_records(value: JSON, rewrite: Callable[[str, Mapping[str, JSON], bool]
         entries = {key: walked(entry) for key, entry in held.items()}
         changed = any(entries[key] is not entry for key, entry in held.items())
         named = class_record(entries)
-        # A JSON record's fields are JSON (`entries`' own).
-        if named is not None and (rewritten := rewrite(named[0], typing.cast("Mapping[str, JSON]", named[1]),
-                                                       root)) is not None:
+        # A JSON record's fields are JSON: `entries`' own, read as the record names them.
+        fields = entries.get("fields", {})
+        if named is not None and isinstance(fields, dict) and (
+                rewritten := rewrite(named[0], fields, root)) is not None:
             return rewritten
         return entries if changed else held
     return walked(value, root=True)
