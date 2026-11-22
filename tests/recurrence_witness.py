@@ -761,7 +761,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
             return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
                             records=False)
 
-        kept_o, kept_final, (a, (w, h, c, _)) = kept(*operands, starts=starts)
+        kept_o, kept_final, (a, (w, h, c, _, _)) = kept(*operands, starts=starts)
         for native, own in ((o, kept_o), (final, kept_final)):
             assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
                 "the certify build is the production program"
