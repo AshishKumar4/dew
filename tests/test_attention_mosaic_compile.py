@@ -2017,8 +2017,16 @@ def test_decode_deepens_to_3_stages_without_losing_residency():
         spans = template.spans(1, 4096, 8, causal=False)
         qd = jax.ShapeDtypeStruct((8, 1, 32, 128), jnp.bfloat16)
         kd = jax.ShapeDtypeStruct((8, 4096, 8, 128), jnp.bfloat16)
-        plan = attention_decode.plan(qd, kd, kd, spans, None, scale=None, target=target)
-        assert plan is not None and plan.config.stages >= 3, plan
+        work, rows, row_spans, whole = attention_decode.planned(qd, kd, kd, spans, template.Hooks())
+        assert work is not None and work["plain"].config.stages >= 3, work
+        cfg = work["plain"].config
+        op, args = attention_mosaic._forward_call(
+            rows, kd, kd, row_spans, whole, scale=None, natural=False,
+            out_dtype=jnp.float32 if work["plain"].slices > 1 else None, masked=True,
+            splits=work["plain"].slices, subtracted=True)
+        ba = op.bind(*args, residuals=template.Kept.OUTPUT if work["plain"].slices > 1 else template.Kept.NONE,
+                     interpret=False)
+        assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
         dec_case = KernelCase("sm90-dec-b8-d128-3stage",
                               lambda: (lambda q, k, v: attention_decode.attend(q, k, v, spans),
                                        (qd, kd, kd)))
