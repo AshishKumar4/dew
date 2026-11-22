@@ -602,10 +602,12 @@ def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
     np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
 
 
-def test_a_merge_runs_under_a_callers_unhashable_capture_filter_and_interceptor():
+@pytest.mark.parametrize("watch", ["capture filter", "interceptor"])
+def test_a_merge_runs_under_a_callers_unhashable_capture_filter_or_interceptor(watch):
     """A caller's `capture_intermediates` filter and method interceptor may be any callable, an unhashable
     one too (a dataclass's instance): a merge deciding whether it is watched matches Dew's own by identity
-    (rows 11876, 11877: hashing them raised), so the model runs under each, its logits the unwatched run's."""
+    (rows 11876, the filter, and 11877, the interceptor: hashing them raised), so the model runs under
+    each, its logits the unwatched run's."""
 
     @dataclasses.dataclass
     class Every:
@@ -621,11 +623,12 @@ def test_a_merge_runs_under_a_callers_unhashable_capture_filter_and_interceptor(
     ids = jnp.asarray(np.random.default_rng(11876).integers(0, VOCAB, (2, 12)), jnp.int32)
     variables = gated(model.init(jax.random.key(0), ids), 11876)
     expected = np.asarray(model.apply(variables, ids))
-    captured, _ = model.apply(variables, ids, capture_intermediates=Every(), mutable=["intermediates"])
-    with nn.intercept_methods(Passing()):
-        intercepted = model.apply(variables, ids)
-    np.testing.assert_array_equal(np.asarray(captured), expected)
-    np.testing.assert_array_equal(np.asarray(intercepted), expected)
+    if watch == "capture filter":
+        logits, _ = model.apply(variables, ids, capture_intermediates=Every(), mutable=["intermediates"])
+    else:
+        with nn.intercept_methods(Passing()):
+            logits = model.apply(variables, ids)
+    np.testing.assert_array_equal(np.asarray(logits), expected)
 
 
 def qwix_owned(provider: str, rules: Sequence[dict], spec: CrossPass = MESSAGES) -> tuple:
