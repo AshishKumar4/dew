@@ -8,7 +8,6 @@ state `h_t = a_t h_{t+1} + b_t`. A chunked recurrence's backward walks its chunk
 scan's, mamba_ssm's selective_scan_bwd_kernel.cuh, a BlockScan a state forward and a reverse one back).
 Interpreted, the scan is XLA's (`lax.associative_scan`)."""
 
-import dataclasses
 import math
 from collections.abc import Callable
 
@@ -24,7 +23,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, vector
 
 from dew.nn import precision
-from dew.nn.kernels.templates import emission
+from dew.nn.kernels.templates import emission, native
 from dew.nn.kernels.templates.cost import Work
 
 THREADS = 128
@@ -164,25 +163,6 @@ def _zeroed_columns(running) -> None:
     utils.warpgroup_barrier()
 
 
-@dataclasses.dataclass(frozen=True)
-class Emitted:
-    """An fp32 MLIR value whose `+`, `-` and `*` emit its kernel's own addition, subtraction and
-    multiplication (`arith.addf`, `arith.subf`, `arith.mulf`, rounded each): an algebra's own arithmetic run
-    in a native kernel's body, its schedule the kernel's (`precision.renormalized_sum` in
-    `compensated_columns`, `recurrence_algebra.band_term` and `gated` in `own_pairs`)."""
-
-    value: ir.Value
-
-    def __add__(self, other: "Emitted") -> "Emitted":
-        return Emitted(arith.addf(self.value, other.value))
-
-    def __sub__(self, other: "Emitted") -> "Emitted":
-        return Emitted(arith.subf(self.value, other.value))
-
-    def __mul__(self, other: "Emitted") -> "Emitted":
-        return Emitted(arith.mulf(self.value, other.value))
-
-
 def _compensated_columns(ref, running) -> None:
     """`compensated_columns` in Mosaic GPU's terms, each row's pair joined by `precision.renormalized_sum`,
     the arithmetic the interpreted scan's `compensated_add` runs."""
@@ -191,11 +171,14 @@ def _compensated_columns(ref, running) -> None:
     column = arith.index_cast(index, arith.remui(utils.thread_idx(), arith.constant(i32, THREADS)))
     halves = [arith.constant(index, half) for half in (0, 1)]
 
-    pair = tuple(Emitted(memref.load(running, [half, column])) for half in halves)
+    def pair_at(source, at: list) -> tuple[native.Word, native.Word]:
+        hi, lo = (native.Word(memref.load(source, [half, *at])) for half in halves)
+        return hi, lo
+
+    pair = pair_at(running, [column])
     for row in range(rows):
         at = [arith.constant(index, row), column]
-        term = tuple(Emitted(memref.load(ref, [half, *at])) for half in halves)
-        pair = precision.renormalized_sum(pair, term)
+        pair = precision.renormalized_sum(pair, pair_at(ref, at))
         for half, value in zip(halves, pair, strict=True):
             memref.store(value.value, ref, [half, *at])
     for half, value in zip(halves, pair, strict=True):

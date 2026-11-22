@@ -76,9 +76,10 @@ with report.certifying(compile_only_gpus("sm90")[0]):
         text = step.trace(*shapes).lower().as_text()
     else:
         # Certified aside as a compile's lowering is (`OuterProgram._lowered_aside`), settled at its end.
-        with report.certifying_aside() as aside:
-            text = step.trace(*shapes).lower().as_text()
-        report.settled_aside(aside)
+        with report.settling():
+            with report.certifying_aside() as aside:
+                text = step.trace(*shapes).lower().as_text()
+            report.settled_aside(aside)
         assert not report.refused_launches()
     found = [[each.op, each.stored] for each in report.certifications()]
 print(json.dumps({"text": text, "traced": len(traced), "certified": found,
@@ -142,9 +143,10 @@ def loss(query, key, value):
 step = jax.value_and_grad(loss, argnums=(0, 1, 2))
 with report.certifying(compile_only_gpus("sm90")[0]):
     if sys.argv[1] == "captured":
-        with report.certifying_aside() as aside:
-            text = lowered_for(step, shapes, "sm90").as_text()
-        report.settled_aside(aside)
+        with report.settling():
+            with report.certifying_aside() as aside:
+                text = lowered_for(step, shapes, "sm90").as_text()
+            report.settled_aside(aside)
         assert not report.refused_launches()
     else:
         text = lowered_for(step, shapes, "sm90").as_text()

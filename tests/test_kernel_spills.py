@@ -184,7 +184,9 @@ trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.ke
                   mesh=MeshSpec().build(devices))
 compile_ahead(trainer, token_rows(64, 1, 12289))
 print(json.dumps({"events": events, "modules": modules, "kind": devices[0].device_kind,
-                  "stored": [certification.stored for certification in report.certifications()]}))
+                  "stored": [certification.stored for certification in report.certifications()],
+                  "misses": [[miss.kernel, miss.op, repr(miss.config), miss.stepped]
+                             for miss in report.misses()]}))
 """
 """A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only GPU of the generation
 or the kind argv[1] names (`compile_only_gpus`): each program it lowered by name, each Mosaic GPU kernel
@@ -222,6 +224,12 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, d
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
+    # Each launch certification refused, within the settle that refused it, is recorded once a refused config
+    # and stepped: the retry certified it past the rung (`report.settling`), as a B200's reverse launch at its
+    # first was (FS-ASIDE-SM100C).
+    misses = runs[0]["misses"]
+    assert all(stepped for *_, stepped in misses), misses
+    assert len({tuple(miss) for miss in misses}) == len(misses), misses
 
 
 @lowers("sm90")
@@ -768,6 +776,59 @@ def test_a_program_lowered_before_another_compile_refused_its_config_is_relowere
         report.compiled(second, relower=lowered)
         misses = report.misses()
     assert misses and all(miss.stepped for miss in misses), misses
+
+
+def _aside(devices, lowered_first, relowered):
+    """`report.lowered_aside` of a lowering's first call `lowered_first` and its retry `relowered` over
+    `devices`, its launches certified aside on a compile-only H100 within a `refusals` scope of its own: its
+    misses, its refused launches and the retries it made."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    retries: list[int] = []
+
+    def retried():
+        retries.append(1)
+        return relowered()
+
+    with (report.refusals(), generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.lowered_aside(lowered_first, retried, lambda value: value)
+        return report.misses(), report.refused_launches(), retries
+
+
+@lowers("sm90")
+def test_an_aside_miss_is_recorded_stepped_in_the_recording_that_queued_its_launch():
+    """A program whose launch spills at its first tile (`Uncounted`), lowered with its launches certified
+    aside (`report.lowered_aside`), its first lowering within a recording of its own: the launch's miss is
+    recorded once, stepped by its retry's certification past the tile, in the recording its launch was queued
+    in though the block settles outside it (row 11786's review: misses went to the draining context's)."""
+    devices, lowered = _paired_step(Uncounted())
+    queued: list[report.Recorded] = []
+
+    def first():
+        with report.recording() as recorded:
+            queued.append(recorded)
+            return lowered()
+
+    misses, _, retries = _aside(devices, first, lowered)
+    assert misses and all(miss.stepped for miss in misses) and retries, (misses, retries)
+    assert tuple(queued[0].missed) == misses, (queued[0].missed, misses)
+
+
+@lowers("sm90")
+def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
+    """The same program's first lowering within a `refusals` scope of its own: the launch it queued refuses
+    its tile in that scope as the block settles outside it, so the enclosing scope holds no refusal and no
+    miss and retries nothing (row 11786's review: the refusal went to the draining context's registry, which
+    retried the lowering past it)."""
+    devices, lowered = _paired_step(Uncounted())
+
+    def first():
+        with report.refusals():
+            return lowered()
+
+    misses, refused, retries = _aside(devices, first, lowered)
+    assert not misses and not refused and not retries, (misses, refused, retries)
 
 
 class SpillingOnly(Uncounted):

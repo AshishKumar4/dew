@@ -606,17 +606,15 @@ def certifying(device) -> Iterator[None]:
 
 @dataclasses.dataclass(frozen=True)
 class _AsideLaunch:
-    """A launch certified aside (`certifying_aside`): what `certified` read of it, the abstract mesh its call
-    traced under (`mesh`: a `shard_map`'s manual axes, which its derivation reads where it settles,
-    `settled_aside`), and, once the block's trace reached its call (`capture`), its replay's kernels to come
-    (`replay.replayed`: its kernels, their verdict's key, and whether that verdict was read back)."""
+    """A launch certified aside (`certifying_aside`): what `certified` read of it, the reporting scope it was
+    queued in (`_reporting`), and its replay's kernels to come once its call was reached (`capture`)."""
     op: "KernelOp"
     arguments: tokamax.BoundArguments
     config: Hashable
     reverse: bool
     device: Hashable
     stored: str | None
-    mesh: jax.sharding.AbstractMesh
+    reporting: tuple
     kernels: Future | None = None
 
 
@@ -658,9 +656,12 @@ def certifying_aside() -> Iterator[Aside]:
 
 def settled_aside(aside: Aside) -> frozenset[tuple]:
     """Each launch `aside` certified, kept as `certified` keeps one and dropped from the block's pending: a
-    launch whose kernels the assembler refuses refused (`refuse_launch`) and its misses recorded, stepped
-    where its derivation offers another config now, so a trace that took its config is traced afresh
-    (`settled_trace`) and a program lowered at it lowered afresh (`refused_in`). The keys of those refused."""
+    launch whose kernels the assembler refuses refused (`refuse_launch`), so a trace that took its config is
+    traced afresh (`settled_trace`) and a program lowered at it lowered afresh (`refused_in`), its misses kept
+    for that retry to record (`settling`). The keys of those refused."""
+    settlement = _SETTLING.get()
+    if settlement is None:
+        raise ValueError("a block certifying aside is settled within `settling`, which records its misses")
     refused = set()
     for key, each in list(aside.pending.items()):
         # A launch a derivation certified (a route's eligibility) and no trace called: no program holds it.
@@ -682,39 +683,35 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
                                        read=read).refused
         if spilling:
             refused.add(key)
-            refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
-                          {binary.kernel: binary.spilled_in for binary in spilling})
-            # Its derivation as its call made it, under the mesh it traced under: a launch inside a
-            # `shard_map` settled past it derives on its manual axes (a block-sparse attention's step, whose
-            # derivation outside them refused the automatic data axis, train 1176).
-            with jax.sharding.use_abstract_mesh(each.mesh):
-                stepped = each.op.remaining(each.arguments) is not None
-            missed(each.op, each.arguments, each.config, spilling, stepped=stepped)
+            # Refused in the scope its call was queued in, whatever scope drains it.
+            with _reported_in(each.reporting):
+                refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
+                              {binary.kernel: binary.spilled_in for binary in spilling})
+            # Held by the settle (`settling`) until a retry, under its own context, steps past it (row 11786).
+            settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
+                                        tuple(spilling), each.reporting))
     return frozenset(refused)
 
 
 def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
-    """`trace()`'s value, within a block certifying aside (`certifying_aside`) the launches it reached settled
-    before it is lowered (`settled_aside`) and the program traced afresh (`retrace()`, past any trace cache
-    holding the config) for as long as they refuse a config it took, each refused launch's derivation stepping
-    past it: a program lowers once, at the configs its certification settled, as one certified in turn does,
-    where lowering at a refused rung lowered the step twice (a B200's recurrent reverse launch spilling at its
-    first rung, FS-ASIDE-SM100C). Each trace runs in the caller's own context, which JAX keys its trace cache
-    on, so a later trace of the program there takes it (train 1176's review: traced within a routes block of
-    its own, each compiled program was traced again outside it); an abandoned trace's routes are withdrawn
-    from the blocks that recorded them (`generation.withdrawn`). A trace that takes a config refused before
-    again (a derivation reading no refusal, a pin's) is its compile's to read (`settled`). Outside such a
-    block, `trace()`'s."""
+    """`trace()`'s value, within a block certifying aside the launches it reached settled before it lowers
+    (`settled_aside`, within `settling`), and traced afresh (`retrace()`, past any trace cache) while they
+    refuse a config it took: it lowers once, at the configs its certification settled (FS-ASIDE-SM100C).
+    Each trace runs in the caller's context, which JAX's trace cache keys on, so a program compiled ahead is
+    found by its trace (row 11766); an abandoned trace's routes are withdrawn (`generation.withdrawn`), a
+    nested program retraces past the refusal (`options.OuterProgram._nested`, row 11783), and a failed trace
+    keeps the routes it reported, as JAX's does. Outside such a block, `trace()`'s."""
     aside = _ASIDE.get()
     if aside is None:
         return trace()
-    marks = generation.route_marks()
-    value = trace()
-    seen: set = set()
-    while (refused := settled_aside(aside)) and not refused <= seen:
-        seen |= refused
-        generation.withdrawn(marks)
-        value = retrace()
+    with settling():
+        marks = generation.route_marks()
+        value = trace()
+        seen: set = set()
+        while (refused := settled_aside(aside)) and not refused <= seen:
+            seen |= refused
+            generation.withdrawn(marks)
+            value = retrace()
     return value
 
 
@@ -731,17 +728,89 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
     step's planner's and fit check's (`planning.FitSearch.lowering`), whose launches certified in turn took
     64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324); a program's trace alone certifies aside too
     (`OuterProgram.trace`)."""
-    with certifying_aside() as aside:
-        value = lower()
-    settled_aside(aside)
-    seen: set = set()
-    while ((lowered := program(value)) is not None and (refused := refused_in(lowered))
-           and not refused & seen):
-        seen |= refused
+    with settling():
         with certifying_aside() as aside:
-            value = relower()
+            value = lower()
         settled_aside(aside)
+        seen: set = set()
+        while ((lowered := program(value)) is not None and (refused := refused_in(lowered))
+               and not refused & seen):
+            seen |= refused
+            with certifying_aside() as aside:
+                value = relower()
+            settled_aside(aside)
     return value
+
+
+@dataclasses.dataclass
+class _Settlement:
+    """A settle's misses (`settled_aside`) by certification key and queueing scope, held until the launch
+    holds at another config in that scope's registry (stepped) or the settle ends, recorded in their own
+    scope either way (row 11786)."""
+
+    scope: tuple
+    deferred: list[tuple[tuple, Launch, tuple["Binary", ...], tuple]] = dataclasses.field(
+        default_factory=list)
+
+    def certified(self, key: tuple) -> None:
+        """Its misses of `key`'s launch, device and mode at other configs, in this registry, stepped."""
+        identity, config, *placement = key
+        registry = _SCOPE.get()
+        with _GUARD:
+            past = [entry for entry in self.deferred
+                    if entry[0][0] == identity and list(entry[0][2:]) == placement and entry[0][1] != config
+                    and entry[3][0] is registry]
+            self.deferred = [entry for entry in self.deferred if entry not in past]
+        for _, launch, kernels, reporting in past:
+            with _reported_in(reporting):
+                _recorded([(None, binary, launch) for binary in kernels], stepped=True)
+
+    def ended(self) -> None:
+        """Its misses no certification stepped past recorded, not stepped."""
+        with _GUARD:
+            deferred, self.deferred = self.deferred, []
+        for _, launch, kernels, reporting in deferred:
+            with _reported_in(reporting):
+                _recorded([(None, binary, launch) for binary in kernels], stepped=False)
+
+
+def _reporting() -> tuple:
+    """This context's `refusals` registry (None: the process's) and open `recording`s."""
+    return _SCOPE.get(), _RECORDING.get()
+
+
+@contextlib.contextmanager
+def _reported_in(reporting: tuple) -> Iterator[None]:
+    """Within the block, refusals and misses recorded in `reporting` (`_reporting`'s)."""
+    registry, recordings = reporting
+    scope, recorded = _SCOPE.set(registry), _RECORDING.set(recordings)
+    try:
+        yield
+    finally:
+        _RECORDING.reset(recorded)
+        _SCOPE.reset(scope)
+
+
+_SETTLING: contextvars.ContextVar[_Settlement | None] = _cache.untraced(
+    contextvars.ContextVar("settling_aside", default=None))
+
+
+@contextlib.contextmanager
+def settling() -> Iterator[None]:
+    """A settle of blocks certifying aside and its retries (`_Settlement`), its misses recorded as it ends,
+    even where it raises; within another of the same scope, the enclosing one's."""
+    scope = (id(_registry()), *map(id, _RECORDING.get()))
+    enclosing = _SETTLING.get()
+    if enclosing is not None and enclosing.scope == scope:
+        yield
+        return
+    settlement = _Settlement(scope)
+    token = _SETTLING.set(settlement)
+    try:
+        yield
+    finally:
+        _SETTLING.reset(token)
+        settlement.ended()
 
 
 def _refused_before(op, arguments: tokamax.BoundArguments) -> bool:
@@ -788,10 +857,13 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     reverse = _PULLED.get() and op.CARRIES_DERIVATIVE
     key = (_identity(op, arguments, generation.gpu_target()), config, device.id, device.device_kind, reverse)
     with _GUARD:
-        if key in _CERTIFIED:
-            return _CERTIFIED[key].refused
-        if key in _UNCERTIFIED:
+        held = _CERTIFIED.get(key)
+        if held is None and key in _UNCERTIFIED:
             return None
+    if held is not None:
+        if not held.refused:
+            _progressed(key)
+        return held.refused
     provenance = op_provenance(op, arguments.arguments)
     stored = _verdict_key(_identity(op, arguments, generation.gpu_target()), config, reverse, provenance)
     verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
@@ -803,8 +875,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
         # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
-        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored,
-                                          jax.sharding.get_abstract_mesh())
+        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, _reporting())
         aside.awaiting[(_launched(key[0], config, reverse), reverse)] = key
         return ()
     # Its verdict where its kernels' was stored however their Dew tree named it (`_lowered_verdict_key`),
@@ -860,7 +931,15 @@ def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels
     found = Certification(type(op).__name__, config, reverse, kernels, read, device)
     with _GUARD:
         _CERTIFIED[key] = found
+    if not found.refused:
+        _progressed(key)
     return found
+
+
+def _progressed(key: tuple) -> None:
+    """A launch certified at a config that holds (`key`): its settle's misses past it stepped."""
+    if (settlement := _SETTLING.get()) is not None:
+        settlement.certified(key)
 
 
 def verdict_target(device) -> str:
@@ -885,7 +964,7 @@ def _lowered_verdict_key(calls) -> str | None:
     installation has no seal."""
     kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
                      for call in calls if call.kind in ("mosaic_gpu", "triton"))
-    return _sealed_key("lowered", _assemblers(), kernels)
+    return _sealed_key("lowered", _assemblers(), _verdict_fields(), kernels)
 
 
 def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
@@ -916,10 +995,17 @@ def _sealed_key(head, *fields) -> str | None:
 def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None
                  ) -> str | None:
     """What decides a launch's certification for a compile target (`stored_key`, `verdict_target`,
-    `tuning.stored_verdict`) before it traces, including the ptxas that assembles it (`_assemblers`)."""
+    `tuning.stored_verdict`) before it traces, including the ptxas that assembles it (`_assemblers`) and what
+    a stored verdict states (`_verdict_fields`)."""
     from dew.nn.kernels.tuning import encoded
 
-    return stored_key(provenance, _assemblers(), identity, encoded(config), reverse)
+    return stored_key(provenance, _assemblers(), _verdict_fields(), identity, encoded(config), reverse)
+
+
+def _verdict_fields() -> list[str]:
+    """What a stored verdict states of a kernel, its `Binary`'s fields: a field added keys every verdict
+    afresh, where one stored before it decoded without it (row 11796: `Binary.spilled`)."""
+    return [field.name for field in dataclasses.fields(Binary)]
 
 
 @functools.cache
