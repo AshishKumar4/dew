@@ -641,9 +641,10 @@ def test_a_looped_decoder_runs_under_a_capture_of_every_method():
     variables = gated(model.init(jax.random.key(0), ids), 11882)
     _, captured = model.apply(variables, ids, capture_intermediates=lambda module, method: True,
                               mutable=["intermediates"])
-    # Each capture is kept under its method's name: one beside `__call__` the loop's later pass called.
-    methods = {path[-2].key for path, _ in jax.tree_util.tree_leaves_with_path(captured["intermediates"])}
-    assert methods - {"__call__"}, methods
+    # Each capture is kept under its method's name: the decoder's `looped`, which runs its passes, among them.
+    names = {key.key for path, _ in jax.tree_util.tree_leaves_with_path(captured["intermediates"])
+             for key in path if isinstance(key, jax.tree_util.DictKey)}
+    assert "looped" in names, names
 
 
 def qwix_owned(provider: str, rules: Sequence[dict], spec: CrossPass = MESSAGES) -> tuple:
