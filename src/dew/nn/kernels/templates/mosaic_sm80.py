@@ -364,14 +364,16 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False,
                            transposed: bool = False) -> int:
-        # A transposed granule read once (not `retained`) dies an instruction's slice at a time as its
-        # products issue: live the granule less the slice its first product consumes, an ordinary one's
-        # lookahead at a 32-deep step (a transposed matrix's input gradient held as its forward is at 32 deep
-        # and 24-40 registers past it at 64, FS-5634-DX-sm80/-sm86). A retained one is read again by a later
-        # product and keeps its whole granule (a recurrence's queries and keys, `_query_key_held`).
-        if transposed and not retained:
-            instruction = self.fragment_depth(depth)
-            loaded = max(instruction, loaded - instruction)
+        # A transposed granule read once (not `retained`) that is its step's whole depth at two
+        # instructions dies a slice at a time as its products issue: one instruction's live, an ordinary
+        # one's lookahead (a transposed matrix's input gradient held as its forward is at a 32-deep step,
+        # FS-5634-DX-sm80/-sm86). Deeper granules keep the rule below: a 64-deep step's input gradient ran
+        # 24-40 registers past its forward, and a recurrence backward's 64-deep transposed reads compiled
+        # spill-free at it (FS-5634-RECUR). A retained one is read again by a later product and keeps its
+        # whole granule (`_query_key_held`).
+        instruction = self.fragment_depth(depth)
+        if transposed and not retained and loaded == depth == 2 * instruction:
+            return instruction
         return super().operand_live_depth(depth, loaded, retained=retained, transposed=transposed)
 
     def lhs_fragment_depth(self, depth: int, *, swizzle: int | None = None) -> int:
