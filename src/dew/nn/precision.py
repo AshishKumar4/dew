@@ -1916,6 +1916,16 @@ def _paired_and_plain(left, right):
     return (*renormalized_add(left[:2], right[:2]), left[2] + right[2])
 
 
+COMPENSATED_COMBINES: dict[Callable, tuple[str, ...]] = {
+    compensated_add: ("pair", "pair"), renormalized_add: ("pair", "pair"),
+    _paired_and_plain: ("pair", "pair", "plain")}
+"""Each combine Dew's compensated sums hand `jax.lax.reduce`, as a reduction equation holds it (its
+`computation`), with its results' parts: a double-float pair's halves (`compensated_add`, and
+`renormalized_add`, `summed_pairs`'), and a one-pass sum's pair and the plain sum carried beside it
+(`_paired_and_plain`, `summed_total`'s): the one list the gate's rounding bound and its check 2 read them by
+(row 11880)."""
+
+
 def compensates_loops() -> bool:
     """Whether a running sum of float32 products carried across a loop keeps what each addition
     drops (`compensated_add`), so the loop's sum rounds once as one product's does: where a CPU sums
