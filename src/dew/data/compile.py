@@ -177,12 +177,12 @@ from dew.data.sources.base import (
     Source,
     View,
     _consumed,
+    asked,
     beneath,
     materialized,
     stream_manifest,
     tokenizer_contract,
 )
-from dew.data.sources.files import Files
 from dew.data.steps.generic import Coordinated
 from dew.data.storage import Mirrored
 
@@ -315,6 +315,13 @@ class _Facts(View[Source]):
     def metadata(self) -> Mapping[str, object]:
         return self._metadata
 
+    def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
+        """Those of its facts named by `keys`: as pinning read them, or, where it read none, asked of its
+        store alone (`asked`), which opens no file for a fact its store cannot state (row 9009)."""
+        if self.stated_metadata is None:
+            return asked(self.source, keys)
+        return {key: value for key, value in self.stated_metadata.items() if key in keys}
+
     @functools.cached_property
     def _metadata(self) -> Mapping[str, object]:
         return self.source.metadata() if self.stated_metadata is None else self.stated_metadata
@@ -407,20 +414,33 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     return found
 
 
-def asked_facts(source: Source, keys: Iterable[str]) -> Mapping[str, object]:
-    """Those of `source`'s facts named by `keys`: a pinned source's as pinning read them, a raw store's
-    without opening a file for a fact its schema cannot state (`Files.asked`), any other's off its
-    metadata (row 9009)."""
-    wanted = frozenset(keys)
-    held = source.source if isinstance(source, _Facts) and source.stated_metadata is None else None
-    if isinstance(held, Files):
-        return held.asked(wanted)
-    return {key: value for key, value in source.metadata().items() if key in wanted}
-
-
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
-    tokenizer_contract((f"corpus {_name(leaf)}", asked_facts(source, TOKENIZER_CONTRACT))
-                       for pipeline in pipelines for leaf, source in _leaves(pipeline))
+    """Every corpus's tokenizer facts read alike (`tokenizer_contract`), each asked of its store alone
+    (`asked`), in threads of their own as pinning reads them (`_pin_sources`; row 11638: one after
+    another)."""
+    corpora = [(f"corpus {_name(leaf)}", source)
+               for pipeline in pipelines for leaf, source in _leaves(pipeline)]
+    # Each source read once, those over one store one after another in one thread: a store's facts are
+    # cached unlocked, which two threads reading one store at once, through views or not, would race on
+    # (row 11638's review).
+    sources = {id(source): source for _, source in corpora}
+    stores: dict[int, list[Source]] = {}
+    for source in sources.values():
+        stores.setdefault(id(_store_of(source)), []).append(source)
+
+    def read(over: list[Source]) -> list[tuple[int, Mapping[str, object]]]:
+        return [(id(source), asked(source, TOKENIZER_CONTRACT)) for source in over]
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(stores)))) as readers:
+        facts = dict(pair for pairs in readers.map(read, stores.values()) for pair in pairs)
+    tokenizer_contract((name, facts[id(source)]) for name, source in corpora)
+
+
+def _store_of(source: Source) -> Source:
+    """The store `source` reads beneath every view over it, a compile's pinned one among them."""
+    while isinstance(source, View):
+        source = source.source
+    return source
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:
@@ -542,7 +562,7 @@ def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
             # that states its content (a store given no name names its shards by no content of its own).
             arrays[f"{index}/shards"] = stream_manifest(
                 source, positioned=any(isinstance(stage, MapWithIndex) for stage in leaf.stages)).digest
-        metadata = asked_facts(source, ("valid_targets",))
+        metadata = asked(source, ("valid_targets",))
         if "valid_targets" in metadata:
             arrays[f"{index}/valid_targets"] = fingerprint(
                 integer(metadata["valid_targets"], "valid_targets")
@@ -1208,7 +1228,7 @@ def _compiled(
         raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
                          "keeps no count of the examples its rows consume: run it before the bound, as a "
                          "step Dew names, or read the data in a global order")
-    held_out = sum(integer(asked_facts(source, ("held_out",)).get("held_out", 0), "held_out")
+    held_out = sum(integer(asked(source, ("held_out",)).get("held_out", 0), "held_out")
                    for _, source in _leaves(train))
     return Loader(
         training,

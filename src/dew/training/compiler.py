@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     from dew.nn.kernels.options import Compiling
     from dew.training.ahead import AheadOfTime
     from dew.training.interval import Interval
+    from dew.training.trainer import Trainer
     from dew.training.transaction import Committed
 
 _log = logging.getLogger(__name__)
@@ -250,11 +251,12 @@ class Building:
 
     def _judged(self, planned: Planned, held: int, built: int) -> tuple[bool, int | None]:
         """`step_fits` of `planned`'s step and, where it samples, its sampled step, `held` bytes beside it,
-        `built` of them among its arguments."""
+        `built` of them among its arguments; its headroom the sampled step's where it samples, which stands
+        for the step as its search's probe read it (`Planned.judged`; row 11832)."""
         mesh = self.stepping.settings.device_mesh
         fit, headroom = step_fits(planned.executable, mesh, held, built)
         if fit and planned.sampled is not None:
-            fit = step_fits(planned.sampled.executable, mesh, held, built)[0]
+            fit, headroom = step_fits(planned.sampled.executable, mesh, held, built)
         return fit, headroom
 
 
@@ -1002,7 +1004,7 @@ class StepCompiler[L, E]:
             # judgements in one record); and the placed judgement whole (`placed`): that headroom with its
             # copies built, and the bytes it held beside the step that the allocators did not.
             held_out = judging.charged[0]
-            stats = compiled_memory(planned.executable)
+            stats = compiled_memory(planned.judged)
             beside = None if stats is None else placed_beside(stats, held_out)
             probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside},
                       *probes[own + 1:]]
@@ -1135,7 +1137,7 @@ class StepCompiler[L, E]:
         keep()
         return planned, compiled
 
-    def drawing(self, holder: Holding[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
+    def drawing(self, holder: Trainer[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
                 state: TrainState, batch: Batch, key: jax.Array) -> CompiledStep:
         """`compiled`'s step, or where the run draws its pass count per microbatch (`PhasePasses.sampled`)
         its every count's step at its cap's plan, drawing under the run's `key` (`sampled_step`)."""
@@ -1154,7 +1156,7 @@ class StepCompiler[L, E]:
             flops = compiled.drawn(interval, step, state)
         return compiled, flops
 
-    def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
+    def sampled_step(self, holder: Trainer[L, E], stepping: Callable[[], Stepping], cap: Compiled,
                      state: TrainState, batch: Batch, key: jax.Array) -> DrawingStep:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
         `cap`, its cap's step (`compile`), and every other count's admitted at its plan (`admitted_at`), each
@@ -1230,7 +1232,7 @@ class StepCompiler[L, E]:
     def _refuse_sampled_window(self, cap: Planned) -> None:
         """Refused where a run and a build ahead (`compile_ahead`) both admit a sampled run's counts, as the
         step is built: a window that pools its microbatches by their mean holds their gradient's sum and its
-        mass (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that
+        mass (`dew.training._windows.empty_window`), DiLoCo's its groups' (`TrainState.window`); one that
         replays them holds their batches instead."""
         sampled = self.phase_passes.sampled
         assert sampled is not None, "a run that draws its pass count per microbatch"

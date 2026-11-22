@@ -46,8 +46,9 @@ class HeadedObjective(Objective[Loss, Effects]):
     executed: ClassVar[tuple[str, ...]] = ("head_chunks", "head_tile", "head_fused")
 
     untraced: ClassVar[Mapping[str, str]] = {
-        "_head_matrices": "what its head's last trace found of each model's output table (`fused_head`), "
-                          "whose fusing the key holds as its programs run it (`program_key`'s `head_fused`)"}
+        "_head_matrix": "the model its head's last trace read and whether it found its output table one "
+                        "matrix (`_read_head`), whose fusing the key holds as its programs run it "
+                        "(`program_key`'s `head_fused`)"}
 
     head_fused: bool = True
     """Whether a tiled head scored for its weighted sums takes their gradient in its forward
@@ -60,11 +61,13 @@ class HeadedObjective(Objective[Loss, Effects]):
         default (`keeps_whole_logits`), 'whole' and 'tiled' naming the choice, or a tile."""
         self.head_chunks = head_chunks
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
-        # Each decoder a fused loss traced, by identity, and whether its head was one matrix
-        # (`chunked.head_table`): past a nonlinear head transform, beside an adapter's factors or
-        # in place of a frozen FP8 kernel no matrix is, and no head is fused. A decoder not yet
-        # traced is taken to have one.
-        self._head_matrices: dict[int, tuple[object, bool]] = {}
+        # The model a trace last read the head of and whether that head was one matrix
+        # (`chunked.head_table`): past a nonlinear head transform, beside an adapter's factors or in place
+        # of a frozen FP8 kernel no matrix is, and no head is fused. A model no trace read, one set in
+        # another's place among them, is taken to have one. Rebound, never changed in place, so an
+        # objective's copy (`substituted`) shares none of its readings (row 11741); a module is its
+        # configuration alone, holding no parameters.
+        self._head_matrix: tuple[nn.Module, bool] | None = None
 
     def fuses_head(self) -> bool:
         """Whether this objective's training loss takes a tiled head's gradient in its forward
@@ -77,13 +80,13 @@ class HeadedObjective(Objective[Loss, Effects]):
         return head_cross_entropy(model, params, read, targets, self.head_chunks, tile=self.head_tile,
                                   **options)
 
-    def fused_head(self, model, params) -> OutputTable | None:
-        """`model`'s head as the one matrix a summed loss takes its gradient through in the forward
+    def fused_head(self, params) -> OutputTable | None:
+        """Its model's head as the one matrix a summed loss takes its gradient through in the forward
         (`chunked.fused_head_loss`), None where it keeps the whole logits, is not fused or is no
         matrix (`_read_head`)."""
-        if self.head_tile is None or not reads_states(model):
+        if self.head_tile is None or not reads_states(self.model):
             return None
-        head = self._read_head(model, params)
+        head = self._read_head(params)
         return head if self.head_fused else None
 
     def output_table(self, variables: Variables) -> OutputTable | None:
@@ -91,14 +94,15 @@ class HeadedObjective(Objective[Loss, Effects]):
         states read one (`predicts_by_head`)."""
         if not (self.predicts_by_head and reads_states(self.model)):
             return None
-        return self._read_head(self.model, variables)
+        return self._read_head(variables)
 
-    def _read_head(self, model: nn.Module, params) -> OutputTable | None:
-        """`model`'s head over `params` as one matrix (`head_table`), None where no matrix alone is: past a
-        nonlinear head transform, beside an adapter's factors, in place of a frozen FP8 kernel. What a trace
-        finds of the head is kept, which `head_program` reads (row 11677: two readers recorded it apart)."""
-        head = head_table(model, params)
-        self._head_matrices[id(model)] = (model, head is not None)
+    def _read_head(self, params) -> OutputTable | None:
+        """Its model's head over `params` as one matrix (`head_table`), None where no matrix alone is: past
+        a nonlinear head transform, beside an adapter's factors, in place of a frozen FP8 kernel. What a
+        trace finds of the head is kept, which `head_program` reads (row 11677: two readers recorded it
+        apart)."""
+        head = head_table(self.model, params)
+        self._head_matrix = (self.model, head is not None)
         return head
 
     def head_program(self, model: nn.Module) -> ProgramModule:
@@ -106,8 +110,9 @@ class HeadedObjective(Objective[Loss, Effects]):
         backward takes, where the model holds its head as one matrix (none where it keeps its whole
         logits, a head no matrix alone is, `chunked.head_cross_entropy`), and fused where the loss fuses
         it."""
+        known = self._head_matrix
         matrix = (reads_states(model) and isinstance(model, AffineHead)
-                  and self._head_matrices.get(id(model), (None, True))[1])
+                  and (known is None or known[0] is not model or known[1]))
         tile = self.head_tile if matrix else None
         fused = self.fuses_head() and self.head_fused and tile is not None
         return ProgramModule(model, tile, trained=True, head_fused=fused)
@@ -116,12 +121,11 @@ class HeadedObjective(Objective[Loss, Effects]):
         return (self.head_program(self.model),)
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
-        # A module put in the model's place (a remat rung's, `recompute_more`) holds the head it held: what a
-        # trace found of that head is kept for it (`head_program`).
-        before = self.model
+        # A module put in the model's place for a rung (`recompute_more`) holds the head the model held.
+        before, read = self.model, self._head_matrix
         super().substitute(modules)
-        if (known := self._head_matrices.get(id(before))) is not None and self.model is not before:
-            self._head_matrices[id(self.model)] = (self.model, known[1])
+        if read is not None and read[0] is before:
+            self._head_matrix = (self.model, read[1])
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.

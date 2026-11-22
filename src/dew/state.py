@@ -286,7 +286,7 @@ def without_empty_window(state: TrainState) -> TrainState:
     DiLoCo every group's. A commit clears every field of the window but its
     gradient sum and batch statistics, which the next window's first microbatch replaces unread
     (`dew.training.transaction`),
-    so the empty window a resume allocates (`Trainer._initialize_accumulation`) is the same window, and
+    so the empty window a resume allocates (`dew.training._windows.empty_window`) is the same window, and
     the sum, a trainable-size float32 tree, is no checkpoint's (row 4309: ~36 GB of a 9B run's ~112 GB).
     A window part filled is saved whole."""
     if state.window is None:

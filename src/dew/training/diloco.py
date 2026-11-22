@@ -235,7 +235,7 @@ def group_of(state: TrainState, batch: Batch) -> Iterator[tuple[TrainState, Batc
 def windowed(initialize: Callable, state: TrainState, batch,
              place: Callable[[TrainState], Placement[TrainState]] | None = None) -> TrainState:
     """`initialize(state, batch, shape_only)` (the trainer's window of a batch's shapes,
-    `Trainer._initialize_accumulation`) of `state` and `batch`, its shapes alone unless `place` gives the
+    `dew.training._windows.empty_window`) of `state` and `batch`, its shapes alone unless `place` gives the
     state's placement (`Trainer.shardings`) to allocate it on. Under DiLoCo, of one group's view, its
     inner state and its share of the batch's rows, the window stacked over the groups as the inner
     state's: allocated, each group's empty (`cleared`), where `place` puts the stacked window, so no

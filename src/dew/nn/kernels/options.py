@@ -535,7 +535,9 @@ def release() -> None:
     process, and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache
     JAX clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
     compiles again at its next call."""
-    # A snapshot taken under the lock, each holder asked outside it: none waits on the set with its own lock.
+    # A snapshot taken under the lock, each holder asked outside it: a holder registers under its own lock
+    # (`candidate_for` takes `_HOLDERS_LOCK` within `_KEEPING`), so a release that asked it within ours
+    # would take the two the other way round.
     with _HOLDERS_LOCK:
         holders = list(_HOLDERS)
     for holder in holders:

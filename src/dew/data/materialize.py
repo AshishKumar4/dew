@@ -70,7 +70,7 @@ from dew.data.pipeline import (
     with_children,
 )
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
+from dew.data.sources.base import Read, Rows, ShardManifest, Source, Stated, View, _uncounted
 from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
 
 _log = logging.getLogger(__name__)
@@ -110,12 +110,14 @@ class _Memory(View[Source]):
     def records(self, read: Read) -> tuple[Batch | bytes, ...]:
         return self.held
 
-    def metadata(self) -> Mapping[str, object]:
-        """Its source's facts, the counts only where it ran no stage over the source's rows, then
-        the counts it measured."""
-        stated = self.source.metadata()
-        return {**(_uncounted(stated) if self.ran else stated), **self.facts, "rows": len(self.held),
-                "accepted": len(self.held)}
+    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Its source's facts, the counts only where it ran no stage over the source's rows, then the
+        counts it measured, held already."""
+        return {**(_uncounted(facts) if self.ran else facts), **self.facts}
+
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
+        """Its rows, as it holds them."""
+        return {"rows": lambda: len(self.held), "accepted": lambda: len(self.held)}
 
     def lengths(self) -> np.ndarray | None:
         return self.measured

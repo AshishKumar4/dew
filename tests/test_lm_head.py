@@ -94,6 +94,22 @@ def test_a_decoder_put_back_keeps_what_its_trace_found_of_its_head():
     assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
 
 
+
+def test_a_decoder_set_in_its_objectives_place_is_read_as_one_matrix_before_any_trace():
+    """An objective whose traced decoder's head was no matrix (`program_key` stating no tile) and whose
+    decoder a caller then sets anew, one matrix, as a checkpoint's ranking swaps a model in, states its
+    tile at once, before a loss traces the new decoder: what a trace found of the old one's head held for
+    no other (row 11741's review: a stale reading kept the new head untiled)."""
+    vocab = 61
+    model, tokens = head_scored(vocab, head_transform="gelu")
+    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+    params = objective.init(jax.random.key(0))
+    jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
+    assert objective.program_key()[0].head_tile is None
+    objective.model = model.clone(head_transform=None)
+    assert objective.program_key()[0].head_tile == (4, 16)
+
 PREDICTION_SEEDS = 8
 """Check 1's declared seeds for a prediction against the tiled head's scores (`seeds_for`, paired)."""
 
