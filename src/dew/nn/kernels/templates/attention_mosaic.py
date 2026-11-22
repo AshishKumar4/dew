@@ -114,7 +114,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     score_places,
     split_queries,
     stagings,
-    step_live_tiles,
     streams_operands,
     value_columns,
     varying_slopes,
@@ -123,6 +122,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     walked_unit,
     whole_tiles,
 )
+from dew.nn.kernels.templates.attention_mosaic_scores import step_live_tiles
 from dew.nn.kernels.templates.base import Template
 
 

@@ -6,8 +6,10 @@ import dataclasses
 import functools
 
 import jax
+import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.extend import core as jax_core
 
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
@@ -334,3 +336,58 @@ def _query_tile_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: 
     rows = head_slice(family, row, head, pl.ds(first, smem[0].shape[1]))
     family.loaded(tuple((ref.at[rows], stage.at[index], barrier.at[index])
                         for ref, stage, barrier in zip(refs, smem, loaded, strict=True)))
+
+
+@functools.cache
+def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool,
+                            accurate: bool = False) -> int:
+    """Peak live 2D score-tile arrays in the traced attention algebra step (`jax.make_jaxpr`, row 10965)."""
+    tile = (8, 8)
+    s_in, row = jax.ShapeDtypeStruct(tile, jnp.float32), jax.ShapeDtypeStruct((tile[0],), jnp.float32)
+    q_pos = jax.ShapeDtypeStruct((tile[0], 1), jnp.int32)
+    k_pos = jax.ShapeDtypeStruct((1, tile[1]), jnp.int32)
+    spec = algebra.Forward("causal", 64, ids=False, scale=1.0 / 8.0, natural=natural_form, headroom=scaled)
+    if backward:
+        def backward_step(s, dp, peak, total, anchor, delta, q, k):
+            seen = algebra.seen(spec, algebra.Coords(q, k), s)
+            forms = derived_cotangents(keys_first=False, dropped=False, masked=True,
+                                       accurate=accurate, anchored=accurate)
+            tiles = {"logits": s, "products": dp, "peak": peak, "total": total, "anchor": anchor,
+                     "delta": delta, "seen": seen}
+            if accurate:
+                tiles["at_anchor"] = seen
+            exps, weights, ds = forms.mapped(tiles)
+            return algebra.value_weights(exps, weights, jnp.bfloat16), ds.astype(jnp.bfloat16)
+        jaxpr = jax.make_jaxpr(backward_step)(s_in, s_in, row, row, row, row, q_pos, k_pos).jaxpr
+    else:
+        def forward_step(s, m, l_val, q, k):
+            mod = algebra.modify(spec, s, algebra.Coords(q, k), (), masked=True)
+            new_m, alpha = algebra.peak(spec, m, mod)
+            w = algebra.weights(spec, mod, new_m)
+            if scaled:
+                exp = jnp.ones((tile[0],), jnp.int32)
+                held = algebra.Scaled(exp, exp, lambda shift: algebra.weights(spec, mod, new_m - shift))
+                return (*algebra.at_scale(w, held), new_m, alpha)
+            return w.astype(jnp.bfloat16), algebra.total(l_val, alpha, w), new_m
+        jaxpr = jax.make_jaxpr(forward_step)(s_in, row, row, q_pos, k_pos).jaxpr
+
+    def is_tile(v):
+        return not isinstance(v, jax_core.Literal) and getattr(v.aval, "shape", None) == tile
+
+    last_use = {v: pos for pos, eqn in enumerate(jaxpr.eqns) for v in eqn.invars if is_tile(v)}
+    last_use.update({v: len(jaxpr.eqns) for v in jaxpr.outvars if is_tile(v)})
+    live = {v for v in jaxpr.invars if is_tile(v)}
+    peak = len(live)
+    for pos, eqn in enumerate(jaxpr.eqns):
+        live.update(v for v in eqn.outvars if is_tile(v))
+        peak = max(peak, len(live))
+        live = {v for v in live if last_use.get(v, -1) > pos}
+    return peak
+
+
+def step_live_tiles(block_q: int, block_k: int, *, backward: bool = False, natural_form: bool = False,
+                    scaled: bool = False, accurate: bool = False) -> tuple:
+    """Live `(block_q, block_k)` fp32 score tiles in TPU VMEM derived from the traced step (row 10965)."""
+    count = _traced_step_tile_count(backward=backward, natural_form=natural_form, scaled=scaled,
+                                    accurate=accurate)
+    return (((block_q, block_k), jnp.float32),) * count
