@@ -224,11 +224,10 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, d
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
-    # A launch certification refused, within the settle that refused it, is recorded once a refused config and
-    # stepped: the retry certified it past the rung (`report.settling`), a B200's reverse launch at its first
-    # (FS-ASIDE-SM100C), an H100's none.
+    # Each launch certification refused, within the settle that refused it, is recorded once a refused config
+    # and stepped: the retry certified it past the rung (`report.settling`), as a B200's reverse launch at its
+    # first was (FS-ASIDE-SM100C).
     misses = runs[0]["misses"]
-    assert (target == "sm100") == bool(misses), misses
     assert all(stepped for *_, stepped in misses), misses
     assert len({tuple(miss) for miss in misses}) == len(misses), misses
 

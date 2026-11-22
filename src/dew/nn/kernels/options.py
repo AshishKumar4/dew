@@ -1192,8 +1192,9 @@ def _fresh[**P, R](function: Callable[P, R]) -> Callable[P, R]:
 
 def _weak_types(traced: jax.stages.Traced) -> tuple[bool, ...]:
     """A trace's outputs' weak types, in their leaves' order: what an executable's `out_info` drops and its
-    results over arrays keep (`_outputs`)."""
-    return tuple(aval.weak_type for aval in jax.tree.leaves(traced.out_avals))
+    results over arrays keep (`_outputs`); none for an output of no array (a token's)."""
+    return tuple(isinstance(aval, jax_core.ShapedArray) and aval.weak_type
+                 for aval in jax.tree.leaves(traced.out_avals))
 
 
 def _outputs(out_info, weak_types: tuple[bool, ...]):

@@ -742,7 +742,8 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
             # (`certified`), not where the settle ends without one; whether its derivation steps is the
             # retry's, under its own context (row 11786: a probe of it here ran outside the call's
             # `shard_map`).
-            settlement.deferred.append((Launch(key[0], type(each.op).__name__, each.config), tuple(spilling)))
+            settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
+                                        tuple(spilling)))
     return frozenset(refused)
 
 
@@ -804,26 +805,31 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
 
 @dataclasses.dataclass
 class _Settlement:
-    """A settle's refused launches' misses (`settled_aside`), each its launch (`Launch`: its identity, op and
-    refused config) and its spilling binaries, held until a retry within it certifies the launch at another
-    config (`certified`: stepped) or it ends without one (`settling`: not stepped). Its own, never another
-    settle's: a process-wide store crossed concurrent settles and refusal scopes (row 11786's review)."""
+    """A settle's refused launches' misses (`settled_aside`), each its certification's key (its launch's
+    identity and config, the device and whether reversed), its launch record and its spilling binaries,
+    held until its launch on the same device and mode is certified at another config that holds (`certified`:
+    stepped) or the settle ends without (`settling`: not stepped). Its own, in the refusal scope and the
+    recordings it was opened in (`scope`), never another settle's (row 11786's review)."""
 
-    deferred: list[tuple[Launch, tuple["Binary", ...]]] = dataclasses.field(default_factory=list)
+    scope: tuple
+    deferred: list[tuple[tuple, Launch, tuple["Binary", ...]]] = dataclasses.field(default_factory=list)
 
-    def certified(self, identity: str, config: Hashable) -> None:
-        """Its misses of `identity` at configs other than `config` recorded stepped: a retry certified the
-        launch past them."""
-        past = [(launch, binaries) for launch, binaries in self.deferred
-                if launch.identity == identity and launch.config != config]
-        self.deferred = [entry for entry in self.deferred if entry not in past]
-        for launch, binaries in past:
+    def certified(self, key: tuple) -> None:
+        """Its misses of `key`'s launch, device and mode at configs other than `key`'s recorded stepped: a
+        certification that holds past them."""
+        identity, config, *placement = key
+        with _GUARD:
+            past = [entry for entry in self.deferred
+                    if entry[0][0] == identity and list(entry[0][2:]) == placement and entry[0][1] != config]
+            self.deferred = [entry for entry in self.deferred if entry not in past]
+        for _, launch, binaries in past:
             _recorded([(None, binary, launch) for binary in binaries], stepped=True)
 
     def ended(self) -> None:
-        """Its misses no retry stepped past recorded, not stepped."""
-        deferred, self.deferred = self.deferred, []
-        for launch, binaries in deferred:
+        """Its misses no certification stepped past recorded, not stepped."""
+        with _GUARD:
+            deferred, self.deferred = self.deferred, []
+        for _, launch, binaries in deferred:
             _recorded([(None, binary, launch) for binary in binaries], stepped=False)
 
 
@@ -834,12 +840,17 @@ _SETTLING: contextvars.ContextVar[_Settlement | None] = _cache.untraced(
 @contextlib.contextmanager
 def settling() -> Iterator[None]:
     """A settle of blocks certifying aside (`settled_aside` within it) and its retries, its refused launches'
-    misses recorded as it ends, even where it raises: each stepped where a retry within it certified its
-    launch at another config, else not (`_Settlement`). A settle within another is the enclosing one's."""
-    if _SETTLING.get() is not None:
+    misses recorded as it ends, even where it raises: each stepped where a certification within it held its
+    launch at another config, else not (`_Settlement`). A settle within another in the same refusal scope
+    and recordings is the enclosing one's; one within a scope of its own (a `refusals` or `recording` block)
+    is its own, its misses recorded there."""
+    # Its refusal scope and its recordings, by identity: where a miss it records goes.
+    scope = (id(_registry()), *map(id, _RECORDING.get()))
+    enclosing = _SETTLING.get()
+    if enclosing is not None and enclosing.scope == scope:
         yield
         return
-    settlement = _Settlement()
+    settlement = _Settlement(scope)
     token = _SETTLING.set(settlement)
     try:
         yield
@@ -891,13 +902,14 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
 
     reverse = _PULLED.get() and op.CARRIES_DERIVATIVE
     key = (_identity(op, arguments), config, device.id, device.device_kind, reverse)
-    if (settlement := _SETTLING.get()) is not None:
-        settlement.certified(key[0], config)
     with _GUARD:
-        if key in _CERTIFIED:
-            return _CERTIFIED[key].refused
-        if key in _UNCERTIFIED:
+        held = _CERTIFIED.get(key)
+        if held is None and key in _UNCERTIFIED:
             return None
+    if held is not None:
+        if not held.refused:
+            _progressed(key)
+        return held.refused
     provenance = op_provenance(op, arguments.arguments)
     stored = _verdict_key(_identity(op, arguments), config, reverse, provenance)
     verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
@@ -965,7 +977,16 @@ def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels
     found = Certification(type(op).__name__, config, reverse, kernels, read, device)
     with _GUARD:
         _CERTIFIED[key] = found
+    if not found.refused:
+        _progressed(key)
     return found
+
+
+def _progressed(key: tuple) -> None:
+    """A launch certified at a config its kernels hold (`key`): the misses its settle deferred for the same
+    launch on the same device and mode, at another config, are stepped past (`_Settlement.certified`)."""
+    if (settlement := _SETTLING.get()) is not None:
+        settlement.certified(key)
 
 
 def verdict_target(device) -> str:
