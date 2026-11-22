@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .dense import watched_or_owned
+from .dense import intercepted, watched_or_owned
 from .derivatives import portable_formed
 from .flops import projection_flops
 from .norms import unweighted_rmsnorm
@@ -83,6 +83,11 @@ def sources(state, finished: int, partial):
     return jnp.concatenate([state[:, :, :finished], partial[:, :, None, :]], axis=2)
 
 
+MIXTURE_OPS = ("dot_general", "einsum")
+"""The products a depth mixture computes (`float32_einsum`'s einsums, a merge's matmuls), which a Qwix rule
+may own (`dense.intercepted`)."""
+
+
 class DepthAttention(nn.Module):
     """Mix `[B, S, n, D]` sources into `[B, S, D]` by one learned pseudo-query.
 
@@ -112,13 +117,19 @@ class DepthAttention(nn.Module):
         """Only the score contracts a learned matrix; value mixing uses its weights."""
         return projection_flops(lengths, self.emb_features, num_sources)
 
+    def product_owned(self) -> bool:
+        """Whether a wrapper owns this mixture's products (its einsums, and any dot_general), asked within
+        its own scope, so a Qwix rule over its module path answers: what a merge holding it reads
+        (`CrossPassMerge`)."""
+        return intercepted(MIXTURE_OPS)
+
     def __call__(self, values):
         # The values' cotangent leaves only with the query's scale and kernel gradients formed, the
         # mixture recomputed from its operands in the reverse mode (`portable_formed`): XLA otherwise puts
         # those reductions over every token off to the step's end, holding the fp32 keys and values live
-        # across layers and an exit-gated loop's unrolled passes (row 11713). A call a wrapper owns or a
-        # caller watches runs as it is (`watched_or_owned`).
-        if watched_or_owned(self):
+        # across layers and an exit-gated loop's unrolled passes (row 11713). A call a wrapper owns (its
+        # einsums', `MIXTURE_OPS`) or a caller watches runs as it is (`watched_or_owned`).
+        if watched_or_owned(self, MIXTURE_OPS):
             return depth_attended(values, self.scale, self.kernel, norm_eps=self.norm_eps,
                                   normalize_values=self.normalize_values)
 

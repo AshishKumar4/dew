@@ -22,7 +22,7 @@ from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
-from dew.nn.cross_pass import MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
+from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
 
 VOCAB = 37
 
@@ -568,15 +568,54 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
         f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
 
 
-def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call():
-    """A caller capturing every module's outputs (`capture_intermediates`) sees each merge's depth mixture
+@pytest.mark.parametrize("watch", ["captured", "inspected"])
+def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
+    """A caller watching a merge's calls, capturing every module's outputs (`capture_intermediates`) or
+    summarizing its depth mixture's (`inspection.watching`, `INSPECTED`), sees each merge's depth mixture
     called, as a merge no one watches computes it through its reverse-mode rule (`portable_formed`, row
-    11713's review): the merge runs as Flax sees it, its logits the unwatched run's."""
+    11713's review): the merge runs as Flax sees it, its gates off zero (`gated`) so its output reads the
+    mixture, its logits the unwatched run's."""
+    from dew.nn.inspection import INSPECTED, watching
+
     model = decoder("attention", steps=2)
     ids = jnp.asarray(np.random.default_rng(11713).integers(0, VOCAB, (2, 12)), jnp.int32)
-    variables = model.init(jax.random.key(0), ids)
-    logits, captured = model.apply(variables, ids, capture_intermediates=True, mutable=["intermediates"])
-    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(captured)]
-    assert any("cross_pass" in path and "'depth'" in path for path in paths)
+    variables = gated(model.init(jax.random.key(0), ids), 11713)
+    if watch == "captured":
+        logits, seen = model.apply(variables, ids, capture_intermediates=True, mutable=["intermediates"])
+    else:
+        with watching(("DepthAttention",)):
+            logits, seen = model.apply(variables, ids, mutable=[INSPECTED])
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(seen)]
+    assert any(MERGE_PREFIX in path and "'depth'" in path for path in paths)
     np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
+
+
+@pytest.mark.parametrize(("site", "op"), [(r".*cross_pass_[^/]+$", "dot_general"),
+                                          (r".*cross_pass_[^/]+/depth", "einsum")], ids=["merge", "depth"])
+def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(site, op):
+    """A merge whose products a direct `qwix.quantize_model` rule owns, its controller's matmuls or its depth
+    mixture's einsums alone (a rule over the depth child's path), runs as Flax and Qwix see it in both modes
+    (row 11713's review): its gradients the ones of the same model run as a watched merge runs (captured,
+    `capture_intermediates`), and the rule's, not the unquantized model's."""
+    qwix = pytest.importorskip("qwix")
+
+    model = decoder("attention", steps=2)
+    ids = jnp.asarray(np.random.default_rng(11716).integers(0, VOCAB, (2, 12)), jnp.int32)
+    quantized = qwix.quantize_model(model, qwix.QtProvider([qwix.QtRule(
+        module_path=site, weight_qtype=jnp.int8, act_qtype=jnp.int8, op_names=(op,))]))
+    variables = gated(quantized.init(jax.random.key(0), ids), 11716)
+
+    def gradients(applied, **watched):
+        def loss(params):
+            out = applied({**variables, "params": params}, ids, **watched)
+            logits = out[0] if watched else out
+            return jnp.sum(jnp.square(logits.astype(jnp.float32)))
+        return jax.tree.leaves(jax.grad(loss)(variables["params"]))
+
+    owned = gradients(quantized.apply)
+    for got, watched in zip(owned, gradients(quantized.apply, capture_intermediates=True,
+                                             mutable=["intermediates"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(watched))
+    assert any(not np.array_equal(np.asarray(got), np.asarray(plain))
+               for got, plain in zip(owned, gradients(model.apply), strict=True))
 

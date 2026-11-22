@@ -59,34 +59,49 @@ def packed_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]):
     return make()
 
 
-def watched_or_owned(module: nn.Module) -> bool:
+def watched_or_owned(module: nn.Module, ops: tuple[str, ...] = ("dot_general",)) -> bool:
     """Whether `module`'s calls must run as Flax and a wrapper see them, no rule of Dew's standing in for its
     computation (`dew.nn.derivatives.portable_formed`, which differentiates a function of arrays apart from
-    the module's scope): a wrapper owning its products (`intercepted`, a Qwix rule matching it among them),
-    a Flax method interceptor installed (`nn.intercept_methods`: a watch's), or its caller capturing its
-    calls' outputs (`capture_intermediates`)."""
+    the module's scope): a wrapper owning its products of `ops` (`intercepted`, a Qwix rule matching one of
+    them at its path among them), a Flax method interceptor installed (`intercepting`: a watch's), or its
+    caller capturing its calls' outputs (`observed`)."""
+    return intercepted(ops) or intercepting() or observed(module)
+
+
+def intercepting() -> bool:
+    """Whether a Flax method interceptor is installed (`nn.intercept_methods`, Flax's own stack): any of them
+    may intercept a module's own call, which a rule standing in for the call would bypass (a joined
+    projection's, base review 760be77fe F1: an interceptor zeroing `v_proj`'s output, the joined layer
+    returned it; a recomputed merge's)."""
     from flax.linen import module as flax_module
 
-    return (intercepted() or bool(flax_module._global_interceptor_stack)
-            or module.is_mutable_collection('intermediates'))
+    return bool(flax_module._global_interceptor_stack)
 
 
-def intercepted() -> bool:
-    """Whether a wrapper owns the layer's product, which reaches it as a `jax.lax.dot_general` call: a Dew
-    interception scope (`dew.quantization`, `dew.lora`: `dew._cache.INTERCEPTED`), or a Qwix rule matching
-    the op at this module under a direct `qwix.quantize_model` call (`qwix.pallas.get_current_rule`, Qwix's
-    public query for code that runs its own kernels, which every active provider answers)."""
-    return INTERCEPTED.value or _ruled()
+def observed(module: nn.Module) -> bool:
+    """Whether a caller reads `module`'s own calls' outputs as Flax captures every module's (its
+    `intermediates` collection open: `capture_intermediates`); a caller intercepting them is
+    `intercepting`'s (a watch's, node perturbation's)."""
+    return module.is_mutable_collection('intermediates')
 
 
-def _ruled() -> bool:
-    """Whether a Qwix rule matches the op at this module under a direct `qwix.quantize_model` call
+def intercepted(ops: tuple[str, ...] = ("dot_general",)) -> bool:
+    """Whether a wrapper owns the layer's products of `ops` (`jax.lax.dot_general` calls, a layer's
+    `jnp.einsum`'s): a Dew interception scope (`dew.quantization`, `dew.lora`: `dew._cache.INTERCEPTED`), or
+    a Qwix rule matching one of them at this module under a direct `qwix.quantize_model` call
+    (`qwix.pallas.get_current_rule`, Qwix's public query for code that runs its own kernels, which every
+    active provider answers)."""
+    return INTERCEPTED.value or _ruled(ops)
+
+
+def _ruled(ops: tuple[str, ...]) -> bool:
+    """Whether a Qwix rule matches one of `ops` at this module under a direct `qwix.quantize_model` call
     (`qwix.pallas.get_current_rule`, which every active provider answers)."""
     if not QWIX:
         return False
     from qwix import pallas as qwix_pallas
 
-    return qwix_pallas.get_current_rule("dot_general") is not None
+    return any(qwix_pallas.get_current_rule(op) is not None for op in ops)
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions,
@@ -284,7 +299,7 @@ class Dense(_LinearEnvelope, nn.Dense):
         it as it is: a packed weight's source stores none for it (`codecs.SourceQuantization.as_nvfp4`)."""
         from dew.nn.kernels.gemm import nvfp4_product
 
-        if _ruled():
+        if _ruled(("dot_general",)):
             raise ValueError(f"{self.name}'s kernel is packed (a checkpoint's NVFP4 codes, served as they "
                              "are), and a quantization rule owns its product: load it without packed_weights")
         width = jnp.shape(inputs)[-1]

@@ -409,12 +409,17 @@ def test_a_module_reading_its_parameters_formed_together_holds_every_order(edge)
     direction = normal_draw(11714, (4, 8), (8,), (8,), scale=EDGES[edge])
     (cotangent,) = normal_draw(11715, (4, 8))
 
+    def read(x, gain, shift, fixed, count):
+        return (x * gain + shift) * fixed + count.astype(x.dtype)
+
     def plain(x, gain, shift):
-        return x * gain + shift
+        return read(x, gain, shift, jnp.ones(8), jnp.arange(8))
 
     def tied(x, gain, shift):
-        x, (gain, shift) = formed_together(x, (gain, shift))
-        return plain(x, gain, shift)
+        # Beside the moving parameters a fixed float one and an integer one, whose tangents are symbolic zeros
+        # (an integer's JAX's `float0`): they pass as they came (row 11713's review).
+        x, parameters = formed_together(x, (gain, shift, jnp.ones(8), jnp.arange(8)))
+        return read(x, *parameters)
 
     assert_contract(tied, primals, direction, cotangent, f"parameters formed together {edge}", plain_fn=plain)
 

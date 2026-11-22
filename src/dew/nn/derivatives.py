@@ -483,14 +483,9 @@ def _together_value[Input, Parameters](value: Input, parameters: Parameters) -> 
 
 def _together_tangent(primals, tangents):
     """`formed_together`'s tangent: its operands' tangents through the rule's dual (`with_tangents_formed`),
-    an operand no derivative reaches a zero beside them, as the identity's."""
-    from jax.custom_derivatives import SymbolicZero
-
-    t_value, t_parameters = with_tangents_formed(*tangents)
-    held = jax.tree.map(lambda primal, tangent: jnp.zeros_like(primal) if isinstance(tangent, SymbolicZero)
-                        else tangent, primals, (t_value, t_parameters),
-                        is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
-    return primals, held
+    an operand no derivative reaches its symbolic zero as it came (`marked` returns it beside the span's
+    outputs; a non-floating leaf's zero is JAX's `float0`, which no instantiated zero of its dtype is)."""
+    return primals, with_tangents_formed(*tangents)
 
 
 formed_together = contracted("test_a_module_reading_its_parameters_formed_together_holds_every_order")(

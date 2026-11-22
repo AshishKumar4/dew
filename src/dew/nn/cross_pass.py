@@ -28,7 +28,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .attention_residuals import DepthAttention, depth_attended
+from .attention_residuals import MIXTURE_OPS, DepthAttention, depth_attended
 from .dense import watched_or_owned
 from .derivatives import formed_together, portable_formed
 from .flops import projection_flops
@@ -112,8 +112,9 @@ class CrossPassMerge(nn.Module):
         """`read` `[B, S, D]` with `bank` `[B, S, blocks, D]` merged in, in `read`'s dtype."""
         controller = (self.input_down, self.message_down, self.gain, self.forget,
                       *((self.added,) if self.spec.additive else ()))
-        if watched_or_owned(self):
-            # A merge a wrapper owns or a caller watches, its depth mixture's call among them, runs as it is.
+        if watched_or_owned(self, MIXTURE_OPS) or self.depth.product_owned():
+            # A merge a wrapper owns or a caller watches, a rule over its depth mixture's path among them,
+            # runs as it is.
             return _merged(read, self.depth(bank.astype(at_least_fp32(read.dtype))), controller, self.spec,
                            self.norm_eps)
         # The read's and the bank's cotangents leave only with the merge's parameters' gradients formed,
