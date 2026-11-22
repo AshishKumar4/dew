@@ -337,13 +337,15 @@ interpreted, and their gradients everywhere, which the GPU tier runs whole (test
 
 
 SHARDED_ORDINARY = (('vector delta', 'resets on chunk edges'), ('vector delta', 'the decay bound'),
-                    ('rated', 'resets on chunk edges'), ('gated', 'resets on chunk edges'))
+                    ('rated', 'resets on chunk edges'), ('gated', 'resets on chunk edges'),
+                    ('scalar delta', 'resets on chunk edges'))
 """The ordinary regimes' cases past a task whole, each a check-1 site of its own recorded seeds over map
 tasks: Kimi delta attention's 16 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw,
 and its 64 seeds under the decay bound at 2.2 s (179 and 146 s whole at CI's rate, train of 2026-11-14
 05:20Z); the rated scan's 64 seeds under resets on chunk edges, each of its forms (121 s whole under the
 accurate ones, train 861's CI); the gated delta net's 32 there (130 to 143 s whole, tests/test_durations.json
-at dc7ebf822, row 10861). Their marks are literal parameters (`pytest.param`), as the plan reads a site's
+at dc7ebf822, row 10861); the gated delta net with a decay a head, its 16 seeds there (125 s whole, train
+1196's CI, row 11974). Their marks are literal parameters (`pytest.param`), as the plan reads a site's
 from the source."""
 
 
@@ -359,7 +361,9 @@ from the source."""
     pytest.param('rated', 'resets on chunk edges', 'accurate', id='rated-resets_on_chunk_edges-accurate',
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param('gated', 'resets on chunk edges', 'accurate', id='gated-resets_on_chunk_edges-accurate',
-                 marks=pytest.mark.check1_shards(seeds=32, per_task=16))])
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=16)),
+    pytest.param('scalar delta', 'resets on chunk edges', None, id='scalar_delta-resets_on_chunk_edges',
+                 marks=pytest.mark.check1_shards(seeds=16, per_task=8))])
 def test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted(name, regime, forms):
     """`test_each_form_the_template_takes_stays_finite_and_on_par_interpreted` under the regimes of a draw's
     own tokens (`ORDINARY`): the CPU twin of each form's forward cell of the GPU tier's, each case a test of

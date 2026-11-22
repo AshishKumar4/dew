@@ -529,7 +529,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 and _launches_held(launches, family))
 
     def _refused(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
-                 *, training: bool | None = None) -> bool:
+                 *, training: bool) -> bool:
         """Whether a compile refused `tiles` past what its derivation's raise answers (`_exhausted`), or a
         launch it spilled so at other tiles plans at `tiles` as it did there but its grid (`_spilled`): the
         same kernel at the same registers, shared memory, ring, roles and residency, which a compile spills
@@ -593,10 +593,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return frozenset(kernel for kernel in terminal if all(kernel in at for at in refused))
 
     def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
-                   *, training: bool | None = None) -> bool:
+                   *, training: bool) -> bool:
         """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
-        (`report.refused_at`), of the product `training` names where it names one (`_refused`), whose
-        launch's producer can rise no further, or would leave its tiles unheld (`_raised`)."""
+        (`report.refused_at`), of the product `training` names (`_refused`), whose launch's producer can rise
+        no further, or would leave its tiles unheld (`_raised`)."""
         spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles) if _of(kernel, training))
         return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
 
@@ -1114,10 +1114,10 @@ def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> f
                                                else frozenset())
 
 
-def _of(kernel: str, training: bool | None) -> bool:
+def _of(kernel: str, training: bool) -> bool:
     """Whether `kernel` is the product's `training` names (a training call's, else a forward alone's,
-    `mainloop.ran_alone`), every product's where it names none."""
-    return training is None or mainloop.ran_alone(kernel) != training
+    `mainloop.ran_alone`)."""
+    return mainloop.ran_alone(kernel) != training
 
 
 def _owner(kernel: str, names: Iterable[str]) -> str | None:

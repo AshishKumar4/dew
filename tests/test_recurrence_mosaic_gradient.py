@@ -570,7 +570,8 @@ def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
             return template.MOSAIC.launches(bound, tiles.forward or tiles, target, backward=False)
 
         # Spent: past every rung of its ladder (none where its launch moves no registers), no raise answers.
-        assert template.MOSAIC._exhausted(bound, base, target) and stepped is not None, (rungs, stepped)
+        assert template.MOSAIC._exhausted(bound, base, target, training=not alone) and stepped is not None, (
+            rungs, stepped)
         # The spent product off its ladder, the other's launches as they were.
         assert launches(stepped, not alone) != launches(first, not alone), (first, stepped)
         assert launches(stepped, alone) == launches(first, alone), (first, stepped)
