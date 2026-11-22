@@ -378,11 +378,12 @@ class Mamba2(nn.Module):
                                    for width, factor in zip(widths, self.section_multipliers, strict=True)])
         return projected * factors
 
-    def _fused_token(self, taps, bias, dt, valid, starts):
+    def _fused_token(self, taps, bias, dt, valid, starts, dtype):
         """A decode token's conv, step and skip in one launch (`linear.fused_token` under `FUSED`): its
         x, B and C convolved, with their bias where the module has one (`use_conv_bias`), the step through
         softplus with its bias and limit, the decay `exp(A dt)`; the gated norm over its groups after
-        (`_gated`)."""
+        (`_gated`). Its output in `dtype`, the layer's compute dtype, as the scan's (`_ssd`); its history and
+        state in their cache's, as `held_scan` keeps them."""
         assert FUSED.conv is not None, "the fused step convolves its token"
         conv = dataclasses.replace(FUSED.conv, bias=self.use_conv_bias)
         hooks = dataclasses.replace(FUSED, conv=conv,
@@ -391,7 +392,7 @@ class Mamba2(nn.Module):
                            widths=(self.state_size, self.state_size, self.head_dim),
                            per_row={'gate': dt[:, 0]},
                            per_head={'log_a': self.A_log, 'bias': self.dt_bias, 'skip': self.D},
-                           weight=None, valid=valid, starts=starts, conv_bias=bias)
+                           weight=None, valid=valid, dtype=dtype, starts=starts, conv_bias=bias)
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
@@ -442,7 +443,7 @@ class Mamba2(nn.Module):
         if decode and length == 1 and tokens.forks is None and not self.is_initializing() and decode_kernel(
                 jax.ShapeDtypeStruct((batch, *state), wide), groups=self.n_groups, fuses=True,
                 normed=False) == 'fused':
-            token = self._fused_token(taps, bias, dt, valid, tokens.starts)
+            token = self._fused_token(taps, bias, dt, valid, tokens.starts, compute)
         out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads), state,
                         decode=decode, coordinates=tokens, spec=self.cache_spec(batch) if decode else None,
                         state_dtype=wide, conv_dtype=wide, dtype=compute, token=token)
