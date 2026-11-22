@@ -1054,7 +1054,8 @@ class Uncounted(grouped_matmul.MosaicGmm):
     where it uses them: `rings.opaque`); a narrower tile comes once a compile has refused a tile of its
     launch (`report.refused_launches`, the relowering's proposals included)."""
 
-    def registers(self, ba, config):
+    def registers(self, ba, config, target=None):
+        del target
         return 0
 
     def candidate(self, ba, config, target):

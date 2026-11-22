@@ -54,7 +54,7 @@ from dew.nn.kernels.templates import axes as side_axes_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
-from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
+from dew.nn.kernels.templates.product import SCALE_DEPTH, declared, formed, parts, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import called, read_by
 from dew.nn.sharding import automatic_axes, varying_like
@@ -715,7 +715,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         del saved
         rows, words, scales, sizes, gather, first = operands
         matrices = decoded(words, scales, first)
-        parts = _bf16_parts(cotangent, EXACT_PARTS)
+        parts = _bf16_parts(cotangent, _bf16_part_count(jnp.float32))
         d_rows = functools.reduce(jnp.add, [
             gemm(part, matrices, None if dense else sizes, transpose_rhs=True, out_dtype=jnp.float32,
                  precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
@@ -1502,18 +1502,45 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     return kernels[0] == kernels[1]
 
 
+_BF16_PARTS: dict[str | None, int] = {}
+
+
+def _bf16_part_count(dtype) -> int:
+    """bf16 parts for `dtype` in an exact fp32 GEMM from `dew.algebra.error.product_precision` (row 5473)."""
+    if jnp.dtype(dtype) != jnp.float32:
+        return parts(dtype)
+    import math
+
+    from dew.algebra.error import product_precision
+    from dew.nn import programs
+
+    target = generation.gpu_target()
+    key = target.generation if target is not None else generation.placed_platform()
+    if key not in _BF16_PARTS:
+        chosen = product_precision(
+            64, 64, 64, jnp.float32,
+            stated=programs.dot_algorithms(jnp.float32),
+            admits=lambda p: (a := programs.dot_arithmetic(p, jnp.float32, jnp.float32)) is not None
+            and a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
+            and not a.imprecise and a.operations >= 6)
+        arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
+        assert arith is not None, chosen
+        _BF16_PARTS[key] = (math.isqrt(1 + 8 * arith.operations) - 1) // 2
+    return _BF16_PARTS[key]
+
+
 def _part_counts(lhs_dtype, rhs_dtype, precision) -> tuple[int, int] | None:
     """The bf16 parts each operand of a product is multiplied as on a family's launch, its operands' values
     `lhs_dtype`'s and `rhs_dtype`'s: where the product is fp32's and asked whole above the default precision,
-    which the families' tensor cores multiply only in TF32, each operand's bf16 parts (`product.parts`: an
-    fp32 operand's three, a 16-bit one's one or two), each pair's product exact and their sums fp32's
-    (`_in_parts`); None where the product is the operands' own (a 16-bit one's, an fp32 one at the default
-    precision TF32's, a declared algorithm's a portable route's)."""
+    which the families' tensor cores multiply only in TF32, each operand's bf16 parts (`_bf16_part_count`:
+    derived via `error.product_precision` for fp32, `product.parts` for 16-bit), each pair's product exact
+    and their sums fp32's (`_in_parts`); None where the product is the operands' own (a 16-bit one's, an
+    fp32 one at the default precision TF32's, a declared algorithm's a portable route's)."""
     if (jnp.promote_types(lhs_dtype, rhs_dtype) != jnp.float32
             or asks_default_precision(precision, configured=True)
             or not exact_products(precision, jnp.float32)):
         return None
-    return parts(lhs_dtype), parts(rhs_dtype)
+    return _bf16_part_count(lhs_dtype), _bf16_part_count(rhs_dtype)
 
 
 def _in_dtype(prologue, dtype, rows, *sides):
@@ -1873,35 +1900,44 @@ def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
 
 
 def _committed_device(operands):
-    """The single committed device of concrete `operands`, or None if uncommitted, empty, or mixed."""
+    """A process-local device of concrete `operands` when every committed leaf shares one platform
+    (including homogeneous multi-host sharding), or None if uncommitted, empty, or mixed-platform."""
     devices = {
         device
         for leaf in jax.tree.leaves(operands)
         if isinstance(leaf, jax.Array) and leaf.committed
         for device in leaf.devices()
     }
-    return next(iter(devices)) if len(devices) == 1 else None
+    platforms = {device.platform for device in devices}
+    if len(platforms) != 1:
+        return None
+    local = next((device for device in devices if device.process_index == jax.process_index()), None)
+    return local if local is not None else jax.local_devices(backend=next(iter(platforms)))[0]
 
 
 def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
     (`xla_products._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
     its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
-    kernel's refusal): an eager call is first traced abstractly as a jit traces it, every branch
-    selecting, then runs its platform's branch eagerly on the operands' committed device where they carry
-    one (so `jax.lax.platform_dependent` resolves its lowering platform natively even under a mismatched
-    `jax.default_device`), op by op as any eager call does: run under a jit of its own (23c59c5fb), a
-    quantized block's reload no longer computed its logits bit for bit (test_wrapped_runs)."""
-    branches, default = xla_products._on_platform(kernel, portable, interpret_on_cpu)
-
-    def dispatched(*operands):
-        return jax.lax.platform_dependent(*operands, default=default, **branches)
+    kernel's refusal): an eager call resolves committed placement before `_on_platform` so CPU-committed
+    operands with `interpret_on_cpu=True` install the interpreter branch even under a GPU default, traces
+    abstractly so every branch selects, then runs eagerly on the committed device (row 11887)."""
+    import contextlib
 
     from jax.core import Tracer
 
+    def run():
+        branches, default = xla_products._on_platform(kernel, portable, interpret_on_cpu)
+
+        def dispatched(*args):
+            return jax.lax.platform_dependent(*args, default=default, **branches)
+
+        return dispatched
+
     if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
-        jax.eval_shape(dispatched, *operands)
-        if (device := _committed_device(operands)) is not None:
-            with jax.default_device(device):
-                return dispatched(*operands)
-    return dispatched(*operands)
+        device = _committed_device(operands)
+        with jax.default_device(device) if device is not None else contextlib.nullcontext():
+            dispatched = run()
+            jax.eval_shape(dispatched, *operands)
+            return dispatched(*operands)
+    return run()(*operands)
