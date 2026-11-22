@@ -159,7 +159,7 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     draws = functools.partial(drawn, dtype, **geometry(case))
     # Drawn on the host: a GPU tier's prepare runs no program on its device (row 7869).
     with jax.default_device(jax.devices("cpu")[0]):
-        (sample,) = draw(dtype, 0, **geometry(case))
+        (sample,) = jax.device_get(draw(dtype, 0, **geometry(case)))
     # Judged under the forms the call runs (`on_the_mainloop`'s fast ones): an fp32 call's rounding reads the
     # product precision they set (`recurrence_chunk.fast_rounding`).
     if not formed('fast', trained)(sample, hooks):

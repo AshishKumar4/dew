@@ -321,7 +321,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     tiles pass the device's shared memory (an fp32 call's solve on an A100's block), whose arithmetic the
     CPU interprets. Drawn on the host: a GPU tier's prepare runs no program on its device (row 7869)."""
     with jax.default_device(jax.devices("cpu")[0]):
-        (operands,) = draw(dtype, 0, **geometry(case))
+        (operands,) = jax.device_get(draw(dtype, 0, **geometry(case)))
     if formed(forms, taken)(operands, hooks):
         return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):

@@ -209,17 +209,16 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
 
     import tier_wire
 
-    # Drawn before its site on the host's CPU: a GPU tier's prepare runs no program on its compile-only
-    # device, and drawn there it left every site of the case unprepared (rows 8054, 11010).
-    host = jax.default_device(jax.devices("cpu")[0])
-    with host:
-        operands = restarting(lambda given: given, regime)(draws(0)[0])
+    # Drawn before its site on the host's CPU, then held as NumPy's: a GPU tier's prepare runs no program on
+    # its compile-only device, and drawn there it left every site of the case unprepared (rows 8054,
+    # 11010); the refusal probed outside the host's context, as the run's device plans the call (row 12003:
+    # probed within it, a native run's template planned for the CPU's interpreted target).
+    with jax.default_device(jax.devices("cpu")[0]):
+        operands, drawn = jax.device_get((restarting(lambda given: given, regime)(draws(0)[0]), draws(0)))
     mosaic = _arms(name, _arms_regime(regime), 'forward', forms)[0]
     dew, reference, truth, portable = _arms(name, _arms_regime(regime), product, forms)
     with under(forms):
-        with host:
-            taken_here = runs(dew, hooks, operands, draws(0), product)
-        if not taken_here:
+        if not runs(dew, hooks, operands, drawn, product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
         label = f'the template, {name} under {regime}, its {product}'
         # The finite draws and the distance against the portable math run the case's programs outside its
