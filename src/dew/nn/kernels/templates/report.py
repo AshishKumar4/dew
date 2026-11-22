@@ -475,6 +475,12 @@ def _launched(identity: str, config: Hashable, reverse: bool) -> str:
     return _digest(f"{identity}|{config!r}|{()!r}{'|reverse' if reverse else ''}")
 
 
+def launch_tracing() -> bool:
+    """Whether a launch is tracing (`launching`), asked without its digest, whose identity a launch traces
+    its own body to form (`launch_digest`): a span within that body asking it recursed without end."""
+    return _TRACING.get() is not None
+
+
 def launch_digest() -> str | None:
     """The digest of the launch tracing (`launching`), its identity, config and mode (`Launch.reverse`: a
     gradient's product or a call's own), which its calls carry beside their kernels' names

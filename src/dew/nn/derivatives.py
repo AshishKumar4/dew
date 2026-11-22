@@ -30,7 +30,6 @@ import inspect
 import json
 import logging
 import math
-import types
 from collections.abc import Callable, Collection, Hashable, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -341,12 +340,7 @@ def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
             tuple(leaf.perturbed if isinstance(leaf, CustomVJPPrimal) else None for leaf in held),
             tuple((position, arg) for position, arg in enumerate(bound.args) if position in fixed),
             len(bound.args))
-        return marked(kind, span, holdable=module_function)(*map(_array, held))
-
-    # Held only where `function` is a module's (an error-free transform, row 10762's cause): a local one (a
-    # kernel's glue) closes over its traced programs and objects, which its statement need not tell apart (row
-    # 11003: two norm activations' glue took each other's program, and its tangent recursed without end).
-    module_function = isinstance(function, types.FunctionType) and "<locals>" not in function.__qualname__
+        return marked(kind, span)(*map(_array, held))
     return call
 
 
@@ -570,10 +564,11 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
     from dew.nn.kernels import options
     from dew.nn.kernels.templates import report
 
-    if report.launch_digest() is not None:
+    if report.launch_tracing():
         # Within a launch's trace (a Mosaic kernel's body): the launch's own, which its held trace holds
         # (`tuning.lowered_once`); keyed here, its pending launch would miss at every launch and pin its
-        # frames (row 11002's review, F4).
+        # frames (row 11002's review, F4). Asked without the launch's digest, whose identity traces the
+        # launch's body, this span within it among its steps (a norm's activation glue recursed without end).
         return None
     try:
         statement = json.dumps(stated(function, f"a marked span of {kind!r}"), sort_keys=True)
@@ -584,14 +579,12 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
             tuple(sorted(np.geterr().items())))
 
 
-def marked[Result](kind: Kind, function: Callable[..., Result], *,
-                   holdable: bool = True) -> Callable[..., Result]:
+def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked_call_p`) over its arguments, a tree of arrays: it
     computes what `function` does, and every transform of it keeps a marked call of `kind`. An eager call
     (`_evaluating`), which no program records, is `function`'s own: traced, every such call traced a program
     a step's steady state paid each step (a decision task's eager scores, train 586). A traced call takes
-    the program a call in the same state traced (`_SPANS`, `_span_key`), where `holdable`; else it is traced
-    at each call (`bound_span`'s of a local function)."""
+    the program a call in the same state traced (`_SPANS`, `_span_key`)."""
     def call(*arguments):
         if _evaluating():
             return function(*arguments)
@@ -609,8 +602,7 @@ def marked[Result](kind: Kind, function: Callable[..., Result], *,
             return [leaf for leaf in produced if not isinstance(leaf, SymbolicZero)]
 
         closed, returned["structure"], returned["zeros"] = _traced_span(
-            _span_key(kind, function, structure, flat) if holdable else None,
-            lambda: jax.make_jaxpr(span)(*flat), returned)
+            _span_key(kind, function, structure, flat), lambda: jax.make_jaxpr(span)(*flat), returned)
         # A value of the enclosing trace the function closes over (a kernel's mask, a reference's operand) is
         # one of the call's operands, leading its arguments, as a closed-over value is no constant there.
         held = [isinstance(const, Tracer) for const in closed.consts]
