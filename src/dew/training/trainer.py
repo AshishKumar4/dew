@@ -191,7 +191,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, computation_differs, resumed_step, run_data
+from dew.training.startup import Startup, computation_differs, refuse_export, resumed_step, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -451,8 +451,7 @@ class Trainer(Generic[Loss, Effects]):
             # step donates the state.
             scale=None if self._loss_scale is None else jax.tree.map(transferred_copy, self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
-            variables=params,
-            opt_state=opt_state,
+            variables=params, opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
             # step donates the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(transferred_copy, select(params, ema.select)),
@@ -833,8 +832,7 @@ class Trainer(Generic[Loss, Effects]):
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints.rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
-        differs = computation_differs(checkpoints.artifact(resume), self._artifact(),
-                                      checkpoints.training(resume), self.objective.training_record())
+        differs = computation_differs(self, checkpoints, resume)
         if differs:
             raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
                              f"computation ({', '.join(differs)}); resume it with the objective, its "
@@ -1523,7 +1521,7 @@ class Trainer(Generic[Loss, Effects]):
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
         objective that names its input field alone declares it first (`_declare_input`), a resume's from the
         first batch its saved position admits (`_resumed_position`)."""
-        checkpoints = self.checkpoints
+        checkpoints, _ = self.checkpoints, refuse_export(self)
         resumed = None if initial is not None else self._resumed(run, resume)
         self._declare_input(lambda: self._primed_first(run, dataset,
                                                        None if resumed is None else resumed.position))
@@ -2372,8 +2370,8 @@ class Trainer(Generic[Loss, Effects]):
         return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
                 # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
                 "rung": {**self._compiler.checkpoint_rung(), "host": list(self.layout.host)},
-                "artifact": self._artifact(), "training": self.objective.training_record(),
-                "boxed": self._boxed_axes(),
+                "artifact": self._artifact(), "training": self.phase_passes.training_record(self.objective),
+                "boxed": self._boxed_axes(), "held_apart": self._staging.apart,
                 "rollout": None if weights_only else _rollout_saved(self.rollout)}
 
     def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,

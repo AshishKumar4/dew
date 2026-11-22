@@ -251,3 +251,50 @@ def test_a_judge_judges_a_tests_sites_from_its_map_tasks_records_alone(tmp_path,
     monkeypatch.setattr(map_judge, "commit", lambda: "another")
     with pytest.raises(PoolRefused):
         judged(tmp_path / "on par", lambda: judged_from_records(test))
+
+
+def test_a_map_task_past_a_sites_first_draw_runs_no_arm_again(monkeypatch, tmp_path):
+    """A site's arms are held to be functions of their inputs once a site, each run again on its first draw
+    (`reference_error._of_its_inputs`); a map task whose draws start past that draw runs each arm once a
+    draw, where every task repeated its own first draw's arms (rows 7603, 7604: eight repeats a site at one
+    draw a task, 190 s each on a sharded Mosaic site). Each run of the reference counted as it executes."""
+    from check1_wire import DRAWS, RECORDS
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_judged.py::test_judged (call)")
+    ran = []
+
+    def reference(x, w):
+        jax.debug.callback(lambda: ran.append(None))
+        return jnp.matmul(x, w)
+
+    def task(start: int, stop: int) -> int:
+        ran.clear()
+        monkeypatch.setenv(DRAWS, f"{start}:{stop}")
+        monkeypatch.setenv(RECORDS, str(tmp_path / str(start)))
+        assert_as_exact(jnp.matmul, reference, a_product_draw, "a product", seeds=16, truth_fn=jnp.matmul)
+        return len(ran)
+
+    first = task(0, 2)
+    assert task(2, 4) < first
+
+
+def test_a_later_stage_runs_no_arm_again():
+    """A check's later stage draws past its site's first draw (`assert_moves`' second stage, as a staged
+    check's, a sizing's later blocks and a null run's later runs do), so it runs each arm once a draw: the
+    first-draw repeat, each arm held to its inputs, is the site's alone (row 10880: every driver but the
+    site's own repeated its stage's first draw's arms by a default). Each run of the original counted as it
+    executes; a change that moves nothing is drawn over both stages."""
+    from reference_error import assert_moves
+
+    from dew.parity_stages import staged_units
+
+    ran = []
+
+    def original(x, w):
+        jax.debug.callback(lambda: ran.append(None))
+        return jnp.matmul(x, w)
+
+    with pytest.raises((AssertionError, GateFailure)):
+        assert_moves(original, jnp.matmul, a_product_draw, "a change that moves nothing", seeds=16,
+                     truth_fn=jnp.matmul)
+    assert len(ran) == staged_units(16) + 1

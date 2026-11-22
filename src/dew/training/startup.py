@@ -26,7 +26,7 @@ from dew.training.evaluation import EvalSuite, Split
 from dew.training.runtime import ready_process
 
 if TYPE_CHECKING:
-    from dew.checkpoints import Resume
+    from dew.checkpoints import Checkpoints, Resume
     from dew.training.trainer import Trainer
 
 _log = logging.getLogger(__name__)
@@ -158,9 +158,8 @@ def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "
 
     def continued() -> int | None:
         step, held = checkpoints.resumed(resume), max(checkpoints.committed(), default=None)
-        if step is None and held is not None and resume == "auto" and computation_differs(
-                checkpoints.artifact(held), trainer._artifact(), checkpoints.training(held),
-                trainer.objective.training_record()):
+        if (step is None and held is not None and resume == "auto"
+                and computation_differs(trainer, checkpoints, held)):
             raise ValueError(f"resume='auto' starts a run afresh here, and {checkpoints.directory} holds "
                              f"another run's model at step {held}, which no run resumes; give the new run a "
                              "directory of its own")
@@ -169,7 +168,34 @@ def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "
     return agreed_same("newest checkpoint", continued)
 
 
-def computation_differs(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
+def refuse_export[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]") -> None:
+    """Refused as a run starts, not at its last checkpoint: a run whose checkpoints export its model
+    (`Checkpoints.export_model`) and whose pipeline's stages each hold their rows on processes of the pool
+    apart (`StageLocal.apart`, `export_refusal`), which Orbax's standard layout writes none of."""
+    checkpoints = trainer.checkpoints
+    if checkpoints is None or not checkpoints.export_model or not trainer._staging.apart:
+        return
+    from dew.checkpoints._exported import export_refusal
+    from dew.mesh import STAGE_AXIS
+
+    if (refusal := export_refusal(trainer.device_mesh, STAGE_AXIS)) is not None:
+        raise ValueError(refusal)
+
+
+def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", checkpoints: "Checkpoints",
+                                         step: int) -> list[str]:
+    """Where the computation `checkpoints`' `step` trained and `trainer`'s differ (`differing_records`):
+    their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
+    a pass count's sampled law among it, row 10783)."""
+    saved, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
+    # A law the checkpoint records binds a run that draws none: a fixed-pass resume would stop drawing (a
+    # checkpoint that records none, a fixed-pass run's, any run resumes).
+    dropped = (["training.sampled_passes"] if isinstance(saved, dict) and "sampled_passes" in saved
+               and "sampled_passes" not in now else [])
+    return differing_records(checkpoints.artifact(step), trainer._artifact(), saved, now) + dropped
+
+
+def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
     """Where the computation a checkpoint trained and this run's differ: each path of its objective's class
     or its model's record in its inference record (`Objective.inference_record`), the fields that say how
     layers execute aside (the configured path's own `RunConfig.EXECUTED`), and each setting of what its
@@ -194,7 +220,7 @@ def computation_differs(saved: JSON, now: JSON, trained: JSON, training: JSON) -
 
 
 def _differing(before: JSON, after: JSON, path: str) -> list[str]:
-    """Each path at which `before` and `after` both state a value and disagree (`computation_differs`)."""
+    """Each path at which `before` and `after` both state a value and disagree (`differing_records`)."""
     from dew.nn.backbones.decoder_stack import Loop
 
     # A loop's passes are the run's to set, a phase's own (`Loop.PASSED`).

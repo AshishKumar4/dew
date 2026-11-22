@@ -29,7 +29,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn import derivatives
+from dew.nn import derivatives, programs
 from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
@@ -89,17 +89,47 @@ def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, b
         write_rows(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=ieee))
 
 
+TRITON_ALGORITHMS = tuple(preset for preset in jax.lax.DotAlgorithmPreset
+                          if preset.supported_lhs_types is not None
+                          and preset is not jax.lax.DotAlgorithmPreset.F64_F64_F64)
+"""The dot algorithms Pallas's Triton lowering runs as named (`_dot_general_lowering`): TF32's one and three
+passes and IEEE fp32 as `tt.dot`'s input precisions, each 16-bit one as its operands' own product, and a bf16
+split of fp32 operands (X3, X6, X9) as its parts' bf16 products; of those naming their operand types, it
+refuses fp64's (the default and the FP8 ones name none)."""
+
+
+def _upstream(dtype, ieee: bool) -> jax.lax.DotAlgorithmPreset:
+    """The algorithm fla's `tl.dot` runs a product of `dtype` operands in: a 16-bit operand's own product
+    summed in fp32 (`programs.own_preset`; no `input_precision` names another); an fp32 one's one TF32, its
+    default `input_precision` and its `SOLVE_TRIL_DOT_PRECISION` on a GPU that runs TF32 (fla 0.5.2
+    gated_delta_rule/chunk_fwd.py), or IEEE where it states `allow_tf32=False` (`ieee`: `recompute_w_u`'s
+    `A @ v`)."""
+    if dtype == jnp.float32:
+        return jax.lax.DotAlgorithmPreset.F32_F32_F32 if ieee else jax.lax.DotAlgorithmPreset.TF32_TF32_F32
+    own = programs.own_preset(dtype)
+    if own is None:
+        raise ValueError(f"fla's products take fp32 or 16-bit float operands, not {jnp.dtype(dtype)}")
+    return own
+
+
+def _precision(rows: int, depth: int, columns: int, dtype, ieee: bool) -> jax.lax.DotAlgorithmPreset:
+    """The algorithm a port's `[rows, depth] @ [depth, columns]` product of `dtype` operands runs in: of
+    those Triton runs as named (`TRITON_ALGORITHMS`), the cheapest on the target it traces for at least as
+    exact as fla's own (`_upstream`; `dew.algebra.error.at_least`, `product_precision`, row 5473), chosen
+    as each product traces, so a process tracing for two GPUs takes each one's. The algebra is read here,
+    not as the port loads."""
+    from dew.algebra import error
+
+    admits = error.at_least(_upstream(dtype, ieee), dtype)
+    return error.product_precision(rows, depth, columns, dtype, admits=admits, stated=TRITON_ALGORITHMS)
+
+
 def _dot(a, b, *, exact: bool, ieee: bool = False):
-    """`a @ b`, same-dtype operands, with fp32 accumulation, at fla's own precision; reject mismatches
-    before any interpreted product, so CPU tests catch dots Triton rejects. Each operand dtype names its
-    products, so no global `jax_default_matmul_precision` changes the kernel (the suite's 'highest' made
-    every fp32 product IEEE):
-    - bf16 or fp16: exact products summed in fp32 (fla's `tl.dot` of narrow operands); no precision.
-    - fp32 with `ieee`: IEEE products, fla's `allow_tf32=False` dots (`recompute_w_u`'s `A @ v`).
-    - fp32 otherwise: one TF32, fla's, its `tl.dot`'s default `input_precision` for fp32 and its
-      `SOLVE_TRIL_DOT_PRECISION` on a GPU that runs TF32 (fla 0.5.2 gated_delta_rule/chunk_fwd.py), held
-      to fla's own kernels (the recurrence matrix's upstream oracle). An fp32 call took BF16x6 here, an
-      fp32 product's accuracy fla's dots do not take.
+    """`a @ b`, same-dtype operands, with fp32 accumulation, at least as exact as fla's own product
+    (`_precision`); reject mismatches before any interpreted product, so CPU tests catch dots Triton
+    rejects. Each product names its algorithm, so no global `jax_default_matmul_precision` changes the
+    kernel (the suite's 'highest' made every fp32 product IEEE). An fp32 call took BF16x6 here, an fp32
+    product's accuracy fla's dots do not take.
     - interpreted (`exact`): the product as the interpreted template issues it (`product.interpreted`):
       an IEEE one summed in float64 and rounded once, every other one as Dew sums an fp32 contraction
       (`precision.accumulated`), its products exact; XLA's CPU dot, which picks its fp32 accumulation by
@@ -114,8 +144,7 @@ def _dot(a, b, *, exact: bool, ieee: bool = False):
         product = Product(jnp.dtype(jnp.float32), promoted=ieee, refusal=None)
         return interpreted(product, a.astype(jnp.float32), b.astype(jnp.float32),
                            (((a.ndim - 1,), (0,)), ((), ())))
-    wide = jnp.dtype(a.dtype) == jnp.float32
-    precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT) if wide else None
+    precision = _precision(a.shape[-2], a.shape[-1], b.shape[-1], jnp.dtype(a.dtype), ieee)
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
@@ -848,14 +877,12 @@ def _summed_back(index, pairs, after, *, exact: bool):
 
 
 def _exactly(x, mask, exact: bool):
-    """`x @ mask` fp32 for a mask of zeros and ones, each product exact: bf16x6's three parts of an fp32
-    value its 24 bits, which one product of IEEE fp32 would compile to FMA loops on sm80; interpreted,
-    IEEE fp32 (`_dot`)."""
+    """`x @ mask` fp32 for a mask of zeros and ones, each product exact: at least IEEE fp32's (`_dot`'s
+    `ieee`), whatever is cheapest on the target (by the cost model three bf16 parts' six products on sm80
+    and sm90, where one IEEE product compiles to FMA loops); interpreted, as `_dot` sums an fp32
+    contraction."""
     x = x.astype(jnp.float32)
-    if exact:
-        return _dot(x, mask, exact=True)
-    return jnp.dot(x, mask, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
-                   preferred_element_type=jnp.float32)
+    return _dot(x, mask, exact=True) if exact else _dot(x, mask, exact=False, ieee=True)
 
 
 def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dp_ref, da_ref, gl_ref,

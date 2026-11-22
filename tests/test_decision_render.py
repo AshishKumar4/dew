@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from merging_tokenizer import MERGED_ID, Merging
 
 from dew._records import JSON
 from dew.data.text import ByteTokenizer, HFTokenizer
@@ -418,3 +419,22 @@ def test_a_cut_takes_the_longest_state_a_merge_lets_fit():
     tight = dataclasses.replace(empty, max_len=len(bare.tokens))
     [row] = tight.rows(laya, SPECIALS, "ta", {"team": TEAM})
     assert tight.fits(row) and row.state_kept >= 1
+
+
+def test_a_state_cut_in_a_row_encoded_whole_takes_a_longer_cut_whose_row_encodes_shorter():
+    """A question row encoded whole whose room is one token short of the state "aaxyq" whole: the cut its
+    share counts ("aa", the state's own tokens against the room) grows past "aax", whose row overflows, to
+    "aaxy", whose "xy" merges with the "z" written after it into one token and whose row fits (row 9060:
+    the growth stopped at the first longer cut that overflowed)."""
+    _, _, _, *question = release().segments
+
+    def row(state: str, max_len: int):
+        layout = SegmentLayout.state_first_row(max_len=max_len, labels=release().labels, unit="whole",
+                                               segments=(Text("S:"), State(), Text("z\n"), *question))
+        [laid] = layout.rows(Merging(b"xyz"), SPECIALS, state, {"team": TEAM})
+        return laid
+
+    # The row of the cut "aaxy" kept whole, its "xyz" one token: the room the cut state is given.
+    fitting = row("aaxy", 1 << 16)
+    assert MERGED_ID in list(fitting.tokens)
+    assert list(row("aaxyq", len(fitting.tokens)).tokens) == list(fitting.tokens)

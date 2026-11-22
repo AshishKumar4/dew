@@ -62,10 +62,11 @@ def models():
     return CausalTransformer(**META["student"]), CausalTransformer(**META["teacher"])
 
 
-def fixture_objective(arrays: dict, **overrides) -> tuple[DistillationObjective, dict]:
-    """The objective over the fixture's variables, its projections included."""
+def fixture_objective(arrays: dict, student_type=LMObjective,
+                      **overrides) -> tuple[DistillationObjective, dict]:
+    """The objective over the fixture's variables, its projections included, its student a `student_type`."""
     student_model, teacher_model = models()
-    student = LMObjective(student_model, SEQ, pad_id=META["pad_id"], ema_decay=None,
+    student = student_type(student_model, SEQ, pad_id=META["pad_id"], ema_decay=None,
                           variables=tree(arrays, "student/"))
     teacher = LMObjective(teacher_model, SEQ, ema_decay=None, variables=tree(arrays, "teacher/"))
     settings = {"alpha": META["alpha"], "temperature": META["temperature"], "beta": META["beta"],
@@ -184,16 +185,20 @@ def student_pullback(*, wide: bool):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("tiled", [False, True], ids=["whole", "tiled"])
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
-def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
+def test_the_loss_and_its_terms_match_the_maxtext_reference(kind, tiled):
     """Loss and every reported term on par with the reference's own float32
     run over drawn students, teachers and projections (check 1): the truth
     runs the reference in float64 on the student's float64 forward, the
     reference in float32 on its float32 one, both beside the teacher's
     forward that Dew runs (`teacher_outputs`). Padding sits in the batch, so
-    the mask is part of what agrees."""
+    the mask is part of what agrees. With the student's head tiled (row 9067), the full KL reads both
+    models' logits a tile of positions at a time, and the terms agree as they do whole."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
+    if tiled:
+        assert objective.tile_head((3, META["student"]["vocab_size"])) is not None
     ids = jnp.asarray(arrays["tokens"][:, :-1])
     named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss", "distill/kl": "kl_div_at_T",
              "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
@@ -714,3 +719,98 @@ def test_a_teacher_with_another_tokenizer_of_the_same_size_is_refused(tmp_path):
     DistillationObjective(student, teacher, tokenizers=(str(chat), str(chat)))
     with pytest.raises(ValueError):
         DistillationObjective(student, teacher, tokenizers=(str(chat), str(swapped)))
+
+
+def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
+    """A distillation whose student's head is tiled computes its full KL's gradient holding no
+    `[B, S, vocab]` logits of either model, where whole its program holds them (row 9067: both whole
+    logits tensors were materialized whatever the rung said)."""
+    arrays = fixture()
+    objective, params = fixture_objective(arrays)
+    batch = fixture_batch(arrays)
+    rows, positions = batch[TEXT_KEY].shape[0], batch[TEXT_KEY].shape[1] - 1
+    vocab = META["student"]["vocab_size"]
+
+    import jax.extend
+
+    whole = {(rows, positions, vocab), (rows * positions, vocab)}
+
+    def holds_whole(program) -> bool:
+        """Whether any value `program` computes, in any of its nested programs, is a whole logits tensor."""
+        def walk(jaxpr) -> bool:
+            for equation in jaxpr.eqns:
+                if any(tuple(getattr(var.aval, "shape", ())) in whole for var in equation.outvars):
+                    return True
+                inner = [value for held in equation.params.values()
+                         for value in (held if isinstance(held, tuple) else (held,))
+                         if isinstance(value, (jax.extend.core.Jaxpr, jax.extend.core.ClosedJaxpr))]
+                if any(walk(getattr(value, "jaxpr", value)) for value in inner):
+                    return True
+            return False
+        return walk(jax.make_jaxpr(program)(params).jaxpr)
+
+    def gradient(objective):
+        return lambda params: jax.grad(lambda held: objective.scalar_loss(held, batch, step_at())[0])(params)
+
+    tiled, _ = fixture_objective(arrays)
+    assert tiled.tile_head((3, vocab)) is not None
+    assert holds_whole(gradient(objective)) and not holds_whole(gradient(tiled))
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("axes", [{}, {"sequence": 2}], ids=["rows", "rows-and-positions"])
+def test_a_tiled_full_kl_over_tokens_split_across_devices_gathers_no_states(axes):
+    """The tiled full KL (`_tiled_divergence`) over final states whose rows, or rows and positions, are split
+    across four devices compiles with no all-gather of either model's states: each device runs the slices
+    of its own tokens (row 9067: a slice of the flattened token axis gathered `[B*S, D]` onto every device,
+    and a slice of the positions gathered a device's `[B/dp, S, D]` where the positions were split). The
+    KL's agreement with the whole logits' is the reference test's, tiled."""
+    import math
+
+    from sharded import collectives
+
+    from dew.objectives.base import Prediction
+    from dew.training import MeshSpec
+
+    arrays = fixture()
+    objective, _ = fixture_objective(arrays)
+    vocab, width, rows, positions = META["student"]["vocab_size"], 8, 4, 12
+    assert objective.tile_head((3, vocab)) is not None
+    keys = jax.random.split(jax.random.key(0), 4)
+    student_table, teacher_table = (jax.random.normal(key, (width, vocab)) for key in keys[:2])
+    states = [jax.random.normal(key, (rows, positions, width)) for key in keys[2:]]
+    mesh = MeshSpec(**axes).build(jax.devices()[:4])
+    split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(
+        "data", "sequence" if "sequence" in axes else None))
+
+    def divergence(student_states, teacher_states):
+        student = Prediction(None, None, None, (), final=student_states, head=lambda h: h @ student_table)
+        teacher = Prediction(None, None, None, (), final=teacher_states, head=lambda h: h @ teacher_table)
+        finite = jnp.ones((rows, positions), bool)
+        return objective._tiled_divergence(student, teacher, finite, jnp.asarray(2.0))
+
+    with jax.set_mesh(mesh):
+        compiled = jax.jit(divergence, in_shardings=(split, split)).lower(*states).compile()
+    gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
+    local = rows * positions * width // 4
+    assert not any(math.prod(shape) > local for shape in gathered), gathered
+
+
+def test_a_tiled_students_full_kl_beside_a_model_scoring_through_more_than_its_head_reads_whole_logits():
+    """A distillation whose student's head is tiled and whose student scores through more than its head (an
+    adaptation, which states no final states or head, `predicts_by_head`) trains, its full KL read off the
+    whole logits as it was before the head was tiled (row 10983: the tiled KL refused it at its first trace,
+    which the planner's tile rung reached)."""
+
+    class Adapted(LMObjective):
+        """An LM objective whose prediction, as an adapted model's, states no final states or head."""
+
+        @property
+        def predicts_by_head(self) -> bool:
+            return False
+
+    arrays = fixture()
+    objective, params = fixture_objective(arrays, student_type=Adapted)
+    assert objective.tile_head((3, META["student"]["vocab_size"])) is not None
+    loss, _ = objective.scalar_loss(params, fixture_batch(arrays), step_at())
+    assert np.isfinite(float(loss))

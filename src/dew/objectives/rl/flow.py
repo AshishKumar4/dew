@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from typing import TYPE_CHECKING
 
 import jax
@@ -333,9 +333,13 @@ class GroupedRollout:
         raise NotImplementedError
 
     def _program_name(self) -> str:
-        """The name the objective holds the rollout's generation by (`Objective.program`): everything
-        `_generate_impl` computes by beside its inputs, its count of time points by default."""
-        return f"{type(self).__name__} over {self.steps} time points"
+        """The name the objective holds the rollout's generation by (`Objective.program`): the rollout's
+        own fields, everything `_generate_impl` may compute by beside its inputs, its objective (which
+        holds the program) and its reward (read after generation) apart, so a field a method reads names
+        its own program with no list to keep (row 10836)."""
+        held = ", ".join(f"{field.name}={getattr(self, field.name)!r}" for field in dataclass_fields(self)
+                         if field.name not in ("objective", "reward"))
+        return f"{type(self).__name__}({held})"
 
     def _training_rows(self, generated, context: Batch, spatial: Mapping[str, np.ndarray],
                        rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
@@ -528,10 +532,6 @@ class FlowRollout(GroupedRollout):
     def _selected(self) -> int:
         """How many of the walk's transitions train: its first `train_steps`, every one where None."""
         return self.steps - 1 if self.train_steps is None else self.train_steps
-
-    def _program_name(self) -> str:
-        """`GroupedRollout`'s, and the trained prefix its generation hands on (`_selected`, row 10821)."""
-        return f"{super()._program_name()}, its first {self._selected()} trained"
 
     def _training_rows(self, generated: FlowTrajectory, context: Batch, spatial: Mapping[str, np.ndarray],
                        rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:

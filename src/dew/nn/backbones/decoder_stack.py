@@ -35,6 +35,7 @@ from dew.nn.inspection import QK
 from dew.nn.protocols import StagedStacks
 
 from .. import in_backward
+from ..cross_pass import CrossPass
 from ..host_memory import fetched, fetched_at, on_host
 from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
@@ -263,6 +264,14 @@ class Loop:
     pass overwriting the step's keys and values the pass before wrote, so
     a step's earlier tokens read the last pass's (Dory's last-loop cache):
     each pass starts from the cache as the step entered it (`SharedPassView`).
+
+    With `messages` (`dew.nn.cross_pass`) every pass enters the block at the prelude's output, the block's
+    own input, and the passes couple through the bank of block summaries the pass before left alone: each
+    later pass's sublayer inputs merge it in (`CrossPass`, `CrossPassMerge`), its gates drawn at zero, so a
+    decoder gains passes without changing what it computes. Each pass reads the block's input itself, so
+    the loop takes no step norm, reinjection or implicit step; under `backprop_steps` the cut stops the
+    bank, so the prelude still trains through every pass after it. Its merges are parameters, so a resume
+    compares it (not `PASSED`).
     """
     steps: int
     step_norm: bool = True
@@ -276,6 +285,7 @@ class Loop:
     exit_threshold: float | None = None
     exits: bool = False
     theta_passes: int | None = None
+    messages: CrossPass | None = None
 
     PASSED: ClassVar[tuple[str, ...]] = ("steps", "backprop_steps", "remat", "implicit", "exit_threshold",
                                          "exits")
@@ -313,6 +323,12 @@ class Loop:
         if self.theta_passes is not None and self.steps > self.theta_passes:
             raise ValueError(f"a loop of {self.steps} passes reads a θ row for each later pass, and its θ "
                              f"holds rows for {self.theta_passes} passes: run at most {self.theta_passes}")
+        if self.messages is not None and (self.step_norm or self.reinject or self.implicit):
+            raise ValueError("a loop passing messages enters every pass at the block's input and couples its "
+                             "passes through their bank alone: it takes no step_norm, reinject or implicit")
+        if self.messages is not None and self.layers is not None and self.layers[0] == self.layers[1]:
+            raise ValueError(f"a loop passing messages banks its block's summaries, and the block "
+                             f"{self.layers} holds no layer")
         if self.exit_threshold is not None and (not self.exit_gate or not 0 < self.exit_threshold <= 1):
             raise ValueError("an exit threshold is a cumulative probability in (0, 1] over the passes the "
                              f"exit gate weighs, got {self.exit_threshold} with exit_gate={self.exit_gate}")
@@ -437,7 +453,7 @@ def _run_module(block: Block, specs: Sequence[LayerSpec], first: int, count: int
 
 def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[LayerSpec], x, *, fetching: bool,
                   train: bool, decode: bool, kv_store, per_layer_input, attention_metadata,
-                  remats: Sequence[RematPolicy | None]):
+                  remats: Sequence[RematPolicy | None], prior_bank=None):
     """`run_stack` without the inference prefetch: each run of one layer
     called as the plain loop calls it, and each longer run under flax's
     scan, a periodic run's (a `PipelineStage` of its period) over its repeats. Training, or a
@@ -458,8 +474,10 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # transform the writes come back explicitly, as `DecoderBlock.__call__`'s remat returns
             # them, so no tracer of the transform leaks through the dict.
             written = None if store is None else dict(store)
+            # A looped pass's bank (`dew.nn.cross_pass`), which every layer of the run reads alike.
+            banked = {} if prior_bank is None else {'prior_bank': prior_bank}
             out = layer(carry, train=train, decode=decode, kv_store=written,
-                        per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+                        per_layer_input=per_layer_input, attention_metadata=attention_metadata, **banked)
             changes = {} if written is None or store is None else {
                 name: value for name, value in written.items() if value is not store.get(name)}
             return out, changes
@@ -476,8 +494,11 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             x, written = step(run, x, None if inputs is None else inputs.layer(0), store)
             if store is not None:
                 store.update(written)
-        elif _updates_in_backward(run, run.specs if periodic else (specs[first],), train=train,
-                                  decode=decode, fetching=fetching, store=store, inputs=inputs):
+        elif prior_bank is None and _updates_in_backward(
+                run, run.specs if periodic else (specs[first],), train=train, decode=decode,
+                fetching=fetching, store=store, inputs=inputs):
+            # A run reading a pass's bank scans as below: the in-backward run applies a layer on its weights
+            # and the call's metadata alone (`_updated_in_backward`).
             x = _updated_in_backward(run, x, attention_metadata=attention_metadata, remat=remat)
         else:
             # A longer run's layers share keys or own them, so they only read the store: a provider
@@ -582,7 +603,7 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
               kv_store, per_layer_input, attention_metadata=None, banked: bool = False,
-              periods: Sequence[int] = ()):
+              periods: Sequence[int] = (), prior_bank=None):
     """Run the layers over `x`, one run at a time as `groups` says.
 
     A run of one is `layers[first]`; a longer run is one block named for its
@@ -608,6 +629,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     `periods` is each run's period (`StackView.periods`): a run of a longer
     one repeats its period's layers under the scan (`_run_module`), which
     the stack runs over resident weights alone (`CausalTransformer.stack`).
+
+    `prior_bank` is a looped pass's bank of the pass before's block summaries (`dew.nn.cross_pass`), which
+    every layer reads alike; a run read a layer at a time from banks or the host takes none.
     """
     if any(period > 1 for period in periods):
         periodic = [layers[first] if count == 1 else _run_module(block, specs, first, count, period)
@@ -615,7 +639,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         return _scanned_runs(periodic, groups, specs, x, fetching=False, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
                              attention_metadata=attention_metadata,
-                             remats=[layers[first].remat for first, _ in groups])
+                             remats=[layers[first].remat for first, _ in groups], prior_bank=prior_bank)
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
     streaming = any('streaming' in run.variables for run in runs)
@@ -626,7 +650,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
                              attention_metadata=attention_metadata,
-                             remats=[layers[first].remat for first, _ in groups])
+                             remats=[layers[first].remat for first, _ in groups], prior_bank=prior_bank)
+    if prior_bank is not None:
+        raise LayoutRefused("a looped pass reads the bank its pass before left in every layer, and a forward "
+                            "reading its layers one at a time from banks or the host reads none: run the "
+                            "loop's layers resident")
 
 
     def read_only(run: DecoderBlock) -> list[str]:
@@ -850,13 +878,14 @@ class PipelineStage(nn.Module):
 
     @nn.compact
     def __call__(self, x, per_layer_input=None, attention_metadata=None, *, train: bool | None = None,
-                 decode: bool = False, kv_store=None):
+                 decode: bool = False, kv_store=None, prior_bank=None):
         # A period's scan calls it as it calls a layer, which leaves nothing a later layer reads.
         assert kv_store is None, "a stage's or a period's layers leave nothing a later layer reads"
         # Singleton layers and scanned runs alike are built from this stage's own indices.
         return run_stack(self.layers, self._block, self.specs, self.groups, x,
                          train=self.train if train is None else train, decode=decode, kv_store=None,
-                         per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+                         per_layer_input=per_layer_input, attention_metadata=attention_metadata,
+                         prior_bank=prior_bank)
 
 
 class BlockStage(nn.Module):

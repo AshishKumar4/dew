@@ -25,7 +25,7 @@ import kernel_matrix
 import numpy as np
 import pytest
 from fla_sites import RECORDED, the_template_is_as_exact_as_fla
-from generation_support import COMPILES_ON_CPU, lowers
+from generation_support import COMPILES_ON_CPU, lowers, production_refusals
 from identity_cover import COVER_PRECISION, IDENTITY_COVER
 from kernel_compile import gate_generations
 from reference_error import assert_as_exact, declared_seeds
@@ -1551,9 +1551,11 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     once a spilling launch steps down as a run's compile steps it (`stepped_down`,
     `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's shared
     memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
-    rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds for its
-    own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the newer targets are
-    the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
+    rule's 16-bit call and Kimi's, the production cells, derive tiles on every family, their fast backward
+    holding wherever no open row declares it refused (`production_refusals`: a blanket pass on its refusal
+    left a GPU's training cell compiling nothing). A GPU host's ptxas builds for its own GPU and those
+    before it, not a newer one's (an A100's refuses sm_90a), so there the newer targets are the CPU suite's
+    alone. A test a group of cases (`GATE_GROUPS`)."""
     if jax.default_backend() == 'gpu':
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
@@ -1563,9 +1565,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
         cases, found = stepped_down(target, group, plans, refused, apart)
     # Every case compiles and reports; a required case's spill fails, and a case whose launches are held
     # apart fails launch by launch.
-    failed = resource_failures(cases, found, plans, apart)
-    failed += [f"{case}: no tiles derived" for case in refused
-               if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
+    failed = resource_failures(cases, found, plans, apart) + production_refusals(target, group, refused)
     if target == 'sm100':
         failed += [f"{case}: no tiles derived" for case in refused
                    if case.startswith("a write gate bfloat16")]
@@ -1618,9 +1618,8 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     certification reads too, `report.Binary.refused`) at a config not refused before, its launch refused
     (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
-    derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
-    first derivation, before any compile); the plans and launches held apart are those of the cases
-    returned."""
+    derives none and leaves the template. `refused` holds the calls the template refuses, at its first
+    derivation or a retry's; the plans and launches held apart are those of the cases returned."""
     from kernel_compile import compile_mosaic_kernels
 
     launched: dict = {}
@@ -1649,7 +1648,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         plans.clear()
         apart.clear()
         launched.clear()
-        cases = compiled_cases(target, plans, [], apart, only=group, launched=launched)
+        cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
         found = compile_mosaic_kernels(cases, target)
     return cases, found
 
@@ -1681,7 +1680,7 @@ def test_a_launchs_call_and_its_gradients_product_are_two_launches_in_either_ord
     assert digests[False] != digests[True]
     launches = {reverse: report.traced(found) for reverse, found in digests.items()}
     assert {reverse: launch.reverse for reverse, launch in launches.items()} == {False: False, True: True}
-    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse)
+    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse, launch.provenance)
             for launch in launches.values()}
     assert len(keys) == 2 or keys == {None}, keys
 
@@ -2195,9 +2194,8 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     found = report._misses_of([dataclasses.replace(binary, frame=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
-    stored = [tuning.stored_verdict(report.verdict_target(device),
-                                    report._verdict_key(identity, rung, refused.reverse))
-              is not None for rung in rungs]
+    keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance) for rung in rungs]
+    stored = [tuning.stored_verdict(report.verdict_target(device), key) is not None for key in keys]
 print(json.dumps({"stored": stored}))
 """
 """Two rungs of one launch's producer ladder lowered for a compile-only H100 with certification on, the

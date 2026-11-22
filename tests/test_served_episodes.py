@@ -185,7 +185,8 @@ def test_an_episode_schedulers_cohort_draws_what_its_policy_draws_whole(kind, se
     prompt by sampling, its model declaring pages, it serves over those pages (`served_layout`), its later
     turns extending whole pages of their rows' histories, which they read back and prefill only what
     follows; one searching beams, which a server over pages does not draw, it draws whole, its policy's
-    decode over its model's cache unpaged (`Regrouping`, row 7934). Either way its cohort is what the policy
+    decode over its model's cache as a search lays it (`Regrouping`, `regrouped_layout`: an undivided pool
+    keeps its pages, sized for the search, rows 7934 and 8508). Either way its cohort is what the policy
     collects prefilling every turn whole: every turn's context and action token for token, over drawn
     weights (row 7905); a served cohort's likelihoods are held to check 1 beside."""
     from dew.objectives.rl import GRPOObjective
@@ -216,6 +217,35 @@ def test_an_episode_schedulers_cohort_draws_what_its_policy_draws_whole(kind, se
         assert int(np.max(np.sum(scheduled["contexts"] >= 0, axis=-1))) > 2 * PAGE
         for name in ("contexts", "tokens"):
             np.testing.assert_array_equal(scheduled[name], whole[name], err_msg=f"seed {seed}: {name}")
+
+
+@pytest.mark.parametrize(("max_seq_len", "n", "paged"), [(64, 1, True), (48, 1, False), (64, 2, False)],
+                         ids=["no pages declared", "too short for a page", "two samples a prompt"])
+def test_an_episode_schedulers_cohort_over_a_model_declaring_no_pages_is_served_where_pages_share(
+        max_seq_len, n, paged):
+    """An episode scheduler over a policy whose model declares no pages serves its cohort over pages of 64
+    where a server over them shares its turns' histories (`served_layout`'s 'shared'): a model whose
+    max_seq_len holds a turn's row in whole pages; one too short to (a row of 36 slots past 48's whole
+    pages of 64) and a policy drawing two samples a prompt draw it whole. Either way its cohort is what the
+    policy collects prefilling every turn whole (row 7947)."""
+    from dew.objectives.rl import GRPOObjective
+    from dew.objectives.rl.scheduler import RolloutScheduler
+
+    model = attention_model().clone(max_seq_len=max_seq_len)
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    policy = TextGeneration(model, variables, n=n)
+    collector_ = RolloutScheduler.episodes(
+        policy, conversations, lambda episode: 1.0, objective=GRPOObjective(model, seq_len=PROMPT + RESPONSE),
+        max_prompt_tokens=PROMPT, max_new_tokens=RESPONSE, max_turns=TURNS, sampling=SAMPLED
+    ).acquisition.collector
+    layout = collector_.kv_cache
+    assert (layout.page_size if layout is not None else None) == (64 if paged else None)
+    if n == 1:
+        whole = EpisodeCollector(policy, conversations, lambda episode: 1.0, PROMPT, RESPONSE, TURNS,
+                                 sampling=SAMPLED)
+        scheduled, drawn = collected(collector_, variables), collected(whole, variables)
+        for name in ("contexts", "tokens"):
+            np.testing.assert_array_equal(scheduled[name], drawn[name], err_msg=name)
 
 
 def test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled_whole(caplog):

@@ -652,27 +652,17 @@ def test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle(tmp_path, s
         np.testing.assert_array_equal(np.asarray(guided_leaf), np.asarray(unguided_leaf))
 
 
-def test_the_executable_a_profile_replaces_goes_with_its_program():
+@pytest.mark.parametrize("earlier", [False, True])
+def test_the_executable_a_profile_replaces_goes_with_its_program(earlier):
     """Under AutoPGLE a profile of the admitted step's runs compiles its program again, and the run keeps
     the guided executable alone: once the compile returns, the one the plan was admitted with is freed
     and the backend holds as many executables as it did with that one alive, though JAX keeps every
     executable it compiled of a program while the program's lowering lives. A handoff that kept the
-    admitted executable, or kept both, would hold one more."""
-    with autopgle(2):
-        trainer = lm()
-        state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
-    assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
-    assert trials.unguided is not None and trials.unguided() is None
-    live = live_executables()
-    assert live == trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
-                                                            holding(live - trials.live))
-
-
-def test_a_guided_compile_releases_an_earlier_trainers_unguided_executable():
-    """A trainer under AutoPGLE whose unguided step an earlier trainer of the same program compiled takes
-    that step, compiles the guided one, and lets the unguided go: no lowering the earlier trainer kept holds
-    it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
-    trained(lm(), steps=0)
+    admitted executable, or kept both, would hold one more. Where an `earlier` trainer of the same program
+    compiled the unguided step, the trainer takes it and lets it go too: no lowering the earlier trainer kept
+    holds it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
+    if earlier:
+        trained(lm(), steps=0)
     with autopgle(2):
         trainer = lm()
         state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
@@ -1690,6 +1680,49 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
     # A typed PRNG key by its key data, its key type beside it (train 1019's review, F1).
     first, second = (key(Displayed(4, held=jax.random.key(seed))) for seed in (0, 1))
     assert first is not None and first == key(Displayed(4, held=jax.random.key(0))) != second
+
+
+def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):
+    """A flag given twice is read by its last value, so a rung record's key states the flags in their order:
+    two orders of one flag's two values compute apart and key apart (row 10797: sorted, they were one key),
+    and the same order keys alike."""
+    import os
+
+    from dew.training.rungs import rung_key
+
+    trainer = lm()
+    state, _, _ = trainer.place()
+    flags = os.environ.get("XLA_FLAGS", "")
+
+    def key(*settings):
+        monkeypatch.setenv("XLA_FLAGS", " ".join((flags, *settings)))
+        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)
+
+    autotune_on, autotune_off = "--xla_gpu_autotune_level=4", "--xla_gpu_autotune_level=0"
+    first = key(autotune_on, autotune_off)
+    assert first is not None and first == key(autotune_on, autotune_off) != key(autotune_off, autotune_on)
+
+
+SCALE = 2
+"""A module setting the wrapped function below reads."""
+
+
+def test_a_users_function_wrapped_as_a_librarys_states_the_globals_it_reads(monkeypatch):
+    """A user's function that names a library's as the one it wraps (`functools.wraps`, which copies the
+    library's module onto it) is the user's by the globals it was defined in, so its statement holds the
+    module setting it reads, and a change to that setting states another function (row 10554: taken as the
+    library's, its globals were dropped, and a rung record or truth store keyed a stale entry)."""
+    import json
+
+    from dew._stated import stated
+
+    @functools.wraps(json.dumps)
+    def scaled(value):
+        return value * SCALE
+
+    before = stated(scaled, "a wrapped function")
+    monkeypatch.setitem(globals(), "SCALE", 3)
+    assert stated(scaled, "a wrapped function") != before
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():

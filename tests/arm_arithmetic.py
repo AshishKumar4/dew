@@ -5,7 +5,7 @@ and its compiled program (`Truth`)."""
 
 import contextlib
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -48,16 +48,19 @@ def on_float64_host(tree):
         return jax.tree.map(put, tree)
 
 
-def drawn_on_the_host[S, R](inputs_of: Callable[[S], R], seed: S) -> R:
+def drawn_on_the_host[S, R](inputs_of: Callable[[S], R], seed: S, *, held: bool = False) -> R:
     """`inputs_of(seed)` drawn on the host's CPU, as a recording's inputs were, whatever device the test runs
     on: jax.random's draws are the same bits on every device but its normal's float transform is not (a
     recorded site's seed drawn on an H100 had another digest than on the CPU, the recording's, in 157 of the
     recurrence GPU flow's cells, draw-digest at 996fa29f1), so a draw on the test's device would not be the
     recorded inputs; and a GPU tier part's prepare, whose default device is a compile-only GPU, computes
     nothing there (a draw or a weight load made there left its cell unprepared, rows 8074, 8635, 10552). The
-    arrays, committed to no device, then go where the run reads them."""
+    arrays, committed to no device, then go where the run reads them; with `held`, fetched to the host as
+    NumPy's (`jax.device_get`), as a matrix a cell's every program closes over or a flow's prepare pickles
+    is held (row 10831: its inline copies)."""
     with jax.default_device(jax.devices("cpu")[0]):
-        return inputs_of(seed)
+        made = inputs_of(seed)
+    return jax.device_get(made) if held else made
 
 
 def widened(tree):
@@ -131,9 +134,22 @@ def rounds_nothing(primitive) -> bool:
 FORMATTED = frozenset({jax.lax.bitcast_convert_type_p, jax.lax.nextafter_p, jax.lax.reduce_precision_p})
 """The operations whose meaning is a float format's own, whatever width a program computes in: a value's
 bits read as another type, its neighbour on its format's grid, its rounding to a format's digits. JAX states
-no such fact of a primitive, so they are named here, once, by their objects: the float64 replay runs them at
-the traced dtypes (tests/float64_replay.py), and a float64 truth may hold their narrow results
-(`reference_error._read_through_floats`)."""
+no such fact of a primitive, so they are named here, once, by their objects: the float64 replay and a
+rounding scale's walk run them at the traced dtypes (`as_traced`), and a float64 truth may hold their narrow
+results (`reference_error._read_through_floats`)."""
+
+
+def as_traced(equation, values: Sequence) -> list:
+    """`equation` bound on `values`, each floating one narrowed to the dtype its program traced it at, with
+    its own parameters: its results as that program computes them, which a float64 evaluation widens after.
+    The one rule a format's own operation (`FORMATTED`) and an operation over no floats run by in one: the
+    float64 replay's (`float64_replay.Replay`) and a rounding scale's walk (`rounding_bound.TapRule`; row
+    10888: its copy)."""
+    narrowed = [jnp.asarray(value).astype(variable.aval.dtype)
+                if hasattr(variable.aval, "dtype") and jnp.issubdtype(variable.aval.dtype, jnp.floating)
+                else value for value, variable in zip(values, equation.invars, strict=True)]
+    outputs = equation.primitive.bind(*narrowed, **equation.primitive.get_bind_params(equation.params))
+    return list(outputs) if equation.primitive.multiple_results else [outputs]
 
 
 def stored_as(value, dtype):

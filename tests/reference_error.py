@@ -837,9 +837,11 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> 
     scaled = reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn
 
     def scale_of(inputs, seed):
-        if scale is not None:
-            return scale(inputs, seed)
+        # A site's own scale too, in the arithmetic its arms run in (a Gemma 3n site's, stated without it,
+        # weighed float64 CPU sums its arms never run: row 9780's debugger).
         with summed_as_run():
+            if scale is not None:
+                return scale(inputs, seed)
             if not isinstance(reference_fn, _Windowed):
                 return rounding_scale(scaled, *inputs, seed=seed)[1]
             each = [rounding_scale(scaled, *jax.tree.map(lambda leaf, at=at: leaf[at], inputs), seed=seed)[1]
@@ -920,10 +922,21 @@ def _first_timed(timed: dict, rows_at: Callable, seed):
     return rows
 
 
+def _ordered(orders, inputs, their_inputs) -> list[tuple]:
+    """A draw's orders (`_drawn`'s `orders`), each with the reference's draw at that order: the draw's own
+    alone where none are asked; an orbit holds the draw's own and another at least."""
+    if orders is None:
+        return [(inputs, their_inputs)]
+    ordered = list(zip(orders(inputs), orders(their_inputs), strict=True))
+    if len(ordered) < 2:
+        raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
+    return ordered
+
+
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
            label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None,
-           followed=None, library_also: int | None = None) -> list[_Draws]:
+           followed=None, library_also: int | None = None, *, repeats: bool) -> list[_Draws]:
     """Every leaf's errors (`_Draws`) over `seeds`, a list (the reference's, each further one's after): both
     functions run on `draw(seed)`'s inputs, truth `truth_fn` (else `reference_fn`) on them widened,
     unrewritten. With `reference_seeds`, the reference runs on those draws instead, each held to its own
@@ -942,7 +955,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     that program's, on the same widened inputs. With `conditioning` (dew.parity's `Conditioning`), every arm's
     leaves are read as residuals in units of the reference's rounding at its truth's inputs
     (`Weighed.weighed`). With `followed`, each arm is held to the truth of its own decisions (`_draw_truth`,
-    `_followed_truth`)."""
+    `_followed_truth`). Its first draw is held to be its seed's and each arm a function of its inputs, run
+    again on them, where `repeats`, which each driver states: its site's first draw, once a site, not a map
+    task's or a later stage's past it (rows 7603, 7604: each task repeated its own first draw's arms; row
+    10880: a later stage's and a sizing's later blocks', by a default); each null run's first draw is its
+    own run's, a block every such run checks (ledger 2641)."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
@@ -960,7 +977,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
         nonlocal names, widths
         inputs = draw(seed)
-        if not at:
+        site_first = repeats and not at
+        if site_first:
             _of_its_seed(label, draw, seed, inputs)
         # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own,
         # on the programs the arms run (their scope, `summed_as_run`).
@@ -968,7 +986,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, followed, dew_fn, inputs)
         # Else held (`arm_store.compile_site`).
-        if not at and (running() is None or _given(truth_fn or reference_fn)):
+        if site_first and (running() is None or _given(truth_fn or reference_fn)):
             _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
@@ -979,12 +997,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         weighed = None if conditioning is None else conditioning.at(
             ((truth, inputs, seed), (their_truth, their_inputs, seed if reference_seeds is None
                                      else reference_seeds[at])))
-        if orders is None:
-            ordered = [(inputs, their_inputs)]
-        else:
-            ordered = list(zip(orders(inputs), orders(their_inputs), strict=True))
-            if len(ordered) < 2:
-                raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
+        ordered = _ordered(orders, inputs, their_inputs)
         rows = [None for _ in arms]
         stacked[:] = [None for _ in arms]
         stacked_rows[:] = [None for _ in arms]
@@ -992,7 +1005,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             # Each arm, and its replay on the same inputs, in the arithmetic arms run in (`summed_as_run`).
             with summed_as_run():
                 dew = dew_fn(*mine_at) if ran is None else ran
-                if not at and mine_at is ordered[0][0]:
+                if site_first and mine_at is ordered[0][0]:
                     _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
             dew = dew if ran is None else ran.judged
             if (held := HELD.get()) is not None:
@@ -1009,8 +1022,9 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 here, true_here, terms_here = ((theirs_at, their_truth, their_terms) if arm is reference_fn
                                                else (mine_at, truth, terms))
                 with summed_as_run():
-                    other = _arm_ran(label, arm, dew_fn, dew, here, mine_at, true_here, None if at or (
-                        mine_at is not ordered[0][0]) else _arm_name(arm, reference_fn, library_fn, at_arm))
+                    name = (_arm_name(arm, reference_fn, library_fn, at_arm)
+                            if site_first and mine_at is ordered[0][0] else None)
+                    other = _arm_ran(label, arm, dew_fn, dew, here, mine_at, true_here, name)
                 other, true_here = _own_truth(prepared_followed, followed, other, here, true_here, arm)
                 shared = true_here is truth
                 if weighed is not None:
@@ -1331,12 +1345,18 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
     plain, span = staged_units(seeds), staged_units(conditioning)
 
     def weighed():
-        _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=conditioning,
-                     truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
-                     library_leaves=library_leaves, also=also, terms=False, examples=examples,
-                     weighing=functools.partial(_conditioning, draw=draw, seeds=range(span), scale=scale),
-                     upto=span,
-                     offset=plain)
+        try:
+            _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=conditioning,
+                         truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
+                         library_leaves=library_leaves, also=also, terms=False, examples=examples,
+                         weighing=functools.partial(_conditioning, draw=draw, seeds=range(span), scale=scale),
+                         upto=span, offset=plain)
+        finally:
+            # Its weighing's programs, a test's every conditioned site's, held past it alone (row 9780: a
+            # task weighing 20 sites of Gemma 3n's loop kept each site's and was killed at 10 GiB).
+            from rounding_bound import released_scales
+
+            released_scales()
 
     try:
         _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
@@ -1512,7 +1532,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                                              library_leaves=library_leaves, also=further, terms_fn=terms_fn,
                                              label=label, examples=examples,
                                              conditioning=conditioning_now(), timed=first, followed=followed,
-                                             library_also=library_also)
+                                             library_also=library_also, repeats=start == 0)
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
         return drawn
@@ -1578,11 +1598,12 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     _refuse_numpy_arms(draw, changed_fn, original_fn)
     changed_fn, original_fn = _arms(changed_fn, original_fn)
     truth_fn = _truth_program(truth_fn)
-    [draws] = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
+    [draws] = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label, repeats=True)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
         further = range(seeds, staged_units(seeds))
-        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label)[0])
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label,
+                                    repeats=False)[0])
         moved, kept, unresolved = _moved(draws, 2)
     if not moved:
         found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
@@ -1663,7 +1684,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     def drawn(start_at: int, stop: int):
         return _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + start_at, first + stop),
                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None,
-                      conditioning=weighing, followed=followed)[0]
+                      conditioning=weighing, followed=followed, repeats=start_at == 0)[0]
 
     return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None, progress=progress)
 
@@ -1729,7 +1750,8 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
                               truth_fn, orders=orders,
                               reference_seeds=None if paired else range(base + span + start,
                                                                         base + span + stop),
-                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing)[0]
+                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing,
+                              repeats=start == 0)[0]
             return _staged(drawn, count, label, two_stage=two_stage)
 
         over, unresolved, stage = judged(None, seeds)

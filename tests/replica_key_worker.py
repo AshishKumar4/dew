@@ -30,9 +30,9 @@ def replica_key(args) -> dict:
     template = {"key": key, "shape": shape}
     tree = ({"key": data, "shape": data} if jax.process_index() == 0
             else jax.tree.map(_zeros, template))
-    grid = Grid.of(template)
-    assert grid is not None, "a template placed by name lies on one grid"
-    recovered = _from_replicas(tree, grid, frozenset({0}))
+    grids = Grid.each(template)
+    assert grids is not None, "a template placed by name lies on its mesh's grid"
+    recovered = _from_replicas(tree, grids, frozenset({0}))
 
     def read(words, drawn) -> dict:
         # Each process's own copy of a value the pool replicates.
@@ -45,7 +45,38 @@ def replica_key(args) -> dict:
         "zeros": [list(np.shape(leaf)) for leaf in jax.tree.leaves(jax.tree.map(_zeros, template))]}
 
 
-MODES = {"replica_key": replica_key}
+def replica_grids(args) -> dict:
+    """Two leaves a pool replicates, each on its own mesh over the same devices (one flat, one its 2 x n
+    reshape), as a pipeline's rows each lie on their own stage's: the local step records a grid a mesh
+    (`Grid.each`), read back from its record as a recovery reads it (`_grids_recorded`), and process 1, which
+    lost its copy and holds zeros, receives each leaf from process 0 over its own mesh (row 10814: one grid
+    alone was recorded, none for leaves on two meshes, so the step was recovered from none)."""
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.checkpoints import _grids_recorded
+    from dew.checkpoints._replicas import Grid, _covered, _from_replicas, _zeros
+    from dew.registry import from_record, to_record
+
+    devices = np.asarray(jax.devices())
+    meshes = [Mesh(devices, ("x",)), Mesh(devices.reshape(2, -1), ("a", "b"))]
+    values = {f"row{at}": np.arange(4, dtype=np.float32) + 10 * at for at in range(2)}
+    template = {name: jax.ShapeDtypeStruct((4,), np.float32, sharding=NamedSharding(mesh, PartitionSpec()))
+                for name, mesh in zip(values, meshes, strict=True)}
+    written = {name: jax.make_array_from_callback((4,), template[name].sharding,
+                                                  lambda index, name=name: values[name][index])
+               for name in values}
+    tree = written if jax.process_index() == 0 else jax.tree.map(_zeros, template)
+    recorded = _grids_recorded({"grids": [to_record(grid, Grid) for grid in Grid.each(template) or ()]})
+    grids = tuple(from_record(Grid, grid) for grid in recorded)
+    recovered = _from_replicas(tree, grids, frozenset({0}))
+    return {"grids": len(grids), "covered": _covered(grids, frozenset({0})),
+            "recovered": {name: np.asarray(value.addressable_data(0)).tolist()
+                          for name, value in recovered.items()},
+            "expected": {name: value.tolist() for name, value in values.items()}}
+
+
+MODES = {"replica_key": replica_key, "replica_grids": replica_grids}
 
 
 def main(argv=None) -> None:

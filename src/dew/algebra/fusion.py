@@ -42,6 +42,7 @@ routes and launches where each program is written as it did when it traced.
 from __future__ import annotations
 
 import collections
+import dataclasses
 from collections.abc import Callable, Hashable, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -471,7 +472,10 @@ def typed(aval: ShapedArray, *, weak: bool = False) -> jax.ShapeDtypeStruct:
     reduced or unreduced placement, an outer checked map's an unchecked one inherits) and its weak type, as
     the body holds them, so a region's call or a window's form traced over them binds its inputs as the
     body does (row 6578: binders typed the same on every device beside the body's varying values, which JAX's
-    check of the body refused)."""
+    check of the body refused). Outside one, its sharding is not kept: on a mesh with an Explicit axis a
+    product region's replay over sharded operands contracts over the sharded axis with no output sharding,
+    which JAX refuses (a JEPA step on an explicit data axis, row 10691), so a region traced there makes
+    replicated values, fails `_traced`'s type gate and is reported unwritten (`_unwritten`)."""
     if not jax.sharding.get_abstract_mesh().manual_axes:
         return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=weak and aval.weak_type)
     return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type, sharding=aval.sharding,
@@ -634,13 +638,36 @@ def _traced(region: Written) -> _Trace | None:
     held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD,
                           still=lambda trace: trace.record.still())
     # Its outputs the very types the region made (`jax_core.typematch`: shape, dtype, sharding, the manual
-    # axes they vary over), else it is not written, nothing of its trace reported: a value of another type
-    # in its place is a program JAX refuses.
+    # axes they vary over), else it is not written, a value of another type in its place a program JAX
+    # refuses, and its routes reported refused (`_unwritten`).
     if not all(jax_core.typematch(out.aval, made.aval)
                for out, made in zip(region.outputs, held.equation.outvars, strict=True)):
+        _unwritten(region, held)
         return None
     held.record.replay()
     return held
+
+
+UNWRITTEN = "unwritten"
+"""The code of the refusal a region's routes are reported with where its written call makes other types than
+the region's own (`_unwritten`)."""
+
+
+def _unwritten(region: Written, trace: _Trace) -> None:
+    """Each route `trace` took to a kernel of Dew's reported again as XLA's, its kernel the one preferred and
+    refused for it (`UNWRITTEN`, the two outputs' types named), its site, target and forcing its own: the
+    region is not written, its equations kept as traced, and a kernel report says so (row 10719: the choice
+    was dropped with no report; row 10856: reported anew, it took the reporting frame's site and lost its
+    forcing). A route its call took to XLA already is reported as it ran, its own refusal kept: the region's
+    routes reach no other report (`Recorded.replay` runs for a written region alone; row 10879)."""
+    from dew.nn.kernels.selection import Refusal
+
+    made = [str(var.aval) for var in trace.equation.outvars]
+    own = [str(var.aval) for var in region.outputs]
+    refusal = Refusal(UNWRITTEN, f"its written call makes {made}, not the region's own {own}")
+    for taken in trace.record.routes:
+        generation.published(taken if taken.kernel == "xla" else dataclasses.replace(
+            taken, kernel="xla", preferred=taken.kernel, refusal=refusal))
 
 
 def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:

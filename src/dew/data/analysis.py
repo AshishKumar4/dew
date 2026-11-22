@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal, get_args
 
 import grain.python as pygrain
+import numpy as np
 
 from dew._records import JSON, json_value, record
 from dew.data.completion import cuts
@@ -124,7 +125,8 @@ class Measuring:
 
 
 def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
-            whole: Callable[[Source], Records] | None = None) -> tuple[Records | None, Mapping[str, object]]:
+            whole: Callable[[Source], Records] | None = None
+            ) -> tuple[Records | None, Mapping[str, object] | None]:
     """The records a memory read of `source` holds, then its metadata, with each fact `measuring`
     measures in place of any the store states, in a memory read: over the whole store's records,
     below any holdout (a generation's part's over the generation's rows for every input,
@@ -134,6 +136,9 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
     from dew.data.holdout import SelectedGeneration
     from dew.data.lowering import prepared_rows
 
+    if read != "memory" and not measuring:
+        # Its facts read where they are asked (`dew.data.compile._Facts.metadata`; row 9009).
+        return None, None
     if read != "memory":
         return None, source.metadata()
     store = _store(source)
@@ -173,7 +178,8 @@ def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Man
     consumed = _consumed(source, read)
     pipeline = Pipeline(consumed, tuple(prefix))
     if any(isinstance(stage, Configured) for stage in prefix):
-        stated = _stated(consumed, read, _measures(prefix))[1]
+        held = _stated(consumed, read, _measures(prefix))[1]
+        stated = consumed.metadata() if held is None else held
         pipeline = _configured(pipeline, stated, read, stated=stated)
     return _cache_manifest(consumed, pipeline.stages, read)
 
@@ -298,15 +304,17 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             overlap = cutting(stages)
             at = int(overlap is not None)
             packing = stages[at] if len(stages) > at else None
-            # A published plan cuts a document as a window-long chunk step without overlap does; a best-fit
-            # plan places documents whole, an empty one too, which a chunk step after the generation drops,
-            # so that step runs as written (row 9053).
+            # A published plan cuts a document as a window-long chunk step without overlap does, but places
+            # an empty document, which a chunk step after the generation drops (`chunk_table`): under a
+            # chunk step, a plan stands in only for a generation holding none, as its lengths state, and a
+            # best-fit plan, which places documents whole, never; elsewhere that step runs as written (rows
+            # 9053, 10736).
             if isinstance(source, _GenerationSource) and isinstance(packing, Pack):
                 # The packer imported where a published generation is packed.
                 from dew.data.packing import PackedSource, plan_name
 
                 if (plan_name(packing, "accepted") in plans and overlap in (None, 0)
-                        and not (packing.policy == "best-fit" and overlap is not None)
+                        and (overlap is None or (packing.policy != "best-fit" and _none_empty(source)))
                         and not _ruled(source)):
                     source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
                     stages = stages[at + 1 :]
@@ -316,7 +324,9 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     pack = stages[at] if len(stages) > at else None
     if (
         isinstance(pack, Pack)
-        and pack.policy == "first-fit"
+        # A best-fit pack of whole documents planned as a first-fit one is (`placement.BestFit`), one
+        # placement whatever reads it, grain's packer its test's oracle alone (row 10737).
+        and (pack.policy == "first-fit" or (pack.policy == "best-fit" and overlap is None))
         and not pack.along
         and not isinstance(source, Combined)
         and source.supports("indexed")
@@ -332,6 +342,13 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         stride = first.seq_len if first.stride is None else first.stride
         source, stages = WindowSource(source, source.tokens, first.seq_len, stride), stages[1:]
     return dataclasses.replace(pipeline, source=source, stages=stages)
+
+
+def _none_empty(source: Source) -> bool:
+    """Whether every document `source` holds has a token, as its lengths state (`Source.lengths`): False
+    where they state none."""
+    lengths = source.lengths()
+    return lengths is not None and bool(np.all(np.asarray(lengths) > 0))
 
 
 def _ruled(source: Source) -> bool:

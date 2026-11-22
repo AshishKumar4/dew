@@ -115,6 +115,11 @@ def followed(first: tuple[Chain, ...], then: tuple[Chain, ...]) -> tuple[Chain, 
     return _kept(tuple(one.then(other) for one in first for other in then))
 
 
+_NOT_ISSUED = {"issued": False}
+"""A `Work` field no kernel body issues instruction by instruction (its device bytes, span, dependent paths,
+fused kernels and kept bytes): every other field is a unit a body issues (`ISSUED_UNITS`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Work:
     """The cost vocabulary every price is told in (docs/design/algebra.md §6.5): an operation's work by unit
@@ -136,13 +141,13 @@ class Work:
     operations: float = 0.0
     exponentials: float = 0.0
     conversions: float = 0.0
-    device_bytes: float = 0.0
+    device_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
-    span: float = 0.0
+    span: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
     fp8_flops: float = 0.0
-    kernels: float = 0.0
-    kept_bytes: float = 0.0
+    kernels: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
+    kept_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
     """The bytes XLA's fusion moves between the vector registers and the on-chip memory its kernels keep their
     operands and results in (`dew.algebra.cost.work`'s: a leaf's read once, a reduction's and a product's
     result written once and read once): a TPU's VMEM, at its rate (`GpuTarget.vmem_rate`); a GPU's on-chip
@@ -150,7 +155,11 @@ class Work:
     integer_operations: float = 0.0
     """32-bit integer operations a CUDA multiprocessor's ALU issues (add, shift, logic, comparison), beside
     its fp32 lanes at its own rate (`Architecture.integer_per_clock`)."""
-    chains: tuple[Chain, ...] = ()
+    unpriced_operations: float = 0.0
+    """Elementwise operations no rule prices (`emission.operation_work`: an atan2's, an erf_inv's, which no
+    kernel's body holds and no probe has measured), one an output element, at no rate (`units`): a form
+    taking more of them is never cheaper (`dew.algebra.cost.cheaper`), its price never a guess."""
+    chains: tuple[Chain, ...] = dataclasses.field(default=(), metadata=_NOT_ISSUED)
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
@@ -161,6 +170,14 @@ class Work:
         chains = (_kept(self.chains + other.chains) if self.chains and other.chains
                   else self.chains or other.chains)
         return Work(**summed, span=max(self.span, other.span), chains=chains)
+
+
+ISSUED_UNITS = tuple(field.name for field in dataclasses.fields(Work) if field.metadata.get("issued", True))
+"""The units of `Work` a kernel's body issues, which its emission counts instruction by instruction: every
+field not marked otherwise (`_NOT_ISSUED`). A launch's work from its emission takes each
+(`emission.launch_work`), and a launch's programs share each alike beside its device bytes (a program's
+share of a launch's work), so a unit added to `Work` is counted and shared wherever these are with no list
+to update (row 10793)."""
 
 
 class Rates(NamedTuple):
@@ -227,14 +244,15 @@ def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
     FP8 modes in turn), the CUDA cores (operations and conversions), the special-function units, on-chip
     memory (shared memory's bytes, then what XLA's fusion keeps there, one memory's two levels, so a TPU's
-    one VMEM is one unit), device memory and the integer units; and, level by level, the work at a rate the
-    target states none
+    one VMEM is one unit), device memory, the integer units and the operations no rule prices
+    (`Work.unpriced_operations`, at no rate); and, level by level, the work at a rate the target states none
     of, which no time prices (0 where one does)."""
     grouped = (((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
                ((work.operations + work.conversions, at.cuda),),
                ((work.exponentials, at.special),),
                ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
-               ((work.device_bytes, at.device),), ((work.integer_operations, at.integer),))
+               ((work.device_bytes, at.device),), ((work.integer_operations, at.integer),),
+               ((work.unpriced_operations, None),))
     priced = [sum((amount / per_second for amount, per_second in unit if amount and per_second is not None),
                   0.0) for unit in grouped]
     unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)
@@ -299,3 +317,22 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     launch = target.launch_seconds or 0.0
     worked = max(*units(work, rates(target, device=True))[0], path(work, target))
     return worked + work.kernels * launch
+
+
+def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
+                   resident: int = 1) -> float:
+    """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
+    multiprocessor: the longer of the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs
+    sharing one multiprocessor's units), its overlapped latency waves (`ceil(n / (SMs * resident))` waves of
+    `path`), plus launch latency, against the whole launch's device bound (`seconds`). Co-resident programs
+    share one multiprocessor's throughput units rather than multiplying its peak by `resident`, while
+    overlapping their dependent paths (rows 6216, 10809, 10810)."""
+    count = max(programs, 1)
+    shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
+    per_program = dataclasses.replace(work, **shared, kernels=0)
+    processors = target.multiprocessors or 1
+    per_sm = math.ceil(count / processors)
+    waves = math.ceil(count / (processors * max(resident, 1)))
+    unit_seconds = max(units(per_program, rates(target, device=False))[0])
+    wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
+    return max(wave_seconds + (target.launch_seconds or 0.0), seconds(work, target))

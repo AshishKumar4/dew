@@ -18,7 +18,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tools" / "armada"))
+sys.path.insert(0, str(REPO / "tools"))
 from ci import PYTHONS  # the tested Pythons, pyproject.toml's classifiers'
+from reference_releases import pinned  # the one reader of a pyproject pin
 
 SHELL = ("# BEGIN install facts (site/scripts/gen_install.py)", "# END install facts")
 TABLE = ("<!-- BEGIN CUDA builds (site/scripts/gen_install.py) -->", "<!-- END CUDA builds -->")
@@ -56,10 +58,14 @@ def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str,
     return builds, index, least[1], tensor_memory
 
 
-def pinned(requirements: list[str], name: str) -> str:
-    """The version `requirements` pin `name` at (its first `==` requirement, an extra or a marker beside)."""
-    return next(found[1] for requirement in requirements
-                if (found := re.match(rf"{re.escape(name)}(?:\[[^]]*\])?==([^;\s]+)", requirement)))
+def agreed(requirements: list[str], names: tuple[str, ...]) -> str:
+    """The one release `requirements` pin every one of `names` at (`reference_releases.pinned`), refused
+    where one is unpinned or two differ: the page states one release for them all (train 1140's review: it
+    read the CUDA 12 plugin's pin alone while stating every plugin's and PJRT's)."""
+    found = {name: pinned(requirements, name) for name in names}
+    if None in found.values() or len(set(found.values())) != 1:
+        raise SystemExit(f"pyproject.toml's pins of {', '.join(names)} are not one release: {found}")
+    return next(iter(found.values()))
 
 
 def builds_sentence(project: dict) -> list[str]:
@@ -68,14 +74,17 @@ def builds_sentence(project: dict) -> list[str]:
     Linux x86_64 and aarch64, the release's elsewhere (train 1111's review: the page named post114's and
     post111's while the pins were post117's)."""
     optional, dependencies = project["optional-dependencies"], project["dependencies"]
-    plugins, compiling = (pinned(optional[extra], "jax-cuda12-plugin").rpartition(".")[2]
-                          for extra in ("cuda12", "kernel-compile"))
-    dews = pinned([each for each in dependencies if "sys_platform == 'linux'" in each], "jaxlib")
-    stock = pinned([each for each in dependencies if "sys_platform != 'linux'" in each], "jaxlib")
+    plugins = agreed(optional["cuda12"] + optional["cuda13"], tuple(
+        f"jax-cuda{cuda}-{part}" for cuda in (12, 13) for part in ("plugin", "pjrt"))).rpartition(".")[2]
+    compiling = agreed(optional["kernel-compile"],
+                       ("jax-cuda12-plugin", "jax-cuda12-pjrt")).rpartition(".")[2]
+    dews = agreed([each for each in dependencies if "sys_platform == 'linux'" in each], ("jaxlib",))
+    stock = agreed([each for each in dependencies if "sys_platform != 'linux'" in each], ("jaxlib",))
+    libtpu = agreed(optional["tpu"], ("libtpu",)).removesuffix(".*")
     return [f"Dew's CUDA and PJRT plugins are {plugins}'s on x86_64 and aarch64 (a GH200's Grace) alike, "
             f"and the `kernel-compile` extra's (x86_64 only) are {compiling}'s. On Linux x86_64 and aarch64 "
             f"jaxlib is Dew's build too, `jaxlib=={dews}`, whose client of a plugin reads that metadata, and "
-            f"libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock "
+            f"libtpu {libtpu} loads into it as into the stock one; elsewhere it is the stock "
             f"`jaxlib=={stock}`."]
 
 

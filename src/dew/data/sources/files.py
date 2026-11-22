@@ -51,7 +51,7 @@ from dew.data.storage import (
     on_gcs,
 )
 
-from .base import Read, Shard, ShardManifest, preparing, source_record, url_label
+from .base import Read, Shard, ShardManifest, _single_indexed_manifest, preparing, source_record, url_label
 from .index import ArrayIndex
 
 type Format = Literal[
@@ -658,8 +658,10 @@ class Files(Dataset):
                 return True
             for url in self.paths:
                 fs, _ = Store(url, self.storage_options).resolve()
-                # ArrayRecord's own reader opens a local path or a GCS URL (`ArrayRecords.reader`).
-                if not (local(fs) or on_gcs(fs)):
+                # ArrayRecord's own reader opens a local path or a GCS URL, and a shard its producer
+                # declared from a checked copy on this host (`ArrayRecords.reader`, `Declared.leased`;
+                # row 9052).
+                if not (local(fs) or on_gcs(fs) or url in self.declared):
                     return False
             return True
         if self.where is not None:
@@ -863,6 +865,11 @@ class Files(Dataset):
         (`_arrow_files`), which its shards' ids are made of."""
         return self._places[self._arrow_files[2][path]]
 
+    def _read_files(self) -> tuple[str, ...]:
+        """The names of the files its dataset reads, in its order, each its shard's (`_shard_name`), read off
+        the paths Arrow reads with no dataset built."""
+        return tuple(self._shard_name(path) for path in (self._arrow_files[1] if self.paths else ()))
+
     @cached_property
     def arrow(self) -> ds.Dataset:
         filesystem, paths, _, base = self._arrow_files
@@ -926,6 +933,22 @@ class Files(Dataset):
             return self._listed_files[number]
         return self._footers.fragment(self, number).subset(row_group_ids=[group])
 
+    def positioned_manifest(self) -> ShardManifest:
+        """Its shards for a stream that numbers its rows (`dew.data.sources.base.stream_manifest`): a text
+        store's records as its offset index lists them (`records`' indexed read), each row at its index
+        there, in parts of whole records each stating its rows, as many as its readers ask
+        (`_single_indexed_manifest`); its own shards (`manifest`) where it holds no such index, or reads
+        its records otherwise (row 9051: its byte ranges state no rows, which a positioned stream needs).
+        Its index, its producer's or one `provision` wrote, is what its indexed read reads, so both reads
+        number the same records alike."""
+        if (self.kind not in ("jsonl", "text", "csv") or self.where is not None or not self.paths
+                or any(infer_compression(url.lower()) for url in self.paths) or not self.supports("indexed")):
+            return self.manifest()
+        # Named by its files' places (`_places`), which every host that mounted them anywhere names alike, as
+        # a digest of them, of one length however many files it holds.
+        places = "\n".join(self._places[url] for url in self.paths)
+        return _single_indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}")
+
     def manifest(self) -> ShardManifest:
         """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a fill
         keyed by a shard's rows finds them wherever the files are mounted: a Parquet store's its files
@@ -972,8 +995,9 @@ class Files(Dataset):
         Each file's rows are counted from its footer where a read needs them (`ShardManifest.sized`), unless
         `where` filters them, and its row groups are its shards where readers and workers outnumber its
         files (`_row_groups`)."""
-        shards = tuple(Shard(name, name, number) for number, name in enumerate(
-            self._shard_name(fragment.path) for fragment in self._listed_files))
+        # Named by the files Arrow reads, its dataset unbuilt and its schema unread (row 9009: a compile
+        # building the dataset read every file's).
+        shards = tuple(Shard(name, name, number) for number, name in enumerate(self._read_files()))
         return ShardManifest(shards, self._read_shard, self._row_groups,
                              counted=None if self.where is not None else self._file_rows, fixed_parts=True)
 
@@ -1117,6 +1141,18 @@ class Files(Dataset):
 
     def metadata(self) -> Mapping[str, object]:
         return self._metadata
+
+    SCHEMA_FACTS = frozenset({"class_names", "rows", "count_rules"})
+    """The facts a raw Parquet or Arrow store's schema can state (`_metadata`), and no other."""
+
+    def asked(self, keys: Iterable[str]) -> Mapping[str, object]:
+        """Those of its facts named by `keys` (`dew.data.compile.asked_facts`): a raw Parquet or Arrow
+        store, whose schema states none of the others, opens no file for a fact outside `SCHEMA_FACTS`
+        (row 9009: a seeded streamed mix read every member's schema to check the tokenizer contract)."""
+        wanted = set(keys)
+        if self.committed is None and self.kind in ("parquet", "arrow") and not wanted & self.SCHEMA_FACTS:
+            return {}
+        return {key: value for key, value in self._metadata.items() if key in wanted}
 
     def stated(self) -> Mapping[str, object]:
         """What its committed manifest says, or a parquet or Arrow store's schema names (class

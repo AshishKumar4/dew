@@ -187,15 +187,11 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # 2^-10): a stream of their own, or where one passes the block staged a step from the call's own
     # (`BackwardTiles.staged_logits`; a third of the launch at Qwen3-8B, ET-SWAPABL-h100). dK from the call's
     # own, which the power would flush where a query is 2^-126 at the scale 2^-10.
-    if logits_stage is None:
-        s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
-                                    v_smem, do_slot.transpose((1, 0)), shape)
-    else:
-        s = family.product(k_smem, logits_slot.transpose((1, 0)), shape)
-        # Its share of the staged queries read (the product waited): the next step's stage may be written.
+    s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
+                                v_smem, do_slot.transpose((1, 0)), shape)
+    if logits_stage is not None:
+        # Its share of the staged queries read (the products waited): the next step's stage may be written.
         walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
-        dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
-    # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
     read = walk.places_read(masked=masked)
@@ -635,8 +631,8 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
               for array, (_, share) in zip((key, value), shares, strict=True))
     return family.kernel(
         entry, out_type=(dk, dv),
-        grid=(heads, keys_padded // (holders(family, consumers) * tiles.block_k), batch),
-        grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
+        grid=(heads, batch, keys_padded // (holders(family, consumers) * tiles.block_k)),
+        grid_names=("heads", "batch", "k_tiles"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math,
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.reduces),
@@ -801,8 +797,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     grads = _dkv_launched(walk, launch, (query, key, value, dout, peak, total, anchor, delta, key_index,
                                          *leaves), graded, buffers, groups)
-    return (head_layout(family, grads[0]), head_layout(family, grads[1]), *grads[2:])
-
+    swapped = 3 if walk.fused else 2
+    return (*(head_layout(family, grad) for grad in grads[:swapped]), *grads[swapped:])
 
 def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:
     """A dK/dV program's stages past its resident blocks and output stages, as `_dkv_allocations` lays them:

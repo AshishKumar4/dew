@@ -18,6 +18,7 @@ every diffusion loss, sample, artifact and image metric uses, and
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
@@ -239,6 +240,14 @@ class InputSpec:
             if not condition.encoder.reads_captions
         }
 
+    @functools.cached_property
+    def _caption_widths(self) -> dict[str, dict[str, tuple[int, ...]]]:
+        """Each caption-reading condition's widths (`token_widths`), by its keyword: derived once a spec, a
+        tokenize and a chat template's render a run-constant fact, where every batch's check read them
+        (row 10564)."""
+        return {keyword: token_widths(condition.encoder) for keyword, condition in self.conditions.items()
+                if condition.encoder.reads_captions}
+
     def check(self, batch: Batch, *, whole: bool = True) -> None:
         """Raise `ValueError` if `batch` is missing a field this spec names or has a wrong shape.
 
@@ -249,7 +258,7 @@ class InputSpec:
         the fields it carries, but for an inpainting spec's mask and the sample
         it masks, which every draw and loss reads (ledger 2900). A condition
         that reads captions is held to the widths its encoder tokenizes them to
-        (`_token_widths`, row 9063): captions a data step encoded with another
+        (`token_widths`, row 9063): captions a data step encoded with another
         encoder, or at another context, are refused before a step, where the
         encoder read them at whatever width they came."""
         for keyword, condition in self.conditions.items():
@@ -266,7 +275,7 @@ class InputSpec:
                 # end), not captions an encoder tokenized: no tokenizer's width holds them.
                 continue
             widths = {name: tuple(np.shape(value))[1:] for name, value in held.items()}
-            declared = _token_widths(condition.encoder)
+            declared = self._caption_widths[keyword]
             if widths != declared:
                 raise ValueError(f"objective.inputs condition {keyword!r} reads {condition.field!r} as its "
                                  f"encoder tokenizes captions, {declared} a row, and the batch holds "
@@ -313,9 +322,10 @@ class InputSpec:
                                                                 "conditions").items()}
         return registry.from_record(InputSpec, {**record, "conditions": conditions})
 
-def _token_widths(encoder: ConditionEncoder) -> dict[str, tuple[int, ...]]:
+def token_widths(encoder: ConditionEncoder) -> dict[str, tuple[int, ...]]:
     """The shape a row of each field `encoder` tokenizes a caption into holds (`ConditionEncoder.tokenize`,
-    its context), read off one caption: every encoder that reads captions pads each to its context."""
+    its context), read off one caption: every encoder that reads captions pads each to its context; a
+    decision's context encoder reads a document at its `input_ids` width (`dew.decision.model._apart`)."""
     return {name: tuple(np.shape(value))[1:] for name, value in encoder.tokenize([""]).items()}
 
 

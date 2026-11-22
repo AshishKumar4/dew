@@ -38,6 +38,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
+from jax.sharding import PartitionSpec as P
 from typing_extensions import TypeVar
 
 from dew._records import UNREAD
@@ -57,6 +58,7 @@ from dew.objectives.base import (
     ProgramModule,
     Ratio,
     Step,
+    head_tile_of,
 )
 from dew.objectives.routing import RoutedStatistics
 
@@ -273,11 +275,20 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         self.teacher.substitute(modules[count:])
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
-        """Tile the student's head, the vocabulary head this objective trains."""
-        return self.student.tile_head(tile)
+        """Tile the student's head, the vocabulary head this objective trains, and the teacher's alike, so
+        neither model's loss holds its whole logits and the full KL reads both a tile at a time
+        (`_tiled_divergence`, row 9067)."""
+        moved = self.student.tile_head(tile)
+        self.teacher.restore_head(self._student_tile(), fused=False)
+        return moved
 
     def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
         self.student.restore_head(tile, fused=fused)
+        self.teacher.restore_head(tile, fused=False)
+
+    def _student_tile(self) -> tuple[int, int] | None:
+        """The tile the student's trained head computes in, None where it keeps its whole logits."""
+        return head_tile_of(self.student)
 
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""
@@ -348,7 +359,12 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         """Score the student in the step's mode and the frozen teacher in evaluation mode, each with its
         whole logits where the divergence reads every column (`full`), and none where it reads the
         sampled ids' likelihoods alone (`selected`), each loss scoring its head as it trains."""
-        whole = self.divergence == "full"
+        # The full KL reads every column: a tile of rows at a time from the final states where the student's
+        # head is tiled and both models state their head (`_tiled_divergence`), else the whole logits (an
+        # adapted model scores through more than its head, row 10983).
+        tiled = (self._student_tile() is not None and self.student.predicts_by_head
+                 and self.teacher.predicts_by_head)
+        whole = self.divergence == "full" and not tiled
         statistics, aux, student = self.student.predict(
             self.student_variables(params), batch, self._student_step(step), train=step.training,
             layers=tuple(student_layer for _, student_layer in self.features), logits=whole)
@@ -363,6 +379,57 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
                 f"student scores {student.logits.shape[-1]} ids and the teacher "
                 f"{teacher.logits.shape[-1]}")
         return statistics, aux, student, teacher
+
+    def _tiled_divergence(self, student: Prediction, teacher: Prediction, finite: jax.Array,
+                          temperature: jax.Array) -> jax.Array:
+        """The `[B, S]` KL of the teacher's tempered distribution from the student's, each position's
+        logits computed from its final states a slice of positions at a time over every row, each slice's
+        recomputed in the backward: no `[B, S, vocab]` logits of either model are held. On a mesh each
+        device runs the slices of its own tokens (`shard_map` over the loss's token split, `token_spec`,
+        as the head's own loss runs, `chunked._sharded_head`), so no device gathers another's states,
+        their rows or their positions split. A slice holds as many tokens as the student's head tile's
+        area allows logits of (`tile[0] * tile[1]` over the vocabulary, every local row at least one
+        position, row 9067)."""
+        student_head, teacher_head = student.head, teacher.head
+        assert student.final is not None and teacher.final is not None
+        assert student_head is not None and teacher_head is not None
+        tile = self._student_tile()
+        assert tile is not None
+        vocab = jax.eval_shape(student_head, student.final[:, :1]).shape[-1]
+
+        def local(own: jax.Array, other: jax.Array, kept: jax.Array) -> jax.Array:
+            rows, positions = own.shape[:2]
+            per = max(1, min(positions, tile[0] * tile[1] // vocab // rows))
+            chunks = -(-positions // per)
+
+            def padded(values: jax.Array) -> jax.Array:
+                return jnp.pad(values, ((0, 0), (0, chunks * per - positions),
+                                        *((0, 0),) * (values.ndim - 2)))
+
+            own, other, kept = padded(own), padded(other), padded(kept)
+
+            @jax.checkpoint
+            def one(at):
+                start = at * per
+                student_logits = student_head(jax.lax.dynamic_slice_in_dim(own, start, per, axis=1))
+                teacher_logits = teacher_head(jax.lax.dynamic_slice_in_dim(other, start, per, axis=1))
+                held = jnp.where(jax.lax.dynamic_slice_in_dim(kept, start, per, axis=1)[..., None],
+                                 teacher_logits, 0)
+                return categorical.kl_divergence(student_logits / temperature, held / temperature)
+
+            divergence = jax.lax.map(one, jnp.arange(chunks))
+            return jnp.moveaxis(divergence, 0, 1).reshape(rows, chunks * per)[:, :positions]
+
+        if jax.sharding.get_abstract_mesh().empty:
+            return local(student.final, teacher.final, finite)
+        # The language model's own token split, imported where a mesh asks for it: a distillation's
+        # domain imports no language model's.
+        from dew.objectives.lm.chunked import token_spec
+
+        spec = token_spec(finite.shape)
+        states = P(*spec, *[None] * (3 - len(spec)))
+        return jax.shard_map(local, in_specs=(states, states, spec), out_specs=spec, check_vma=False)(
+            student.final, teacher.final, finite)
 
     def _distance(self, student: jax.Array, teacher: jax.Array) -> jax.Array:
         """The pair's per-position feature distance, `[B, S]`, in the pair's common dtype, at least fp32."""
@@ -397,9 +464,12 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
             finite = finite & jnp.all(jnp.isfinite(state), axis=-1)
         teacher_losses = jnp.where(finite, teacher.losses, 0)
         scored = weights * finite
-        if teacher.logits is not None and student.logits is not None:
-            held = jnp.where(finite[..., None], teacher.logits, 0)
-            divergence = categorical.kl_divergence(student.logits / temperature, held / temperature)
+        if self.divergence == "full":
+            if teacher.logits is not None and student.logits is not None:
+                held = jnp.where(finite[..., None], teacher.logits, 0)
+                divergence = categorical.kl_divergence(student.logits / temperature, held / temperature)
+            else:
+                divergence = self._tiled_divergence(student, teacher, finite, temperature)
             soft = self.row_mean(divergence, batch, weights=scored).total
             estimate = soft
         else:

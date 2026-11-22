@@ -16,15 +16,22 @@ from importlib.metadata import version
 from pathlib import Path
 
 
+def pinned(requirements: list[str], name: str) -> str | None:
+    """The release `requirements` pin `name` at: its first `name==release` requirement, an extra in brackets
+    or an environment marker beside it; None where none pins it."""
+    for requirement in requirements:
+        if found := re.match(rf"{re.escape(name)}(?:\[[^]]*\])?==([^;\s]+)", requirement):
+            return found[1]
+    return None
+
+
 def tested(distribution: str) -> str:
     """The release of `distribution` the reference suite pins in pyproject.toml's test extra, which
     the locks and CI install: the release most fixtures are recorded against."""
     extras = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
-    for requirement in extras["project"]["optional-dependencies"]["test"]:
-        pinned = re.fullmatch(rf"{re.escape(distribution)}==([^;\s]+)", requirement)
-        if pinned:
-            return pinned[1]
-    raise LookupError(f"pyproject.toml's test extra pins no {distribution} release")
+    if (release := pinned(extras["project"]["optional-dependencies"]["test"], distribution)) is None:
+        raise LookupError(f"pyproject.toml's test extra pins no {distribution} release")
+    return release
 
 
 MODELOPT = {"nvidia-modelopt": "0.47.0"}

@@ -19,7 +19,7 @@ import pytest
 from process_support import device_flags
 
 from dew import communicators
-from dew._cache import package_digest
+from dew._code import code_digest
 from dew._devices import FRACTIONS, WRITTEN, pool_bound
 from dew.communicators import Collectives, CommunicatorRoom, Needs
 
@@ -259,11 +259,11 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
 
 
-def test_a_programs_communicators_are_kept_under_the_digest_of_dews_code(tmp_path, monkeypatch):
-    """A program's communicators are kept under the digest of Dew's own code (`dew._cache.package_digest`),
-    the key every cache of what Dew's code computed reads: those kept under this Dew's digest are taken as
-    they are kept, its text unread, and those kept by another Dew's code, under its digest or none, are read
-    again from the program's text."""
+def test_a_programs_communicators_are_kept_under_the_digest_of_their_readers_code(tmp_path, monkeypatch):
+    """A program's communicators are kept under the digest of the code that reads them
+    (`dew._code.code_digest`): those kept under this code's digest are taken as they are kept, its text
+    unread, and those kept by another code, under its digest or none, are read again from the program's
+    text."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     kept = tmp_path / "dew" / "communicators" / "programs"
     planted = Collectives(groups=frozenset({(0, 1, 2, 3)}))
@@ -271,7 +271,7 @@ def test_a_programs_communicators_are_kept_under_the_digest_of_dews_code(tmp_pat
     def unread() -> str:
         raise AssertionError("the text of a program whose communicators this Dew kept is read again")
 
-    ours = kept / package_digest() / f"{b'kept'.hex()}.json"
+    ours = kept / str(code_digest("dew.communicators")) / f"{b'kept'.hex()}.json"
     ours.parent.mkdir(parents=True)
     ours.write_text(json.dumps(planted.to_json()))
     assert communicators.collectives_kept(b"kept", (0, 1, 2, 3), unread) == planted
@@ -667,7 +667,7 @@ def a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_commun
     environment = {**os.environ, "XDG_CACHE_HOME": str(cache), "JAX_COMPILATION_CACHE_DIR": str(compiled),
                    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
                    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0"}
-    kept = cache / "dew" / "communicators" / "programs" / package_digest()
+    kept = cache / "dew" / "communicators" / "programs" / str(code_digest("dew.communicators"))
 
     def ran() -> tuple[list[int], dict[str, tuple[int, int]]]:
         done = subprocess.run([sys.executable, "-c", COMPILED_ON_GPU], check=True, env=environment,

@@ -51,6 +51,41 @@ def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generat
     assert np.any(np.asarray(once.astype(jnp.bfloat16), np.float32) != expected)
 
 
+def _checked_draws(seed: int, wide: int, narrow: int) -> tuple:
+    """Two devices' rows (2 x 64 x 128) and biases (2 x 256), a feature scale (128) and a matrix (128 x
+    256), integers in bf16: the rows and the matrix within `wide` of zero, the scale and the bias within
+    `narrow`."""
+    keys = jax.random.split(jax.random.key(seed), 4)
+    x = jax.random.randint(keys[0], (2, 64, 128), -wide, wide + 1).astype(jnp.bfloat16)
+    scale = jax.random.randint(keys[1], (128,), -narrow, narrow + 1).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[2], (128, 256), -wide, wide + 1).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[3], (2, 256), -narrow, narrow + 1).astype(jnp.bfloat16)
+    return x, scale, w, bias
+
+
+def _checked_map(target: str, *, fused: bool = True):
+    """A region fused through `fused_gemm.fused` (the rows scaled before the product, its producer, and a bias
+    added after, its epilogue) in a shard_map over two CPU devices that checks the axes its values vary over
+    (`check_vma`): each device's rows and bias its own, the scale and the matrix the same on every device;
+    the product interpreted where `target` is a GPU's. With `fused` False, the region written plainly in the
+    same map: its unfused program, the law the fused one is held to."""
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def region(x, scale, w, bias):
+        if not fused:
+            return jnp.dot(x * scale, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16) + bias
+        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16,
+                                  interpret_on_cpu=target != "cpu") + bias
+
+    def each_device(x, scale, w, bias):
+        apply = functools.partial(fused_gemm.fused, region) if fused else region
+        return apply(x[0], scale, w, bias[0])[None]
+
+    return jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, data), out_specs=data,
+                         check_vma=True)
+
+
 @INTERPRETS
 @pytest.mark.parametrize("target", ["sm90", "cpu"])
 def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_its_own_of(target):
@@ -61,23 +96,8 @@ def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_i
     template's launch, named, takes both, its product typed as its operands vary (row 9808); on the CPU, XLA's
     products run them whole, checked. Each device's region computes the scaled rows' dot rounded to bf16 plus
     its bias, bitwise, over integers whose sums pass bf16's 256."""
-    keys = jax.random.split(jax.random.key(9808), 4)
-    x = jax.random.randint(keys[0], (2, 64, 128), -7, 8).astype(jnp.bfloat16)
-    scale = jax.random.randint(keys[1], (128,), -3, 4).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[2], (128, 256), -7, 8).astype(jnp.bfloat16)
-    bias = jax.random.randint(keys[3], (2, 256), -3, 4).astype(jnp.bfloat16)
-    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
-    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
-
-    def region(x, scale, w, bias):
-        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16,
-                                  interpret_on_cpu=target != "cpu") + bias
-
-    def each_device(x, scale, w, bias):
-        return fused_gemm.fused(region, x[0], scale, w, bias[0])[None]
-
-    mapped = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, data),
-                                   out_specs=data, check_vma=True))
+    x, scale, w, bias = _checked_draws(9808, 7, 3)
+    mapped = jax.jit(_checked_map(target))
     if target == "cpu":
         got = mapped(x, scale, w, bias)
     else:
@@ -89,6 +109,43 @@ def test_a_fused_region_in_a_checked_manual_map_reads_values_each_device_holds_i
                           preferred_element_type=jnp.float32).astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(got, np.float32),
                                   np.asarray(expected + bias[:, None, :], np.float32))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("target", ["sm90", "cpu"])
+def test_a_replicated_operands_gradient_in_a_checked_manual_map_is_summed_over_its_devices(target):
+    """The gradient of a region fused through `fused_gemm.fused` in a shard_map that checks the axes its
+    values vary over (`check_vma`), with respect to the feature scale and the matrix every device holds the
+    same of: each device's rows and bias its own, so each device's partial gradient of the replicated values
+    varies over the map's axis, and the gradient of the replicated value is their sum over the devices, typed
+    the same on every device. On an assumed, interpreted H100 the template's launch takes the product, its
+    kernel gradient typed as its operands vary (row 9808), which reverse mode then sums over the devices (row
+    10526: `ad.ct_check` refused a varying cotangent for the unvarying matrix); on the CPU, XLA's products,
+    checked. The gradients equal the unfused program's in the same map, bitwise: each device's partial rounded
+    to the operand's dtype and summed over the devices, as JAX's own transposes sum them."""
+    x, scale, w, bias = _checked_draws(10526, 3, 2)
+    mapped = _checked_map(target)
+
+    def loss(scale, w):
+        return jnp.sum(mapped(x, scale, w, bias).astype(jnp.float32))
+
+    gradient = jax.jit(jax.grad(loss, argnums=(0, 1)))
+    if target == "cpu":
+        got = gradient(scale, w)
+    else:
+        with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"), \
+                generation.routes() as routes:
+            got = gradient(scale, w)
+        assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
+
+    unfused_map = _checked_map(target, fused=False)
+
+    def unfused_loss(scale, w):
+        return jnp.sum(unfused_map(x, scale, w, bias).astype(jnp.float32))
+
+    expected = jax.jit(jax.grad(unfused_loss, argnums=(0, 1)))(scale, w)
+    for each, want in zip(got, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(each, np.float32), np.asarray(want, np.float32))
 
 
 @INTERPRETS
@@ -170,6 +227,36 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     assert found.fused_seconds is not None and found.unfused_seconds is not None, found
     assert found.unfused_seconds - found.fused_seconds >= 2 * 8192 * 4096 * 2 / rate, found
     assert plain.fused_seconds is None and plain.unfused_seconds is None
+
+
+def _chained(function, wide):
+    """`function` applied eight times over `wide`, in float32."""
+    for _ in range(8):
+        wide = function(wide)
+    return wide
+
+
+@pytest.mark.parametrize("stage", ["epilogue", "prologue"])
+def test_a_fused_launchs_special_functions_are_priced_in_the_forms_it_compiles(stage):
+    """A bf16 product of 8192 x 256 x 4096 with eight chained float32 logs after it (its epilogue's), or of
+    8192 x 4096 x 256 with them before it on its rows (its prologue's), launched by the Mosaic template on a
+    compile-only H100: fused, the logs cost its launch more than as many exp2s, as it compiles them without
+    `approx_math` (`emission.ACCURATE_FORMS`: a log a polynomial of FP32 instructions, an exp2 one MUFU),
+    where each was priced one MUFU an element and the two alike (row 10824). Shapes only."""
+    def region(function, x, w):
+        if stage == "prologue":
+            x = _chained(function, x.astype(jnp.float32)).astype(jnp.bfloat16)
+        product = fused_gemm.product(x, w, out_dtype=jnp.bfloat16)
+        return product if stage == "prologue" else _chained(function, product.astype(jnp.float32))
+
+    depth, width = (4096, 256) if stage == "prologue" else (256, 4096)
+    x = jax.ShapeDtypeStruct((8192, depth), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((depth, width), jnp.bfloat16)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        logs, exp2s = (fused_gemm.analysis(functools.partial(region, function), x, w)
+                       for function in (jnp.log, jnp.exp2))
+    assert exp2s.fused_seconds is not None, exp2s
+    assert logs.fused_seconds > exp2s.fused_seconds, (logs, exp2s)
 
 
 @pytest.mark.parametrize("operation", [jax.lax.erf, jnp.expm1, jnp.isfinite], ids=lambda f: f.__name__)

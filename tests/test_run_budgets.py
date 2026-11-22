@@ -1855,3 +1855,38 @@ def test_a_memory_read_packing_after_a_draw_declares_the_windows_its_shortest_re
         opened.close()
     assert {coordinates.max_segments for coordinates in laid} == {2 if stated else 16}
     assert max(int(coordinates.segments.max()) for coordinates in laid) <= 2
+
+
+def test_a_token_budget_reached_inside_a_split_step_keeps_the_window_its_later_parts_opened():
+    """A step read in two microbatches whose first step's first part is rejected: the second step's first
+    part commits the window its second part opened, reaching a budget of one token, and its second part
+    opens the next. The run ends with that step and keeps the window its second part opened, its row
+    pooled, so a continuation reads on exactly (training.md §4, row 6143's option 1, until the owner
+    chooses; row 10982: a drop lost those rows silently)."""
+    import jax
+    import optax
+    from affine_run import Replaying
+    from test_trainer import Targeted
+
+    from dew.state import occupied
+
+    class TokenTargeted(Targeted):
+        """`Targeted`, each row one valid target token."""
+
+        counts_tokens = True
+
+        def scored_tokens(self, batch):
+            return jnp.ones(jnp.shape(batch["target"]), jnp.int32)
+
+    rows = 2 * jax.device_count()
+    targets = [(1e20, 1.0), (3.0, 5.0), (7.0, 9.0)]
+
+    def batch_at(at: int):
+        first, second = targets[min(at, len(targets) - 1)]
+        return {"target": np.asarray([first, second] * (rows // 2), np.float32)}
+
+    trainer = Trainer(TokenTargeted(), optax.sgd(0.0), key=jax.random.key(0), split=2, dynamic_scale=True)
+    loader = Loader(train=lambda partition: Replaying(batch_at), val=None, batch=rows, records=None)
+    state = trainer.fit(loader, tokens=1, log_every=1)
+    assert int(state.step) == 2 and int(state.updates) == 1
+    assert state.window is not None and occupied(state.window) == 1 and int(state.microstep) == 3

@@ -338,8 +338,11 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         raise NotImplementedError("the mainloop reads a token's state apart from its group's writes under a "
                                   "decay a head without the delta rule alone, its chunk whole groups: the "
                                   "portable math takes the rest")
+    # Interpreted, the target the interpreted bundle is of (`generation.interpreted_target`,
+    # `mainloop.issued`), so a CPU's run takes the launches a plan for it takes.
+    target = generation.interpreted_target() if interpret else generation.gpu_target()
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, apart=apart,
+                interpret, target, tiles.chunk, ranged=ranged, apart=apart,
                 values_gated=values_gated, unit_keys=unit_keys, producers=tiles.producers,
                 residents=tiles.residents, alone=not keeps)
     table = None if forked is None else tabled(forked, width, columns)

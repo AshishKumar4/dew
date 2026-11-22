@@ -283,7 +283,8 @@ the packed row as its Dew arm, on armada, ledger 2828): compared with themselves
 and C biases' and norms' gradients within 512."""
 
 
-SHARDED = {"gated_delta_net", "kimi_delta_attention", "kpool_sparse_attention", "mamba", "mamba2", "memory"}
+SHARDED = {"gated_delta_net", "kimi_delta_attention", "kpool_sparse_attention", "mamba", "mamba2", "mamba3",
+           "memory"}
 """The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
 
 
@@ -320,6 +321,13 @@ def test_a_packed_row_of_mamba_computes_what_its_documents_compute_alone():
     """`assert_packs_as_alone` over Mamba, whose 32 seeds took 133 s in train 1005's CI (main f4ee27d20):
     CI draws them in map tasks of 8 (row 7475)."""
     assert_packs_as_alone("mamba")
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=128)
+def test_a_packed_row_of_mamba3_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over Mamba-3, whose 512 seeds took 141 s alone uncached on armada's CI CPU
+    and 180 s in train 1142's CI: CI draws them in map tasks of 128 (row 10820)."""
+    assert_packs_as_alone("mamba3")
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=32)
@@ -432,13 +440,15 @@ def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(c
                            SEEDS[f"deepseek_v4 {compressor}"])
 
 
+@pytest.mark.check1_shards(seeds=16, per_task=8)
 def test_a_packed_row_of_kpool_attention_without_tails_computes_what_its_documents_compute_alone():
     """The k-pool layer selecting whole pools alone (`index_kpool_always_select_tail=False`): a document's
     first queries, before its first pool completes, select nothing and read every key of their own
     document alike, as the document alone reads its row's, so a row packing documents gives each
     document's logits and the parameters' gradients its documents give run one at a time (check 1);
     those queries read the whole packed row's keys alike, other documents' and the padding's among them
-    (the spec pass's review of T2)."""
+    (the spec pass's review of T2). Its 16 seeds drawn in map tasks of 8, as the layer with tails draws
+    them (123 s whole in train 1158's CI, row 10961)."""
     total = sum(DOCUMENTS)
     model = tiny(mixer=mixers.build("kpool_sparse_attention", index_kpool_always_select_tail=False),
                  max_seq_len=max(128, total + PADDING))

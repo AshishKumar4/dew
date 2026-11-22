@@ -496,7 +496,7 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
 
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
                  products: tuple | None = None, over_rings: bool = False,
-                 values: tuple[dict, tuple] | None = None) -> resources.Scope:
+                 values: tuple[dict, tuple] | tuple[dict, tuple, tuple] | None = None) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
     walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
     where its `products` take one (`Family.product_held`, its tensor memory's addresses
@@ -506,7 +506,12 @@ def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups:
     `reducing_warpgroups`' scratch (`resources.Scope`)."""
     scoped, streams, *after = allocations
     after_walks = tuple(after[0]) if after else ()
-    scratch = () if values is None else family.value_scratch(*values)
+    if values is None:
+        scratch = ()
+    elif len(values) == 3:
+        scratch = family.value_scratch(values[0], values[1], step=values[2])
+    else:
+        scratch = family.value_scratch(values[0], values[1])
     if after_walk.uses_over_rings(family, after_walks, over_rings=over_rings):
         added, rest, _ = after_walk.over_rings_plan(streams, after_walks)
         held, walks = family.lifetimes(rest)
@@ -1590,14 +1595,21 @@ class _Program[T: (Tiles, BackwardTiles)]:
         assert spans.q_lo is not None and spans.q_hi is not None, "a key block's walk reads its readers"
         return at(spans.q_lo, block), at(spans.q_hi, block), seen_whole
 
-    def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
+    def segmented(self, step: Callable, run: tuple[jax.Array | None, jax.Array] | None, lo, hi) -> tuple:
         """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its
         whole tiles run unbroken (`run`, `whole_run`), those one segment of their own, unmasked, and the
         tiles around them masked, so no step chooses at run time, whose two branches' registers join
-        (FlashAttention 3's masked and unmasked iterations); else one segment choosing a tile at a time."""
+        (FlashAttention 3's masked and unmasked iterations); where `run[0]` is None (`forward_whole_run`),
+        the unmasked run starts at `lo` so only two segments emit; else one segment choosing a tile at a
+        time."""
         if run is None:
             return ((step, lo, hi),)
-        start, end = (jnp.clip(bound, lo, hi) for bound in run)
+        raw_start, raw_end = run
+        end = jnp.clip(raw_end, lo, hi)
+        if raw_start is None:
+            return ((functools.partial(step, masked=False), lo, end),
+                    (functools.partial(step, masked=True), end, hi))
+        start = jnp.clip(raw_start, lo, hi)
         return ((functools.partial(step, masked=True), lo, start),
                 (functools.partial(step, masked=False), start, end),
                 (functools.partial(step, masked=True), end, hi))
@@ -1610,13 +1622,14 @@ class _Program[T: (Tiles, BackwardTiles)]:
         faster a causal one at Qwen3-8B's)."""
         return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
 
-    def forward_whole_run(self, first, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
-        """The key tiles `[0, whole_end)` a causal forward query block from `first` sees whole (`reach`), one
-        unbroken run for `segmented`; None for non-causal or spans calls (row 10790)."""
+    def forward_whole_run(self, first, spans: _Spans | None) -> tuple[None, jax.Array] | None:
+        """The key tiles `[0, whole_end)` a causal forward/dQ query block from `first` sees whole (`reach`),
+        one unbroken run from `lo` for `segmented`; None for non-causal or spans calls (rows 10790, 4839)."""
         if spans is not None or not self.causal:
             return None
         walked = self.walked(first)
-        return jnp.int32(0), jnp.where(self.padded(first), jnp.int32(0), self.whole(first, walked))
+        return None, jnp.where(self.padded(first), jnp.int32(0), self.whole(first, walked))
+
     def _first_reader(self, k_first, q_steps: int) -> jax.Array:
         """The first query tile that sees the key block from `k_first` (`first_reader`)."""
         return first_reader(k_first, self.tiles.block_q, q_steps, self.keys, self.causal)
@@ -1854,6 +1867,17 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
     return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in chunked]
 
 
+def _wide_wgmma_extra(family: mosaic.Family, block_q: int, value_width: int, *,
+                      residuals: bool) -> list[tuple]:
+    """Wide (>128) register-home Wgmma forward accumulator/staging pressure across the softmax step
+    (spilling 16-32B on cuda12 ptxas at consumers=2's 240-reg cap): 64 f32 cols in training and 112 in
+    inference shifts consumers=2 past 240 while consumers=1 fits 255 with 3 TMA stages (rows 5272, 10890)."""
+    if (not family.operands_in_registers and not family.places_on_role and not scopes_products(family)
+            and value_width > 128):
+        return [(block_q, 64 if residuals else 112, jnp.float32)]
+    return []
+
+
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                       natural: bool = False, params: tuple = (), width: int | None = None,
                       parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
@@ -1928,6 +1952,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
             step.append((block_k, value_width * family.rhs_copies, dtype))
     masks = _mask_places(family, block_q, block_k)
     step += masks
+    step += _wide_wgmma_extra(family, block_q, value_width, residuals=residuals)
     # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
@@ -2192,6 +2217,26 @@ STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "ancho
 launch over a shared dQ streams each beside its queries, and the fused launch the first its block holds
 (`attention_mosaic_fused.streamed_statistics`); row vectors a fused launch's queries first holds
 (`backward_registers`), column vectors keys first, one at a time."""
+STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total", "delta", *STATISTICS)))
+"""Stream priority for per-query statistics (`STATISTICS`): `peak`, `total`, and `delta` first so
+the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
+
+def tpu_forward_step_tiles(block_q: int, block_k: int, *, natural_form: bool, scaled: bool) -> tuple:
+    """Live `(block_q, block_k)` fp32 score tiles held in TPU VMEM during a forward step
+    (`MxuIssuer.value_scratch(step=...)` bills `VALUES` copies each; 6 + 6 natural/scaled, row 10771)."""
+    base = ("logits", "coords", "shifted", "exponentials", "weights", "rescaled")
+    extra = ("scaled_logits", "small_weights", "small_exp", "guard_mask", "scaled_sum", "restored")
+    count = len(base) + (len(extra) if natural_form or scaled else 0)
+    return (((block_q, block_k), jnp.float32),) * count
+
+
+def tpu_backward_step_tiles(block_q: int, block_k: int) -> tuple:
+    """Live `(block_q, block_k)` fp32 score tiles held in TPU VMEM during a backward step
+    (`MxuIssuer.value_scratch(step=...)` bills `VALUES` copies each; 10 beside 3 fp32 accumulators,
+    v5e 22 MiB, row 10771)."""
+    names = ("logits", "dp", "coords", "mask", "shifted", "exponentials", "weights", "ds",
+             "weights_cast", "ds_cast")
+    return (((block_q, block_k), jnp.float32),) * len(names)
 
 
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,

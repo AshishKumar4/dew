@@ -56,7 +56,7 @@ import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.algebra.terms import parameter_key, parameters_key
-from dew.mesh import STAGE_AXIS, LayoutRefused, held_apart
+from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn import programs
 from dew.nn.kernels.options import owned_program, program
 from dew.nn.kernels.templates.layout import entrywise
@@ -372,6 +372,12 @@ class StageLocal:
                 for row in range(math.prod(shape))]
         return self.layered(shapes, cut)
 
+    @property
+    def apart(self) -> bool:
+        """Whether the state it saves (`saved`) holds rows each on its own stage's devices, on part of a pool
+        (`dew.checkpoints.submesh.HeldApart`): a pipelined run's over more than one stage."""
+        return bool(self.sites) and self.stages > 1
+
     def saved(self, state: TrainState) -> TrainState:
         """`state` as a checkpoint holds it, every layer `layers_N`, each row an array on its own
         stage's devices made from that stage's shards: a device copies its own rows, and nothing
@@ -389,9 +395,9 @@ class StageLocal:
                     [shard.data for shard in leaf.addressable_shards if shard.device in held],
                     dtype=leaf.dtype)
                 row = _sharded(sharding, devices, sharding.spec[len(shape):])
-                # Each row a checkpoint holds on its own stage's devices, on part of a pool (`held_apart`).
-                rows.extend(held_apart(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
-                    math.prod(shape) // self.stages))(piece, stacked=len(shape))))
+                # Each row a checkpoint holds on its own stage's devices, on part of a pool (`apart`).
+                rows.extend(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
+                    math.prod(shape) // self.stages))(piece, stacked=len(shape)))
             return rows
         return self.state(state, lambda tree: self.layered(tree, cut))
 

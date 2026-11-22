@@ -30,13 +30,33 @@ def load(name: str, directory: str = "tools") -> ModuleType:
 @contextmanager
 def run_from(name: str, directory: str) -> Iterator[ModuleType]:
     """`directory/name.py` loaded as `load` loads it, with its directory first on sys.path while held: a
-    script run from its directory, which imports its siblings."""
-    path = str(REPO_ROOT / directory)
-    sys.path.insert(0, path)
+    script run from its directory, which imports its siblings. A sibling named as another of the
+    repository's modules on the path (site/live/container/kernel_outputs.py beside tests/kernel_outputs.py)
+    is the script's while held alone: a cached namesake is set aside and put back after, and the sibling
+    leaves the cache, so neither import reads the other's module (rows 7329 to 7333)."""
+    path = REPO_ROOT / directory
+    shared = {script.stem for script in path.glob("*.py") if _named_elsewhere(script.stem, path)}
+    aside = {module: sys.modules.pop(module) for module in shared if module in sys.modules}
+    sys.path.insert(0, str(path))
     try:
         yield load(name, directory)
     finally:
-        sys.path.remove(path)
+        sys.path.remove(str(path))
+        for module in shared:
+            sys.modules.pop(module, None)
+        sys.modules.update(aside)
+
+
+def _named_elsewhere(name: str, directory: Path) -> bool:
+    """Whether an import of `name` reads one of the repository's modules outside `directory`: one cached
+    under that name, or one in another of sys.path's directories of the repository."""
+    def outside(location: Path) -> bool:
+        return location.is_relative_to(REPO_ROOT) and not location.is_relative_to(directory)
+    cached = getattr(sys.modules.get(name), "__file__", None)
+    if cached is not None and outside(Path(cached).resolve().parent):
+        return True
+    return any(outside(root) and (root / f"{name}.py").is_file()
+               for root in {Path(entry).resolve() for entry in sys.path if entry})
 
 
 def git(root: Path, *arguments: str) -> str:

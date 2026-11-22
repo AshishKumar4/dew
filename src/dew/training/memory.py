@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import AbstractMesh, Mesh, NamedSharding
 
 from dew import communicators
 from dew._devices import allocator_limit, device_memory, fresh_pool, gpu_free_bytes, stated_share, xla_flag
@@ -35,7 +35,7 @@ from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
 from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
-from dew.objectives.base import Objective
+from dew.objectives.base import Objective, head_fused_of, head_tile_of
 from dew.state import TrainState
 from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
 
@@ -245,7 +245,7 @@ def split_share(params: Variables) -> float:
 
 
 def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: Batch, variables: Variables,
-                                  mesh: Mesh, gathered: int | None = None
+                                  mesh: Mesh | AbstractMesh, gathered: int | None = None
                                   ) -> jax.stages.CompilerOptions | None:
     """The options a step over microbatches of `micro` on `mesh` compiles with
     (`step_compiler_options`): by the tokens one device steps of a microbatch split over the
@@ -253,7 +253,7 @@ def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: 
     `gathered` bytes (`layer_gathers`)."""
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
-                                 mesh.devices.size, gathered=gathered)
+                                 mesh.size, gathered=gathered)
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
@@ -289,21 +289,6 @@ def climb_to[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mappi
                for index, entry in enumerate(entries)]
     if any(module is not entry.module for module, entry in zip(modules, entries, strict=True)):
         objective.substitute(modules)
-
-
-def head_tile_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[int, int] | None:
-    """The tile the vocabulary head the objective trains computes its
-    backward in (`ProgramModule.head_tile`), or None for a head that keeps
-    its whole logits or an objective that trains no head: what `tile_head`
-    moves and `restore_head` sets."""
-    return next((entry.head_tile for entry in objective.program_key()
-                 if entry.trained and entry.head_tile is not None), None)
-
-
-def head_fused_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
-    """Whether the vocabulary head the objective trains takes its gradient in the forward
-    (`ProgramModule.head_fused`): what `unfuse_head` moves and `restore_head` sets."""
-    return any(entry.head_fused for entry in objective.program_key() if entry.trained)
 
 
 def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> JSON:

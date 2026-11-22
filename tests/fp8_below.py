@@ -72,7 +72,7 @@ def assert_fp8_below(dew_fn, named_fn, draw, label: str, *, seeds: int, named: s
 
     def drawn(start, stop):
         ranges[start, stop] = _drawn(dew_fn, named_fn, draw, range(start, stop), truth_program,
-                                     also=[reference_fn], terms_fn=terms_fn, label=label)
+                                     also=[reference_fn], terms_fn=terms_fn, label=label, repeats=start == 0)
         return ranges[start, stop][0]
 
     held = f"{label}, against {named}"

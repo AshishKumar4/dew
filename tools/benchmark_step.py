@@ -93,6 +93,7 @@ from dew.telemetry.benchmark import carried
 from dew.telemetry.instrumentation import (
     BOUND_MARKS,
     compilation_cache_counts,
+    compiled_memory,
     count_compilation_cache,
     logged_utilization,
 )
@@ -103,6 +104,7 @@ from dew.training.ahead import AheadOfTime
 from dew.training.interval import throughput
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
+from dew.training.tracker import Tracker, WandbTracker
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import peak_memory
@@ -216,6 +218,10 @@ class BenchmarkConfig:
     """Documents per row for the language-model cases; the others are left
     alone. This is the packed loader's batch, which reroutes attention off the
     fused kernel."""
+    tracked: str | None = None
+    """A W&B project each case's row is logged into once every case is measured, outside every timed
+    window, one step a case, its numbers named by its architecture (`tracked`): an operational run's MFU
+    and step time where a training run's land. Unset, nothing is logged."""
     profile_dir: str | None = None
     """Trace `profile_steps` more steps under this directory with `dew.Profiler`
     after the timed windows, and read the device timeline back into the row:
@@ -292,15 +298,11 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
 
 
 def step_bytes(executable: jax.stages.Compiled | None) -> int | None:
-    """The bytes one device holds while the compiled step runs, as XLA planned
-    them: its arguments, the outputs not written over them, and the
-    temporaries; native workspaces (cuBLAS, cuDNN, a kernel's scratch) are
-    outside the plan, which `measured_row` reads."""
-    stats = None if executable is None else executable.memory_analysis()
-    if stats is None:
-        return None
-    return (stats.argument_size_in_bytes + stats.output_size_in_bytes
-            - stats.alias_size_in_bytes + stats.temp_size_in_bytes)
+    """The bytes one device holds while the compiled step runs, as XLA planned them (`CompiledMemory.summed`,
+    read once an executable, as the trainer read it); native workspaces lie outside the plan, which
+    `measured_row` reads."""
+    stats = None if executable is None else compiled_memory(executable)
+    return None if stats is None else stats.summed
 
 
 def parameter_count(params) -> int:
@@ -811,6 +813,15 @@ def entered(within: str | None) -> contextlib.AbstractContextManager:
     return getattr(importlib.import_module(module), function)()
 
 
+def tracked(rows: list[Row], tracker: Tracker) -> None:
+    """`rows`' numbers logged into `tracker` and it closed, one step a row in their order, each named by its
+    row's architecture: after every case's measurement, so no timed window holds it (row 285)."""
+    for step, row in enumerate(rows):
+        tracker.log({f"{row['architecture']}/{key}": float(value) for key, value in row.items()
+                     if isinstance(value, (int, float)) and not isinstance(value, bool)}, step)
+    tracker.close()
+
+
 def main(config: BenchmarkConfig) -> list[Row]:
     if config.compile_ahead is not None:
         if config.generation is None or config.capacity_gib is None:
@@ -858,6 +869,9 @@ def main(config: BenchmarkConfig) -> list[Row]:
     else:
         print()
         print(json.dumps(rows, indent=2))
+    # Last, the rows written first: a tracker that fails loses none of them (train 1150's review F4).
+    if config.tracked:
+        tracked(rows, WandbTracker(config.tracked, name=f"benchmark_step {config.preset}"))
     return rows
 
 

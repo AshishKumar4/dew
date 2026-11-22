@@ -67,7 +67,15 @@ def assert_kernel_on_par(kernel, reference, draw, label: str) -> None:
     """A kernel against its expression in XLA with the same roundings (`fla_gdn_support`'s reference): the
     same shapes and dtypes, and every output on par with the reference's from float64 over the site's
     declared draws (check 1, `KERNEL_SEEDS`), the reference's expression on the inputs widened its truth
-    (`support.computed_at`)."""
+    (`support.computed_at`). Interpreted alone, where the kernel's arithmetic is the reference's: natively
+    the port takes fla's own, an fp32 call's products one TF32, about 2000 times an exact product's error
+    (row 10860, M-JS-164-gh200), and every call's exponentials Triton's approximate `exp2`, which put a bf16
+    `chunk_bwd_dqkwg` 1.7 times the expression's distance (row 10947); the GPU tier holds the port to fla's
+    own outputs in each dtype instead (`the_port_is_as_exact_as_fla`, `FLA_DTYPES`, bf16 among them:
+    M-JS-180-a100)."""
+    if not INTERPRETED:
+        pytest.skip("a kernel's XLA expression holds the interpreted port's arithmetic alone")
+
     def laid(arm):
         return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), jax.eval_shape(arm, *draw(0)))
 
@@ -947,10 +955,13 @@ FLA_SHAPE = (1, 1024, 2, 4, 128)
 """The port's cell against fla's own: a row of 1024 tokens, two key heads each serving two value heads, 128
 wide (Qwen3.5's gated delta net's head)."""
 
-FLA_DTYPES = {"float32": (jnp.float32,) * 3, "mixed dtypes": (jnp.bfloat16, jnp.float32, jnp.bfloat16)}
-"""The queries', keys' and values' dtypes of the port's cells against fla's own: fp32, whose products the port
-takes in BF16x6 (six bf16 products, `fla_gdn`'s BF16_BF16_F32_X6) and fla in one TF32, and mixed, which each
-runs in their common dtype."""
+FLA_DTYPES = {"float32": (jnp.float32,) * 3, "mixed dtypes": (jnp.bfloat16, jnp.float32, jnp.bfloat16),
+              "bfloat16": (jnp.bfloat16,) * 3}
+"""The queries', keys' and values' dtypes of the port's cells against fla's own: fp32, whose products each
+takes at least as exact as fla's one TF32 (`fla_gdn._precision`); mixed, which each runs in their common
+dtype, fp32; and bf16, a 16-bit call as models train it, each product exact and summed in fp32 on both
+sides, its exponentials each kernel's own (Triton's `exp2`), which no expression in XLA states (row
+10947: the port's `chunk_bwd_dqkwg` 1.7 times its XLA expression's distance natively)."""
 
 
 def the_port_is_as_exact_as_fla(per_key: bool, dtypes: str):
@@ -1029,15 +1040,16 @@ def _lowered_dot(product, default: str) -> list:
 
 
 def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
-    """The port's fp32 dots lower alike under a run's default precision and the suite's 'highest', at
-    fla's own precision: one TF32, or one IEEE where fla turns TF32 off, never the global setting's (which
-    made the sm80 WY backward an IEEE kernel ptxas compiled for minutes). A dot that names nothing follows
-    the setting."""
+    """The port's fp32 dots lower alike under a run's default precision and the suite's 'highest', each the
+    algorithm the algebra chose at least as exact as fla's own (`fla_gdn._precision`): one TF32 where fla
+    takes TF32, never the global setting's (which made the sm80 WY backward an IEEE kernel ptxas compiled
+    for minutes). A dot that names nothing follows the setting."""
     from jaxlib.triton.dialect import InputPrecision
 
-    for ieee, named in ((False, InputPrecision.TF32), (True, InputPrecision.IEEE)):
+    for ieee in (False, True):
         product = functools.partial(fla_gdn._dot, exact=False, ieee=ieee)
-        assert _lowered_dot(product, "default") == _lowered_dot(product, "highest") == [named]
+        assert _lowered_dot(product, "default") == _lowered_dot(product, "highest")
+    assert _lowered_dot(functools.partial(fla_gdn._dot, exact=False), "default") == [InputPrecision.TF32]
 
     def unnamed(a, b):
         return jnp.dot(a, b, preferred_element_type=jnp.float32)

@@ -9,7 +9,7 @@ class CFG(scale: float, interval: tuple[float, float] = (0.0, 1.0), rescale: flo
   .modules(self) -> tuple[nn.Module, ...]
   .replace(self, **updates)
   .walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk
-class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str | None = None, local_every: int | str | None = None)  [dew.checkpoints]
+class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str | None = None, local_every: int | str | None = None, export_model: bool = False)  [dew.checkpoints]
   .accumulation_template(self, step: int)
   .artifact(self, step: int | str | None = None) -> JSON
   .best: property -> int | None
@@ -37,8 +37,8 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .resumed(self, resume: Resume = 'auto') -> int | None
   .rollout_state(self, step: int, template: Mapping[str, object]) -> dict | None
   .rung(self, step: int) -> JSON
-  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, tokenizer: Tokenizer | None = None) -> None
-  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None) -> None
+  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, tokenizer: Tokenizer | None = None, held_apart: bool = False) -> None
+  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, held_apart: bool = False) -> None
   .source(self, step: int) -> str
   .stored(self, step: int | str | None = None) -> Variables
   .training(self, step: int) -> JSON
@@ -168,6 +168,7 @@ class Objective()  [dew.objectives.base]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]
+  .predicts_by_head: property -> bool
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
   .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
@@ -273,6 +274,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]
+  .predicts_by_head: property -> bool
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
   .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
@@ -413,6 +415,10 @@ dew.config.DecoderRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
 dew.config.MetricConfig
   name: str
   fields: JsonDict = builtins.dict()
@@ -561,6 +567,10 @@ dew.config.lm.LMRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
   tokenizer: str = 'byte'
   prompt: str = ''
   max_new_tokens: int = 128
@@ -613,6 +623,7 @@ dew.config.trainer.TrainerConfig
   checkpoint_final: bool = True
   local_directory: str | None = None
   local_every: int | str | None = None
+  export_model: bool = False
   scored_to: str | None = None
   accumulation: int = 1
   split: int | None = None
@@ -687,6 +698,10 @@ dew.decision.config.DecisionRunConfig
   loop_steps_mean: float | None = None
   loop_steps_dispersion: float | None = None
   loop_steps_max: int | None = None
+  loop_messages: bool = False
+  loop_message_block_size: int | None = None
+  loop_message_rank: int | None = None
+  loop_message_additive: bool = True
   pretrained: str = 'convaiinnovations/laya'
   subfolder: str | None = None
   revision: str | None = None
@@ -906,7 +921,7 @@ dew.interop.source_options.SourceOptions
   attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
   dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
   scan_layers: bool = False
-  packed_experts: bool = False
+  packed_weights: bool = False
   param_dtype: str | None = None
   step: int | str | None = None
   ema: bool | None = None

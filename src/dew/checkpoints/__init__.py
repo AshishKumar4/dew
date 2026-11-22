@@ -85,6 +85,7 @@ from dew._coordination import broadcast_from_process_zero, from_every_process, s
 from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
+from dew.checkpoints._exported import EXPORTED, exported
 from dew.checkpoints._integrity import _digest
 from dew.checkpoints._payloads import (
     _NEEDS,
@@ -133,7 +134,7 @@ from dew.checkpoints.averaging import (
     averaged as averaged,
     averaged_pinned as averaged_pinned,
 )
-from dew.checkpoints.submesh import SubmeshArrays
+from dew.checkpoints.submesh import SubmeshArrays, save_args
 from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
@@ -248,6 +249,14 @@ def location(directory: str) -> epath.Path:
     return path if is_uri(directory) else path.resolve()
 
 
+def _grids_recorded(written: Mapping[str, JSON]) -> JSON:
+    """The grids a local step records (`Grid.each`), one a mesh: a step an earlier Dew wrote records its one
+    mesh's alone (`grid`), read as the list of it."""
+    if "grids" in written:
+        return written["grids"]
+    return None if written.get("grid") is None else [written["grid"]]
+
+
 class Envelope(TypedDict):
     """What a checkpoint of a run's state holds on every tier, as `Checkpoints.save` and `save_local` each
     take it, their own metadata beside it: the state as saved, its data position (`saved`), the partition
@@ -263,6 +272,10 @@ class Envelope(TypedDict):
     training: JSON
     boxed: Mapping[tuple[str, ...], LogicalAxes] | None
     rollout: Mapping[str, object] | None
+    held_apart: bool
+    """Whether `state` holds a pipeline's rows each on its own stage's devices
+    (`dew.training.stages.StageLocal.saved`), which each tier writes by the processes holding them
+    (`submesh.HeldApart`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -962,10 +975,14 @@ class Checkpoints:
     pool's local checkpoint restores onto the placement it was written with,
     because no process holds another process's shards (`_check_placement`);
     one process's, and the persistent checkpoint, restore onto any mesh.
+
+    `export_model` writes beside each persistent step of a train state its model whole (`EXPORTED`), every
+    collection (a LoRA base) and EMA as their own arrays, in Orbax's standard layout stock Orbax reads.
     """
 
     def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
-                 local_directory: str | None = None, local_every: int | str | None = None):
+                 local_directory: str | None = None, local_every: int | str | None = None,
+                 export_model: bool = False):
         if (local_directory is None) != (local_every is None):
             raise ValueError(
                 "local checkpoints take both local_directory and local_every: where "
@@ -992,6 +1009,7 @@ class Checkpoints:
         self._deleting: tuple[threading.Thread, list[OSError], frozenset[int]] | None = None
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
+        self.export_model = export_model
         # Why the run these checkpoints keep has no record that rebuilds it (`python_run`).
         self._reasons: tuple[str, ...] = ()
         self._manager = None
@@ -1000,7 +1018,7 @@ class Checkpoints:
         self._metadata: tuple[bool, int, _StepFacts] | None = None
         # The newest local step, the processes holding it and where its arrays lie, where some process
         # lost its copy and recovers it from them (`_local_latest`); None where every process holds it.
-        self._recovery: tuple[int, frozenset[int], Grid] | None = None
+        self._recovery: tuple[int, frozenset[int], tuple[Grid, ...]] | None = None
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -1213,7 +1231,8 @@ class Checkpoints:
             # A step's items (`ROLES`), or the one item of a step an earlier Dew wrote or a mapping's.
             self._manager = ocp.CheckpointManager(
                 self.directory, options=options,
-                item_handlers={name: _handler() for name in (*ROLES, ONE_ITEM)})
+                item_handlers={**{name: _handler() for name in (*ROLES, ONE_ITEM)},
+                               EXPORTED: ocp.StandardCheckpointHandler()})
             for step in self._manager.all_steps():
                 if not self._complete(step):
                     continue
@@ -1322,12 +1341,12 @@ class Checkpoints:
         # A process that lost its copy recovers it where the processes holding it hold a copy of
         # every shard it held (`_covered`).
         holders = frozenset(index for index, step in enumerate(steps) if step == newest)
-        recorded = self._from_holder(holders, lambda: (self._open_local().metadata(newest).custom_metadata
-                                                       or {}).get("grid"))
-        grid = None if recorded is None else from_record(Grid, recorded)
-        if grid is None or not _covered(grid, holders):
+        recorded = self._from_holder(holders, lambda: _grids_recorded(
+            self._open_local().metadata(newest).custom_metadata or {}))
+        grids = tuple(from_record(Grid, grid) for grid in recorded) if isinstance(recorded, list) else None
+        if grids is None or not _covered(grids, holders):
             return None
-        self._recovery = newest, holders, grid
+        self._recovery = newest, holders, grids
         return newest
 
     def _from_holder(self, holders: frozenset[int], read: Callable[[], JSON]) -> JSON:
@@ -1434,11 +1453,15 @@ class Checkpoints:
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
         tokenizer: Tokenizer | None = None,
+        held_apart: bool = False,
     ) -> None:
         """Write `state` under `step`, asynchronously, a train state with its rollout's tree of arrays where
         it holds one (`rollout`), which `rollout_state` reads back, and the run holding `tokenizer`, where
         given, the one the step's inference declaration (`artifact`) states the files of, before the step is
         written (`dew.inference.tasks.hold_tokenizer`): a committed step's tokenizer is in its run.
+        `held_apart` writes each array on part of the pool by the processes holding it (`Envelope`): for a
+        pipeline's rows, each leaf one global array placed alike on every process, never a value each
+        process holds of its own under one name, which Orbax refuses as host-local.
 
         `state` is a run's `TrainState`, or a mapping of arrays in its place
         for a state that is not a training run's, such as a simulation's,
@@ -1493,7 +1516,7 @@ class Checkpoints:
             # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
             self._hold(artifact, tokenizer)
             profiles, state_tree, frozen, deltas, payloads = self._state_items(state, saved, share, rollout,
-                                                                               weights_only)
+                                                                               weights_only, held_apart)
         profile_metadata = None if profiles is None else {**_profile_record(profiles[1]),
                                                           'at': _named(profiles[0])}
         self._metadata = None
@@ -1512,8 +1535,12 @@ class Checkpoints:
                               tuple(name for name in (*ROLES, ONE_ITEM) if name in payloads))
         try:
             with region("checkpoint.submit"):
-                persistent.save(step, args=ocp.args.Composite(**{
-                    name: ocp.args.PyTreeSave(tree) for name, tree in payloads.items()}),
+                written: dict[str, ocp.args.CheckpointArgs] = {
+                    name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
+                    for name, tree in payloads.items()}
+                if self.export_model and not mapping:
+                    written[EXPORTED] = ocp.args.StandardSave(exported(state))
+                persistent.save(step, args=ocp.args.Composite(**written),
                                 metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
             self._staged.pop(step)
@@ -1576,12 +1603,14 @@ class Checkpoints:
                     continue
                 root = epath.Path(self.path(step))
                 kept = [name for name in ROLES if name in needed and name in payloads]
-                leftover = not self._swept and any((root / name).exists() for name in ROLES
-                                                   if name not in kept)
+                # A step's exported model is its model's: kept with it, else cut with it (`EXPORTED`).
+                own, written = [*kept, *([EXPORTED] if MODEL in kept else [])], (*ROLES, EXPORTED)
+                leftover = not self._swept and any((root / name).exists() for name in written
+                                                   if name not in own)
                 if len(kept) == len(payloads) and not leftover:
                     continue
                 write_atomically(root / PROJECTED, json.dumps(kept))
-                doomed += [root / name for name in ROLES if name not in kept and (root / name).exists()]
+                doomed += [root / name for name in written if name not in own and (root / name).exists()]
                 cuts[str(step)] = kept
         cuts = broadcast_from_process_zero(cuts)
         if doomed:
@@ -1611,7 +1640,7 @@ class Checkpoints:
         if failures:
             raise failures[0]
 
-    def _frozen(self, state_tree: dict[str, StateLeaf]
+    def _frozen(self, state_tree: dict[str, StateLeaf], held_apart: bool = False
                 ) -> tuple[Mapping[str, object], dict[str, dict[str, str]]]:
         """Return `state_tree` with the collections but `params` of each of its variables trees
         (`_variable_trees`: the variables and the EMA, the run's and each DiLoCo group's, stacked) held
@@ -1648,7 +1677,8 @@ class Checkpoints:
                 digest = digests[tree][name]
                 if digest not in written and digest not in stored:
                     with region("checkpoint.frozen"), ocp.Checkpointer(_handler()) as checkpointer:
-                        checkpointer.save(root / digest, args=ocp.args.PyTreeSave(value))
+                        checkpointer.save(root / digest, args=ocp.args.PyTreeSave(
+                            value, save_args=save_args(value, held_apart)))
                     written.add(digest)
         kept_tree: Mapping[str, object] = state_tree
         for path, collections in trees.items():
@@ -1811,7 +1841,7 @@ class Checkpoints:
         return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)
 
     def _state_items(self, state: TrainState, saved: bytes | None, share: DataPartition | None,
-                     rollout: Mapping[str, object] | None, weights_only: bool) -> tuple:
+                     rollout: Mapping[str, object] | None, weights_only: bool, held_apart: bool) -> tuple:
         """`state`'s items as `save` writes them: its profiles where it records them, its tree less its
         frozen trees and its EMA as deltas (`_with_ema_deltas`), those frozen trees, the deltas and the
         payloads its items make (`_in_payloads`), its model alone where `weights_only`."""
@@ -1822,7 +1852,7 @@ class Checkpoints:
             from dew.state import MODEL_STATE
             state_tree = {name: state_tree[name] for name in MODEL_STATE}
         profiles = None if weights_only else _profiles_at(state_tree)
-        state_tree, frozen = self._frozen(state_tree)
+        state_tree, frozen = self._frozen(state_tree, held_apart)
         state_tree, deltas = _with_ema_deltas(state_tree)
         return profiles, state_tree, frozen, deltas, _in_payloads(state_tree, None if profiles is None
                                                                   else profiles[0])
@@ -1840,9 +1870,11 @@ class Checkpoints:
         training: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
+        held_apart: bool = False,
     ) -> None:
         """Write `state` under `step` to this process's local directory, asynchronously, with its
-        rollout's tree where it holds one (`rollout`, replicated: every process writes it whole).
+        rollout's tree where it holds one (`rollout`, replicated: every process writes it whole);
+        `held_apart` as `save` takes it, for a pipeline's rows alone.
 
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The
@@ -1853,7 +1885,7 @@ class Checkpoints:
         refuse_non_finite(state, step, lambda: self.latest)
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
-        grid = Grid.of({name: leaf for name, leaf in state_tree.items() if name != 'position'})
+        grids = Grid.each({name: leaf for name, leaf in state_tree.items() if name != 'position'})
         coded, deltas = _with_ema_deltas(state_tree)
         state_tree = dict(coded)
         if saved is not None:
@@ -1869,13 +1901,13 @@ class Checkpoints:
         with region("checkpoint.submit_local"):
             local.save(
                 step,
-                args=ocp.args.PyTreeSave(state_tree),
+                args=ocp.args.PyTreeSave(state_tree, save_args=save_args(state_tree, held_apart)),
                 force=True,
                 custom_metadata={
                     **step_record(deltas, control, rung, artifact, training, boxed, state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
-                    "grid": None if grid is None else to_record(grid, Grid),
+                    "grids": None if grids is None else [to_record(grid, Grid) for grid in grids],
                 },
             )
         if _written_in_place(state_tree):
@@ -2399,10 +2431,11 @@ class Checkpoints:
         recovery = self._recovery
         if recovery is None or recovery[0] != step:
             return restored
-        _, holders, grid = recovery
+        _, holders, grids = recovery
         table = restored.pop('position', None)
         # The leaves the step wrote, from their holders; one it never wrote is each process's own as made.
-        restored = _merged(_from_replicas(_written(restored, self._placement(step)), grid, holders), restored)
+        restored = _merged(_from_replicas(_written(restored, self._placement(step)), grids, holders),
+                           restored)
         if positioned:
             restored['position'] = _from_table_record(self._from_holder(
                 holders, lambda: _table_record(jax.tree.map(np.asarray, dict(table or {})))))
@@ -2415,7 +2448,7 @@ class Checkpoints:
         recovery = self._recovery
         written = (self._step_metadata(step, local=True).custom_metadata or {})
         if recovery is not None and written.get('processes') == jax.process_count() and (
-                Grid.of(_written(state_tree, self._placement(step))) == recovery[2]):
+                Grid.each(_written(state_tree, self._placement(step))) == recovery[2]):
             return
         raise ValueError(
             f"This process lost its copy of local step {step}, which the processes "

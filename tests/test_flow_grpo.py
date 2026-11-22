@@ -490,9 +490,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     would not guide a step 1 of 6, so the rescoring reads the rollout's step
     count off the batch. Its group advantages are the float64 normalization's,
     rounded once, and its timesteps the 4-point walk's first two, bit for
-    bit. The walk its collective gathers is its trained prefix: three of its
-    four states, two densities and stochastic marks, its four times whole
-    (row 10795)."""
+    bit: its rows hold its trained prefix alone."""
     from dew.inputs import CharTable, Condition
     from dew.nn.backbones.dit import SimpleDiT
 
@@ -517,16 +515,10 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     def reward(images, context):
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
-    from dew.distributed.batches import split_fields
-
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
-    # What the rollout's generation hands its collective (`_generate_impl`), by its shapes alone.
-    expanded = rollout._expanded(split_fields(prompts)[0])[0]
-    walk = jax.eval_shape(lambda: rollout._generate_impl(rollout._policy(state), expanded,
-                                                         jax.random.key(23)))[0]
-    assert (walk.states.shape[1], walk.log_probs.shape[1], walk.stochastic.shape[1], walk.times.shape) == (
-        3, 2, 2, (4,))
     batch = rollout(state, prompts, jax.random.key(23), objective=objective)
+    # Its rows hold the walk's first two transitions alone, its trained prefix (row 10903).
+    assert batch["timesteps"].shape == batch["transition_mask"].shape == (6, 2)
     rewards = np.asarray(batch["rewards"], np.float64).reshape(2, 3)
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))

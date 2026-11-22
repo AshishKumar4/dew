@@ -24,7 +24,7 @@ from jax.extend.core import primitives
 from dew.algebra import terms
 from dew.algebra.forms import aval
 from dew.nn.derivatives import marked_call_p, stated_operation
-from dew.nn.programs import SCALAR_FOLDED, called, entrywise, host_evaluated, live, on_host
+from dew.nn.programs import SCALAR_FOLDED, called, entrywise, host_evaluated, live, on_host, own_preset
 
 
 def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -314,25 +314,21 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
     return bound if equation.primitive.multiple_results else [bound]
 
 
-OWN_PRESETS = {jnp.dtype(jnp.bfloat16): "BF16_BF16_F32", jnp.dtype(jnp.float16): "F16_F16_F32"}
-"""Each 16-bit float's own dot algorithm: its products exact and summed in float32."""
-
-
 def _stated(params: dict, operands: Sequence) -> dict:
     """A product's `params` with its precision as the arithmetic it states: two operands of one 16-bit
     float summed to float32 are exact products summed in float32 under any `jax.lax.Precision` (which
     chooses the passes of wider operands alone), the default algorithm or the dtype's own algorithm
-    (`OWN_PRESETS`, jax.nn's attention names it), so each reads as no precision; any other product keeps
-    the precision it states."""
+    (`dew.nn.programs.own_preset`, jax.nn's attention names it), so each reads as no precision; any
+    other product keeps the precision it states."""
     dtypes = {jnp.result_type(value) for value in operands}
     precision = params.get("precision")
-    if (len(dtypes) != 1 or (dtype := dtypes.pop()) not in OWN_PRESETS
+    if (len(dtypes) != 1 or (own := own_preset(dtypes.pop())) is None
             or params.get("preferred_element_type") != jnp.float32):
         return params
     enums = precision if isinstance(precision, tuple) else (precision,)
     if all(part is None or isinstance(part, jax.lax.Precision) for part in enums) or (
             isinstance(precision, jax.lax.DotAlgorithmPreset)
-            and precision.name in ("DEFAULT", OWN_PRESETS[dtype])):
+            and precision in (jax.lax.DotAlgorithmPreset.DEFAULT, own)):
         return {**params, "precision": None}
     return params
 
@@ -405,8 +401,11 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
         # An operand of one element along an axis the result spans is broadcast along it, as the
         # equation reads it: laid out to the result's axes of more than one element (`_broadcast`).
         inner = [_broadcast(value, out.shape, squeezed) if jnp.ndim(value) else value for value in operands]
-    core_shape = jax.eval_shape(lambda *values: equation.primitive.bind(*values, **params), *inner).shape
-    inner_equation = equation.replace(params=params, outvars=[jcore.Var(out.update(shape=core_shape))])
+    # Its erased value's type, its sharding's spec of that value's rank (an Explicit mesh's: the whole
+    # result's spec on it raised).
+    core = jax.eval_shape(lambda *values: equation.primitive.bind(*values, **params), *inner)
+    inner_equation = equation.replace(params=params, outvars=[jcore.Var(out.update(shape=core.shape,
+                                                                                  sharding=core.sharding))])
     core = _normal(inner_equation, inner, widened, laid)[0]
     return [_unsqueezed(core, out.shape, squeezed)]
 
@@ -540,9 +539,10 @@ def _lifted(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
             if value in laid}) != 1:
         return None
     (shape, dimensions), = layouts
-    inner = equation.replace(outvars=[jcore.Var(equation.outvars[0].aval.update(
-        shape=jnp.shape(next(source for source, value in zip(sources, operands, strict=True)
-                             if value in laid))))])
+    source = jax.typeof(next(source for source, value in zip(sources, operands, strict=True)
+                             if value in laid))
+    inner = equation.replace(outvars=[jcore.Var(equation.outvars[0].aval.update(shape=source.shape,
+                                                                                 sharding=source.sharding))])
     made = _normal(inner, sources, widened, laid)[0]
     spread = jax.lax.broadcast_in_dim(made, shape, dimensions)
     laid[spread] = (made, (shape, dimensions))

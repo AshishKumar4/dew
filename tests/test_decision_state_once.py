@@ -11,13 +11,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from merging_tokenizer import Merging
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 from test_decision_context import windows_of
 from test_decision_letters_context import LABELS, STATES
 from test_decision_streams import SPECIALS, TOKENIZER, in_streams
 
 from dew.batch import unboxed
-from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Example
 from dew.decision.head import JointSchemaHead, LabelReadout
 from dew.decision.inputs import DecisionInputs
@@ -366,25 +366,6 @@ def test_a_decision_run_whose_layout_states_no_sharing_declares_a_request_one_ro
     assert len(decide.layout.rows(decide.tokenizer, decide.specials, STATES[0], QUESTIONS)) == 1
 
 
-class Merging(ByteTokenizer):
-    """Bytes, but for "B. y", one token (256): a lettered row's tokens then depend on which option its second
-    slot shows, as a BPE vocabulary's do."""
-
-    MERGED = b"B. y"
-
-    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
-        data, ids, at = text.encode(), [], 0
-        while at < len(data):
-            merged = data.startswith(self.MERGED, at)
-            ids.append(256 if merged else data[at])
-            at += len(self.MERGED) if merged else 1
-        return ids
-
-    def decode(self, ids) -> str:
-        return b"".join(self.MERGED if int(id_) == 256 else bytes([int(id_)]) for id_ in ids).decode(
-            errors="replace")
-
-
 YES_NO = {"first": Choice("First?", ["no", "yes"]), "second": Choice("Second?", ["no", "yes"])}
 
 
@@ -392,7 +373,7 @@ def test_a_draw_of_option_orders_that_splits_a_row_over_one_state_lays_it_as_fit
     """A row over one state that fits `max_len` in its questions' own option orders and would not in a
     drawn one (a vocabulary that reads "B. yes" as fewer tokens than "B. no") is laid out, as Fit admitted
     it, in one row of both questions, whatever order a training read draws (review of state-once)."""
-    tokenizer = Merging()
+    tokenizer = Merging(b"B. y")
     example = Example(STATES[0], YES_NO, {"first": "yes", "second": "yes"})
     [row] = SHARED.rows(tokenizer, SPECIALS, STATES[0], YES_NO)
     fitting = dataclasses.replace(SHARED, max_len=len(row.tokens))

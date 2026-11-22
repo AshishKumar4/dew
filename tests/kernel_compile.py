@@ -108,12 +108,12 @@ class Report:
     launched: str | None = None
     """The digest of the launch that traced it (`report.Binary.launched`), None where no binary carries it."""
     binary_registers: int | None = None
-    binary_frame: int | None = None
+    binary_spilled: int | None = None
     binary_losses: tuple[str, ...] = ()
     """The codes of the notes of a performance loss its binary carries (`report.Binary.notes`, what the
     plugin's own ptxas noted as it assembled the kernel, `LOSSES`), beside the gate's own read of its PTX's
     (`losses`)."""
-    """Its registers a thread and stack frame's bytes as its executable's binary carries them
+    """Its registers a thread and the bytes it spills as its executable's binary carries them
     (`report.Binary`): this process's assembly, which `inherited` reads where no PTX of it was dumped."""
     threads: int | None = None
     decreased: int | None = None
@@ -207,7 +207,7 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             sass=tuple(binary.sass or ()) if binary is not None else (),
             launched=binary.launched if binary is not None else None,
             binary_registers=binary.registers if binary is not None else None,
-            binary_frame=binary.frame if binary is not None else None,
+            binary_spilled=binary.spills if binary is not None else None,
             binary_losses=(tuple(note.code for note in binary.notes if note.code in LOSSES)
                            if binary is not None else ()),
             threads=binary.threads if binary is not None else None,
@@ -223,9 +223,9 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             ("machine code", binary.sass is not None)) if not read)
         found_reports.append(Report(
             binary.kernel, binary.shared, 0 if tmem_known else None,
-            binary.registers, binary.frame, unread, None, binary.launch,
+            binary.registers, binary.spills, unread, None, binary.launch,
             sass=tuple(binary.sass or ()), launched=binary.launched,
-            binary_registers=binary.registers, binary_frame=binary.frame,
+            binary_registers=binary.registers, binary_spilled=binary.spills,
             threads=binary.threads, decreased=binary.decreased, raised=binary.raised,
             kind="triton", index=binary.index))
     return found_reports
@@ -362,10 +362,10 @@ def _uncertified_since(uncertified: dict) -> list[str]:
 
 def _certified_since(count: int) -> list[dict]:
     """Each launch certification compiled since the first `count` (`report.certifications`): its op and
-    config and each kernel's registers, stack frame and verdict (`Binary.refused`), what a cell a family
+    config and each kernel's registers, spilled bytes and verdict (`Binary.refused`), what a cell a family
     declines proves the decline by, read where a process of its own compiled it (`compiled_apart`)."""
     return [{"op": found.op, "config": repr(found.config),
-             "kernels": {name: [binary.registers, binary.frame, binary.refused]
+             "kernels": {name: [binary.registers, binary.spills, binary.refused]
                          for name, (_, binary) in found.kernels.items()}}
             for found in report.certifications()[count:]]
 
@@ -421,8 +421,8 @@ def _compiled(case, generation: str, record: dict,
     # Each kernel certification compiled alone in this process, by name and launch: its module.
     record["certified"] = {name: module for found in report.certifications()
                            for name, (module, _) in found.kernels.items()}
-    # Each launch certification compiled for this case, its op and config and each kernel's registers, stack
-    # frame and verdict (`Binary.refused`): what a cell a family declines proves the decline by, read where
+    # Each launch certification compiled for this case, its op and config and each kernel's registers, spilled
+    # bytes and verdict (`Binary.refused`): what a cell a family declines proves the decline by, read where
     # a process of its own compiled it (`compiled_apart`) as here.
     record["certifications"] = _certified_since(certifying)
     if directory is not None:
@@ -754,7 +754,7 @@ def inherited(kernel: dict, compiled: dict[str, dict], generation: str) -> dict:
         # No PTX of it in this process (its module compiled before the gate's): its executable's binary
         # (`report.binaries`), as certification reads it, where this process's builds are every build the
         # generation's GPUs run (`_assembles_for`; train 956 F1, train 960 F1).
-        return {**kernel, "registers": kernel["binary_registers"], "spilled": kernel["binary_frame"],
+        return {**kernel, "registers": kernel["binary_registers"], "spilled": kernel["binary_spilled"],
                 "ptxas": "its executable's binary"}
     unread = [*kernel["unread"], *(field for field in ("registers", "spills")
                                    if field not in kernel["unread"])]
@@ -938,11 +938,13 @@ def _compiled_here(cases, generation: str) -> list[dict]:
     return found
 
 
-def mosaic_failures(found: list[dict]) -> list[str]:
+def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[str]:
     """Compile errors, spills, missing or excessive shared/TMEM allocations, a launch its lowering did not
     certify (`report.certified`), and a producer its schedule lowers to other registers than its model
     states (`setmaxnreg.dec` against `RegisterModel.producer`: a launch's plan and its emission one fact).
-    Whether a launch's registers hold is its certification's alone: the gate judges no register model."""
+    Whether a launch's registers hold is its certification's alone: the gate judges no register model. A
+    kernel's planned shared bytes are its case's model's, or with `traced_models`, where its case states
+    none, its launch's as it traced (a case settled as a call takes its tile, `KernelOp.lowering` at None)."""
     failed = failures(found)
     for record in found:
         if refused(record):
@@ -955,8 +957,16 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             found_kernel = _report(kernel)
             if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
+            cased = record.get("models", {}).get(found_kernel.kernel)
             stated = (None if found_kernel.kind == "triton"
-                      else record.get("models", {}).get(found_kernel.kernel))
+                      else cased if cased is not None or not traced_models
+                      else record.get("stated_models", {}).get(found_kernel.traced))
+            unplanned = stated is None or stated["shared"] is None
+            if traced_models and found_kernel.kind != "triton" and unplanned:
+                # A settled case plans its shared bytes by its launch's traced model alone: none, or one
+                # stating no shared bytes, is no evidence its allocation is the plan's.
+                failed.append(f"{record['name']}: {found_kernel.kernel} states no traced model's shared "
+                              f"bytes, its allocation unchecked against its plan")
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")

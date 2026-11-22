@@ -117,15 +117,13 @@ def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shar
     template's launch was refused the split rows (row 6594): its launches read one device's rows and each
     kernel whole, none both devices' rows. Its numerics per shard are the matrix's
     (tests/gated_mlp_matrix.py)."""
-    from flax import linen as nn
     from jax.sharding import PartitionSpec
     from kernel_compile import Expected, lowered_for
+    from sharded import layer_scope
 
-    from dew.distributed.placement import Layout
-    from dew.mesh import DATA_AXIS, DEFAULT_RULES, MESH_AXES
+    from dew.mesh import DATA_AXIS, MESH_AXES
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.mlp import GatedMLP
-    from dew.nn.sharding import placing
 
     layer = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
     x = jax.ShapeDtypeStruct((2, 64, FEATURES), jnp.bfloat16)
@@ -133,8 +131,7 @@ def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shar
     # A run's mesh (`MeshSpec`'s axes): the data axis two devices, every other one.
     mesh = Expected(tuple((axis, 2 if axis == DATA_AXIS else 1) for axis in MESH_AXES),
                     (None, PartitionSpec(DATA_AXIS)), frozenset())
-    with (nn.logical_axis_rules(DEFAULT_RULES), placing(Layout(min_shard=1)),
-          generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"), generation.routes() as routes):
+    with layer_scope(grouped_matmul="mosaic", gated_mlp="fused"), generation.routes() as routes:
         lowered = lowered_for(layer.apply, (params, x), generation_name, mesh)
     assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
     assert lowered.out_info.shape == (2, 64, FEATURES)

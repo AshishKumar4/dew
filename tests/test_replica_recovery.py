@@ -41,8 +41,8 @@ def test_a_save_whose_shards_have_no_copy_off_the_lost_process_is_not_covered():
     recorded no grid (an array placed otherwise than by name), so the pool resumes elsewhere."""
     from dew.checkpoints._replicas import _covered
 
-    assert _covered(GRID, frozenset({0}), PROCESS)
+    assert _covered((GRID,), frozenset({0}), PROCESS)
     unreplicated = dataclasses.replace(GRID, split={**GRID.split, "['params']['x']": ("data", "fsdp")})
-    assert not _covered(unreplicated, frozenset({0}), PROCESS)
+    assert not _covered((unreplicated,), frozenset({0}), PROCESS)
     assert not _covered(None, frozenset({0}), PROCESS)
 

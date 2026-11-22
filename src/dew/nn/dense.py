@@ -19,6 +19,7 @@ flax's own calls broadcast the bias in its storage dtype, where its gradient
 then sums, and offer no step to widen it.
 """
 
+import contextlib
 import functools
 import importlib.util
 import inspect
@@ -34,12 +35,27 @@ from flax.typing import Array
 from dew._cache import INTERCEPTED
 
 from .derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed
-from .kernels import projections
+from .kernels import generation, projections
 from .precision import accumulated, biased, float32_dot_general, refuse_recipe
-from .sharding import declared
+from .sharding import automatic_axes, declared
 
 QWIX = importlib.util.find_spec("qwix") is not None
 """Whether Qwix is installed (`dew.quantization`'s extra), whose rules a layer's product may fall under."""
+
+
+QUANTIZATION = "quantization"
+"""The collection that holds a projection site's checkpoint quantization, at
+the site's own scope: every view of the variables (a scanned or staged
+stack, a packed group, a pipeline) carries it with the weights it scales."""
+
+
+def dense_matrix(module: nn.Module):
+    """A dense layer's packed kernel (`[in, out]`, `dew.nn.kernels.formats.NvFp4`: a checkpoint's 4-bit
+    weight served as its codes, row 8550) its `QUANTIZATION` collection holds under `kernel`, else None,
+    the layer's own parameter its kernel."""
+    if not module.has_variable(QUANTIZATION, "kernel"):
+        return None
+    return module.get_variable(QUANTIZATION, "kernel")
 
 
 def intercepted() -> bool:
@@ -47,8 +63,12 @@ def intercepted() -> bool:
     interception scope (`dew.quantization`, `dew.lora`: `dew._cache.INTERCEPTED`), or a Qwix rule matching
     the op at this module under a direct `qwix.quantize_model` call (`qwix.pallas.get_current_rule`, Qwix's
     public query for code that runs its own kernels, which every active provider answers)."""
-    if INTERCEPTED.value:
-        return True
+    return INTERCEPTED.value or _ruled()
+
+
+def _ruled() -> bool:
+    """Whether a Qwix rule matches the op at this module under a direct `qwix.quantize_model` call
+    (`qwix.pallas.get_current_rule`, which every active provider answers)."""
     if not QWIX:
         return False
     from qwix import pallas as qwix_pallas
@@ -228,6 +248,8 @@ class Dense(_LinearEnvelope, nn.Dense):
     def _linear(self, inputs: Array) -> jax.Array:
         width = jnp.shape(inputs)[-1]
         axes = self.kernel_axes
+        if (packed := dense_matrix(self)) is not None:
+            return self._packed(inputs, packed)
         kernel = self.param('kernel', declared(self.kernel_init, axes), (width, self.features),
                             self.param_dtype)
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
@@ -236,6 +258,40 @@ class Dense(_LinearEnvelope, nn.Dense):
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
         return _biased(self, inputs, kernel, dimensions, bias, lambda bias: bias, stored)
+
+
+    @nn.nowrap
+    def _packed(self, inputs: Array, matrix) -> jax.Array:
+        """The layer over its packed kernel (`dew.nn.dense.dense_matrix`, a checkpoint's 4-bit weight
+        served as its codes, row 8550): its NVFP4 product (`gemm.nvfp4_product`: the inputs rounded to
+        bfloat16, each code times its block's scale exact, the sums in fp32 and the matrix's tensor scale
+        after), its fp32 sum plus its bias rounded once to the layer's dtype. Frozen, as the codes are a
+        checkpoint's; a quantization rule over the site (Qwix's) quantizes a kernel, which a packed one is
+        not, and is refused. An input quantization of other sites (a source's stored input scales) leaves
+        it as it is: a packed weight's source stores none for it (`codecs.SourceQuantization.as_nvfp4`)."""
+        from dew.nn.kernels.gemm import nvfp4_product
+
+        if _ruled():
+            raise ValueError(f"{self.name}'s kernel is packed (a checkpoint's NVFP4 codes, served as they "
+                             "are), and a quantization rule owns its product: load it without packed_weights")
+        width = jnp.shape(inputs)[-1]
+        depth, features = 8 * jnp.shape(matrix.words)[-1], jnp.shape(matrix.words)[-2]
+        if (depth, features) != (width, self.features):
+            raise ValueError(f"{self.name}'s packed kernel is [{depth}, {features}], its layer "
+                             f"[{width}, {self.features}]")
+        bias = (self.param('bias', declared(self.bias_init, None if self.kernel_axes is None
+                                            else self.kernel_axes[-1:]), (self.features,), self.param_dtype)
+                if self.use_bias else None)
+        dtype = self.dtype if self.dtype is not None else jnp.result_type(inputs)
+        rows = jnp.reshape(inputs, (-1, width))
+        # Under a mesh XLA places (`sharding.automatic_axes`), the product XLA partitions: the matrix decoded
+        # and multiplied (`gemm.NVFP4`'s 'xla'), where a packed launch would read one device's rows whole.
+        with (generation.chosen(grouped_matmul='xla', nvfp4='xla') if automatic_axes()
+              else contextlib.nullcontext()):
+            summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
+        if bias is not None:
+            summed = summed + jnp.asarray(bias, jnp.float32)
+        return jnp.reshape(summed.astype(dtype), (*jnp.shape(inputs)[:-1], self.features))
 
 
 def _members(init, batched: int, flat_shape):

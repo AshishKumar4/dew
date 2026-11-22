@@ -157,6 +157,7 @@ from dew.data.pipeline import (
 from dew.data.plan import Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import _Sequential, bounded as shards_bounded, bounded_places, cut, streamed
+from dew.data.sources import base
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
@@ -1529,16 +1530,14 @@ class _Build:
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
             return mixed_indexed(mapped, source)
-        streams = [
-            build.accepted(_as_iter(parent, build.loading), _name(child), _label(child))
-            for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
-        ]
+        # Each member's position under its key (`Plan.check`); its targets weighed as accepted (row 10784).
+        stated = self.lowering.order.get("shares") == STATED_SHARES
+        weighed: _Counter = {"tokens": source.tokens} if source.tokens is not None and stated else {}
+        streams = [build.accepted(_as_iter(parent, build.loading), _name(child), _label(child), **weighed)
+                   for parent, build, child in zip(parents, builds, source.pipelines, strict=True)]
         if tagged:
             streams = [stream.map(functools.partial(member_record, member=key))
                        for key, stream in zip(keys, streams, strict=True)]
-        # A streamed mix saves each member's position under its key, so a member that joins starts
-        # and one that left is dropped while the others resume (`Plan.check`).
-        stated = self.lowering.order.get("shares") == STATED_SHARES
         if source.tokens is not None and not stated:
             return TokenDeficit(
                 streams,
@@ -1686,12 +1685,12 @@ class _Build:
         cache, interleave = self.lowering.cache, self.lowering.interleave
         start = 0 if cache is None else cache + 1
         transparent = cache is not None and _transparent(pipeline, cache)
-        shards = source.manifest()
+        shards = base.stream_manifest(source, positioned=last >= 0 and (cache is None or last < cache))
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
             reader = filled.streamed(shards.reader, manifest, transform=prefix, pool=prefix.pool,
-                                     source=source, transparent=transparent)
+                                     source=source, transparent=transparent, shard_count=len(shards.shards))
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards, partition, self.stream_loading) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]

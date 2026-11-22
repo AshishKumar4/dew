@@ -1,12 +1,9 @@
-"""The shipped recipes' documented commands (their docstrings' `python recipes/...` lines, `RUN`), run
-as written at a tiny size on CPU: their flags as documented, with only the model's sizes, the run's
-length, the data and the pretrained source swapped for small local ones (`TINY`). A recipe whose
-defaults refuse its own command is red: the decision recipe's `--trainer.steps 2000` was refused at its
-default cadence ("epoch"), which no test of the recipes ran."""
+"""The shipped recipes run through their entry points (each recipe's `main`) at a tiny size on CPU: each its
+documented command's flags (the recipe's docstring) with the model's sizes, the run's length, the data and
+the pretrained source swapped for small local ones, and the run it saves checked. A recipe whose defaults
+refuse its own command is red: the decision recipe's `--trainer.steps 2000` was refused at its default
+cadence ("epoch"), which no test of the recipes ran."""
 
-import ast
-import shlex
-from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -14,39 +11,21 @@ import pytest
 from objective_data import IMAGES
 from run_kinds import QWEN_TINY, TINY_LAYA, pictures
 from token_support import write_token_corpus
-from tool_support import REPO_ROOT, load
+from tool_support import load
 
 from dew.data import TFDS, Memory
 from dew.data.text import export_tokens
 
+TRAINED = ["--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None"]
+"""What every run here adds: one process, no shared compilation cache."""
 
-def documented(recipe: str) -> list[list[str]]:
-    """The commands `recipes/<recipe>.py`'s docstring documents for it, each its arguments as a shell reads
-    them."""
-    path = REPO_ROOT / "recipes" / f"{recipe}.py"
-    written = ast.get_docstring(ast.parse(path.read_text())) or ""
-    script = f"python recipes/{recipe}.py"
-    return [shlex.split(line.strip())[2:] for line in written.replace("\\\n", " ").splitlines()
-            if line.strip().startswith(script)]
+IMAGE_MODEL = ["--model.patch-size", "2", "--model.emb-features", "16", "--model.num-layers", "1",
+               "--model.num-heads", "2"]
 
 
-def scaled(args: list[str], sizes: dict[str, str]) -> list[str]:
-    """`args` with each flag `sizes` names (`--model.num-layers`, or a `--set` path such as
-    `data.images.size`) given its value there, every other argument as written."""
-    out, at = [], 0
-    while at < len(args):
-        flag = args[at]
-        if flag == "--set" and args[at + 1].split("=", 1)[0] in sizes:
-            path = args[at + 1].split("=", 1)[0]
-            out += ["--set", f"{path}={sizes[path]}"]
-            at += 2
-        elif flag in sizes:
-            out += [flag, sizes[flag]]
-            at += 2
-        else:
-            out.append(flag)
-            at += 1
-    return out
+def saved(root: Path) -> list[Path]:
+    """The runs a recipe saved under `root/runs`: each run's configuration beside its checkpoints."""
+    return sorted((root / "runs").glob("**/run.json"))
 
 
 def tickets():
@@ -66,122 +45,91 @@ def byte_store(root: Path, name: str) -> str:
     return str(root / name)
 
 
-TRAINED = ["--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None"]
-"""What every run here adds: one process, no shared compilation cache."""
-
-def decision(args: list[str], root: Path) -> Callable[[], object]:
-    from dew.decision.config import DecisionRunConfig
-
+@pytest.mark.mesh
+@pytest.mark.parametrize("command", [
+    ["--trainer.epochs", "1"],
+    ["--pretrained", str(QWEN_TINY), "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj",
+     "--optim.learning-rate", "1e-4", "--trainer.steps", "2"],
+], ids=["epochs", "lora"])
+def test_the_decision_recipe_trains_and_saves_its_run(command, tmp_path):
+    """recipes/decision/train.py's two documented commands over a small table: a run by epochs over the
+    default model (a tiny LAYA's), and a LoRA fine-tune of a tiny Qwen by steps, each saving its run."""
     recipe = load("train", "recipes/decision")
-    pretrained = str(QWEN_TINY if "--lora.rank" in args else TINY_LAYA)
-    sized = scaled(args, {"--pretrained": pretrained, "--trainer.epochs": "1", "--trainer.steps": "2",
-                          "--lora.rank": "2"})
-    sized = sized if "--pretrained" in sized else ["--pretrained", pretrained, *sized]
-    config = DecisionRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")],
-                                   default=recipe.default(*tickets()))
-    return config.run
-
-
-IMAGE_MODEL = {"--model.patch-size": "2", "--model.emb-features": "16", "--model.num-layers": "1",
-               "--model.num-heads": "2"}
-
-
-def diffusion(args: list[str], root: Path) -> Callable[[], object]:
-    from dew.config.diffusion import DiffusionRunConfig
-
-    recipe = load("train", "recipes/diffusion")
-    sized = scaled(args, {"data.images.size": "8", "data.images.batch": "8", "--trainer.epochs": "1",
-                          **IMAGE_MODEL})
-    config = DiffusionRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
-                                     "--set", "validation.images.size=8",
-                                     "--set", "validation.images.batch=8",
-                                     # Its default scores read a CLIP model from the Hub.
-                                     "--val-metrics", "[]",
-                                     "--text.encoder", "char_table", "--text.checkpoint", "char_table"],
-                                    default=recipe.default(*pictures()))
-    return config.run
-
-
-def jepa(args: list[str], root: Path) -> Callable[[], object]:
-    from dew.config.jepa import JepaRunConfig
-
-    recipe = load("train", "recipes/jepa")
-    sized = scaled(args, {"data.images.size": "16", "data.images.batch": "8", "--trainer.epochs": "1",
-                          "--probe-classes": "2", **IMAGE_MODEL})
-    images = TFDS("dew_images", path=str(IMAGES), split="train")
-    config = JepaRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
-                                "--set", "validation.images.size=16", "--set", "validation.images.batch=8"],
-                               default=recipe.default(*images.holdout(split="test")))
-    return config.run
-
-
-def lm(args: list[str], root: Path) -> Callable[[], object]:
-    """The LM recipe's epochs over a byte store of 40 x 16 tokens, 39 windows of 16 inputs and their
-    targets: five batches of eight, the fifth holding the last seven and the next epoch's first, as an
-    order that repeats for ever reads on, its windows read by index and ordered after, so the run knows
-    an epoch's length."""
-    from dew.config.lm import LMRunConfig
-
-    recipe = load("train", "recipes/lm")
-    tokens = np.random.default_rng(0).integers(1, 250, 40 * 16).astype(np.uint8)
-    store = write_token_corpus(root / "shakespeare-byte", tokens).train
-    sized = scaled(args, {"data.source.url": store, "data.token_windows.seq_len": "16",
-                          "data.token_windows.batch": "8", "--trainer.epochs": "1",
-                          "--model.emb-features": "16", "--model.num-layers": "1", "--model.num-heads": "2"})
-    config = LMRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
-                              "--max-new-tokens", "0"], default=recipe.default())
-
-    def trained() -> None:
-        assert int(config.run().step) == 5
-    return trained
-
-
-def rigel(args: list[str], root: Path) -> Callable[[], object]:
-    recipe = load("rigel", "recipes/lm")
-    at = args.index("--corpora") + 1
-    named = args[at:at + next((index for index, word in enumerate(args[at:]) if word.startswith("--")),
-                              len(args) - at)]
-    stores = {directory: byte_store(root, name)
-              for name, directory in zip(named[::2], named[1::2], strict=True)}
-    # Eight steps, the fewest whose rescaled phases each end past the one before.
-    sizes = {"--width": "128", "--steps": "8", "--batch-size": "8", "--seq-len": "16"}
-    sized = [stores.get(word, word) for word in scaled(args, sizes)]
-    # A size the command leaves at the recipe's (Rigel's own batch and length) is given small too.
-    unsized = [word for flag, value in sizes.items() if flag not in sized for word in (flag, value)]
-    rigel_flags = [*sized, *unsized, "--tokenizer", "byte"]
-    sized_run = ["--model.num-layers", "4", "--model.layer-types", "mamba", "mamba", "mamba", "attention",
-                 "--max-new-tokens", "0", *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")]
-    return lambda: recipe.main([*scaled(rigel_flags, {"--trainer.checkpoint-dir": str(root / "runs")}),
-                                *sized_run])
-
-
-def mixture(args: list[str], root: Path) -> Callable[[], object]:
-    import tyro
-
-    recipe = load("mixture", "recipes/lm")
-    return lambda: recipe.main(tyro.cli(recipe.Args, args=scaled(args, {"--show": "8"})))
-
-
-TINY = {"decision/train": decision, "diffusion/train": diffusion, "jepa/train": jepa, "lm/train": lm,
-        "lm/rigel": rigel, "lm/mixture": mixture}
-"""How each recipe's documented commands run here: their documented flags at a tiny size, over local data."""
-
-RUN = (("decision/train", 0), ("decision/train", 1), ("diffusion/train", 0), ("jepa/train", 0),
-       ("lm/train", 0), ("lm/rigel", 0), ("lm/rigel", 1), ("lm/mixture", 0))
-"""The documented commands this file runs, each by its recipe and its place among the recipe's commands: those
-that run as documented; a fix that makes another run adds it."""
-
-NETWORK = {"lm/mixture"}
-"""The recipes whose commands read the Hub, as their documented runs do: the mixture's sources and
-tokenizer."""
-
-COMMANDS = [pytest.param(recipe, documented(recipe)[index], id=f"{recipe}-{index}",
-                         marks=[pytest.mark.network] if recipe in NETWORK else [])
-            for recipe, index in RUN]
+    pretrained = [] if "--pretrained" in command else ["--pretrained", str(TINY_LAYA)]
+    state = recipe.main([*pretrained, *command, *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs")],
+                        tickets())
+    assert int(state.step) == 2 if "--trainer.steps" in command else int(state.step) > 0
+    assert saved(tmp_path)
 
 
 @pytest.mark.mesh
-@pytest.mark.parametrize(("recipe", "args"), COMMANDS)
-def test_a_recipes_documented_command_runs_at_a_tiny_size(recipe, args, tmp_path):
-    """The command runs to its end at a tiny size: its run trains, or the mixture prints its counts."""
-    TINY[recipe](args, tmp_path)()
+def test_the_diffusion_recipe_trains_and_saves_its_run(tmp_path):
+    """recipes/diffusion/train.py's documented command at 8 pixels, a batch of eight, one epoch of a small
+    picture table, captioned by a character table in place of the Hub's encoder, and no CLIP score."""
+    recipe = load("train", "recipes/diffusion")
+    state = recipe.main(["--set", "data.images.size=8", "--set", "data.images.batch=8",
+                         "--trainer.epochs", "1", "--model", "simple_dit", *IMAGE_MODEL, *TRAINED,
+                         "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                         "--set", "validation.images.size=8", "--set", "validation.images.batch=8",
+                         "--val-metrics", "[]", "--text.encoder", "char_table", "--text.checkpoint",
+                         "char_table"], pictures())
+    assert int(state.step) > 0 and saved(tmp_path)
+
+
+@pytest.mark.mesh
+def test_the_jepa_recipe_trains_and_saves_its_run(tmp_path):
+    """recipes/jepa/train.py's documented command at 16 pixels, a batch of eight and two probe classes, one
+    epoch of a small image table."""
+    recipe = load("train", "recipes/jepa")
+    images = TFDS("dew_images", path=str(IMAGES), split="train")
+    state = recipe.main(["--set", "data.images.size=16", "--set", "data.images.batch=8", "--trainer.epochs",
+                         "1", "--probe-classes", "2", *IMAGE_MODEL, *TRAINED,
+                         "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                         "--set", "validation.images.size=16", "--set", "validation.images.batch=8"],
+                        images.holdout(split="test"))
+    assert int(state.step) > 0 and saved(tmp_path)
+
+
+@pytest.mark.mesh
+def test_the_lm_recipe_trains_an_epoch_of_its_store_and_saves_its_run(tmp_path):
+    """recipes/lm/train.py's documented command over a byte store of 40 x 16 tokens, 39 windows of 16 inputs
+    and their targets: five batches of eight, the fifth holding the last seven and the next epoch's first, as
+    an order that repeats for ever reads on, its windows read by index and ordered after, so the run knows an
+    epoch's length."""
+    recipe = load("train", "recipes/lm")
+    tokens = np.random.default_rng(0).integers(1, 250, 40 * 16).astype(np.uint8)
+    store = write_token_corpus(tmp_path / "shakespeare-byte", tokens).train
+    state = recipe.main(["--set", f"data.source.url={store}", "--set", "data.token_windows.seq_len=16",
+                         "--set", "data.token_windows.batch=8", "--trainer.epochs", "1",
+                         "--model.emb-features", "16", "--model.num-layers", "1", "--model.num-heads", "2",
+                         *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                         "--max-new-tokens", "0"])
+    assert int(state.step) == 5 and saved(tmp_path)
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("corpora", [("web", "code"), ("web",)], ids=["two corpora", "one corpus proxy"])
+def test_the_rigel_recipe_trains_its_phases_and_saves_its_run(corpora, tmp_path):
+    """recipes/lm/rigel.py's documented commands over small byte stores, a width of 128 and eight steps, the
+    fewest whose rescaled phases each end past the one before: the full mixture of two corpora, and the muP
+    proxy on one."""
+    recipe = load("rigel", "recipes/lm")
+    named = [word for name in corpora for word in (name, byte_store(tmp_path, name))]
+    state = recipe.main(["--corpora", *named, "--width", "128", "--steps", "8", "--batch-size", "8",
+                         "--seq-len", "16", "--tokenizer", "byte", "--model.num-layers", "4",
+                         "--model.layer-types", "mamba", "mamba", "mamba", "attention",
+                         "--max-new-tokens", "0",
+                         *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs")])
+    assert int(state.step) == 8 and saved(tmp_path)
+
+
+@pytest.mark.mesh
+@pytest.mark.network
+def test_the_mixture_recipe_counts_each_sources_targets():
+    """recipes/lm/mixture.py's documented command over its first eight mixed documents, read from the Hub:
+    it counts the valid targets of the sources the mix drew."""
+    import tyro
+
+    recipe = load("mixture", "recipes/lm")
+    targets = recipe.main(tyro.cli(recipe.Args, args=["--show", "8"]))
+    assert set(targets) == set(recipe.WEIGHTS) and sum(targets.values()) > 0

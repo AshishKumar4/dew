@@ -70,7 +70,7 @@ class Args:
     """Mixed documents to read and count."""
 
 
-def main(args: Args) -> None:
+def main(args: Args) -> dict[str, int]:
     tok = tokenizer()
     counts = mixed(tok).stats(records=args.show)
     for metric, value in sorted(counts.items()):
@@ -83,6 +83,7 @@ def main(args: Args) -> None:
     for name, weight in WEIGHTS.items():
         print(f"{name}: {targets[name]} valid targets, {targets[name] / total:.3f} of the mix "
               f"(asked {weight})")
+    return targets
 
 
 if __name__ == "__main__":

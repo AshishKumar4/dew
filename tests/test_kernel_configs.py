@@ -24,7 +24,16 @@ from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, generations, l
 from jax.sharding import PartitionSpec
 from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
-from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
+from dew.nn.kernels import (
+    chunked_launch,
+    fla_gdn,
+    fla_kda,
+    gemm,
+    generation,
+    grouped_matmul,
+    recurrence,
+    tuning,
+)
 from dew.nn.kernels.templates import bundles, report, resources, swizzling
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
@@ -598,23 +607,15 @@ class GemmCase(NamedTuple):
     tile: Any
     consumers: int | None
     case: support.KernelCase
-    shape: str = ""
-    """Its projection (`GEMM_SHAPES`): two projections at one tile are two kernels, as a call leaving an axis
-    partial copies its blocks otherwise (`mosaic_gpu.partial_runs`) and one padded is compiled at its padded
-    extents."""
-
-    @property
-    def kernel(self) -> tuple:
-        """Its kernel's identity: its form, tile and projection, the band its tiles are walked in apart
-        (`Tiles.grid_block_n`), a contract case's count the tile's consumers stating it."""
-        return self.form, dataclasses.replace(self.tile, grid_block_n=0), self.shape
 
 
 def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False,
-                         form: str | None = None) -> list[GemmCase]:
+                         form: str | None = None, settled: bool = False) -> list[GemmCase]:
     """Each GEMM Mosaic launch form a `generation_name` GPU runs at the projection `shape`
     (`GEMM_SHAPES`, `_gemm_forms`), at the one tile its launch derives from the generation's facts
-    (`Template.derived`); each a family's mainloop only where it takes the call
+    (`Template.derived`), or with `settled` the one it settles on as a call (`KernelOp.lowering` at None:
+    the launch's certification, where the gate's compile certifies, refusing a tile whose kernels spill and
+    its derivation taking the next); each a family's mainloop only where it takes the call
     (`Template.eligible`). With `every_consumer_count`, each form at one consumer and at the family's most
     (`Family.consumers`) where that tile is legal instead, each case named with its count (`x1`, `x2`).
     With `form`, that form's alone. Each a record (`GemmCase`)."""
@@ -643,11 +644,17 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                     residencies = dict.fromkeys((config.programs, 1))
                     # At the derived step's depth, else twice it.
                     depths = dict.fromkeys((config.block_k, 2 * config.block_k))
-                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, block_k=depth,
-                                        stages=stages, programs=programs,
+                    # At more than one consumer, half the derived tile's columns first, else its own: two
+                    # consumers' registers are the scarce ones, so the contract's witness there is the form's
+                    # geometry with the fewest registers a consumer (sm120's two-consumer forward spills at
+                    # every 256-column tile of the derived one's search).
+                    widths = dict.fromkeys((config.block_n // 2, config.block_n) if consumers > 1
+                                           else (config.block_n,))
+                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, block_n=columns,
+                                        block_k=depth, stages=stages, programs=programs,
                                         cluster=config.cluster if consumers > 1 else 1)
-                              for rows_ in shares for depth in depths for programs in residencies
-                              for stages in range(config.stages, 1, -1))
+                              for columns in widths for rows_ in shares for depth in depths
+                              for programs in residencies for stages in range(config.stages, 1, -1))
                     tile = next((tile for tile in staged
                                  if isinstance(tile, tiling.Tiles) and launch.legal(ba, tile, target)),
                                 None)
@@ -655,12 +662,23 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                         configs[(f"{name} x{consumers} {tile}", consumers)] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for (label, consumers), config in configs.items():
-                case = support.KernelCase(label, lambda launch=launch, ba=ba, config=config:
-                                          launch.lowering(ba, config),
-                                          {kernel: _model(launch, ba, config)},
-                                          required=launch.legal(ba, config, target))
-                cases.append(GemmCase(name, config, consumers, case, shape))
+                if settled:
+                    # The launch as a call takes it: certification refuses a derived tile whose kernels spill
+                    # and the derivation takes the next, as a run's start does, within the gate's compile.
+                    case = support.KernelCase(f"{label}, as a call settles it",
+                                              lambda launch=launch, ba=ba: launch.lowering(ba, None),
+                                              required=launch.legal(ba, config, target))
+                else:
+                    case = _pinned_case(label, launch, ba, config, kernel, target)
+                cases.append(GemmCase(name, config, consumers, case))
     return cases
+
+
+def _pinned_case(label: str, launch, ba, config, kernel: str, target) -> support.KernelCase:
+    """`launch`'s call `ba` compiled at `config` (`KernelOp.lowering`), its `kernel`'s model the template's at
+    that tile, required where the tile is legal on `target`."""
+    return support.KernelCase(label, lambda: launch.lowering(ba, config),
+                              {kernel: _model(launch, ba, config)}, required=launch.legal(ba, config, target))
 
 
 def _replaced(config, **changes):
@@ -734,11 +752,13 @@ def _gate_forms(generation_name: str) -> set[str]:
     return forms
 
 
-@functools.cache
 def _gate_cases(generation_name: str, form: str) -> list:
-    """A form's cases at every projection (`_gemm_mainloop_cases`), each projection's call its own
-    (`GemmCase.shape`): two calls of one tile compile apart where one leaves an axis partial."""
-    return [case for shape in GEMM_SHAPES for case in _gemm_mainloop_cases(generation_name, shape, form=form)]
+    """A form's cases at every projection, each at the tile its launch settles on as a call
+    (`_gemm_mainloop_cases`' `settled`): each call its own, as two calls that derive one tile may settle on
+    two (certification refuses a launch by its whole call), a module compiled once a process however many
+    cases emit it. Derived where they compile, in the gate's refusals (`report.refusals`)."""
+    return [case for shape in GEMM_SHAPES
+            for case in _gemm_mainloop_cases(generation_name, shape, form=form, settled=True)]
 
 
 def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> list:
@@ -754,22 +774,31 @@ def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> lis
 @pytest.mark.parametrize(("generation_name", "form"), _by_form(gate_generations(stated=True), _gate_forms))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, form):
     """Every distinct GEMM Mosaic GPU kernel of a form a generation runs at a real projection (`_gate_cases`),
-    a test each form, at the tile its launch derives from the generation's facts, compiled by Mosaic for a
-    compile-only device of the generation on
-    this CPU through ptxas, with the JAX this checkout pins. Required launches must spill nothing; compiler
-    errors and missing reports fail any. Beside them, each launch of the
-    form's family contract (`_family_cases`: each consumer count) the gate does not hold lowers, within the
-    block, spilling nothing, before any consumer adopts a Family head; no version guard skips it."""
+    a test each form, at the tile its launch settles on as a call (its certification refusing a derived tile
+    whose kernels spill, its derivation taking the next), compiled by Mosaic for a compile-only device of the
+    generation on this CPU through ptxas, with the JAX this checkout pins. Required launches must spill
+    nothing under every CUDA build the gate judges and state the model its shared bytes are checked by;
+    compiler errors and missing reports fail any. A tile another build's certification would settle on
+    before or past the gate build's goes unqualified here, as a tile a build stepped down to did when the gate
+    compiled the derived tile (row 10766). Beside them, each launch form of the form's family
+    contract (`_contract_cases`: each consumer count) lowers within the block spilling nothing, before any
+    consumer adopts a Family head; no version guard skips it."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    cases = [each.case for each in _gate_cases(generation_name, form)]
-    contract = ([each.case for each in _family_cases(generation_name, form)]
-                if form in _family_forms(generation_name) else [])
-    assert cases
-    found = compile_mosaic_kernels(cases + contract, generation_name)
-    failed = failures(found) + mosaic_failures(found[len(cases):])
-    required = [record for case, record in zip(cases, found[:len(cases)], strict=True) if case.required]
-    failed += mosaic_failures(required)
+    # The gate's certifications refuse within its own refusals, none of them read by another test's
+    # derivation (`report.refusals`).
+    with report.refusals():
+        cases = [each.case for each in _gate_cases(generation_name, form)]
+        contract = ([each.case for each in _contract_cases(generation_name, form)]
+                    if form in _family_forms(generation_name) else [])
+        assert cases
+        # The contract's witnesses first, each its own kernels' first compile in the process, whose reports
+        # the gate reads (Mosaic compiles a module once a process); the gate's launches then certify as they
+        # trace.
+        found = compile_mosaic_kernels(contract + cases, generation_name)
+    failed = failures(found) + mosaic_failures(found[:len(contract)])
+    required = [record for case, record in zip(cases, found[len(contract):], strict=True) if case.required]
+    failed += mosaic_failures(required, traced_models=True)
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
@@ -819,7 +848,7 @@ def test_a_b200s_gathered_launch_certifies_its_tcgen05_tile_at_its_first_compile
         certified = report.certifications()[before:]
     assert (tile.family.startswith("tcgen05"), tile.block_m, tile.block_n) == (True, 128, 128), tile
     assert tile.producers.of(launch.KERNEL) is not None, tile
-    assert len(certified) == 1, [(each.config, [b.frame for b in each.refused]) for each in certified]
+    assert len(certified) == 1, [(each.config, [b.spills for b in each.refused]) for each in certified]
     assert not certified[-1].refused
 
 
@@ -877,7 +906,7 @@ def test_an_h100s_gathered_launch_certifies_its_tile_at_its_first_compile(name):
         tile = launch.taken(arguments)
         certified = report.certifications()[before:]
     assert tile.producers.of(launch.KERNEL) is None, tile
-    assert len(certified) == 1, [(each.config, [b.frame for b in each.refused]) for each in certified]
+    assert len(certified) == 1, [(each.config, [b.spills for b in each.refused]) for each in certified]
     assert not certified[-1].refused
 
 
@@ -939,14 +968,6 @@ def _contract_cases(generation_name: str, form: str | None = None) -> list:
                    for name in target_forms):
                 break
     return list(found.values())
-
-
-def _family_cases(generation_name: str, form: str) -> list:
-    """A form's family contract cases (`_contract_cases`) the compile gate does not already hold
-    (`_gate_cases`)."""
-    held = {case.kernel for case in _gate_cases(generation_name, form)}
-    contract = _contract_cases(generation_name, form)
-    return [case for case in contract if case._replace(consumers=None).kernel not in held]
 
 
 def _family_forms(generation_name: str) -> set[str]:
@@ -1102,14 +1123,38 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     every transfer of the sm80 cells, unchanged at their pin otherwise."""
     from kernel_compile import PTX, compile_mosaic_kernels
 
-    cases = [each.case for form in ("forward", "input gradient", "kernel gradient")
-             for each in _gate_cases("sm80", form)]
-    found = compile_mosaic_kernels(cases, "sm80")
+    with report.refusals():
+        cases = [each.case for form in ("forward", "input gradient", "kernel gradient")
+                 for each in _gate_cases("sm80", form)]
+        found = compile_mosaic_kernels(cases, "sm80")
     modules = [kernel["module"] for record in found for kernel in record.get("kernels", ())]
     copies = [line for module in modules for line in PTX.get(module, "").splitlines() if "cp.async.c" in line]
     assert copies, modules
     bounded = [line.strip() for line in copies if re.search(r"\],\s*\d+,\s*%r", line)]
     assert not bounded, bounded[:4]
+
+
+@COMPILES_ON_CPU
+@lowers("sm80")
+def test_an_amperes_dense_product_compiles_its_tile_within_its_registers():
+    """Llama-3-8B's down projection forward on a compile-only A100, 8192 tokens, the template named: the tile
+    its launch takes compiles by Mosaic and ptxas within the registers its model prices, spilling nothing
+    (`mosaic_failures`), its last wave's merge priced only where its registers hold it (row 5271)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    rows, weights = bf16((8192, 14336)), bf16((14336, 4096))
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as launches:
+        jax.eval_shape(lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16), rows, weights)
+    [(tile, ba)] = launches.taken
+    with generation.assumed("sm80"):
+        model = _model(ba.op, ba, tile)
+    case = support.KernelCase(f"llama-3-8b down forward {tile}", lambda: ba.op.lowering(ba, tile),
+                              {"dew_gmm": model})
+    found = compile_mosaic_kernels([case], "sm80")
+    assert found and all(record.get("kernels") for record in found), found
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
 
 
 @COMPILES_ON_CPU
