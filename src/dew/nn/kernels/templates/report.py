@@ -528,9 +528,16 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727). `spilled_in`, the
     roles each kernel's spill stood in where the compile read them (`Binary.spilled_in`), kept with it
     (`Refused`) for its ladder (`spilled_in`)."""
+    _refused_launch(_identity(op, arguments, generation.gpu_target()), config, kernels, spilled_in)
+
+
+def _refused_launch(identity: Hashable, config: Hashable, kernels,
+                    spilled_in: Mapping[str, tuple[str, ...] | None] | None) -> None:
+    """The launch of `identity` (`_identity`: its op, arguments and target) refused at `config`, as
+    `refuse_launch` refuses it: what a settle of launches certified aside records by the identity it queued
+    each under, whatever GPU is in effect as it drains (row 12031)."""
     roles = spilled_in or {}
-    _record((_identity(op, arguments, generation.gpu_target()), config), None,
-            frozenset((kernel, roles.get(kernel)) for kernel in kernels))
+    _record((identity, config), None, frozenset((kernel, roles.get(kernel)) for kernel in kernels))
 
 
 _CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device", default=None)
@@ -690,9 +697,8 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
             for reporting in scopes:
                 # Refused in each scope its call was taken in, whatever scope drains it.
                 with _reported_in(reporting):
-                    refuse_launch(each.op, each.arguments, each.config,
-                                  {binary.kernel for binary in spilling},
-                                  {binary.kernel: binary.spilled_in for binary in spilling})
+                    _refused_launch(key[0], each.config, {binary.kernel for binary in spilling},
+                                    {binary.kernel: binary.spilled_in for binary in spilling})
                 # Held by the settle (`settling`) until a retry, under its own context, steps past it (row
                 # 11786).
                 settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
