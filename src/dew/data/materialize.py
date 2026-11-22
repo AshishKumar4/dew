@@ -110,7 +110,7 @@ class _Memory(View[Source]):
     def records(self, read: Read) -> tuple[Batch | bytes, ...]:
         return self.held
 
-    def _facts(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Its source's facts, the counts only where it ran no stage over the source's rows, then
         the counts it measured."""
         return {**(_uncounted(facts) if self.ran else facts), **self.facts, "rows": len(self.held),

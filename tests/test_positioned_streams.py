@@ -110,14 +110,15 @@ def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_s
         if shares is None:
             rows = iterate(chain.cache(cache), read="streamed", loading=Loading(workers=0))
             return sorted((int(row["at"]), int(row["id"])) for row in rows)
-        data = compile(chain.cache(cache).batch(1), read="streamed",
+        data = compile(chain.cache(cache).batch(shares), read="streamed",
                        loading=Loading(workers=2, threads=1, read_buffer=1))
         read = []
         for index in range(shares):
             reader = data.train(DataPartition(index=index, count=shares))
             try:
-                read += [(int(batch["at"][0]), int(batch["id"][0])) for batch in
-                         (next(reader) for _ in range(12 // shares))]
+                # Its share of each batch, one row of every batch of `shares`: an epoch's.
+                read += [(int(at), int(id_)) for batch in (next(reader) for _ in range(12 // shares))
+                         for at, id_ in zip(batch["at"], batch["id"], strict=True)]
             finally:
                 reader.close()
         return sorted(read)

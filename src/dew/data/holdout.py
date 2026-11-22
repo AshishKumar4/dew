@@ -90,8 +90,8 @@ class RecordSlice(View[Source]):
             raise ValueError(f"{self.describe()} exceeds the source's {records} records")
         return self.start, stop
 
-    def _facts(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        return {**super()._facts(facts), **({"held_out": self.start} if self.start else {})}
+    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return {**super()._viewed(facts), **({"held_out": self.start} if self.start else {})}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()

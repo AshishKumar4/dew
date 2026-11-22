@@ -96,9 +96,9 @@ class WindowSource(View[TokenFiles]):
         del read
         return IndexedWindows({"text": self.tokens}, self.length, self.stride, "int32")
 
-    def _facts(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         count = len(self.records("indexed"))
-        return {**super()._facts(facts), "rows": count, "valid_targets": count * self.length}
+        return {**super()._viewed(facts), "rows": count, "valid_targets": count * self.length}
 
     def lengths(self) -> np.ndarray | None:
         return None

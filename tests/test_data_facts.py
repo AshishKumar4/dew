@@ -266,9 +266,9 @@ def test_a_view_over_a_raw_parquet_store_states_its_asked_facts_reading_no_schem
     SCHEMAS_READ.clear()
     assert asked(view, TOKENIZER_CONTRACT) == {} and SCHEMAS_READ == []
     # Its own facts stated as its full facts state them (row 11638's review: a view's own were dropped).
-    assert asked(view, ("held_out",)) == {"held_out": 2} == {"held_out": view.metadata()["held_out"]}
-    assert SCHEMAS_READ == []
+    assert asked(view, ("held_out",)) == {"held_out": 2} and SCHEMAS_READ == []
     assert asked(view, ("class_names",)) == {"class_names": {}} and SCHEMAS_READ
+    assert view.metadata()["held_out"] == 2
 
 def test_a_position_saved_under_plan_16_of_a_store_stating_lengths_resumes_under_17(tmp_path):
     """A store whose files state each row's length (a `length` column), read whole with no packing: a

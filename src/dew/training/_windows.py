@@ -21,7 +21,7 @@ from dew.training.transaction import batch_statistics_shapes, compact_qk, pooled
 
 if TYPE_CHECKING:
     from dew.distributed.placement import Placement
-    from dew.objectives.base import Aux, Objective
+    from dew.objectives.base import Objective
 
 
 class Windowing(NamedTuple):
@@ -37,12 +37,13 @@ class Windowing(NamedTuple):
 
 
 def empty_window[LossT, EffectsT](windowing: Windowing, state: TrainState, batch: Batch,
-                                  shapes: tuple[LossT, Aux[EffectsT]], *,
+                                  shapes: tuple, *,
                                   window: int, split: int = 1, shape_only: bool = False,
                                   donor: Accumulation | None = None,
                                   objective: Objective[LossT, EffectsT]) -> TrainState:
     """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty, as
-    `windowing` states its run; unchanged under a custom step or a held one that replays such batches
+    `windowing` states its run, its loss's `shapes` its statistics' and its effects' (`traced_loss`);
+    unchanged under a custom step or a held one that replays such batches
     (`Accumulation.replays`): a ramp's stage begins with a window (`Ramp.stages`). Under a window of one,
     the state holds none: an empty one it holds of another split (a phase planned afresh,
     `StepCompiler.afresh`) is the one its step lets go as it is handed the state (`laid_out`), so the step

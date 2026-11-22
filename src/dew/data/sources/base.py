@@ -357,15 +357,15 @@ class View[S: Source]:
         return self.source.lengths()
 
     def metadata(self) -> Mapping[str, object]:
-        return self._facts(self.source.metadata())
+        return self._viewed(self.source.metadata())
 
     def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
         """Those of its facts named by `keys`: its store's asked alone (`asked`), taken to its own as
-        `metadata` takes all of them (`_facts`, row 11638's review: a view that stated facts of its own
+        `metadata` takes all of them (`_viewed`, row 11638's review: a view that stated facts of its own
         forwarded its store's, its own dropped)."""
-        return {key: value for key, value in self._facts(asked(self.source, keys)).items() if key in keys}
+        return {key: value for key, value in self._viewed(asked(self.source, keys)).items() if key in keys}
 
-    def _facts(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+    def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Its facts from its store's (`facts`, all of them or those asked): the one place a view states
         them, its counts dropped where its rows are not its store's (`_uncounted`)."""
         return facts if self.rows in ("read", "described") else _uncounted(facts)
