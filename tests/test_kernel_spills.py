@@ -635,6 +635,33 @@ def test_a_models_draw_of_its_variables_selects_no_kernel():
     assert applied_routes, "the model's forward selects no kernel, so its draw's selecting none says nothing"
 
 
+def test_a_decision_models_draw_of_the_parts_its_tree_lacks_selects_no_kernel():
+    """A decision model's draw (`DecisionObjective.init`), its backbone and its head drawn as the tree lacks
+    them (`complete_variables`, over a one-row batch no step runs), reports no route, where its backbone's
+    forward over the drawn variables reports its kernels (row 12029: the parts a tree lacked were drawn
+    outside `generation.drawing`, their kernels derived and certified at the draw's shapes)."""
+    from dew.data.text import ByteTokenizer
+    from dew.decision import DecisionObjective, Specials
+    from dew.decision.layout import SegmentLayout
+    from dew.nn.kernels.generation import routes
+    from dew.registry import models
+
+    model = models.build("causal_transformer", vocab_size=260, emb_features=128, num_layers=1, num_heads=2,
+                         num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=32, dtype="bfloat16",
+                         attention_impl="template")
+    objective = DecisionObjective(model, tokenizer=ByteTokenizer(),
+                                  specials=Specials(None, 10, 0, "\x00", 255),
+                                  layout=SegmentLayout.state_first_row(max_len=32, head_max_len=24,
+                                                                       option_tokens=6))
+    with routes() as drawn_routes:
+        drawn = jax.eval_shape(objective.init, jax.random.key(0))
+    tokens = jax.ShapeDtypeStruct((2, 32), jnp.int32)
+    with routes() as applied_routes:
+        jax.eval_shape(objective.model.backbone.apply, {"params": drawn["params"]["backbone"]}, tokens)
+    assert not drawn_routes, drawn_routes
+    assert applied_routes, "the backbone selects no kernel, so its draw's selecting none says nothing"
+
+
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
     """Each Mosaic GPU call a thunk names has its binary (`assembled.thunk_kernels`): two calls and two kernel
     protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a
