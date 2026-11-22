@@ -83,7 +83,7 @@ def _concatenates(variables: Variables, group: ProjectionGroup) -> bool:
     node = _node(variables, "params", group.path)
     held = [node.get(name, {}) for name in group.members]
     fields = set(held[0])
-    # Every member's kernel a parameter first: a packed one (`dew.nn.dense.dense_matrix`, an NVFP4 matrix in
+    # Every member's kernel a parameter first: a packed one (`dew.nn.dense.packed_matrix`, an NVFP4 matrix in
     # `QUANTIZATION`) concatenates with none, and its quantization is no input scale to compare.
     return group.packed in node or ("kernel" in fields and fields <= {"kernel", "bias"} and all(
         set(projection) == fields for projection in held) and _same_quantization(variables, group) and all(

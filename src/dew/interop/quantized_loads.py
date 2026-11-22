@@ -186,9 +186,9 @@ def with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: M
     """`variables` with each packed bank (`packed_banks`) in `QUANTIZATION` under the path its source name's
     layout binds, the unread leaf there taken out of `params`: one path, uncut, whole, and a bank its
     layout reads as it stands (gpt-oss's experts, `[experts, in, out]`, which the expert layers read so,
-    `dew.quantization.expert_matrix`) or a Linear's kernel its layout transposes from the source's
+    `dew.nn.dense.packed_matrix`) or a Linear's kernel its layout transposes from the source's
     `[out, in]` (a ModelOpt weight's, packed `[in, out]` already, which the layer reads so,
-    `dew.nn.dense.dense_matrix`); any other binding is refused, naming the weight, which a load
+    `dew.nn.dense.packed_matrix`); any other binding is refused, naming the weight, which a load
     without `packed_weights` decodes."""
     if not banks:
         return variables
