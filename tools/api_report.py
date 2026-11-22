@@ -318,7 +318,6 @@ def cli() -> list[str]:
 
 def records() -> list[str]:
     from dew.data import generation
-    from dew.nn.kernels.templates import report
     from dew.telemetry import records
     from dew.training import rungs
 
@@ -327,8 +326,7 @@ def records() -> list[str]:
         lines.append(f"{cls.__module__}.{cls.__qualname__}")
         lines.extend(f"  {line}" for line in fields(cls))
     lines += [f"dew.data.generation.GENERATION_SCHEMA = {generation.GENERATION_SCHEMA}",
-              f"dew.training.rungs.RECORD_VERSION = {rungs.RECORD_VERSION}",
-              f"dew.nn.kernels.templates.report.KERNEL_PROTO_VERSION = {report.KERNEL_PROTO_VERSION}"]
+              f"dew.training.rungs.RECORD_VERSION = {rungs.RECORD_VERSION}"]
     return lines
 
 

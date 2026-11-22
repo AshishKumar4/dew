@@ -1354,4 +1354,3 @@ dew.telemetry.records.TrialFinished
   value: float
 dew.data.generation.GENERATION_SCHEMA = 2
 dew.training.rungs.RECORD_VERSION = 3
-dew.nn.kernels.templates.report.KERNEL_PROTO_VERSION = 4

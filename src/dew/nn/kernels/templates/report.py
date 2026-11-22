@@ -33,7 +33,7 @@ import tokamax
 from google.protobuf import empty_pb2
 from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
-from jax._src.thunky import thunky
+from jax.extend import mosaic_gpu as mosaic_gpu_records
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
@@ -84,15 +84,8 @@ def kernel_of(name: str) -> tuple[str, str | None, str | None]:
     if not (launch := LAUNCH_SUFFIX.search(kernel)):
         return kernel, None, None
     return kernel[:launch.start()], launch.group(1), launch.group(2)
-KERNEL_PROTO_VERSION = 4
-"""The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
 MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
-SHARED_BYTES = 10
-"""The `MosaicGpuKernelProto` field of the dynamic shared memory a kernel's launch asks for (`smem_bytes`)."""
-CALLER_METADATA = 12
-"""The `MosaicGpuKernelProto` field of what its call's caller stated of the launch (`caller_metadata`, Dew's
-JAX build's kernel-metadata): Dew's launch's digest (`launch_metadata`)."""
 SERIALIZED = frozenset({*(f"C751{digit}" for digit in range(6)), "C7519"})
 """The codes of ptxas's notes (`AssemblerNote`) of a kernel's warpgroup MMAs serialized, each product waited
 for before the next issues (C7510 to C7515; C7519, a dependence in a divergent path): a run refuses a kernel
@@ -103,12 +96,6 @@ IGNORED_RAISE = "C7507"
 threads left at the entry's registers (row 4071): the compile gate fails a derived kernel for it, a template's
 structure that leaves its roles their registers; a run does not refuse it, as a role short of registers there
 spills, which `Binary.refused` reads."""
-ASSEMBLER_NOTES = 13
-"""The `MosaicGpuKernelProto` field of what ptxas noted of a loss of performance as it assembled the kernel
-(`assembler_notes`, Dew's JAX build's mosaic-gpu-kernel-facts), each note a message of its code (1) and its
-message (2) (`AssemblerNote`)."""
-SPILLED_BYTES = 100
-"""The `MosaicGpuKernelProto` field of the bytes ptxas spilled, where measured (`Binary.spilled`)."""
 CUSTOM_KERNEL_THUNK = 36
 """The `ThunkProto` field of a custom kernel's thunk, a Pallas-Triton launch's (`CustomKernelThunkProto`): its
 kernel (3, `CustomKernelProto`), whose loader spec (2) holds its cubin (2, `CudaCubinProto`; 1) and which
@@ -2159,7 +2146,8 @@ def spilled_bytes(frame: int, spilled: int | None) -> int:
 
 
 def refuses(spilled: int, codes: Collection[str]) -> bool:
-    """Whether a kernel spilling `spilled` bytes (`Binary.spills`), noting `codes` (`ASSEMBLER_NOTES`'),
+    """Whether a kernel spilling `spilled` bytes (`Binary.spills`), noting `codes` (its record's
+    `assembler_notes`'),
     is refused for its config: it spills, or its warpgroup MMAs were serialized (`SERIALIZED`).
     Certification's verdict (`Binary.refused`) and the compile gate's alike."""
     return bool(spilled) or bool(SERIALIZED & set(codes))
@@ -2180,11 +2168,11 @@ class Binary:
     shared: int | None = None
     sass: tuple[str, ...] | None = ()
     caller: str | None = None
-    """The launch that traced it, as its call's caller stated it (`CALLER_METADATA`, a Mosaic GPU kernel's);
-    None where its call stated none."""
+    """The launch that traced it, as its call's caller stated it (its record's `caller_metadata`, a Mosaic GPU
+    kernel's); None where its call stated none."""
     notes: tuple["AssemblerNote", ...] = ()
-    """What ptxas noted of a loss of performance as it assembled it, in its order (`ASSEMBLER_NOTES`, a
-    Mosaic GPU kernel's); none where its call states none (a Pallas-Triton kernel's, a build without them)."""
+    """What ptxas noted of a loss of performance as it assembled it, in its order (its record's
+    `assembler_notes`, a Mosaic GPU kernel's); none where its call states none (a Pallas-Triton kernel's)."""
     spilled_in: tuple[str, ...] | None = ()
     """The roles whose code its spill stands in where it spills (`spilled_roles`: `PRODUCER`, `CONSUMERS`),
     read `decoded` or for its `spills` (`binaries`, certification's), none where it spills none; None where
@@ -2202,7 +2190,7 @@ class Binary:
     index: str | None = None
     """XLA uniquification suffix (`__1`) where a second cubin shares `(kernel, launch)`; None otherwise."""
     spilled: int | None = None
-    """The bytes ptxas spilled for it (`SPILLED_BYTES`); None where its record states none."""
+    """The bytes ptxas spilled for it (its record's `spilled_bytes`); None where its record states none."""
 
     spills = property(lambda self: spilled_bytes(self.frame, self.spilled))
     """The bytes it spills a thread (`spilled_bytes`)."""
@@ -2285,10 +2273,11 @@ def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
     reader of the serialized form, which its public `jax_executable_to_mlir` reads from a
     `jax.stages.Compiled`, where a kernel's compiled alone is a backend's `LoadedExecutable`), by its
     kernel's name, with its serialized proto."""
-    # thunky is imported with this module, not at a first reading: its import registers a discharge rule
-    # (`call_thunky_nested`) the Pallas lowering cache keys every lowering after it by, so a process that
-    # certified a launch before its step lowered keyed the step's lowerings apart from a warm start's, which
-    # reads none (FS-CERTREG: a warm start's first process lowered 26 kernels afresh).
+    # Imported where it is read: the lowering cache keys a lowering by the rules it can reach alone (JAX's
+    # build from 0.12.0.1.post122, row 5919), so thunky's discharge rule splits no lowering's key, where its
+    # import at a first reading keyed a warm start's lowerings apart from a cold one's (FS-CERTREG).
+    from jax._src.thunky import thunky
+
     found: list[tuple[str, bytes]] = []
     thunky._check_thunky_available()
     context = thunky.make_ir_context()
@@ -2348,29 +2337,22 @@ def proto_fields(message: bytes) -> dict[int, list]:
 
 
 def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tuple[list[Binary], int]:
-    """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
-    version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, whose
-    `SHARED_BYTES` its launch's dynamic shared memory, whose `CALLER_METADATA` the launch its call carried
-    (`launch_metadata`), the launch its name states where it carries none, whose `ASSEMBLER_NOTES` what
-    ptxas noted of a loss of performance and whose `SPILLED_BYTES` what it spilled), and how many Mosaic GPU
-    custom calls it names (`MOSAIC_TARGET`, a custom call thunk's target). A message holding neither the
-    target's bytes nor an ELF's holds neither, and is not parsed: most of a program's thunks and their
-    messages (a 4B decoder's step read 223,561 messages, 1.8 of its compile point's 3.5 seconds)."""
+    """The kernels of each Mosaic GPU kernel's record within a thunk's serialized proto (a
+    `MosaicGpuKernelProto` read through the plugin's own schema, `jax.extend.mosaic_gpu.kernel_record`, whose
+    binary is an ELF), and how many Mosaic GPU custom calls it names (`MOSAIC_TARGET`, a custom call thunk's
+    target). A message holding neither the target's bytes nor an ELF's holds neither, and is not parsed: most
+    of a program's thunks and their messages (a 4B decoder's step read 223,561 messages, 1.8 of its compile
+    point's 3.5 seconds)."""
     if MOSAIC_TARGET not in message and ELF not in message:
         return [], 0
+    record = mosaic_gpu_records.kernel_record(message)
+    if record is not None and record.gpu_binary[:4] == ELF:
+        notes = tuple(AssemblerNote(note.code, note.message) for note in record.assembler_notes)
+        spilled = record.spilled_bytes if record.HasField("spilled_bytes") else None
+        kernel = _binary(record.kernel_name, record.gpu_binary, decoded, spills, spilled=spilled)
+        return [dataclasses.replace(kernel, shared=record.smem_bytes,
+                                    caller=record.caller_metadata.decode() or None, notes=notes)], 0
     fields = proto_fields(message)
-    binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
-    if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
-            and isinstance(binary[0], bytes) and binary[0][:4] == ELF and isinstance(name[0], bytes)):
-        stated = shared[0] if len(shared) == 1 and isinstance(shared[0], int) else None
-        caller = fields.get(CALLER_METADATA, [])
-        stated_caller = caller[0].decode() if len(caller) == 1 and isinstance(caller[0], bytes) else None
-        notes = tuple(AssemblerNote(*(part[0].decode() for part in (note.get(1, [b""]), note.get(2, [b""]))))
-                      for note in map(proto_fields, fields.get(ASSEMBLER_NOTES, [])))
-        measured = next(iter(fields.get(SPILLED_BYTES, [])), None)
-        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills, spilled=measured),
-                                    shared=stated,
-                                    caller=stated_caller, notes=notes)], 0
     found, calls = [], 0
     for values in fields.values():
         for value in values:

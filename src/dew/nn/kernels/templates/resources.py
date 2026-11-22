@@ -546,6 +546,12 @@ def _barrier(leaf) -> bool:
     return isinstance(leaf, (plgpu.Barrier, plgpu.ClusterBarrier))
 
 
+def _named_barrier(leaf) -> bool:
+    """Whether a scope's `leaf` is a named CTA barrier (`plgpu.CtaBarrier`, `bar.arrive` and `bar.sync`): the
+    block's hardware barrier, no byte of its shared memory."""
+    return isinstance(leaf, plgpu.CtaBarrier)
+
+
 def _semaphore(leaf) -> bool:
     """Whether a scope's `leaf` is a semaphore (a TPU core's DMA or regular one, `pltpu.SemaphoreType`): an
     extended dtype held in the core's semaphore memory, no byte of its VMEM."""
@@ -569,19 +575,20 @@ def stored_bytes(shape: tuple, dtype) -> int:
 
 
 def scratch_bytes(family: "Family", scope: Scope) -> int:
-    """The shared memory a program of `scope` asks for besides its barriers and semaphores (`_semaphore`),
-    as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every array rounded up to
-    `SMEM_ALIGNMENT` (`allocated`), a `plgpu.RefUnion` as large as its largest member (`after_walk`, row
-    8800), the walks the largest of them, the tiles scoped after the walks the larger of them and the walks
-    on a family that scopes its walks apart (`Family.walks_scoped`), and beside the program's otherwise, and
-    the family's reduction scratch where the program reduces (`Family.reduction_scratch`) and its
-    warpgroups' shares where they reduce implicitly (`Family.warpgroup_reduction_scratch`)."""
+    """The shared memory a program of `scope` asks for besides its barriers (`_named_barrier`'s none) and
+    semaphores (`_semaphore`), as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every
+    array rounded up to `SMEM_ALIGNMENT` (`allocated`), a `plgpu.RefUnion` as large as its largest member
+    (`after_walk`, row 8800), the walks the largest of them, the tiles scoped after the walks the larger of
+    them and the walks on a family that scopes its walks apart (`Family.walks_scoped`), and beside the
+    program's otherwise, and the family's reduction scratch where the program reduces
+    (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
+    (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
         sizes = []
         for leaf in jax.tree.leaves(tree, is_leaf=lambda x: isinstance(x, plgpu.RefUnion)):
             if isinstance(leaf, plgpu.RefUnion):
                 sizes.append(max(allocated(*arrays(member)) for member in leaf.refs))
-            elif not _barrier(leaf) and not _semaphore(leaf):
+            elif not _barrier(leaf) and not _named_barrier(leaf) and not _semaphore(leaf):
                 sizes.append(stored_bytes(leaf.shape, leaf.dtype))
         return sizes
 
