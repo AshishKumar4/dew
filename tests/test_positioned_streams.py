@@ -127,4 +127,6 @@ def test_a_positioned_stream_behind_its_cache_publishes_it_once_it_reads_every_s
     numbered = log.read_text().split()
     again = values()
     assert first == again == [(index, index) for index in range(12)]
-    assert sorted(map(int, numbered)) == list(range(12)) and log.read_text().split() == numbered
+    # Every row numbered by the first pass (workers reading ahead into the next epoch number some again),
+    # and none by the second, which reads the published generation.
+    assert set(map(int, numbered)) == set(range(12)) and log.read_text().split() == numbered

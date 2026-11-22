@@ -37,7 +37,7 @@ class Windowing(NamedTuple):
 
 
 def empty_window[LossT, EffectsT](windowing: Windowing, state: TrainState, batch: Batch,
-                                  shapes: tuple, *,
+                                  shapes, *,
                                   window: int, split: int = 1, shape_only: bool = False,
                                   donor: Accumulation | None = None,
                                   objective: Objective[LossT, EffectsT]) -> TrainState:
