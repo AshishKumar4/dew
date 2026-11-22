@@ -15,7 +15,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
-from dew.nn.kernels.templates import mosaic, product, resources
+from dew.nn.kernels.templates import mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.chunk_forward import ForkedTable, prepared
@@ -798,15 +798,16 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
 
 
 def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequence, first, landing: dict,
-                     split: bool = False) -> None:
+                     held_sums: dict, split: bool = False) -> None:
     """`algebra.memory_gradients`' emit in `_query_key`: the weights' gradient (`kind` 'dw') in the
     operands' dtype to `weights` (its parts' views) as it is final, as fla's dqkwg writes it; the queries'
-    and keys' ('dq', 'dk') summed over the key head's value heads in fp32 in their shared tiles
-    (`landing[kind]`), the first value head's (`first`) taken as it is and the rest added, in the order the
-    steps take them, which the step stores once at the last: added into the output at each value head an
-    A100's element-wise global atomics (`Family.added`, no TMA reduction before Hopper) held query_key at 26%
-    of its stall samples, its tensor pipe under 10% busy (M-JS-183). A value split's (`split`) weights'
-    gradient is its split's own part of it, fp32, which XLA adds, through its own landing tile."""
+    and keys' ('dq', 'dk') summed over the key head's value heads in fp32 in their own shared tiles
+    (`held_sums[kind]`, `_query_key_staging`), the first value head's (`first`) taken as it is and the rest
+    added, in the order the steps take them, which the step stores once at the last: added into the output
+    at each value head an A100's element-wise global atomics (`Family.added`, no TMA reduction before
+    Hopper) held query_key at 26% of its stall samples, its tensor pipe under 10% busy (M-JS-183). A value
+    split's (`split`) weights' gradient is its split's own part of it, fp32, which XLA adds, through its
+    own landing tile."""
     del block
     family = call.family
     if kind == "dw":
@@ -819,23 +820,24 @@ def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequen
 
     @pl.when(first)
     def _():
-        plgpu.store(landing[kind], grad, optimized=False)
+        plgpu.store(held_sums[kind], grad, optimized=False)
 
     @pl.when(jnp.logical_not(first))
     def _():
-        _summed_into(call, landing[kind], grad)
+        _summed_into(call, held_sums[kind], grad)
 
 
-def _sums_stored(call: Call, landing: dict, sums: dict, last) -> None:
+def _sums_stored(call: Call, held_sums: dict, sums: dict, landing, last) -> None:
     """The key head's queries' and keys' sums (`_gradient_stored`'s shared tiles) stored to `sums` once, at
-    its last value head's step (`last`), and waited on by design: Mosaic GPU waits on no copy at a kernel's
-    exit (numerics review 10-26, P3-4)."""
+    its last value head's step (`last`), each in turn through the launch's `landing` tile, and waited on by
+    design: Mosaic GPU waits on no copy at a kernel's exit (numerics review 10-26, P3-4)."""
     family = call.family
 
     @pl.when(last)
     def _():
         for kind in ("dq", "dk"):
-            family.stored([family.tile_of(landing[kind])], [sums[kind]], smem=landing[kind])
+            family.store_wait(0)
+            family.stored([family.tile_of(held_sums[kind])], [sums[kind]], smem=landing)
 
     family.store_wait(0)
 
@@ -873,7 +875,7 @@ def _query_key_split(call: Call) -> int:
     def fits(vq: int) -> bool:
         tiles, _ = _query_key_launched(call, vq)
         landing = _query_key_landing(call, call.value_width // vq)
-        _, scope, _, _ = shared_allocation(call, tiles, (), landing)
+        _, scope, _, _ = shared_allocation(call, tiles, _query_key_staging(call), landing)
         registers = _query_key_held(call, vq).registers(call.family, addressed((), landing))
         return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
                 and registers <= call.family.registers(1))
@@ -919,13 +921,20 @@ def _query_key_held(call: Call, vq: int) -> Held:
 
 def _query_key_landing(call: Call, splits: int) -> dict:
     """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule
-    (fp32 where there are two splits or more) and the queries' and keys' sums, each its own, held across the
-    key head's steps (`_gradient_stored`)."""
+    (fp32 where there are two splits or more) and the queries' and keys' sums, stored once each in turn
+    (`_sums_stored`)."""
     chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
     weights = held.landing(chunk, call.block) if splits == 1 else ((chunk, call.block), jnp.float32)
-    sums = ((chunk, call.block), jnp.float32)
-    return {**({"weights": weights} if call.delta else {}), "dq": sums, "dk": sums}
+    return {**({"weights": weights} if call.delta else {}), "sums": ((chunk, call.block), jnp.float32)}
+
+
+def _query_key_staging(call: Call) -> tuple:
+    """`_query_key`'s queries' and keys' sums over a key head's value heads, fp32, a plain shared tile each,
+    held across its steps (`_gradient_stored`): staging of their own, as a launch's landing tiles are its
+    stores' in turn, which a family whose stores finish when they return keys by shape (`_landing_keys`:
+    the two sums one tile there, each value head's 'dk' landing on its 'dq')."""
+    return (swizzling.plain((call.chunk, call.block), jnp.float32),) * 2
 
 
 def _query_key_launched(call: Call, vq: int) -> tuple[dict, tuple]:
@@ -976,7 +985,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
 
     def program(at, q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
                 beta_ref, *outs, streams, staging, landing):
-        del staging
+        held_sums = dict(zip(("dq", "dk"), staging, strict=True))
         dq_ref, dk_ref, *weights_ref, after_ref, leaving_ref, memory_ref = outs
         c, n, keyed = at["blocks"], at["chunks"], at["heads"]
         split = at["values"]
@@ -1008,7 +1017,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                        held.views(weights_ref[0], row, chunk, weights_at, call.block) if splits == 1 else
                        [weights_ref[0].at[span, pl.ds(split * call.heads * width + weights_at, call.block)]])
             stored = functools.partial(_gradient_stored, call, weights=weights, first=first_head,
-                                       landing=landing, split=splits > 1)
+                                       landing=landing, held_sums=held_sums, split=splits > 1)
 
             issue = Issuer(call)
             ds = stream_tile(slots, "ds", grads) if scores else None
@@ -1026,7 +1035,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                 def _():
                     keys, queries = whole("keys", given, 0), whole("queries", given, 0)
                     for kind, lhs, rhs in (("dq", ds, keys), ("dk", ds.T, queries)):
-                        _summed_into(call, landing[kind], issue("scores_dq", lhs, rhs))
+                        _summed_into(call, held_sums[kind], issue("scores_dq", lhs, rhs))
             after_ref.at[split * key_blocks + c, h, span][...] = after
             leaving_ref.at[split * key_blocks + c, h, span][...] = leaving
             # `sum(S dS)` over the block's rows, read here rather than both memories again: where products
@@ -1039,7 +1048,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                 for j in range(blocks)))
             memory_ref.at[split * key_blocks + c, h, pl.ds(n * call.block, call.block)][...] = traced
 
-            _sums_stored(call, landing, sums, index == group - 1)
+            _sums_stored(call, held_sums, sums, landing["sums"], index == group - 1)
             return carry, accumulators
 
         # Without the delta rule the scores' products the first step's alone.
@@ -1058,7 +1067,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None, stages=1,
         live=chunk_liveness(10),
         steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq),
-        landing=_query_key_landing(call, splits),
+        landing=_query_key_landing(call, splits), staging=_query_key_staging(call),
         persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
