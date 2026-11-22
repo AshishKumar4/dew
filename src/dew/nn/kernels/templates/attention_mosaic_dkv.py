@@ -199,14 +199,15 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
         def between(s):
             if logits_stage is not None:
                 walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
-            return _score_weights(walk, coords, (), s, rows[0], rows[1], masked=masked)
+            _, weights, slopes, seen = _score_weights(walk, coords, (), s, rows[0], rows[1], masked=masked)
+            return weights, slopes, seen
 
-        (exponentials, weights, slopes, seen), dp = family.product_pair(
+        (weights, slopes, seen), dp = family.product_pair(
             k_smem, logits_slot.transpose((1, 0)), v_smem, do_slot.transpose((1, 0)), shape, between=between)
         cotangents = _score_cotangents(coords, weights, dp, rows[2], rows[3], seen)
         narrowed, logits, pieces = _weighed(
             walk, coords, (), None, None, rows, dtypes, one_part=fused, masked=masked,
-            scored=(exponentials, weights, cotangents, slopes, seen))
+            scored=(weights, weights, cotangents, slopes, seen))
     else:
         s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
                                     v_smem, do_slot.transpose((1, 0)), shape)

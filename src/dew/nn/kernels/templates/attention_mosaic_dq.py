@@ -140,14 +140,14 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     shape = (tiles.block_q, tiles.block_k)
     k_slot = slots["keys"]
     k_first = (index if tile is None else tile(index)) * tiles.block_k
-    is_whole = whole(index) if masked is None else None
-    coords = (coords_of(k_first) if masked is None
-              else coords_of(k_first, read=walk.places_read(masked=masked)))
     overlapped: tuple | None = None
+    overlapped_coords: algebra.Coords | None = None
     if masked is not None and _splits_scores(walk):
-        def between(s):
-            return _score_weights(walk, coords, (), s, peak, prior, masked=masked)
+        step_coords = coords_of(k_first, read=walk.places_read(masked=masked))
+        overlapped_coords = step_coords
 
+        def between(s):
+            return _score_weights(walk, step_coords, (), s, peak, prior, masked=masked)
         overlapped, dp = family.product_pair(
             q, k_slot.transpose((1, 0)), do, slots["values"].transpose((1, 0)), shape, between=between)
         slots.release("values")
@@ -167,10 +167,13 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         # 2.06 ms under sinks at width 64 (ET-HELD-h100, the config unchanged), its registers no fewer.
         # Only the segmented TPU walk (`masked is not None`) passes `read` to skip unneeded coordinate tiles.
         if overlapped is not None:
+            assert overlapped_coords is not None
             exponentials, overlapped_weights, slopes, seen = overlapped
-            cotangents = _score_cotangents(coords, overlapped_weights, dp, anchor, delta,
+            cotangents = _score_cotangents(overlapped_coords, overlapped_weights, dp, anchor, delta,
                                            seen if masked_step else None)
         else:
+            coords = (coords_of(k_first) if masked is None
+                      else coords_of(k_first, read=walk.places_read(masked=masked_step)))
             scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen,
                              masked=masked_step)
             exponentials, _, cotangents, slopes, seen = scored
@@ -182,11 +185,10 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         return row_sums, parts, keyed
     # One walk, its tiles' masks chosen a tile at a time on register-budgeted GPUs (a walk of two loops into
     # one warpgroup accumulator, the first empty, faults on an H100 under jax 0.11.2); segmented on TPU mxu.
-    if is_whole is not None:
-        rows, scaled, keyed = lax.cond(is_whole, functools.partial(issued, masked_step=False),
+    if masked is None:
+        rows, scaled, keyed = lax.cond(whole(index), functools.partial(issued, masked_step=False),
                                        functools.partial(issued, masked_step=True))
     else:
-        assert masked is not None
         rows, scaled, keyed = issued(masked_step=masked)
     dq_acc, *keyed_accs = accumulators
     # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's

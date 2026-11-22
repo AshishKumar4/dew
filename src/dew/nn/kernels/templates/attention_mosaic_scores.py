@@ -189,10 +189,11 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
             exps, w, sl, sn = _score_weights(walk, tile_coords, (), s, rows[0], rows[1], masked=masked)
             if on_weights is not None and not whole_operands:
                 on_weights(algebra.value_weights(exps, w, do_slot.dtype, walk.dropped))
-            return exps, w, sl, sn
+            return w, sl, sn
 
-        (exponentials, weights, slopes, seen), dp = family.product_pair(
+        (weights, slopes, seen), dp = family.product_pair(
             q_slot, held, do_slot, values_t, shape, between=between)
+        exponentials = weights
         if after_weights is not None and not whole_operands:
             after_weights()
         cotangents = _score_cotangents(tile_coords, weights, dp, rows[2], rows[3], seen)

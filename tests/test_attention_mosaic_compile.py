@@ -2085,9 +2085,9 @@ def test_forward_registers_charges_prescale_only_when_non_unit(gen):
         wide_reg_unit = dataclasses.replace(reg_unit, width=576, value_width=128)
         tiles = program.Tiles(64, 64, 2, 1, family=family.name)
         if family.budgets_registers and program.query_swizzle(family) is None:
-            scaled_regs = wide_reg_scaled.at(family, tiles)
-            folded_regs = wide_reg_folded.at(family, tiles)
-            unit_regs = wide_reg_unit.at(family, tiles)
+            scaled_regs = wide_reg_scaled.at(family, tiles, peaks=True)
+            folded_regs = wide_reg_folded.at(family, tiles, peaks=True)
+            unit_regs = wide_reg_unit.at(family, tiles, peaks=True)
             assert scaled_regs is not None and folded_regs is not None and unit_regs is not None
             assert scaled_regs > unit_regs and folded_regs == unit_regs
         def forward_scaled(query, key, value):
