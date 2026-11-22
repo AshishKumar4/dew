@@ -457,25 +457,29 @@ class _DecisionSource(View[Source]):
 
     def _own(self) -> Mapping[str, Callable[[], Stated]]:
         """Its slots and, a table's, its options, each read only where asked (row 11895: its own
-        `metadata` stated them, which its asked facts did not)."""
-        return {"slots": self._slots, "decision_options": lambda: self._names() or None,
-                "decision_options_by_value": self._by_value}
+        `metadata` stated them, which its asked facts did not), its options resolved once a read of
+        them all (row 11901)."""
+        names = functools.cache(self._names)
+
+        def slots() -> Stated:
+            return {"questions": 1, "options": len(names())} if names() else (dict(self._facts) or None)
+
+        def by_value() -> Stated:
+            valued = self.table is not None and not self.table.options and bool(self._valued)
+            return True if valued and names() else None
+
+        return {"slots": slots, "decision_options": lambda: names() or None,
+                "decision_options_by_value": by_value}
 
     def _names(self) -> tuple[str, ...]:
-        """A table's options: its own, the classes its rows hold, or its store's class names."""
+        """A table's options: its own, the classes its rows hold, or, only where it holds neither, its
+        store's class names, asked of it alone (row 11901: asked first, whatever it held)."""
         if self.table is None:
             return ()
-        stated = asked(self.source, frozenset({"class_names"}))
-        return (self.table.options or tuple(self._classes) or _records.strings(
-            record(stated.get("class_names", {}), "class names").get(self.table.label, ()), "class names"))
-
-    def _slots(self) -> Stated:
-        names = self._names()
-        return {"questions": 1, "options": len(names)} if names else (dict(self._facts) or None)
-
-    def _by_value(self) -> Stated:
-        valued = self.table is not None and not self.table.options and bool(self._valued)
-        return True if valued and self._names() else None
+        if self.table.options or self._classes:
+            return self.table.options or tuple(self._classes)
+        stated = record(asked(self.source, frozenset({"class_names"})).get("class_names", {}), "class names")
+        return _records.strings(stated.get(self.table.label, ()), "class names")
 
 
 
