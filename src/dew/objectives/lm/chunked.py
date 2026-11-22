@@ -1131,7 +1131,10 @@ def head_divergence(hidden, head: OutputTable, reference, reference_head: Output
     work = at_least_fp32(hidden.dtype)
     products = _head_product(head, hidden), _head_product(reference_head, reference)
     cap = None if head.softcap is None else jnp.asarray(head.softcap, work)
-    temperatures = jnp.broadcast_to(jnp.asarray(temperature, work), kept.shape)
+    # The temperature at its own width, at least fp32: a float64 one under x64 kept whole, as the whole
+    # logits' KL divides by it (row 10978's review: one cast to fp32 states turned 1e-50 into 0).
+    temperature = jnp.asarray(temperature)
+    temperatures = jnp.broadcast_to(temperature.astype(at_least_fp32(temperature.dtype)), kept.shape)
 
     def scored(hidden, table, targets, excluded, cap, columns, reference_table):
         del excluded
