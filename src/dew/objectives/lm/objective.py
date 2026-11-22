@@ -94,7 +94,6 @@ from dew.nn.protocols import (
     Lacks,
     LayerStates,
     Looped,
-    OutputTable,
     PositionCapacity,
     SteppedFeedForward,
     SteppedInContext,
@@ -135,7 +134,6 @@ from dew.objectives.lm.chunked import (
     logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
-    reads_states,
     refuse_without_logits,
     support_log_probs,
 )
@@ -1721,15 +1719,6 @@ class LMObjective(TokenScorer):
     def predicts_by_head(self) -> bool:
         """Its scores its head's alone where no adaptation scores through more (`ChunkAdaptation`)."""
         return self.adaptation is None
-
-    def output_table(self, variables: Variables) -> OutputTable | None:
-        """Its model's head over `variables` as one matrix (`head_table`), where its final states read one;
-        what the trace finds of the head is kept, as `fused_head` keeps it, which `head_program` reads."""
-        if not (self.predicts_by_head and reads_states(self.model)):
-            return None
-        table = head_table(self.model, variables)
-        self._head_matrices[id(self.model)] = (self.model, table is not None)
-        return table
 
     def predict(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
                 logits: bool = True) -> tuple[Ratio | RoutedStatistics, Aux[Variables], Prediction]:
