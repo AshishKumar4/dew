@@ -8,6 +8,7 @@ import itertools
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 from generation_support import INTERPRETS
@@ -411,16 +412,34 @@ def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
             Checkpoints(str(tmp_path / "sharded_mixed")).restore(sharded_template)
 
 
-def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix():
-    """An NVFP4 product at a decode cell where its packed launch plans a tile (`gemm.NVFP4_CELLS`' H100
-    decode cell) takes the packed launch over whole operands and the matrix decoded once a call where a mesh
-    XLA places splits them (`PackedCase.whole`, `sharding.automatic_axes`), as every GEMM selector's
-    launch reads one device's operands whole (row 11642: a Linear's product forced XLA by hand beside it,
-    and an expert bank's took the packed launch under such a mesh)."""
-    from dew.nn.kernels import selection
+@pytest.mark.parametrize("group_sizes", [None, (8, 8)], ids=["matrix", "expert bank"])
+def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_sizes):
+    """An NVFP4 product at the H100's 16-row decode cell (`gemm.NVFP4_CELLS`), a matrix's or an expert
+    bank's, takes its packed launch over whole operands and decodes its matrix where a mesh XLA places
+    splits them (an automatic axis of two, `sharding.automatic_axes`), as every GEMM selector's launch reads
+    one device's operands whole (row 11642: a Linear forced XLA by hand beside it, and an expert bank's
+    product took the packed launch under such a mesh)."""
+    from jax.sharding import AbstractMesh, AxisType
 
-    with generation.assumed("sm90"):
-        tile = tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
-        assert selection.select(gemm.NVFP4, gemm.PackedCase(tile, 16)).kernel == "packed"
-        assert selection.select(gemm.NVFP4, gemm.PackedCase(tile, 16, whole=False)).kernel == "xla"
+    if group_sizes is None:
+        matrix, sizes = nvfp4(0, 512, 128, scale=0.25)[0], None
+    else:
+        rng = np.random.default_rng(1)
+        codes = rng.integers(0, 16, size=(len(group_sizes), 512, 128)).astype(np.uint8)
+        powers = rng.integers(-3, 4, size=(len(group_sizes), 32, 128))
+        scales = np.exp2(powers).astype(ml_dtypes.float8_e4m3fn)
+        matrix = formats.NvFp4.of(codes, scales, np.full(len(group_sizes), 0.25, np.float32))
+        sizes = jnp.asarray(group_sizes, jnp.int32)
+    rows = jax.ShapeDtypeStruct((16, 512), jnp.bfloat16)
+
+    def taken(mesh):
+        with (generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh),
+              generation.routes() as routes):
+            jax.eval_shape(lambda x: gemm.nvfp4_product(x, matrix, sizes, out_dtype=jnp.float32), rows)
+        return {route.kernel for route in routes if route.choice == "nvfp4"}
+
+    whole = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,))
+    split = AbstractMesh((2,), ("data",), axis_types=(AxisType.Auto,))
+    assert taken(whole) == {"packed"}
+    assert taken(split) == {"xla"}
 
