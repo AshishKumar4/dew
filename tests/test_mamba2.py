@@ -567,3 +567,22 @@ def test_a_decode_token_on_the_fused_step_is_the_layers_own(conv_bias):
                                delta_decode_matrix.initialized('mamba2', use_conv_bias=conv_bias))
 
 
+@pytest.mark.parametrize("kernel", ["fused", "xla"])
+def test_a_bf16_mamba2s_decode_token_returns_its_operands_dtype_on_every_kernel(kernel):
+    """A bfloat16 Mamba-2's decode token in bfloat16 on the fused kernel, interpreted off a GPU, as on the
+    unfused step and in the prefill, as mamba_ssm's `selective_state_update` returns it (row 11790: the
+    fused token's output stayed at float32), its token taking the kernel asked."""
+    import delta_decode_matrix
+
+    from dew.nn.kernels import generation
+    from dew.nn.linear import DELTA_DECODE
+
+    module = delta_decode_matrix.LAYERS["mamba2"].make(jnp.bfloat16)
+    variables = nn.unbox(module.init(jax.random.key(11790), jnp.zeros((3, 1, 64))))
+    cache, tokens = delta_decode_matrix._prefilled(module, variables, 11790, 64)
+    with generation.assumed("sm80"), generation.chosen(delta_decode=kernel), generation.routes() as routes:
+        out, _ = module.apply({**variables, "cache": cache}, tokens[:, :1], MixerCall(decode=True),
+                              mutable=["cache"])
+    assert (DELTA_DECODE.choice, kernel) in {(route.choice, route.kernel) for route in routes}
+    assert out.dtype == jnp.bfloat16
+
