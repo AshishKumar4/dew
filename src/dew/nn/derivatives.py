@@ -641,4 +641,4 @@ formed_together = contracted("test_a_module_reading_its_parameters_formed_togeth
 `parameters`' cotangents formed (`with_tangents_formed`): identity forward, its reverse mode retaining no
 primal. What reads them computes in any way of its own; the layer below, reading `value`'s cotangent, waits
 on the parameters' (row 11713: a loop pass's bank cotangent summed over the layers above in one
-accumulator, `cross_pass.tie_bank`)."""
+accumulator, `decoder_stack._scanned_runs`)."""

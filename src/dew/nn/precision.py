@@ -1839,8 +1839,9 @@ def compensated_difference(later, earlier):
 
 def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """The sum of `values` over `axes`, rounded once: one XLA reduction whose accumulator is a
-    double-float `(hi, lo)` pair combined by `compensated_add`, so it partitions as any reduction
-    does, and what the roundings dropped is added back at the end.
+    double-float `(hi, lo)` pair combined by `compensated_add`'s arithmetic, its plain sum carried beside
+    it for an infinity's fallback (`summed_total`), so it partitions as any reduction does, reads its
+    input once, and what the roundings dropped is added back at the end.
 
     One plain reduction over a loss's every axis rounds as it goes; on 6144 JEPA squares it left the
     sum one float32 step above the correctly rounded one, and the loss a float32 ulp from float64,
@@ -1865,8 +1866,9 @@ def summed_pairs(pair: tuple[jax.Array, jax.Array], axes: Sequence[int]) -> tupl
     one value where it is made (`uncontracted`), or the reduction's additions marked to round alone
     (`rounding_alone`), and the pairs combined by `compensated_add`'s arithmetic with no barrier of its own
     (`renormalized_add`: one in a reduction's computation splits the fusions around the program, row 7953).
-    The one compensated pair reduction: a compensated sum's (`compensated_sum`), a kernel's programs' parts'
-    (`norm_swiglu`), a guidance projection's dot products' (row 8498). An axis of one element is no sum and
+    The compensated pair reduction alone: a guidance projection's dot products' (row 8498); a compensated
+    sum's (`compensated_sum`) and a kernel's programs' parts' (`norm_swiglu`) carry their plain sum beside it
+    in the same reduction (`summed_total`). An axis of one element is no sum and
     is taken out before the reduction: XLA:GPU's simplifier (post117) rewrote a pair reduction over such an
     axis into one bitcast of a single array's shape and refused its own program (a RET_CHECK of
     `ShapeUtil::Compatible`, row 10674)."""
@@ -1912,6 +1914,16 @@ def _paired_and_plain(left, right):
     """`summed_total`'s combine: two `(hi, lo, plain)` accumulators' pairs by `renormalized_add`, their plain
     sums added."""
     return (*renormalized_add(left[:2], right[:2]), left[2] + right[2])
+
+
+COMPENSATED_COMBINES: dict[Callable, tuple[str, ...]] = {
+    compensated_add: ("pair", "pair"), renormalized_add: ("pair", "pair"),
+    _paired_and_plain: ("pair", "pair", "plain")}
+"""Each combine Dew's compensated sums hand `jax.lax.reduce`, as a reduction equation holds it (its
+`computation`), with its results' parts: a double-float pair's halves (`compensated_add`, and
+`renormalized_add`, `summed_pairs`'), and a one-pass sum's pair and the plain sum carried beside it
+(`_paired_and_plain`, `summed_total`'s): the one list the gate's rounding bound and its check 2 read them by
+(row 11880)."""
 
 
 def compensates_loops() -> bool:

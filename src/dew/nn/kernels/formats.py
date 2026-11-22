@@ -6,6 +6,7 @@ GEMM's (`gemm`), their recipes' projections a layer's (`projections`)."""
 
 import dataclasses
 import functools
+import hashlib
 from collections.abc import Sequence
 
 import jax
@@ -19,10 +20,35 @@ from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
 from dew.nn.precision import at_least_fp32, power2
 
-FORM = np.frombuffer(bytes.fromhex(bits.NVFP4_BFLOAT16_FORM.version), np.uint8)
-"""The version of the form an `NvFp4`'s words are packed by (`bits.BitForm.version`, its encoder's digest),
-as the bytes a matrix stores beside its words (`NvFp4.form`): words another encoder packed decode wrong by
-this Dew's form, so a load refuses them (`NvFp4.checked`; algebra.md 7.4, row 6101)."""
+NVFP4_STAGE = packed.NVFP4_STEP
+"""The depths a stage of the mainloop's NVFP4 decode reads: two groups, so each column's scales are a
+16-byte row (a TMA copy's least)."""
+
+
+def staged_rows(depth: int) -> np.ndarray:
+    """The depth each code of the staged order holds (`NvFp4`): packed row `8w + j` of a group (word `w`'s
+    code `j`) holds the depth `packed.nvfp4_staged_depth` gives it, so a stage's word rows decode, code by
+    code, into its sixteen-row depth slices, the block of one scale each (the mainloop's stage decode)."""
+    group = packed.NVFP4_GROUP
+    if depth % group:
+        raise ValueError(f"an NVFP4 matrix's depth is whole {group}-deep groups, not {depth}")
+    groups, within = np.divmod(np.arange(depth), group)
+    word, code = np.divmod(within, 32 // bits.E2M1.width)
+    return packed.nvfp4_staged_depth(groups, word, code)
+
+
+def form_version(encoder: str, order: np.ndarray) -> np.ndarray:
+    """The 8-byte digest of an `NvFp4` encoding: its bit-form `encoder` (`bits.BitForm.version`) and the
+    staged depth `order` (`staged_rows(NVFP4_STAGE)`). Changing either invalidates stored words."""
+    digest = hashlib.sha256(bytes.fromhex(encoder) + np.asarray(order, "<i4").tobytes()).digest()[:8]
+    return np.frombuffer(digest, np.uint8).copy()
+
+
+FORM = form_version(bits.NVFP4_BFLOAT16_FORM.version, staged_rows(NVFP4_STAGE))
+"""The version of the form an `NvFp4`'s words are packed by (`form_version`: its encoder's digest and its
+staged depth order, `staged_rows(NVFP4_STAGE)`), as the bytes a matrix stores beside its words
+(`NvFp4.form`): words packed by another encoder or staged order decode wrong by this Dew's form, so a load
+refuses them (`NvFp4.checked`; algebra.md 7.4, rows 6101, 8662)."""
 
 
 @jax.tree_util.register_dataclass
@@ -149,28 +175,11 @@ class NvFp4:
         by owing 2^8."""
         return jnp.float32(bits.NVFP4_OWED) * jax.lax.stop_gradient(jnp.asarray(self.scale, jnp.float32))
 
-NVFP4_STAGE = packed.NVFP4_STEP
-"""The depths a stage of the mainloop's NVFP4 decode reads: two groups, so each column's scales are a
-16-byte row (a TMA copy's least)."""
-
-
 def unstaged(depth: int) -> str | None:
     """Why a matrix of `depth` inputs is no NVFP4 matrix (`NvFp4`: its depth whole `NVFP4_STAGE`s), or None:
     what a load asks of a weight's shape before it reads any of its values (row 11643's review: an MXFP4
     bank's powers and conversion, gigabytes on a host, were made for banks no stage holds)."""
     return f"its depth {depth} is no whole {NVFP4_STAGE}-deep stages" if depth % NVFP4_STAGE else None
-
-
-def staged_rows(depth: int) -> np.ndarray:
-    """The depth each code of the staged order holds (`NvFp4`): packed row `8w + j` of a group (word `w`'s
-    code `j`) holds the depth `packed.nvfp4_staged_depth` gives it, so a stage's word rows decode, code by
-    code, into its sixteen-row depth slices, the block of one scale each (the mainloop's stage decode)."""
-    group = packed.NVFP4_GROUP
-    if depth % group:
-        raise ValueError(f"an NVFP4 matrix's depth is whole {group}-deep groups, not {depth}")
-    groups, within = np.divmod(np.arange(depth), group)
-    word, code = np.divmod(within, 32 // bits.E2M1.width)
-    return packed.nvfp4_staged_depth(groups, word, code)
 
 
 def _e2m1_values(codes: jax.Array) -> jax.Array:

@@ -1389,7 +1389,9 @@ class Attempt:
 
     executable: jax.stages.Compiled | None
     error: Exception | None = None
-    """A `jax.errors.JaxRuntimeError`, which JAX names as a value, no type."""
+    """A `jax.errors.JaxRuntimeError` (which JAX names as a value, no type), or an `Untuned` or a
+    `CompiledOnDevice` refusal of a compile for a device to run: each its own program's, so a caller of
+    several (`attempts`) knows which raised it."""
 
 
 def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None, *,
@@ -1402,7 +1404,9 @@ def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions |
     step for a compile-only H100: `MLIRError: Failure while executing pass pipeline`)."""
     try:
         return Attempt(xla_compiled(lowered, options, background=background))
-    except jax.errors.JaxRuntimeError as error:
+    # `Untuned` and its `CompiledOnDevice`, the latter raised before XLA compiles, held as XLA's own errors
+    # are (the review of 3606, F3: one escaped several compiles unnamed).
+    except (jax.errors.JaxRuntimeError, Untuned) as error:
         return Attempt(None, error)
 
 

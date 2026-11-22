@@ -30,7 +30,7 @@ from flax import linen as nn
 
 from .attention_residuals import DepthAttention, depth_attended
 from .dense import watched_or_owned
-from .derivatives import formed_together, portable_formed
+from .derivatives import portable_formed
 from .flops import projection_flops
 from .norms import unweighted_rmsnorm
 from .precision import at_least_fp32
@@ -112,9 +112,9 @@ class CrossPassMerge(nn.Module):
         """`read` `[B, S, D]` with `bank` `[B, S, blocks, D]` merged in, in `read`'s dtype."""
         controller = (self.input_down, self.message_down, self.gain, self.forget,
                       *((self.added,) if self.spec.additive else ()))
-        if watched_or_owned(self):
+        if watched_or_owned(self) or watched_or_owned(self.depth):
             # A merge a quantization may own (a rule over its depth mixture's path among them) or a caller
-            # watches runs as it is.
+            # watches, it or its depth mixture, runs as it is.
             return _merged(read, self.depth(bank.astype(at_least_fp32(read.dtype))), controller, self.spec,
                            self.norm_eps)
         # The read's and the bank's cotangents leave only with the merge's parameters' gradients formed,
@@ -153,9 +153,3 @@ def _merged(read: jax.Array, mixed: jax.Array, controller, spec: CrossPass, eps:
     return (kept + (sigma * sent if spec.scale_by_input_rms else sent)).astype(read.dtype)
 
 
-def tie_bank(x, bank):
-    """`x` and a pass's `bank` as they are, `x`'s cotangent leaving only with the bank's formed
-    (`formed_together`): the bank's cotangent summed over the layers above in one accumulator before the
-    layers below run, rather than every merge site's `[B, S, blocks, D]` one held live to the pass's end
-    (row 11713)."""
-    return formed_together(x, bank)

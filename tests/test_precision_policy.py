@@ -1823,15 +1823,17 @@ def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flush
     kept zero; and `binade_of` is `floor(log2|x|)`, -1024 at zero, int32 (row 6302's finish,
     `algebra.quotient`, and an initial state's gradient)."""
     values = edge_values(np.float32)
-    shifts = np.asarray([0, 1, 2, 23, 24, 25, 63, 64, 126, 127, 149, 150, 151, 252, 300], np.int32)
+    # The largest int32 shift among them: lowered by it every value is a zero, no exponent's sum wrapping (row
+    # 11807's review: a wrapped sum made it the least normal).
+    shifts = np.asarray([0, 1, 2, 23, 24, 25, 63, 64, 126, 127, 149, 150, 151, 252, 300, 2**31 - 1], np.int32)
     on_cpu = jax.devices("cpu")[0]
     x, k = (jax.device_put(each, on_cpu) for each in (values[:, None], shifts[None, :]))
     lowered = np.asarray(jax.jit(lowered_rounded)(x, k))
     rounded = np.ldexp(values[:, None], -shifts[None, :]).astype(np.float32)
     np.testing.assert_array_equal(lowered.view(np.uint32), rounded.view(np.uint32))
-    raised = np.asarray(jax.jit(raised_exactly)(x, k))
+    raised = np.asarray(jax.jit(raised_exactly)(x, k[:, :-1]))
     assert raised.dtype == np.float32
-    exact = np.ldexp(values[:, None].astype(np.float64), shifts[None, :])
+    exact = np.ldexp(values[:, None].astype(np.float64), shifts[None, :-1])
     held = np.abs(exact) <= np.finfo(np.float32).max
     expected = exact[held].astype(np.float32)
     np.testing.assert_array_equal(raised[held].view(np.uint32), expected.view(np.uint32))

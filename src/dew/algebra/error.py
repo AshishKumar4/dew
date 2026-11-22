@@ -133,7 +133,10 @@ def at_least(asked: jax.lax.DotAlgorithmPreset, dtype) -> Callable[[jax.lax.DotA
     """A site's gate for `product_precision` stated as an algorithm: it admits a product of `dtype` operands
     in a preset at least as exact as `asked` in them, by what each states of its arithmetic
     (`dew.nn.programs.dot_arithmetic`): as many significand digits of each operand
-    (`DotArithmetic.digits`), as wide an accumulation, and an imprecise one only where `asked`'s is. So a
+    (`DotArithmetic.digits`), as wide an accumulation, an imprecise one only where `asked`'s is, and parts
+    of as wide a range as `asked`'s hold of the operands (`DotArithmetic.largest`: a part whose format's
+    largest is beneath rounds an operand near the dtype's largest to an infinity, row 11878: BF16x6 and x9
+    of fp32 operands near float32's largest overflow where IEEE fp32's products are finite). So a
     port states the algorithm its upstream runs and takes the cheapest its backend runs that keeps as much,
     not a precision picked by hand (row 5473). `asked` names an algorithm: the default preset, which names
     none, is refused."""
@@ -142,11 +145,13 @@ def at_least(asked: jax.lax.DotAlgorithmPreset, dtype) -> Callable[[jax.lax.DotA
     if floor is None:
         raise ValueError(f"{asked} names no dot algorithm for a product to be at least as exact as")
 
+    reach = min(*floor.largest, float(jax.numpy.finfo(operand).max))
+
     def admits(preset: jax.lax.DotAlgorithmPreset) -> bool:
         arithmetic = programs.dot_arithmetic(preset, operand, operand)
         return (arithmetic is not None and arithmetic.digits >= floor.digits
                 and arithmetic.accumulation_bits >= floor.accumulation_bits
-                and (floor.imprecise or not arithmetic.imprecise))
+                and (floor.imprecise or not arithmetic.imprecise) and min(arithmetic.largest) >= reach)
     return admits
 
 

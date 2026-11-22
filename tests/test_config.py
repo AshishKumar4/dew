@@ -984,6 +984,34 @@ def test_a_run_stating_the_default_layout_saves_and_loads_it_stated(tmp_path):
     assert RunConfig.load(str(path)).trainer.layout is None
 
 
+def test_a_run_saved_before_its_retired_and_unsettable_fields_loads_as_it_trained(tmp_path):
+    """A decoder run saved while its trainer stated `export_model` (row 11636) and while its messages'
+    additive term could not be unset, its true their default (row 11742), loads: the retired field taken off,
+    its true read as unset, a false kept; a record written today keeps a stated true as stated. Each was
+    refused or read as stated (the head review of row 11742: a saved run's default true raised with no
+    messages, or overrode a checkpoint's choice)."""
+    from dew.config.earlier import ADDITIVE_UNSETTABLE, earlier_run
+    from dew.config.lm import LMRunConfig
+
+    today = LMRunConfig().record()
+    earlier = {key: value for key, value in today.items() if key != ADDITIVE_UNSETTABLE}
+    trainer = {**today["fields"]["trainer"], "export_model": False}
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({**earlier, "fields": {**today["fields"], "trainer": trainer,
+                                                      "loop_message_additive": True}}))
+    assert LMRunConfig.load(str(path)).loop_message_additive is None
+    # A trainer recorded by its class, as a subclass's is: its retired field taken off inside its record.
+    named = {"class": "dew.config.trainer:TrainerConfig", "fields": trainer}
+    path.write_text(json.dumps({**earlier, "fields": {**today["fields"], "trainer": named}}))
+    assert LMRunConfig.load(str(path)).trainer == LMRunConfig().trainer
+    # Data a field holds that names a class and no fields passes as it is, migrating nothing.
+    payload = {"class": "builtins:dict"}
+    opaque = {**earlier, "fields": {**today["fields"], "trainer": trainer, "payload": payload}}
+    assert earlier_run(opaque)["fields"]["payload"] == payload
+    for record, additive in ((earlier, False), (today, True)):
+        stated = {**record, "fields": {**record["fields"], "loop_message_additive": additive}}
+        assert earlier_run(stated)["fields"]["loop_message_additive"] is additive, (record is today, additive)
+
 def test_a_run_saved_with_its_experts_packed_loads_with_its_weights_packed(tmp_path):
     """A run saved while `SourceOptions.packed_weights` was `packed_experts` (row 8550) loads with its
     source's weights packed as it trained, its record read under today's name (`earlier_packed_experts`)."""

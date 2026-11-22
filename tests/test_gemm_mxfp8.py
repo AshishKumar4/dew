@@ -104,3 +104,23 @@ def test_an_mxfp8_projections_training_step_is_on_par():
     assert_as_exact(jax.jit(with_gradients(projection)), jax.jit(with_gradients(plain)), step_operands,
                     "mxfp8 training step", seeds=SEEDS,
                     truth_fn=with_gradients(mx_matrix.recipe_truth(blocks)))
+
+
+def test_mxfp8_named_mosaic_uninterpreted_dispatches_portable_on_cpu():
+    """In a CPU process assuming a B200 with `mxfp8="mosaic"` named and `interpret_on_cpu=False`,
+    `mxfp8_product` dispatches through `_dispatched` to its portable arm on CPU instead of lowering Mosaic
+    uninterpreted (row 8646)."""
+    from dew.nn.kernels import formats, gemm, generation
+
+    rng = np.random.default_rng(23)
+    lhs = formats.MxFp8(jnp.asarray(rng.normal(size=(128, 128)) / 4, jnp.float8_e4m3fn),
+                        jnp.ones((128, 4), jnp.float8_e8m0fnu))
+    matrices = formats.MxFp8(jnp.asarray(rng.normal(size=(1, 128, 128)) / 4, jnp.float8_e4m3fn),
+                             jnp.ones((1, 128, 4), jnp.float8_e8m0fnu))
+    blocks = jnp.asarray([1], jnp.int32)
+    with generation.assumed("sm100"):
+        with generation.chosen(mxfp8="mosaic"):
+            got = gemm.mxfp8_product(lhs, matrices, blocks, out_dtype=jnp.float32, interpret_on_cpu=False)
+        with generation.chosen(mxfp8="xla"):
+            ref = gemm.mxfp8_product(lhs, matrices, blocks, out_dtype=jnp.float32, interpret_on_cpu=False)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))

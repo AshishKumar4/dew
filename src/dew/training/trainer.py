@@ -67,9 +67,8 @@ from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
-from dew.nn.kernels.options import Compiling, attempting, owned_program, shapes_of
+from dew.nn.kernels.options import Compiling, attempting, shapes_of
 from dew.nn.kernels.templates import report
-from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, explicit_placement, tracing
 from dew.objectives.base import (
     Aux,
@@ -95,18 +94,7 @@ from dew.optim_schedules import (
 )
 from dew.registry import Unrecordable
 from dew.scores import Summary
-from dew.state import (
-    MODEL_STATE,
-    Accumulation,
-    TrainState,
-    apart,
-    drawn_in,
-    kept_window,
-    occupied,
-    paired,
-    taken,
-    together,
-)
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, occupied, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
@@ -157,6 +145,7 @@ from dew.training._fit import (
     waited_read,
 )
 from dew.training._lowering import Lowered
+from dew.training._windows import Windowing, empty_window
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
 from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held, planned_over
@@ -191,16 +180,13 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, computation_differs, refuse_export, resumed_step, run_data
+from dew.training.startup import Startup, computation_differs, resumed_step, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
     Transaction,
-    batch_statistics_shapes,
     checked,
-    compact_qk,
     loss_scale,
-    pooled_by_mean,
     refuse_unpassed_progress,
     traced_loss,
 )
@@ -584,7 +570,8 @@ class Trainer(Generic[Loss, Effects]):
         bound = functools.partial
         return Stepping(self._settings(objective), bound(self._step_key, objective, compiler), self.shardings,
                         bound(self._loss_shape, objective=objective), self._staging,
-                        bound(self._initialize_accumulation, objective=objective), self._model_batch,
+                        bound(empty_window, self._windowing(), objective=objective),
+                        self._model_batch,
                         self._model_shapes, bound(self._step_body, objective=objective),
                         bound(fetched_state, layout=self.layout), self._traced_on, self._shape,
                         self._validation, self._builds_window, bound(self._window_of, objective=objective))
@@ -920,90 +907,6 @@ class Trainer(Generic[Loss, Effects]):
         loss, (variables, *rest) = traced_loss(objective, state, window, split)
         return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 
-    def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
-                                 split: int = 1, shape_only=False, donor: Accumulation | None = None,
-                                 objective: Objective[Loss, Effects]):
-        """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty;
-        unchanged under a custom step or a held one that replays such batches (`Accumulation.replays`): a
-        ramp's stage begins with a window (`Ramp.stages`). Under a window of one, the state holds none: an
-        empty one it holds of another split (a phase planned afresh, `StepCompiler.afresh`) is the one its
-        step lets go as it is handed the state (`laid_out`), so the step is planned over the state without
-        it. Built over `donor`, the empty window it replaces, where given: each of its leaves of a new
-        leaf's shape and dtype donated to it, its buffer the new one's, zeroed, the rest released
-        (`taken`)."""
-        if self.step is not None:
-            return state
-        if window == 1:
-            return state if state.accumulation is None else dataclasses.replace(state, accumulation=None)
-        stats, aux = shapes
-        shared = pooled_by_mean(stats)
-        mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
-        slots = window - 1
-        def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
-            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
-
-        trainable = jax.tree.map(shape, state.variables["params"])
-        records = jax.tree.map(shape, self._model_shapes(batch))
-        mutable = (None if shared or aux.variables is None else
-                   jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
-        batch_stats = batch_statistics_shapes(objective, state, records, window, split)
-
-        def zeros(leaf):
-            wide = at_least_fp32(leaf.dtype)
-            return jnp.zeros(leaf.shape, wide if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype)
-
-        def buffer(tree):
-            return jax.tree.map(lambda x: jnp.zeros((slots, *x.shape), x.dtype), tree)
-
-        def allocate():
-            return Accumulation(
-                gradient=jax.tree.map(zeros, trainable) if shared else None,
-                mass=jnp.zeros((), mean_dtype) if shared else None,
-                statistics=((jnp.zeros((), mean_dtype),) if shared else
-                            tuple(zeros(x) for x in jax.tree.leaves(stats))),
-                effects=tuple(zeros(x) for x in jax.tree.leaves(aux.effects)),
-                qk_stats=jax.tree.map(
-                    lambda x: jnp.full(x.shape, -jnp.inf, at_least_fp32(x.dtype))
-                    if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
-                    compact_qk(jax.tree.map(zeros, aux.qk_stats), self.phase_passes.sampled is not None)),
-                batches=None if shared else buffer(records),
-                variables=None if mutable is None else buffer(mutable),
-                attempts=None if shared else jnp.zeros((slots,), jnp.int32),
-                tokens=jnp.zeros((2,), jnp.uint32) if TOKENS in batch else None,
-                batch_statistics=None if batch_stats is None else tuple(zeros(x) for x in batch_stats),
-                replayed_statistics=(None if shared or batch_stats is None
-                                     else tuple(buffer(zeros(x)) for x in batch_stats)),
-                statistics_stamp=None if batch_stats is None else jnp.full((2,), -1, jnp.int32),
-                fill=jnp.zeros((), jnp.int32))
-
-        pending = jax.eval_shape(allocate)
-        # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
-        if kept_window(state.accumulation, pending, read=not shape_only):
-            return state
-        if not shape_only:
-            placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
-            # Allocate on the final shards, without a replicated window-sized temporary, over the donor's
-            # buffers where the old window's leaves have the new ones' shapes: none allocated twice.
-            # The window it replaces: one laid out for another split (`donor`), or the state's own, a ramp's
-            # stage's of other shapes.
-            donor = state.accumulation if donor is None else donor
-            released(taken(donor, pending)[1])
-            pairs = paired(donor, pending)
-            given = jax.tree.leaves(donor)
-            donated = [given[index] for index in sorted(pairs.values())]
-            place = {index: sorted(pairs.values()).index(held) for index, held in pairs.items()}
-
-            def built(held):
-                # Each leaf a donated one takes the place of is written over it: the donated buffer is an
-                # operand, so XLA writes the new window's zeros into it.
-                leaves, structure = jax.tree.flatten(allocate())
-                for index, at in place.items():
-                    leaves[index] = held[at].at[...].set(leaves[index])
-                return jax.tree.unflatten(structure, leaves)
-
-            pending = owned_program(built, out_shardings=placement, donate_argnums=0)(donated)
-        return dataclasses.replace(state, accumulation=pending)
-
     def _builds_window(self, state: TrainState, candidate: Candidate, window: int) -> bool:
         """Whether a step of `window` microbatches over `state` builds its window first (`_window_of`): a
         state that holds none, or a ramp's stage whose window replays other shapes."""
@@ -1011,15 +914,20 @@ class Trainer(Generic[Loss, Effects]):
         return window > 1 and self.step is None and (
             held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
 
+    def _windowing(self) -> Windowing:
+        """What its runs' empty windows are built by (`empty_window`)."""
+        return Windowing(self.step is not None, self._model_shapes, self.shardings,
+                         self.phase_passes.sampled is not None)
+
     def _window_of(self, state: TrainState, candidate: Candidate, window: int,
                    donor: Accumulation | None = None, *,
                    objective: Objective[Loss, Effects] | None = None) -> TrainState:
         """`state` with the accumulation `window` microbatches of `candidate`'s pool in, empty, on its shards
         (`windowed`), built over `donor`, the empty window it replaces, where given: what a run's first step
         of a window builds, and a run compiled ahead compiles (`dew.training.ahead.started`)."""
-        return windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
-            state, rows, candidate.shapes, window=window, split=window // self.accumulation,
-            shape_only=shape_only, donor=donor,
+        return windowed(lambda state, rows, *, shape_only: empty_window(
+            self._windowing(), state, rows, candidate.shapes, window=window,
+            split=window // self.accumulation, shape_only=shape_only, donor=donor,
             objective=self.objective if objective is None else objective), state, candidate.micro,
             self.shardings)
 
@@ -1522,7 +1430,7 @@ class Trainer(Generic[Loss, Effects]):
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
         objective that names its input field alone declares it first (`_declare_input`), a resume's from the
         first batch its saved position admits (`_resumed_position`)."""
-        checkpoints, _ = self.checkpoints, refuse_export(self)
+        checkpoints = self.checkpoints
         resumed = None if initial is not None else self._resumed(run, resume)
         self._declare_input(lambda: self._primed_first(run, dataset,
                                                        None if resumed is None else resumed.position))
@@ -2325,7 +2233,7 @@ class Trainer(Generic[Loss, Effects]):
         settled_heap(run)  # A step the process held, its fit's start collected all the same.
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], interval, run.current, state), trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current, trials.state), trials.state)
 
     def _saved_checkpoint(
         self,

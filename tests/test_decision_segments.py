@@ -277,12 +277,12 @@ def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():
 
 def test_copies_of_the_state_share_the_room_as_any_rows_segments_do():
     """A row's copies of the state share its room as any row's segments do (`share_tokens`): each its
-    cap, its own or the joint layout's, a whole copy all it holds (row 1616)."""
+    cap, a whole copy all it holds whatever its cap (row 1616)."""
     from dew.data.tokens import share_tokens
     from dew.decision.layout import allocated
 
     copies = [State(max_tokens=4), State(keep="all", max_tokens=2), State()]
-    assert allocated([10, 6, 10], copies, 12, default_cap=5) == share_tokens(
+    assert allocated([10, 6, 10], copies, 12, [4, 2, 5]) == share_tokens(
         [10, 6, 10], 12, caps=[4, 2, 5], whole=[False, True, False]) == [3, 6, 3]
 
 

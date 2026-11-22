@@ -92,7 +92,7 @@ def projections_of(projections: Sequence[nn.Module], depth: int | None = None) -
                         and projection.dot_general_cls is None for projection in projections),
         intercepted=intercepting() or any(projection.product_owned() for projection in projections),
         held=leaves is not None, recipe=leaves is not None and _recipe_differs(leaves.kernels),
-        observed=observed(projections[0]), leaves=leaves)
+        observed=any(observed(projection) for projection in projections), leaves=leaves)
 
 
 def _leaves(projections: Sequence[Dense], depth: int | None) -> Leaves | None:

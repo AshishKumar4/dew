@@ -497,6 +497,12 @@ class Planned:
     """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled under the
     plan's options and admitted with it (`FitSearch.measured`); None in a run that inspects nothing."""
 
+    @property
+    def judged(self) -> jax.stages.Compiled:
+        """The executable whose memory its fit is read by: its sampled step's where it samples, which must
+        fit where the step does and stands for it (`FitSearch.measured`), else its own."""
+        return self.executable if self.sampled is None else self.sampled.executable
+
     def record(self) -> dict[str, JSON]:
         record: dict[str, JSON] = {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
         if self.profiled is not None:
@@ -1023,7 +1029,8 @@ class FitSearch[LossT, EffectsT]:
         return compiled_key(lowered, options, local_devices(self.mesh))
 
     def measured(self, split: int, candidate: Candidate) -> tuple[
-            jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:
+            jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe,
+            jax.stages.Compiled | None]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
         where it fits the devices, or for the search's first compile the step compiled ahead
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
@@ -1101,7 +1108,7 @@ class FitSearch[LossT, EffectsT]:
         probe = Probe.read(split, candidate, self.current(), fit, headroom, judged, self.held(candidate))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, spent=spent,
                                     admitted=admitted)
-        return options, candidate, executable, probe
+        return options, candidate, executable, probe, judged
 
     def fits_here(self, split: int) -> bool:
         key = (split, self.rung())
@@ -1110,12 +1117,14 @@ class FitSearch[LossT, EffectsT]:
             # within its refusals, for its GPU; every other compile within this process's, for this GPU.
             with handed(self.ahead):
                 self.lowered[key] = self.lowering(split)
-        self.chosen, candidate, executable, probe = self.measured(split, self.lowered[key])
+        self.chosen, candidate, executable, probe, judged = self.measured(split, self.lowered[key])
         self.lowered[key] = candidate
         fit, headroom = probe.fits, probe.headroom
         self.probes.append(probe)
         if not fit and headroom is not None and probe.temp is not None:
-            live = None if executable is None else LiveSet.of(executable, batch_rows(candidate))
+            # The live set of the executable its probe's memory is (`measured`'s `judged`), as its shortfall
+            # (row 11833: the step's own, beside its sampled twin's miss).
+            live = None if judged is None else LiveSet.of(judged, batch_rows(candidate))
             # Its temporaries a microbatch's rows scale, as its live set states them, those it states no
             # provenance of among them (the most a split can free of them); every one where it states none.
             scaled = probe.temp if live is None else live.scaled + live.unknown

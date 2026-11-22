@@ -99,13 +99,16 @@ class _Launch(tuning.KernelOp):
         return self._fitted(ba, self.PICKS[_picked(ba)])
 
     def variants(self, ba) -> tuple[Tiles, ...]:
-        """Its derived config, then, for a call picked as a bf16 one (`_picked`), the scan `MEASURED` timed,
-        mamba_ssm's own autotuner's picks on an A100 for its kernel, fitted to the call and the summing
-        kernels' heads the derived config's: a tuning run's candidates (`tuning.tune`), each held to the
-        port's gate (tests/test_mamba_ssd.py, whose bf16 case pins each). Offered an fp32 call, a pick no
-        run measured at fp32 took the tuning run's choice past every gate the fp32 cases hold (row 10882)."""
+        """Its derived config, then, for a call of bf16 operands, the scan `MEASURED` timed, mamba_ssm's own
+        autotuner's picks on an A100 for its kernel, fitted to the call and the summing kernels' heads the
+        derived config's: a tuning run's candidates (`tuning.tune`), each held to the port's gate
+        (tests/test_mamba_ssd.py, whose bf16 case pins each). Offered an fp32 call, a pick no run measured at
+        fp32 took the tuning run's choice past every gate the fp32 cases hold (row 10882); an fp16 call, which
+        takes bf16's heuristic picks (`_picked`), no measured one either (row 11835)."""
         derived = ba.heuristics_config
-        measured = MEASURED.get(self.NAME, ()) if _picked(ba) == "bfloat16" else ()
+        operand = _operand(ba)
+        bf16 = operand is not None and jnp.dtype(operand.dtype) == jnp.bfloat16
+        measured = MEASURED.get(self.NAME, ()) if bf16 else ()
         found = (self._fitted(ba, dataclasses.replace(tiles, heads=derived.heads)) for tiles in measured)
         return tuple(dict.fromkeys((derived, *found)))
 
@@ -130,8 +133,8 @@ port's derived configs (an H100's picks, `_picks`) ran its training 1.54 and 1.1
 
 
 def _picked(ba) -> str:
-    """The operand dtype a call's configs are picked for (`_Launch.PICKS`, `MEASURED`): fp32 where its
-    operand is fp32 or it has none (the step's kernels), bf16 for a 16-bit one, fp16 taking bf16's."""
+    """The operand dtype a call's heuristic configs are picked for (`_Launch.PICKS`): fp32 where its operand
+    is fp32 or it has none (the step's kernels), bf16 for a 16-bit one, fp16 taking bf16's."""
     operand = _operand(ba)
     return "float32" if operand is None or jnp.dtype(operand.dtype).itemsize == 4 else "bfloat16"
 

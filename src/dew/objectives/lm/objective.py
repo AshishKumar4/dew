@@ -1033,7 +1033,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         inspected = gathered.get(INSPECTED, {}) if watched else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
-        table = self.fused_head(self.model, params) if z_loss is not None else None
+        table = self.fused_head(params) if z_loss is not None else None
         weights = self._target_weights(prepared, roles, at_least_fp32(hidden.dtype), rows)
         total, (losses, predicted, log_z), whole, moved = self._head_scores(
             params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss, logits=logits)
