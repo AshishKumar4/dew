@@ -113,14 +113,13 @@ def teacher_forward():
 
 
 DISTILLATION_SEEDS = {"terms": 64, "gradient": 16, "wide temperature": 8}
-"""Each site's declared seeds; the wide temperature's `seeds_for`'s at the suite's host level, paired with
-its tiled arm."""
+"""Check 1's declared seeds, each sized by `seeds_for` on armada at the suite's host level: the loss's terms
+and the student's gradient (2026-10-21), and the wide temperature's (2026-11-22), 8 for its tiled arm paired
+with the whole logits' as the gate compiles them."""
 
 TILE = (6, META["student"]["vocab_size"])
 """A tiled head whose full KL takes 3 of a row's positions a slice (`chunked.head_divergence`), which do not
 divide the fixture's 8."""
-"""Check 1's declared seeds for the loss's terms and the student's gradient, sized by `seeds_for`
-(2026-10-21, on armada)."""
 
 
 def drawn_parameters(params):
