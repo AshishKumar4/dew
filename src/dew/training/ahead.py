@@ -684,14 +684,16 @@ def tpu_chips(devices: Sequence) -> str | None:
 def programs_need(device, programs: Iterable[tuple[CompiledMemory | None, int, int]]) -> int | None:
     """The least allocator limit a GPU like `device` must hold to admit each of `programs`, the most of
     them: each a program's memory as XLA analysed it, the bytes a loop keeps beside it and those of them its
-    first call builds, admitted as the planner admits a step (`memory.admission`, `memory.needed`) and read
-    as the limit that GPU's pool holds (`allocator_limit` at its stated share). None for a device of no GPU
-    pool (a TPU's, whose topology states its own) and where a program states no memory."""
+    first call builds, admitted as the planner admits a step (`memory.admission`) and read
+    as a limit of that GPU's pool (`least_limit`, whatever share takes it). None for a device of no GPU
+    pool (a TPU's, whose topology states its own; a CPU's, but one standing in for a GPU, `stand_in_gpus`)
+    and where a program states no memory."""
     from dew.training.memory import admission, least_limit
 
     programs = list(programs)
     stated = [(memory, held, built) for memory, held, built in programs if memory is not None]
-    if device.platform != "gpu" or not programs or len(stated) < len(programs):
+    gpu = device.platform == "gpu" or device in STATED_GPUS
+    if not gpu or not programs or len(stated) < len(programs):
         return None
     return least_limit(device, [admission(memory, held, built) for memory, held, built in stated])
 
@@ -867,12 +869,17 @@ class Keeping:
 
     def save(self, path: str | Path) -> AheadPrograms:
         """Write the programs kept so far to `path` with this process's target, for `kept` in a process of
-        it; returns what it wrote. Each program it could not keep is logged with its reason (`refused`)."""
+        it; returns what it wrote. Each program it could not keep is logged with its reason (`refused`). The
+        target states what its programs need of a device (`programs_need`), not the limit of the GPU that
+        kept them, so a smaller GPU that admits them loads them (row 8711, as rows 8094 and 8371 for a
+        build compiled ahead)."""
         for named, reason in self.refused.items():
             _log.warning("the program %s is not kept, and compiles where the file is handed: %s", named,
                          reason)
-        target = BuildTarget.of(jax.devices())
-        cpu_stated(target, jax.devices())
+        devices = jax.devices()
+        need = programs_need(devices[0], [(kept.executable.memory, 0, 0) for kept in self.kept.values()])
+        target = dataclasses.replace(BuildTarget.of(devices), memory=need)
+        cpu_stated(target, devices)
         # Each compiled on this process's devices, which made its every choice itself.
         programs = AheadPrograms(target, {}, tuned=True, at_run=(), kept=dict(self.kept))
         programs.save(path)
@@ -1584,11 +1591,12 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     sampled = _sampled_ahead(planned)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
-    held = [compiled, *starts.values(), *([] if planned.sampled is None else [planned.sampled.executable])]
     memory = compiled_memory(compiled)
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
-    need = _step_need(planned, starts, devices[0])
+    programs = _step_programs(planned, starts)
+    need = programs_need(devices[0], [(compiled_memory(executable), held, built)
+                                      for executable, held, built in programs])
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_digest(lowered),
         Executable.of(compiled),
@@ -1599,19 +1607,28 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices)),
         refusals=report.refused_launches(), sampled=sampled,
-        at_run=any(report.left_at_run(each) for each in held),
-        starts={digest: Executable.of(executable) for digest, executable in starts.items()})
+        at_run=any(report.left_at_run(executable) for executable, _, _ in programs),
+        starts={digest: Executable.of(executable) for digest, (executable, _) in starts.items()})
 
 
-def _step_need(planned: Planned, starts: Mapping[str, jax.stages.Compiled], device) -> int | None:
-    """What a device must hold to run a step compiled ahead (`programs_need`): its step, with its sampled
-    step, beside the bytes their loop keeps (`Candidate.held`), and the programs that build its fresh state
-    before it (`AheadOfTime.starts`), beside none."""
-    held, built = planned.candidate.held, planned.candidate.built
+def _step_programs(planned: Planned, starts: Started) -> list[tuple[jax.stages.Compiled, int, int]]:
+    """Every program a run of a step compiled ahead runs, each with the bytes its run holds beside it and
+    those of them its first call builds (`memory.admission`'s `held` and `built`): the one list the build's
+    need (`programs_need`) and its choices left to run time (`report.left_at_run`) read (row 8713). Its
+    step and sampled step beside what their loop keeps (`Candidate.held`); its fresh state's build beside
+    none, run before any state is placed; every other program it runs (`started`) beside what the run holds
+    between its steps (the step's arguments, its first call's builds charged once, and what its loop
+    keeps), less the bytes of the state among the program's own arguments (row 8710: a program run beside
+    the placed state admitted beside none, so a device admitted at the need ran out of memory where the
+    run's own admission refused it). The step's memory is stated (`_planned_ahead`)."""
+    candidate = planned.candidate
+    memory = compiled_memory(planned.executable)
+    assert memory is not None
+    resident = memory.argument - candidate.built + candidate.held
     steps = [planned.executable, *([] if planned.sampled is None else [planned.sampled.executable])]
-    programs = [*((compiled_memory(executable), held, built) for executable in steps),
-                *((compiled_memory(executable), 0, 0) for executable in starts.values())]
-    return programs_need(device, programs)
+    return [*((step, candidate.held, candidate.built) for step in steps),
+            *((executable, 0 if among is None else max(0, resident - among), 0)
+              for executable, among in starts.values())]
 
 
 def _sampled_ahead(planned: Planned) -> AheadProgram | None:
@@ -1647,8 +1664,13 @@ def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch:
                                                step_batch(trainer, batch))
 
 
+type Started = dict[str, tuple[jax.stages.Compiled, int | None]]
+"""The programs a run compiles besides its step (`started`), each by its digest with the bytes of the run's
+state among its arguments, None for one run before any state is placed."""
+
+
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
-                             plan: FitPlan | None = None) -> dict[str, jax.stages.Compiled]:
+                             plan: FitPlan | None = None) -> Started:
     """The programs a run of `trainer` compiles besides its step, compiled for the target over their
     arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement (`start_compiled`), for
     a run that starts afresh, the first step's narrowed copies of its weights where the plan reads some
@@ -1658,32 +1680,61 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     (`latest`), its log's copies (`copied`) and its logged tokens' sum (`added_tokens`), and with the plan
     of its `fit` (`plan`), what its evaluations' warming pass compiles before they run
     (`Evaluator.warmed_ahead`; row 4752). Each by its program's digest, through the kernel templates'
-    reports as every compile is."""
+    reports as every compile is, with the bytes of the run's state among its arguments, which the run holds
+    while it runs (`_step_programs`): None for the fresh state's build, run before any state is placed."""
     from dew.training.distributed import start_compiled
     from dew.training.narrow import narrowing
 
     candidate = planned.candidate
-    with collecting() as collected:
-        if start.resume is None and not trainer.host_master:
+    programs: Started = {}
+    if start.resume is None and not trainer.host_master:
+        with _collected(programs, lambda executable: None):
             start_compiled(start.placing, start.initializer,
                            shapes_of(start.key), start.abstract,
                            start.shardings, trainer.device_mesh)
-        if candidate.copies:
-            # The variables as the run's first step holds them, placed as its start placed them.
-            variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
-                                                                                 sharding=sharding),
-                                     start.abstract.variables, start.shardings.variables)
-            narrowing(candidate.copies, candidate.shardings.compute).compiled(
-                variables)
-    collected.update(_results_programs(trainer, start, planned, plan))
-    return collected
+    if candidate.copies:
+        # The variables as the run's first step holds them, placed as its start placed them.
+        variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                                             sharding=sharding),
+                                 start.abstract.variables, start.shardings.variables)
+        with _collected(programs, _arguments):
+            narrowing(candidate.copies, candidate.shardings.compute).compiled(variables)
+    _results_programs(trainer, start, planned, plan, programs)
+    return programs
+
+
+@contextlib.contextmanager
+def _collected(programs: Started, among: Callable[[jax.stages.Compiled], int | None]) -> Iterator[None]:
+    """Within the block, each program Dew's compile point compiles (`collecting`) joins `programs` by its
+    digest, with the bytes of the run's state among its arguments (`among` of it: None for one run before
+    any state is placed); a program two blocks compile, with the fewest, as its run holds the most beside
+    it there."""
+    with collecting() as collected:
+        yield
+    for digest, executable in collected.items():
+        state = among(executable)
+        if digest in programs:
+            earlier = programs[digest][1]
+            state = earlier if state is None else state if earlier is None else min(state, earlier)
+        programs[digest] = (executable, state)
+
+
+def _arguments(executable: jax.stages.Compiled) -> int:
+    """The bytes of the run's state among the arguments of a program over the state alone: its arguments',
+    as XLA analysed them, those it reads (`compiled_memory`: a program's unread arguments are no part of
+    it). A program XLA states no memory of states no need (`programs_need`), whatever this reads."""
+    memory = compiled_memory(executable)
+    return 0 if memory is None else memory.argument
 
 
 def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
-                                       plan: FitPlan | None) -> dict[str, jax.stages.Compiled]:
+                                       plan: FitPlan | None, programs: Started) -> None:
     """The programs a run's steps run on their results and its state, and with its `fit`'s `plan` its
     evaluations' warming pass over its first state, compiled where the run's own code calls them over
-    shapes (`collecting`), by digest: `started`'s last part."""
+    shapes (`collecting`), joining `programs` by digest (`_collected`): `started`'s last part. A window's
+    allocation and a log's copies take the state alone; the programs over a step's results take none of it,
+    and an evaluation's, its weights among its batches, are counted beside the whole state, a need never
+    under what its run holds."""
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest, streak_of
@@ -1694,9 +1745,10 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     frozen = apart(placed)[1]
     # A sampled step's results hold its summaries (`Committed.inspected`), which its programs read too.
     steps = [planned.executable] + ([] if planned.sampled is None else [planned.sampled.executable])
-    with collecting() as collected:
-        if trainer._builds_window(placed, candidate, window):
+    if trainer._builds_window(placed, candidate, window):
+        with _collected(programs, _arguments):
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
+    with _collected(programs, lambda executable: 0):
         for step in steps:
             moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
             # As the step runs it: its whole where it is split (`StepCompiler.runner`).
@@ -1709,8 +1761,8 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             if committed is not None and committed.inspected is not None:
                 latest((committed.count, committed.inspected), (committed.count, committed.inspected))
             added_tokens(counted.tokens, counted.tokens)
-            copied(together(moving, frozen))
+            with _collected(programs, _arguments):
+                copied(together(moving, frozen))
         if plan is not None:
             trainer._evaluator().warmed_ahead(plan, placed, start.shardings,
                                               trainer._compiler.links(trainer.device_mesh))
-    return collected
