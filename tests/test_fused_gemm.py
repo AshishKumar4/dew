@@ -236,13 +236,10 @@ def _chained(function, wide):
     return wide
 
 
-@pytest.mark.parametrize("stage", ["epilogue", "prologue"])
-def test_a_fused_launchs_special_functions_are_priced_in_the_forms_it_compiles(stage):
-    """A bf16 product of 8192 x 256 x 4096 with eight chained float32 logs after it (its epilogue's), or of
-    8192 x 4096 x 256 with them before it on its rows (its prologue's), launched by the Mosaic template on a
-    compile-only H100: fused, the logs cost its launch more than as many exp2s, as it compiles them without
-    `approx_math` (`emission.ACCURATE_FORMS`: a log a polynomial of FP32 instructions, an exp2 one MUFU),
-    where each was priced one MUFU an element and the two alike (row 10824). Shapes only."""
+def _logs_and_exp2s(stage: str, target: str) -> tuple:
+    """`fused_gemm.analysis` of a bf16 product of 8192 x 256 x 4096 with eight chained float32 logs after it
+    (`stage` 'epilogue'), or of 8192 x 4096 x 256 with them before it on its rows ('prologue'), launched by
+    the Mosaic template on a compile-only `target`; and of the same with exp2s."""
     def region(function, x, w):
         if stage == "prologue":
             x = _chained(function, x.astype(jnp.float32)).astype(jnp.bfloat16)
@@ -252,11 +249,32 @@ def test_a_fused_launchs_special_functions_are_priced_in_the_forms_it_compiles(s
     depth, width = (4096, 256) if stage == "prologue" else (256, 4096)
     x = jax.ShapeDtypeStruct((8192, depth), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((depth, width), jnp.bfloat16)
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        logs, exp2s = (fused_gemm.analysis(functools.partial(region, function), x, w)
-                       for function in (jnp.log, jnp.exp2))
+    with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"):
+        return tuple(fused_gemm.analysis(functools.partial(region, function), x, w)
+                     for function in (jnp.log, jnp.exp2))
+
+
+@pytest.mark.parametrize("stage", ["epilogue", "prologue"])
+def test_a_fused_launchs_special_functions_are_priced_in_the_forms_it_compiles(stage):
+    """A product's epilogue or prologue of eight chained float32 logs, its launch the Mosaic template's on a
+    compile-only H100 (`_logs_and_exp2s`): fused, the logs cost its launch more than as many exp2s, as it
+    compiles them without `approx_math` (`emission.ACCURATE_FORMS`: a log a polynomial of FP32 instructions,
+    an exp2 one MUFU), where each was priced one MUFU an element and the two alike (row 10824). Shapes
+    only."""
+    logs, exp2s = _logs_and_exp2s(stage, "sm90")
     assert exp2s.fused_seconds is not None, exp2s
     assert logs.fused_seconds > exp2s.fused_seconds, (logs, exp2s)
+
+
+def test_a_tpu_fused_launchs_special_functions_are_priced_as_its_kernel_counts_them():
+    """A product's prologue of eight chained float32 logs on a v5e (`_logs_and_exp2s`), whose Mosaic TPU
+    kernel lowers its special functions one way whatever `approx_math`: fused, the logs cost its launch as
+    many exp2s do, as its own estimate counts them (`emission.launch_work`), where an H100's forms priced its
+    logs (train 1165's F1). (The epilogue's product the v5e's launch refuses: its MXUs' sums within a step
+    no measurement states IEEE.) Shapes only."""
+    logs, exp2s = _logs_and_exp2s("prologue", "v5e")
+    assert exp2s.fused_seconds is not None, exp2s
+    assert logs.fused_seconds == exp2s.fused_seconds, (logs, exp2s)
 
 
 @pytest.mark.parametrize("operation", [jax.lax.erf, jnp.expm1, jnp.isfinite], ids=lambda f: f.__name__)

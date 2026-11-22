@@ -63,6 +63,8 @@ from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import SCALE_DEPTH, Product, eight
 
 if TYPE_CHECKING:
+    import tokamax
+
     from .templates import mosaic, resources
     from .templates.gemm import mosaic_gpu, pricing
 
@@ -2372,14 +2374,10 @@ def resident(hooked: Sequence[tuple[base.Call, str]],
     or no product unhooked, is not judged. On an A100 an epilogue reading four float32 arrays of the
     product's shape derived 64 x 64 at one program a multiprocessor, where the product alone takes two
     (FS-HOOKED-RES)."""
-    if not hooked:
+    launched = _mosaic_launch(hooked)
+    if launched is None:
         return True
-    call, kernel = hooked[-1]
-    if kernel not in call.bound:
-        return True
-    template, ba = call.bound[kernel]
-    if not isinstance(template, _Mosaic):
-        return True
+    kernel, template, ba = launched
     target = generation.gpu_target()
     config = template.derived(ba, target)
     if config is None:
@@ -2393,18 +2391,38 @@ def resident(hooked: Sequence[tuple[base.Call, str]],
 
 
 def special_forms(hooked: Sequence[tuple[base.Call, str]]) -> Mapping | None:
-    """The special functions' forms the last launch `weighed` collected compiles its hooks' in: a Mosaic
-    launch's (`mosaic_gpu.APPROX_MATH`, `emission.special_forms`); None for any other launch, or none (one
-    MUFU an element, `emission.operation_work`)."""
+    """The special functions' forms the last launch `weighed` collected compiles its hooks' in, where it is a
+    Mosaic template's at a tile it derives: those of the compiler parameters its family compiles with
+    (`mosaic.Transport.compiled_with` at `mosaic_gpu.APPROX_MATH`), read as a kernel equation's are
+    (`emission.forms_of`); None for any other launch, or none (one MUFU an element,
+    `emission.operation_work`)."""
     from .templates import emission
-    from .templates.gemm import mosaic_gpu
+    from .templates.gemm import mosaic_gpu, pricing
 
+    launched = _mosaic_launch(hooked)
+    if launched is None:
+        return None
+    _, template, ba = launched
+    config = template.derived(ba, generation.gpu_target())
+    if config is None:
+        return None
+    family = pricing.family_of(config, ba.arguments['tokens'].dtype)
+    return emission.forms_of(family.compiled_with(approx_math=mosaic_gpu.APPROX_MATH))
+
+
+def _mosaic_launch(hooked: Sequence[tuple[base.Call, str]]
+                   ) -> tuple[str, _Mosaic, tokamax.BoundArguments] | None:
+    """The last launch `weighed` collected where it is a Mosaic template's (`_Mosaic`): its kernel's name, its
+    template and its call's bindings; None for any other launch, or none."""
     if not hooked:
         return None
     call, kernel = hooked[-1]
-    if kernel not in call.bound or not isinstance(call.bound[kernel][0], _Mosaic):
+    if kernel not in call.bound:
         return None
-    return emission.special_forms(mosaic_gpu.APPROX_MATH)
+    template, ba = call.bound[kernel]
+    if not isinstance(template, _Mosaic):
+        return None
+    return kernel, template, ba
 
 
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
