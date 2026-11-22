@@ -1482,8 +1482,8 @@ class LaterCounts:
     7959, 8067)."""
 
     @staticmethod
-    def begun(trainer: Trainer, cap: Planned, shapes: TrainState, batch: Batch
-              ) -> Callable[[DrawingStep, int], None] | None:
+    def begun[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], cap: Planned, shapes: TrainState,
+                               batch: Batch) -> Callable[[DrawingStep, int], None] | None:
         """What begins compiling `trainer`'s counts off its loop at its first draw (`DrawingStep.begin`),
         none where it runs on several processes or where its later phases are planned on the loop
         (`LaterPlans.started`'s exceptions)."""
