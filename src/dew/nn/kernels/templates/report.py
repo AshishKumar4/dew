@@ -658,15 +658,15 @@ def certifying(device) -> Iterator[None]:
 
 @dataclasses.dataclass(frozen=True)
 class _AsideLaunch:
-    """A launch certified aside (`certifying_aside`): what `certified` read of it, and, once the block's
-    trace reached its call (`capture`), its replay's kernels to come (`replay.replayed`: its kernels, their
-    verdict's key, and whether that verdict was read back)."""
+    """A launch certified aside (`certifying_aside`): what `certified` read of it, the reporting scope it was
+    queued in (`_reporting`), and its replay's kernels to come once its call was reached (`capture`)."""
     op: "KernelOp"
     arguments: tokamax.BoundArguments
     config: Hashable
     reverse: bool
     device: Hashable
     stored: str | None
+    reporting: tuple
     kernels: Future | None = None
 
 
@@ -735,15 +735,13 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
                                        read=read).refused
         if spilling:
             refused.add(key)
-            refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
-                          {binary.kernel: binary.spilled_in for binary in spilling})
-            # Its misses held by the settle that refused it (`settling`), recorded as discovered so a later
-            # replay's failure loses none: stepped where a retry certifies the launch at another config
-            # (`certified`), not where the settle ends without one; whether its derivation steps is the
-            # retry's, under its own context (row 11786: a probe of it here ran outside the call's
-            # `shard_map`).
+            # Refused in the scope its call was queued in, whatever scope drains it.
+            with _reported_in(each.reporting):
+                refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
+                              {binary.kernel: binary.spilled_in for binary in spilling})
+            # Held by the settle (`settling`) until a retry, under its own context, steps past it (row 11786).
             settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
-                                        tuple(spilling)))
+                                        tuple(spilling), each.reporting))
     return frozenset(refused)
 
 
@@ -798,30 +796,51 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
 
 @dataclasses.dataclass
 class _Settlement:
-    """A settle's refused launches' misses (`settled_aside`) by certification key, held until the launch on
-    the same device and mode holds at another config (`certified`: stepped) or the settle ends (not stepped);
-    its own, in the refusal scope and recordings it was opened in (`scope`, row 11786)."""
+    """A settle's misses (`settled_aside`) by certification key and queueing scope, held until the launch
+    holds at another config in that scope's registry (stepped) or the settle ends, recorded in their own
+    scope either way (row 11786)."""
 
     scope: tuple
-    deferred: list[tuple[tuple, Launch, tuple["Binary", ...]]] = dataclasses.field(default_factory=list)
+    deferred: list[tuple[tuple, Launch, tuple["Binary", ...], tuple]] = dataclasses.field(
+        default_factory=list)
 
     def certified(self, key: tuple) -> None:
-        """Its misses of `key`'s launch, device and mode at configs other than `key`'s recorded stepped: a
-        certification that holds past them."""
+        """Its misses of `key`'s launch, device and mode at other configs, in this registry, stepped."""
         identity, config, *placement = key
+        registry = _SCOPE.get()
         with _GUARD:
             past = [entry for entry in self.deferred
-                    if entry[0][0] == identity and list(entry[0][2:]) == placement and entry[0][1] != config]
+                    if entry[0][0] == identity and list(entry[0][2:]) == placement and entry[0][1] != config
+                    and entry[3][0] is registry]
             self.deferred = [entry for entry in self.deferred if entry not in past]
-        for _, launch, binaries in past:
-            _recorded([(None, binary, launch) for binary in binaries], stepped=True)
+        for _, launch, binaries, reporting in past:
+            with _reported_in(reporting):
+                _recorded([(None, binary, launch) for binary in binaries], stepped=True)
 
     def ended(self) -> None:
         """Its misses no certification stepped past recorded, not stepped."""
         with _GUARD:
             deferred, self.deferred = self.deferred, []
-        for _, launch, binaries in deferred:
-            _recorded([(None, binary, launch) for binary in binaries], stepped=False)
+        for _, launch, binaries, reporting in deferred:
+            with _reported_in(reporting):
+                _recorded([(None, binary, launch) for binary in binaries], stepped=False)
+
+
+def _reporting() -> tuple:
+    """This context's `refusals` registry (None: the process's) and open `recording`s."""
+    return _SCOPE.get(), _RECORDING.get()
+
+
+@contextlib.contextmanager
+def _reported_in(reporting: tuple) -> Iterator[None]:
+    """Within the block, refusals and misses recorded in `reporting` (`_reporting`'s)."""
+    registry, recordings = reporting
+    scope, recorded = _SCOPE.set(registry), _RECORDING.set(recordings)
+    try:
+        yield
+    finally:
+        _RECORDING.reset(recorded)
+        _SCOPE.reset(scope)
 
 
 _SETTLING: contextvars.ContextVar[_Settlement | None] = _cache.untraced(
@@ -830,8 +849,8 @@ _SETTLING: contextvars.ContextVar[_Settlement | None] = _cache.untraced(
 
 @contextlib.contextmanager
 def settling() -> Iterator[None]:
-    """A settle of blocks certifying aside and its retries, its misses recorded as it ends, even where it
-    raises (`_Settlement`); within another of the same refusal scope and recordings, the enclosing one's."""
+    """A settle of blocks certifying aside and its retries (`_Settlement`), its misses recorded as it ends,
+    even where it raises; within another of the same scope, the enclosing one's."""
     scope = (id(_registry()), *map(id, _RECORDING.get()))
     enclosing = _SETTLING.get()
     if enclosing is not None and enclosing.scope == scope:
@@ -908,7 +927,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
         # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
-        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored)
+        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, _reporting())
         aside.awaiting[(_launched(key[0], config, reverse), reverse)] = key
         return ()
     # Its verdict where its kernels' was stored however their Dew tree named it (`_lowered_verdict_key`),
