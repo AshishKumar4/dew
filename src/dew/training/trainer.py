@@ -1753,6 +1753,7 @@ class Trainer(Generic[Loss, Effects]):
             batch = handed(placed, self._shape.examples)
             if run.searched != planned_over(batch, self._shape):
                 self._planned_unplaced(run, fresh, batch)
+                self._compiler.refuse_unplaced(fresh.freed(self.device_mesh))
         return begun
 
     def _whole_validated(self, state: TrainState, batch: Batch, split: int) -> Validation:

@@ -705,6 +705,8 @@ class StepCompiler[L, E]:
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
+        # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
+        self._refused: PlanRefused | None = None
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
         self._counted: Interval | None = None
         # What a host step's startup compiled over its state's shapes (`_compile_host`), None before one.
@@ -996,10 +998,28 @@ class StepCompiler[L, E]:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
         except PlanRefused as refused:
             _log.info(UNPLACED_REFUSED, refused)
-            self._unplaced = None
+            self._unplaced, self._refused = None, refused
             return signature
         self._unplaced = Unplaced(signature, planned, compiled, keep)
         return signature
+
+    def refuse_unplaced(self, freed: int) -> None:
+        """Refuse a fresh run whose first step fit no plan before its state was placed (`planned_unplaced`)
+        where placing the state frees too little to cover the search's closest miss: the placed devices hold
+        no more room than it read beside the state's bytes but what the held arrays the start copies let go
+        (`freed`, `Start.freed`), so a search on them misses as this one did (row 11712: a 4B step on two
+        H100s, short by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state
+        was placed, 1.5 h). Every process refuses or none does, each reading its own devices' misses; a run
+        not refused searches again on the placed devices (`compile`)."""
+        refused, self._refused = self._refused, None
+        shorts = [] if refused is None else [-probe.headroom for probe in refused.probes
+                                             if not probe.fits and isinstance(probe.headroom, int)]
+        if all(from_every_process(bool(shorts) and min(shorts) > freed)):
+            assert refused is not None
+            _log.warning("the step fits no plan before its state is placed, short by %d bytes at the least, "
+                         "which placing it frees no more than %d of: refused without searching again",
+                         min(shorts), freed)
+            raise refused
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:

@@ -399,6 +399,9 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     trainer._compiler = devices_compiler
     devices_rung.put(active)
     trainer._laid_out(given)
+    if start is not None:
+        # Its search refused where placing the state cannot cover its misses, before it is placed.
+        devices_compiler.refuse_unplaced(start.freed(trainer.device_mesh))
     # The given layout's start, which its first compile takes the plan above over; or, its devices holding
     # none, its refusal, as a run that streams nothing refuses.
     return start if start is not None else trainer._started(resume, known)
