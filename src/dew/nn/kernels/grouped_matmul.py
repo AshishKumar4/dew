@@ -33,7 +33,7 @@ import importlib
 import importlib.util
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -63,6 +63,8 @@ from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import SCALE_DEPTH, Product, eight
 
 if TYPE_CHECKING:
+    import tokamax
+
     from .templates import mosaic, resources
     from .templates.gemm import mosaic_gpu, pricing
 
@@ -2408,15 +2410,18 @@ def special_forms(hooked: Sequence[tuple[base.Call, str]]) -> Mapping | None:
     return emission.forms_of(family.compiled_with(approx_math=mosaic_gpu.APPROX_MATH))
 
 
-def _mosaic_launch(hooked: Sequence[tuple[base.Call, str]]) -> tuple[str, _Mosaic, Any] | None:
+def _mosaic_launch(hooked: Sequence[tuple[base.Call, str]]
+                   ) -> tuple[str, _Mosaic, tokamax.BoundArguments] | None:
     """The last launch `weighed` collected where it is a Mosaic template's (`_Mosaic`): its kernel's name, its
     template and its call's bindings; None for any other launch, or none."""
     if not hooked:
         return None
     call, kernel = hooked[-1]
-    if kernel not in call.bound or not isinstance(call.bound[kernel][0], _Mosaic):
+    if kernel not in call.bound:
         return None
     template, ba = call.bound[kernel]
+    if not isinstance(template, _Mosaic):
+        return None
     return kernel, template, ba
 
 

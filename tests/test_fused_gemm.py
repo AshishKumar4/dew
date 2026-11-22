@@ -266,12 +266,13 @@ def test_a_fused_launchs_special_functions_are_priced_in_the_forms_it_compiles(s
     assert logs.fused_seconds > exp2s.fused_seconds, (logs, exp2s)
 
 
-@pytest.mark.parametrize("stage", ["epilogue", "prologue"])
-def test_a_tpu_fused_launchs_special_functions_are_priced_as_its_kernel_counts_them(stage):
-    """The same on a v5e (`_logs_and_exp2s`), whose Mosaic TPU kernel lowers its special functions one way
-    whatever `approx_math`: fused, the logs cost its launch as many exp2s do, as its own estimate counts them
-    (`emission.launch_work`), where an H100's forms priced its logs (train 1165's F1). Shapes only."""
-    logs, exp2s = _logs_and_exp2s(stage, "v5e")
+def test_a_tpu_fused_launchs_special_functions_are_priced_as_its_kernel_counts_them():
+    """A product's prologue of eight chained float32 logs on a v5e (`_logs_and_exp2s`), whose Mosaic TPU
+    kernel lowers its special functions one way whatever `approx_math`: fused, the logs cost its launch as
+    many exp2s do, as its own estimate counts them (`emission.launch_work`), where an H100's forms priced its
+    logs (train 1165's F1). (The epilogue's product the v5e's launch refuses: its MXUs' sums within a step
+    no measurement states IEEE.) Shapes only."""
+    logs, exp2s = _logs_and_exp2s("prologue", "v5e")
     assert exp2s.fused_seconds is not None, exp2s
     assert logs.fused_seconds == exp2s.fused_seconds, (logs, exp2s)
 

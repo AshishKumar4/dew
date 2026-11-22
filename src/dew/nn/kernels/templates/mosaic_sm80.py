@@ -593,7 +593,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
 
-    def compiled_with(self, *, approx_math: bool):
+    def compiled_with(self, *, approx_math: bool) -> plgpu.CompilerParams:
         # Its kernels' lane-level lowering (`kernel`'s), Mosaic GPU's default.
         return plgpu.CompilerParams(approx_math=approx_math)
     prefetches_fragments = True  # `emit_pipeline`'s `prefetch`: a step's first fragments under the last's

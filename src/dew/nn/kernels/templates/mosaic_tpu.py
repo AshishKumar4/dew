@@ -233,7 +233,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         deepest = budget // (STAGES * 2 * self.role_rows * jnp.dtype(dtype).itemsize)
         return tuple(128 << shift for shift in range(max(0, (deepest // 128).bit_length() - 1), -1, -1))
 
-    def compiled_with(self, *, approx_math: bool):
+    def compiled_with(self, *, approx_math: bool) -> pltpu.CompilerParams:
         # Mosaic TPU's, which lower its special functions one way whatever `approx_math` (`kernel` drops it).
         del approx_math
         return pltpu.CompilerParams()
