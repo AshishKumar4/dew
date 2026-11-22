@@ -136,9 +136,10 @@ def _spanned(width: int, implementation: str):
     the output, and the gradients of `sum(out * dout)` of the query, key and value, and the keys each query
     keeps."""
     segments = _segments()
-    spans = _spans()
 
     def step(query, key, value, dout):
+        spans = _spans()
+
         def attended(query, key, value):
             if implementation == "reference":
                 return jnp.asarray(template.reference(query, key, value, spans))
@@ -158,11 +159,11 @@ def a_span_calls_one_launch_is_on_par_on_an_h100(name: str) -> None:
     wrong and unrepeatable there before row 3180's fix, on par with it (ET-SPAN-h100)."""
     width = SPANNED[name]
     step, keep = _spanned(width, "template")
-    config = one_launch(width, operands(width, HEADS, 2, jnp.bfloat16)(0)[:4])
 
-    def ours(*operands):
+    def ours(*step_operands):
+        config = one_launch(width, step_operands[:4])
         with tuning.pinned({attention_mosaic.MosaicBackward: config}):
-            return step(*operands)
+            return step(*step_operands)
 
     assert_as_exact(jax.jit(ours), jax.jit(_spanned(width, "reference")[0]),
                     operands(width, HEADS, 2, jnp.bfloat16),

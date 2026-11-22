@@ -810,9 +810,12 @@ def _terms(case: dict):
     """The float64 terms of `case`'s output and gradients, its sinks' among them (`attention_terms`), over
     the keys it keeps (its spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw
     `(query, key, value, sinks, dout)`."""
-    keep = case_keep(case)[:, None]
+    keep: np.ndarray | None = None
 
     def terms(query, key, value, sinks, dout):
+        nonlocal keep
+        if keep is None:
+            keep = case_keep(case)[:, None]
         found = attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap"))
         # The sinks' gradient, which a call without sinks holds as None.
         return (*found, None) if sinks is None else tuple(found)
