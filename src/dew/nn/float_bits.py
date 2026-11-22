@@ -125,7 +125,8 @@ def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
 
 
 def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array, *,
-                    infinite: jax.Array | bool = False, nan: jax.Array | bool = False) -> jax.Array:
+                    last: jax.Array | None = None, infinite: jax.Array | bool = False,
+                    nan: jax.Array | bool = False) -> jax.Array:
     """The float32 nearest `significand * 2^exponent` (`significand` uint32, any width under 2^32; `exponent`
     int32), signed by `sign` (uint32, the sign bit in place), rounded once to nearest even at the result's
     last place: 24 bits below its leading one, or the least subnormal's however far below the least normal,
@@ -133,9 +134,14 @@ def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array
     bits, so a process whose float32 arithmetic flushes a subnormal (XLA's CPU, row 4023) still returns it.
     A value its caller's operands' bits make non-finite is its: an infinity of `sign` where `infinite`, a
     NaN where `nan` (row 11795: classified on the bits, where a float32 multiply flushed a subnormal operand
-    first). The one rounding of an exact value into float32 (`lowered_rounded`'s,
-    `dew.quantization.packed_values`'s, row 11807)."""
-    last = jnp.maximum(exponent + _bit_length(significand) - 24, -149)
+    first). The result's last place, where a caller knows it (`last`: a normal significand of 24 bits'
+    exponent, or below the least normal the least subnormal's), is its; else the leading one's position
+    found (`_bit_length`). An exponent past float32's every place, either way, holds as one at its edge
+    (`EXPONENT_REACH`: no int32 sum of it wraps). The one rounding of an exact value into float32
+    (`lowered_rounded`'s, `dew.quantization.packed_values`'s, row 11807)."""
+    exponent = jnp.clip(exponent, -EXPONENT_REACH, EXPONENT_REACH)
+    last = (jnp.maximum(exponent + _bit_length(significand) - 24, -149) if last is None
+            else jnp.clip(last, -149, EXPONENT_REACH))
     drop = last - exponent
     shift = jnp.clip(drop, 1, 31).astype(jnp.uint32)
     kept = jnp.where(drop <= 0, significand << jnp.clip(-drop, 0, 31).astype(jnp.uint32),
@@ -156,6 +162,12 @@ def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array
     bits = sign | jnp.where(significand == 0, np.uint32(0), magnitude)
     bits = jnp.where(nan, np.uint32(0x7FC00000), jnp.where(infinite, sign | np.uint32(0x7F800000), bits))
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+
+EXPONENT_REACH = 1 << 16
+"""An exponent's reach in `rounded_float32`: past float32's every place by far either way (a significand under
+2^32 times 2^±65536 a zero or an infinity), and far from int32's edge, so its sums never wrap (row 11807's
+review: `last + 150` wrapped at 2^31 - 1, a minimal normal in place of an infinity)."""
 
 
 def _bit_length(x: jax.Array) -> jax.Array:
@@ -179,7 +191,11 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     # A subnormal `x` holds its significand at the least normal's exponent, its leading bit none.
     significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
     top = biased == 0xFF
-    return rounded_float32(sign, significand, jnp.maximum(biased, 1) - 150 - k,
+    # Lowered by at most every place there is: no difference of exponents wraps (row 11807's review).
+    exponent = jnp.maximum(biased, 1) - 150 - jnp.clip(k, 0, EXPONENT_REACH)
+    # A normal's 24 bits keep their last place; a subnormal's fewer, or any lowered below the least normal,
+    # round at the least subnormal's: no leading one to search for.
+    return rounded_float32(sign, significand, exponent, last=jnp.maximum(exponent, -149),
                            infinite=top & (fraction == 0), nan=top & (fraction != 0))
 
 

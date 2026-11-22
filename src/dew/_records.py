@@ -304,8 +304,11 @@ framing it fills where a record states none, `SegmentLayout.joint_row`)."""
 def class_record(value: Mapping[typing.Any, object]) -> tuple[str, Mapping[str, object]] | None:
     """The class a class record, `{"class": ..., "fields": {...}}`, names and its fields (a record with no
     fields may leave them out); None for a mapping that is not one: data that names a class is no record."""
-    name, fields = value.get("class"), value.get("fields", {})
-    if set(value) <= {"class", "fields"} and isinstance(name, str) and isinstance(fields, Mapping):
+    name = value.get("class")
+    if not isinstance(name, str):
+        return None
+    fields = value.get("fields", {})
+    if isinstance(fields, Mapping) and all(key in ("class", "fields") for key in value):
         return name, fields
     return None
 
@@ -319,19 +322,26 @@ def class_records(value: JSON, rewrite: Callable[[str, Mapping[str, JSON], bool]
     (row 11838): `earlier_layout`'s, `dew.config.earlier.earlier_retired`'s."""
     def walked(held: JSON, *, root: bool = False) -> JSON:
         if isinstance(held, list):
-            elements = [walked(element) for element in held]
-            return held if all(new is old for new, old in zip(elements, held, strict=True)) else elements
+            # Copied only from its first element that changed (row 11838's review: no list a node).
+            elements = None
+            for index, element in enumerate(held):
+                new = walked(element)
+                if elements is None and new is not element:
+                    elements = held[:index]
+                if elements is not None:
+                    elements.append(new)
+            return held if elements is None else elements
         if not isinstance(held, Mapping):
             return held
-        entries = {key: walked(entry) for key, entry in held.items()}
-        changed = any(entries[key] is not entry for key, entry in held.items())
+        changed = {key: new for key, entry in held.items() if (new := walked(entry)) is not entry}
+        entries = {**held, **changed} if changed else held
         named = class_record(entries)
         # A JSON record's fields are JSON: `entries`' own, read as the record names them.
         fields = entries.get("fields", {})
         if named is not None and isinstance(fields, dict) and (
                 rewritten := rewrite(named[0], fields, root)) is not None:
             return rewritten
-        return entries if changed else held
+        return entries
     return walked(value, root=True)
 
 

@@ -23,6 +23,7 @@ import functools
 import importlib.util
 import inspect
 import sys
+import types
 from collections.abc import Callable, Iterable
 
 import jax
@@ -87,34 +88,53 @@ def providing() -> bool:
 
 
 def intercepting(module: nn.Module | None = None) -> bool:
-    """Whether a Flax method interceptor may intercept `module`'s own call (`nn.intercept_methods`, Flax's
-    own stack), which a rule standing in for the call would bypass (a joined projection's, base review
-    760be77fe F1: an interceptor zeroing `v_proj`'s output, the joined layer returned it; a recomputed
-    merge's): one not Dew's watches' (node perturbation's, a caller's own), or a watch naming `module`
-    (`inspection.watched`; row 11820: a watch of the MLPs leaves a merge to its own rules). Without a
+    """Whether a Flax method interceptor installed (`nn.intercept_methods`, Flax's own stack) may intercept
+    `module`'s own call, which a rule standing in for the call would bypass (a joined projection's, base
+    review 760be77fe F1: an interceptor zeroing `v_proj`'s output, the joined layer returned it; a recomputed
+    merge's): one not a watch of Dew's (node perturbation's, a caller's own), or a watch naming `module`
+    (`inspection.watched_by`; row 11820: a watch of the MLPs leaves a merge to its own rules). Without a
     module, any interceptor installed."""
     from flax.linen import module as flax_module
 
     from dew.nn import inspection
 
-    installed = len(flax_module._global_interceptor_stack)
-    if module is None or installed > inspection.watches():
+    installed = list(flax_module._global_interceptor_stack)
+    if module is None:
         return bool(installed)
-    return inspection.watched(module)
+    return any(inspection.watched_by(interceptor, module) for interceptor in installed)
+
+
+PRE_CALL_CAPTURES: set[Callable] = set()
+"""The `capture_intermediates` filters that decide from a module's name and method alone, before its call
+runs (`pre_call_capture`): `observed` asks them; any other filter may read what the call sets up (its
+parameters), which Flax asks after it, so a module under one is observed (row 11820's review)."""
+
+
+def pre_call_capture(keep: Callable) -> Callable:
+    """`keep`, a `capture_intermediates` filter that reads a module's name and method alone, registered
+    as one `observed` may ask before the call (`PRE_CALL_CAPTURES`)."""
+    PRE_CALL_CAPTURES.add(keep)
+    return keep
 
 
 def observed(module: nn.Module) -> bool:
     """Whether a caller keeps `module`'s own calls' outputs as Flax captures a module's (its
     `intermediates` collection open and the capture's filter, `capture_intermediates`', taking its call;
-    row 11820: a capture of the layers' states leaves a merge to its own rules); a caller intercepting
-    them is `intercepting`'s (a watch's, node perturbation's)."""
+    row 11820: a capture of the layers' states leaves a merge to its own rules), a filter that may read what
+    the call sets up taking it (`PRE_CALL_CAPTURES`); a caller intercepting them is `intercepting`'s (a
+    watch's, node perturbation's)."""
     from flax.linen import module as flax_module
 
     if not module.is_mutable_collection('intermediates'):
         return False
     captures = flax_module._context.capture_stack
     keep = captures[-1] if captures else None
-    return bool(keep) and keep(module, "__call__")
+    if not keep:
+        return False
+    method = keep.__func__ if isinstance(keep, types.MethodType) else keep
+    if method is flax_module.capture_call_intermediates or method in PRE_CALL_CAPTURES:
+        return bool(keep(module, "__call__"))
+    return True
 
 
 def intercepted() -> bool:

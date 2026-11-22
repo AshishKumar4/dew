@@ -13,7 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import fnmatch
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import flax.linen as nn
 import jax
@@ -339,18 +339,17 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         leaves[index] = tapped(first, module.get_variable(PROBES, PROBE), where, scale, histogram)
         return jax.tree.unflatten(tree, leaves)
 
-    token = _WATCHED.set((*_WATCHED.get(), modules))
+    _WATCHES[interceptor] = modules
     try:
         with nn.intercept_methods(interceptor):
             yield
     finally:
-        _WATCHED.reset(token)
+        del _WATCHES[interceptor]
 
 
-_WATCHED: contextvars.ContextVar[tuple[tuple[str, ...], ...]] = contextvars.ContextVar("watched_modules",
-                                                                                       default=())
-"""Each open `watching` block's globs, innermost last: the method interceptors Dew's watches install."""
-
+_WATCHES: dict[Callable, tuple[str, ...]] = {}
+"""Each method interceptor an open `watching` block installed on Flax's stack, by the globs it watches: the
+stack's own entry, so a watch is read where Flax holds it, whatever thread or context runs the module."""
 
 def _named(module: nn.Module, modules: tuple[str, ...]) -> tuple[bool, bool]:
     """Whether a glob of `modules` names `module`, by its class name or its path (`layers_3/attn`, and a
@@ -368,15 +367,12 @@ def _named(module: nn.Module, modules: tuple[str, ...]) -> tuple[bool, bool]:
     return named, candidate
 
 
-def watches() -> int:
-    """How many of the method interceptors installed are Dew's watches (`watching`)."""
-    return len(_WATCHED.get())
-
-
-def watched(module: nn.Module) -> bool:
-    """Whether an open watch (`watching`) intercepts `module`'s own calls: a glob of one names it or a layer
-    of the run it is (row 11820: a watch of the MLPs leaves a cross-pass merge to its own rules)."""
-    return any(any(_named(module, modules)) for modules in _WATCHED.get())
+def watched_by(interceptor: Callable, module: nn.Module) -> bool:
+    """Whether a method interceptor on Flax's stack may intercept `module`'s own calls: any not a watch of
+    Dew's (`watching`), and a watch where a glob of it names `module` or a layer of the run it is (row 11820:
+    a watch of the MLPs leaves a cross-pass merge to its own rules)."""
+    modules = _WATCHES.get(interceptor)
+    return modules is None or any(_named(module, modules))
 
 
 def kept(inspected: Mapping, modules: tuple[str, ...]) -> set[tuple[str, ...]]:
