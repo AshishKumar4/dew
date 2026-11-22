@@ -198,12 +198,12 @@ def test_a_recording_opened_after_a_miss_holds_it_when_met_again():
     """A miss a launch's certification records (`report.missed`) is the process's once, and a `recording`
     opened since (a later plan's admission, `planning.admitted`) holds it when its own trace meets it again,
     where the process's having it already kept it from the recording (train 935 F4)."""
-    from dew.nn.kernels.templates import report
+    from dew.nn.kernels.templates import assembled, report
 
     op = Doubling()
     with generation.assumed("sm86"):
         ba, config = bound(op), Block(64)
-    spilled = report.Binary("doubling", None, 255, 16, "mosaic_gpu")
+    spilled = assembled.Binary("doubling", None, 255, 16, "mosaic_gpu")
     with report.refusals():
         report.missed(op, ba, config, [spilled], stepped=True)
         with report.recording() as recorded:

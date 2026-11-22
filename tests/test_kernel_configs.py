@@ -34,7 +34,7 @@ from dew.nn.kernels import (
     recurrence,
     tuning,
 )
-from dew.nn.kernels.templates import bundles, report, resources, swizzling
+from dew.nn.kernels.templates import assembled, bundles, report, resources, swizzling
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 
@@ -1445,9 +1445,9 @@ def test_a_blackwells_nvfp4_product_runs_the_template_named_for_it():
 
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
-    A100: with every custom kernel its executable launches (`report.launched_kernels`), the gate reads their
-    shared bytes; without one of the two `probe` launches, or without `probe_headroom`'s, it has no evidence
-    (row 1381), where matching a launch by a name's prefix took one launch for both calls."""
+    A100: with every custom kernel its executable launches (`assembled.launched_kernels`), the gate reads
+    their shared bytes; without one of the two `probe` launches, or without `probe_headroom`'s, it has no
+    evidence (row 1381), where matching a launch by a name's prefix took one launch for both calls."""
     from jax.experimental import pallas as pl
     from kernel_compile import _compiled, triton_evidence
 
@@ -1557,8 +1557,8 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
     a, b, c = (inherited(dataclasses.asdict(found), compiled, "sm90") for found in reports(
         {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
-        [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024),
-         report.Binary("b", None, 255, 40, "mosaic_gpu", shared=1024)]))
+        [assembled.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024),
+         assembled.Binary("b", None, 255, 40, "mosaic_gpu", shared=1024)]))
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
     assert set(c["unread"]) == {"shared bytes", "tensor memory columns", "binary", "registers", "spills"}
@@ -1566,7 +1566,7 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert len(mosaic_failures([{**record, "kernels": [{**each, "cap": 255} for each in (a, b, c)]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):
-        reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=512)])
+        reports({"a": complete}, [assembled.Binary("a", None, 168, 0, "mosaic_gpu", shared=512)])
     # A complete estimate and its PTX's compile without a binary: no compiled kernel, read as missing.
     (unbound,) = (inherited(dataclasses.asdict(found), compiled, "sm90")
                   for found in reports({"a": complete}, []))
@@ -1585,7 +1585,7 @@ def test_a_kernel_no_ptx_covers_takes_its_binarys_figures_only_under_every_build
     from kernel_compile import inherited, reports
 
     complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
-    (found,) = reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024)])
+    (found,) = reports({"a": complete}, [assembled.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024)])
     judged = {}
     for builds, gpu in ((["cuda13"], "sm100"), (["cuda12"], "sm90"), (["cuda12"], "sm100")):
         monkeypatch.setattr(kernel_compile, "cuda_builds", lambda builds=builds: builds)
@@ -1607,7 +1607,7 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     assert report.kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
     with pytest.raises(report.KernelsOfOneName):
         report.kernel_modules(calls)
-    binaries = [report.Binary("k", "0123456789", registers, 0, "mosaic_gpu") for registers in (168, 200)]
+    binaries = [assembled.Binary("k", "0123456789", registers, 0, "mosaic_gpu") for registers in (168, 200)]
     assert len(reports({}, binaries[:1])) == 1
     with pytest.raises(ValueError):
         reports({}, binaries)

@@ -29,7 +29,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import Fetched, compiled_with, owned_program, program
-from dew.nn.kernels.templates import report, sass
+from dew.nn.kernels.templates import assembled, report, sass
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
@@ -605,16 +605,16 @@ def _thunk(calls: int, kernels: list[bytes]) -> bytes:
 
 
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
-    """Each Mosaic GPU call a thunk names has its binary (`report.thunk_kernels`): two calls and two kernel
+    """Each Mosaic GPU call a thunk names has its binary (`assembled.thunk_kernels`): two calls and two kernel
     protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a
     missing binary would read as a kernel that does not spill (row 2851)."""
 
-    both = report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm__l0123456789", 168, 0),
+    both = assembled.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm__l0123456789", 168, 0),
                                            _kernel_proto("dew_tgmm", 255, 344)]))
     read = [(kernel.kernel, kernel.launch, kernel.registers, kernel.frame, kernel.shared) for kernel in both]
     assert read == [("dew_gmm", "0123456789", 168, 0, 1024), ("dew_tgmm", None, 255, 344, 1024)]
     with pytest.raises(ValueError):
-        report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
+        assembled.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
 
 
 def test_a_kernel_is_refused_for_what_ptxas_spilled_not_for_its_stack_frame():
@@ -622,7 +622,7 @@ def test_a_kernel_is_refused_for_what_ptxas_spilled_not_for_its_stack_frame():
     range reduction keeps a 32-byte array, row 9649), as ptxas measured it (its record's `spilled_bytes`), is
     certified; one that spilled is refused; one a build measured nothing of is held to its frame, which
     holds every byte it spills."""
-    kernels = report.thunk_kernels(_thunk(3, [_kernel_proto("dew_gmm", 168, 32, spilled=0),
+    kernels = assembled.thunk_kernels(_thunk(3, [_kernel_proto("dew_gmm", 168, 32, spilled=0),
                                               _kernel_proto("dew_tgmm", 255, 96, spilled=64),
                                               _kernel_proto("dew_added", 168, 32)]))
     assert [(kernel.spills, kernel.refused) for kernel in kernels] == [(0, False), (64, True), (32, True)]
@@ -638,8 +638,8 @@ def test_a_kernels_assembler_notes_are_read_from_its_compiled_call():
     ignored = ("C7507", "'setmaxnreg' ignored to maintain minimum register requirements")
     kernels = [_kernel_proto("attention_dkv", 168, 0, (serialized, ignored)),
                _kernel_proto("attention_dq", 128, 0)]
-    noted, plain = report.thunk_kernels(_thunk(2, kernels))
-    assert noted.notes == (report.AssemblerNote(*serialized), report.AssemblerNote(*ignored))
+    noted, plain = assembled.thunk_kernels(_thunk(2, kernels))
+    assert noted.notes == (assembled.AssemblerNote(*serialized), assembled.AssemblerNote(*ignored))
     assert plain.notes == ()
 
 
@@ -975,7 +975,7 @@ def test_one_kernel_called_from_two_places_compiles_alone_once():
 @pytest.mark.parametrize("constant", [False, True], ids=["no-constant", "a-constant"])
 def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(constant):
     """A program of a Pallas-Triton launch feeding a Mosaic GPU kernel and an XLA fusion, compiled for an
-    H100, with or without a constant: `report.binaries` reads the launch once, its cubin from its custom
+    H100, with or without a constant: `assembled.binaries` reads the launch once, its cubin from its custom
     kernel's proto (a program holding a constant gives every thunk that constant's module alone as its
     binary, which states no registers: row 3858), and the Mosaic kernel once, from its kernel proto, each
     stating its registers; the fusion, whose thunk carries its cubin too, names no launch and is no
@@ -1004,7 +1004,7 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(consta
     spec = jax.ShapeDtypeStruct((128, 128), jnp.float32, sharding=NamedSharding(devices, PartitionSpec()))
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
         compiled = jax.jit(program).trace(spec, spec).lower().compile()
-    found = report.binaries(compiled)
+    found = assembled.binaries(compiled)
     assert len(found) == 2 and all(binary.registers > 0 and not binary.spills for binary in found)
     launched = [(binary.kernel, binary.launch) for binary in found if binary.launch]
     assert launched == [("dew_added", "0123456789")]
@@ -1236,7 +1236,7 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     import kernel_compile as kc
 
     assert sass.disassembler() is not None
-    unread = report.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, "mosaic_gpu", 1024, sass=None)
+    unread = assembled.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, "mosaic_gpu", 1024, sass=None)
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None
@@ -1307,14 +1307,15 @@ PRODUCER:
 def test_a_binary_states_its_threads_and_the_registers_its_roles_reconfigure_to(tmp_path):
     """A kernel of 384 threads whose producer lowers to 40 registers and whose consumers raise to 232
     (`setmaxnreg`), assembled for an H100 by the gate's ptxas (`kernel_compile.assemblers`): its binary
-    (`report._binary`, decoded) states its threads from its `.nv.info` and the two counts from its machine
-    code (USETMAXREG), the facts the compile gate reads where no PTX of a kernel was dumped (row 7105)."""
+    (`assembled.binary_of`, decoded) states its threads from its `.nv.info` and the two counts from its
+    machine code (USETMAXREG), the facts the compile gate reads where no PTX of a kernel was dumped (row
+    7105)."""
     from kernel_compile import assemblers
 
     source = tmp_path / "reconfiguring.ptx"
     source.write_text(RECONFIGURING_PTX)
     cubin = tmp_path / "reconfiguring.cubin"
     subprocess.run([str(assemblers("sm90")[0]), "-arch=sm_90a", str(source), "-o", str(cubin)], check=True)
-    binary = report._binary("reconfiguring", cubin.read_bytes(), decoded=True)
+    binary = assembled.binary_of("reconfiguring", cubin.read_bytes(), decoded=True)
     assert (binary.threads, binary.decreased, binary.raised) == (384, 40, 232), binary
 

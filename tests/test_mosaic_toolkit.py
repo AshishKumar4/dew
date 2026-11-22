@@ -20,6 +20,7 @@ from kernel_compile import gate_generations, stated_outputs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     across,
+    assembled,
     bundles,
     emission,
     handoffs,
@@ -550,7 +551,7 @@ def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
         stated = resources.register_model(WGMMA, 2, 168)
         with report.launching(op, bound, Tiles(16, 16, 2, 1, family="wgmma")):
             name = report.named("attention", model=stated)
-        kernel, launch, _ = report.kernel_of(name)
+        kernel, launch, _ = assembled.kernel_of(name)
         assert kernel == "attention" and report.traced(launch).kernels == {"attention": stated}
         assert report.named("attention", model=stated) == "attention"
 

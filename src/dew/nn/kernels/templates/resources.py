@@ -51,8 +51,8 @@ def producer_floor() -> int:
 
 @dataclasses.dataclass(frozen=True)
 class ByLaunch:
-    """A config's caps on some of its launches, by launch (a kernel's name, `report.Binary.kernel`), where a
-    compile found one spilling: every other launch's its derivation's own. A dimension of the config its
+    """A config's caps on some of its launches, by launch (a kernel's name, `assembled.Binary.kernel`), where
+    a compile found one spilling: every other launch's its derivation's own. A dimension of the config its
     launches derive, refused and stepped as a compile or its certification refuses a spilling config."""
 
     caps: tuple[tuple[str, int], ...] = ()

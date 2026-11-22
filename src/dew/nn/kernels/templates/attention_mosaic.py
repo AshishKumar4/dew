@@ -2154,7 +2154,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def ranks_alone(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         # A backward takes its ranking's first legal config, the assembler judging its registers and its
         # products' issue (a kernel that spills or whose warpgroup MMAs ptxas serializes refused,
-        # `report.Binary.refused`, and the next ranked in its place): the one its register model proposed
+        # `assembled.Binary.refused`, and the next ranked in its place): the one its register model proposed
         # ran slower on every launch measured (M-FS-15: a GH200's 0.692, an A100's six at 0.62 to 0.94).
         del ba, target
         return True

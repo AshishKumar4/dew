@@ -20,6 +20,7 @@ from reference_error import assert_as_exact
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
+    assembled,
     attention as template,
     attention_algebra as algebra,
     attention_decode,
@@ -699,8 +700,9 @@ def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100
     def decode(query, key_pool, value_pool, table):
         return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
 
-    # The Mosaic kernels the executable itself carries (`report.binaries`): a launch compiled, none spilling.
-    found = report.binaries(lowered_for(decode, (query, pool, pool, table), "sm90").compile())
+    # The Mosaic kernels the executable itself carries (`assembled.binaries`): a launch compiled, none
+    # spilling.
+    found = assembled.binaries(lowered_for(decode, (query, pool, pool, table), "sm90").compile())
     assert found and all(binary.spills == 0 for binary in found), found
 
 

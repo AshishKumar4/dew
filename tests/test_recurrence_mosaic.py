@@ -52,7 +52,7 @@ from test_recurrence_chunk import (
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.kernels.templates import bundles, mosaic, product, report, resources, sass
+from dew.nn.kernels.templates import assembled, bundles, mosaic, product, report, resources, sass
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
@@ -1615,8 +1615,8 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
 
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
-    long as a required launch spills or serializes its warpgroup MMAs (`report.refuses`, which a run's
-    certification reads too, `report.Binary.refused`) at a config not refused before, its launch refused
+    long as a required launch spills or serializes its warpgroup MMAs (`assembled.refuses`, which a run's
+    certification reads too, `assembled.Binary.refused`) at a config not refused before, its launch refused
     (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
     derives none and leaves the template. `refused` holds the calls the template refuses, at its first
@@ -1629,7 +1629,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     stepped: set = set()
     while True:
         spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
-                                if report.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
+                                if assembled.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
                                 and kernel["kernel"] not in
                                 refused_kernels(record, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
@@ -2166,7 +2166,7 @@ from kernel_compile import _device, lowered_for
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.lowered import kernel_calls
-from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates import assembled, report
 from dew.nn.kernels.templates.recurrence import template
 
 target = "sm90"
@@ -2189,7 +2189,7 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
 
         programs.append(lowered_for(program if pulled else traced, tuple(shapes), target))
     first, second = (set(report.kernel_modules(kernel_calls(program, unrun=True))) for program in programs)
-    binary = next(binary for binary in report.binaries(programs[1].compile())
+    binary = next(binary for binary in assembled.binaries(programs[1].compile())
                   if report.launch_name(binary.kernel, binary.launch) in first & second)
     # The second rung's program refuses a kernel whose name the first rung's shares.
     found = report._misses_of([dataclasses.replace(binary, spilled=8)])
