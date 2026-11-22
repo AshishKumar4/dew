@@ -19,8 +19,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_matrix import operands, terms_of
-from attention_oracle import kept
+from attention_matrix import operands
+from attention_oracle import kept, traced_attention_terms
 from reference_error import assert_as_exact
 from test_attention_mosaic import ON_HOPPER
 
@@ -56,17 +56,13 @@ def _route(causal: bool, implementation: AttentionImpl = "template"):
     return step
 
 
-def _terms(keep, heads: int = HEADS):
-    """The gradients' float64 terms (`terms_of`, without the output's) over the keys each query keeps: a
-    causal query that keeps few keys has a dQ that cancels toward zero in float64, held to its terms'
-    rounding, not to its own size."""
-    terms = terms_of(keep, heads)
-
-    def gradients(*drawn):
-        return terms(*drawn)[1:]
-
-    return gradients
-
+def _terms(keep, *, output: bool = False):
+    """The float64 terms (`traced_attention_terms`) over the keys each query keeps: traceable under
+    `jax.make_jaxpr` during GPU prepare, returning `(out, dq, dk, dv)` when `output` else `(dq, dk, dv)`."""
+    def terms(query, key, value, dout):
+        found = traced_attention_terms(query, key, value, dout, jnp.asarray(keep))
+        return tuple(found) if output else tuple(found[1:])
+    return terms
 
 @ON_HOPPER
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
@@ -136,9 +132,10 @@ def _spanned(width: int, implementation: str):
     the output, and the gradients of `sum(out * dout)` of the query, key and value, and the keys each query
     keeps."""
     segments = _segments()
-    spans = _spans()
 
     def step(query, key, value, dout):
+        spans = _spans()
+
         def attended(query, key, value):
             if implementation == "reference":
                 return jnp.asarray(template.reference(query, key, value, spans))
@@ -158,12 +155,12 @@ def a_span_calls_one_launch_is_on_par_on_an_h100(name: str) -> None:
     wrong and unrepeatable there before row 3180's fix, on par with it (ET-SPAN-h100)."""
     width = SPANNED[name]
     step, keep = _spanned(width, "template")
-    config = one_launch(width, operands(width, HEADS, 2, jnp.bfloat16)(0)[:4])
 
-    def ours(*operands):
+    def ours(*step_operands):
+        config = one_launch(width, step_operands[:4])
         with tuning.pinned({attention_mosaic.MosaicBackward: config}):
-            return step(*operands)
+            return step(*step_operands)
 
     assert_as_exact(jax.jit(ours), jax.jit(_spanned(width, "reference")[0]),
                     operands(width, HEADS, 2, jnp.bfloat16),
-                    f"span call one launch {name}", seeds=SEEDS, terms=terms_of(keep, HEADS))
+                    f"span call one launch {name}", seeds=SEEDS, terms=_terms(keep, output=True))

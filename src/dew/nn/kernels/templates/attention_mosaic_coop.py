@@ -16,7 +16,6 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels import launches, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stacked, stores, swizzling
 from dew.nn.kernels.templates.attention_mosaic_fused import (
-    _STREAM_ORDER,
     _statistics,
     dq_and_dkv,
     staged_parts,
@@ -34,6 +33,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     modelled,
     reducing,
     stated,
+    streamed_statistics_order,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -68,7 +68,8 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
         streamed = streamed_statistics(family, config, width, dtype, stages, reduced=reduced,
                                        allocations_of=_coop_allocations, anchored=False)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
-              **{name: ((block_q,), STATISTICS[name]) for name in _STREAM_ORDER[:min(streamed, 4)]}}
+              **{name: ((block_q,), STATISTICS[name])
+                 for name in streamed_statistics_order(streamed, anchored=False)}}
     return scoped, family.streams(blocks, stages, consumers)
 
 

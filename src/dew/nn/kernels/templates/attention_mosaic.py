@@ -114,7 +114,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     score_places,
     split_queries,
     stagings,
-    step_live_tiles,
     streams_operands,
     value_columns,
     varying_slopes,
@@ -123,6 +122,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     walked_unit,
     whole_tiles,
 )
+from dew.nn.kernels.templates.attention_mosaic_scores import step_live_tiles
 from dew.nn.kernels.templates.base import Template
 
 
@@ -1156,12 +1156,12 @@ class MosaicForward(_Mainloop[Tiles]):
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
-        tpu_values = ({"keys": ((config.block_k, width), query.dtype),
-                       "values": ((config.block_k, value_width), query.dtype)},
-                      (((config.block_q, value_width), jnp.float32),
-                       *step_live_tiles(config.block_q, config.block_k,
-                                        natural_form=config.natural_form,
-                                        scaled=self.scales_in_kernel(ba))))
+        tpu_values = (None if family.budgets_registers else (
+            {"keys": ((config.block_k, width), query.dtype),
+             "values": ((config.block_k, value_width), query.dtype)},
+            (((config.block_q, value_width), jnp.float32),
+             *step_live_tiles(config.block_q, config.block_k, natural_form=config.natural_form,
+                              scaled=self.scales_in_kernel(ba)))))
         return launch_scope(family, allocations, reduced, reduces=forward_reduces(family, reduced),
                             products=products, over_rings=True, values=tpu_values)
 
@@ -1279,6 +1279,9 @@ class MosaicForward(_Mainloop[Tiles]):
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
+        spec, taken = folded_form(self.form, self.keys, ids=False, dtype=query.dtype, width=query.shape[-1],
+                                  scale=self.scale, natural=self._natural(query), score_mod=self.score_mod,
+                                  subtracted=self.subtracted)
         return ForwardRegisters(query.dtype, query.shape[-1], value.shape[-1], residuals is Kept.SPLIT,
                                 self._natural(query), params, self.parts,
                                 self._scales(table, sources, scales, computed), codes=scales is not None,
@@ -1290,7 +1293,8 @@ class MosaicForward(_Mainloop[Tiles]):
                                 weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
                                 scaled_products=scaled_drop(computed, drop, initial),
                                 prologue=(None if self.query_mod is None
-                                          else (self.query_mod, self.query_kinds, self.query_dtypes)))
+                                          else (self.query_mod, self.query_kinds, self.query_dtypes)),
+                                prescaled=spec.prescale != 1.0, rewalk_prescaled=taken != 1.0)
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
@@ -1927,11 +1931,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         (rows 4839, 5272, 10948, 10962)."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        if not family.budgets_registers:
+        if not family.budgets_registers or not config.fused:
             return config
         q_block = config.dkv_blocks[0] if config.dkv_blocks is not None else config.block_q
-        q_steps = -(-query.shape[1] // q_block)
-        steps = q_steps if config.fused else min(q_steps, -(-ba.arguments["key"].shape[1] // config.block_k))
+        steps = -(-query.shape[1] // q_block)
         cap = 3 if config.dkv_blocks is not None else max(config.consumers, 2) + 1
         want = min(cap, steps)
         if want <= config.stages:
@@ -2107,13 +2110,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         scaled = config.fused and staged_parts(dtype) > 1
         return [(layout, tiles.consumers, launch_scope(
             layout, allocations, reducing(layout, tiles.consumers, self.score_reduces, scaled=scaled),
-            reduces=reduces, values=(
+            reduces=reduces, values=(None if layout.budgets_registers else (
                 {"queries": ((tiles.block_q, width), dtype), "keys": ((tiles.block_k, width), dtype),
                  "values": ((tiles.block_k, value_width), dtype)},
                 (((tiles.block_k, width), jnp.float32),
                  ((tiles.block_k, value_width), jnp.float32),
                  ((tiles.block_q, width), jnp.float32),
-                 *step_live_tiles(tiles.block_q, tiles.block_k, backward=True)))))
+                 *step_live_tiles(tiles.block_q, tiles.block_k, backward=True, accurate=self.accurate,
+                                  dropped=ba.arguments["drop"] is not None))))))
             for layout, tiles, allocations, reduces in launches]
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
