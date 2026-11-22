@@ -183,15 +183,23 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
         rows = tuple(_read(row) for row in rows)
         coords = _read(coords)
     tile_coords = _read(coords)
-    if not walk.scaled and masked is not None and _splits_scores(walk):
-        def between(s):
-            exps, w, sl, sn = _score_weights(walk, tile_coords, (), s, rows[0], rows[1], masked=masked)
+    if masked is not None and _splits_scores(walk):
+        if walk.scaled:
+            s = family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
+            exps, weights, slopes, seen = _score_weights(
+                walk, tile_coords, (), s, rows[0], rows[1], masked=masked)
             if on_weights is not None and not whole_operands:
-                on_weights(algebra.value_weights(exps, w, do_slot.dtype, walk.dropped))
-            return w, sl, sn
+                on_weights(algebra.value_weights(exps, weights, do_slot.dtype, walk.dropped))
+            dp = family.product(do_slot, values_t, shape)
+        else:
+            def between(s):
+                exps, w, sl, sn = _score_weights(walk, tile_coords, (), s, rows[0], rows[1], masked=masked)
+                if on_weights is not None and not whole_operands:
+                    on_weights(algebra.value_weights(exps, w, do_slot.dtype, walk.dropped))
+                return w, sl, sn
 
-        (weights, slopes, seen), dp = family.product_pair(
-            q_slot, held, do_slot, values_t, shape, between=between)
+            (weights, slopes, seen), dp = family.product_pair(
+                q_slot, held, do_slot, values_t, shape, between=between)
         exponentials = weights
         if after_weights is not None and not whole_operands:
             after_weights()

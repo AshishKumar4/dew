@@ -1966,9 +1966,9 @@ def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
         op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, shapes, scale=1.0,
                                                    natural=attention_mosaic.NATURAL, accurate=False)
-        cfg = op.derived(op.bind(*args, interpret=False), target)
-        assert cfg is not None and cfg.shared_keys, cfg
-        family = program.bundle("sm90", jnp.bfloat16)
+        cfg = program.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed", shared_keys=True)
+        assert op.takes(op.bind(*args, interpret=False), cfg, target), cfg
+        family = program.bundle_of(cfg, jnp.bfloat16)
         streamed = fused.streamed_statistics(family, cfg, 256, jnp.bfloat16, cfg.stages, reduced=0,
                                              allocations_of=coop._coop_allocations, anchored=False)
         assert streamed > 0 and "chosen" not in program.streamed_statistics_order(streamed, anchored=False)
@@ -2034,15 +2034,16 @@ def test_decode_deepens_to_3_stages_without_losing_residency():
             splits=work["plain"].slices, subtracted=True)
         kept = template.Kept.OUTPUT if work["plain"].slices > 1 else template.Kept.NONE
         ba = op.bind(*args, residuals=kept, interpret=False)
+        assert op.takes(ba, cfg2, target) and op.takes(ba, cfg3, target)
         assert op.resident(ba, cfg3, target) == op.resident(ba, cfg2, target)
-        def decode_pinned(cfg):
-            def run(q, k, v):
+        def forward_pinned(cfg):
+            def run(*operands):
                 with tuning.pinned({attention_mosaic.MosaicForward: cfg}):
-                    return attention_decode.attend(q, k, v, spans)
+                    return op(*operands, residuals=kept, interpret=False)
             return run
         cases = [
-            KernelCase("sm90-dec-b8-d128-2stage", lambda: (decode_pinned(cfg2), (qd, kd, kd))),
-            KernelCase("sm90-dec-b8-d128-3stage", lambda: (decode_pinned(cfg3), (qd, kd, kd))),
+            KernelCase("sm90-dec-b8-d128-2stage", lambda: (forward_pinned(cfg2), args)),
+            KernelCase("sm90-dec-b8-d128-3stage", lambda: (forward_pinned(cfg3), args)),
         ]
         found = compile_mosaic_kernels(cases, "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

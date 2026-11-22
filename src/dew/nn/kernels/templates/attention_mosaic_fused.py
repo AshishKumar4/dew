@@ -192,7 +192,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
             masked=masked, whole_operands=True))
     cotangents_staged = staged.at[1]
-    if masked is not None and not walk.scaled and _splits_scores(walk):
+    if masked is not None and _splits_scores(walk):
         _, part = _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
             masked=masked,

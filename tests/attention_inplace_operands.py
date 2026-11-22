@@ -60,9 +60,8 @@ def _terms(keep, *, output: bool = False):
     """The float64 terms (`traced_attention_terms`) over the keys each query keeps: traceable under
     `jax.make_jaxpr` during GPU prepare, returning `(out, dq, dk, dv)` when `output` else `(dq, dk, dv)`."""
     def terms(query, key, value, dout):
-        found = traced_attention_terms(query, key, value, dout, jnp.asarray(keep)[None, None])
+        found = traced_attention_terms(query, key, value, dout, jnp.asarray(keep))
         return tuple(found) if output else tuple(found[1:])
-
     return terms
 
 @ON_HOPPER
