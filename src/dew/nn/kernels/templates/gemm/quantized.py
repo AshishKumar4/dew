@@ -14,7 +14,8 @@ import jax
 import jax.numpy as jnp
 
 from dew.algebra import bits
-from dew.nn.kernels.templates import inline_forms, launches, product as product_formats
+from dew.nn.kernels import launches
+from dew.nn.kernels.templates import inline_forms, product as product_formats
 
 _EPILOGUE_LAYOUT: contextvars.ContextVar[Any] = contextvars.ContextVar("gemm_epilogue_layout", default=None)
 """Active GPU accumulator register layout while tracing a compiled GEMM epilogue (`encode_tile`)."""
