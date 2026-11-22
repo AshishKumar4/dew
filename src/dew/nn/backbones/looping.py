@@ -34,7 +34,9 @@ from collections.abc import Callable, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.core import lift
 from flax.core.scope import DenyList
+from flax.linen.transforms import lift_direct_transform
 
 from dew.batch import sows_appended
 
@@ -52,12 +54,21 @@ def _preamble(model, loop: Loop, x, injected, *, stop: bool, normed=None, theta=
     `theta`, which `_theta` gives an implicit loop alone)."""
     if loop.step_norm:
         x = model.norm(x) if normed is None else normed
-    x = jax.lax.stop_gradient(x) if stop else x
+    x = _stopped(x, stop)
     if loop.reinject:
         x = model.norm(x + injected)
     if theta is not None:
         x = injected + theta.astype(x.dtype) * (x - injected)
     return x
+
+
+def _stopped(value, stop):
+    """`value` cut from the gradient where `stop` says: a static bool, or a traced one (a count of passes
+    given per call, whose cut moves with it, `_Passes.counted_step`), which the gradient passes through
+    where false."""
+    if isinstance(stop, bool):
+        return jax.tree.map(jax.lax.stop_gradient, value) if stop else value
+    return jax.tree.map(lambda leaf: jnp.where(stop, jax.lax.stop_gradient(leaf), leaf), value)
 
 
 def _theta(model, loop: Loop, steps: range, *, rows: bool = False):
@@ -276,7 +287,7 @@ def _entered(model, x, bank, injected, *, stop: bool, normed=None, theta=None):
     the pass before left, which the cut stops (`_passed`); else the pass before's state (`_preamble`)."""
     loop = model.loop
     if loop.messages is not None:
-        return injected, jax.lax.stop_gradient(bank) if stop else bank
+        return injected, _stopped(bank, stop)
     return _preamble(model, loop, x, injected, stop=stop, normed=normed, theta=theta), None
 
 
@@ -427,7 +438,7 @@ class _Passes:
         out, bank = run(model, x, bank, **self.inputs)
         return _stepped(loop, out, x, self.injected), bank
 
-    def stepped(self, module, carry, theta, *, exit_stop: bool, enter_stop: bool, block=None):
+    def stepped(self, module, carry, theta, *, exit_stop, enter_stop, block=None):
         """One later pass inside the scan over its step's collections: the exit of the pass before it
         where every pass exits (its exit state and its normed output, the scan's outputs where read:
         `exit_states`, `exit_outputs`), then its block (`block`, `run_block` where None)."""
@@ -436,7 +447,7 @@ class _Passes:
         _, end = self.span
         leaving = output = normed = None
         if loop.exiting:
-            leaving = self.coda(module, jax.lax.stop_gradient(x) if exit_stop else x)
+            leaving = self.coda(module, _stopped(x, exit_stop))
             output = module.exit_states(leaving)
             normed = output if end == module.num_layers and module.normed_output else None
         x, bank = self.entering(module, x, bank, stop=enter_stop, normed=normed, theta=theta)
@@ -511,32 +522,81 @@ class _Passes:
         and its transpose alone, so a skipped pass or one before the cut costs nothing backward, and the
         block's program is traced once a branch."""
         # The pass checkpointed whole, its branch among them, not its block within the branch: the scan
-        # saves each step's entering carry alone, as a loop of every pass saves its block's.
-        def run(module, carry):
-            return self.stepped(module, carry, theta, exit_stop=False, enter_stop=False,
-                                block=self.pass_block)
-
-        def skip(module, carry):
-            x, _ = carry
-            zero = jnp.zeros_like(x)
-            output = module.exit_states(zero) if self.exit_outputs else None
-            return carry, (zero if self.exit_states else None, output)
+        # saves each step's entering carry alone, as a loop of every pass saves its block's. The pass the
+        # cut stops exits and enters stopped, where a static cut stops them (`fixed`).
+        backprop = self.loop.backprop_steps
 
         def branched(module, carry, step, passes):
-            if self.loop.backprop_steps is None:
-                return nn.cond(step < passes, run, skip, module, carry)
+            at_cut = False if backprop is None else step == passes - backprop
+
+            def run(module, carry):
+                return self.stepped(module, carry, theta, exit_stop=at_cut, enter_stop=at_cut,
+                                    block=self.pass_block)
+
+            def skip(module, carry):
+                x, _ = carry
+                zero = jnp.zeros_like(x)
+                output = module.exit_states(zero) if self.exit_outputs else None
+                return carry, (zero if self.exit_states else None, output)
+
+            if backprop is None:
+                return _sown_switch((step < passes).astype(jnp.int32), (skip, run), module, carry)
 
             def held_back(module, carry):
                 return jax.lax.stop_gradient(run(module, jax.lax.stop_gradient(carry)))
 
-            cut = passes - self.loop.backprop_steps
-            carry = jax.tree.map(lambda leaf: jnp.where(step == cut, jax.lax.stop_gradient(leaf), leaf),
-                                 carry)
-            index = jnp.where(step >= passes, 0, jnp.where(step < cut, 1, 2))
-            return nn.switch(index, (skip, held_back, run), module, carry)
+            index = jnp.where(step >= passes, 0, jnp.where(step < passes - backprop, 1, 2))
+            return _sown_switch(index, (skip, held_back, run), module, carry)
 
         stepping = nn.remat(branched) if self.loop.remat else branched
         return stepping(module, carry, step, passes)
+
+
+def _sown_switch(index, branches, module, *operands):
+    """`nn.switch` over Flax module functions whose last branch, a pass, sows what the others do not (its
+    attention's statistics, its routers' loads, captures: what a pass writes beside its state): each other
+    branch's collections take the pass's shape, its own entries kept and what it does not sow zero, so
+    the branches agree, as `lax.switch` asks (`_shaped_like`). A skipped pass's sows are zero; a reader
+    weighs them by the count it gave (`run_loop`'s `passes`)."""
+    count = len(branches)
+
+    def transform(*parts):
+        functions, (scope, index, *operands) = parts[:count], parts[count:]
+
+        def inner(scope_fn, repack_fn, variable_groups, rng_groups):
+            def branch(function, *operands):
+                scope = scope_fn(variable_groups, rng_groups)
+                return function(scope, *operands), repack_fn(scope)
+
+            pure = [functools.partial(branch, function) for function in functions]
+            _, sown = jax.eval_shape(pure[-1], *operands)
+
+            def agreeing(function):
+                def run(*operands):
+                    out, variables = function(*operands)
+                    return out, _shaped_like(variables, sown)
+                return run
+
+            return jax.lax.switch(index, [agreeing(function) for function in pure], *operands)
+
+        return lift.pack(inner, (True,), (True,), (True,), name='switch')(scope)
+
+    return lift_direct_transform(transform, tuple(branches), module, index, *operands)
+
+
+def _shaped_like(value, shape):
+    """`value` (a branch's collections) in `shape`'s tree (the pass's, `jax.eval_shape`'s): each entry
+    `value` holds at a place of `shape` kept, each it lacks zeros of its shape."""
+    if isinstance(shape, Mapping):
+        held = value if isinstance(value, Mapping) else {}
+        return type(shape)({key: _shaped_like(held.get(key), each) for key, each in shape.items()})
+    if isinstance(shape, (tuple, list)):
+        held = value if isinstance(value, (tuple, list)) else ()
+        return type(shape)(_shaped_like(held[index] if index < len(held) else None, each)
+                           for index, each in enumerate(shape))
+    if shape is None:
+        return None
+    return jnp.zeros(shape.shape, shape.dtype) if value is None else value
 
 
 def _handed_on(model, exited, last, threshold: float) -> jax.Array:

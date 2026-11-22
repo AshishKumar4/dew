@@ -527,11 +527,11 @@ def test_a_loop_passing_messages_resumes_as_it_never_stopped(tmp_path):
 
 
 def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes():
-    """A bf16 decoder passing messages over an unrolled exit-gated loop (`Loop.messages`, `exit_gate=True`),
-    every block rematerialized (`full`), compiled ahead on two compile-only H100s splitting its rows: its
-    live memory past its arguments grows from two passes to six by no more than a message-free loop's growth
+    """A bf16 decoder passing messages over an exit-gated loop (`Loop.messages`, `exit_gate=True`), every
+    block rematerialized (`full`), compiled ahead on two compile-only H100s splitting its rows: its live
+    memory past its arguments grows from three passes to seven by no more than a message-free loop's growth
     plus the added passes' saved banks, rather than holding deferred fp32 merge intermediates or un-summed
-    bank cotangents live across unrolled passes (row 11713)."""
+    bank cotangents live across its passes (row 11713)."""
     from step_memory import MIXER_HEAD, MIXER_LENGTH, MIXER_ROWS, MIXER_WIDTH, STEP_LAYOUT
     from token_support import token_rows
 
@@ -564,7 +564,9 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
         memory = ahead.sampled.executable.memory
         return memory.live - memory.argument
 
-    plain_two, plain_six = live_past_args(2, None), live_past_args(6, None)
+    # Three passes to seven, each program's later passes under one scan: two passes' one later pass is
+    # traced alone, a scan of one being no program of its own (`looping._Passes.fixed`).
+    plain_two, plain_six = live_past_args(3, None), live_past_args(7, None)
     plain_growth = plain_six - plain_two
     # Four added passes each hold beyond a message-free loop's its saved bf16 bank [B/fsdp, S, blocks, D]
     # and that bank's one summed cotangent: two banks a pass.
@@ -572,7 +574,7 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
     # So too where the step watches its MLPs (row 11820: a watch of other modules leaves the merges to their
     # own rules), its sampled step the one compiled.
     for inspection in (None, Inspection(modules=("*MLP",), every=1)):
-        msg_two, msg_six = live_past_args(2, spec, inspection), live_past_args(6, spec, inspection)
+        msg_two, msg_six = live_past_args(3, spec, inspection), live_past_args(7, spec, inspection)
         msg_growth = msg_six - msg_two
         assert msg_growth <= plain_growth + 2 * added_banks, (
             f"cross-pass live growth {msg_growth} B, watching {inspection}, exceeded plain growth "

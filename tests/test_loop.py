@@ -836,3 +836,18 @@ def test_a_loop_whose_every_pass_exits_lowers_its_block_once_whatever_its_count(
 
     assert operations(8) == operations(3)
 
+
+def test_a_count_of_passes_given_per_call_sows_each_passs_attention_statistics(rng):
+    """A looped stack given a count of its passes per call sows its attention's logit maxima (`QK`, which a
+    run drawing its counts keeps for QK-Clip) for each of the loop's passes: those it ran as they ran, a
+    skipped pass's zero, where a pass that sows and one that does not are one program's two branches."""
+    looped = tiny(num_layers=4, qk_norm=False, loop=Loop(3, step_norm=False, layers=(1, 3)))
+    ids = tokens(rng)
+    variables = nn.unbox(looped.init(rng, ids))
+    sown = jax.jit(lambda tree, ids: looped.apply(tree, ids, mutable=[QK], loop_passes=jnp.int32(2))[1][QK])(
+        variables, ids)
+    maxima = sown['layers_1']['self_attn']['max_logits']
+    assert len(maxima) == 3
+    assert all(bool(jnp.any(each != 0)) for each in maxima[:2])
+    assert not bool(jnp.any(maxima[2]))
+
