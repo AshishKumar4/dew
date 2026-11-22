@@ -59,6 +59,10 @@ type Format = Literal[
 ]
 
 
+type SchemaFact = dict[str, tuple[str, ...]] | int | list[str] | None
+"""A fact a raw Parquet or Arrow store's schema states (`Files._schema_facts`), None where it states none."""
+
+
 def _format(url: str) -> Format:
     inferred = inferred_format(url)
     if inferred is None:
@@ -1155,7 +1159,7 @@ class Files(Dataset):
             return {key: value for key, value in facts.items() if value is not None}
         return {key: value for key, value in self._metadata.items() if key in keys}
 
-    def _schema_facts(self) -> dict[str, Callable[[], object]]:
+    def _schema_facts(self) -> dict[str, Callable[[], SchemaFact]]:
         """A raw Parquet or Arrow store's facts, each by the read that states it, None where its store
         states none: the one place they are built (`_metadata`, `asked`), its names known with no file
         opened (row 11638: a list of them beside the builder dropped a key it gained)."""
