@@ -1397,8 +1397,11 @@ class LaterPlans:
     which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes its kernels or
     runs PGLE plans its phases at their boundaries."""
 
-    def __init__(self, futures: Mapping[int, Future]) -> None:
+    def __init__(self, futures: Mapping[int, Future], stale: Sequence[Future] = ()) -> None:
         self.futures = dict(futures)
+        self.stale = list(stale)
+        """Compiles an earlier step began that no plan waits for (`LaterCounts`'s of a superseded batch
+        signature), waited for as the run ends alone."""
 
     @classmethod
     def started[LossT, EffectsT](cls, trainer: Trainer[LossT, EffectsT], batch: Batch,
@@ -1454,12 +1457,13 @@ class LaterPlans:
 
     def stopped(self) -> None:
         """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said."""
-        for passes, future in self.futures.items():
+        for passes, future in [*self.futures.items(), *((None, future) for future in self.stale)]:
             if future.cancel():
                 continue
             if (error := future.exception()) is not None:
-                _log.warning("planning the step of %d passes off the loop failed: %r", passes, error)
+                _log.warning("planning the step of %s passes off the loop failed: %r", passes, error)
         self.futures.clear()
+        self.stale.clear()
 
 
 UPCOMING_STEPS = 64
@@ -1503,19 +1507,19 @@ class LaterCounts:
 
         def begin(step, position: int) -> None:
             # An earlier batch signature's counts still compiling off the loop: those not begun give way to
-            # this step's own, and one compiling is kept, waited for as the run ends.
-            running = {count: future for count, future in
-                       (trainer._later.futures if trainer._later is not None else {}).items()
-                       if not future.cancel() and not future.done()}
+            # this step's own, and one compiling is kept apart, waited for as the run ends alone.
+            prior = trainer._later or LaterPlans({})
+            stale = [*prior.stale, *(future for future in prior.futures.values()
+                                     if not future.cancel() and not future.done())]
             order = [count for count in step.upcoming(position, UPCOMING_STEPS * step.split)
-                     if count not in step.plans and count not in running]
+                     if count not in step.plans]
             pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-later-counts")
             try:
                 futures = {count: pool.submit(contextvars.copy_context().run, compiled, count)
                            for count in order}
             finally:
                 pool.shutdown(wait=False)
-            later = LaterPlans({**running, **futures})
+            later = LaterPlans(futures, stale)
             trainer._later = later
             step.waited = later.waited
             _log.info("compiling the steps of pass counts %s off the loop, as the draws ask them", order)

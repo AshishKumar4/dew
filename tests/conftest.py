@@ -487,17 +487,6 @@ def release_compilations():
 
 
 @pytest.fixture(autouse=True)
-def counts_compiled_off_the_loop():
-    """A test that draws a sampled run's counts as a fit does (`DrawingStep.drawn`) ends once the counts it
-    began compiling off the loop are compiled (`dew.training.ahead.LaterCounts`, whose thread a fit waits
-    for as it ends), so none compiles on into the next test."""
-    yield
-    for thread in threading.enumerate():
-        if thread.name.startswith("dew-later-counts"):
-            thread.join()
-
-
-@pytest.fixture(autouse=True)
 def fresh_held_steps():
     """Each test plans its steps as a fresh process does: the step executables an earlier test's trainers
     compiled, which the process holds across trainers (`dew.nn.kernels.options.hold`), are dropped as it

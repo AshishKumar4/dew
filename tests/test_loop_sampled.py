@@ -163,6 +163,18 @@ def test_a_sampled_pass_count_outside_its_law_is_refused(fields):
         SampledPasses(**fields)
 
 
+
+@pytest.fixture(autouse=True)
+def counts_compiled_off_the_loop():
+    """A test that draws a sampled run's counts as a fit does (`DrawingStep.drawn`) ends once the counts it
+    began compiling off the loop are compiled (`dew.training.ahead.LaterCounts`, whose thread a fit waits
+    for as it ends), so none compiles on into the next test."""
+    yield
+    for thread in threading.enumerate():
+        if thread.name.startswith("dew-later-counts"):
+            thread.join()
+
+
 CAP = 3
 """The cap of the trainer cells' law, the passes their tiny looped decoder holds
 (`test_pass_weights.looped`)."""

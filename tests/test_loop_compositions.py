@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_loop_sampled import CAP, TRAINED, token_batch
+from test_loop_sampled import CAP, TRAINED, counts_compiled_off_the_loop, token_batch
 from test_pass_weights import phased_trainer
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -19,6 +19,9 @@ from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.kernels.generation import chosen
 from dew.training.compiler import DrawingStep
 from dew.training.interval import Interval
+
+# The counts a test draws as a fit does compiled before it ends (`test_loop_sampled`'s fixture).
+pytestmark = pytest.mark.usefixtures(counts_compiled_off_the_loop.__name__)
 
 COMPOSED = [
     # (drawn, implicit, copies, gated): every pair of the four met, and all four together.

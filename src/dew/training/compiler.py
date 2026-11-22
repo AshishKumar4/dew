@@ -677,9 +677,10 @@ class DrawingStep:
             begin(self, self.position)
         self._draw()
         self.pending = True
-        began = time.perf_counter()
+        began, held = time.perf_counter(), len(self.plans)
         self._admitted(state)
-        interval.compiling += time.perf_counter() - began
+        if len(self.plans) > held:
+            interval.compiling += time.perf_counter() - began
         total: StepFlops | None = None
         for count in self.counts:
             each = self.flops[count]
