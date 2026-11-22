@@ -313,7 +313,7 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         if inputs is None:
             raise ValueError("feature distillation requires the student's InputSpec")
         probe = {inputs.sample.key: jnp.zeros((1, *inputs.sample.shape), jnp.int32)}
-        _, _, student, teacher = jax.eval_shape(
+        _, _, student, teacher, _ = jax.eval_shape(
             self._predictions, tree, probe, Step(jnp.zeros((), jnp.int32), key, None))
         projections = dict(tree["params"].get(PROJECTIONS, {}))
         for index, (own, other) in enumerate(zip(student.hidden, teacher.hidden, strict=True)):
