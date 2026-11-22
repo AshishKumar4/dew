@@ -1814,10 +1814,10 @@ class DecoderRunConfig(RunConfig):
     """The rank of each merge's controller (`CrossPass.rank`); None its default."""
     loop_message_additive: bool | None = None
     """Whether each merge's message adds a term of its own beside the gained summary
-    (`CrossPass.additive`): `--loop-message-additive` keeps it and `--no-loop-message-additive` drops it,
-    over a checkpoint's own choice; unstated, a checkpoint's own choice is kept, and the default taken where
-    it holds no messages (row 11742: stating it on was read as unstated, so a checkpoint that dropped it kept
-    it dropped)."""
+    (`CrossPass.additive`): `--loop-message-additive True` keeps it and `False` drops it, over a checkpoint's
+    own choice; unstated, a checkpoint's own choice is kept, and the default taken where it holds no
+    messages (row 11742: stating it on was read as unstated, so a checkpoint that dropped it kept it
+    dropped)."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -1926,7 +1926,7 @@ class DecoderRunConfig(RunConfig):
     def messages(self, held: "CrossPass | None") -> "CrossPass | None":
         """The messages the run's loop passes (`loop_messages`), None where it keeps a checkpoint's own: the
         checkpoint's own messages where it holds them (`held`), else the defaults, with what the run
-        states in their place (a block size, a rank, `--no-loop-message-additive`), so a checkpoint's
+        states in their place (a block size, a rank, `--loop-message-additive`), so a checkpoint's
         others, which shape no parameter, are kept, not reset (row 10855)."""
         if not self.loop_messages:
             return None
