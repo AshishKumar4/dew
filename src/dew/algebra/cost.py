@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+from collections.abc import Sequence
 from typing import Protocol
 
 import jax
@@ -274,10 +275,16 @@ class Schedule(Protocol):
 
 def cheaper(form: Seconds, than: Seconds) -> bool:
     """Whether `form` is cheaper than `than` on every device its schedule's facts describe: fewer seconds,
-    and no more work at a rate its target states none of (a TPU's vector and transcendental units), which
-    then costs no more whatever that rate is."""
-    pairs = zip(form.schedule.unpriced(form.work), than.schedule.unpriced(than.work), strict=True)
-    return form.value < than.value and all(mine <= theirs for mine, theirs in pairs)
+    and no more work at a rate its target states none of (`carries_no_more`)."""
+    return form.value < than.value and carries_no_more(form.schedule.unpriced(form.work),
+                                                       than.schedule.unpriced(than.work))
+
+
+def carries_no_more(mine: Sequence[float], theirs: Sequence[float]) -> bool:
+    """Whether a form carrying the work `mine` at rates its target states none of (a TPU's vector and
+    transcendental units, an operation no rule prices: `templates.cost.units`' second part) carries no more
+    than one carrying `theirs`, unit by unit: it then costs no more whatever those rates are."""
+    return all(amount <= other for amount, other in zip(mine, theirs, strict=True))
 
 
 @dataclasses.dataclass(frozen=True)
