@@ -893,25 +893,33 @@ def _query_key_split(call: Call) -> int:
     from its accumulator, because CUDA 12.9's ptxas folded the read's sign flip (an xor) so that the
     product's HGMMA wrote the zero register, not the split (row 4346: the JAX fork's float-sign-ops
     lowering, post66; M-JS-22q native as interpreted)."""
-    def fits(vq: int) -> bool:
-        tiles, _ = _query_key_launched(call, vq)
-        landing = _query_key_landing(call, call.value_width // vq)
-        _, scope, _, _ = shared_allocation(call, tiles, (), landing)
-        registers = _query_key_held(call, vq).registers(call.family, addressed((), landing))
-        return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
-                and registers <= call.family.registers(1))
-
-    return next((vq for vq in whole_blocks(call.value_width, call.value_block) if fits(vq)),
-                call.value_block)
+    return next((vq for vq in whole_blocks(call.value_width, call.value_block)
+                 if _query_key_fits(call, vq, holds=False)), call.value_block)
 
 
-def _query_key_held(call: Call, vq: int) -> Held:
+def _query_key_fits(call: Call, vq: int, *, holds: bool) -> bool:
+    """Whether `_query_key` at value split `vq` fits the block's shared memory (`generation.shared_budget`)
+    and a thread's registers (`_query_key_held`), its streams one deep, its landing and, where it `holds` its
+    sums, their staging (`_query_key_staging`): each split's bytes the launch's own (`shared_allocation`, as
+    `launch_kernel` lays it)."""
+    tiles, _ = _query_key_launched(call, vq)
+    landing = _query_key_landing(call, call.value_width // vq)
+    staging = _query_key_staging(call) if holds else ()
+    _, scope, _, _ = shared_allocation(call, tiles, staging, landing)
+    registers = _query_key_held(call, vq, holds=holds).registers(call.family, addressed(staging, landing))
+    return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
+            and registers <= call.family.registers(1))
+
+
+def _query_key_held(call: Call, vq: int, *, holds: bool) -> Held:
     """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum
     (one accumulator over the value blocks), that sum gated, its scores' product, and a block's queries or
     keys in fp32 for the range terms; then `sum(S dS)` (`_memory_sum`): the memories' product and its
     diagonal's mask where products read registers, with a block of each operand, else the memories in fp32.
     An accumulator a value block, the SSD's spilled 168 bytes a thread on an A100, where one needed 249
-    registers (gateqk at c2808ebbe)."""
+    registers (gateqk at c2808ebbe). Where it `holds` its sums (`_query_key_holds`), a sum's tile read back
+    beside the gradient it adds (`_summed_into`): unstated, the scalar write's training at 16-wide value
+    tiles spilled at 255 registers on an A100 against a stated 232 (M-JS-191)."""
     chunk, vb = call.chunk, call.value_block
     held, memories, given = call.held, call.memories, call.given
 
@@ -936,8 +944,8 @@ def _query_key_held(call: Call, vq: int) -> Held:
     # spilled 36 bytes (jsf-owncap).
     rows = [f32(chunk, 4)] * 2 if call.family.products_overlap and held.parts > 1 else []
     return Held(phases=(
-        [f32(chunk, call.block)] * 4 + rows + read(chunk, given, memories.parts) + read(chunk, held, 0),
-        summed))
+        [f32(chunk, call.block)] * (4 + holds) + rows + read(chunk, given, memories.parts)
+        + read(chunk, held, 0), summed))
 
 
 def _query_key_landing(call: Call, splits: int) -> dict:
@@ -971,13 +979,7 @@ def _query_key_holds(call: Call, vq: int) -> bool:
     split adds nothing to hold: its sums stored as they come."""
     if not call.family.stores_through_registers or (call.group == 1 and vq == call.value_width):
         return False
-    tiles, _ = _query_key_launched(call, vq)
-    landing = _query_key_landing(call, call.value_width // vq)
-    staging = _query_key_staging(call)
-    _, scope, _, _ = shared_allocation(call, tiles, staging, landing)
-    registers = _query_key_held(call, vq).registers(call.family, addressed(staging, landing))
-    return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
-            and registers <= call.family.registers(1))
+    return _query_key_fits(call, vq, holds=True)
 
 
 def _query_key_launched(call: Call, vq: int) -> tuple[dict, tuple]:
@@ -1112,7 +1114,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None, stages=1,
         live=chunk_liveness(10),
-        steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq),
+        steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq, holds=holds),
         landing=_query_key_landing(call, splits), staging=_query_key_staging(call) if holds else (),
         persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
