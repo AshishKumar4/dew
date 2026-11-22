@@ -19,6 +19,7 @@ import functools
 import itertools
 import os
 import threading
+import typing
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
@@ -426,7 +427,8 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     sources = {id(source): source for _, source in corpora}
     stores: dict[int, list[Source]] = {}
     for source in sources.values():
-        stores.setdefault(id(_store_of(source)), []).append(source)
+        *_, store = beneath(source, typing.get_args(Rows.__value__))
+        stores.setdefault(id(store), []).append(source)
 
     def read(over: list[Source]) -> list[tuple[int, Mapping[str, object]]]:
         return [(id(source), asked(source, TOKENIZER_CONTRACT)) for source in over]
@@ -434,13 +436,6 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(stores)))) as readers:
         facts = dict(pair for pairs in readers.map(read, stores.values()) for pair in pairs)
     tokenizer_contract((name, facts[id(source)]) for name, source in corpora)
-
-
-def _store_of(source: Source) -> Source:
-    """The store `source` reads beneath every view over it, a compile's pinned one among them."""
-    while isinstance(source, View):
-        source = source.source
-    return source
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:
