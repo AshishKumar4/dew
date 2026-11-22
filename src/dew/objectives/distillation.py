@@ -432,22 +432,24 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         finite = jnp.isfinite(teacher.losses)
         for state in (*states, *(() if teacher.logits is None else (teacher.logits,))):
             finite = finite & jnp.all(jnp.isfinite(state), axis=-1)
+        divergence = None
+        if tables is not None:
+            # The language model's head, imported where a run reads it: a distillation's domain imports no
+            # language model's. It reads the teacher's logits a slice at a time, and gives where they are
+            # finite beside, so a tiled head leaves out the positions the whole logits do (row 10984).
+            from dew.objectives.lm.chunked import head_divergence
+
+            tile = head_tile_of(self.student)
+            assert student.final is not None and teacher.final is not None and tile is not None
+            divergence, finite = head_divergence(student.final, tables[0], teacher.final, tables[1], finite,
+                                                 temperature, tile=tile)
         teacher_losses = jnp.where(finite, teacher.losses, 0)
         scored = weights * finite
         if self.divergence == "full":
-            if tables is None:
+            if divergence is None:
                 assert teacher.logits is not None and student.logits is not None
                 held = jnp.where(finite[..., None], teacher.logits, 0)
                 divergence = categorical.kl_divergence(student.logits / temperature, held / temperature)
-            else:
-                # The language model's head, imported where a run reads it: a distillation's domain
-                # imports no language model's.
-                from dew.objectives.lm.chunked import head_divergence
-
-                tile = head_tile_of(self.student)
-                assert student.final is not None and teacher.final is not None and tile is not None
-                divergence = head_divergence(student.final, tables[0], teacher.final, tables[1], finite,
-                                             temperature, tile=tile)
             soft = self.row_mean(divergence, batch, weights=scored).total
             estimate = soft
         else:

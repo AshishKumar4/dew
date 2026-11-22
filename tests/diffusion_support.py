@@ -2,7 +2,6 @@
 and its batch, a student stepped once and saved as a run, and a trainer's update held to its
 objective's gradient by check 1 (`moved_weights`, `applied`, `objective_gradient`)."""
 
-import math
 
 import jax
 import jax.numpy as jnp
@@ -253,18 +252,15 @@ def objective_gradient(objective, variables, batch, step):
 
 def as_a_step(trainer, variables, micro, gradient):
     """`gradient` jitted with the compiler options `trainer`'s step of a `micro` microbatch takes over
-    its mesh, its devices and row shards (`dew.training.memory.step_compiler_options`, as
-    `StepCompiler._planned` derives them), so a check of that step against it compiles both arms alike: on
-    a GPU the step keeps dots that share an input apart, where XLA's default merges them into one
-    GEMM, which rounds otherwise."""
-    from dew.batch import FROZEN
-    from dew.mesh import batch_axes
-    from dew.training.memory import device_tokens, step_compiler_options
+    its mesh (`dew.training.memory.step_options`, its layers' gathers among them, as `StepCompiler`
+    derives them), so a check of that step against it compiles both arms alike: on a GPU the step keeps
+    dots that share an input apart, where XLA's default merges them into one GEMM, which rounds otherwise
+    (row 10899: the options rebuilt here by hand dropped the gathers)."""
+    from dew.training.memory import layer_gathers, step_options
 
     mesh = trainer.device_mesh
-    shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
-    options = step_compiler_options(trainer.objective, device_tokens(trainer.objective, micro, shards),
-                                    FROZEN in variables, mesh.devices.size)
+    options = step_options(trainer.objective, micro, variables, mesh,
+                           layer_gathers(trainer.objective, variables, mesh.devices.size))
     # Compiled here with the step's own options, so the gate runs it as given: a jit nested in another
     # with compiler options of its own is refused (row 1800).
     return as_given(jax.jit(gradient, compiler_options=options))
