@@ -320,8 +320,8 @@ _ONE_DEVICE: dict[tuple, list] = {}
 """Each case's one-device step, its trainer and the step compiled (`drawn_steps`), by the case's name,
 whether it runs in float64 and the trace's context an arm first calls it in (`options.trace_context`: check
 1's own sums among it), where an arm compiles its own: the same program for every cell of the case and every
-step count (a count is the steps it runs, not a program), built once a process for the cells a group of the
-case holds (`shared_setup`)."""
+step count (a count is the steps it runs, not a program), built once a process for the cells of the case it
+runs."""
 
 
 def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: int, *, exact: bool = False):
@@ -466,8 +466,9 @@ UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
 
 
 # A case's cells share its fresh state and one device's steps (`case_setup`, `_ONE_DEVICE`), and a selecting
-# case's its compiled selection capture (`selections_forward`), one a process.
-@pytest.mark.shared_setup("architecture_case", by=r"[a-z0-9_+]+(?=-)")
+# case's its compiled selection capture (`selections_forward`), within a process, not across groups: a case's
+# cells held in one group ran 124 to 212 s together, past the 120 s group target, where each alone fits
+# (row 8533, train 1170's CI).
 @pytest.mark.parametrize(("case", "steps", "layout"), UNSHARDED_CELLS, ids=cell_ids(UNSHARDED_CELLS))
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
@@ -535,7 +536,6 @@ FIT_APART = [*HIERARCHICAL_MMDIT_CELLS, *THREE_D_UNET_CELLS]
 beside them (rows 7457, 7633)."""
 
 
-@pytest.mark.shared_setup("architecture_case", by=r"[a-z0-9_+]+(?=-)")
 @pytest.mark.parametrize("arm", ["one device", "layout"])
 @pytest.mark.parametrize(("case", "steps", "layout"), FIT_APART, ids=cell_ids(FIT_APART))
 def test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave(case, steps, layout, arm, tmp_path):
@@ -625,8 +625,8 @@ _SETUPS: dict[str, tuple] = {}
 
 def case_setup(case: Case, tmp_path) -> tuple:
     """`case`'s one-device trainer, its encoder and its fresh state (`initial_state`), made once a process
-    for every cell of the case a group holds (`shared_setup`): the state is never donated, each draw and
-    each fit stepping a copy of it."""
+    for every cell of the case it runs: the state is never donated, each draw and each fit stepping a copy
+    of it."""
     if case.name not in _SETUPS:
         trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
         _SETUPS[case.name] = trainer, encoder, initial_state(trainer)
