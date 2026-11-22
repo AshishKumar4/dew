@@ -276,9 +276,8 @@ class Dense(_LinearEnvelope, nn.Dense):
             raise ValueError(f"{self.name}'s kernel is packed (a checkpoint's NVFP4 codes, served as they "
                              "are), and a quantization rule owns its product: load it without packed_weights")
         width = jnp.shape(inputs)[-1]
-        depth, features = 8 * jnp.shape(matrix.words)[-1], jnp.shape(matrix.words)[-2]
-        if (depth, features) != (width, self.features):
-            raise ValueError(f"{self.name}'s packed kernel is [{depth}, {features}], its layer "
+        if tuple(matrix.shape) != (width, self.features):
+            raise ValueError(f"{self.name}'s packed kernel is {list(matrix.shape)}, its layer "
                              f"[{width}, {self.features}]")
         bias = (self.param('bias', declared(self.bias_init, None if self.kernel_axes is None
                                             else self.kernel_axes[-1:]), (self.features,), self.param_dtype)

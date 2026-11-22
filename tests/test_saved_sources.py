@@ -72,36 +72,59 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     assert int(drawn.step) == 1
 
 
-def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_release(tmp_path, monkeypatch):
+@pytest.fixture(scope="module")
+def native_release_run(tmp_path_factory):
     """A decision run whose head's format holds no backbone of its own family (Laya's fresh head, whose
-    format holds ModernBERT alone, over Qwen 3.5's MoE text decoder) exports as its native release, and a
-    second decision run naming it (`--pretrained <run>`) starts from that release as from the run's own
-    task: its head and backbone the first run's final ones, its record the run and step it read, and its
-    task answers (row 4776: the release's record states no dtypes a family's load reads, and the start
-    raised KeyError)."""
-    from dew.decision import Choice, Decide
+    format holds ModernBERT alone, over Qwen 3.5's MoE text decoder), trained a step and saved: its root,
+    its config, its directory and its state, trained once for the cells reading it, which their mark keeps
+    in one group (`shared_setup`, row 11722: one cell training it and the run from it took 131 s cold)."""
+    root = tmp_path_factory.mktemp("native-release")
+    decoder = Path(__file__).parent / "fixtures" / "hf" / "qwen38-moe-tiny"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+        first = dataclasses.replace(decision(root, drawn=False), pretrained=str(decoder))
+        state, _ = trained(first, root, "first", trainer={"checkpoint_final": True})
+    return root, first, root / "runs" / "first", state
+
+
+@pytest.mark.shared_setup("native_release_run")
+def test_a_decision_run_whose_head_holds_no_backbone_of_its_family_exports_as_its_native_release(
+        native_release_run, monkeypatch):
+    """Such a run exports as its native release, which a run naming it (`--pretrained <run>`) starts from
+    as from the run's own task: its head and backbone the first run's final ones; loaded without its
+    weights, it holds their shapes, its projections packed as its weights are (row 4776: the release's
+    record states no dtypes a family's load reads, and the start raised KeyError)."""
     from dew.decision.formats import format_unstated
     from dew.inference.tasks import saved_model
     from dew.interop import Pretrained
 
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    decoder = Path(__file__).parent / "fixtures" / "hf" / "qwen38-moe-tiny"
-    first = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(decoder))
-    state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
-    source = tmp_path / "runs" / "first"
+    root, first, source, state = native_release_run
+    # The fixture's own cache, which its run and the run from it publish their release in.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
     assert format_unstated("laya", saved_model(SavedRun.pinned(str(source)).record, None).build()) is not None
-    # Its release loaded without its weights holds their shapes, its projections packed as its weights are.
     shapes = Pretrained.load(str(source), weights=False)
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
     run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
     started = run.prepare().objective.init(jax.random.key(0))
     leaves_alike(started["params"], state.variables["params"])
-    second, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
+
+
+@pytest.mark.shared_setup("native_release_run")
+def test_a_decision_run_started_from_a_native_release_trains_records_it_and_answers(native_release_run,
+                                                                                     monkeypatch):
+    """A run started from that native release trains, its record naming the run and step it read, and its
+    task answers (row 4776)."""
+    from dew.decision import Choice, Decide
+
+    root, first, source, _ = native_release_run
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
+    second, _ = trained(run, root, "second", trainer={"checkpoint_final": True})
     assert int(second.step) == 1
-    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
+    recorded = DecisionRunConfig.load(str(root / "runs" / "second"))
     assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
     team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
-    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    answer = Decide.from_run(str(root / "runs" / "second"))("charged twice", {"team": team})["team"]
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
@@ -823,12 +846,13 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     """A multimodal LM run whose loop passes messages (`Loop.messages`), which no family's layout writes,
     releases in Dew's own layout (`released_run`), which loads back (`Pretrained.from_saved`'s wrapper
     branch) as the run's model: its towers' and decoder's weights the run's, its loop the run's messages;
-    its export is refused, stating why, and a change of its merges' rank refused on the reloaded bundle,
-    whose merges it holds, not draws (row 10839)."""
-    from saved_run_kinds import multimodal
+    its export is refused, as the source's own loop is once it gains the same messages, which exports
+    without them; and a change of its merges' rank refused on the reloaded bundle, whose merges it holds,
+    not draws (rows 10839, 11755)."""
+    from saved_run_kinds import MULTIMODAL, multimodal
 
     from dew.interop import Pretrained
-    from dew.nn.cross_pass import MESSAGES_UNWRITTEN, CrossPass
+    from dew.nn.cross_pass import CrossPass
     from dew.nn.multimodal import MultimodalTransformer
 
     looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop_steps=2, loop_layers=(0, 2),
@@ -838,9 +862,16 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     assert isinstance(loaded.model, MultimodalTransformer)
     assert loaded.model.loop is not None and loaded.model.loop.messages == CrossPass(block_size=1)
     leaves_alike(loaded.variables["params"], state.variables["params"])
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(ValueError):
         loaded.export()
-    assert refused.value.args == (MESSAGES_UNWRITTEN,)
+    # The control: the run's source, looped as the run is, exports; gaining the run's messages, it is
+    # refused as the run's release is, so the messages are what no family's format writes.
+    source = Pretrained.load(MULTIMODAL, dtype="float32")
+    looping = source.with_model(source.model.with_passes(2, (0, 2)), key=0)
+    assert looping.export()
+    messaged = source.with_model(source.model.with_passes(2, (0, 2), messages=CrossPass(block_size=1)), key=0)
+    with pytest.raises(ValueError):
+        messaged.export()
     with pytest.raises(ValueError):
         loaded.with_model(loaded.model.with_passes(messages=CrossPass(block_size=1, rank=8)), key=0)
 
