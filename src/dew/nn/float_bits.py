@@ -8,7 +8,6 @@ widens one. Integer arithmetic on a float's bits alone, which `dew.nn.precision`
 from __future__ import annotations
 
 import contextlib
-import functools
 
 import jax
 import jax.numpy as jnp
@@ -202,23 +201,15 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
 
     x = jnp.asarray(x)
     source = jax.typeof(x)
-    apply, pullback = _widening(resolved, source)
-    # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
-    return linear_map(apply, pullback, (), x, out_aval=source.update(dtype=resolved, weak_type=False),
-                      summed_first=True)
 
-
-@functools.cache
-def _widening(resolved: np.dtype, source: ShapedArray) -> tuple:
-    """`widened_exactly`'s map into `resolved` from `source` and its transpose, made once a pair: the same
-    functions each call, so an eager call's program is JAX's cached one (made anew each call, every eager
-    widening compiled its own, 40 to 50% of a test's time, rows 11759 and 11764)."""
     def apply(_, moving):
         # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope (`float64_sum`'s).
         with jax.enable_x64(new_val=True) if resolved == np.dtype(np.float64) else contextlib.nullcontext():
             return _widened_bits(moving, resolved)
 
-    return apply, lambda _, cotangent: cast_back(cotangent, source)
+    # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
+    return linear_map(apply, lambda _, cotangent: cast_back(cotangent, source), (), x,
+                      out_aval=source.update(dtype=resolved, weak_type=False), summed_first=True)
 
 
 def cast_back(cotangent: jax.Array, source: ShapedArray) -> jax.Array:
