@@ -610,9 +610,9 @@ def test_a_merge_runs_under_a_callers_unhashable_capture_filter_or_interceptor(w
     each, its logits the unwatched run's."""
 
     @dataclasses.dataclass
-    class Every:
+    class Calls:
         def __call__(self, module, method):
-            return True
+            return method == "__call__"
 
     @dataclasses.dataclass
     class Passing:
@@ -624,7 +624,7 @@ def test_a_merge_runs_under_a_callers_unhashable_capture_filter_or_interceptor(w
     variables = gated(model.init(jax.random.key(0), ids), 11876)
     expected = np.asarray(model.apply(variables, ids))
     if watch == "capture filter":
-        logits, _ = model.apply(variables, ids, capture_intermediates=Every(), mutable=["intermediates"])
+        logits, _ = model.apply(variables, ids, capture_intermediates=Calls(), mutable=["intermediates"])
     else:
         with nn.intercept_methods(Passing()):
             logits = model.apply(variables, ids)
