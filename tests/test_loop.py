@@ -918,7 +918,8 @@ def test_a_count_of_passes_given_per_call_counts_and_weighs_the_routers_as_a_loo
     # loop's where its call ran and none where it was skipped.
     ran = [mass for mass in masses if float(mass)]
     np.testing.assert_array_equal(np.asarray(ran), np.asarray(want_masses))
-    assert len(masses) > len(want_masses), "the capped loop's skipped calls are among its terms, weighing none"
+    # The capped loop's skipped calls are among its terms, weighing none.
+    assert len(masses) > len(want_masses)
     np.testing.assert_array_equal(np.asarray(sum(moments)), np.asarray(sum(want_moments)))
 
 
