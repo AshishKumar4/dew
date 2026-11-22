@@ -491,7 +491,7 @@ class _Spans:
         self.held: collections.OrderedDict[Hashable, _HeldSpan | None] = collections.OrderedDict()
 
     def cache_clear(self) -> None:
-        self.held.clear()
+        _cache.cleared(self.held)
 
     def cache_info(self) -> int:
         return len(self.held)

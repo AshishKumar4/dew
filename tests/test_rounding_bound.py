@@ -103,6 +103,7 @@ def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypat
     step, it was compiled whole with its neighbours; row 11004: the values alone cannot show it), and its
     values and rounding scale those the program compiled whole gives."""
     import float64_terms
+    from jax.extend.core import Jaxpr
 
     @jax.jit
     def body(x):
@@ -115,6 +116,6 @@ def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypat
 
     _held_whole_in_spans(monkeypatch, program)
     rounding_scale(program, jnp.asarray([1.0, -2.0, 3.5], jnp.float32))
-    compiled = [sum(float64_terms._steps(equation) for equation in jaxpr.eqns[start:stop])
+    compiled = [float64_terms.steps(Jaxpr([], [], [], jaxpr.eqns[start:stop]))
                 for jaxpr, start, stop, *_ in float64_terms.RUNS]
     assert compiled and max(compiled) <= float64_terms.SPAN_STEPS
