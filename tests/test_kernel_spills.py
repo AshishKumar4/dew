@@ -77,6 +77,25 @@ def experts(mesh, nonce: float, ahead=None) -> Trainer:
 BATCH = {"x": np.zeros((ROWS, FEATURES), np.float32)}
 
 
+ALIKE_ON_EVERY_BACKEND = pytest.mark.cpu(
+    reason="a program's mechanics, alike on every backend: the CPU lane holds it, no GPU part compiles it")
+"""A test of how a program compiles, keys and keeps its executables, which JAX does alike on every backend:
+the CPU lane runs it, and a GPU tier part skips it, its prepare and its run (rows 8241-8264)."""
+
+COMPILE_ONLY = pytest.mark.cpu(
+    reason="compiles for a compile-only GPU, as the CPU lane does: no GPU part holds a GPU to compile it")
+"""A test whose programs compile for a compile-only GPU (`compile_only_gpus`, a step compiled ahead), which
+any host's CPU does as a GPU host's process does: the CPU lane runs it, and a GPU tier part skips it (rows
+8300-8308)."""
+
+CERTIFIES_AT_RUN = pytest.mark.compiles_at_run(
+    reason="certifies its launches as its call traces, beside or on this host's own GPU, no check-1 site")
+"""A GPU test whose subject is its launches' certification on a GPU host (a launch certified on this host's
+GPU, or on a compile-only GPU's beside it, which this host's default device must not take; a run stepping
+its spilling launch down on its GPU): its compiles are its run's, which its part's prepare cannot hold (rows
+8246, 8247, 8252, 8259, 8260, 8302)."""
+
+
 @pytest.fixture(name="nonce")
 def fresh_compilation_nonce() -> float:
     """A value no earlier run's step was compiled with (`Experts.nonce`)."""
@@ -121,6 +140,7 @@ with report.refusals():
 argv[3] `refused`, another from the refusals that one carries."""
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_path, nonce):
     """A step compiled ahead for a compile-only H100 on this CPU, its launch's derived tile spilling at
@@ -194,6 +214,7 @@ lowered afresh by its module's text, the kind its device reported, and whether e
 read its verdict back from the store (`report.certifications`' `stored`)."""
 
 
+@COMPILE_ONLY
 @pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
                                     pytest.param("sm100", marks=lowers("sm100"))])
 @pytest.mark.parametrize("deterministic", [False, True], ids=["keeping picks", "deterministic ops"])
@@ -232,6 +253,7 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, d
     assert len({tuple(miss) for miss in misses}) == len(misses), misses
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_verdict_certified_for_a_gpu_is_read_by_another_kind_of_its_generation(tmp_path):
     """Certification's verdicts are the compile target's (`report.verdict_target`): a step compiled ahead for
@@ -304,6 +326,7 @@ print(json.dumps({"within": sorted(map(repr, within)), "step": sorted(map(repr, 
 step compiled ahead at argv[1]."""
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_run_handed_a_step_compiled_ahead_derives_within_the_steps_refusals_alone(tmp_path, nonce):
     """A process handed a step compiled ahead, whatever launches it or its cache refused before, lowers
@@ -316,6 +339,7 @@ def test_a_run_handed_a_step_compiled_ahead_derives_within_the_steps_refusals_al
     assert scoped["within"] == scoped["step"] and scoped["after"]
 
 
+@CERTIFIES_AT_RUN
 @pytest.mark.gpu(reason="trains a step whose launch spills on this host's H100")
 @lowers("sm90")
 def test_a_run_steps_its_spilling_launch_down_and_trains(tmp_path, nonce):
@@ -334,6 +358,7 @@ def pickle_load(path):
 """What the scripts share: the refusals a saved step carries."""
 
 
+@CERTIFIES_AT_RUN
 @pytest.mark.gpu(reason="hands a step compiled ahead for the canonical H100 to a run on this host's H100")
 @lowers("sm90")
 def test_a_run_handed_a_step_compiled_ahead_for_the_canonical_h100_takes_it_on_one_of_its_multiprocessors(
@@ -391,6 +416,7 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
             pass
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
     """A program (`dew.nn.kernels.options.program`) compiled through the reports keys its executables
     as jit does: called under a run's fast attention forms and its accurate ones in turn
@@ -417,6 +443,7 @@ def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
             np.testing.assert_array_equal(output, expected)
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_released_program_drops_its_executables_and_compiles_again():
     """`options.release` drops every live program's executables, which jit's cache clearing never reaches
     (XLA:CPU maps each one's code into the process, and a program keeps them for as long as it lives): the
@@ -437,6 +464,7 @@ def test_a_released_program_drops_its_executables_and_compiles_again():
     np.testing.assert_array_equal(run(x), first)
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
     """Two threads calling one program at two shapes each lower their own executable while the other
     does, as jit's calls do: each tracing waits for the other's, which a call that held the program for
@@ -456,6 +484,7 @@ def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
     np.testing.assert_array_equal(outputs[1], jnp.full(3, 2.0))
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_calls_compiled_together_run_their_executables_after_and_compile_nothing_more():
     """Calls of programs within `compiled_together` answer with their results' shapes and run nothing,
     each traced on this thread; as the block ends each is compiled, all at once, and kept by its program,
@@ -500,6 +529,7 @@ class Slots:
     columns: jax.Array
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_program_donates_its_state_and_places_it_by_a_tree_of_formats():
     """A program a server steps its state with (`program`, row 3327) donates the state it is handed
     (`donate_argnums`, `donate_argnames`), the state's arrays deleted once it ran, and places its arguments
@@ -526,6 +556,7 @@ def test_a_program_donates_its_state_and_places_it_by_a_tree_of_formats():
     np.testing.assert_array_equal(np.asarray(again.columns), np.full((2, 3), 4.0))
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():
     """Within `jax.grad`, `jax.vmap` or an enclosing jit a program is its jit, traced into theirs, its
     tracers its arguments or ones its function closes over, and under `jax.disable_jit` Python; called
@@ -674,6 +705,7 @@ def test_a_kernels_assembler_notes_are_read_from_its_compiled_call():
     assert plain.notes == ()
 
 
+@ALIKE_ON_EVERY_BACKEND
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("statics", [False, True], ids=["dynamic", "static"])
 def test_a_program_called_under_another_mesh_of_its_shape_runs_on_that_meshs_devices(statics):
@@ -697,6 +729,7 @@ def test_a_program_called_under_another_mesh_of_its_shape_runs_on_that_meshs_dev
         np.testing.assert_array_equal(np.asarray(ran), given * scale + 1)
 
 
+@COMPILE_ONLY
 def test_a_programs_spilling_triton_launch_is_recorded_with_no_mosaic_kernel_beside_it():
     """A program of one Pallas-Triton launch, no Mosaic GPU kernel in it, compiled for a compile-only H100:
     its launch's spill (a row softmax of a 64 x 512 block at one warp, 1024 values a thread) is read from its
@@ -762,6 +795,7 @@ class TwiceUncounted(Uncounted):
             config.block_n == 256 or len(report.refused_launches()) >= 2)
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_launch_spilling_at_two_configs_steps_down_alone_and_its_program_compiles_whole_once_more():
     """A program of one launch whose kernel spills at its first two configs, compiled for a compile-only H100
@@ -784,6 +818,7 @@ def test_a_launch_spilling_at_two_configs_steps_down_alone_and_its_program_compi
     assert compiles.count == 1
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_program_lowered_before_another_compile_refused_its_config_is_relowered_past_it():
     """Two lowerings of one step through a launch whose first tile spills (`Uncounted`), both traced before
@@ -819,6 +854,7 @@ def _aside(devices, lowered_first, relowered):
         return report.misses(), report.refused_launches(), retries
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_an_aside_miss_is_recorded_stepped_in_the_recording_that_queued_its_launch():
     """A program whose launch spills at its first tile (`Uncounted`), lowered with its launches certified
@@ -838,6 +874,7 @@ def test_an_aside_miss_is_recorded_stepped_in_the_recording_that_queued_its_laun
     assert tuple(queued[0].missed) == misses, (queued[0].missed, misses)
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
     """The same program's first lowering within a `refusals` scope of its own: the launch it queued refuses
@@ -854,6 +891,7 @@ def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
     assert not misses and not refused and not retries, (misses, refused, retries)
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_launch_taken_in_two_recordings_of_one_aside_block_records_its_miss_in_each():
     """The same program lowered twice within one block certifying aside, each lowering within a recording of
@@ -883,6 +921,7 @@ class SpillingOnly(Uncounted):
         return Uncounted.candidate(self, ba, config, target) and not report.refused_launches()
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_program_whose_launch_spills_at_every_config_left_is_refused_not_kept():
     """A program whose launch spills at every config its derivation has, compiled for a compile-only H100
@@ -913,6 +952,7 @@ class TwoKernels(grouped_matmul.MosaicGmm):
         return whole.at[: half.shape[0]].add(half), residuals
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_two_kernels_of_one_launch_are_two_names_each_certified_on_its_own():
     """A launch of two kernels its template names alike (the grouped forward and its re-launch over half its
@@ -938,6 +978,7 @@ def test_two_kernels_of_one_launch_are_two_names_each_certified_on_its_own():
     assert set(alone) == set(names), alone
 
 
+@CERTIFIES_AT_RUN
 @lowers("sm90")
 def test_a_launch_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu():
     """A launch traced under a compile-only H100's mesh (`jax.set_mesh`, as a trainer traces its step's
@@ -960,6 +1001,7 @@ def test_a_launch_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu
     assert certified.kernels, certified
 
 
+@CERTIFIES_AT_RUN
 @lowers("sm90")
 def test_a_runs_launch_traced_outside_its_mesh_is_certified_on_the_gpu_it_targets():
     """A launch a run traces outside its mesh (its start's, `Trainer._started`) is certified on the GPU the
@@ -979,6 +1021,7 @@ def test_a_runs_launch_traced_outside_its_mesh_is_certified_on_the_gpu_it_target
     assert certified.device == devices.devices.flat[0], certified.device
 
 
+@CERTIFIES_AT_RUN
 @pytest.mark.gpu(reason="certifies and runs a kernel on this host's GPU")
 def test_a_plain_jit_on_this_gpu_certifies_its_launch_there_and_runs():
     """A Dew kernel called under a plain jit on this GPU, no mesh and no run naming a target, is certified
@@ -998,6 +1041,7 @@ def test_a_plain_jit_on_this_gpu_certifies_its_launch_there_and_runs():
     assert certified and {each.device for each in certified} == {jax.devices()[0]}, certified
 
 
+@CERTIFIES_AT_RUN
 @lowers("sm90")
 def test_a_launchs_rungs_traced_under_a_compile_only_gpus_mesh_are_certified_on_that_gpu():
     """A launch's configs certified in turn (`report.certified`, a ladder's rungs past its first) under a
@@ -1040,6 +1084,7 @@ def test_two_kernels_of_one_name_and_launch_are_refused_not_read_as_one():
         report.kernel_bodies([call("a"), call("b")])
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_one_kernel_called_from_two_places_compiles_alone_once():
     """A Mosaic GPU kernel and a Pallas-Triton kernel each called from two places under two name scopes, its
@@ -1076,6 +1121,7 @@ def test_one_kernel_called_from_two_places_compiles_alone_once():
     assert alone is not None and len(alone) == 2 and all(found.error is None for found in alone.values())
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 @pytest.mark.parametrize("constant", [False, True], ids=["no-constant", "a-constant"])
 def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(constant):
@@ -1114,6 +1160,7 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(consta
     launched = [(binary.kernel, binary.launch) for binary in found if binary.launch]
     assert launched == [("dew_added", "0123456789")]
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_program_its_caller_owns_is_released_with_its_caller():
     """A program over a closure or a bound method its caller owns (`owned_program`), as a run's placement
     and its host phases compile, keeps no reference of Dew's: once the caller lets it go, the owner the
@@ -1144,6 +1191,7 @@ def test_a_program_its_caller_owns_is_released_with_its_caller():
     assert program(jnp.sum) is program(jnp.sum)
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_fetched_program_runs_the_executable_of_its_first_call():
     """A program a host loop calls every step (`Fetched`) answers as the program does for arguments of its
     first call's shapes and dtypes, however their values change; arguments of another shape are refused
@@ -1160,6 +1208,7 @@ def test_a_fetched_program_runs_the_executable_of_its_first_call():
         Fetched(owned_program(lambda scale, x: scale * x, static_argnums=0))
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_fetched_step_called_in_another_trace_context_runs_that_contexts_program():
     """A fetched step (`Fetched`) keeps an executable for each trace context it is called in, as the program
     compiles one for each: a step first run in float32 and then with 64-bit types on runs the program that
@@ -1172,6 +1221,7 @@ def test_a_fetched_step_called_in_another_trace_context_runs_that_contexts_progr
         assert widened(narrow).dtype == jnp.float64
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_program_within_another_takes_the_enclosing_programs_options():
     """A program called within another trace (a kernel's own program inside a step) is the enclosing
     program's part and compiles under its options, as JAX takes compiler options on the outermost jit
@@ -1181,6 +1231,7 @@ def test_a_program_within_another_takes_the_enclosing_programs_options():
         outer = owned_program(lambda x: inner(x) + 1.0)
         np.testing.assert_array_equal(np.asarray(outer(jnp.ones(3))), np.full(3, 3.0))
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_program_under_an_eager_transformation_compiles_under_its_own_options():
     """A program called under an eager `jax.vmap` or `jax.grad`, which no enclosing program compiles,
     compiles under its own options as a direct call does, so an option XLA does not know is refused
@@ -1365,6 +1416,7 @@ def widest(derived):
     return dataclasses.replace(derived, block_n=256, grid_block_n=columns // 256, stages=2)
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_tuner_times_no_candidate_the_gpus_assembler_refuses():
     """The configs a measuring tuner times (`tuning._candidates`) are those its launch's certification holds
