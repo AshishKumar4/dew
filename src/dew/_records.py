@@ -301,7 +301,7 @@ default that `dew.decision.SegmentLayout` holds otherwise (a joint row's 16384 t
 framing it fills where a record states none, `SegmentLayout.joint_row`)."""
 
 
-def class_record(value: Mapping[str, object]) -> tuple[str, Mapping[str, object]] | None:
+def class_record(value: Mapping[typing.Any, object]) -> tuple[str, Mapping[str, object]] | None:
     """The class a class record, `{"class": ..., "fields": {...}}`, names and its fields (a record with no
     fields may leave them out); None for a mapping that is not one: data that names a class is no record."""
     name, fields = value.get("class"), value.get("fields", {})
@@ -319,8 +319,8 @@ def class_records(value: JSON, rewrite: Callable[[str, Mapping[str, JSON], bool]
     (row 11838): `earlier_layout`'s, `dew.config.earlier.earlier_retired`'s."""
     def walked(held: JSON, *, root: bool = False) -> JSON:
         if isinstance(held, list):
-            items = [walked(item) for item in held]
-            return held if all(new is old for new, old in zip(items, held, strict=True)) else items
+            elements = [walked(element) for element in held]
+            return held if all(new is old for new, old in zip(elements, held, strict=True)) else elements
         if not isinstance(held, Mapping):
             return held
         entries = {key: walked(entry) for key, entry in held.items()}
