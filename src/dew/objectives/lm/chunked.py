@@ -1241,13 +1241,15 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
         mesh.shape[axis] for axis in axes) * size * hidden.dtype.itemsize
         < table.size * table.dtype.itemsize)
 
-    def local(hidden, table, targets, excluded, cap, columns, *reference):
+    def local(hidden, table, targets, excluded, cap, columns, *gathered):
         if split:
             return _vocabulary_split(hidden, whole(table, None, ((), widths))[0], targets, excluded, cap,
                                      columns, group, head, column_logits)
         table, columns = whole(table, columns, (group, widths))
         if other is not None:
-            return head(hidden, table, targets, excluded, cap, columns, whole(*reference[0], other))
+            (reference_table, reference_columns), = gathered
+            return head(hidden, table, targets, excluded, cap, columns,
+                        whole(reference_table, reference_columns, other))
         if sums:
             total, outputs = head(hidden, table, targets, excluded, cap, columns)
             return total.reshape(1), outputs

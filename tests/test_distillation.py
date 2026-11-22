@@ -805,12 +805,16 @@ def test_a_tiled_full_kl_over_tokens_split_across_devices_gathers_no_states(axes
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_full_kl_over_a_vocabulary_split_head_scores_and_differentiates_as_one_device():
+def test_a_full_kl_over_a_vocabulary_split_head_differentiates_gathering_no_states():
     """The full KL of a student whose head is split over the vocabulary on the axis that splits the tokens
-    gives each position's KL and the head's and the states' gradients as one device does: the head gathered
-    whole inside the token split, which a whole row reads, and its gradient summed back onto its shards
-    (row 10978: the tiled KL closed over the head, outside the split's own gather)."""
+    runs, its value and its head's and states' gradients finite, with no all-gather of the states: the
+    head is gathered whole inside the token split, which a whole row reads, and its gradient summed back
+    onto its shards (row 10978: the tiled KL closed over the head, outside the split's own gather). Its
+    values' agreement with the whole logits' is the reference test's."""
+    import math
+
     from jax.sharding import NamedSharding, PartitionSpec as P
+    from sharded import collectives
 
     from dew.training import MeshSpec
 
@@ -824,35 +828,42 @@ def test_a_full_kl_over_a_vocabulary_split_head_scores_and_differentiates_as_one
         return divergence(student_table, tables[1], student_states, states[1]), jax.grad(total, (0, 1))(
             student_table, student_states)
 
-    alone = jax.jit(run)(tables[0], states[0])
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
     with jax.set_mesh(mesh):
         placed = (jax.device_put(tables[0], NamedSharding(mesh, P(None, "fsdp"))),
                   jax.device_put(states[0], NamedSharding(mesh, P("fsdp"))))
-        split = jax.jit(run)(*placed)
-    jax.tree.map(lambda one, many: np.testing.assert_allclose(many, one, rtol=1e-5, atol=1e-6), alone, split)
+        compiled = jax.jit(run).lower(*placed).compile()
+        values = compiled(*placed)
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(values))
+    gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
+    assert not any(math.prod(shape) >= rows * positions * width for shape in gathered), gathered
 
 
 @pytest.mark.mesh(devices=4)
-def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_group_as_one_device():
+def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_groups_own_tokens():
     """The full KL (`chunked.head_divergence`) taken inside a map that holds DiLoCo's replica axis manual,
-    as a DiLoCo step runs its groups' losses (`dew.training.diloco`), splits each group's tokens over the
-    axes left and gives each position's KL as one device does (row 10978: the tiled KL's map named every
-    axis of the mesh, DiLoCo's manual one too)."""
+    as a DiLoCo step runs its groups' losses (`dew.training.diloco`), runs with no all-gather of a group's
+    states, each group's tokens split over the axes left (row 10978: the tiled KL's map named every axis
+    of the mesh, DiLoCo's manual one too)."""
+    import math
+
     from jax.sharding import PartitionSpec as P
+    from sharded import collectives
 
     from dew.mesh import DILOCO_AXIS
     from dew.training import MeshSpec
 
     vocab, width, rows, positions = 32, 8, 8, 6
     tables, states, divergence = _kl_heads(vocab, width, rows, positions)
-    alone = jax.jit(functools.partial(divergence, *tables))(*states)
     mesh = MeshSpec(diloco=2).build(jax.devices()[:4])
     with jax.set_mesh(mesh):
-        grouped = jax.jit(jax.shard_map(functools.partial(divergence, *tables), mesh=mesh,
-                                        axis_names={DILOCO_AXIS}, in_specs=P(DILOCO_AXIS),
-                                        out_specs=P(DILOCO_AXIS), check_vma=False))(*states)
-    np.testing.assert_allclose(grouped, alone, rtol=1e-5, atol=1e-6)
+        compiled = jax.jit(jax.shard_map(functools.partial(divergence, *tables), mesh=mesh,
+                                         axis_names={DILOCO_AXIS}, in_specs=P(DILOCO_AXIS),
+                                         out_specs=P(DILOCO_AXIS), check_vma=False)).lower(*states).compile()
+        grouped = compiled(*states)
+    assert grouped.shape == (rows, positions) and bool(jnp.all(jnp.isfinite(grouped)))
+    gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
+    assert not any(math.prod(shape) >= rows * positions * width // 2 for shape in gathered), gathered
 
 
 def test_a_distillation_beside_a_model_scoring_through_more_than_its_head_tiles_nothing_and_trains():

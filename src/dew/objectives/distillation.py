@@ -368,8 +368,9 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         student_variables = self.student_variables(params)
         tables = None
         if self.divergence == "full" and head_tile_of(self.student) is not None:
-            heads = (self.student.output_table(student_variables), self.teacher.output_table(params[TEACHER]))
-            tables = None if None in heads else heads
+            own = self.student.output_table(student_variables)
+            theirs = self.teacher.output_table(params[TEACHER])
+            tables = None if own is None or theirs is None else (own, theirs)
         whole = self.divergence == "full" and tables is None
         statistics, aux, student = self.student.predict(
             student_variables, batch, self._student_step(step), train=step.training,
