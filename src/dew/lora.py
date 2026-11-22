@@ -1255,7 +1255,7 @@ def _kernel_shape(variables: Variables, path: Path) -> tuple[int, ...]:
     codes = _site_codes(variables, path)
     held: Mapping = variables
     for name in path:
-        held = held.get(name, {}) if isinstance(held, Mapping) else {}
+        held = held.get(name, {})
     if codes is None and "kernel" not in held:
         raise ValueError(f"{'/'.join(map(str, path))}'s kernel is packed (a checkpoint's NVFP4 codes "
                          "served as they are, `packed_weights`), which an adapter does not wrap: load the "
