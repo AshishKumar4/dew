@@ -1734,9 +1734,10 @@ def _modelopt_as_nvfp4(tensors: Mapping[str, Stored], name: str, *, method: str 
     `[in / 16, out]`, its global scale the tensor's; for a load that reads no values (`weights=False`), their
     shapes and dtypes (`jax.ShapeDtypeStruct`), so it holds the tree a load of values holds. None for an FP8
     or NVFP4 weight, whose stored input scale its product quantizes its input under
-    (`dew.interop.quantized_loads.input_quantization`), and for an expert's (`.experts.` in its name, a
-    stack's member, which Dew packs as a bank whole or not at all)."""
-    if _modelopt_algo(name, method, layers) != 'W4A16_NVFP4' or '.experts.' in name:
+    (`dew.interop.quantized_loads.input_quantization`), and for an expert's (`experts.<k>.` in its name,
+    `v_experts.<k>.` among them, a stack's member, which Dew packs as a bank whole or not at all; a shared
+    expert's stays packable)."""
+    if _modelopt_algo(name, method, layers) != 'W4A16_NVFP4' or re.search(r'experts\.\d+\.', name):
         return None
     stored = (unread.held(tensors[part]) for part in (name, *_modelopt_layer_parts(name, 'W4A16_NVFP4')))
     packed = next(stored)

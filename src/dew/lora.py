@@ -1253,7 +1253,9 @@ def _kernel_shape(variables: Variables, path: Path) -> tuple[int, ...]:
     """The shape of the kernel of the module at `path`, its own or a frozen FP8 site's as its codes
     decode (`decoded_frozen_fp8`), read without decoding them."""
     codes = _site_codes(variables, path)
-    held = _node(variables, path)
+    held: Mapping = variables
+    for name in path:
+        held = held.get(name, {}) if isinstance(held, Mapping) else {}
     if codes is None and "kernel" not in held:
         raise ValueError(f"{'/'.join(map(str, path))}'s kernel is packed (a checkpoint's NVFP4 codes "
                          "served as they are, `packed_weights`), which an adapter does not wrap: load the "

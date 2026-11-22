@@ -232,7 +232,8 @@ def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refu
     review): its load without values (`weights=False`, a resume's) holds the tree a load of its values holds,
     every packed kernel's leaves at their shapes and dtypes; served, its attention's projections pack into
     no group (each member's kernel is packed, its bias a parameter), its logits finite; and an adapter over
-    a packed kernel is refused by name."""
+    a packed kernel is refused by name, a biased one's and an unbiased one's, whose layer holds no
+    parameter at all."""
     from dew.lora import LoRA
     from dew.nn.projections import projection_groups
 
@@ -245,6 +246,7 @@ def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refu
     assert projection_groups(packed.model, packed.variables) == ()
     ids = jnp.asarray(np.random.default_rng(3).integers(0, 96, (2, 8)), jnp.int32)
     assert np.isfinite(np.asarray(packed.model.apply(packed.variables, ids), np.float32)).all()
-    with pytest.raises(ValueError):
-        packed.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
+    for module in ("q_proj", "gate_proj"):
+        with pytest.raises(ValueError):
+            packed.adapt(LoRA(rank=2, modules=(module,)), key=0)
 
