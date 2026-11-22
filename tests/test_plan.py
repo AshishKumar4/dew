@@ -416,9 +416,13 @@ def test_a_trainer_built_after_the_process_releases_its_programs_traces_its_step
     from dew.telemetry.compiles import Compiles
 
     free(monkeypatch, LIMIT)
+    # One optimizer for every trainer, so each states the step the first traced (`Trainer._step_key`).
+    sgd = optax.sgd(1e-2)
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
 
     def traced() -> int:
-        trainer = lm()
+        trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), sgd, key=jax.random.key(0)))
         state, _, _ = trainer.place()
         with Compiles("step") as compiles:
             trainer.compile(state, BATCH)
