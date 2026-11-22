@@ -18,6 +18,8 @@ import functools
 from collections.abc import Iterator
 from pathlib import Path
 
+import lint_scopes as scopes
+
 DERIVATIVE_MAKERS = frozenset({"custom_jvp", "custom_vjp", "surrogate", "declared_derivative",
                                "declared_tangent", "linear_tangent"})
 """What makes a custom derivative (SLOP028): JAX's own, and Dew's (`dew.nn.derivatives`; a declaring builder's
@@ -30,21 +32,17 @@ def _maker_of(node: ast.expr, given: tuple = ()) -> str | None:
     the algebra pass reads it (docs/design/algebra.md §1.3); `given`, a partial's arguments past the
     function."""
     if isinstance(node, ast.Call):
-        name = _call_name(node.func)
+        name = scopes.last(node.func)
         if name == "partial" and node.args:
             return _maker_of(node.args[0], tuple(node.args[1:]))
         if name in ("declared_derivative", "declared_tangent"):
             return _maker_of(node.func, tuple(node.args))
         return _maker_of(node.func)
-    name = _call_name(node)
+    name = scopes.last(node)
     if name in ("declared_derivative", "declared_tangent"):
         kind = given[0] if given else None
-        return f"{name}:{_call_name(kind.func) if isinstance(kind, ast.Call) else None}"
+        return f"{name}:{scopes.called(kind) or None}"
     return name if name in DERIVATIVE_MAKERS - {"linear_tangent"} else None
-
-
-def _call_name(node: ast.expr) -> str | None:
-    return getattr(node, "attr", None) or getattr(node, "id", None)
 
 
 def derivative_seams(relative: str, tree: ast.Module
@@ -63,7 +61,7 @@ def derivative_seams(relative: str, tree: ast.Module
         """The `contracted(...)` call wrapping the call `node` (`contracted(...)(node)`), if any."""
         outer = parents.get(node)
         if (isinstance(outer, ast.Call) and outer.args == [node] and isinstance(outer.func, ast.Call)
-                and _call_name(outer.func.func) == "contracted"):
+                and scopes.last(outer.func.func) == "contracted"):
             return outer.func
         return None
 
@@ -73,10 +71,10 @@ def derivative_seams(relative: str, tree: ast.Module
         holder = parents.get(call)
         if (isinstance(call.func, ast.Call) or id(call) in decorators
                 or (isinstance(holder, ast.Call) and holder.args[:1] == [call]
-                    and _call_name(holder.func) == "partial" and _maker_of(holder) is not None)):
+                    and scopes.last(holder.func) == "partial" and _maker_of(holder) is not None)):
             # A maker the partial around it stands for is the partial's: the outer call is the one seam.
             return None
-        return "linear_tangent" if _call_name(call.func) == "linear_tangent" else _maker_of(call)
+        return "linear_tangent" if scopes.last(call.func) == "linear_tangent" else _maker_of(call)
 
     def named(call: ast.Call, scope: list[str], maker: str) -> str:
         """`call`'s seam name: the name its result is assigned to, through a contract wrapping it or a call
@@ -99,7 +97,7 @@ def derivative_seams(relative: str, tree: ast.Module
                     if makers:
                         contract = next((decorator for decorator in child.decorator_list
                                          if isinstance(decorator, ast.Call)
-                                         and _call_name(decorator.func) == "contracted"), None)
+                                         and scopes.last(decorator.func) == "contracted"), None)
                         yield ".".join([*scope, child.name]), makers[0], child, contract
                 yield from walk(child, [*scope, child.name])
                 continue

@@ -284,7 +284,9 @@ def test_consumers_staging_over_their_rings_write_only_past_every_consumers_read
     p, x = _fed_operands()
     # A race is recorded and the kernel runs on (`on_race="warn"`), so each arm reads the detector's verdict.
     races = plgpu.InterpretGPUParams(detect_races=True, on_race="warn")
-    (parts,) = _fed_staged_over_rings(p, x, interpret=races, ordered=True)
+    # Each arm is run whole before its verdict is read: a dispatch returns before the kernel ran, and the
+    # detector's state is the last kernel's.
+    (parts,) = jax.block_until_ready(_fed_staged_over_rings(p, x, interpret=races, ordered=True))
     assert not interpreter.get_races().races_found
     np.testing.assert_array_equal(np.asarray(parts).sum(axis=0), _fed_expected(p, x)[0])
     jax.block_until_ready(_fed_staged_over_rings(p, x, interpret=races, ordered=False))
