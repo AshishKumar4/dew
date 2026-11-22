@@ -309,3 +309,37 @@ def test_a_stream_with_no_batch_ends_its_run_where_it_starts_its_final_checkpoin
     named = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
     with pytest.raises(ValueError):
         Trainer(named, optax.sgd(0.1), key=jax.random.key(0)).fit(empty, steps=5, log_every=100)
+
+
+def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_its_run_holds(tmp_path,
+                                                                                          monkeypatch):
+    """A fit compiled ahead that evaluates midway states a need admitting each of its evaluation's programs
+    with the run's state beside it, as its run holds the state while it scores (row 8710: the need admitted
+    every program compiled beside the step with nothing beside it, so a GPU admitted at it ran out of memory
+    at an evaluation of batches larger than its step's, where the run's own admission refused it). A model
+    1024 wide, whose state outweighs its step's other bytes, and an evaluation of 32 times its step's rows:
+    its evaluation, alone, needs less than its step, and beside the state more (FS-8710-NEEDW: 111 against
+    163 MB, and 193)."""
+    from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune, gpus
+    from token_support import token_rows
+
+    from dew.training import MeshSpec
+    from dew.training.ahead import compile_ahead, stand_in_gpus
+    from dew.training.memory import admitted
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    scored = 32 * BATCH
+    validation = {"val": Memory(token_rows(VOCAB, 2 * scored, SEQ_LEN + 1, seed=1)).batch(scored)}
+    plain = compile_ahead(fine_tune(MeshSpec().build(gpus("sm90")), width=1024), batch)
+    evaluating = compile_ahead(fine_tune(MeshSpec().build(gpus("sm90")), width=1024), batch,
+                               fit={"steps": 4, "validation": validation, "eval_every": 2})
+    evaluations = [evaluating.starts[digest] for digest in set(evaluating.starts) - set(plain.starts)]
+    assert evaluations and evaluating.built.memory is not None
+    with stand_in_gpus(jax.devices("cpu")[:1], evaluating.built.memory, share=1.0) as stood:
+        for program in evaluations:
+            memory = program.memory
+            assert memory is not None
+            spare = admitted(stood, memory.argument, memory.output - memory.alias + evaluating.argument_bytes,
+                             memory.temp)
+            assert spare is not None and spare >= 0, (spare, memory, evaluating.argument_bytes)

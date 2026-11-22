@@ -1139,34 +1139,6 @@ def test_a_step_built_for_a_whole_gpu_loads_where_its_programs_fit_and_is_refuse
     assert len(refused) == 1 and str(need) in refused[0], refused
 
 
-def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_its_run_holds(tmp_path,
-                                                                                          monkeypatch):
-    """A fit compiled ahead that evaluates midway states a need admitting each of its evaluation's programs
-    with the run's state beside it, as its run holds the state while it scores (row 8710: the need admitted
-    every program compiled beside the step with nothing beside it, so a GPU admitted at it ran out of memory
-    at an evaluation of batches larger than its step's, where the run's own admission refused it)."""
-    from dew.data import Memory
-    from dew.training.ahead import compile_ahead, stand_in_gpus
-    from dew.training.memory import admitted
-
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    scored = 16 * BATCH
-    validation = {"val": Memory(token_rows(VOCAB, 2 * scored, SEQ_LEN + 1, seed=1)).batch(scored)}
-    plain = compile_ahead(fine_tune(MeshSpec().build(gpus("sm90"))), batch)
-    evaluating = compile_ahead(fine_tune(MeshSpec().build(gpus("sm90"))), batch,
-                               fit={"steps": 4, "validation": validation, "eval_every": 2})
-    evaluations = [evaluating.starts[digest] for digest in set(evaluating.starts) - set(plain.starts)]
-    assert evaluations and evaluating.built.memory is not None
-    with stand_in_gpus(jax.devices("cpu")[:1], evaluating.built.memory, share=1.0) as stood:
-        for program in evaluations:
-            memory = program.memory
-            assert memory is not None
-            spare = admitted(stood, memory.argument, memory.output - memory.alias + evaluating.argument_bytes,
-                             memory.temp)
-            assert spare is not None and spare >= 0, (spare, memory, evaluating.argument_bytes)
-
-
 def test_a_build_of_compile_only_gpus_holds_their_stated_memory_and_refuses_a_device_holding_less():
     """A build of compile-only GPUs (`BuildTarget.of`) holds the allocator's limit their stated memory gives
     (`device_memory`), as a build of attached GPUs holds theirs: a device of a lower limit is refused naming
