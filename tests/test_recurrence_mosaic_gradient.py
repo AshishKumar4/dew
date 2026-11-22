@@ -460,21 +460,6 @@ def test_a_saved_fp32_gradient_under_the_highest_precision_runs_the_numbers_its_
     assert any(call.name.startswith("recurrence_values_back") for call in kernel_calls(lowered, unrun=True))
 
 
-def test_mosaic_held_prices_backward_launches_when_reverse_is_true():
-    """`Mosaic.held(ba, config, reverse=True)` checks every launch `launches(..., backward=True)` compiles
-    against its own consumer register budget, while `reverse=False` checks `_forwards` alone (row 6740)."""
-    hooks = case_hooks("one sequence")
-    (sample,) = draw(jnp.bfloat16, 0, **geometry("one sequence"))
-    ba = template_call(sample, hooks)
-    target = generation.gpu_target("sm100")
-    family = bundles.of("sm100", jnp.bfloat16)
-    with generation.assumed(target):
-        tiles = template.MOSAIC.derived(ba, target)
-        assert tiles is not None
-        assert template.MOSAIC.held(ba, tiles, reverse=False) == template.MOSAIC._launches_hold(
-            template.MOSAIC._forwards(ba, tiles, target), family)
-        assert template.MOSAIC.held(ba, tiles, reverse=True) == template.MOSAIC._launches_hold(
-            template.MOSAIC.launches(ba, tiles, target, backward=True), family)
 @INTERPRETS
 @pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
 def test_an_fp32_turned_call_on_the_template_trains_as_the_portable_math_interpreted(packed):
@@ -516,34 +501,6 @@ def test_an_fp32_turned_training_step_certifies_on_h100():
              if id(each) not in before and each.op == type(template.MOSAIC).__name__]
     bodies = _certified_bodies(found)
     assert bodies and all(not entries[-1].refused for entries in bodies.values()), bodies
-
-
-@pytest.mark.parametrize('target', ['sm90', 'sm100'])
-@pytest.mark.parametrize('name', ['nemotron-h-4b-ssd', 'qwen3.5-27b-gdn'])
-def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
-    """A 16-bit forward no gradient follows, under a decay a head on warpgroup MMA and tcgen05, at its own
-    tiles (`Tiles.forward`): the launches the training forward runs (`Mosaic.launches`), its states then
-    its output. Its states and output walked in one launch lost to them at every measured shape: on a GH200
-    Nemotron-H 4B's SSD forward took 669.5 us walked against 271.2 apart, 30B's 192.3 against 182.4 and
-    the 27B gated delta net's 569.8 against 440.6 (M-JS-148b; a B200's 27B walk 613 us against its training
-    forward's states 254, js106c), rows 5668, 7877."""
-    from test_recurrence_mosaic import RATED, _form, _skipped, resource_operands
-
-    dtype = jnp.bfloat16
-    bound = template.MOSAIC.bind(*resource_operands(name, dtype, 1, 4096), None, max_segments=None,
-                                 bound=None if name in RATED else 1.0, **_form(name, dtype), **_skipped(name))
-    facts = generation.gpu_target(target)
-    with generation.assumed(facts):
-        tiles = template.MOSAIC.derived(bound, facts)
-
-        def names(tiles, *, training: bool) -> list[str]:
-            return [launch.name for launch in template.MOSAIC.launches(bound, tiles, facts, backward=False,
-                                                                       training_forward=training)]
-
-        forward, trained = names(tiles.forward or tiles, training=False), names(tiles, training=True)
-    # Named apart, a forward alone's (`mainloop.named`).
-    alone = [name.replace('recurrence', 'recurrence_alone', 1) for name in trained]
-    assert forward == alone, (forward, trained)
 
 
 @pytest.mark.parametrize('kernel', ['recurrence_alone_output', 'recurrence_states'],

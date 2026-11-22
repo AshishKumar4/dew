@@ -96,17 +96,17 @@ class _Launch(tuning.KernelOp):
         return dataclasses.replace(tiles, bm=blocks[0], bn=blocks[1], bk=blocks[2], heads=heads)
 
     def _get_heuristics_config(self, ba) -> Tiles:
-        operand = _operand(ba)
-        dtype = "float32" if operand is None or jnp.dtype(operand.dtype).itemsize == 4 else "bfloat16"
-        return self._fitted(ba, self.PICKS[dtype])
+        return self._fitted(ba, self.PICKS[_picked(ba)])
 
     def variants(self, ba) -> tuple[Tiles, ...]:
-        """Its derived config, then mamba_ssm's own autotuner's picks on an A100 for its kernel (`MEASURED`),
-        fitted to the call and the summing kernels' heads the derived config's: a tuning run's candidates
-        (`tuning.tune`), each held to the port's gate (tests/test_mamba_ssd.py)."""
+        """Its derived config, then, for a call picked as a bf16 one (`_picked`), the scan `MEASURED` timed,
+        mamba_ssm's own autotuner's picks on an A100 for its kernel, fitted to the call and the summing
+        kernels' heads the derived config's: a tuning run's candidates (`tuning.tune`), each held to the
+        port's gate (tests/test_mamba_ssd.py, whose bf16 case pins each). Offered an fp32 call, a pick no
+        run measured at fp32 took the tuning run's choice past every gate the fp32 cases hold (row 10882)."""
         derived = ba.heuristics_config
-        found = (self._fitted(ba, dataclasses.replace(tiles, heads=derived.heads))
-                 for tiles in MEASURED.get(self.NAME, ()))
+        measured = MEASURED.get(self.NAME, ()) if _picked(ba) == "bfloat16" else ()
+        found = (self._fitted(ba, dataclasses.replace(tiles, heads=derived.heads)) for tiles in measured)
         return tuple(dict.fromkeys((derived, *found)))
 
 
@@ -127,6 +127,13 @@ launch's BLOCK_SIZE_M, _N and _K (`Tiles`' reading), warps and stages at Nemotro
 chunks, 96 heads of 80, a state of 128) and 30B's (128-token chunks, 64 heads of 64), M-JS-155-a100. The
 port's derived configs (an H100's picks, `_picks`) ran its training 1.54 and 1.17 times mamba_ssm's there
 (M-JS-144-a100); these are its tuning run's candidates (`_Launch.variants`), no plain run's."""
+
+
+def _picked(ba) -> str:
+    """The operand dtype a call's configs are picked for (`_Launch.PICKS`, `MEASURED`): fp32 where its
+    operand is fp32 or it has none (the step's kernels), bf16 for a 16-bit one, fp16 taking bf16's."""
+    operand = _operand(ba)
+    return "float32" if operand is None or jnp.dtype(operand.dtype).itemsize == 4 else "bfloat16"
 
 
 def _operand(ba):

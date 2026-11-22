@@ -57,6 +57,7 @@ from interval_certificates import (
     outward,
     point,
     staged,
+    two_parts_reach,
     where,
     within,
 )
@@ -601,11 +602,12 @@ def _through(operands: tuple, starts, last: int) -> tuple:
 
 def _route_forward(route, operands: tuple, form: str, *, inference: bool = False) -> tuple:
     """The forward of `route` over `operands` as a training step runs it, the template's (`chosen`):
-    `(output, final memory, tiles, trained)`. The training forward, the primal of the route's VJP, where
-    the template trains the call (`Mosaic.trains`, `trained`) and the `inference` forward is not asked; else
-    the inference forward: a training step takes another kernel for a call the template does not train (an
-    fp32 call's backward on an A100's registers, 264 to 328 a thread). `form` names the options `route`
-    closes over, which its launches' labels carry."""
+    `(output, final memory, tiles, trained, bound)`, `bound` the template op's bound arguments, the options
+    it took (`unit_keys`, ...). The training forward, the primal of the route's VJP, where the template
+    trains the call (`Mosaic.trains`, `trained`) and the `inference` forward is not asked; else the inference
+    forward: a training step takes another kernel for a call the template does not train (an fp32 call's
+    backward on an A100's registers, 264 to 328 a thread). `form` names the options `route` closes over,
+    which its launches' labels carry."""
     import jax
 
     (o, final), launches = launched(jax.jit(route), operands, f"inference forward, {form}")
@@ -617,7 +619,25 @@ def _route_forward(route, operands: tuple, form: str, *, inference: bool = False
         (o, final), launches = launched(trained_forward, operands, f"training forward, {form}")
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
-    return o, final, tiles, trained
+    return o, final, tiles, trained, bound
+
+
+def witnessed_route(delta: bool, *, scale: float, rounded: bool, starts=None,
+                    max_segments: int | None = None):
+    """The route a witnessed call runs: under the `delta` rule the chunked op over the draws' unit keys,
+    their sigmoid write gates bounded by 1 (`recurrence.Hooks.write_bound`) as layers declare; without it the
+    template's op as the SSD's route calls it (`recurrence_chunk.template_rule`, its output in the operands'
+    dtype)."""
+    from dew.nn.kernels import recurrence_chunk
+
+    def route(*x):
+        if not delta:
+            return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
+                                                  delta=False, wide=False, rounded=rounded)
+        return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
+                                                       write_bound=1.0)
+
+    return route
 
 
 def route_rounding(delta: bool, dtype) -> bool:
@@ -700,25 +720,17 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     import jax
     import jax.numpy as jnp
 
-    from dew.nn.kernels import generation, recurrence_chunk
+    from dew.nn.kernels import generation
 
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
     scale = k.shape[-1] ** -0.5 if delta else 1.0
-    # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
-    write_bound = 1.0 if delta else None
     if rounded is None:
         rounded = route_rounding(delta, dtype)
     family = mainloop.issued(dtype)[0]
     wide = jnp.dtype(dtype) == jnp.float32
     given, held, write = call_form(family, wide=wide, delta=delta, rounded=rounded)
-
-    def route(*x):
-        if not delta:
-            return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
-                                                  delta=False, wide=False, rounded=rounded)
-        return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
-                                                       write_bound=write_bound)
+    route = witnessed_route(delta, scale=scale, rounded=rounded, starts=starts, max_segments=max_segments)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         # The options the call's programs close over name their launches (`launched`), the starts' by digest.
@@ -727,7 +739,9 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
             array_fingerprint(hasher, np.asarray(starts))
         form = (f"delta {delta}, rounded {rounded}, inference {inference}, segments {max_segments}, starts "
                 f"{None if starts is None else hasher.hexdigest()[:16]}")
-        o, final, tiles, trained = _route_forward(route, operands, form, inference=inference)
+        o, final, tiles, trained, bound = _route_forward(route, operands, form, inference=inference)
+        # Whether the call's own pairs fold each decay into the row first, as the op took it.
+        unit_keys = bound.arguments.get("unit_keys", False)
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
         tiles = tiles if trained and not inference else tiles.forward or tiles
@@ -738,7 +752,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         program = jax.jit(lambda *x: chunk_forward.kept_forward(
             *x[:6], tiles=tiles, starts=x[6], max_segments=max_segments, scale=scale, delta=delta,
             rounded=rounded, family=mainloop.issued(jnp.result_type(*x[:3]))[0],
-            interpret=generation.backend() != "gpu", unit_keys=write_bound is not None))
+            interpret=generation.backend() != "gpu", unit_keys=unit_keys))
 
         def kept(*x, starts):
             return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
@@ -787,7 +801,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                write=write, held=held, given=given, wide=bool(wide),
                pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
-               tf32=tf32_conversion(family), trained=bool(trained), unit_keys=write_bound is not None,
+               tf32=tf32_conversion(family), trained=bool(trained), unit_keys=unit_keys,
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -1208,10 +1222,9 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     dv = fp32(mul(du, point(beta)), lane) if keyed_gate else du
     kept = Iv(np.full(step.grad.lo.shape, raised.lo[-1]), np.full(step.grad.lo.shape, raised.hi[-1]))
     # The decayed output gradient fp32 in two bf16 parts against the queries (fla's split product,
-    # `mainloop_backward._reverse`): the parts' sum within 2^-16 of it.
-    read = fp32(mul(do, rows), lane)
-    reach = 2.0 ** -16 * np.maximum(np.abs(read.lo), np.abs(read.hi))
-    reads = dot(tr(q), outward(read.lo - reach, read.hi + reach), lane, parts=(given, 2))
+    # `mainloop_backward._reverse`): the parts' sum as two parts hold it (`staged`'s `two_parts_reach`).
+    read = staged(fp32(mul(do, rows), lane), dataclasses.replace(lane, held=2))
+    reads = dot(tr(q), read, lane, parts=(given, 2))
     entering = fp32(add(fused(mul(step.grad, kept), lane), fused(mul(reads, factor), lane)), lane)
     if write == "delta":
         entering = fp32(add(entering, neg(dot(tr(point(step.w)), point(step.dv), lane, parts=(held, held)))),
@@ -1307,7 +1320,7 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
     import jax
     import jax.numpy as jnp
 
-    from dew.nn.kernels import generation, recurrence_chunk
+    from dew.nn.kernels import generation
     from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
     q, k, v, _, _, h0 = operands
@@ -1318,30 +1331,25 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
     dfinal = np.asarray(rng.standard_normal(h0.shape), np.float32)
     scale, rounded = run.scale, route_rounding(delta, dtype)
     interpret = generation.backend() != "gpu"
-    write_bound = 1.0 if delta else None
-
-    def route(*x):
-        if not delta:
-            return recurrence_chunk.template_rule(*x, None, scale=scale, delta=False, wide=False,
-                                                  rounded=rounded)
-        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=write_bound)
+    route = witnessed_route(delta, scale=scale, rounded=rounded)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         native, launches = launched(jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal))), operands,
                                     f"training backward of seed {seed}, delta {delta}")
-        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                   if isinstance(op, template.Mosaic)]
+        [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
+                            zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
+        unit_keys = bound.arguments.get("unit_keys", False)
 
         def kept(*x):
             # Its family read from its operands, a family no identity states (`launched`'s statement).
             family = mainloop.issued(jnp.result_type(*x[:3]))[0]
             _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
                                                          delta=delta, family=family, interpret=interpret,
-                                                         unit_keys=write_bound is not None)
+                                                         unit_keys=unit_keys)
             grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
                                                            rounded=rounded, delta=delta, family=family,
                                                            interpret=interpret, inverse=inverse, kept=held,
-                                                           unit_keys=write_bound is not None)
+                                                           unit_keys=unit_keys)
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
@@ -1559,10 +1567,13 @@ def key_pairs_back(d_pairs: Iv, rows, k: np.ndarray, exponents: Exponents, lane:
     d_keys = mul(weighted, Iv(held.lo[:, None, :], held.hi[:, None, :]))
 
     def summed(terms: Iv, axis: int) -> Iv:
-        magnitude = np.maximum(np.abs(terms.lo), np.abs(terms.hi)).sum(axis)
-        count = terms.lo.shape[axis]
-        slack = allowance(magnitude, count, TRUNCATING["float32"], truncating_underflow(lane.flushes)) \
-            + 2.0 ** -16 * magnitude * (1 + 2.0 ** -7)
+        each = np.maximum(np.abs(terms.lo), np.abs(terms.hi))
+        magnitude, count = each.sum(axis), terms.lo.shape[axis]
+        # Each term's product read the pairs' gradient in two bf16 parts: its reach (`two_parts_reach`, the
+        # owner), its absolute term once a term (a unit key's decayed product scales a part's loss by at
+        # most 1).
+        slack = (allowance(magnitude, count, TRUNCATING["float32"], truncating_underflow(lane.flushes))
+                 + two_parts_reach(each * (1 + 2.0 ** -7), lane).sum(axis))
         return outward(terms.lo.sum(axis) - slack, terms.hi.sum(axis) + slack)
 
     return summed(d_rows, 1), summed(d_keys, 0)
