@@ -1104,21 +1104,19 @@ _VERIFIED = 'verified'
 """The directory under Dew's cache a passed verification is recorded in, one file per key."""
 
 
-def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str | None:
+def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
     """What a verification holds for: the config, the transformers and torch releases, Dew's own
     implementation (`dew._code.whole_digest`, so any change of a reader, the shrink or a model verifies
     again) and the repository, commit and folder the remote code was fetched at (`ModelSource.pinned`), as
-    one digest; None, no record kept or read, where Dew's source changed while the process ran."""
+    one digest."""
     import importlib.metadata
 
     from transformers import __version__
 
     remote = None if source.pinned is None else asdict(source.pinned)
-    if (code := whole_digest()) is None:
-        return None
     return hashlib.sha256(json.dumps({'config': hf_config, 'transformers': __version__, 'remote': remote,
                                       'torch': importlib.metadata.version('torch'),
-                                      'dew': code},
+                                      'dew': whole_digest()},
                                      sort_keys=True, default=str).encode()).hexdigest()
 
 

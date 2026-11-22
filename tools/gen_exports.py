@@ -12,11 +12,12 @@ passes."""
 
 import argparse
 import ast
-import importlib.util
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_scopes as scopes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -41,23 +42,10 @@ def imports(package: str, exports: dict[str, str]) -> list[str]:
             *(f"    from {module} import {', '.join(names)}" for module, names in named.items())]
 
 
-def walker() -> ModuleType:
-    """Dew's reader of the imports a module's run executes and of a lazy package's `_EXPORTS`
-    (src/dew/_imports.py), loaded by its path: it reads the standard library alone, Dew not imported."""
-    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "_imports.py"
-    if "_dew_imports" not in sys.modules:
-        spec = importlib.util.spec_from_file_location("_dew_imports", path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"{path} is no Python source file; is its checkout there?")
-        sys.modules["_dew_imports"] = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(sys.modules["_dew_imports"])
-    return sys.modules["_dew_imports"]
-
-
 def exported(tree: ast.Module) -> dict[str, str]:
     """A lazy package's `_EXPORTS` read from its `__init__.py`'s tree (`dew._imports.exported`, the one reader
     of the declaration): this tool writes the package's blocks from it."""
-    return walker().exported(tree)
+    return scopes.walker().exported(tree)
 
 
 def written(path: Path, root: Path) -> str:

@@ -471,8 +471,8 @@ def stepped(segments) -> tuple:
     return tuple((functools.partial(_marked_step, step, step_index), lo, hi) for step, lo, hi in segments)
 
 
-def _marked_step(step: Callable, marked: Callable, index, *rest):
-    return step(marked(index), *rest)
+def _marked_step(step: Callable, marked: Callable, index, *rest, **keywords):
+    return step(marked(index), *rest, **keywords)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -811,6 +811,19 @@ class Issuer[Accumulator](abc.ABC):
         """`products` of block-scaled operands (`block_formats`), `scales` the step's two scale slots."""
         raise NotImplementedError(f"{self.name}'s products take no block scales")
 
+    def first_fragments(self, lhs, rhs):
+        """The fragments `products(acc, lhs, rhs)` reads first from its operands' slots, read now: what a walk
+        prefetches of a step's slots under the step before's last products (`products_across`,
+        `Transport.prefetches_fragments`)."""
+        raise NotImplementedError(f"{self.name} prefetches no fragments")
+
+    def products_across(self, acc, lhs, rhs, prefetched, boundary: Callable):
+        """`products(acc, lhs, rhs)` from its `prefetched` first fragments (`first_fragments`), `boundary()`
+        called once before its last product issues, which waits for the next step's slots and returns their
+        first fragments: `(acc, next_prefetched)`, the next step's first loads under this step's last product
+        (`emit_pipeline`'s `prefetch`, CUTLASS's multistage order across a step)."""
+        raise NotImplementedError(f"{self.name} prefetches no fragments")
+
     transposes_tf32: bool = False
     """Whether its TF32 products take an operand read transposed (`takes_tf32`): mma.sync's, whose threads
     load each fragment's elements themselves; not warpgroup MMA's ('Only f16 WGMMA supports transposes'), so
@@ -845,12 +858,11 @@ class Issuer[Accumulator](abc.ABC):
         bounds them (`resources.held_area`: a TPU core's VMEM); None where registers do."""
         return None
 
-    def value_scratch(self, blocks: dict, outputs: tuple, *, step: tuple = ()) -> tuple:
+    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
         """The `(shape, dtype)` stand-ins of the values it keeps in scratch memory beside a program's
         allocations (`gemm.mosaic_gpu.Allocations.scope`): none where they live in registers."""
-        del blocks, outputs, step
+        del blocks, outputs
         return ()
-
     issues_in_consumers: bool = True
     """Whether a walk's step runs in the consumer that issues its products, so it can prepare their operands
     first: a prologue's rewrite, a kernel gradient's zeroed neighbouring rows, an exactly summed step's own
@@ -1239,10 +1251,12 @@ class Issuer[Accumulator](abc.ABC):
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                     between: Callable = lambda value: value) -> tuple:
         """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
-        (`WgmmaIssuer`), else in turn (`product`)."""
-        return self.product(lhs1, rhs1, shape), self.product(lhs2, rhs2, shape)
+        (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
+        second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""
+        return between(self.product(lhs1, rhs1, shape)), self.product(lhs2, rhs2, shape)
 
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""
@@ -1533,6 +1547,11 @@ class Transport[Allocated, Opened](abc.ABC):
     walks_scoped: bool = False
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
+
+    prefetches_fragments: bool = False
+    """Whether its walk takes a step's `prefetch` (`walk`'s): the first fragments of a step's products read
+    under the step before's last product, a step then given them and the boundary that reads the next's
+    (`Issuer.products_across`)."""
 
     stages_over_rings: bool = False
     """Whether a program's tiles past its walks may take its rings' slots (`after_walk.over_rings_scoped`)."""

@@ -288,14 +288,16 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("cases", ["widths", "shapes"])
 @pytest.mark.parametrize("name", ["sm90", "sm100"])
-def test_a_padded_merge_compiles_as_one_launch(name):
+def test_a_padded_merge_compiles_as_one_launch(name, cases):
     """The padded merge's one launch (`merged._kernel`, a GPU's lowering) compiles for a compile-only H100
     and B200 in one process per GPU across: value widths 80, 96, 100, 128 and 192 (a row's channels one block
     of the least power of two past the width, its loads and stores past the columns masked); a `jax.vmap`
     batch of three splits (the batch folded into its rows, beside nothing but the one transpose that folds it,
     every launch typed by `report.launched_thunks`); and long splits of 64 and 256 slices (row 8439: its
-    program a chunk of the law's at a time, `merged._chunks`)."""
+    program a chunk of the law's at a time, `merged._chunks`). The widths and the other shapes compile apart,
+    each a group's work within its target (134 s whole in train 1156's CI)."""
     from fla_gdn_support import KernelCase
 
     def one_case(label: str, *, slices: int, width: int) -> KernelCase:
@@ -312,12 +314,25 @@ def test_a_padded_merge_compiles_as_one_launch(name):
     finished_stacked = jax.ShapeDtypeStruct((2, 1, 8, 16, 16), jnp.float32)
     finished = functools.partial(merged.merged_finished, SPECS["natural"], queries=4, width=128,
                                  out_dtype=jnp.bfloat16, out_heads=32)
-    cases = [*(one_case(f"width-{width}", slices=16, width=width) for width in (80, 96, 100, 128, 192)),
-             KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
-             KernelCase("finished", lambda: (finished, (finished_padded, finished_stacked))),
-             *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256))]
+    init_m = jax.ShapeDtypeStruct((1, 8, 4), jnp.float32)
+    init_t = jax.ShapeDtypeStruct((1, 8, 4), jnp.float32)
+    init_acc = jax.ShapeDtypeStruct((1, 8, 4, 128), jnp.float32)
+
+    def finished_init(p, s, im, it, ia):
+        return merged.merged_finished(
+            SPECS["natural"], p, s, queries=4, width=128, out_dtype=jnp.bfloat16, out_heads=32,
+            initial=template.Initial(im, it, ia))
+
+    named = {"widths": [one_case(f"width-{width}", slices=16, width=width)
+                        for width in (80, 96, 100, 128, 192)],
+             "shapes": [KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
+                        KernelCase("finished", lambda: (finished, (finished_padded, finished_stacked))),
+                        KernelCase("finished-initial",
+                                   lambda: (finished_init, (finished_padded, finished_stacked,
+                                                            init_m, init_t, init_acc))),
+                        *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256))]}
     with generation.assumed(name):
-        records = compile_kernels(cases, name)
+        records = compile_kernels(named[cases], name)
     for record in records:
         assert "error" not in record, record
         expected = (["merged_padded", "wrapped_transpose"] if record["name"] == "batched"
@@ -591,24 +606,30 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
     `0.0`."""
     batch, slices, rows, kv_heads, width, queries, out_heads = 1, 2, 4, 1, 16, 2, 2
     spec = algebra.finished_form(algebra.Forward(form="full", ids=False, keys=16, scale=1.0))
-    padded = jnp.zeros((batch, slices, rows, kv_heads, width), jnp.float32)
-    maxima = jnp.full((batch, kv_heads, slices, rows), -jnp.inf, jnp.float32)
-    totals = jnp.zeros((batch, kv_heads, slices, rows), jnp.float32)
-    stacked = jnp.stack([maxima, totals])
-    sub = jnp.float32(2.0 ** -127)
-    init_m = jnp.zeros((batch, kv_heads, queries), jnp.float32)
-    init_t = jnp.array([[[sub, 0.0]]], jnp.float32)
-    init_acc = jnp.stack([jnp.full((batch, kv_heads, width), sub, jnp.float32),
-                          jnp.zeros((batch, kv_heads, width), jnp.float32)], axis=2)
-    initial = template.Initial(init_m, init_t, init_acc)
 
-    got = jax.jit(lambda p, s, i: merged.merged_finished(
-        spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        initial=i))(padded, stacked, initial)
-    expected = np.concatenate([np.ones((1, 1, 1, width), dtype=np.float32),
-                               np.zeros((1, 1, 1, width), dtype=np.float32)], axis=2)
-    np.testing.assert_array_equal(np.asarray(got, dtype=np.float32), expected)
+    def draw(_seed: int):
+        padded = np.zeros((batch, slices, rows, kv_heads, width), np.float32)
+        maxima = np.full((batch, kv_heads, slices, rows), -np.inf, np.float32)
+        totals = np.zeros((batch, kv_heads, slices, rows), np.float32)
+        stacked = np.stack([maxima, totals])
+        sub = np.float32(2.0 ** -127)
+        init_m = np.zeros((batch, kv_heads, queries), np.float32)
+        init_t = np.array([[[sub, 0.0]]], np.float32)
+        init_acc = np.stack([np.full((batch, kv_heads, width), sub, np.float32),
+                             np.zeros((batch, kv_heads, width), np.float32)], axis=2)
+        return padded, stacked, init_m, init_t, init_acc
 
+    def ours(p, s, im, it, ia):
+        return merged.merged_finished(spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16,
+                                      out_heads=out_heads, initial=template.Initial(im, it, ia))
+
+    def reference(p, s, im, it, ia):
+        del p, s, im, it, ia
+        return np.concatenate([np.ones((1, 1, 1, width), np.float64),
+                               np.zeros((1, 1, 1, width), np.float64)], axis=2)
+
+    assert_as_exact(jax.jit(ours), as_given(reference), draw,
+                    "finished split merge preserves subnormal initial mass", seeds=FEWEST_SEEDS)
 
 def test_resumable_split_merge_preserves_subnormal_initial_mass():
     """Row 10818: `algebra.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps its

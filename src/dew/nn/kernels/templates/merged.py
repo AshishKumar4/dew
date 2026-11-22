@@ -190,8 +190,8 @@ THREADS = 4 * 32
 def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
                       queries: int, width: int, block: int, has_initial: bool = False,
                       raw_scale: float | None = None, out_dtype=None,
-                      out_heads: int | None = None) -> tuple[cost.Work, cost.Work, int]:
-    """One program's on-chip work, the full launch's work, and the grid size of `_launch` at `block` channels
+                      out_heads: int | None = None) -> tuple[cost.Work, int]:
+    """The full launch's work and grid size of `_launch` at `block` channels
     on the common one-window path (`means.merged_state_chunked`): one anchor/hull joining pass (`joining`:
     chunk 0 in `role.fixed` plus `chunks - 1` loop steps) followed by one window's two dependent passes
     (`_placing` and `_summing`, `2 * chunks` steps), excluding the rare re-landing `lax.cond` branch, for a
@@ -206,7 +206,7 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
     rows = batch * queries * heads
     launched = rows * blocks
     if launched == 0:
-        return cost.Work(), cost.Work(), 0
+        return cost.Work(), 0
     extra_s = ((jax.ShapeDtypeStruct((batch, heads, queries), stacked.dtype),
                 jax.ShapeDtypeStruct((batch, heads, queries), stacked.dtype),
                 jax.ShapeDtypeStruct((batch, heads, queries, width), padded.dtype)) if has_initial else ())
@@ -232,11 +232,10 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
         total_device_bytes = float(rows * (3 * slices * read_width * padded_item
                                            + init_reads * width * padded_item + width * out_item
                                            + blocks * (3 * slices + init_reads) * 2 * stacked_item))
-    per_program = dataclasses.replace(role.fixed + walk_work, device_bytes=total_device_bytes / launched,
-                                      span=float(passes))
+    per_program = role.fixed + walk_work
     total = dataclasses.replace(emission.repeated(per_program, launched), device_bytes=total_device_bytes,
                                 span=float(passes), kernels=1.0)
-    return per_program, total, launched
+    return total, launched
 
 
 @functools.cache
@@ -257,12 +256,11 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
                                            raw_scale, out_dtype, out_heads) for block in blocks}
 
     def seconds(block: int) -> float:
-        _, total, launched = candidates[block]
+        total, launched = candidates[block]
         return cost.launch_seconds(total, launched, target)
 
     chosen = min(blocks, key=lambda block: (seconds(block), -block))
-    return chosen, candidates[chosen][1]
-
+    return chosen, candidates[chosen][0]
 
 def _channel_block(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
                    stacked: jax.ShapeDtypeStruct, queries: int, width: int, target: generation.GpuTarget,

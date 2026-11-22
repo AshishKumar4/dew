@@ -63,21 +63,17 @@ def test_a_formats_decode_is_found_at_the_cheapest_price_and_reads_back_its_valu
 
 def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order():
     """NVFP4 words packed in their natural order (code `i` at bits `4i`), stored in the checked-in form's
-    layout as a prepare step stores them on the device (`BitForm.prepared`) and decoded to bfloat16 elements
-    as the GEMM's portable path reads them (`BitForm.values`), under a jit: every code of every place reads
-    back in its place as its E2M1 value times 2^-126, the bit pattern NumPy's encoder stores."""
+    layout on the host (`BitForm.encoded`) and decoded to bfloat16 elements as the GEMM's portable path
+    reads them (`BitForm.values`), under a jit: every code of every place reads back in its place as its
+    E2M1 value times 2^-126, the bit pattern NumPy's encoder stores."""
     form = bits.NVFP4_BFLOAT16_FORM
     rng = np.random.default_rng(3621)
     codes = rng.integers(0, 16, size=(512, 8))
     codes[:16, :] = np.arange(16)[:, None]
     words = (codes.astype(np.uint64) << (4 * np.arange(8, dtype=np.uint64))).sum(axis=1)
-    def stored_and_decoded(natural):
-        stored = form.prepared(natural)
-        return stored, form.values(stored, jnp.bfloat16)
-
-    stored, decoded = ahead_arm(jax.jit(stored_and_decoded), "NVFP4 words stored and decoded")(
-        words.astype(np.uint32).reshape(64, 8))
-    np.testing.assert_array_equal(np.asarray(stored).astype(np.uint64).ravel(), form.encoded(words))
+    stored = form.encoded(words).astype(np.uint32).reshape(64, 8)
+    decoded = ahead_arm(jax.jit(lambda stored: form.values(stored, jnp.bfloat16)),
+                        "NVFP4 words decoded")(stored)
     assert decoded.shape == (64, 64)
     expected = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
     got = np.asarray(decoded).astype(np.float64).reshape(512, 8) * 2.0 ** 126
@@ -145,9 +141,8 @@ def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
     scales = scale_bits.view(ml_dtypes.float8_e4m3fn)
     packed = codes.reshape(depth // 8, 8, columns).astype(np.uint64) << (
         4 * np.arange(8, dtype=np.uint64))[None, :, None]
-    decoded = ahead_arm(jax.jit(lambda natural, scales: bits.nvfp4_decoded(
-        bits.NVFP4_BFLOAT16_FORM.prepared(natural), scales)), "an NVFP4 tile decoded")(
-        packed.sum(axis=1).astype(np.uint32), scales)
+    stored = bits.NVFP4_BFLOAT16_FORM.encoded(packed.sum(axis=1)).astype(np.uint32)
+    decoded = ahead_arm(jax.jit(bits.nvfp4_decoded), "an NVFP4 tile decoded")(stored, scales)
     values = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
     block = np.repeat(scales.astype(np.float64), 16, axis=0)
     np.testing.assert_array_equal(np.asarray(decoded.astype(jnp.float32), np.float64) * bits.NVFP4_OWED,

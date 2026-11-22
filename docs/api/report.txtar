@@ -9,7 +9,7 @@ class CFG(scale: float, interval: tuple[float, float] = (0.0, 1.0), rescale: flo
   .modules(self) -> tuple[nn.Module, ...]
   .replace(self, **updates)
   .walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk
-class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str | None = None, local_every: int | str | None = None)  [dew.checkpoints]
+class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str | None = None, local_every: int | str | None = None, export_model: bool = False)  [dew.checkpoints]
   .accumulation_template(self, step: int)
   .artifact(self, step: int | str | None = None) -> JSON
   .best: property -> int | None
@@ -164,10 +164,12 @@ class Objective()  [dew.objectives.base]
   .model_tree(cls, variables: Variables) -> Variables  [classmethod]
   .model_variables(self, variables: Variables) -> Variables
   .optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation
+  .output_table(self, variables: Variables) -> OutputTable | None
   .parameter_axes: cached property -> dict[tuple[str, ...], LogicalAxes]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]
+  .predicts_by_head: property -> bool
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
   .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
@@ -269,10 +271,12 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .model_tree(cls, variables: Variables) -> Variables  [classmethod]
   .model_variables(self, variables: Variables) -> Variables
   .optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation
+  .output_table(self, variables: Variables) -> OutputTable | None
   .parameter_axes: cached property -> dict[tuple[str, ...], LogicalAxes]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]
+  .predicts_by_head: property -> bool
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
   .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
@@ -621,6 +625,7 @@ dew.config.trainer.TrainerConfig
   checkpoint_final: bool = True
   local_directory: str | None = None
   local_every: int | str | None = None
+  export_model: bool = False
   scored_to: str | None = None
   accumulation: int = 1
   split: int | None = None
@@ -918,7 +923,7 @@ dew.interop.source_options.SourceOptions
   attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
   dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
   scan_layers: bool = False
-  packed_experts: bool = False
+  packed_weights: bool = False
   param_dtype: str | None = None
   step: int | str | None = None
   ema: bool | None = None

@@ -18,7 +18,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew import quantization
 from dew.mesh import LogicalAxes
 from dew.nn.activations import quick_gelu, swiglu_clamped
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, packed_matrix
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.moe import (
     Routes,
@@ -74,14 +74,14 @@ class GptOssExperts(nn.Module):
         initializer = nn.initializers.variance_scaling(
             1.0, "fan_in", "truncated_normal", in_axis=-2, out_axis=-1, batch_axis=(0,))
         # A served checkpoint's packed banks stand in for the matrices where the module's collection holds
-        # them (`quantization.expert_matrix`: a 4-bit checkpoint's experts as their codes, row 4516).
-        gate_up = quantization.expert_matrix(self, "gate_up_proj", lambda: self.param(
+        # them (`dew.nn.dense.packed_matrix`: a 4-bit checkpoint's experts as their codes, row 4516).
+        gate_up = packed_matrix(self, "gate_up_proj", lambda: self.param(
             "gate_up_proj", declared(initializer, FUSED_EXPERT_AXES["gate_up_proj"]),
             (self.num_local_experts, self.hidden_size, 2 * self.intermediate_size)))
         gate_bias = self.param("gate_up_proj_bias",
                                declared(nn.initializers.zeros, FUSED_EXPERT_AXES["gate_up_proj_bias"]),
                                (self.num_local_experts, 2 * self.intermediate_size))
-        down = quantization.expert_matrix(self, "down_proj", lambda: self.param(
+        down = packed_matrix(self, "down_proj", lambda: self.param(
             "down_proj", declared(initializer, FUSED_EXPERT_AXES["down_proj"]),
             (self.num_local_experts, self.intermediate_size, self.hidden_size)))
         down_bias = self.param("down_proj_bias",

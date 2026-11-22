@@ -16,6 +16,7 @@ from flax import linen as nn
 from map_judge import marked_seeds
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
+from test_loop_sampled import counts_compiled_off_the_loop
 
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -37,7 +38,8 @@ any of a site's cases asked)."""
 UNROLLED_SEEDS = {"two": 8, "four": 512, "the last trained": 8, "recomputed": 512, "attention": 512,
                   "depth residuals": 8, "scanned layers": 128}
 """Check 1's declared seeds for each unrolled case, sized by `seeds_for` on armada (XP-SIZE); those of 512
-drawn 128 a map task (`check1_shards`)."""
+drawn 128 a map task (`check1_shards`), the scanned layers' 128 drawn 32 a task (237 s whole in train 1156's
+CI, row 10946)."""
 
 MESSAGES = CrossPass(block_size=2, rank=4)
 """Messages over blocks of two layers through a controller of rank 4."""
@@ -248,7 +250,8 @@ def _without_merges(params):
     pytest.param(("attention", {"steps": 3}), UNROLLED_SEEDS["attention"], id="attention",
                  marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
     pytest.param(("depth", {"steps": 3}), UNROLLED_SEEDS["depth residuals"], id="depth residuals"),
-    pytest.param(("scanned", {"steps": 3}), UNROLLED_SEEDS["scanned layers"], id="scanned layers")])
+    pytest.param(("scanned", {"steps": 3}), UNROLLED_SEEDS["scanned layers"], id="scanned-layers",
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32))])
 def test_a_loop_passing_messages_computes_its_passes_unrolled(case, seeds, request):
     """At gates drawn off zero, a loop passing messages computes its passes unrolled pass by pass from the
     stack's own spans (`_messages_by_hand`): its logits and every parameter's gradient, the prelude's and
@@ -458,6 +461,7 @@ def test_a_source_written_in_its_own_bindings_refuses_its_export_once_it_passes_
     assert refused.value.args == (MESSAGES_UNWRITTEN,)
 
 
+@pytest.mark.usefixtures(counts_compiled_off_the_loop.__name__)
 def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies():
     """A bf16 decoder passing messages over a block every pass exits through (an exit gate), its passes
     recomputed and drawn per microbatch (`SampledPasses`), its parameters read through narrow copies,
@@ -481,7 +485,7 @@ def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies()
         interval = Interval(0.0, None, microbatches=0)
         drawn = []
         for index in range(6):
-            step.drawn(interval, index)
+            step.drawn(interval, index, state)
             drawn.extend(step.counts)
             state, loss, *_ = step(state, batch)
             assert np.isfinite(float(loss)), (index, step.counts)

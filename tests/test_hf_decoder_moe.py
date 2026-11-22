@@ -287,7 +287,7 @@ def decoded_in_float64(source):
 
 
 def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
-    """An MXFP4 GPT-OSS loaded with its experts packed (`Pretrained.load`'s `packed_experts`, row 4516):
+    """An MXFP4 GPT-OSS loaded with its experts packed (`Pretrained.load`'s `packed_weights`, row 4516):
     each expert matrix an NVFP4 bank in the `QUANTIZATION` collection, no parameter beside it, holding
     exactly the values the dequantizing load decodes; its logits on par with that load's, both bf16 with
     the stored weights' own dtype (check 1, truth the decoded load in float64); and its export the source's
@@ -297,7 +297,7 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
 
     source = _mxfp4_gpt_oss(tmp_path)
     packed, decoded = (Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto",
-                                       attention_impl="xla", packed_experts=served)
+                                       attention_impl="xla", packed_weights=served)
                        for served in (True, False))
     banks = {".".join(path): bank for path, bank in flatten_dict(
         dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
@@ -334,7 +334,7 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
     """E8M0's 0x00 byte is the scale 2**-127, which a writer may give a group of nonzero codes as the
     released encoder gives an all-zero group (`quantize_mxfp4`): a GPT-OSS whose first expert's groups
     span bytes 0 to 17, one under byte 0 holding 0.5 and -0, and one of signed zeros under byte 200 far
-    past them, loads packed (`packed_experts`), the bank holding every value its dense load decodes to the
+    past them, loads packed (`packed_weights`), the bank holding every value its dense load decodes to the
     bit, signed zeros included, and exports the values its dense load exports."""
     from safetensors.numpy import load_file, save_file
 
@@ -352,7 +352,7 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
     stored[stem + "_blocks"], stored[stem + "_scales"] = blocks, scales
     save_file(stored, str(source / "model.safetensors"))
 
-    packed, dense = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=flag)
+    packed, dense = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_weights=flag)
                      for flag in (True, False))
     banks = {".".join(path): bank for path, bank in flatten_dict(
         dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
@@ -371,7 +371,7 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
 
 @pytest.mark.mesh(devices=2)
 def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(tmp_path):
-    """An MXFP4 GPT-OSS loaded packed onto a mesh whose expert axis takes two devices (`packed_experts`
+    """An MXFP4 GPT-OSS loaded packed onto a mesh whose expert axis takes two devices (`packed_weights`
     with `mesh`): each bank's three leaves placed by its dense matrix's axes as the bank lays them out
     (`quantization.expert_leaf_axes`), its words, block scales and tensor scales sharded on the expert
     axis as the dense matrix's experts are, and its logits on par with the unplaced packed load's
@@ -383,9 +383,9 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     source = _mxfp4_gpt_oss(tmp_path)
     mesh = MeshSpec(expert=2)
     placed = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
-                             packed_experts=True, mesh=mesh)
+                             packed_weights=True, mesh=mesh)
     held = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
-                           packed_experts=True)
+                           packed_weights=True)
     dense = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
                             mesh=mesh)
     params = dict(flatten_dict(dict(dense.variables["params"])))
@@ -414,13 +414,13 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
 
 
 def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
-    """An MXFP4 GPT-OSS loaded packed with its layers scanned (`packed_experts` with `scan_layers`, row
+    """An MXFP4 GPT-OSS loaded packed with its layers scanned (`packed_weights` with `scan_layers`, row
     4861): the scan stacks each bank's three leaves as it stacks a dense matrix and slices a layer's back,
     so its logits and their gradient are the unscanned packed load's bit for bit."""
     import tempfile
 
     source = _mxfp4_gpt_oss(Path(tempfile.mkdtemp()))
-    scanned, plain = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=True,
+    scanned, plain = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_weights=True,
                                       scan_layers=scan) for scan in (True, False))
     tokens = jax.random.randint(jax.random.key(0), (2, 8), 0, PACKED_CONFIG["vocab_size"])
 
@@ -457,14 +457,14 @@ def test_an_mxfp4_gpt_oss_whose_experts_are_no_whole_stages_loads_packed_as_it_l
     (directory / "config.json").write_text(json.dumps(
         {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
     served, plain = (Pretrained.load(str(directory), dtype="float32", attention_impl="xla",
-                                     packed_experts=flag) for flag in (True, False))
+                                     packed_weights=flag) for flag in (True, False))
     assert QUANTIZATION not in served.variables
     for path, leaf in flat_tree(served.variables["params"]).items():
         assert np.array_equal(np.asarray(leaf), np.asarray(flat_tree(plain.variables["params"])[path])), path
 
 
 def _packed_run(source: Path, directory: Path, steps: int):
-    """A run of `steps` steps of the MXFP4 GPT-OSS at `source` served packed (`packed_experts`), its
+    """A run of `steps` steps of the MXFP4 GPT-OSS at `source` served packed (`packed_weights`), its
     parameters trained by SGD around its frozen banks, each step checkpointed, and the state it ends with."""
     import optax
 
@@ -474,7 +474,7 @@ def _packed_run(source: Path, directory: Path, steps: int):
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
 
-    loaded = Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=True)
+    loaded = Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_weights=True)
     objective = LMObjective(loaded.model, seq_len=8, ema_decay=None, variables=loaded.variables)
     rows = [{"text": (np.arange(9, dtype=np.int32) + index) % PACKED_CONFIG["vocab_size"]}
             for index in range(16)]

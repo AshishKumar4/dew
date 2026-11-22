@@ -24,9 +24,14 @@ DETERMINISTIC_OPS = "--xla_gpu_deterministic_ops=true"
 """Under it a process keeps no picks (`dew._cache.keeps_picks`) and Dew's fused kernels take their ordered
 schedules (`dew._devices.deterministic_ops_requested`)."""
 
-REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0")
+DETERMINISTIC_TRITON = "--xla_gpu_experimental_deterministic_ops_triton=unchecked"
+"""Under deterministic ops, XLA's autotuner keeps its Triton GEMMs (no split-k, so their sums are ordered):
+upstream XLA's own statement of what Dew's JAX build's deterministic_ops_keep_triton patch makes the
+default, so the lane computes as it does once the patch is gone (row 5812)."""
+
+REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, DETERMINISTIC_TRITON, "--xla_gpu_autotune_level=0")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
-ops order the reductions; autotuning off leaves every cuBLAS and cuDNN call
+ops order the reductions, Triton's GEMMs among them; autotuning off leaves every cuBLAS and cuDNN call
 the configuration it was emitted with, so no process chooses one; and such
 a run keeps no stored picks (`dew._cache.keeps_picks`), which XLA and Dew's
 kernels would take instead. The lane states nothing of XLA's Triton GEMM

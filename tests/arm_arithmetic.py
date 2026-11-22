@@ -5,7 +5,7 @@ and its compiled program (`Truth`)."""
 
 import contextlib
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -61,6 +61,24 @@ def drawn_on_the_host[S, R](inputs_of: Callable[[S], R], seed: S, *, held: bool 
     with jax.default_device(jax.devices("cpu")[0]):
         made = inputs_of(seed)
     return jax.device_get(made) if held else made
+
+
+@contextlib.contextmanager
+def ahead_on_the_host() -> Iterator[None]:
+    """Where a GPU tier part's prepare runs a test (`tier_wire.preparing`), whose default device is a
+    compile-only GPU that computes nothing, the host's CPU as its default device and the host's own kernels
+    (no GPU `generation.assumed`) while held; elsewhere the test's own: the context of what a cell computes
+    before its first check-1 site (a load, an export, a behavioral decode), so its prepare reaches its
+    sites, where `drawn_on_the_host` draws on the host wherever the test runs (rows 11424-11619)."""
+    import tier_wire
+
+    from dew.nn.kernels import generation
+
+    if not tier_wire.preparing():
+        yield
+        return
+    with jax.default_device(jax.devices("cpu")[0]), generation.assumed(None):
+        yield
 
 
 def widened(tree):

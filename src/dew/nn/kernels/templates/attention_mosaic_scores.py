@@ -16,7 +16,11 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.attention import DQ_GRADS, Kind, by_power
-from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents
+from dew.nn.kernels.templates.attention_backward_algebra import (
+    derived_cotangents,
+    derived_from_weights,
+    derived_weights,
+)
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardRegisters,
     BackwardTiles,
@@ -193,6 +197,36 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     return algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped), part
 
 
+def _score_logits(walk: _Backward, coords: algebra.Coords, params: tuple, s, *, masked: bool):
+    """Shared mask and hooked-logits prologue for `_score_weights` and `_scores`."""
+    seen = algebra.seen(walk.spec, coords, s) if masked else None
+    how = walk.how
+    logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
+                                         coords.k_pos, params,
+                                         scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
+    return logits, slopes, seen
+
+
+def _score_weights(walk: _Backward, coords: algebra.Coords, params: tuple, s, peak, total, *,
+                   masked: bool):
+    """First half of `_scores` (row 11659): mask, hooked logits + slopes, and derived unnormalized and
+    normalized weights from `s`, `peak`, and `total` (runnable while `dP` is in flight)."""
+    logits, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
+    exponentials, weights = derived_weights(
+        keys_first=bool(coords.keys_first), how=walk.how, accurate=walk.accurate).mapped(
+            {"logits": logits, "peak": _read(peak), "total": _read(total)})
+    return exponentials, weights, slopes, seen
+
+
+def _score_cotangents(coords: algebra.Coords, weights, dp, anchor, delta, seen):
+    """Second half of `_scores` for undropped fast-form walks (row 11659): derived score cotangents from
+    normalized `weights` and `dp`."""
+    tiles = {"weights": weights, "products": dp, "anchor": _read(anchor), "delta": _read(delta)}
+    if seen is not None:
+        tiles["seen"] = seen
+    return derived_from_weights(keys_first=bool(coords.keys_first), masked=seen is not None).mapped(tiles)
+
+
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,
             chosen, *, masked: bool):
     """A backward tile's weights unnormalized and over `total`, its score cotangents
@@ -200,37 +234,27 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     from its products `s` and `dp`, its coordinates, its hook parameters `params`, its mask (`algebra.seen`
     where `masked`) and its queries' statistics, each a vector or a function reading it where it is used (a
     stream's stage, `_dkv_step`)."""
-    seen = algebra.seen(walk.spec, coords, s) if masked else None
-    how = walk.how
-    logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
-                                         coords.k_pos, params,
-                                         scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
-    # Each query's statistics along a keys-first tile's query axis (`algebra.Coords.queries`); a queries-first
-    # tile's the algebra broadcasts at each use, so no broadcast tile stays live across the step (a fused
-    # launch at 128 x 64 and width 64 spilled 60 bytes holding them).
-    def per_query(x):
-        return coords.queries(_read(x), s) if coords.keys_first else _read(x)
-
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
+    if not walk.accurate and multiplier is None:
+        exponentials, weights, slopes, seen = _score_weights(walk, coords, params, s, peak, total,
+                                                             masked=masked)
+        cotangents = _score_cotangents(coords, weights, dp, anchor, delta, seen)
+        return exponentials, weights, cotangents, slopes, seen
+    logits, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
     # A dropping anchor's centre can survive where its tile's product rounds to zero before the
     # multiplier joins it. Take its self-difference as 0, as the accurate form does. The undropped
     # fast form keeps FlashAttention 3's math (the select took 10.8% of fused dK/dV's instructions).
-    anchored = walk.accurate or multiplier is not None
-    at_anchor = coords.k_pos == coords.queries(_read(chosen), coords.k_pos) if anchored else None
-    # The tile's weights and cotangents the derived forms' (`derived_cotangents`).
+    at_anchor = coords.k_pos == coords.queries(_read(chosen), coords.k_pos)
     tiles = {"logits": logits, "products": dp, "peak": _read(peak), "total": _read(total),
-             "anchor": _read(anchor), "delta": _read(delta)}
+             "anchor": _read(anchor), "delta": _read(delta), "at_anchor": at_anchor}
     if multiplier is not None:
         tiles["keep"] = multiplier
     if seen is not None:
         tiles["seen"] = seen
-    if at_anchor is not None:
-        tiles["at_anchor"] = at_anchor
-    forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, how,
-                               walk.accurate, anchored=anchored)
+    forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, walk.how,
+                               walk.accurate, anchored=True)
     exponentials, weights, cotangents = forms.mapped(tiles)
     return exponentials, weights, cotangents, slopes, seen
-
 def _rescaled_parts(walk: _Backward, acc, shift, rhs, refs: tuple, staged: tuple = ()):
     """An fp16 step's accumulator `acc` (dV's or dK's) taken to its walk's new scale (`shift`,
     `precision.scalar_power2`, a power of two at most 1) before its operand's two fp16 parts' products over

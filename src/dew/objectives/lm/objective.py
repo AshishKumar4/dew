@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -1716,6 +1715,11 @@ class LMObjective(TokenScorer):
                                                   summed=step.training)
         return statistics, aux
 
+    @property
+    def predicts_by_head(self) -> bool:
+        """Its scores its head's alone where no adaptation scores through more (`ChunkAdaptation`)."""
+        return self.adaptation is None
+
     def predict(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
                 logits: bool = True) -> tuple[Ratio | RoutedStatistics, Aux[Variables], Prediction]:
         """Return the loss with the logits, target weights and `layers` outputs behind it.
@@ -1738,11 +1742,8 @@ class LMObjective(TokenScorer):
         # Its final states and their head where its scores are the model's head's alone; an adaptation
         # scores through more than that head (`ChunkAdaptation`), which a caller reading the states would
         # leave out.
-        plain = self.adaptation is None
         return statistics, aux, Prediction(whole, scores.losses, scores.weights, scores.layers,
-                                           final=scores.hidden if plain else None,
-                                           head=functools.partial(model_logits, self.model, params)
-                                           if plain else None)
+                                           final=scores.hidden if self.predicts_by_head else None)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
                      summed: bool = False, logits: bool = False, predict: bool | None = None) -> _Scored:

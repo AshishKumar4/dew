@@ -1,13 +1,14 @@
-"""dew.nn.kernels.templates.attention_triton: the template's Pallas Triton forward, at each config it is
-proven over, on par with the template's XLA arithmetic from float64 (check 1) over every call form and
-hook, its residuals too; interpreted on the CPU, compiled on a GPU."""
+"""The attention template's Pallas-Triton mainloop (`attention_triton`): its forward and backward on par with
+`attention.reference` from float64 across every call form, head width and hook, here interpreted and on a GPU
+(tests/test_gpu_attention.py)."""
+import functools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU, interprets
-from reference_error import assert_as_exact, assert_fp32_reduction_bound
+from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import (
     CASES,
     ONE_RUN,
@@ -93,7 +94,7 @@ def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 
     return draw
 
 
-def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> template.Hooks:
+def hooks_for(names: tuple[str, ...], queries: int, value_width: int, gate=None) -> template.Hooks:
     """The hooks `names` asks for: a softcap and ALiBi as one score_mod, sinks as the initial state, an
     output gate."""
     slopes = jnp.asarray(alibi_slopes(4), jnp.float32)
@@ -118,9 +119,9 @@ def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> te
         (template.Param(jnp.asarray(gate), template.Kind.OUTPUT),) if "gate" in names else ())
 
 
-HOOKS = {"none": frozenset(), "softcap": frozenset({"softcap"}), "sinks": frozenset({"sinks"}),
-         "alibi": frozenset({"alibi"}), "gate": frozenset({"gate"}),
-         "all": frozenset({"softcap", "sinks", "alibi", "gate"})}
+HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",),
+         "alibi": ("alibi",), "gate": ("gate",),
+         "all": ("alibi", "gate", "sinks", "softcap")}
 
 FORMS = ("full", "causal", "causal-window", "two-sided-window", "causal-chunk", "documents",
          "causal-documents-window", "cross-causal", "cross-causal-lengths-starts", "lengths-starts")
@@ -130,13 +131,14 @@ def gate_of(queries: int, value_width: int) -> np.ndarray:
     return np.random.default_rng(99).standard_normal((ROWS, queries, 4, value_width)).astype(np.float32)
 
 
-def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, **options):
+def check(case: dict, names: tuple[str, ...], dtype, config: attention_triton.Tiles, **options):
     """`check_each` at the one `config`."""
     check_each(case, names, dtype, (config,), **options)
 
 
-def check_each(case: dict, names: frozenset, dtype, configs, *, residuals: bool = False, width: int = 32,
-               value_width: int = 32, natural: bool = template.NATURAL, mainloop: str = "triton"):
+def check_each(case: dict, names: tuple[str, ...], dtype, configs, *, residuals: bool = False,
+               width: int = 32, value_width: int = 32, natural: bool = template.NATURAL,
+               mainloop: str = "triton"):
     """`attention_triton.forward` pinned at each of `configs` (or with `mainloop` "portable" the plain-JAX
     mainloop's `attend` at their tiles) on par with `template.reference` over `case`'s keys and the hooks
     `names`, at the site's declared seeds, its exponent `natural` or the fold: one check of every config,
@@ -269,20 +271,27 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
     sinks their denominator is the sink's one and their output still zero."""
     case = CASES["documents"]
     queries, keys = geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
-    query, key, value = drawing(queries, keys, jnp.float32)(0)
-    with tuning.pinned({attention_triton.TritonForward: PINNED[0]}):
-        out, _, total, *_ = attention_triton.forward(query, key, value, spans, residuals=True,
-                                                     interpret=not ON_GPU)
-        sinks = hooks_for(HOOKS["sinks"], queries, 32)
-        _, _, sunk, *_ = attention_triton.forward(query, key, value, spans, sinks, residuals=True,
-                                                  interpret=not ON_GPU)
-    padding = np.asarray(spans.query_ids) == 0
-    assert padding.any()
-    assert np.all(np.asarray(out)[padding] == 0)
-    assert np.all(np.asarray(total).transpose(0, 2, 1)[padding] == 0)
-    assert np.all(np.asarray(sunk).transpose(0, 2, 1)[padding] == 1)
 
+    def ours(query, key, value):
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
+        padding = (spans.query_ids == 0)[..., None]
+        with tuning.pinned({attention_triton.TritonForward: PINNED[0]}):
+            out, _, total, *_ = attention_triton.forward(query, key, value, spans, residuals=True,
+                                                         interpret=not ON_GPU)
+            sinks = hooks_for(HOOKS["sinks"], queries, 32)
+            _, _, sunk, *_ = attention_triton.forward(query, key, value, spans, sinks, residuals=True,
+                                                      interpret=not ON_GPU)
+        return (jnp.where(padding[..., None], out, 0.0),
+                jnp.where(padding, total.transpose(0, 2, 1), 0.0),
+                jnp.where(padding, sunk.transpose(0, 2, 1), 1.0))
+
+    def reference(query, key, value):
+        del key, value
+        return (np.zeros(query.shape, np.float64),
+                np.zeros((*query.shape[:2], 4), np.float64),
+                np.ones((*query.shape[:2], 4), np.float64))
+    assert_as_exact(jax.jit(ours), as_given(reference), drawing(queries, keys, jnp.float32),
+                    "padding query and sink", seeds=8)
 
 SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi": ("alibi",),
                "temperature": ("temperature",), "key-bias": ("key",), "tile-bias": ("tile",),
@@ -492,22 +501,43 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
     its gradient returns in float64, equal to the fp32 slope's."""
     case = CASES["causal-window"]
     queries, keys = geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(("alibi",), queries, keys)
-    query, key, value = drawing(queries, keys, jnp.float32)(0)
-    dout = jax.random.normal(jax.random.key(5), query.shape, jnp.float32)
-    (slopes,), _ = draw_hooks(0)
-    with jax.enable_x64(new_val=True), tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
-        grads = [attention_triton.backward(query, key, value, spans,
-                                           template.Hooks(score_mod, (template.Param(wide, kinds[0]),)), dout,
-                                           interpret=not ON_GPU)
-                 for wide in (slopes.astype(jnp.float64), slopes)]
-    assert grads[0].score_params[0].dtype == jnp.float64
-    np.testing.assert_array_equal(np.asarray(grads[0].score_params[0], np.float32),
-                                  np.asarray(grads[1].score_params[0]))
-    np.testing.assert_array_equal(np.asarray(grads[0].query), np.asarray(grads[1].query))
 
+    def draw(seed: int):
+        query, key, value = drawing(queries, keys, jnp.float32)(seed)
+        dout = jax.random.normal(jax.random.key(seed + 5), query.shape, jnp.float32)
+        (slopes,), _ = draw_hooks(seed)
+        return query, key, value, dout, slopes
 
+    def run(query, key, value, dout, slopes, *, wide: bool):
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
+        slope = slopes.astype(jnp.float64) if wide else slopes
+        with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+            grads = attention_triton.backward(query, key, value, spans,
+                                              template.Hooks(score_mod, (template.Param(slope, kinds[0]),)),
+                                              dout, interpret=not ON_GPU)
+        return grads.score_params[0], grads.query
+
+    def theirs(query, key, value, dout, slopes):
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
+        def attend(q, sl):
+            return template.reference(q, key, value, spans,
+                                      template.Hooks(score_mod, (template.Param(sl, kinds[0]),)))
+        _, pull = jax.vjp(attend, query, slopes)
+        dq, dsl = pull(dout)
+        return dsl, dq
+
+    with jax.enable_x64(new_val=True):
+        wide_fn = jax.jit(functools.partial(run, wide=True))
+        f32_fn = jax.jit(functools.partial(run, wide=False))
+        assert_as_exact(wide_fn, jax.jit(theirs), draw, "wide alibi parameter", seeds=8)
+        import tier_wire
+        if not tier_wire.preparing():
+            sample = draw(0)
+            wide_out, f32_out = wide_fn(*sample), f32_fn(*sample)
+            assert wide_out[0].dtype == jnp.float64
+            np.testing.assert_array_equal(np.asarray(wide_out[0], np.float32), np.asarray(f32_out[0]))
+            np.testing.assert_array_equal(np.asarray(wide_out[1]), np.asarray(f32_out[1]))
 def bucketed(s, q_pos, k_pos, bucket):
     """A score hook of an int32 key parameter: a key's bucket, its low bit a bias."""
     del q_pos, k_pos
@@ -609,21 +639,30 @@ def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
                     seeds=SEEDS)
 
 
+def _check_zero_qkv_dv(draw, label: str, *, tokens: int, chunk: int | None = None) -> None:
+    """Check Triton backward's `dV` over equal zero Q/K/V against `template.reference`."""
+    def ours(zeros, dout):
+        spans = template.spans(tokens, tokens, 1, chunk=chunk)
+        with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+            return attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
+                                             interpret=not ON_GPU).value
+
+    def theirs(zeros, dout):
+        spans = template.spans(tokens, tokens, 1, chunk=chunk)
+        _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
+        return pull(dout)[0]
+
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, label, seeds=8)
+
+
 def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
     """fp16, 32 queries over 32 equal keys, every output cotangent 2^-24: each query's share 2^-29 of
     every value is below fp16's least subnormal, yet their 32 sum to dV = 2^-24, as the reference's
     derivative gives."""
-    spans = template.spans(32, 32, 1)
-    zeros = jnp.zeros((1, 32, 1, 1), jnp.float16)
-    dout = jnp.full((1, 32, 1, 1), 2.0 ** -24, jnp.float16)
-    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
-        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
-                                         interpret=not ON_GPU).value
-    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
-    [theirs] = pull(dout)
-    assert float(theirs[0, 0, 0, 0]) == 2.0 ** -24
-    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
+    def draw(_seed: int):
+        return np.zeros((1, 32, 1, 1), np.float16), np.full((1, 32, 1, 1), 2.0 ** -24, np.float16)
 
+    _check_zero_qkv_dv(draw, "many small fp16 cotangents", tokens=32)
 
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype):
@@ -635,9 +674,8 @@ def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype)
     rounded, a common factor of a sum that cancels exactly, so its rounding moves nothing; what remains is
     a length-3 dot product's rounding, within gamma_3 of its products' magnitudes with each product's own
     rounding included (Higham, Accuracy and Stability, 3.1), which the bound takes twice."""
-    spans = template.spans(3, 3, 1)
-
     def ours(value, dout):
+        spans = template.spans(3, 3, 1)
         zeros = jnp.zeros((1, 3, 1, 1), value.dtype)
         with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
             return attention_triton.backward(zeros, zeros, value, spans, None, dout, scale=1.0,
@@ -645,16 +683,11 @@ def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype)
 
     def theirs(value, dout):
         def attend(value):
+            spans = template.spans(3, 3, 1)
             zeros = jnp.zeros((1, 3, 1, 1), value.dtype)
             return template.reference(zeros, zeros, value, spans, scale=1.0)
 
         return jax.vjp(attend, value)[1](dout)[0]
-
-    zeros = jnp.zeros((1, 3, 1, 1), dtype)
-    dout = jnp.asarray([1.0, 2.0, -3.0], dtype).reshape(1, 3, 1, 1)
-    shares = np.full((1, 3, 1, 1), np.abs(np.asarray(dout, np.float64)).sum() / 3)
-    for found in (ours(zeros, dout), theirs(zeros, dout)):
-        assert_fp32_reduction_bound(np.zeros((1, 3, 1, 1)), np.asarray(found, np.float64), shares, terms=3)
 
     def draw(seed: int):
         # Two cotangents drawn a channel, the third their negated sum: equal keys share them alike.
@@ -664,6 +697,15 @@ def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype)
 
     assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, f"cancelling cotangents {jnp.dtype(dtype).name}",
                     seeds=8)
+    import tier_wire
+    if tier_wire.preparing():
+        return
+
+    zeros = jnp.zeros((1, 3, 1, 1), dtype)
+    dout = jnp.asarray([1.0, 2.0, -3.0], dtype).reshape(1, 3, 1, 1)
+    shares = np.full((1, 3, 1, 1), np.abs(np.asarray(dout, np.float64)).sum() / 3)
+    for found in (ours(zeros, dout), theirs(zeros, dout)):
+        assert_fp32_reduction_bound(np.zeros((1, 3, 1, 1)), np.asarray(found, np.float64), shares, terms=3)
 
 
 def test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv():
@@ -671,69 +713,72 @@ def test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv():
     weight exp(-87) / 2^25 is below fp32's least subnormal, yet against a cotangent of 2^100 its gradient
     is a normal number, as the reference's derivative's is: kept apart from zero where the reference keeps
     it (the stability rule)."""
-    spans = template.spans(1, 1, 1)
-    zeros = jnp.zeros((1, 1, 1, 1), jnp.float32)
-    state = template.Initial(jnp.full((1, 1, 1), 87.0), jnp.full((1, 1, 1), 2.0 ** 25),
-                             jnp.zeros((1, 1, 1, 1)))
-    hooks = template.Hooks(initial=state)
-    dout = jnp.full((1, 1, 1, 1), 2.0 ** 100, jnp.float32)
-    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
-        ours = attention_triton.backward(zeros, zeros, zeros, spans, hooks, dout, scale=1.0,
-                                         interpret=not ON_GPU).value
-    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, hooks, scale=1.0), zeros)
-    [theirs] = pull(dout)
-    assert float(theirs[0, 0, 0, 0]) > 0
-    assert np.isfinite(np.asarray(ours)).all() and float(ours[0, 0, 0, 0]) >= np.finfo(np.float32).tiny
+    def draw(_seed: int):
+        return (np.zeros((1, 1, 1, 1), np.float32),
+                np.full((1, 1, 1), 87.0, np.float32),
+                np.full((1, 1, 1), 2.0 ** 25, np.float32),
+                np.zeros((1, 1, 1, 1), np.float32),
+                np.full((1, 1, 1, 1), 2.0 ** 100, np.float32))
+
+    def ours(zeros, im, it, ia, dout):
+        spans = template.spans(1, 1, 1)
+        hooks = template.Hooks(initial=template.Initial(im, it, ia))
+        with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+            return attention_triton.backward(zeros, zeros, zeros, spans, hooks, dout, scale=1.0,
+                                             interpret=not ON_GPU).value
+
+    def theirs(zeros, im, it, ia, dout):
+        spans = template.spans(1, 1, 1)
+        hooks = template.Hooks(initial=template.Initial(im, it, ia))
+        _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, hooks, scale=1.0),
+                          zeros)
+        return pull(dout)[0]
+
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "fp32 weight below subnormal", seeds=8)
 
 
 def test_a_small_fp16_cotangent_channel_beside_a_large_one_still_sums_into_dv():
     """fp16, 32 queries over 32 equal keys, cotangents 2 in one value channel and 2^-24 in the other:
     the small channel's 32 shares of 2^-29 still sum to 2^-24, as the reference's derivative gives."""
-    spans = template.spans(32, 32, 1)
-    zeros = jnp.zeros((1, 32, 1, 2), jnp.float16)
-    dout = jnp.broadcast_to(jnp.asarray([2.0, 2.0 ** -24], jnp.float16), (1, 32, 1, 2))
-    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
-        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
-                                         interpret=not ON_GPU).value
-    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
-    [theirs] = pull(dout)
-    np.testing.assert_array_equal(np.asarray(theirs, np.float32)[0, :, 0], [[2.0, 2.0 ** -24]] * 32)
-    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
+    def draw(_seed: int):
+        dout = np.broadcast_to(np.asarray([2.0, 2.0 ** -24], np.float16), (1, 32, 1, 2)).copy()
+        return np.zeros((1, 32, 1, 2), np.float16), dout
+
+    _check_zero_qkv_dv(draw, "small fp16 cotangent channel", tokens=32)
 
 
 def test_a_small_fp16_cotangent_beside_a_large_one_still_reaches_its_key():
     """fp16, two queries each seeing only its own key, cotangents 65504 and 2^-24: each key's gradient
     is its own query's, exactly, as the reference's derivative gives, the small beside the large."""
-    spans = template.spans(2, 2, 1, chunk=1)
-    zeros = jnp.zeros((1, 2, 1, 1), jnp.float16)
-    dout = jnp.asarray([65504.0, 2.0 ** -24], jnp.float16).reshape(1, 2, 1, 1)
-    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
-        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
-                                         interpret=not ON_GPU).value
-    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
-    [theirs] = pull(dout)
-    np.testing.assert_array_equal(np.asarray(theirs, np.float32).ravel(), [65504.0, 2.0 ** -24])
-    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
+    def draw(_seed: int):
+        dout = np.asarray([65504.0, 2.0 ** -24], np.float16).reshape(1, 2, 1, 1)
+        return np.zeros((1, 2, 1, 1), np.float16), dout
 
+    _check_zero_qkv_dv(draw, "small fp16 cotangent beside large", tokens=2, chunk=1)
 
 def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
     """fp16, one query over keys whose third weight is about 5.3e-8 before its denominator of 2 and
     2.7e-8 after it, which fp16's least subnormal (6e-8) holds only before: dV's third row takes it, as
     the reference's derivative does, kept apart from zero where the reference keeps it (the stability
     rule)."""
-    spans = template.spans(1, 3, 1)
-    query = jnp.ones((1, 1, 1, 1), jnp.float16)
-    key = jnp.asarray([0.0, 0.0, -16.75], jnp.float16).reshape(1, 3, 1, 1)
-    value = jnp.zeros((1, 3, 1, 1), jnp.float16)
-    dout = jnp.full((1, 1, 1, 1), 2.0, jnp.float16)
-    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
-        ours = attention_triton.backward(query, key, value, spans, None, dout, scale=1.0,
-                                         interpret=not ON_GPU).value
-    _, pull = jax.vjp(lambda value: template.reference(query, key, value, spans, scale=1.0), value)
-    [theirs] = pull(dout)
-    assert float(theirs[0, 2, 0, 0]) > 0
-    assert np.isfinite(np.asarray(ours, np.float32)).all() and float(ours[0, 2, 0, 0]) > 0
+    def draw(_seed: int):
+        return (np.ones((1, 1, 1, 1), np.float16),
+                np.asarray([0.0, 0.0, -16.75], np.float16).reshape(1, 3, 1, 1),
+                np.zeros((1, 3, 1, 1), np.float16),
+                np.full((1, 1, 1, 1), 2.0, np.float16))
 
+    def ours(query, key, value, dout):
+        spans = template.spans(1, 3, 1)
+        with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+            return attention_triton.backward(query, key, value, spans, None, dout, scale=1.0,
+                                             interpret=not ON_GPU).value
+
+    def theirs(query, key, value, dout):
+        spans = template.spans(1, 3, 1)
+        _, pull = jax.vjp(lambda v: template.reference(query, key, v, spans, scale=1.0), value)
+        return pull(dout)[0]
+
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "fp16 weight below subnormal", seeds=8)
 
 def test_the_backward_resumes_queries_that_read_no_key():
     """A resumed partial over causal keys that begin at row starts (the second row's first queries see
@@ -943,9 +988,10 @@ def _trained(spans: template.KeySpans):
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128, 256])
 @pytest.mark.parametrize("phase", ["forward", "backward"])
 @pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
-def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, phase):
+def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, phase, width):
     """The forward and a training step's backward (its forward kept) at the tiles they derive on a GPU of a
     99 KB block (an RTX PRO 6000's, an A10's), causal, bf16, widths 64, 128 and 256, compiled by XLA's CUDA
     backend for a compile-only device of it on this CPU (tests/kernel_compile.py): every Triton launch within
@@ -954,19 +1000,15 @@ def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, phas
     from kernel_compile import compile_kernels, failures
 
     spans = template.spans(512, 512, 1, causal=True)
+    shape = jax.ShapeDtypeStruct((1, 512, 2, width), jnp.bfloat16)
 
-    def _case(width: int):
-        shape = jax.ShapeDtypeStruct((1, 512, 2, width), jnp.bfloat16)
+    def forward(query, key, value):
+        return attention_triton.forward(query, key, value, spans, None, natural=True)
 
-        def forward(query, key, value):
-            return attention_triton.forward(query, key, value, spans, None, natural=True)
-
-        return (KernelCase(f"forward-{width}", lambda: (forward, (shape,) * 3)) if phase == "forward"
-                else KernelCase(f"backward-{width}", lambda: (_trained(spans), (shape,) * 4)))
-
-    cases = [_case(width) for width in (64, 128, 256)]
-    found = compile_kernels(cases, generation_name)
-    assert len(found) == len(cases)
+    case = (KernelCase(f"forward-{width}", lambda: (forward, (shape,) * 3)) if phase == "forward"
+            else KernelCase(f"backward-{width}", lambda: (_trained(spans), (shape,) * 4)))
+    found = compile_kernels([case], generation_name)
+    assert len(found) == 1
     assert not failures(found), "\n".join(failures(found))
 
 
@@ -1264,7 +1306,9 @@ def test_a_triton_forward_every_config_of_which_spills_hands_its_call_to_the_nex
 
 
 @COMPILES_ON_CPU
-def test_a_forward_at_its_own_config_compiles_within_an_a100s_block():
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT],
+                         ids=lambda k: k.name)
+def test_a_forward_at_its_own_config_compiles_within_an_a100s_block(kept):
     """A bf16 call's forward 128 wide, its plain walk, the training walk that keeps its output for D and the
     one of split sums (whose anchor value row holds 128 more registers a thread), each at the config the
     launch derives itself (no pin), compiled by XLA's CUDA backend for a compile-only A100 on this CPU
@@ -1276,13 +1320,11 @@ def test_a_forward_at_its_own_config_compiles_within_an_a100s_block():
     query = jax.ShapeDtypeStruct((1, 1024, 4, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.bfloat16)
 
-    def _case(kept):
-        def forward(query, key, value):
-            return attention_triton.forward(query, key, value, spans, residuals=kept)
-        return KernelCase(f"forward-{kept.name}", lambda: (forward, (query, key, key)))
+    def forward(query, key, value):
+        return attention_triton.forward(query, key, value, spans, residuals=kept)
 
-    cases = [_case(kept) for kept in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)]
-    found = compile_kernels(cases, "sm80")
+    found = compile_kernels([KernelCase(f"forward-{kept.name}", lambda: (forward, (query, key, key)))],
+                            "sm80")
     assert not failures(found), "\n".join(failures(found))
 
 

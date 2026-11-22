@@ -50,7 +50,7 @@ from dew.nn.kernels.options import (
     unhold,
 )
 from dew.nn.kernels.templates import report
-from dew.objectives.base import RECORD, Objective, Pooled
+from dew.objectives.base import RECORD, Objective, Pooled, head_fused_of, head_tile_of
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import Ledger
 from dew.telemetry.instrumentation import compiled_memory
@@ -64,8 +64,6 @@ from dew.training.memory import (
     MemoryMiss,
     compile_limit,
     compiled_if_it_fits,
-    head_fused_of,
-    head_tile_of,
     local_devices,
     offloads,
     placeable,
@@ -73,6 +71,7 @@ from dew.training.memory import (
     recompute_more,
     recompute_record,
     remat_offloaded,
+    remat_stated,
     rung_record,
     step_fits,
     temporaries_factor,
@@ -871,10 +870,8 @@ class FitSearch[LossT, EffectsT]:
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
         self.started = self.remat_rung()
-        record = recompute_record(self.objective)
         # Whether any module the run trains sets its own remat, which it compiles at alone.
-        self.remat_set = any(entry is not None for entry in (record if isinstance(record, list)
-                                                             else [record]))
+        self.remat_set = remat_stated(self.objective)
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
         # step's own (`options`) are made; the target's own policy is the compile point's
         # (`report.targeted`).
@@ -1128,8 +1125,16 @@ class FitSearch[LossT, EffectsT]:
         rung.put(self.objective)
         self.xla_defaults, self.narrow, self.ns_group = rung.xla_defaults, rung.narrow, rung.ns_group
 
-    def ladder(self, start: Rung, narrow: bool, ns_group: int | None, *, remat_set: bool | None = None,
-               defaults: tuple[bool, ...] | None = None) -> list[list[Rung]]:
+    def own_defaults(self) -> tuple[bool, ...]:
+        """Whether each place of the ladder is asked under the step's options alone, or under XLA's defaults
+        too where those are another program (`compiled_options`): the step's own options as its program reads
+        them, the compile's stop past the limit no option of the program's (`limited`), are XLA's defaults or
+        not."""
+        own = {name: value for name, value in (self.chosen or {}).items() if name != LIMIT_EXIT} or None
+        return (False, True) if own != self.required else (False,)
+
+    def ladder(self, start: Rung, narrow: bool, ns_group: int | None, *, remat_set: bool,
+               defaults: tuple[bool, ...]) -> list[list[Rung]]:
         """The rungs above `start`, where the search began, by remat rung, least recomputation first: the
         places the one climb visits from `start` (`recompute_more`: at each remat rung its head's rungs,
         then the next remat rung with its head back at the run's tile), each under the step's options and
@@ -1138,16 +1143,11 @@ class FitSearch[LossT, EffectsT]:
         and joining its Newton-Schulz stacks `ns_group` at a time.
         A run that states its remat has its head's rungs alone (docs/design/training.md, every choice can be
         overridden). The rungs at `start`'s remat and head are left out, asked already; the objective is
-        read from `start` and left there, wherever the search stood before. `remat_set` and `defaults` state
-        those two choices where a caller reads the ladder for another run's state (`below`): the search's
-        own (`remat_set`, its options' twins) where None."""
+        read from `start` and left there, wherever the search stood before. `remat_set` states whether the
+        run set its remat (`remat_stated`) and `defaults` the options each place is asked under
+        (`own_defaults`): the search's own, or another run's state's where a caller reads the ladder for it
+        (`below`)."""
         self.at(start)
-        # The step's own options as its program reads them, the compile's stop past the limit no option of
-        # the program's (`limited`): where they are XLA's defaults, a rung under them is the same program.
-        own = {name: value for name, value in (self.chosen or {}).items() if name != LIMIT_EXIT} or None
-        if defaults is None:
-            defaults = (False, True) if own != self.required else (False,)
-        remat_set = self.remat_set if remat_set is None else remat_set
         places = [Rung.of(self.objective, xla_defaults=False, narrow=narrow, ns_group=ns_group)]
         while recompute_more(self.objective, self.base):
             place = Rung.of(self.objective, xla_defaults=False, narrow=narrow, ns_group=ns_group)
@@ -1231,7 +1231,8 @@ class FitSearch[LossT, EffectsT]:
                 # its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them),
                 # so the copies come back, their 1-2% of a step kept, and the ladder climbs with them.
                 _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
-        for rung in (rung for group in self.ladder(start, narrow, ns_group) for rung in group):
+        for rung in (rung for group in self.ladder(start, narrow, ns_group, remat_set=self.remat_set,
+                                                   defaults=self.own_defaults()) for rung in group):
             if rung in self.asked:
                 continue
             split = ask(rung, "the step does not fit the devices; compiling it again at %s")
@@ -1256,8 +1257,7 @@ class FitSearch[LossT, EffectsT]:
         self.at(origin)
         # The climb as the configured run reads it: one that set its own remat climbs its head alone, whatever
         # remat a record then moved it to.
-        record = recompute_record(self.objective)
-        explicit = any(entry is not None for entry in (record if isinstance(record, list) else [record]))
+        explicit = remat_stated(self.objective)
         start = dataclasses.replace(origin, ns_group=plan.ns_group)
         copies = start.narrow and any(candidate.copies for candidate in self.lowered.values())
         order = [*([dataclasses.replace(start, narrow=False)] if copies else []),
@@ -1284,7 +1284,8 @@ class FitSearch[LossT, EffectsT]:
         (each remat place's first, `ladder`), least recomputation first, reading the narrow copies where
         `narrow` and joining the Newton-Schulz stacks `ns_group` at a time: none for a run that states its
         remat, whose ladder is its head's rungs alone."""
-        return [group[0] for group in self.ladder(start, narrow, ns_group)
+        return [group[0] for group in self.ladder(start, narrow, ns_group, remat_set=self.remat_set,
+                                                  defaults=self.own_defaults())
                 if group[0].modules != start.modules and not group[0].xla_defaults]
 
     def said(self, named: list[str]) -> None:

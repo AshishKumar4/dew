@@ -343,7 +343,7 @@ EXPERT_BANKS = ("gate_up_proj", "down_proj")
 def packed_variables(variables) -> dict:
     """`variables`' parameters with each routed expert matrix (`EXPERT_BANKS`) packed into an NVFP4 bank
     (`NvFp4.quantized`) in `QUANTIZATION` at its path, taken out of the parameters, as a packed load holds
-    it (`quantized_loads.with_banks`), which the expert layers read (`dew.quantization.expert_matrix`)."""
+    it (`quantized_loads.with_banks`), which the expert layers read (`dew.nn.dense.packed_matrix`)."""
     from flax import linen as nn
     from flax.traverse_util import flatten_dict, unflatten_dict
 

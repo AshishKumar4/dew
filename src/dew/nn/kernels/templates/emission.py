@@ -104,16 +104,17 @@ class Role:
         return unit(_mean(self.walks)) if self.walks else None
 
 
-def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: Sequence[int] = ()
-            ) -> Emitted:
+def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: Sequence[int] = (),
+            forms: Mapping | None = None) -> Emitted:
     """`body`, a kernel's jaxpr (its `mpmd_map`'s or its `pallas_call`'s), as each of a program's
     `warpgroups` warpgroups along `axis` runs it (`Emitted`; a program of one, no axis, a TPU's or an
     mma.sync family's). Its operands at the indices `device` are refs in device memory, each read and write
     of them its bytes' device traffic (a Triton launch's blocks, which its loads and stores move: the decode
-    merge's, `merged._channel_block`)."""
+    merge's, `merged._channel_block`). Its special functions in `forms` where given (a Mosaic GPU kernel's,
+    `_forms`), else one MUFU an element each (`operation_work`)."""
     roles = []
     for index in range(warpgroups):
-        counted = _Counting(axis, index)
+        counted = _Counting(axis, index, forms=forms)
         counted.run(body, [_DEVICE if at in device else None for at in range(len(body.invars))])
         roles.append(Role(counted.fixed, tuple(counted.walks)))
     return Emitted(tuple(roles))
@@ -159,6 +160,38 @@ them. An fp32 sqrt and rsqrt issue one MUFU each an element on sm80, sm90 and sm
 and an FSETP scaling a subnormal: Mosaic GPU's `sqrt.approx.f32` a MUFU.SQRT and `rsqrt.approx.f32` a
 MUFU.RSQ, and XLA's `sqrt.rn.f32` a MUFU.RSQ refined on the FMA pipe (ptxas 13.0's SASS, probes FS-SQRT2 and
 FS-SQRT4, 2026-11-16), as an exp's MUFU.EX2 is one beside its scaling FMUL."""
+
+APPROXIMATE_FORMS: Mapping = {
+    lax.exp_p: Work(exponentials=1, operations=1), lax.exp2_p: Work(exponentials=1),
+    lax.log_p: Work(exponentials=1, operations=1), lax.log2_p: Work(exponentials=1),
+    lax.tanh_p: Work(exponentials=1), lax.sin_p: Work(exponentials=1), lax.cos_p: Work(exponentials=1),
+    lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3),
+    lax.logistic_p: Work(exponentials=2, operations=3)}
+"""Each special function's issue an element in a Mosaic GPU kernel compiled with `approx_math` (attention's):
+the hardware's approximate form, one MUFU (an exp's and a log's beside the multiply scaling it to base 2; a
+logistic's two, its exp and its reciprocal, beside a negation, a multiply and an add), counted from the PTX
+of a warpgroup kernel of one fp32 tile on sm90 and sm100 alike (FS-APPROX-FORMS3, row 10824); a square root's
+and its reciprocal's MUFU beside two FMULs and an FSETP scaling a subnormal, in their SASS (FS-SQRT2,
+FS-SQRT4). log1p and pow have none: Mosaic GPU lowers neither."""
+
+ACCURATE_FORMS: Mapping = {
+    lax.exp_p: Work(exponentials=1, operations=7, conversions=1, integer_operations=1),
+    lax.exp2_p: Work(exponentials=1),
+    lax.log_p: Work(operations=21, conversions=1, integer_operations=4),
+    lax.log2_p: Work(operations=23, conversions=1, integer_operations=4),
+    lax.tanh_p: Work(exponentials=2, operations=13, integer_operations=3),
+    lax.logistic_p: Work(exponentials=2, operations=9, conversions=1, integer_operations=1),
+    lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3)}
+"""Each special function's issue an element in a Mosaic GPU kernel compiled without `approx_math` (every
+GEMM launch's), from the same PTX (FS-APPROX-FORMS3, sm90 and sm100): an exp the MUFU beside seven fp32
+instructions (its range reduction's four FMAs, an add, a negation and a multiply), a saturating convert and a
+shift; a logistic the exp's beside an add, a negation and its reciprocal's MUFU; a tanh two MUFU (an exp and
+a reciprocal) beside thirteen fp32 instructions and three integer ones; a log and a log2 no MUFU at all, a
+polynomial of 21 and 23 fp32 instructions (its FMAs, selects and compares) beside four integer ones and a
+convert; exp2, sqrt and rsqrt their approximate forms. A sin's and a cos's accurate form branches to a slow
+reduction for large arguments, which a static count misstates: unpriced, with log1p and pow, which Mosaic
+GPU lowers in neither form."""
+
 
 _FREE = frozenset({
     lax.axis_index_p, gpu.barrier_arrive_p, gpu.barrier_wait_p, lax.bitcast_convert_type_p,
@@ -400,8 +433,9 @@ class _Counting:
     `loops` loops where it starts (a conditional's branch, `cond`), and as warp `warp` (its axis and index)
     of its warpgroup's warps where it is one's (`warps`)."""
 
-    def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None):
-        self.axis, self.index, self.warp = axis, index, warp
+    def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
+                 forms: Mapping | None = None):
+        self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
         self.fixed = Work()
         self.walks: list[Work] = []
         self.loops = [_Loop() for _ in range(loops)]
@@ -503,7 +537,8 @@ class _Counting:
             return [values[1 + int(values[0])]]
         if primitive in _ARITHMETIC:
             self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
-                                    [variable.aval for variable in equation.outvars], params))
+                                    [variable.aval for variable in equation.outvars], params,
+                                    forms=self.forms))
         elif primitive in _PRODUCTS:
             self.add(_product(equation))
         elif primitive is gpu.mma_p:
@@ -595,7 +630,8 @@ class _Counting:
                 counter, start, stop, bound = ranged
                 inputs[len(consts) + counter] = _Place(at, start, stop, parity)
                 inputs[len(consts) + bound] = stop
-            trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp)
+            trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
+                              forms=self.forms)
             trial.run(body, inputs)
             return trial
 
@@ -620,7 +656,8 @@ class _Counting:
         ((name, count),) = mesh.shape.items()
         steps, marks = [], 0.0
         for warp in range(count):
-            counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp))
+            counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
+                                forms=self.forms)
             counted.run(inner, [None] * len(inner.invars))
             self.fixed = self.fixed + counted.fixed
             if counted.walks:
@@ -667,7 +704,8 @@ class _Counting:
             return self.run(branches[int(index)], operands)
         trials = []
         for branch in branches:
-            trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp)
+            trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
+                              forms=self.forms)
             trial.run(branch, operands)
             trials.append(trial)
         self.fixed = self.fixed + _envelope(trial.fixed for trial in trials)
@@ -756,7 +794,7 @@ apart (`_Counting.equation`'s, a TPU core's)."""
 
 
 def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mapping,
-                   target: generation.GpuTarget | None = None) -> Work:
+                   target: generation.GpuTarget | None = None, *, forms: Mapping | None = None) -> Work:
     """What one equation of `primitive` computes over operands and results of the avals `inputs` and
     `outputs` (each its shape and dtype), with `params`, on `target` (the process's own, or the one it
     assumes, where None: `generation.gpu_target`): the one rule the counter prices a kernel body's
@@ -766,13 +804,18 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     elements over its contracted ones, in the mode and passes XLA multiplies it in on `target`
     (`product.product_mode`: on a TPU, an fp32 product's bfloat16 passes); what moves and computes nothing
     nothing (`_FREE`: a layout change, a barrier); any other primitive's output elements unpriced
-    (`Work.unpriced_operations`)."""
+    (`Work.unpriced_operations`). With `forms` (a kernel's: `APPROXIMATE_FORMS`, `ACCURATE_FORMS`), a special
+    function issues its form an output element, one with none unpriced."""
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
     if primitive in _REDUCTIONS:
         return Work(operations=_elements(inputs[0]))
     if primitive in SPECIAL_FUNCTIONS:
-        return Work(exponentials=sum(_elements(aval) for aval in outputs))
+        elements = sum(_elements(aval) for aval in outputs)
+        if forms is None:
+            return Work(exponentials=elements)
+        form = forms.get(primitive)
+        return Work(unpriced_operations=elements) if form is None else repeated(form, elements)
     if primitive is lax.convert_element_type_p:
         return Work(conversions=sum(_elements(aval) for aval in outputs))
     if primitive is lax.dot_general_p:
@@ -846,17 +889,26 @@ def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
     return jaxpr.replace(eqns=[rewritten(equation) for equation in jaxpr.eqns])
 
 
+def launch_programs(kernel) -> int:
+    """The programs launched by `kernel` (`mpmd_map` or `pallas_call`), its grid's product."""
+    if kernel.primitive is mpmd.mpmd_map_p:
+        (mesh,) = kernel.params["meshes"]
+        return math.prod(mesh.grid)
+    return math.prod(kernel.params["grid_mapping"].grid)
+
+
 def launch_work(kernel, stated: Stated) -> Work:
     """A kernel equation's work from its body's emission, a launch's: each unit's, a step's `stated.steps`
     times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
     steps its longest program walks (`Stated.longest`, else their mean), and one kernel. Its cost
     estimate's (`_estimate`) and a step's price (`work_of`, `attention_decode.priced_step`) alike."""
+    forms = _forms(kernel)
+    programs = launch_programs(kernel)
     if kernel.primitive is mpmd.mpmd_map_p:
         (mesh,) = kernel.params["meshes"]
-        counted = emitted(_body(kernel), mesh.num_threads or 1, mesh.thread_name)
-        programs = math.prod(mesh.grid)
+        counted = emitted(_body(kernel), mesh.num_threads or 1, mesh.thread_name, forms=forms)
     else:
-        counted, programs = emitted(_body(kernel), 1, None), math.prod(kernel.params["grid_mapping"].grid)
+        counted = emitted(_body(kernel), 1, None, forms=forms)
 
     def issued(field: str) -> float:
         return counted.issued(lambda work: getattr(work, field), stated.steps, programs)
@@ -878,6 +930,24 @@ def _estimate(work: Work) -> pl.CostEstimate:
 _WORKS: "weakref.WeakKeyDictionary[jax_core.Jaxpr, Work]" = weakref.WeakKeyDictionary()
 """Each costed launch's work (`launch_work`) by its kernel's body, as `_filled` counted it: a program a
 launch's lowering cache holds (`tuning.lowered_once`) answers with the body it traced once."""
+
+
+def _forms(kernel) -> Mapping | None:
+    """The special functions' forms a kernel equation's compile lowers them to: a Mosaic GPU kernel's
+    approximate forms where its compiler parameters ask `approx_math`, its accurate ones elsewhere; None for
+    another backend's (a Mosaic TPU or Triton kernel), counted by `operation_work`'s one rule."""
+    held = kernel.params["compiler_params"]
+    if isinstance(held, Mapping):
+        held = held.get("mosaic_gpu")
+    if not isinstance(held, gpu_core.CompilerParams):
+        return None
+    return special_forms(held.approx_math)
+
+
+def special_forms(approx_math: bool) -> Mapping:
+    """The special functions' forms a Mosaic GPU kernel compiled with or without `approx_math` lowers them
+    to: `APPROXIMATE_FORMS` or `ACCURATE_FORMS`."""
+    return APPROXIMATE_FORMS if approx_math else ACCURATE_FORMS
 
 
 def _body(kernel) -> jax_core.Jaxpr:

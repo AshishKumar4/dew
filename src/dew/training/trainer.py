@@ -191,7 +191,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, computation_differs, resumed_step, run_data
+from dew.training.startup import Startup, computation_differs, refuse_export, resumed_step, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -1393,7 +1393,7 @@ class Trainer(Generic[Loss, Effects]):
                     # Each batch of a shape the run has not stepped is checked against what the objective
                     # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
                     check_inputs(self, device)
-                known, began = len(compiled), time.perf_counter()
+                known, began, before = len(compiled), time.perf_counter(), interval.compiling
                 with run.startup.phase("compile", "compiling the step", when=not known):
                     train_step, flops, state = self._compiled_for(compiled, state, device, run, interval)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
@@ -1405,11 +1405,11 @@ class Trainer(Generic[Loss, Effects]):
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
-                    interval.waited = 0.0
+                    interval.waited, interval.compiling = 0.0, before
                 elif len(compiled) > known:
-                    # A shape met later compiles inside the interval, which
-                    # reports that time apart from its steps'.
-                    interval.compiling += time.perf_counter() - began
+                    # A shape met later compiles inside the interval, which reports that time apart from
+                    # its steps', its first draw's admissions (`DrawingStep.drawn`) among it.
+                    interval.compiling = before + time.perf_counter() - began
                 with region("train.step"):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
@@ -1521,7 +1521,7 @@ class Trainer(Generic[Loss, Effects]):
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
         objective that names its input field alone declares it first (`_declare_input`), a resume's from the
         first batch its saved position admits (`_resumed_position`)."""
-        checkpoints = self.checkpoints
+        checkpoints, _ = self.checkpoints, refuse_export(self)
         resumed = None if initial is not None else self._resumed(run, resume)
         self._declare_input(lambda: self._primed_first(run, dataset,
                                                        None if resumed is None else resumed.position))
@@ -2136,7 +2136,6 @@ class Trainer(Generic[Loss, Effects]):
         ends on, ranked by them: a budget's last step, a stream's that ran out and a
         plateau's (`_between_steps`)."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
-        state = plan.closed_at_budget(state, run.clock.read)
         self._take(plan, run, interval, state, unlogged=True)
         self._read_taken(run)
         if run.notice is not None and run.cooling is None:
@@ -2324,7 +2323,7 @@ class Trainer(Generic[Loss, Effects]):
         settled_heap(run)  # A step the process held, its fit's start collected all the same.
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current, state), trials.state)
 
     def _saved_checkpoint(
         self,

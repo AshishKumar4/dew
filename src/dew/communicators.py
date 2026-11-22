@@ -471,16 +471,12 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
     """The communicators an executable makes on `gpus` (`collectives_of`), read from its `program` once per
     executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, below
     the digest of the code that reads it (`dew._code.code_digest`), so a warm start that loads it from the
-    compilation cache reads no module, and those another code of it kept are read again; none kept or
-    read where Dew's source changed while the process ran."""
-    code = code_digest(__name__)
-    path = None if code is None else Path(dew_cache_dir()) / "communicators" / "programs" / code / (
-        f"{fingerprint.hex()}.json")
-    if path is not None and path.exists():
+    compilation cache reads no module, and those another code of it kept are read again."""
+    kept = Path(dew_cache_dir()) / "communicators" / "programs" / code_digest(__name__)
+    path = kept / f"{fingerprint.hex()}.json"
+    if path.exists():
         return Collectives.of(json.loads(path.read_text()), gpus)
     positions = collectives_of(program(), tuple(range(len(gpus))))
-    if path is None:
-        return Collectives.of(positions.to_json(), gpus)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_atomically(path, json.dumps(positions.to_json()))
     return Collectives.of(positions.to_json(), gpus)

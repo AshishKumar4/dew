@@ -18,9 +18,9 @@ if TYPE_CHECKING:
 
 def unwalked(family: Family) -> Callable:
     """A walk of no steps (`Family.persist`'s, where a tile streams nothing): its carry and accumulators as
-    they start."""
-    def walk(step, start, shapes, *, initial=None):
-        del step
+    they start, no step's fragments to prefetch (`Transport.prefetches_fragments`' `prefetch`)."""
+    def walk(step, start, shapes, *, initial=None, prefetch=None):
+        del step, prefetch
         return start, family.started(shapes, initial)
 
     return walk

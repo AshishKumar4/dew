@@ -21,7 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import launches
+from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
     bodies,
     emission,
@@ -36,6 +36,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated, Work
+from dew.nn.programs import meshless
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -66,13 +67,12 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
 
     blocks = streams.pipeline.blocks
     names = tuple(blocks)
-    swizzles = {name: gathered_rows.swizzled(shape, dtype) for name, (shape, dtype) in blocks.items()}
     for step, lo, hi in segments:
         if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
             continue
-        stages = streams.pipeline.stages
-        if isinstance(lo, int) and isinstance(hi, int):
-            stages = min(stages, hi - lo)
+        known = isinstance(lo, int) and isinstance(hi, int)
+        scoped = _gathered_slots(streams.pipeline, hi - lo if known else None)
+        stages = scoped[0].shape[0]
 
         def walked(*slots, step=step, lo=lo, hi=hi, stages=stages, carry=carry):
             def load(index) -> None:
@@ -87,7 +87,8 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
                         source = ref.at[:, pl.ds(depth * width, width)]
                         table = rows.table.at[pl.ds(rows.start, height)]
                         slot = ring.at[lax.rem(index - lo, stages)]
-                        _row_copied(source, table, slot, swizzles[name], interpret)
+                        # At the swizzle its ring is staged at (`_gathered_slots`), the one decision.
+                        _row_copied(source, table, slot, swizzling.swizzle_of(ring), interpret)
 
                 if not interpret:
                     plgpu.inline_mgpu()(gathered_rows.commit_group)()
@@ -112,9 +113,70 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
 
             return lax.fori_loop(lo, hi, body, carry)
 
-        carry = pl.run_scoped(walked, *(swizzling.staged((stages, *shape), dtype, swizzles[name])
-                                         for name, (shape, dtype) in blocks.items()))
+        carry = pl.run_scoped(walked, *scoped)
     return carry
+
+
+def _gathered_slots(pipeline: "Pipeline", steps: int | None) -> tuple:
+    """A gathered walk's ring of each stream (`_gathered_walk`, which scopes them, and `CpAsync.lifetimes`,
+    which sizes them): a slot of each block a stage, no more than the walk's `steps` where they are known,
+    staged at the swizzle its rows' copy tiles (`gathered.swizzled`)."""
+    from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on the toolkit's rings
+
+    stages = pipeline.stages if steps is None else min(pipeline.stages, steps)
+    return tuple(swizzling.staged((stages, *shape), dtype, gathered_rows.swizzled(shape, dtype))
+                 for shape, dtype in pipeline.blocks.values())
+
+
+def _specs(pipeline: "Pipeline", index_maps: dict | None = None) -> list:
+    """Each stream's block spec as the walk hands `emit_pipeline` its tiles (`CpAsync.walk`), and as its
+    allocations are read (`_pipelined`, at no `index_maps`, which an allocation does not read): a tile's
+    blocks staged swizzled for ldmatrix (`_staging`), each read inside its operand: its launch extends every
+    operand its rows read past (`bounded_loads`, `mosaic_gpu._walked_rows`), so its copies are promised in
+    bounds, unchecked."""
+    return [plgpu.BlockSpec(shape, None if index_maps is None else index_maps[name],
+                            transforms=_staging((shape, dtype), pipeline.swizzles.get(name)),
+                            oob_fill_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
+            for name, (shape, dtype) in pipeline.blocks.items()]
+
+
+CP_ASYNC_GENERATION = "sm80"
+"""The generation an mma.sync walk's shared memory is planned for (`_pipelined`): its copies are cp.async's
+on every device the family runs on (`bundles.legal`: no device moving its blocks by TMA runs it), so one
+plan holds for each; Ampere's, the least of them (`generation.BF16_GPU`)."""
+
+
+@functools.lru_cache(maxsize=256)
+def _pipelined(key: tuple, steps: int | None) -> tuple:
+    """The shared memory `emit_pipeline` scopes for a walk of `steps` steps (its stages where they are not
+    known) over the streams `key` names (`_pipeline_key`), as JAX's own builder allocates them
+    (`get_allocations`) for the copies the walk makes (`CP_ASYNC_GENERATION`'s, a slot of each block a stage,
+    fewer for fewer steps, no barrier), whatever GPU, mesh or trace the caller is in: traced on an abstract
+    device of that generation, in a trace of its own that runs nothing, once a walk of the candidate
+    search's."""
+    stages, streams = key
+    pipeline = Pipeline({name: (shape, jnp.dtype(dtype)) for name, shape, dtype, _ in streams}, stages,
+                        {name: swizzle for name, _, _, swizzle in streams if swizzle is not None})
+    found = {}
+
+    def allocated() -> None:
+        built = plgpu.emit_pipeline(lambda *_: None, grid=(stages if steps is None else steps,),
+                                    in_specs=_specs(pipeline), max_concurrent_steps=stages)
+        found.update(built.get_allocations(*(jax.ShapeDtypeStruct(shape, dtype)
+                                             for shape, dtype in pipeline.blocks.values())))
+
+    planned = generation.gpu_mesh(jax.sharding.AbstractMesh((1,), ("walk",)), CP_ASYNC_GENERATION)
+    with meshless(), jax.sharding.use_abstract_mesh(planned):
+        jax.make_jaxpr(allocated)()
+    leaves = (*found["in_smem_refs"], *found["out_smem_refs"], found["barrier_ref"])
+    return tuple(leaf for leaf in leaves if leaf is not None)
+
+
+def _pipeline_key(pipeline: "Pipeline") -> tuple:
+    """`pipeline`'s streams as `_pipelined` caches their allocations: its stages, and each stream's name, tile
+    shape, dtype and named swizzle."""
+    return pipeline.stages, tuple((name, tuple(shape), jnp.dtype(dtype).name, pipeline.swizzles.get(name))
+                                  for name, (shape, dtype) in pipeline.blocks.items())
 
 
 def _row_copied(source, table, slot, swizzle: int, interpret: bool) -> None:
@@ -433,24 +495,43 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        # The left operand loads a whole swizzle tile of its depth at a time (`lhs_fragment_depth`), as a
-        # transposed left operand loaded in instruction slices took the A100's kernel gradient 7% slower
-        # (FS-DENSE-AB1); the right loads only the fragments the next instructions consume, as narrow as
-        # its staging allows (`_depth_granule`), which took its input gradient 12% faster. A register operand
-        # (an accumulator's value) is cast once and sliced. Each instruction's fragments load before the
-        # product ahead of it issues, CUTLASS's warp-level double buffering: every dense kernel gradient on
-        # an A100 took 12 to 14% less time, its outputs bitwise the same, the forward and input gradient
-        # unchanged (FS-C1-NARROW1-a100).
+        loaded, starts, _ = self._fragments(lhs, rhs)
+        fragments = loaded(starts[0])
+        for following in starts[1:]:
+            ahead = loaded(following)
+            acc = self._mma(acc, *fragments)
+            fragments = ahead
+        return self._mma(acc, *fragments)
+
+    def _fragments(self, lhs, rhs, seeded: tuple | None = None, *, sliced: bool = False
+                   ) -> tuple[Callable, range, Callable]:
+        """`products`' fragment reads of `lhs @ rhs`: `loaded(start)`, instruction `start`'s fragments, its
+        loads issued the first time a slice is asked for; the instructions' starts; and `first()`, the left
+        and right slices instruction 0 reads, read (`first_fragments`), those `seeded` gives already read
+        (`products_across`). The left operand loads a whole swizzle tile of its depth at a time
+        (`lhs_fragment_depth`), as a transposed left operand loaded in instruction slices took the A100's
+        kernel gradient 7% slower (FS-DENSE-AB1); the right loads only the fragments the next instructions
+        consume, as narrow as its staging allows (`_depth_granule`), which took its input gradient 12%
+        faster. A register operand (an accumulator's value) is cast once and sliced. Each instruction's
+        fragments load before the product ahead of it issues, CUTLASS's warp-level double buffering: every
+        dense kernel gradient on an A100 took 12 to 14% less time, its outputs bitwise the same, the forward
+        and input gradient unchanged (FS-C1-NARROW1-a100). `sliced`, the left loads as narrow as the right's
+        (an instruction's granule): what a step's prefetch holds across the step before's last product is
+        then the one instruction's fragments the lookahead holds within a step, no register beyond it."""
         instruction = self.fragment_depth(int(rhs.shape[0]))
-        lhs_depth = max(_depth_granule(lhs, 1, instruction),
-                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=swizzling.swizzle_of(lhs)))
+        widest = 0 if sliced else self.lhs_fragment_depth(int(lhs.shape[1]),
+                                                           swizzle=swizzling.swizzle_of(lhs))
+        lhs_depth = max(_depth_granule(lhs, 1, instruction), widest)
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
         rights: dict[int, jax.Array] = {}
+        if seeded is not None:
+            left, rights[0] = seeded
+            if left is not None:
+                lefts[0] = left
 
         def loaded(start: int) -> tuple[jax.Array, jax.Array]:
-            """Instruction `start`'s fragments, its loads issued the first time a slice is asked for."""
             left_at, right_at = start - start % lhs_depth, start - start % rhs_depth
             if held is None and left_at not in lefts:
                 lefts[left_at] = self._left(lhs.at[:, pl.ds(left_at, lhs_depth)])
@@ -461,13 +542,30 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
                 :, start - left_at:start - left_at + instruction]
             return left, rights[right_at][start - right_at:start - right_at + instruction]
 
-        starts = range(0, rhs.shape[0], instruction)
+        def first() -> tuple[jax.Array | None, jax.Array]:
+            loaded(0)
+            return lefts.get(0), rights[0]
+
+        return loaded, range(0, rhs.shape[0], instruction), first
+
+    def first_fragments(self, lhs, rhs):
+        if jnp.dtype(lhs.dtype) != self.dtype:
+            return self.for_dtype(lhs.dtype).first_fragments(lhs, rhs)
+        return self._fragments(lhs, rhs, sliced=True)[2]()
+
+    def products_across(self, acc, lhs, rhs, prefetched, boundary: Callable):
+        if jnp.dtype(lhs.dtype) != self.dtype:
+            return self.for_dtype(lhs.dtype).products_across(acc, lhs, rhs, prefetched, boundary)
+        loaded, starts, _ = self._fragments(lhs, rhs, seeded=prefetched, sliced=True)
         fragments = loaded(starts[0])
         for following in starts[1:]:
             ahead = loaded(following)
             acc = self._mma(acc, *fragments)
             fragments = ahead
-        return self._mma(acc, *fragments)
+        # The last product's operands are in registers: the next step's slots awaited and its first
+        # fragments read now, under it.
+        following = boundary()
+        return self._mma(acc, *fragments), following
 
     def looped_products(self, acc, lhs, rhs, *, accumulate: bool = True):
         """`products`, its instruction slices issued in a loop of their own, each slice's operands loaded from
@@ -559,6 +657,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     an issuer composed with it gives (`Mma`)."""
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
+    prefetches_fragments = True  # `emit_pipeline`'s `prefetch`: a step's first fragments under the last's
 
     # Its programs fix a tile up across programs through global-memory atomics (`Family.fixed_up`), which
     # sm_70 on issues: a balanced tail's and a decode's split partials merge in the launch.
@@ -654,10 +753,14 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
-        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.
-        slots = streams.stages if steps is None else min(streams.stages, steps)
-        tiles = tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in streams.blocks.values())
-        return (), (tiles,)
+        # A walk's shared memory in its own scope: `emit_pipeline`'s, as JAX's builder allocates it for its
+        # cp.async copies (`_pipelined`), or a gathered walk's own rings (`_gathered_slots`); none for a walk
+        # of no steps, which the walk skips.
+        if steps == 0:
+            return (), ((),)
+        if streams.gathered:
+            return (), (_gathered_slots(streams, steps),)
+        return (), (_pipelined(_pipeline_key(streams), steps),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -709,9 +812,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         def walking(counter, active, steps, views):
             del counter, active
 
-            def walk(step, start, shapes, *, initial=None):
+            def walk(step, start, shapes, *, initial=None, prefetch=None):
                 return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes,
-                                 interpret, initial=initial)
+                                 interpret, initial=initial, prefetch=prefetch)
 
             return walk
 
@@ -719,10 +822,15 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, products: Sequence[mosaic.Product] = ()
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, products: Sequence[mosaic.Product] = (),
+                prefetch: Callable | None = None) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
-        # each stage back as its step ends, so no step holds one past it, nor reads one ahead.
+        # each stage back as its step ends, so no step holds one past it, nor reads one ahead. With
+        # `prefetch(slots)` (`prefetches_fragments`), `emit_pipeline` reads a step's first fragments under the
+        # step before's last product: each step is given them and the boundary that reads the next's
+        # (`step(..., prefetched=, boundary=)`, returning its carry and the next's fragments), where it keeps
+        # two slots or more (its prefetch's own refill) and gathers no rows (`_gathered_walk`'s own copies);
+        # elsewhere each step is called as without it.
         if mosaic.ahead_streams(products):
             raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
         del first, in_flight, unrolled
@@ -732,6 +840,16 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         carry = (start, self.started(shapes, initial))
         if streams.pipeline.gathered:
             return _gathered_walk(streams, segments, carry, interpret)
+        prefetching = prefetch is not None and streams.pipeline.stages > 1
+
+        def prefetched_of(indices, *slots):
+            assert prefetch is not None
+            del indices
+            return prefetch(slots_of(slots))
+
+        def slots_of(refs) -> rings.WholeSlots:
+            return rings.WholeSlots(dict(zip(names, refs, strict=True)))
+
         for step, lo, hi in segments:
             if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
                 # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
@@ -739,19 +857,21 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 continue
 
             def body(indices, *refs, step=step, lo=lo):
-                (index,), (carried, accumulators) = indices, refs[-1]
-                slots = rings.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
-                return step(index + lo, slots, carried, accumulators)
+                (index,) = indices
+                if prefetching:
+                    *slots, (carried, accumulators), prefetched, boundary = refs
+                    (carried, accumulators), following = step(
+                        index + lo, slots_of(slots), carried, accumulators, prefetched=prefetched,
+                        boundary=boundary)
+                    return (carried, accumulators), following
+                carried, accumulators = refs[-1]
+                return step(index + lo, slots_of(refs[:-1]), carried, accumulators)
 
-            # A tile's blocks staged swizzled for ldmatrix (`_staging`), each read inside its operand: its
-            # launch extends every operand its rows read past (`bounded_loads`, `mosaic_gpu._walked_rows`),
-            # so cp.async's copies are promised in bounds, unchecked.
-            specs = [plgpu.BlockSpec(blocks[name][0], functools.partial(_at, streams.views[name][1], lo),
-                                     transforms=_staging(blocks[name], streams.pipeline.swizzles.get(name)),
-                                     oob_fill_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
-                     for name in names]
-            pipeline = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
-                                           max_concurrent_steps=streams.pipeline.stages, init_carry=carry)
+            specs = _specs(streams.pipeline,
+                           {name: functools.partial(_at, streams.views[name][1], lo) for name in names})
+            pipeline = plgpu.emit_pipeline(
+                body, grid=(hi - lo,), in_specs=specs, max_concurrent_steps=streams.pipeline.stages,
+                init_carry=carry, prefetch=prefetched_of if prefetching else None)
             carry = pipeline(*(streams.views[name][0] for name in names))
         return carry
 

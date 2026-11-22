@@ -66,9 +66,9 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
         scoped.append(family.staged_memory((2, consumers, block_q), jnp.float32))
     if streamed is None:
         streamed = streamed_statistics(family, config, width, dtype, stages, reduced=reduced,
-                                       allocations_of=_coop_allocations)
+                                       allocations_of=_coop_allocations, anchored=False)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
-              **{name: ((block_q,), STATISTICS[name]) for name in _STREAM_ORDER[:streamed]}}
+              **{name: ((block_q,), STATISTICS[name]) for name in _STREAM_ORDER[:min(streamed, 4)]}}
     return scoped, family.streams(blocks, stages, consumers)
 
 
@@ -84,8 +84,8 @@ def _share_scores(walk: _Backward, share: int, resident: tuple, rows_of, coords_
     own = pl.ds(share * keys, keys)
     coords = coords_of(q_first, read=walk.places_read(masked=masked))
     scores = _tile_scores(walk, (slots["queries"], slots["douts"]), (k_smem.at[own], v_smem.at[own]),
-                          rows_of(slots, q_first), coords, whole(index), (tiles.block_q, keys), masked=masked,
-                          whole_operands=whole_operands)
+                          rows_of(slots, q_first), coords, whole(index), (tiles.block_q, keys),
+                          masked=masked, whole_operands=whole_operands)
     return scores, own, pl.ds(share * columns, columns), q_first
 
 
@@ -191,7 +191,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, heads // kv_heads)
-        statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
+        statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed,
+                                          anchored=False)
         views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         k_first = family.program_index("k_tiles") * block_k
@@ -240,7 +241,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
     stages = min(program.tiles.stages, q_steps)
     reduced = reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1)
     stats_streamed = streamed_statistics(family, program.tiles, width, query.dtype, stages, reduced=reduced,
-                                         allocations_of=_coop_allocations)
+                                         allocations_of=_coop_allocations, anchored=False)
     scoped, rings = _coop_allocations(family, program.tiles, width, query.dtype, stages,
                                       reduced=reduced, streamed=stats_streamed)
 

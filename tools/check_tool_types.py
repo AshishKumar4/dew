@@ -37,6 +37,9 @@ import types
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_scopes as scopes
+
 ROOT = Path(__file__).resolve().parents[1]
 PYRIGHT = "pyright@1.1.406"
 """The release tools/check_gates' pyright gate runs, so both read types alike."""
@@ -120,18 +123,10 @@ def environments_of(path: Path, pins: Mapping[str, Mapping[str, str]]) -> list[t
 
 def imported(path: Path) -> set[str]:
     """The dotted names tool or module `path` imports, absolute and its relative ones resolved, with each
-    `from a import b` also as `a.b` (b may be a module)."""
-    names = set()
+    `from a import b` also as `a.b` (b may be a module): `lint_scopes.modules_imported`, Dew's one reader of
+    them."""
     package = path.relative_to(ROOT).with_suffix("").parts[1:-1] if path.is_relative_to(ROOT) else ()
-    for node in ast.walk(ast.parse(path.read_text(), str(path))):
-        if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            base = ".".join([*package[:len(package) - node.level + 1], *(node.module or "").split(".")]
-                            if node.level else (node.module or "").split(".")).strip(".")
-            names.add(base)
-            names.update(f"{base}.{alias.name}" for alias in node.names if alias.name != "*")
-    return names
+    return scopes.modules_imported(ast.parse(path.read_text(), str(path)), list(package))
 
 
 def roots_of(path: Path) -> tuple[str, ...]:
@@ -169,7 +164,7 @@ def located(name: str, roots: tuple[str, ...]) -> list[Path]:
     for root in roots:
         base = ROOT / root
         if not ((base / parts[0] / "__init__.py").is_file() or (base / f"{parts[0]}.py").is_file()
-                or (base / parts[0]).is_dir() and any((base / parts[0]).glob("*.py"))):
+                or ((base / parts[0]).is_dir() and any((base / parts[0]).glob("*.py")))):
             continue
         found = []
         for depth in range(1, len(parts) + 1):

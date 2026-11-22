@@ -32,7 +32,7 @@ import functools
 import importlib
 import importlib.util
 import math
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
@@ -2390,6 +2390,21 @@ def resident(hooked: Sequence[tuple[base.Call, str]],
     plain_template, plain_ba = bare[-1][0].bound[kernel]
     plain = plain_template.derived(plain_ba, target)
     return plain is None or config.programs >= plain.programs
+
+
+def special_forms(hooked: Sequence[tuple[base.Call, str]]) -> Mapping | None:
+    """The special functions' forms the last launch `weighed` collected compiles its hooks' in: a Mosaic
+    launch's (`mosaic_gpu.APPROX_MATH`, `emission.special_forms`); None for any other launch, or none (one
+    MUFU an element, `emission.operation_work`)."""
+    from .templates import emission
+    from .templates.gemm import mosaic_gpu
+
+    if not hooked:
+        return None
+    call, kernel = hooked[-1]
+    if kernel not in call.bound or not isinstance(call.bound[kernel][0], _Mosaic):
+        return None
+    return emission.special_forms(mosaic_gpu.APPROX_MATH)
 
 
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),

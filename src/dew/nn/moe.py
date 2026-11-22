@@ -38,7 +38,7 @@ from jax.sharding import PartitionSpec as P
 from dew import quantization
 from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
 
@@ -820,8 +820,8 @@ class ExpertLinear(nn.Module):
             return
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching Dense of a dense MLP. A served checkpoint's packed
-        # bank stands in for it where its collection holds one (`quantization.expert_matrix`).
-        self.kernel = quantization.expert_matrix(self, 'kernel', lambda: self.param(
+        # bank stands in for it where its collection holds one (`dew.nn.dense.packed_matrix`).
+        self.kernel = packed_matrix(self, 'kernel', lambda: self.param(
             'kernel',
             declared(normal_kernel(self.init_std, nn.initializers.variance_scaling(
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,

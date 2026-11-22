@@ -74,7 +74,7 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
-from dew.nn.dense import _contractions, _linear_site
+from dew.nn.dense import QUANTIZATION, _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
 from dew.nn.fake_quant import (
     E2M1_MAX,
@@ -480,10 +480,6 @@ def _qwix(module: str = "qwix") -> ModuleType:
         ) from error
 
 
-QUANTIZATION = "quantization"
-"""The collection that holds a projection site's checkpoint quantization, at
-the site's own scope: every view of the variables (a scanned or staged
-stack, a packed group, a pipeline) carries it with the weights it scales."""
 
 InputKind = Literal["fp8", "nvfp4"]
 """A checkpoint input quantizer's format: ModelOpt's static FP8, or NVFP4."""
@@ -552,20 +548,11 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
 
 
-def expert_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]) -> jax.Array | NvFp4:
-    """An expert bank's matrix `name` of `module` (`[experts, in, out]`): the packed bank its `QUANTIZATION`
-    collection holds under the name (`dew.nn.kernels.formats.NvFp4`, a checkpoint's 4-bit experts served as
-    their codes, row 4516), else its parameter, `make()`."""
-    if module.has_variable(QUANTIZATION, name):
-        return module.get_variable(QUANTIZATION, name)
-    return make()
-
-
 def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
-    """The logical axes of each leaf of an expert bank's `matrix` (`expert_matrix`), its own `[experts, in,
-    out]` being `axes`: one leaf, the matrix; a packed bank's four (`NvFp4`), its words and block scales
-    `[experts, out, in / 8 or in / 16]`, its tensor scales `[experts]` and its form's version bytes, whole on
-    every device, in its leaves' order."""
+    """The logical axes of each leaf of an expert bank's `matrix` (`dew.nn.dense.packed_matrix`), its own
+    `[experts, in, out]` being `axes`: one leaf, the matrix; a packed bank's four (`NvFp4`), its words and
+    block scales `[experts, out, in / 8 or in / 16]`, its tensor scales `[experts]` and its form's version
+    bytes, whole on every device, in its leaves' order."""
     from dew.nn.kernels.formats import NvFp4
 
     if not isinstance(matrix, NvFp4):
@@ -574,12 +561,22 @@ def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> l
     return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,), (None,)]
 
 
-def decoded_expert_banks(variables: Variables) -> Variables:
-    """`variables` with each packed expert bank (`expert_matrix`) decoded into `params` under its name,
-    `[..., experts, in, out]` float32 (a scanned run's banks stacked on its layer axis before their
-    experts), each value its code times its block's scale times its expert's, exactly (`NvFp4.decoded`
-    times its factor), and the bank gone from `QUANTIZATION`: the float tree an export or a merge takes,
-    as `decoded_frozen_fp8` decodes a frozen FP8 site."""
+def dense_leaf_axes(axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
+    """The logical axes of each leaf of a dense layer's packed kernel (`dew.nn.dense.packed_matrix`), its
+    own kernel's being `axes` (a Linear's `[in, out]`): its words' and block scales' `[out, in / 8 or
+    in / 16]`, its tensor scale a scalar and its form's version bytes whole on every device, in its leaves'
+    order."""
+    inputs, outputs = axes
+    return [(outputs, inputs), (outputs, inputs), (), (None,)]
+
+
+def decoded_banks(variables: Variables) -> Variables:
+    """`variables` with each packed bank (`dew.nn.dense.packed_matrix`) decoded into `params` under its
+    name: an expert bank's `[..., experts, in, out]` float32 (a scanned run's banks stacked on its layer axis
+    before their experts), a Linear's kernel `[..., in, out]`, each value its
+    code times its block's scale times its matrix's, exactly (`NvFp4.decoded` times its factor), the bank
+    gone from `QUANTIZATION`: the float tree an export or a merge takes, as `decoded_frozen_fp8` decodes a
+    frozen FP8 site."""
     from dew.nn.kernels.formats import NvFp4
 
     held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
