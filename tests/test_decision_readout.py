@@ -340,18 +340,6 @@ def test_a_readout_refuses_what_it_cannot_read():
         SlotReadout(32, (66, 67, 68)).validate_rows(rows)
 
 
-def _served(decision: DecisionModel, variables, bodies, *, strict: bool = False):
-    """`bodies` answered by a server of Jev bodies over `decision` (`WireScoring`, `ScoringServer`)."""
-    from dew.decision.task import Decide, WireScoring
-    from dew.inference import ScoringServer
-
-    task = Decide(decision, variables, LAYOUT, TOKENIZER, SPECIALS)
-    server = ScoringServer(WireScoring(task, strict=strict), variables)
-    futures = [server.submit(body) for body in bodies]
-    server.run()
-    return [future.result() for future in futures]
-
-
 def _exit_passes(gates: np.ndarray, threshold: float) -> np.ndarray:
     """Each token's 1-based exit pass from every pass's exit-gate logit `[P, B, L]` under `threshold`, as
     Ouro's forward chooses it: the first pass whose cumulative exit probability reaches it, the last where
@@ -402,16 +390,29 @@ def test_a_served_looped_readout_reports_the_pass_each_answer_cue_exited_at(head
     threshold = float(np.median(first))
     expected = _exit_passes(cues, threshold)
 
-    def reported(backbone_, **fields):
-        return [answer["answers"]["team"].get("exit_pass")
-                for answer in _served(DecisionModel(backbone_, readout), variables, bodies, **fields)]
+    def served(backbone_, **fields):
+        """`bodies`' responses from a task over `backbone_`, as its server answers them (`systemone`)."""
+        from dew.decision.task import Decide
+
+        task = Decide(DecisionModel(backbone_, readout), variables, LAYOUT, TOKENIZER, SPECIALS)
+        return task.systemone(bodies, **fields)
+
+    def without_exits(responses):
+        def bare(answer):
+            return {key: value for key, value in answer.items() if key != "exit_pass"}
+        return [{**response, "answers": {name: bare(answer) for name, answer in response["answers"].items()}}
+                for response in responses]
 
     gated = looped.with_passes(exit_threshold=threshold)
+    reporting = served(gated)
     if head == "slots":
-        assert reported(gated) == [None] * len(bodies)
+        assert all("exit_pass" not in response["answers"]["team"] for response in reporting)
         return
-    assert reported(gated) == expected.tolist() and len(set(expected.tolist())) > 1
-    assert reported(looped.with_passes(1, exit_threshold=threshold)) == [1] * len(bodies)
-    assert reported(gated, strict=True) == [None] * len(bodies)
-    assert reported(looped) == [None] * len(bodies)
-
+    assert [response["answers"]["team"]["exit_pass"] for response in reporting] == expected.tolist()
+    assert len(set(expected.tolist())) > 1
+    once = served(looped.with_passes(1, exit_threshold=threshold))
+    assert [response["answers"]["team"]["exit_pass"] for response in once] == [1] * len(bodies)
+    # Strict Jev and a loop with no threshold: the same responses but for the field, which neither holds.
+    for response in (*served(gated, strict=True), *served(looped)):
+        assert "exit_pass" not in response["answers"]["team"]
+    assert served(gated, strict=True) == without_exits(reporting)

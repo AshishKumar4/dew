@@ -272,37 +272,40 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16(forward):
     variables, _ = adapter.translate_weights(tensors, config)
     wide = adapter.build(config, dtype="float64", attention_impl="xla")
     image = forward == "image_logits"
-    draw = block.canvas_draw(reference["image_prompt" if image else "prompt"], reference["canvas"], 64,
-                             previous=forward == "conditioned", pixels=reference["pixels"] if image else None)
+    drawn = block.canvas_draw(reference["image_prompt" if image else "prompt"], reference["canvas"], 64,
+                              previous=forward == "conditioned",
+                              pixels=reference["pixels"] if image else None)
+    with jax.enable_x64(new_val=True):
+        held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(
+            jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
 
-    routings: dict = {}
-
-    def routes_of(*inputs):
-        """The float64 run's routing of a draw's inputs, found once a draw for every arm."""
-        arrays = tuple(np.asarray(value) for value in inputs)
-        key = b"".join(value.tobytes() for value in arrays)
-        if key not in routings:
-            with jax.enable_x64(new_val=True):
-                held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(
-                    jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
-                prompt, canvas, *rest = (jnp.asarray(value) for value in arrays)
-                rest = [jnp.asarray(value, jnp.float64) for value in rest]
-                routings[key] = _denoised(wide, held, prompt, canvas, rest)[1]
-        return routings[key]
+    def draw(seed):
+        """A seed's inputs and the float64 run's routing of them, the prompt's and the canvas's, which every
+        arm takes as its own."""
+        inputs = drawn(seed)
+        with jax.enable_x64(new_val=True):
+            prompt, canvas, *rest = (jnp.asarray(value) for value in inputs)
+            rest = [jnp.asarray(value, jnp.float64) for value in rest]
+            routes = _denoised(wide, held, prompt, canvas, rest)[1]
+        return (*inputs, *routes)
 
     @as_given
     def dew(*inputs):
-        prompt, canvas, *rest = (jnp.asarray(value) for value in inputs)
-        logits = _denoised(narrow, variables, prompt, canvas, rest, routes_of(*inputs))[0]
+        prompt, canvas, *rest, prompts, canvases = (jnp.asarray(value) for value in inputs)
+        logits = _denoised(narrow, variables, prompt, canvas, rest, (prompts, canvases))[0]
         return {"logits": np.asarray(logits.astype(jnp.float32))}
 
     def transformers(network, *inputs):
-        with _replayed(network, routes_of(*(value.numpy() for value in inputs))):
+        *inputs, prompts, canvases = inputs
+        with _replayed(network, (prompts.numpy(), canvases.numpy())):
             return block.transformers_canvas(network, *inputs)
 
+    from tools.numerics_reference import workflow
+
+    # The narrow arm loaded in bfloat16 as the recordings' is (`workflow`), its rotary tables its own: a
+    # float32 load cast after keeps float32's rounded.
     source = block.transformers_model(directory)
-    reference_arm, truth = transformers_arms(copy.deepcopy(source).to(torch.bfloat16), transformers,
-                                             source=source)
+    reference_arm, truth = transformers_arms(workflow(torch.bfloat16), transformers, source=source)
     assert_as_exact(dew, reference_arm, draw, f"routed workflow {forward}", seeds=ROUTED_SEEDS,
                     truth_fn=truth)
 

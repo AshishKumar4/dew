@@ -164,12 +164,15 @@ class ExpertBalance:
 
         The reported number is what the terms add to the prediction's loss.
         """
-        if not routing:
-            raise ValueError("aux_loss_alpha requires a model with a mixture")
+        # The routers whose scores the loss reads: a router that records its choice alone (a routing replay's
+        # record, Gemma 4's) gives the loss nothing, refused as no router at all is (row 4739's review).
+        routers = router_scores(routing)
+        if not routers:
+            raise ValueError("aux_loss_alpha requires a model with a mixture whose routers record their "
+                             "scores")
         documents = token_layout(fields)[1]
         laid = fields.get(COORDINATES_FIELD)
         max_segments = laid.max_segments if isinstance(laid, Coordinates) else None
-        routers = router_scores(routing)
         sequence = []
         if self.seq_aux:
             for scores, indices in routers:

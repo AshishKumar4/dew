@@ -61,3 +61,29 @@ def test_the_routed_branch_matches_the_reference_block():
         {"params": router_params(tensors)}, hidden)
     assert np.array_equal(np.asarray(indices), tensors["router_indices"])
     assert float(np.max(np.abs(np.asarray(weights) - tensors["router_weights"]))) < 1e-6
+
+
+def test_a_balance_loss_over_routers_that_record_their_choice_alone_is_refused():
+    """Gemma 4's routers write the experts they chose and no scores (a routing replay's record, row 4739):
+    a run asking a balance loss of them (`ExpertBalance.aux_loss_alpha`) is refused by name, not trained
+    under a loss of nothing (row 4739's review), while one with no balance loss trains."""
+    import jax
+    import pytest
+
+    from dew.batch import TEXT_KEY
+    from dew.interop import Pretrained
+    from dew.objectives.base import Step
+    from dew.objectives.lm import LMObjective
+    from dew.objectives.routing import ExpertBalance
+
+    loaded = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "gemma4-moe-tiny",
+                             dtype="float32")
+    ids = np.random.default_rng(4739).integers(0, loaded.model.vocab_size, (2, 9)).astype(np.int32)
+    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
+    balanced = LMObjective(loaded.model, 8, balance=ExpertBalance(aux_loss_alpha=0.05), token_accuracy=False)
+    with pytest.raises(ValueError):
+        balanced.loss(loaded.variables, {TEXT_KEY: ids}, step)
+    plain = LMObjective(loaded.model, 8, token_accuracy=False)
+    statistic, _ = plain.loss(loaded.variables, {TEXT_KEY: ids}, step)
+    assert np.isfinite(float(statistic.mean()[0]))
+
