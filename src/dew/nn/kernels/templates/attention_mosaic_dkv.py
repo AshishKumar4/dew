@@ -30,7 +30,6 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, Param, by_power, shared_place
-from dew.nn.kernels.templates.attention_backward_algebra import derived_from_weights, derived_weights
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
@@ -63,7 +62,9 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _read,
     _relay_tiles,
     _relayed,
+    _score_cotangents,
     _score_params,
+    _score_weights,
     _scores,
 )
 
@@ -412,33 +413,23 @@ def _overlapped_dkv_scores(walk: _Backward, resident: tuple, slots: tuple, shape
     (k_smem, v_smem), (logits_slot, do_slot) = resident, slots
     values, queries = dtypes
     peak, total, anchor, delta = (_read(row) for row in rows[:4])
-    how = walk.how
-    scale = walk.spec.scale if how.factor is None else 1.0
 
     def between(s):
         if logits_stage is not None:
             family.turn(logits_stage[2], walk.consumers, wait=False)
-        seen = algebra.seen(walk.spec, coords, s) if masked else None
-        logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen,
-                                              coords.q_pos, coords.k_pos, (), scale=scale, slopes=True)
-        exponentials, weights = derived_weights(keys_first=True, how=how, accurate=False).mapped(
-            {"logits": logits, "peak": peak, "total": total})
+        exponentials, weights, slopes, seen = _score_weights(walk, coords, (), s, peak, total, masked=masked)
         narrowed = (algebra.value_weights(exponentials, weights, values, walk.dropped) if one_part
                     else algebra.value_parts(weights, values))
         return narrowed, weights, slopes, seen
 
     (narrowed, weights, slopes, seen), dp = family.product_pair(
         k_smem, logits_slot.transpose((1, 0)), v_smem, do_slot.transpose((1, 0)), shape, between=between)
-    tiles_ds = {"weights": weights, "products": dp, "anchor": anchor, "delta": delta}
-    if seen is not None:
-        tiles_ds["seen"] = seen
-    cotangents = derived_from_weights(keys_first=True, masked=seen is not None).mapped(tiles_ds)
+    cotangents = _score_cotangents(coords, weights, dp, anchor, delta, seen)
     logits, pieces = gradient.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
     if one_part:
         parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
         logits = mosaic.unscaled_part(*parts)
     return narrowed, logits, pieces
-
 
 def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,
              one_part: bool, masked: bool = True) -> tuple:

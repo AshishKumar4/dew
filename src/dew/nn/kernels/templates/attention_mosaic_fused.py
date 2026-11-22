@@ -21,7 +21,6 @@ from dew.nn.kernels.templates import (
     stores,
 )
 from dew.nn.kernels.templates.attention import Dropout, by_power
-from dew.nn.kernels.templates.attention_backward_algebra import derived_from_weights, derived_weights
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
     STATISTICS_STREAM_ORDER as _STREAM_ORDER,
@@ -46,6 +45,8 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _parts_dq,
     _read,
     _rescaled_parts,
+    _score_cotangents,
+    _score_weights,
     _tile_scores,
 )
 
@@ -177,16 +178,6 @@ def dq_and_dkv(walk: _Backward, accumulators: tuple, weights_ref, cotangents_ref
                   else family.product(cotangents_ref, k_rhs, shape))
     return dq, (dk_acc, dv_acc)
 
-def _cotangent_part(walk: _Backward, weights, dp, anchor, delta, slopes, seen, dtype) -> jax.Array:
-    """Compute narrowed score-cotangent `part` from overlapped `weights` and `dp` (row 5272)."""
-    tiles_ds = {"weights": weights, "products": dp, "anchor": anchor, "delta": delta}
-    if seen is not None:
-        tiles_ds["seen"] = seen
-    cotangents = derived_from_weights(keys_first=False, masked=seen is not None).mapped(tiles_ds)
-    pulled = gradient.pulled(cotangents, slopes, seen, ())[0]
-    return mosaic.unscaled_part(*algebra.cotangent_parts(pulled * walk.grad_scale, dtype, accurate=False))
-
-
 def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged, coords, add_dq,
                            slots, carry, accumulators, q_first, *, masked: bool):
     """Pipelined sm90 fused backward step (row 5272): overlaps `S` softmax + staging `P` with `dP = dO Vᵀ`,
@@ -197,16 +188,10 @@ def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged
     dk_acc, dv_acc = accumulators
     peak, total, anchor, delta = (_read(row) for row in rows[:4])
     tile_coords = _read(coords)
-    how = walk.how
-    scale = walk.spec.scale if how.factor is None else 1.0
 
     def stage_weights(s):
-        seen = algebra.seen(walk.spec, tile_coords, s) if masked else None
-        logits, slopes = gradient.tile_logits(tile_coords.hooked(walk.spec.score_mod), s, seen,
-                                              tile_coords.q_pos, tile_coords.k_pos, (), scale=scale,
-                                              slopes=True)
-        exponentials, weights = derived_weights(keys_first=False, how=how, accurate=False).mapped(
-            {"logits": logits, "peak": peak, "total": total})
+        exponentials, weights, slopes, seen = _score_weights(walk, tile_coords, (), s, peak, total,
+                                                             masked=masked)
         narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped)
         family.staged(narrowed, staged.at[0])
         return weights, slopes, seen
@@ -222,7 +207,10 @@ def _overlapped_fused_step(walk: _Backward, resident: tuple, rows: tuple, staged
             q_slot, k_smem.transpose((1, 0)), do_slot, v_smem.transpose((1, 0)),
             shape, between=stage_weights)
     dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
-    part = _cotangent_part(walk, weights, dp, anchor, delta, slopes, seen, q_slot.dtype)
+    cotangents = _score_cotangents(tile_coords, weights, dp, anchor, delta, seen)
+    pulled = gradient.pulled(cotangents, slopes, seen, ())[0]
+    part = mosaic.unscaled_part(*algebra.cotangent_parts(pulled * walk.grad_scale, q_slot.dtype,
+                                                         accurate=False))
     cotangents_staged = staged.at[1]
     family.staged(part, cotangents_staged)
     dq = family.product(

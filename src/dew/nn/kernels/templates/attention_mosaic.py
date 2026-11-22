@@ -2086,10 +2086,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             reduced = reducing(family, config.consumers, self.score_reduces, scaled=staged_parts(dtype) > 1)
             allocations = functools.partial(_coop_allocations if config.shared_keys else _fused_allocations,
                                             reduced=reduced)
-            typed = {} if config.shared_keys else {"typed": stores_typed(
-                family, config, width, dtype, q_stages, grouped=query.shape[2] != key.shape[2],
-                reduced=reduced, rounded=self.rounded)}
-            launches = [(family, config, allocations(family, config, width, dtype, q_stages, **typed),
+            extra = {} if config.shared_keys else {
+                "typed": stores_typed(family, config, width, dtype, q_stages,
+                                      grouped=query.shape[2] != key.shape[2],
+                                      reduced=reduced, rounded=self.rounded),
+                "anchored": ba.arguments["drop"] is not None}
+            launches = [(family, config, allocations(family, config, width, dtype, q_stages, **extra),
                          config.shared_keys)]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
