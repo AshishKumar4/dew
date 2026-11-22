@@ -984,13 +984,11 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
 
-    def value(codes: jax.Array) -> jax.Array:
-        return jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn).astype(jnp.float32)
-
-    # The nearest rounded up where it fell below the ratio, never past the largest finite (448).
-    codes = jnp.where(value(nearest) < ratio, jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(E4M3.largest)),
-                      nearest)
+    # The nearest rounded up where it fell below the ratio, never past the largest finite (448); each code's
+    # value the one decode of a block scale's (`scales_decoded`, row 8675).
+    codes = jnp.where(scales_decoded(nearest) < ratio,
+                      jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(E4M3.largest)), nearest)
     scales = jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn)
-    each = jnp.repeat(value(codes), NVFP4.depth, axis=0)
+    each = jnp.repeat(scales_decoded(codes), NVFP4.depth, axis=0)
     scaled = jnp.where(each > 0, quotient(quotient(x, tensor), jnp.where(each > 0, each, 1)), 0)
     return encoded(jax.lax.bitcast_convert_type(scaled, jnp.uint32), E2M1), scales, tensor
