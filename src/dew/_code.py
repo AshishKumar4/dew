@@ -79,7 +79,8 @@ REVIEWED = {
         "dew._sources:generated_fields:sys.modules", "dew._sources:own_source:sys.modules",
         "dew._sources:recorded:sys.modules", "dew._sources:source_file:sys.modules",
         "dew._stated:_coded:sys.modules", "dew._stated:_converter:sys.modules",
-        "dew._stated:_named:sys.modules", "dew._stated:_wrapping:sys.modules",
+        "dew._stated:_named:sys.modules", "dew._stated:_stateless:sys.modules",
+        "dew._stated:_wrapping:sys.modules",
         "dew.data.pipeline:_main_importable:sys.modules",
         "dew.data.sources.memory:_table_records:sys.modules"),
         "a module this process already imported, a library's, the user's or the one defining a value it "

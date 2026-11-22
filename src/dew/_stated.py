@@ -11,6 +11,7 @@ file, its slots) and refuse what answers nothing."""
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import inspect
@@ -51,6 +52,42 @@ def _coded(module: str | None, at: str) -> str:
                                   or origin in ("built-in", "frozen")):
             return module or ""
     raise Unestablished(f"{at}: defined in {module!r}, which has no source file")
+
+
+def _library_value(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """A library's value by the form it has: its parts (`_parts`, JAX's own values), its converter's
+    (`_converter`), or, the last fallback, so a value with a form of its own is never stated by its type
+    alone, its type if it holds nothing of its own (`_stateless`); None where it has none of them."""
+    if (parts := _parts(value, at, again)) is not None:
+        return parts
+    if (converted := _converter(value, at, again)) is not None:
+        return converted
+    return _stateless(value, at, again)
+
+
+def _stateless(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """An instance holding nothing of its own, by its type alone (`again`: a library's by its name, one of
+    the user's own code walked), which is all it computes by: a library's sentinel or descriptor (Flax's
+    unspecified parent, its module classes' parent descriptor, which every Flax module class of the user's
+    holds, so an arm reading one is stated). None for any other: a type of `__main__`, one whose instances
+    hold no `__dict__` (a C type's or a slotted one's, a context variable's, holding state no attribute
+    shows), one defining its own attribute lookup (which reading it would run), a Flax module or a dataclass
+    with fields (whose state an empty `__dict__` would hide), and an instance whose `__dict__` holds
+    anything."""
+    kind = type(value)
+    if kind.__module__ == "__main__" or kind.__dictoffset__ == 0:
+        return None
+    if any(name in vars(klass) for klass in kind.__mro__[:-1]
+           for name in ("__getattr__", "__getattribute__", "__slots__")):
+        return None
+    flax_module = sys.modules.get("flax.linen.module")
+    if (flax_module is not None and issubclass(kind, flax_module.Module)) or (
+            dataclasses.is_dataclass(kind) and dataclasses.fields(kind)):
+        return None
+    # Read as the object holds it, never through its type's lookup.
+    if object.__getattribute__(value, "__dict__"):
+        return None
+    return ["stateless", again(kind, at=f"{at} (its type)")]
 
 
 def _named(value, at: str) -> list | None:
@@ -191,10 +228,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
     key = terms.parameter_key(value)
     if isinstance(key, tuple) and key[0] != "object":
         return ["native", _plain(key, at)]
-    if (parts := _parts(value, at, again)) is not None:
-        return parts
-    if (converted := _converter(value, at, again)) is not None:
-        return converted
+    if (formed := _library_value(value, at, again)) is not None:
+        return formed
     raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} has no form an "
                         "identity can state")
 
