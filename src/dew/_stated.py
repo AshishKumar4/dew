@@ -23,6 +23,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from jax._src.named_sharding import UNSPECIFIED
+from jax.core import Tracer
 from jax.experimental.layout import Format, Layout
 from jaxlib import xla_client
 from jaxlib._jax import PjitFunction
@@ -216,7 +217,7 @@ def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     identity states, refused), a function `jax.jit` wraps, by its module's name for it where a library's
     (`_named`), else by what it wraps (`_jitted`), a program Dew's compile point compiles, by its function and
     arguments (`_outer_program`); None for any other."""
-    if isinstance(value, jax.core.Tracer):
+    if isinstance(value, Tracer):
         # A value of a trace in progress (a span's enclosing jit's argument): no value to state, and its
         # placement raises as it is read (row 11002's review, F3: `ConcretizationTypeError`).
         raise Unestablished(f"{at}: a value of a trace in progress")
