@@ -164,17 +164,18 @@ def _zeroed_columns(running) -> None:
     utils.warpgroup_barrier()
 
 
-class _Emitted(NamedTuple):
+class Emitted(NamedTuple):
     """An fp32 MLIR value whose `+` and `-` emit its kernel's own addition and subtraction (`arith.addf`,
-    `arith.subf`, rounded each): what `precision.renormalized_sum`'s arithmetic reads in a kernel's body."""
+    `arith.subf`, rounded each): an algebra's own arithmetic run in a native kernel's body, its schedule the
+    kernel's (`precision.renormalized_sum` in `compensated_columns`)."""
 
     value: ir.Value
 
-    def __add__(self, other: "_Emitted") -> "_Emitted":  # type: ignore[override]
-        return _Emitted(arith.addf(self.value, other.value))
+    def __add__(self, other: "Emitted") -> "Emitted":  # type: ignore[override]
+        return Emitted(arith.addf(self.value, other.value))
 
-    def __sub__(self, other: "_Emitted") -> "_Emitted":
-        return _Emitted(arith.subf(self.value, other.value))
+    def __sub__(self, other: "Emitted") -> "Emitted":
+        return Emitted(arith.subf(self.value, other.value))
 
 
 def _compensated_columns(ref, running) -> None:
@@ -185,10 +186,10 @@ def _compensated_columns(ref, running) -> None:
     column = arith.index_cast(index, arith.remui(utils.thread_idx(), arith.constant(i32, THREADS)))
     halves = [arith.constant(index, half) for half in (0, 1)]
 
-    pair = tuple(_Emitted(memref.load(running, [half, column])) for half in halves)
+    pair = tuple(Emitted(memref.load(running, [half, column])) for half in halves)
     for row in range(rows):
         at = [arith.constant(index, row), column]
-        term = tuple(_Emitted(memref.load(ref, [half, *at])) for half in halves)
+        term = tuple(Emitted(memref.load(ref, [half, *at])) for half in halves)
         pair = precision.renormalized_sum(pair, term)
         for half, value in zip(halves, pair, strict=True):
             memref.store(value.value, ref, [half, *at])
