@@ -196,8 +196,9 @@ def assert_recomputed_blocks_train_the_same_model(shape, *, scan):
     plain = model_for(shape, scan_layers=scan)
     remat = plain.clone(remat='full')
     ids = batch()["text"][:, :-1]
-    variables = nn.unbox(plain.init(jax.random.key(0), ids))
-    recomputed = nn.unbox(remat.init(jax.random.key(0), ids))
+    # Each initialized as one program (row 11760: traced op by op, each layer's span compiled its own).
+    variables = nn.unbox(jax.jit(plain.init)(jax.random.key(0), ids))
+    recomputed = nn.unbox(jax.jit(remat.init)(jax.random.key(0), ids))
     assert jax.tree.structure(variables) == jax.tree.structure(recomputed)
     assert largest_difference(variables, recomputed) == 0
     stepped = training_step(plain)
