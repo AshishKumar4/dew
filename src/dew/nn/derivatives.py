@@ -23,19 +23,32 @@ Each lane moves its sites onto them (rows 4026 to 4030); then the slop check ref
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import functools
 import inspect
-from collections.abc import Callable, Collection, Sequence
+import json
+import logging
+import math
+from collections.abc import Callable, Collection, Hashable, Sequence
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax._src import util as jax_util
 from jax.core import Tracer, eval_context, eval_jaxpr
 from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
 from jax.extend.core import create_call_primitive
 
+from dew import _cache
 from dew.nn import programs
+
+if TYPE_CHECKING:
+    from dew.algebra.fusion import Recorded
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "Algebra",
@@ -312,22 +325,38 @@ def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
         bound = signature.bind(*args, **kwargs)
         operands = [arg for position, arg in enumerate(bound.args) if position not in fixed]
         # A forward's primal under `symbolic_zeros` (`CustomVJPPrimal`) is its array, its flag bound in.
-        held, fill = programs.holes((operands, bound.kwargs),
-                                    lambda leaf: isinstance(_array(leaf), jax.Array),
-                                    is_leaf=lambda leaf: isinstance(leaf, CustomVJPPrimal))
-        if not held:
+        leaves, structure = jax.tree.flatten((operands, bound.kwargs),
+                                             is_leaf=lambda leaf: isinstance(leaf, CustomVJPPrimal))
+        places = tuple(index for index, leaf in enumerate(leaves) if isinstance(_array(leaf), jax.Array))
+        if not places:
             return function(*args, **kwargs)
-
-        def span(*arrays):
-            given, named = fill([CustomVJPPrimal(array, leaf.perturbed) if isinstance(leaf, CustomVJPPrimal)
-                                 else array for leaf, array in zip(held, arrays, strict=True)])
-            positional, rest = [], iter(given)
-            for position, arg in enumerate(bound.args):
-                positional.append(arg if position in fixed else next(rest))
-            return function(*positional, **named)
-
+        held = [leaves[index] for index in places]
+        # The span closes over its constants and their places alone, each a value an identity states
+        # (`_span_key`), never the call's arrays (row 11003: a closure over the bound arguments, no
+        # statement holding it, traced every error-free transform afresh).
+        span = functools.partial(
+            _bound_span, function, structure, places,
+            tuple(None if index in places else leaf for index, leaf in enumerate(leaves)),
+            tuple(leaf.perturbed if isinstance(leaf, CustomVJPPrimal) else None for leaf in held),
+            tuple((position, arg) for position, arg in enumerate(bound.args) if position in fixed),
+            len(bound.args))
         return marked(kind, span)(*map(_array, held))
     return call
+
+
+def _bound_span(function: Callable, structure, places: tuple[int, ...], constants: tuple,
+                perturbed: tuple, statics: tuple[tuple[int, object], ...], count: int, *arrays):
+    """`bound_span`'s span: `function` over its arguments, those at `places` of the flattened `(operands,
+    keywords)` (`structure`) the span's `arrays` (a forward's primal again `CustomVJPPrimal`, its flag
+    `perturbed`), every other leaf its constant, and its first `count` positions those operands with the
+    `statics` (each position and value) among them."""
+    filled = list(constants)
+    for index, array, perturbs in zip(places, arrays, perturbed, strict=True):
+        filled[index] = array if perturbs is None else CustomVJPPrimal(array, perturbs)
+    operands, named = jax.tree.unflatten(structure, filled)
+    fixed, rest = dict(statics), iter(operands)
+    return function(*(fixed[position] if position in fixed else next(rest) for position in range(count)),
+                    **named)
 
 
 def _array(leaf):
@@ -434,11 +463,128 @@ def _evaluating() -> bool:
         return here is jax_core.find_top_trace(())
 
 
+SPANS_HELD = 4096
+"""The most marked spans' programs a process holds (`_SPANS`), the least recently used dropped first."""
+
+class _HeldSpan(NamedTuple):
+    """A marked span's traced program (`_traced_span`): it, its outputs' structure, its known zeros and what
+    its trace reported (`fusion.Recorded`)."""
+
+    closed: jax_core.Jaxpr
+    structure: object
+    zeros: object
+    record: Recorded
+
+
+class _Spans:
+    """The marked spans' held programs (`_SPANS`), registered with JAX's caches, so `jax.clear_caches`
+    forgets them as it forgets its own (row 10762's review: a user clearing caches to free memory kept
+    them)."""
+
+    def __init__(self) -> None:
+        self.held: collections.OrderedDict[Hashable, _HeldSpan | None] = collections.OrderedDict()
+
+    def cache_clear(self) -> None:
+        _cache.cleared(self.held)
+
+    def cache_info(self) -> int:
+        return len(self.held)
+
+    def cache_keys(self) -> list:
+        return list(self.held)
+
+
+_SPANS = _Spans()
+"""Each marked span's program as `marked` traced it, with its outputs' structure and the known zeros among
+them, by what a trace of it reads (`_span_key`): a span called again in that state is that program, never
+traced again (row 10762: precision's error-free transforms traced afresh at every call, 7.5 percent of a
+padded merge's grad of grad)."""
+
+jax_util.register_cache(_SPANS, "dew.nn.derivatives.marked's spans")
+
+
+SPAN_CONSTANTS_HELD = 1 << 20
+"""The most bytes of constants a held span's program may keep (`_holdable`): a span closing over a larger
+array (a model's weights) is traced at each call rather than pinning its buffers."""
+
+
+def _holdable(closed) -> bool:
+    """Whether a marked span's traced program may be held for its next call (`_SPANS`): none that closes over
+    the enclosing trace's values (that trace's alone), none with effects (a callback's function is the one
+    its first trace made), and none whose constants pass `SPAN_CONSTANTS_HELD` bytes."""
+    if closed.effects or any(isinstance(const, Tracer) for const in closed.consts):
+        return False
+    return sum(math.prod(var.aval.shape) * var.aval.dtype.itemsize
+               for var in closed.jaxpr.constvars) <= SPAN_CONSTANTS_HELD
+
+
+def _traced_span(key: Hashable | None, trace: Callable, returned: dict) -> tuple:
+    """A marked span's program, its outputs' structure and its known zeros (`returned`, which `trace()` fills
+    as it traces): held at `key` (`_SPANS`, `_cache.holding`, as every held trace of Dew's) while each fact
+    its trace read answers alike (`Recorded.still`), its trace's routes, launches and facts reported again
+    wherever it is taken (`Recorded.replay`: a held SwiGLU span's route and Pallas launch reach the kernel
+    report and the tuner, row 11002); traced afresh where no key holds it (`_span_key`) or its program may
+    not be held (`_holdable`)."""
+    if key is None:
+        # Traced as it is, in the call's own collections: a recording's fresh ones are keys JAX's own caches
+        # hold traces by, so a launch within it lowered again at each call (a recurrence's two layers'
+        # kernels lowered twice).
+        closed = trace()
+        return closed, returned["structure"], returned["zeros"]
+    from dew.algebra.fusion import recorded
+
+    fresh: dict[str, _HeldSpan] = {}
+
+    def made() -> _HeldSpan | None:
+        closed, record = recorded(trace)
+        fresh["traced"] = _HeldSpan(closed, returned["structure"], returned["zeros"], record)
+        # A program that may not be held is kept as none (`_holdable`), so no later call takes it.
+        return fresh["traced"] if _holdable(closed) else None
+
+    entry = _cache.holding(_SPANS.held, key, made, SPANS_HELD,
+                           still=lambda entry: entry is not None and entry.record.still())
+    # A trace made here is this call's, held or not; a held one taken is its first trace's.
+    taken = fresh.get("traced") or entry
+    assert taken is not None
+    taken.record.replay()
+    return taken.closed, taken.structure, taken.zeros
+
+
+def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hashable | None:
+    """What a trace of `function` as a marked span of `kind` over `flat` (its arguments' leaves, of tree
+    `structure`) reads: its function as an identity states it (`dew._stated.stated`: its code and every value
+    it reads, a module global, a closure's dict or array, by value), its arguments' types as the trace takes
+    them (`jax.typeof`: shape, dtype, weak type, sharding, the manual axes they vary over), the context a
+    trace reads (`options.held_context`: JAX's traced configuration, its compute_on and XLA metadata among
+    it, the meshes, Dew's contexts, the logical axis rules, Dew's environment and the compiles' refused
+    launches, the key every held trace of Dew's is kept by) and NumPy's error policy,
+    which a host split reads. None for a function no statement holds (a value of the enclosing trace among its
+    reads) or within a launch's trace, whose span is traced at every call."""
+    from dew._stated import Unestablished, stated
+    from dew.nn.kernels import options
+    from dew.nn.kernels.templates import report
+
+    if report.launch_tracing():
+        # Within a launch's trace (a Mosaic kernel's body): the launch's own, which its held trace holds
+        # (`tuning.lowered_once`); keyed here, its pending launch would miss at every launch and pin its
+        # frames (row 11002's review, F4). Asked without the launch's digest, whose identity traces the
+        # launch's body, this span within it among its steps (a norm's activation glue recursed without end).
+        return None
+    try:
+        statement = json.dumps(stated(function, f"a marked span of {kind!r}"), sort_keys=True)
+    except Unestablished as unstated:
+        _log.debug("a marked span no statement holds is traced at each call: %s", unstated)
+        return None
+    return (kind, structure, statement, tuple(jax.typeof(leaf) for leaf in flat), options.held_context(),
+            tuple(sorted(np.geterr().items())))
+
+
 def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked_call_p`) over its arguments, a tree of arrays: it
     computes what `function` does, and every transform of it keeps a marked call of `kind`. An eager call
     (`_evaluating`), which no program records, is `function`'s own: traced, every such call traced a program
-    a step's steady state paid each step (a decision task's eager scores, train 586)."""
+    a step's steady state paid each step (a decision task's eager scores, train 586). A traced call takes
+    the program a call in the same state traced (`_SPANS`, `_span_key`)."""
     def call(*arguments):
         if _evaluating():
             return function(*arguments)
@@ -455,7 +601,8 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
                                  if isinstance(leaf, SymbolicZero)}
             return [leaf for leaf in produced if not isinstance(leaf, SymbolicZero)]
 
-        closed = jax.make_jaxpr(span)(*flat)
+        closed, returned["structure"], returned["zeros"] = _traced_span(
+            _span_key(kind, function, structure, flat), lambda: jax.make_jaxpr(span)(*flat), returned)
         # A value of the enclosing trace the function closes over (a kernel's mask, a reference's operand) is
         # one of the call's operands, leading its arguments, as a closed-over value is no constant there.
         held = [isinstance(const, Tracer) for const in closed.consts]

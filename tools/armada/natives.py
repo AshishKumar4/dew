@@ -138,12 +138,6 @@ __attribute__((constructor)) static void armed(void) {
 """
 """The preloaded library's source: its handler, armed as each process loads it, before Python's faulthandler.
 """
-PYSTACK = ("uv", "tool", "run", "--quiet", "--from", "pystack==1.7.2", "pystack")
-"""Bloomberg's pystack, which unwinds every OS thread of a live process from outside it, native frames and
-Python frames both, a thread with no Python state too (an XLA worker's abort): py-spy's native mode reads only
-the threads Python knows (review, 2026-11-13). Fetched by uv into its cache as a run's collector starts
-(`collect`), so a crash waits on no download; pyproject's test extra takes it with the next environment change
-(train 791's review, F7: a lock change is a new environment, which waits for the next pin's train)."""
 COLLECT_SECONDS = 60
 """How long a dying process waits for its stacks to be read (`SHIM`), and pystack or py-spy has to read them
 (`collect`)."""
@@ -236,21 +230,20 @@ HELD = "its threads' native stacks"
 """What it says of one whose stacks it read."""
 
 
-def read(pid: str, spy: Path, warm: subprocess.Popen, began: float) -> tuple[str, bool]:
+def read(pid: str, spy: Path, began: float) -> tuple[str, bool]:
     """Every thread's stack of the stopped process `pid`, read from outside it within the time its handler
-    waits (`COLLECT_SECONDS` from `began`): pystack's (`PYSTACK`), each OS thread's native and Python frames,
-    once its fetch (`warm`) has ended, so a first crash's read waits on the download rather than racing it
-    (review, 2026-11-13); py-spy's (`spy`), which reads Python's threads alone, with what time is left where
-    pystack read none; and whether either read them."""
+    waits (`COLLECT_SECONDS` from `began`): Bloomberg's pystack's, beside py-spy (`spy`) in the task
+    environment (pyproject's test extra; train 791's review F7: no fetch of its own a run), each OS thread's
+    native and Python frames, a thread with no Python state too (an XLA worker's abort), which py-spy's
+    native mode does not read (review, 2026-11-13); py-spy's, Python's threads alone, with what time is left
+    where pystack read none; and whether either read them."""
     def left() -> float:
         return COLLECT_SECONDS - 5 - (time.monotonic() - began)
 
     said = []
-    try:
-        warm.wait(timeout=max(left() - 10, 1))
-    except subprocess.TimeoutExpired:
-        said.append("pystack was not fetched in time")
-    for command in ([*PYSTACK, "remote", "--native-all", pid], [str(spy), "dump", "--native", "--pid", pid]):
+    pystack = spy.with_name("pystack")
+    for command in ([str(pystack), "remote", "--native-all", pid],
+                    [str(spy), "dump", "--native", "--pid", pid]):
         if left() < 1:
             said.append(f"no time left to read with {command[0]}")
             break
@@ -268,9 +261,7 @@ def read(pid: str, spy: Path, warm: subprocess.Popen, began: float) -> tuple[str
 def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
     """The collector: each process that writes `<pid> <signal>` to `pipe` as a signal ends it (`SHIM`) gets
     every thread's stack read (`read`), appended to `stacks`, then `done/done.<pid>`, its word that it may
-    die. Opened for reading and writing, so the pipe never reads its end between writers; pystack fetched as
-    it starts, so a crash rarely waits on it."""
-    warm = subprocess.Popen([*PYSTACK, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    die. Opened for reading and writing, so the pipe never reads its end between writers."""
     with open(os.open(pipe, os.O_RDWR), encoding="ascii", errors="replace") as said:
         (done / "ready").touch()
         for line in said:
@@ -279,7 +270,7 @@ def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
                 continue
             pid, signum = parts
-            frames, held = read(pid, spy, warm, began)
+            frames, held = read(pid, spy, began)
             with stacks.open("a") as out:
                 at = time.strftime("%H:%M:%SZ", time.gmtime())
                 header = HELD if held else UNREAD

@@ -402,6 +402,29 @@ def test_a_parts_prepare_draws_an_nvfp4_tiles_values_on_the_host(tmp_path, monke
         assert test_algebra_bits._quantized_values().shape == (256, 64)
 
 
+def test_a_parts_prepare_compiles_a_site_calling_the_host_at_its_run(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100, the process's backend a CPU's), a site whose program
+    calls back to the host (a reference through `jax.pure_callback`, as Dory's torch gradients) is written to
+    compile at its run on its GPU: a host callback is lowered by the backend it runs on, absent here, and the
+    prepare raised "Unknown backend: 'gpu' requested" (row 11497)."""
+    import jax
+    import jax.numpy as jnp
+    import model_flows
+    import numpy as np
+    from generation_support import node_target
+    from truths_ahead import prepared
+
+    shape = jax.ShapeDtypeStruct((3,), jnp.float32)
+
+    def doubled(x):
+        return jax.pure_callback(lambda value: np.asarray(value) * 2, shape, x)
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    with prepared(tmp_path / "store", stamp="a", target=node_target()) as store:
+        store.compile_site("a site calling the host", {"doubled": (doubled, [shape])}, {})
+        assert store.at_run("a site calling the host") is not None
+
+
 def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, monkeypatch):
     """In a GPU tier part's prepare (its node an H100), the numerics flows' cells placed on the host's CPU, a
     projection and the norm seams, are passed by, none recorded deferred: the prepare chooses every kernel as

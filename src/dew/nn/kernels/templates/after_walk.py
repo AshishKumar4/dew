@@ -65,8 +65,7 @@ def over_rings_scoped(family, body, allocations: tuple, streams: dict, after_wal
     consumer-fed walk's last step. Each consumer passes `walked` once, before its first write `after`. A
     program of one tile alone: a persistent launch (`Transport.persist`) would prime its next tile's loads
     into the union, which no barrier here orders after the stores' reads of its tiles. This order is the
-    union's proof obligation, which an interpreted cell witnesses once the interpreter's race detection
-    takes a fed ring (row 7853, post110)."""
+    union's proof obligation."""
     added, rest, names = over_rings_plan(streams, after_walks)
     held = len(allocations)
 
