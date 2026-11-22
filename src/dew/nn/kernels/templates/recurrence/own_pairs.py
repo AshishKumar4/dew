@@ -19,7 +19,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, scf
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import emission, mosaic, resources, scan, swizzling
+from dew.nn.kernels.templates import emission, mosaic, native, resources, scan, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, pair_streams, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -155,8 +155,8 @@ def _own_bands(*refs, products: tuple[str, ...], unit_keys: bool) -> None:
         """An output's row's run of words: the queries', or each key times its write strength."""
         if name == "scores":
             return [memref.load(queries_ref, at(row, column)) for column in columns]
-        strength = scan.Emitted(memref.load(betas_ref, at(row)))
-        keys = (scan.Emitted(memref.load(staged_ref, at(0, arith.addi(row, const(pad)), column)))
+        strength = native.Word(memref.load(betas_ref, at(row)))
+        keys = (native.Word(memref.load(staged_ref, at(0, arith.addi(row, const(pad)), column)))
                 for column in columns)
         return [algebra.gated(key, strength).value for key in keys]
 
@@ -226,9 +226,9 @@ def _own_span(row_words, staged_ref, bands_ref, short, long, p, columns, leader,
                 after += decayed
                 pairs = [None] * run
             else:
-                decayed, pairs = values, [scan.Emitted(d) for d in decays]
+                decayed, pairs = values, [native.Word(d) for d in decays]
             # The algebra's own term (`algebra.band_term`), emitted a word at a time.
-            terms = [algebra.band_term(scan.Emitted(r), scan.Emitted(k), d, unit_keys=unit_keys).value
+            terms = [algebra.band_term(native.Word(r), native.Word(k), d, unit_keys=unit_keys).value
                      for r, k, d in zip(decayed, key, pairs, strict=True)]
             total = terms[0]
             for term in terms[1:]:

@@ -184,7 +184,9 @@ trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.ke
                   mesh=MeshSpec().build(devices))
 compile_ahead(trainer, token_rows(64, 1, 12289))
 print(json.dumps({"events": events, "modules": modules, "kind": devices[0].device_kind,
-                  "stored": [certification.stored for certification in report.certifications()]}))
+                  "stored": [certification.stored for certification in report.certifications()],
+                  "misses": [[miss.kernel, miss.op, repr(miss.config), miss.stepped]
+                             for miss in report.misses()]}))
 """
 """A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only GPU of the generation
 or the kind argv[1] names (`compile_only_gpus`): each program it lowered by name, each Mosaic GPU kernel
@@ -222,6 +224,13 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, d
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
+    # A launch certification refused, within the settle that refused it, is recorded once a refused config and
+    # stepped: the retry certified it past the rung (`report.settling`), a B200's reverse launch at its first
+    # (FS-ASIDE-SM100C), an H100's none.
+    misses = runs[0]["misses"]
+    assert (target == "sm100") == bool(misses), misses
+    assert all(stepped for *_, stepped in misses), misses
+    assert len({tuple(miss) for miss in misses}) == len(misses), misses
 
 
 @lowers("sm90")

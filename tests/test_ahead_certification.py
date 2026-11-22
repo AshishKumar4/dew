@@ -60,12 +60,14 @@ def two_layers(x, w):
     return rms_normalized(y, w, 1e-6, jnp.bfloat16, False, False, True)
 
 with assumed(stated, portable=True), report.certifying(gpu), jax.set_mesh(mesh):
-    with report.certifying_aside() as aside:
-        cold = owned_program(two_layers).trace(x, w).lower()
-    report.settled_aside(aside)
-    with report.certifying_aside() as aside2:
-        warm = owned_program(two_layers).trace(x, w).lower()
-    report.settled_aside(aside2)
+    with report.settling():
+        with report.certifying_aside() as aside:
+            cold = owned_program(two_layers).trace(x, w).lower()
+        report.settled_aside(aside)
+    with report.settling():
+        with report.certifying_aside() as aside2:
+            warm = owned_program(two_layers).trace(x, w).lower()
+        report.settled_aside(aside2)
 
 print(json.dumps({"cold_digest": program_digest(cold), "warm_digest": program_digest(warm),
                   "certified": len(report.certifications())}))

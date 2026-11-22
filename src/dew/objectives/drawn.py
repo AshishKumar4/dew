@@ -149,12 +149,14 @@ def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array],
         from dew.nn.kernels.templates import report
 
         traced, through = passed_through(function, lambda built: parts.split(built)[1])
-        # The launches its trace reaches certified aside and settled as it ends (`report.certifying_aside`):
-        # certified in turn they took a start's tracing thread before its step's lowering (row 5324); a
-        # launch the settling refused leaves the start's lowering to step past it.
-        with report.certifying_aside() as aside:
-            trace = owned_program(traced).trace(held, key)
-        report.settled_aside(aside)
+        # The launches its trace reaches certified aside and settled as it ends (`report.certifying_aside`,
+        # within the settle that records their misses, `report.settling`): certified in turn they took a
+        # start's tracing thread before its step's lowering (row 5324); a launch the settling refused leaves
+        # the start's lowering to step past it.
+        with report.settling():
+            with report.certifying_aside() as aside:
+                trace = owned_program(traced).trace(held, key)
+            report.settled_aside(aside)
         abstract = trace.out_info
         leaves = jax.tree.structure(parts.split(abstract)[1]).num_leaves
         built = tuple(index for index in range(leaves) if index not in through)
