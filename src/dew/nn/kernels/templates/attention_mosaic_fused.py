@@ -198,7 +198,7 @@ def overlapped_tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows:
 
 def _overlapped_weights_and_dp(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords,
                                shape: tuple[int, int], *, masked: bool,
-                               after_weights: Callable[[jax.Array], None] | None = None):
+                               after_weights: Callable | None = None):
     """Issue `S` and `dP` via `product_pair(..., between=...)`, running `S` softmax + optional
     `after_weights(narrowed)` while `dP` is in flight on Tensor Cores."""
     family = walk.program.family
