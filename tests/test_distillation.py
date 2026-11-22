@@ -915,7 +915,8 @@ def test_a_selected_distillation_beside_a_model_scoring_through_more_than_its_he
             return False
 
     arrays = fixture()
-    objective, params = fixture_objective(arrays, teacher_type=Adapted, divergence="selected")
+    objective, params = fixture_objective(arrays, teacher_type=Adapted, divergence="selected",
+                                          temperature=1.0)
     tile = (3, META["student"]["vocab_size"])
     assert objective.tile_head(tile) is not None and head_tile_of(objective.student) == tile
     loss, _ = objective.scalar_loss(params, fixture_batch(arrays), step_at())
