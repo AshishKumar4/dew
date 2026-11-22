@@ -34,7 +34,7 @@ def saved(root: Path, state) -> bool:
     [configuration] = sorted((root / "runs").glob("**/run.json"))
     checkpoints = Checkpoints(str(configuration.parent))
     assert checkpoints.latest == int(state.step), (checkpoints.latest, int(state.step))
-    restored = checkpoints.variables(step=checkpoints.latest, on_host=True)["params"]
+    restored = checkpoints.variables(step=checkpoints.latest, ema=False, on_host=True)["params"]
     jax.tree.map(np.testing.assert_array_equal, restored, jax.device_get(state.variables["params"]))
     return True
 
