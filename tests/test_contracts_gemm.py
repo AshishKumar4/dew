@@ -880,3 +880,50 @@ def test_a_biased_xla_projection_in_its_layer_holds_every_order(edge):
 
     assert_contract(product, primals, direction, cotangent, f"a biased xla projection in its layer {edge}",
                     plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
+    """`gemm.symmetric_gram` (`X @ X^T` and `X^T @ X`) and `gemm.symmetric_polynomial`
+    (`c0 * I + c1 * A + c2 * (A @ A)`), their custom VJPs declared through
+    `derivatives.declared_derivative`: every reverse order, under a nested jit and a scan, finite wherever
+    float64 is a normal float32 and wherever the plain formula is (row 11941)."""
+    (x_fat,) = normal_draw(11941, (2, 6, 10), scale=EDGES[edge])
+    (d_fat,) = normal_draw(11942, (2, 6, 10), scale=EDGES[edge])
+    (c_gram,) = normal_draw(11943, (2, 6, 6))
+
+    def plain_gram(operand):
+        return jax.lax.dot_general(operand, operand, (((2,), (2,)), ((0,), (0,))))
+
+    assert_contract(lambda operand: gemm.symmetric_gram(operand, out_dtype=operand.dtype),
+                    (x_fat,), (d_fat,), c_gram, f"symmetric_gram fat {edge}",
+                    truth_fn=plain_gram, plain_fn=plain_gram, without=FORWARD_ORDERS)
+
+    (x_tall,) = normal_draw(11944, (2, 10, 6), scale=EDGES[edge])
+    (d_tall,) = normal_draw(11945, (2, 10, 6), scale=EDGES[edge])
+
+    def plain_gram_t(operand):
+        return jax.lax.dot_general(operand, operand, (((1,), (1,)), ((0,), (0,))))
+
+    assert_contract(lambda operand: gemm.symmetric_gram(operand, transpose=True, out_dtype=operand.dtype),
+                    (x_tall,), (d_tall,), c_gram, f"symmetric_gram tall {edge}",
+                    truth_fn=plain_gram_t, plain_fn=plain_gram_t, without=FORWARD_ORDERS)
+
+    mat, coeffs = normal_draw(11946, (2, 6, 6), (3,), scale=EDGES[edge])
+    d_mat, d_coeffs = normal_draw(11947, (2, 6, 6), (3,), scale=EDGES[edge])
+
+    def plain_poly(operand, poly):
+        sq = jax.lax.dot_general(operand, operand, (((2,), (1,)), ((0,), (0,))))
+        return poly[0] * jnp.eye(6, dtype=operand.dtype) + poly[1] * operand + poly[2] * sq
+
+    assert_contract(lambda operand, poly: gemm.symmetric_polynomial(operand, poly, out_dtype=operand.dtype),
+                    (mat, coeffs), (d_mat, d_coeffs), c_gram, f"symmetric_polynomial {edge}",
+                    truth_fn=plain_poly, plain_fn=plain_poly, without=FORWARD_ORDERS)
+
+    # Large-cotangent non-overflow witness: dy + dy.T would overflow 2**127 to inf before multiplying 0.25.
+    small_x = jnp.asarray([[[0.25]]], jnp.float32)
+    big_dy = jnp.asarray([[[2.0 ** 127]]], jnp.float32)
+    for transpose in (False, True):
+        _, pull = jax.vjp(lambda operand, t=transpose: gemm.symmetric_gram(operand, transpose=t), small_x)
+        (dx_big,) = pull(big_dy)
+        np.testing.assert_array_equal(np.asarray(dx_big), np.asarray([[[2.0 ** 126]]], jnp.float32))

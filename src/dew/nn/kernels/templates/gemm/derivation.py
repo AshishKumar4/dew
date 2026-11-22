@@ -106,23 +106,23 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         staged busy: at the widest width its registers hold, its rows at their balance."""
         role = math.lcm(family.role_rows * consumers, units[0])
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
+        padded = grouped and not dense
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
-                                   multiprocessors=multiprocessors, grouped=grouped and not dense)
+                                   multiprocessors=multiprocessors, grouped=padded)
+        price_of = functools.partial(_tile_cost, family=family, target=target, dtype=dtype, rows=rows,
+                                     width=width, padded=padded)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
-                                      target=target, programs=programs, rows=rows, width=width)
+                                      target=target, programs=programs, price_of=price_of)
         # rows the most its registers hold there and its stages keep busy, rows short of that balance (the
         # width's held rows, or the balanced side where it holds more) giving way to the next narrower
         # width, so a tile keeps its rows and narrows rather than shortening. mma.sync's one consumer at
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
         # stages busy at its balance, the widest staging busy at all, then the widest that holds.
-        side = _side(layouts, consumers, role, most_rows, columns, rows, target, dtype, steps,
-                     padded=grouped and not dense)
+        side = _side(layouts, consumers, role, most_rows, columns, rows, target, dtype, steps, padded=padded)
         widths = _held_widths(layouts, consumers, columns, role, most_rows, side)
-        return _best_width(widths, held_tile, side, budgets_registers=family.budgets_registers,
-                           rows=rows, width=width)
-    # does a call no cooperative tile holds (a wide epilogue's outputs past a block), and a grouped call
+        return _best_width(widths, held_tile, side, price_of=price_of)
     # whose groups average fewer rows than one role (a decode step's experts, a few routed rows each), whose
     # further consumers would compute padding alone; where groups average a role's rows, a routing's groups
     # past it keep the further consumers' rows real. Row 3622, H100 (FS-3622-AB1/AB2-h100): one consumer ran
@@ -173,17 +173,35 @@ def _derived_columns(family: mosaic.Family, width: int, dtype, unit_of_call: int
     return [block_n for block_n in columns if block_n % unit_of_call == 0]
 
 
+def _tile_cost(tile: Tiles, *, family: mosaic.Family, target, dtype, rows: int, width: int,
+               padded: bool) -> tuple[float, float] | None:
+    """One tile's seconds per useful output element-step (`pricing.step_seconds`, weighted by tile padding as
+    `_padded_side` weighs grouped rows, tie-broken by operand reads per FLOP `1/M + 1/N`): the single cost
+    model every family's derivation reads (docs/design/kernel-templates.md §7, rows 11944, 11983); None
+    where `target` states no tensor rate. Leaving out the call's constant `rows` factor lets even `rows == 0`
+    rank its tiles alike."""
+    itemsize = jnp.dtype(dtype).itemsize
+    seconds = pricing.step_seconds(tile, target, (itemsize, itemsize))
+    if seconds is None:
+        return None
+    row_tile, columns = pricing.tile_rows(tile, family), pricing.tile_columns(tile, family)
+    row_work = (rows + row_tile / 2) if padded else (-(-rows // row_tile) * row_tile)
+    col_pad = (-(-width // columns) * columns) / max(width, 1)
+    return (seconds * row_work * col_pad / (tile.block_m * columns * tile.block_k),
+            1.0 / tile.block_m + 1.0 / columns)
+
+
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], shaped: Callable,
                candidate: Callable, launch_of: Callable, layouts: tuple, target, programs: int,
-               rows: int, width: int) -> tuple["Tiles | None", bool]:
-    """`derived`'s tile at a width: the rows its registers hold there (`held_rows`), shortened where its
-    stages do not fit, at the first step that plans (a step's depth sets how many steps a tile takes, not
-    how many times a FLOP reads each operand); and whether it stages deep enough to stay busy (those its
-    family loads ahead, beside the one consumed and those it keeps in flight)."""
+               price_of: Callable) -> tuple["Tiles | None", bool]:
+    """`derived`'s tile at a width: the rows its registers or VMEM hold there (`held_rows`), shortened where
+    its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
+    shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
+    ahead, beside the one consumed and those it keeps in flight)."""
     family = layouts[0]
     busy = 1 + family.loads_ahead + family.in_flight
     fallback = None
-    best: tuple[tuple[float, int, int], Tiles] | None = None
+    best: tuple[tuple[float, float], Tiles] | None = None
     for block_m in range(held_rows, 0, -role):
         for step in steps:
             def launches_of(layout, block_m=block_m, step=step):
@@ -199,12 +217,11 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
                 # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
                 continue
             if tile.stages >= busy:
-                if family.budgets_registers:
+                price = price_of(tile)
+                if price is None:
                     return tile, True
-                # VMEM-shared family (`mxu`): minimize 3D tile surface-to-volume ratio weighted by padding.
-                score = _vmem_score(tile, rows, width)
-                if best is None or score < best[0]:
-                    best = (score, tile)
+                if best is None or price < best[0]:
+                    best = (price, tile)
                 break
             fallback = fallback or tile
     if best is not None:
@@ -212,35 +229,30 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
     return fallback, False
 
 
-def _vmem_score(tile: Tiles, rows: int, width: int) -> tuple[float, int, int]:
-    """3D tile surface-to-volume ratio `(1/M + 1/N + 1/K)` weighted by row/column tile-padding waste for
-    VMEM-shared families (M-FS-45, M-NG-2-v5e1, row 10152)."""
-    row_pad = (-(-rows // tile.block_m) * tile.block_m) / max(rows, 1)
-    col_pad = (-(-width // tile.block_n) * tile.block_n) / max(width, 1)
-    return ((1.0 / tile.block_m + 1.0 / tile.block_n + 1.0 / tile.block_k) * row_pad * col_pad,
-            -(tile.block_m * tile.block_n), -tile.block_k)
-
-
 def _best_width(widths: list[tuple[int, int]], held_tile: Callable, side: int, *,
-                budgets_registers: bool, rows: int, width: int) -> tuple[Tiles | None, bool]:
-    """Pick the best width among `widths`: widest balanced for register-budgeted families, or lowest
-    `_vmem_score` for VMEM-shared families."""
+                price_of: Callable) -> tuple[Tiles | None, bool]:
+    """Pick the least-priced busy tile across `widths` under the shared cost model (`_tile_cost`), or the
+    first balanced busy tile where the target states no tensor rate."""
     busy_at, fallback = None, None
-    best_vmem: tuple[tuple[float, int, int], Tiles] | None = None
+    best: tuple[tuple[float, float], Tiles] | None = None
     for block_n, held_rows in widths:
         tile, staged = held_tile(block_n, held_rows)
-        if not budgets_registers and tile is not None and staged:
-            score = _vmem_score(tile, rows, width)
-            if best_vmem is None or score < best_vmem[0]:
-                best_vmem = (score, tile)
-            continue
-        if tile is not None and staged and tile.block_m >= min(held_rows, side):
-            return tile, block_n == widths[0][0]
-        busy_at = busy_at or (tile if staged else None)
-        fallback = fallback or tile
-    if best_vmem is not None:
-        return best_vmem[1], True
+        if tile is not None and staged:
+            price = price_of(tile)
+            if price is None:
+                if tile.block_m >= min(held_rows, side):
+                    return tile, block_n == widths[0][0]
+                busy_at = busy_at or tile
+            elif best is None or price < best[0]:
+                best = (price, tile)
+        else:
+            fallback = fallback or tile
+    if best is not None:
+        chosen = best[1]
+        balanced = chosen.block_n == widths[0][0] and chosen.block_m >= min(widths[0][1], side)
+        return chosen, balanced
     return busy_at or fallback, False
+
 
 def _held_widths(layouts: tuple, consumers: int, columns: list[int], role: int, most_rows: int,
                  side: int) -> list[tuple[int, int]]:
@@ -302,21 +314,18 @@ def _padded_side(layouts: tuple, consumers: int, role: int, most_rows: int, colu
     (`_balanced_side`) where the target states no tensor rate."""
     balanced = _balanced_side(layouts, consumers, role, most_rows)
     area = max(resources.held_area(layout, consumers) for layout in layouts)
-    itemsize = jnp.dtype(dtype).itemsize
-    best = None
+    best: tuple[float, int] | None = None
     # No rows past those the narrowest width's accumulator area holds: a taller tile holds no width.
     tallest = min(most_rows, area // columns[-1]) if columns else 0
     for block_m in range(role, tallest + 1, role):
         block_n = next(block_n for block_n in columns if block_n * block_m <= area)
         tiles = Tiles(block_m, block_n, steps[0], 2, 1, warpgroups=consumers, family=layouts[0].name)
-        seconds = pricing.step_seconds(tiles, target, (itemsize, itemsize))
-        if seconds is None:
+        price = _tile_cost(tiles, family=layouts[0], target=target, dtype=dtype, rows=rows, width=block_n,
+                           padded=True)
+        if price is None:
             return balanced
-        # Its step's seconds over the useful rows' share of its tile: the call's rows a group, one factor of
-        # every candidate's, left out, so a call of no rows ranks its tiles too.
-        cost = seconds * (rows + block_m / 2) / (block_m * block_n)
-        if best is None or cost <= best[0]:
-            best = (cost, block_m)
+        if best is None or price[0] <= best[0]:
+            best = (price[0], block_m)
     return balanced if best is None else best[1]
 
 
