@@ -36,7 +36,7 @@ from dew.nn.kernels.options import (
 )
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
-from dew.objectives.base import Objective
+from dew.objectives.base import Objective, head_tile_of
 from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.compiles import Compiles, Ledger, Program, Span, owning
 from dew.telemetry.instrumentation import StepFlops, compiled_memory
@@ -51,7 +51,6 @@ from dew.training.distributed import (
 )
 from dew.training.memory import (
     climb_to,
-    head_tile_of,
     layer_gathers,
     local_devices,
     memory_record,

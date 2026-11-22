@@ -191,7 +191,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, computation_differs, resumed_step, run_data
+from dew.training.startup import Startup, computation_differs, refuse_export, resumed_step, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -1521,7 +1521,7 @@ class Trainer(Generic[Loss, Effects]):
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
         objective that names its input field alone declares it first (`_declare_input`), a resume's from the
         first batch its saved position admits (`_resumed_position`)."""
-        checkpoints = self.checkpoints
+        checkpoints, _ = self.checkpoints, refuse_export(self)
         resumed = None if initial is not None else self._resumed(run, resume)
         self._declare_input(lambda: self._primed_first(run, dataset,
                                                        None if resumed is None else resumed.position))
@@ -2136,7 +2136,6 @@ class Trainer(Generic[Loss, Effects]):
         ends on, ranked by them: a budget's last step, a stream's that ran out and a
         plateau's (`_between_steps`)."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
-        state = plan.closed_at_budget(state, run.clock.read)
         self._take(plan, run, interval, state, unlogged=True)
         self._read_taken(run)
         if run.notice is not None and run.cooling is None:

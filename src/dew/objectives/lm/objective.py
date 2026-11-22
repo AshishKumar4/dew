@@ -1716,6 +1716,11 @@ class LMObjective(TokenScorer):
                                                   summed=step.training)
         return statistics, aux
 
+    @property
+    def predicts_by_head(self) -> bool:
+        """Its scores its head's alone where no adaptation scores through more (`ChunkAdaptation`)."""
+        return self.adaptation is None
+
     def predict(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
                 logits: bool = True) -> tuple[Ratio | RoutedStatistics, Aux[Variables], Prediction]:
         """Return the loss with the logits, target weights and `layers` outputs behind it.
@@ -1738,7 +1743,7 @@ class LMObjective(TokenScorer):
         # Its final states and their head where its scores are the model's head's alone; an adaptation
         # scores through more than that head (`ChunkAdaptation`), which a caller reading the states would
         # leave out.
-        plain = self.adaptation is None
+        plain = self.predicts_by_head
         return statistics, aux, Prediction(whole, scores.losses, scores.weights, scores.layers,
                                            final=scores.hidden if plain else None,
                                            head=functools.partial(model_logits, self.model, params)

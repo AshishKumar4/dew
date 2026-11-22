@@ -96,7 +96,7 @@ from ..precision import (
     two_product,
     uncontracted,
 )
-from ..sharding import automatic_axes, manual_map, on_shards, summed_axes, varying_as, varying_like
+from ..sharding import automatic_axes, excess_axes, manual_map, on_shards, summed_to, varying_like
 from . import generation, tuning
 from .generation import INHERENT, Choice, device_generation
 from .selection import Kernel, Op, Requirement, select
@@ -986,14 +986,14 @@ def _typed(backward, parameters: int = 0):
     sum, as a projection's per-shard reverse mode ties its own."""
     def typed(saved, operands, cotangents):
         gradients = backward(saved, operands, cotangents)
-        local = tuple(gradient if gradient is None or operand is None or summed_axes(gradient, operand)
+        local = tuple(gradient if gradient is None or operand is None or excess_axes(gradient, operand)
                       else gradient.astype(jax.typeof(operand).dtype)
                       for gradient, operand in zip(gradients, operands, strict=True))
         if parameters:
             inputs, formed = with_gradients_formed(local[:-parameters], local[-parameters:])
             local = (*inputs, *formed)
         return tuple(gradient if gradient is None or operand is None
-                     else varying_as(gradient, operand).astype(jax.typeof(operand).dtype)
+                     else summed_to(gradient, operand).astype(jax.typeof(operand).dtype)
                      for gradient, operand in zip(local, operands, strict=True))
     return typed
 

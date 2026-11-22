@@ -62,10 +62,11 @@ def models():
     return CausalTransformer(**META["student"]), CausalTransformer(**META["teacher"])
 
 
-def fixture_objective(arrays: dict, **overrides) -> tuple[DistillationObjective, dict]:
-    """The objective over the fixture's variables, its projections included."""
+def fixture_objective(arrays: dict, student_type=LMObjective,
+                      **overrides) -> tuple[DistillationObjective, dict]:
+    """The objective over the fixture's variables, its projections included, its student a `student_type`."""
     student_model, teacher_model = models()
-    student = LMObjective(student_model, SEQ, pad_id=META["pad_id"], ema_decay=None,
+    student = student_type(student_model, SEQ, pad_id=META["pad_id"], ema_decay=None,
                           variables=tree(arrays, "student/"))
     teacher = LMObjective(teacher_model, SEQ, ema_decay=None, variables=tree(arrays, "teacher/"))
     settings = {"alpha": META["alpha"], "temperature": META["temperature"], "beta": META["beta"],
@@ -793,3 +794,23 @@ def test_a_tiled_full_kl_over_tokens_split_across_devices_gathers_no_states(axes
     gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
     local = rows * positions * width // 4
     assert not any(math.prod(shape) > local for shape in gathered), gathered
+
+
+def test_a_tiled_students_full_kl_beside_a_model_scoring_through_more_than_its_head_reads_whole_logits():
+    """A distillation whose student's head is tiled and whose student scores through more than its head (an
+    adaptation, which states no final states or head, `predicts_by_head`) trains, its full KL read off the
+    whole logits as it was before the head was tiled (row 10983: the tiled KL refused it at its first trace,
+    which the planner's tile rung reached)."""
+
+    class Adapted(LMObjective):
+        """An LM objective whose prediction, as an adapted model's, states no final states or head."""
+
+        @property
+        def predicts_by_head(self) -> bool:
+            return False
+
+    arrays = fixture()
+    objective, params = fixture_objective(arrays, student_type=Adapted)
+    assert objective.tile_head((3, META["student"]["vocab_size"])) is not None
+    loss, _ = objective.scalar_loss(params, fixture_batch(arrays), step_at())
+    assert np.isfinite(float(loss))

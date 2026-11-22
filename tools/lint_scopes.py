@@ -10,8 +10,11 @@ then imports counts as imported.
 from __future__ import annotations
 
 import ast
+import importlib.util
+import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from types import MappingProxyType
+from pathlib import Path
+from types import MappingProxyType, ModuleType
 
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
@@ -51,6 +54,19 @@ def annotated(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[tupl
         yield "return", function.returns
 
 
+def walker() -> ModuleType:
+    """Dew's reader of the imports a module's run executes and of a lazy package's `_EXPORTS`
+    (src/dew/_imports.py), loaded by its path: it reads the standard library alone, Dew not imported."""
+    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "_imports.py"
+    if "_dew_imports" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("_dew_imports", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"{path} is no Python source file; is its checkout there?")
+        sys.modules["_dew_imports"] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sys.modules["_dew_imports"])
+    return sys.modules["_dew_imports"]
+
+
 def package_of(module: str, initializer: bool) -> list[str]:
     """The package a module's relative imports start from, as its parts: the dotted `module` itself where
     it is a package's `__init__` (`initializer`), named without it, else the package holding it."""
@@ -60,10 +76,9 @@ def package_of(module: str, initializer: bool) -> list[str]:
 
 def imported_from(node: ast.ImportFrom, parent: Sequence[str]) -> str:
     """The module a `from` import reads, as a dotted path, a relative one resolved from `parent`, the
-    package its relative imports start from (`package_of`)."""
-    if not node.level:
-        return node.module or ""
-    return ".".join([*parent[:len(parent) - node.level + 1], *([node.module] if node.module else [])])
+    package its relative imports start from (`package_of`), by Dew's one resolver of them
+    (`dew._imports.imported_from`)."""
+    return walker().imported_from(node, ".".join(parent))
 
 
 def bound_by(node: ast.Import | ast.ImportFrom, parent: Sequence[str]) -> dict[str, str]:

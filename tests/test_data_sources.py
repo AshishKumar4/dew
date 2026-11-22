@@ -1792,6 +1792,22 @@ def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
     assert {rows[index]["split"] for index in range(len(rows))} == {"train", "held"}
 
 
+def test_a_delta_tables_shards_are_named_as_its_dataset_names_its_files(tmp_path):
+    """A Delta table's streamed shards are named as its log names its files, as its Arrow dataset's fragments
+    name them, with no dataset built: the names its positions saved before hold them (row 9009's review: the
+    absolute paths its files are read at named them, refusing those positions' resumes)."""
+    from deltalake import write_deltalake
+
+    from dew.data.sources.delta import Delta
+
+    root = str(tmp_path / "delta")
+    for part in range(2):
+        write_deltalake(root, pa.table({"value": list(range(4 * part, 4 * part + 4))}), mode="append")
+    table = Delta(root)
+    assert sorted(shard.id for shard in table.manifest().shards) == sorted(
+        fragment.path for fragment in Delta(root).arrow.get_fragments())
+
+
 def test_a_delta_run_resumes_with_its_version_pinned_and_refuses_another_predicate(tmp_path):
     """A table's identity is its resolved version, files and read options: a run started on the
     table's head resumes exactly with that version pinned, and a run reading it through another

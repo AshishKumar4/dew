@@ -71,6 +71,31 @@ def test_a_square_root_counts_on_the_special_function_units_as_an_exponential_do
     assert (role.fixed.exponentials, role.fixed.operations) == (128, 0), role.fixed
 
 
+@pytest.mark.parametrize("operation", [jnp.exp, jnp.log, jnp.tanh, jax.nn.sigmoid], ids=lambda f: f.__name__)
+def test_a_kernel_counts_a_special_function_in_the_form_its_approx_math_lowers_it_to(operation):
+    """A kernel's special function counts as its compile lowers it: the hardware's approximate form where
+    the kernel asks `approx_math` (an exp one MUFU beside its scaling multiply), and the accurate form
+    elsewhere, every GEMM launch's (an exp the MUFU beside seven fp32 instructions, a saturating convert and
+    a shift; a log a polynomial with no MUFU; row 10824, FS-APPROX-FORMS3, sm90 and sm100 alike). The
+    accurate form issues more fp32 work an element than the approximate one."""
+    def work(*, approx: bool):
+        def body(row, out, staged):
+            staged[...] = operation(row[...])
+            out[...] = staged[...]
+
+        launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
+                              scratch_types=[plgpu.SMEM((128,), jnp.float32)],
+                              compiler_params=plgpu.CompilerParams(approx_math=approx))
+        traced = jax.make_jaxpr(launch)(jnp.zeros(128, jnp.float32)).jaxpr
+        (kernel,) = [equation for equation in programs.equations(traced)
+                     if equation.primitive.name in ("mpmd_map", "pallas_call")]
+        return emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
+
+    approximate, accurate = work(approx=True), work(approx=False)
+    assert accurate.operations > approximate.operations, (accurate, approximate)
+    assert approximate.unpriced_operations == accurate.unpriced_operations == 0, (accurate, approximate)
+
+
 def test_a_step_counts_each_trip_of_a_loop_inside_it():
     """A walk step holding a loop of four trips counts its body four times."""
     walk = _walked(lambda row: lax.scan(lambda row, _: (jnp.exp(row), None), row, length=4)[0])

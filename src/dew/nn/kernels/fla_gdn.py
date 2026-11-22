@@ -29,7 +29,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn import derivatives
+from dew.nn import derivatives, programs
 from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
@@ -100,14 +100,16 @@ refuses fp64's (the default and the FP8 ones name none)."""
 
 def _upstream(dtype, ieee: bool) -> jax.lax.DotAlgorithmPreset:
     """The algorithm fla's `tl.dot` runs a product of `dtype` operands in: a 16-bit operand's own product
-    summed in fp32 (no `input_precision` names another); an fp32 one's one TF32, its default
-    `input_precision` and its `SOLVE_TRIL_DOT_PRECISION` on a GPU that runs TF32 (fla 0.5.2
+    summed in fp32 (`programs.own_preset`; no `input_precision` names another); an fp32 one's one TF32, its
+    default `input_precision` and its `SOLVE_TRIL_DOT_PRECISION` on a GPU that runs TF32 (fla 0.5.2
     gated_delta_rule/chunk_fwd.py), or IEEE where it states `allow_tf32=False` (`ieee`: `recompute_w_u`'s
     `A @ v`)."""
     if dtype == jnp.float32:
         return jax.lax.DotAlgorithmPreset.F32_F32_F32 if ieee else jax.lax.DotAlgorithmPreset.TF32_TF32_F32
-    return {jnp.dtype(jnp.bfloat16): jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
-            jnp.dtype(jnp.float16): jax.lax.DotAlgorithmPreset.F16_F16_F32}[dtype]
+    own = programs.own_preset(dtype)
+    if own is None:
+        raise ValueError(f"fla's products take fp32 or 16-bit float operands, not {jnp.dtype(dtype)}")
+    return own
 
 
 def _precision(rows: int, depth: int, columns: int, dtype, ieee: bool) -> jax.lax.DotAlgorithmPreset:

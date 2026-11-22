@@ -1066,7 +1066,7 @@ def built_target(generation: str, multiprocessors: int | None = None, memory: in
                                memory=memory or target.memory)
 
 
-def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
+def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
     its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;
@@ -1610,6 +1610,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
     from dew.nn.derivatives import contracted, declared_tangent
+    from dew.nn.sharding import summed_to
 
     def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
@@ -1663,11 +1664,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live) if live_cotangents
                                                  else None))
             cotangents = pulled_back if live_cotangents else [pulled_back[index] for index in live]
-            # Each typed as its operand varies (`varying_as`).
             leaves = jax.tree.leaves(operands)
-            from dew.nn.sharding import varying_as
-
-            return [varying_as(each, leaves[index]) for each, index in zip(cotangents, live, strict=True)]
+            return [summed_to(each, leaves[index]) for each, index in zip(cotangents, live, strict=True)]
 
         moving = [directions[index] for index in live]
         # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s

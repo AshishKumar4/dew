@@ -85,6 +85,7 @@ from dew._coordination import broadcast_from_process_zero, from_every_process, s
 from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
+from dew.checkpoints._exported import EXPORTED, exported
 from dew.checkpoints._integrity import _digest
 from dew.checkpoints._payloads import (
     _NEEDS,
@@ -974,10 +975,14 @@ class Checkpoints:
     pool's local checkpoint restores onto the placement it was written with,
     because no process holds another process's shards (`_check_placement`);
     one process's, and the persistent checkpoint, restore onto any mesh.
+
+    `export_model` writes beside each persistent step of a train state its model whole (`EXPORTED`), every
+    collection (a LoRA base) and EMA as their own arrays, in Orbax's standard layout stock Orbax reads.
     """
 
     def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
-                 local_directory: str | None = None, local_every: int | str | None = None):
+                 local_directory: str | None = None, local_every: int | str | None = None,
+                 export_model: bool = False):
         if (local_directory is None) != (local_every is None):
             raise ValueError(
                 "local checkpoints take both local_directory and local_every: where "
@@ -1004,6 +1009,7 @@ class Checkpoints:
         self._deleting: tuple[threading.Thread, list[OSError], frozenset[int]] | None = None
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
+        self.export_model = export_model
         # Why the run these checkpoints keep has no record that rebuilds it (`python_run`).
         self._reasons: tuple[str, ...] = ()
         self._manager = None
@@ -1225,7 +1231,8 @@ class Checkpoints:
             # A step's items (`ROLES`), or the one item of a step an earlier Dew wrote or a mapping's.
             self._manager = ocp.CheckpointManager(
                 self.directory, options=options,
-                item_handlers={name: _handler() for name in (*ROLES, ONE_ITEM)})
+                item_handlers={**{name: _handler() for name in (*ROLES, ONE_ITEM)},
+                               EXPORTED: ocp.StandardCheckpointHandler()})
             for step in self._manager.all_steps():
                 if not self._complete(step):
                     continue
@@ -1528,9 +1535,12 @@ class Checkpoints:
                               tuple(name for name in (*ROLES, ONE_ITEM) if name in payloads))
         try:
             with region("checkpoint.submit"):
-                persistent.save(step, args=ocp.args.Composite(**{
+                written: dict[str, ocp.args.CheckpointArgs] = {
                     name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
-                    for name, tree in payloads.items()}),
+                    for name, tree in payloads.items()}
+                if self.export_model and not mapping:
+                    written[EXPORTED] = ocp.args.StandardSave(exported(state))
+                persistent.save(step, args=ocp.args.Composite(**written),
                                 metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
             self._staged.pop(step)
@@ -1593,12 +1603,14 @@ class Checkpoints:
                     continue
                 root = epath.Path(self.path(step))
                 kept = [name for name in ROLES if name in needed and name in payloads]
-                leftover = not self._swept and any((root / name).exists() for name in ROLES
-                                                   if name not in kept)
+                # A step's exported model is its model's: kept with it, else cut with it (`EXPORTED`).
+                own, written = [*kept, *([EXPORTED] if MODEL in kept else [])], (*ROLES, EXPORTED)
+                leftover = not self._swept and any((root / name).exists() for name in written
+                                                   if name not in own)
                 if len(kept) == len(payloads) and not leftover:
                     continue
                 write_atomically(root / PROJECTED, json.dumps(kept))
-                doomed += [root / name for name in ROLES if name not in kept and (root / name).exists()]
+                doomed += [root / name for name in written if name not in own and (root / name).exists()]
                 cuts[str(step)] = kept
         cuts = broadcast_from_process_zero(cuts)
         if doomed:
