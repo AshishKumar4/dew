@@ -202,8 +202,10 @@ def the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention():
     - a bf16 decoder with a logit softcap decodes a paged cache (where the step used to raise), its logits
       step by step on par with the compact cache's, the compact cache's reference decode in float64 the
       truth."""
-    table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
-    lengths = jnp.asarray([21, 32], jnp.int32)
+    # The cell's constants on the host, so its GPU tier prepare computes nothing before its sites (rows 7858,
+    # 7859: an array made on a compile-only GPU left the cell unprepared).
+    table = np.asarray([[2, 0], [0, 3]], np.int32)
+    lengths = np.asarray([21, 32], np.int32)
     cases = {f"width {width}{' window' if windowed else ''}{' softcap' if softcap else ''}"
              f"{' sinks' if sunk else ''}": (width, windowed, softcap, sunk)
              for width in (64, 256) for windowed in (False, True) for softcap in (None, 0.5)

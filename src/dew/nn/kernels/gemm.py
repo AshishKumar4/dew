@@ -552,10 +552,13 @@ class PackedRows(enum.Enum):
 @dataclasses.dataclass(frozen=True)
 class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
-    it on the target (`grouped_matmul.MosaicPackedGmm`), None where it plans none, and its `rows`."""
+    it on the target (`grouped_matmul.MosaicPackedGmm`), None where it plans none, its `rows`, and whether
+    its operands are whole arrays (`whole`: no mesh XLA places splits them, `automatic_axes`), which the
+    packed launch reads one device's of whole."""
 
     tile: tiling.Tiles | None
     rows: int
+    whole: bool = True
 
     @property
     def cell(self) -> tuple[str, PackedRows]:
@@ -582,6 +585,9 @@ PACKED_FASTER_SM90 = (
 """The receipt behind the packed NVFP4 kernel's declared H100 cell (`NVFP4_CELLS`)."""
 
 PACKED = selection.Kernel[PackedCase]('packed', (
+    selection.Requirement(
+        'placement', lambda case: case.whole, "a mesh axis splits the product's operands, and the packed "
+        "launch sees whole arrays (row 11642)", 'ledger 1306'),
     selection.Requirement(
         'planned', lambda case: case.tile is not None, "the template plans no tile of the packed "
         "product here: a Mosaic GPU family's, its depth whole 256s and its width whole 64-column tiles",
@@ -647,7 +653,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
                         spec(first), spec(gather), out_dtype='float32', trans_rhs=False,
                         interpret=interpret_on_cpu, dense=group_sizes is None, exact_sums=True)
     tile = _planned(launch, bound)
-    if selection.select(NVFP4, PackedCase(tile, count)).kernel == 'packed':
+    if selection.select(NVFP4, PackedCase(tile, count, whole=not automatic_axes())).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
         summed = _packed(rows, words, scales, sizes, gather, first, launch, interpret_on_cpu,
                          dense=group_sizes is None)

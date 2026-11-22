@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from attention_oracle import traced_attention_terms
 from decision_support import decision_rows
 from float64_terms import float64_terms
@@ -478,15 +479,18 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, cou
     over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
     in windows of their own, a leaf zero by algebra sized by the terms its sum adds; its site `arm`'s own
     (`packed window: <arm>`), as two arms' cells share a GPU flow's one store of programs."""
-    batch = windows(objective, count)
-    assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
-    # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
-    # more sequence (`dew.nn.attention.flash_attention`).
-    segments = objective.bounds.segments
-    laid = laid_out(batch, segments).coordinates()
-    declared = batch["tokens_bound"].max_segments
-    assert int(np.max(laid.segments)) <= laid.max_segments == declared <= segments
-    rows = apart(batch)
+    # The windows laid out on the host in a GPU tier prepare (`ahead_on_the_host`, rows 7858, 7859: made on
+    # its compile-only GPU, they left the cell unprepared).
+    with ahead_on_the_host():
+        batch = windows(objective, count)
+        assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
+        # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
+        # more sequence (`dew.nn.attention.flash_attention`).
+        segments = objective.bounds.segments
+        laid = laid_out(batch, segments).coordinates()
+        declared = batch["tokens_bound"].max_segments
+        assert int(np.max(laid.segments)) <= laid.max_segments == declared <= segments
+        rows = apart(batch)
     wide = copy.copy(objective)
     wide.substitute(wide_modules)
     decide = jax.jit(lambda variables, batch: decided(objective, variables, batch, segments))
