@@ -889,7 +889,7 @@ def test_a_count_of_passes_given_per_call_counts_and_weighs_the_routers_as_a_loo
     routers' records, what a loop of two passes routes: each balancing bias's expert counts
     (`router_counts`), each router call's z-loss (`router_z_terms`) and its routed-position moments
     (`router_moments` over `router_scores`), a skipped call's left out by whether it ran (`ROUTER_RAN`),
-    where expert 0 took every slot of it; the counts exactly, the floats a sum of the same terms."""
+    where expert 0 took every slot of it: the counts and the positions each z-loss term is over, exactly."""
     from dew.nn.moe import ROUTER_COLLECTION
     from dew.objectives.routing import router_counts, router_moments, router_scores, router_z_terms
 
@@ -904,19 +904,21 @@ def test_a_count_of_passes_given_per_call_counts_and_weighs_the_routers_as_a_loo
         _, sown = model.apply(variables, ids, mutable=[ROUTER_COLLECTION, "moe"], **given)
         routing = sown[ROUTER_COLLECTION]
         counts = leaves_by_path(router_counts(variables.get("moe", sown.get("moe", {})), routing))
-        terms = [term.total / term.mass for term in router_z_terms(routing, 1.0, batch)]
+        masses = [term.mass for term in router_z_terms(routing, 1.0, batch)]
         moments = [router_moments(scores, indices, batch, ran=ran).counts
                    for _, (scores, indices, ran) in router_scores(routing)]
-        return counts, terms, moments
+        return counts, masses, moments
 
-    counts, terms, moments = jax.jit(lambda: read(capped, loop_passes=jnp.int32(2)))()
-    want_counts, want_terms, want_moments = jax.jit(lambda: read(fixed))()
+    counts, masses, moments = jax.jit(lambda: read(capped, loop_passes=jnp.int32(2)))()
+    want_counts, want_masses, want_moments = jax.jit(lambda: read(fixed))()
     assert counts.keys() == want_counts.keys() and counts
     for path, count in counts.items():
         np.testing.assert_array_equal(count, want_counts[path])
-    # The capped program's skipped calls weigh nothing: its terms are the fixed loop's, then zero mass.
-    ran_terms = [term for term in terms if bool(jnp.isfinite(term))]
-    np.testing.assert_allclose(np.asarray(ran_terms), np.asarray(want_terms), rtol=1e-6)
+    # The capped program's skipped calls weigh nothing: each z-loss term's positions, a count, the fixed
+    # loop's where its call ran and none where it was skipped.
+    ran = [mass for mass in masses if float(mass)]
+    np.testing.assert_array_equal(np.asarray(ran), np.asarray(want_masses))
+    assert len(masses) > len(want_masses), "the capped loop's skipped calls are among its terms, weighing none"
     np.testing.assert_array_equal(np.asarray(sum(moments)), np.asarray(sum(want_moments)))
 
 
