@@ -787,8 +787,12 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   mode and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
   three-pass TF32 product where one pass misses the accuracy and IEEE fp32 costs more); none admitted is
   refused. A gate stated as an algorithm (`error.at_least`) admits one at least as exact: as many significand
-  digits of each operand (`DotArithmetic.digits`, its parts times the narrower side's) and as wide an
-  accumulation. It serves the sites whose kernel lowers the algorithm itself: the Triton ports, each at
+  digits of each operand (`DotArithmetic.digits`, its parts times the narrower side's), as wide an
+  accumulation, an imprecise accumulation only where the asked algorithm's is, and parts of as wide a range as
+  the asked algorithm's hold of the operands (`DotArithmetic.largest`, each side's largest finite value, row
+  11878): a split whose part's format tops out beneath the operand's rounds an operand near its largest to an
+  infinity. So a gate at least IEEE fp32's refuses BF16x6 and x9, whose digits match, by their bfloat16
+  parts' range, and TF32x3 by its digits (two parts of 11). It serves the sites whose kernel lowers the algorithm itself: the Triton ports, each at
   least fla's own (`fla_gdn._precision` over `TRITON_ALGORITHMS`), and the TPU SSD's Mosaic kernel
   (`ssd._exact`, its precisions named back). A product XLA compiles states a `Precision` instead
   (`recurrence_algebra.STATE_PRECISION`'s HIGHEST): XLA routes a dot to an emitter by its shape, and its
