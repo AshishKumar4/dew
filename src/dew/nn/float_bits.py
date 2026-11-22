@@ -124,29 +124,47 @@ def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
     return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
 
 
+def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array) -> jax.Array:
+    """The float32 nearest `significand * 2^exponent` (`significand` uint32, any width under 2^32; `exponent`
+    int32), signed by `sign` (uint32, the sign bit in place), rounded once to nearest even at the result's
+    last place: 24 bits below its leading one, or the least subnormal's however far below the least normal,
+    past the largest finite an infinity; a zero significand a zero of its sign. In integer arithmetic on the
+    bits, so a process whose float32 arithmetic flushes a subnormal (XLA's CPU, row 4023) still returns it.
+    The one rounding of an exact value into float32 (`lowered_rounded`'s, `dew.quantization.packed_values`'s,
+    row 11807)."""
+    length = 32 - jax.lax.clz(significand).astype(jnp.int32)
+    last = jnp.maximum(exponent + length - 24, -149)
+    drop = last - exponent
+    shift = jnp.clip(drop, 1, 31).astype(jnp.uint32)
+    kept = jnp.where(drop <= 0, significand << jnp.clip(-drop, 0, 31).astype(jnp.uint32),
+                     jnp.where(drop <= 31, significand >> shift, np.uint32(0)))
+    rest = significand & ((np.uint32(1) << shift) - np.uint32(1))
+    half = np.uint32(1) << (shift - np.uint32(1))
+    odd = (kept & np.uint32(1)) == np.uint32(1)
+    up = (((drop >= 1) & (drop <= 31) & ((rest > half) | ((rest == half) & odd)))
+          | ((drop == 32) & (significand > np.uint32(1 << 31))))
+    kept = kept + up.astype(jnp.uint32)
+    # `kept` at its last place: a normal's 24 bits (its leading one carried into the exponent where rounding
+    # filled it, the largest binade's carry the infinity), a subnormal's fewer at the least normal's
+    # exponent, whose biased field the sum's carry sets; a last place past the largest binade's, infinity.
+    biased = last + 150
+    magnitude = jnp.where(biased >= 255, np.uint32(0x7F800000),
+                          (jnp.clip(biased, 1, 254).astype(jnp.uint32) << np.uint32(23)) + kept
+                          - np.uint32(1 << 23))
+    return jax.lax.bitcast_convert_type(sign | jnp.where(significand == 0, np.uint32(0), magnitude),
+                                        jnp.float32)
+
+
 def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     """`x` (fp32) times `2^-k` (`k` int32, at least 0, broadcast against `x`) rounded once to nearest even
-    into fp32 however far below its least normal, in integer arithmetic on its bits: a process whose
-    float32 multiply or conversion flushes a subnormal result (XLA's CPU, per primitive, row 4023) still
-    returns it, as an IEEE multiply by the power of two would. A finite `x` alone; an infinity or NaN
-    returns as it is."""
+    into fp32 however far below its least normal (`rounded_float32`): a process whose float32 multiply or
+    conversion flushes a subnormal result (XLA's CPU, per primitive, row 4023) still returns it, as an IEEE
+    multiply by the power of two would. A finite `x` alone; an infinity or NaN returns as it is."""
     _, sign, biased, fraction = raw_fields(x.astype(jnp.float32))
     biased = biased.astype(jnp.int32)
     # A subnormal `x` holds its significand at the least normal's exponent, its leading bit none.
-    held = jnp.maximum(biased, 1)
     significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
-    target = held - k
-    normal = sign | (jnp.maximum(target, 1).astype(jnp.uint32) << 23) | fraction
-    # Below the least normal: the significand shifted right by the binades past it, rounded to nearest even.
-    shift = jnp.clip(1 - target, 0, 31).astype(jnp.uint32)
-    kept = significand >> shift
-    rest = significand & ((np.uint32(1) << shift) - np.uint32(1))
-    half = np.uint32(1) << (jnp.maximum(shift, np.uint32(1)) - np.uint32(1))
-    even = (kept & np.uint32(1)) == np.uint32(1)
-    up = (shift > 0) & ((rest > half) | ((rest == half) & even))
-    subnormal = sign | (kept + up.astype(jnp.uint32))
-    lowered = jnp.where((target >= 1) & (biased > 0), normal, subnormal)
-    rounded = jax.lax.bitcast_convert_type(lowered, jnp.float32)
+    rounded = rounded_float32(sign, significand, jnp.maximum(biased, 1) - 150 - k)
     return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
 
 
