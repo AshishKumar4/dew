@@ -311,20 +311,29 @@ def test_a_stream_with_no_batch_ends_its_run_where_it_starts_its_final_checkpoin
         Trainer(named, optax.sgd(0.1), key=jax.random.key(0)).fit(empty, steps=5, log_every=100)
 
 
-def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("average", [None, "device", "host"])
+def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_once(tmp_path, monkeypatch,
+                                                                                average):
     """A fit compiled ahead that evaluates midway states a need admitting each of its evaluation's programs
-    beside the state its run holds while it scores, the weights each reads from that state counted once
-    (row 8710: the need admitted every program compiled beside the step with nothing beside it, so a GPU
-    admitted at it ran out of memory at an evaluation of batches larger than its step's, where the run's own
-    admission refused it; then it counted the weights twice, beside the state and among the evaluation's
-    arguments, and refused a GPU the evaluation fitted). A model 1024 wide, its state outweighing its step's
-    other bytes: an evaluation of 4 times its step's rows fits where its step does and adds nothing to the
-    need (its weights counted twice, 27 MB more, FS-8710-N-c1ff975583c-4x1024); one of 32 times needs more
-    than the step (FS-8710-N-87cbc58440b-32x1024), and the need admits it."""
-    from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune, gpus
+    beside the state its run holds while it scores, the weights it scores by counted once where the state
+    holds them on the device (row 8710: the need admitted every program compiled beside the step with nothing
+    beside it, so a GPU admitted at it ran out of memory at an evaluation of batches larger than its step's,
+    where the run's own admission refused it; then it counted the weights twice, beside the state and among
+    the evaluation's arguments, and refused a GPU the evaluation fitted). A model 1024 wide, its state
+    outweighing its step's other bytes: an evaluation of 4 times its step's rows fits where its step does and
+    adds nothing to the need (its weights counted twice, 27 MB more, FS-8710-N-c1ff975583c-4x1024); one of 32
+    times needs more than the step, and the need admits it. With an average the objective keeps (`EMASpec`),
+    the evaluation scores by it: kept on the device, it is the state's; kept in host memory
+    (`Layout(host=("ema",))`), the evaluation fetches it beside the live variables, new bytes the need admits
+    in full (its review: a fetched average read as the state's)."""
+    from model_support import TINY_DECODER
+    from test_compile_ahead import BATCH, SEQ_LEN, TINY_SHARD, VOCAB, gpus
     from token_support import token_rows
 
-    from dew.training import MeshSpec
+    from dew.objectives.base import EMASpec
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Layout, MeshSpec
     from dew.training.ahead import compile_ahead, stand_in_gpus
     from dew.training.memory import admitted
 
@@ -332,7 +341,14 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 
     def built(scale: int | None):
-        trainer = fine_tune(MeshSpec().build(gpus("sm90")), width=1024)
+        model = models.build("causal_transformer", vocab_size=VOCAB, **{**TINY_DECODER, "emb_features": 1024},
+                             num_kv_heads=2)
+        objective = LMObjective(model, SEQ_LEN)
+        if average is not None:
+            objective.ema = EMASpec(decay=optax.constant_schedule(0.9))
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                          mesh=MeshSpec().build(gpus("sm90")),
+                          layout=Layout(min_shard=TINY_SHARD, host=("ema",) if average == "host" else ()))
         if scale is None:
             return trainer, compile_ahead(trainer, batch)
         scored = scale * BATCH
@@ -341,17 +357,20 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
                                                            "eval_every": 2})
 
     trainer, plain = built(None)
-    assert built(4)[1].built.memory == plain.built.memory
+    four = built(4)[1].built.memory
+    # A host-kept average is fetched beside the state, which may raise the need past the step's.
+    assert four == plain.built.memory if average != "host" else four >= plain.built.memory
     _, evaluating = built(32)
     weights = sum(leaf.size * leaf.dtype.itemsize
                   for leaf in jax.tree.leaves(jax.eval_shape(trainer.objective.init, jax.random.key(0))))
     evaluations = [evaluating.starts[digest].memory for digest in set(evaluating.starts) - set(plain.starts)]
     need = evaluating.built.memory
     assert evaluations and need is not None and need > plain.built.memory
+    # The weights the evaluation reads from the state's device memory: none of a host-kept average's.
+    among = 0 if average == "host" else weights
     with stand_in_gpus(jax.devices("cpu")[:1], need, share=1.0) as stood:
         for memory in evaluations:
             assert memory is not None
-            # Beside the state the run holds, less the weights the evaluation reads from it.
-            beside = memory.output - memory.alias + evaluating.argument_bytes - weights
+            beside = memory.output - memory.alias + evaluating.argument_bytes - among
             spare = admitted(stood, memory.argument, beside, memory.temp)
-            assert spare is not None and spare >= 0, (spare, memory, evaluating.argument_bytes, weights)
+            assert spare is not None and spare >= 0, (spare, memory, evaluating.argument_bytes, among)
