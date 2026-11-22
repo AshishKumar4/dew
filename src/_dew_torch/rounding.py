@@ -98,7 +98,7 @@ ONCE_ATEN = frozenset({"add", "add_", "sub", "sub_", "mul", "mul_", "div", "div_
 ULPS_ATEN = {"exp": "exp", "log": "log", "log1p": "log1p", "expm1": "expm1", "sigmoid": "logistic",
              "tanh": "tanh", "erf": "erf", "rsqrt": "rsqrt"}
 """Each elementary aten operation by the name of its bound in `ULPS`."""
-POWER_ATEN = {0: 0, 1: 0, 2: 1, -1: 1, 3: 2, -2: 2}
+POWER_ATEN: dict[float, int] = {0: 0, 1: 0, 2: 1, -1: 1, 3: 2, -2: 2}
 """The roundings of torch's CPU power at the scalar exponents its kernel computes otherwise than by a library
 power (aten/src/ATen/native/cpu/PowKernel.cpp: `x**0` and `x**1` made and copied, `x * x`, `1 / x`,
 `x * x * x`, `1 / (x * x)`); at any other exponent, and a tensor's, a library power within one ulp (SLEEF's
@@ -124,7 +124,7 @@ def _tapped():
 
     class Tapped(TorchDispatchMode):
         """Every aten operation dispatched in the block decomposed where torch decomposes it, and each
-        floating result it rounds moved by its weight (`_weight`) times `unit` times a random sign, drawn
+        floating result it rounds moved by its rounding's most (`_move`) times a random sign, drawn
         from a stream keyed by `seed` and the operation's place in the run; `unit` 0 moves nothing."""
 
         def __init__(self, unit: float, seed: int):
@@ -151,8 +151,9 @@ def _tapped():
             if isinstance(computed, (tuple, list)):
                 if name == "convolution_backward":
                     weights = _convolution_backward_weights(func, args, kwargs)
-                    return type(computed)(part if part is None else self.tapped(part, weight)
-                                        for part, weight in zip(computed, weights, strict=True))
+                    return type(computed)(part if part is None or weight is None
+                                          else self.tapped(part, self.unit * weight)
+                                          for part, weight in zip(computed, weights, strict=True))
                 # Several results of one operation: no other rule weighs them apart.
                 if any(isinstance(part, torch.Tensor) and part.is_floating_point() for part in computed):
                     raise ValueError(f"the rounding scale has no rule for aten.{name}'s several results: "
@@ -160,24 +161,39 @@ def _tapped():
                 return computed
             if not isinstance(computed, torch.Tensor) or not computed.is_floating_point():
                 return computed
-            moved = self.tapped(computed, _weight(name, func, args, kwargs, computed, self.unit))
+            moved = self.tapped(computed, _move(name, func, args, kwargs, computed, self.unit))
             if name.endswith("_") and moved is not computed:
                 # An in-place operation's value is its first operand: the move written where it lives.
                 args[0].copy_(moved)
                 return args[0]
             return moved
 
-        def tapped(self, computed, weight):
-            """`computed`, an operation's value, moved by `weight` times the unit times a random sign an
-            element, drawn on every run, the untapped one's too, so each operation's stream is its place's
-            alone; an infinity held as it is (a mask's -inf, an overflow), whose tap would be inf - inf."""
+        def tapped(self, computed, move):
+            """`computed`, an operation's value, moved by `move` (`_move`) times a random sign an element,
+            drawn on every run, the untapped one's too, so each operation's stream is its place's alone; an
+            infinity held as it is (a mask's -inf, an overflow), whose tap would be inf - inf."""
             signs = torch.randint(0, 2, computed.shape, generator=self.generator).to(computed.dtype) * 2 - 1
             if self.unit == 0:
                 return computed
-            tap = self.unit * weight * signs.to(computed.device)
+            tap = move * signs.to(computed.device)
             return torch.where(torch.isfinite(computed), computed + tap, computed)
 
     return Tapped
+
+
+def _move(name: str, func, args, kwargs, computed, unit: float):
+    """The most one rounding of aten `func` moves its float64 `computed`: its weight (`_weight`) times `unit`;
+    a power at a scalar exponent its kernel narrows (`_narrowed`), by the library's rounding of the power at
+    the narrowed exponent and that power's distance from the true one, whatever its size or sign (rows
+    11844: a move past the derivative's reach, and `(-1)**257` taken as `(-1)**256`, a sign), added as
+    distances, never divided by `unit`, which overflowed past float64's range where both powers are finite
+    (the review of 3606, F1)."""
+    if name == "pow" and isinstance(args[1], (int, float)) and args[1] not in POWER_ATEN:
+        narrowed = _narrowed(args[1], unit)
+        if narrowed != args[1]:
+            power = args[0].pow(narrowed)
+            return 2 * unit * power.abs() + (power - computed).abs()
+    return unit * _weight(name, func, args, kwargs, computed, unit)
 
 
 def _weight(name: str, func, args, kwargs, computed, unit: float):
@@ -197,15 +213,8 @@ def _weight(name: str, func, args, kwargs, computed, unit: float):
         exponent = args[1]
         if not isinstance(exponent, (int, float)):
             return 2 * magnitude
-        if exponent in POWER_ATEN:
-            return POWER_ATEN[exponent] * magnitude
-        # The scalar exponent narrowed to the operand's format first (PowKernel.cpp), which moves the power by
-        # its move times |log x|, relative, beside the library's rounding.
-        moved = _narrowed(exponent, unit)
-        if not moved:
-            return 2 * magnitude
-        moves = moved * args[0].abs().log().abs() / unit
-        return torch.where(magnitude > 0, (2 + moves) * magnitude, magnitude)
+        # A scalar exponent the kernel narrows is weighed apart (`_move`).
+        return POWER_ATEN.get(exponent, 2) * magnitude
     if name in SUMS_ATEN:
         magnitudes = [arg.abs() if isinstance(arg, torch.Tensor) and arg.is_floating_point() else arg
                       for arg in args]
@@ -217,15 +226,22 @@ def _weight(name: str, func, args, kwargs, computed, unit: float):
 
 
 def _narrowed(exponent: float, unit: float) -> float:
-    """How far a scalar exponent moves rounded to a format of u `unit` (its significand's bits, `-log2(unit)`,
-    to nearest, ties to even): torch's CPU power converts it to its operand's dtype before it computes (the
-    review of 3580, F6: a bfloat16 4 to the 2 + 2^-7 took its exponent as 2, 2.76u off); none where `unit` is
-    none (an untapped run's) or the exponent is held exactly."""
-    if not unit or not math.isfinite(exponent):
-        return 0.0
-    bits = round(-math.log2(unit))
-    fraction, power = math.frexp(exponent)
-    return abs(exponent - math.ldexp(round(math.ldexp(fraction, bits)), power - bits))
+    """A scalar exponent as torch 2.14's CPU power takes it for an operand of u `unit` (PowKernel.cpp), by
+    the format's significand's bits (`-log2(u)`): a float32 operand's vectorized loop converts it to float32
+    (its scalar loop keeps the double, which the narrowed power's bound covers too), a float16's or
+    bfloat16's `Scalar::to` the double to float32 and that to the format, a float64's none. Each conversion
+    torch's own: to nearest, ties to even, so a bfloat16's rounds twice, past the format's least subnormal a
+    zero and past its largest an infinity (row 11845: `2^-134` a bfloat16 zero, the power then `x**0`, and
+    float32's largest double an infinity); itself where `unit` is none (an untapped run's). The review of
+    3580, F6: a bfloat16 4 to the 2 + 2^-7 took its exponent as 2."""
+    import torch
+
+    conversions = {24: (torch.float32,), 11: (torch.float32, torch.float16),
+                   8: (torch.float32, torch.bfloat16)}
+    held = torch.tensor(exponent, dtype=torch.float64)
+    for format in conversions.get(round(-math.log2(unit)), ()) if unit else ():
+        held = held.to(format)
+    return float(held)
 
 
 def _convolution_backward_weights(func, args, kwargs):

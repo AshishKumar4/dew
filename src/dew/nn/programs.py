@@ -137,12 +137,13 @@ class RaggedLayout(enum.Enum):
 
 class DotArithmetic(NamedTuple):
     """What a dot algorithm states of its arithmetic, as JAX lowers it (`dot_arithmetic`): each operand's
-    precision in bits and its significand's digits (the implicit one counted), whether those are TF32's,
-    its accumulation's bits, the primitive products it sums (an X3's three) and whether its accumulation
-    may be imprecise."""
+    precision in bits, its significand's digits (the implicit one counted) and its largest finite value,
+    whether those are TF32's, its accumulation's bits, the primitive products it sums (an X3's three) and
+    whether its accumulation may be imprecise."""
 
     operand_bits: tuple[int, int]
     significands: tuple[int, int]
+    largest: tuple[float, float]
     tf32: bool
     accumulation_bits: int
     operations: int
@@ -188,8 +189,9 @@ def algorithm_arithmetic(algorithm) -> DotArithmetic:
     sides = (algorithm.lhs_precision_type, algorithm.rhs_precision_type)
     # Each a float type of the bindings (`ir.FloatType`'s cast holds it to one), whose width is its bits.
     left, right = (ir.FloatType(side).width for side in sides)
-    return DotArithmetic(operand_bits=(left, right),
-                         significands=(_significand(sides[0]), _significand(sides[1])),
+    (left_digits, left_largest), (right_digits, right_largest) = map(_format, sides)
+    return DotArithmetic(operand_bits=(left, right), significands=(left_digits, right_digits),
+                         largest=(left_largest, right_largest),
                          tf32=all(isinstance(side, ir.FloatTF32Type) for side in sides),
                          accumulation_bits=ir.FloatType(algorithm.accumulation_type).width,
                          operations=algorithm.num_primitive_operations,
@@ -215,7 +217,8 @@ def dot_arithmetic(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype) -> Do
     if isinstance(named, jax.lax.DotAlgorithm):
         sides = (named.lhs_precision_type, named.rhs_precision_type)
         return DotArithmetic(operand_bits=(_bits(sides[0]), _bits(sides[1])),
-                             significands=(_digits(sides[0]), _digits(sides[1])), tf32=False,
+                             significands=(_digits(sides[0]), _digits(sides[1])),
+                             largest=(_largest(sides[0]), _largest(sides[1])), tf32=False,
                              accumulation_bits=_bits(named.accumulation_type),
                              operations=named.num_primitive_operations,
                              imprecise=named.allow_imprecise_accumulation)
@@ -283,22 +286,28 @@ def _digits(dtype) -> int:
     return jnp.finfo(dtype).nmant + 1
 
 
-def _significand(side) -> int:
-    """The significand digits of a lowered dot algorithm's precision type `side`, its implicit one counted:
-    TF32's ten stored and its one, the one such type no dtype lowers to; any other's by the float dtype JAX
-    lowers to it (`mlir.dtype_to_ir_type`), no list of types' digits beside the dtypes' own. JAX's float
-    dtypes are read from its internal `jax._src.dtypes._float_types`, which a bump of JAX's pin checks."""
+def _largest(dtype) -> float:
+    """A float dtype's largest finite value."""
+    return float(jnp.finfo(dtype).max)
+
+
+def _format(side) -> tuple[int, float]:
+    """The significand digits (its implicit one counted) and the largest finite value of a lowered dot
+    algorithm's precision type `side`: TF32's ten stored digits and its one over float32's exponents, the
+    one such type no dtype lowers to; any other's by the float dtype JAX lowers to it
+    (`mlir.dtype_to_ir_type`), no list of types' formats beside the dtypes' own. JAX's float dtypes are read
+    from its internal `jax._src.dtypes._float_types`, which a bump of JAX's pin checks."""
     from jax.extend.mlir import ir
     from jax.interpreters import mlir
 
     if isinstance(side, ir.FloatTF32Type):
-        return 11
+        return 11, float(np.ldexp(2 - 2.0 ** -10, jnp.finfo(jnp.float32).maxexp - 1))
     # In the type's own context: a compile's checks read a program's dots outside any of theirs
     # (`report.triton_wrong`, a GPU target's compile).
     with side.context:
         for dtype in map(np.dtype, dtypes._float_types):
             if mlir.dtype_to_ir_type(dtype) == side:
-                return _digits(dtype)
+                return _digits(dtype), _largest(dtype)
     raise ValueError(f"no float dtype lowers to the dot algorithm's precision type {side}")
 
 

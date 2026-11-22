@@ -15,7 +15,6 @@ wrong length), and each of its leaves is finite wherever the same order's float6
 public call."""
 
 
-import concurrent.futures
 import contextlib
 import dataclasses
 import functools
@@ -374,8 +373,13 @@ class _Run:
             return self.program.lower(*self.arguments)
 
     def __call__(self):
+        return self.at(*self.arguments)
+
+    def at(self, *arguments):
+        """Its program's leaves at `arguments` (a seeded draw's, `_on_a_mesh`), run in its context, a failure
+        named by its site and order."""
         with self.context():
-            return ran(lambda: self.program(*self.arguments), self.site, self.name)
+            return ran(lambda: self.program(*arguments), self.site, self.name)
 
 
 def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
@@ -397,12 +401,11 @@ def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
     for name, run in meshed.items():
         site = run.site
 
-        # A draw's run a placement and the program run there, which the gate runs as given (`as_given`).
+        # A draw's run a placement and the order's run there (`_Run`), which the gate runs as given
+        # (`as_given`).
         @as_given
-        def on(primals, direction, cotangent, program=run.program, name=name, site=site):
-            with jax.set_mesh(mesh):
-                placed = _placed(mesh, (primals, direction, cotangent))
-                return ran(lambda: program(*placed), site, name)
+        def on(primals, direction, cotangent, run=run):
+            return run.at(*_placed(mesh, (primals, direction, cotangent)))
 
         # At the cell's own inputs, the contract itself (`held`), on the mesh as off it.
         held(jax.tree.leaves(run()), name, site)
@@ -449,21 +452,15 @@ def _on_float64():
 
 def _compiled_ahead(runs: list[_Run]) -> None:
     """Each program a case runs (`runs`, `_Run`) lowered in turn in its context and compiled side by side
-    within this process's compile budget (`report.compile_threads`, each compile in one of its slots,
-    `report.compile_slots`), by JAX's own compile of the lowering, which its run's lowering finds: a convex
-    mean's narrow, float64 and mesh programs of one order, 141,776 operations each, compiled one after
-    another took its cell 140 s cold (row 11720)."""
+    by Dew's compile of several (`report.attempts`), which its run's lowering finds: a convex mean's
+    narrow, float64 and mesh programs of one order, 141,776 operations each, compiled one after another took
+    its cell 140 s cold (row 11720). A compile's error is raised named by its site and order (`running`)."""
     from dew.nn.kernels.templates import report
 
-    lowered = [(run, run.lowered()) for run in runs]
-
-    def compiled(each) -> None:
-        run, program = each
-        with report.compile_slots().held(background=False), running(run.site, run.name):
-            program.compile()
-
-    with concurrent.futures.ThreadPoolExecutor(min(len(lowered), report.compile_threads())) as pool:
-        list(pool.map(compiled, lowered))
+    for run, attempt in zip(runs, report.attempts([(run.lowered(), None) for run in runs]), strict=True):
+        if attempt.error is not None:
+            with running(run.site, run.name):
+                raise attempt.error
 
 
 @functools.lru_cache(maxsize=256)

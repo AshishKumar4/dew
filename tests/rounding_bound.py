@@ -44,7 +44,7 @@ from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
-from dew.nn.precision import _paired_and_plain, compensated_add, correctly_rounded_divide_p, renormalized_add
+from dew.nn.precision import COMPENSATED_COMBINES, correctly_rounded_divide_p
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
              primitives.reduce_scatter_p: "axis_name"}
@@ -73,15 +73,6 @@ SCATTERS = {jax.lax.scatter_p: jax.lax.scatter, jax.lax.scatter_add_p: jax.lax.s
             jax.lax.scatter_max_p: jax.lax.scatter_max}
 """The scatters by primitive, each of whose equations holds its combining computation in its operands' dtype,
 which a float64 evaluation of a float32 program builds again (`TapRule.primitive`)."""
-
-def compensating() -> dict:
-    """The combining computations of Dew's compensated sums by object, as a reduction equation holds the one
-    it was given (its `computation`), each with its results' parts: a double-float pair's (`compensated_add`,
-    and `renormalized_add`, the pair reduction's alone, `summed_pairs`'), and a one-pass sum's, its pair and
-    the plain sum carried beside it (`_paired_and_plain`, `summed_total`'s, `compensated_sum`'s)."""
-    return {compensated_add: ("pair", "pair"), renormalized_add: ("pair", "pair"),
-            _paired_and_plain: ("pair", "pair", "plain")}
-
 
 SCALES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 """Each function's compiled rounding scale (`rounding_scale`) of a static program, by its trace's key
@@ -335,7 +326,7 @@ def _weight(equation, params, operands, value, index: int = 0):
         # expression among them), its products, `x * x * x` the most, two roundings: the larger whatever the
         # exponent, which the replay reads tapped, a folded constant moved off it (the review of 3580, F2).
         return max(POWER, 2) * magnitude
-    if primitive is jax.lax.reduce_p and params["computation"] in compensating():
+    if primitive is jax.lax.reduce_p and params["computation"] in COMPENSATED_COMBINES:
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
         # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
         # the pair's halves by it, as the high half's rounding moves the low half by as much. A plain sum
@@ -343,7 +334,7 @@ def _weight(equation, params, operands, value, index: int = 0):
         # terms does, in whatever order the reduction adds them.
         terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
         summed = operands[:len(equation.outvars)]
-        if compensating()[params["computation"]][index] == "plain":
+        if COMPENSATED_COMBINES[params["computation"]][index] == "plain":
             return max(terms - 1, 1) * jnp.sum(jnp.abs(summed[index]), params["dimensions"])
         u = _unit(primitive, params, equation.outvars[0].aval.dtype)
         gamma = (terms - 1) * u / (1 - (terms - 1) * u)

@@ -208,6 +208,21 @@ def test_an_algorithm_at_least_another_is_as_exact_as_it():
                             seeds=8, truth_fn=_product(jax.lax.DotAlgorithmPreset.F64_F64_F64))
 
 
+def test_an_algorithm_at_least_ieee_fp32_holds_fp32s_range():
+    """A gate at least IEEE fp32's products (fla's `ieee` dots) refuses the bf16 splits whose digits match
+    them, BF16x6 and x9 (row 11878): a split's high part is an operand rounded to bfloat16, whose largest is
+    beneath float32's, so an fp32 operand near float32's largest splits to an infinity where IEEE fp32's
+    product is finite; IEEE fp32 itself is admitted, and a gate at least BF16x3 admits the wider splits, its
+    own parts of bfloat16's range."""
+    presets = jax.lax.DotAlgorithmPreset
+    ieee = at_least(presets.F32_F32_F32, jnp.float32)
+    assert ieee(presets.F32_F32_F32)
+    assert not ieee(presets.BF16_BF16_F32_X6)
+    assert not ieee(presets.BF16_BF16_F32_X9)
+    split = at_least(presets.BF16_BF16_F32_X3, jnp.float32)
+    assert split(presets.BF16_BF16_F32_X6) and split(presets.BF16_BF16_F32_X9)
+
+
 def test_a_program_naming_a_dot_algorithm_compiles_for_a_gpu():
     """A program whose product names a dot algorithm compiles through Dew's compile point for a GPU on this
     CPU, as a prepare compiles it (`generation.assumed`, a compile-only device): the compile's own checks
