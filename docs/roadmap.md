@@ -62,7 +62,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 617]
-- XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]

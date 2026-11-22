@@ -9,13 +9,15 @@ differ in error, which depends on every operand form a candidate reads."""
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 
 import jax
 from egglog import DagCostModel, Vec
 
 from dew.algebra import cost, extract, forms, printed, program, rules, terms
 from dew.nn import programs
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import product
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,36 +152,54 @@ def at_least(asked: jax.lax.DotAlgorithmPreset, dtype) -> Callable[[jax.lax.DotA
 
 def product_precision(rows: int, depth: int, columns: int, dtype, *,
                       admits: Callable[[jax.lax.DotAlgorithmPreset], bool],
-                      stated: Iterable[jax.lax.DotAlgorithmPreset] | None = None,
+                      stated: Iterable[jax.lax.DotAlgorithmPreset]
+                      | Mapping[jax.lax.DotAlgorithmPreset, jax.lax.PrecisionLike] | None = None,
                       ) -> jax.lax.DotAlgorithmPreset:
     """The dot algorithm a `[rows, depth] @ [depth, columns]` product of `dtype` operands runs in for the
     accuracy its site asks: of the algorithms JAX runs operands of that dtype in as they are stored
-    (`dew.nn.programs.dot_algorithms`, JAX's own conversion; no list of them here), those its backend runs
-    as named (`stated`, every one where not given: one converting its operands is none of them, an fp16
-    product of fp32 operands its digits of TF32's and its range fp16's), the cheapest on the process's
-    target (`cost.product_work` under XLA's schedule: a preset's mode and passes as JAX lowers it, one with
-    work at a rate the target states none of after every one without, row 10845) that `admits` holds: the
+    (`dew.nn.programs.dot_algorithms`, JAX's own conversion; no list of them here), first those its lowering
+    runs as named (`_lowered`: `stated`, its own table, Pallas's Triton lowering's, or a mapping of each to
+    the precision it runs it as, Mosaic TPU's; XLA's where not given: every one, on a TPU target XLA:TPU's
+    alone, `product.TPU_ALGORITHMS`), an algorithm it refuses never taken (row 11738); then the cheapest of
+    those on the process's target (`cost.product_work` under XLA's schedule, each at the precision its
+    lowering runs it as, one whose work no rate prices after every priced one, row 10845) that `admits` holds:
+    the
     site's gate run on its own family at that algorithm (as exact as the accuracy asked, from the float64
     truth), or `at_least` the algorithm its upstream runs. So a site states an accuracy and takes whatever
     product meets it at the best rate: three TF32 passes where one is not enough and IEEE fp32 costs more,
     one where it is (row 5473; docs/design/algebra.md §1.5). None admitted is refused: the site asked more
     than any stated algorithm gives, and no cheaper one is taken in its place."""
     operand = jax.numpy.dtype(dtype)
-    found = programs.dot_algorithms(operand)
-    stated = found if stated is None else tuple(preset for preset in found if preset in set(stated))
-    schedule = cost.fused(cost.target())
+    target = cost.target()
+    runs_as = _lowered(programs.dot_algorithms(operand), stated, target)
+    schedule = cost.fused(target)
 
     def seconds(preset: jax.lax.DotAlgorithmPreset) -> tuple[float, ...]:
-        # Work at no rate first (an algorithm the target does not run, `product.TPU_ALGORITHMS`), as
-        # `cost.cheaper` weighs it: no seconds price it, so none makes its algorithm cheaper.
-        work = cost.product_work(rows, depth, columns, dtype=operand, precision=preset)
+        # Work no rate prices last, as `cost.cheaper` weighs it: no seconds price it, so none makes its
+        # algorithm cheaper.
+        work = cost.product_work(rows, depth, columns, dtype=operand, precision=runs_as[preset])
         return sum(schedule.unpriced(work)), *cost.Seconds(work, schedule).key
 
-    for preset in sorted(stated, key=seconds):
+    for preset in sorted(runs_as, key=seconds):
         if admits(preset):
             return preset
-    raise ValueError(f"no dot algorithm JAX states for {operand} operands meets the accuracy asked "
-                     f"(of {[preset.name for preset in stated]})")
+    raise ValueError(f"no dot algorithm JAX states for {operand} operands that its lowering runs meets the "
+                     f"accuracy asked (of {[preset.name for preset in runs_as]})")
+
+
+def _lowered(found: Sequence[jax.lax.DotAlgorithmPreset],
+             stated: Iterable[jax.lax.DotAlgorithmPreset]
+             | Mapping[jax.lax.DotAlgorithmPreset, jax.lax.PrecisionLike] | None,
+             target) -> dict[jax.lax.DotAlgorithmPreset, jax.lax.PrecisionLike]:
+    """Each of `found` a product's lowering runs as named, by what it runs it as, which prices it: `stated`'s
+    table (an algorithm, run as named) or mapping (each to the precision it runs it as: Mosaic TPU's, which
+    takes no algorithm itself); else XLA's own, every algorithm, but on a TPU target XLA:TPU's alone
+    (`product.TPU_ALGORITHMS`), which refuses every other at its compile."""
+    if stated is None:
+        runs = product.TPU_ALGORITHMS if generation.tpu(target) else found
+        return {preset: preset for preset in found if preset in runs}
+    named = stated if isinstance(stated, Mapping) else {preset: preset for preset in stated}
+    return {preset: named[preset] for preset in found if preset in named}
 
 
 def _priced(region: terms.Region, chosen: list[terms.Term], model: DagCostModel[cost.Seconds]) -> float:

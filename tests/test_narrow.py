@@ -15,7 +15,7 @@ from placement_parity import layouts_agree, x64
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import chosen
 from dew.optim import OptimConfig
-from dew.training.narrow import narrowed, narrowed_paths
+from dew.training.narrow import narrowed, narrowed_paths, program_reads
 
 
 def test_only_a_weight_read_once_through_its_cast_is_copied():
@@ -923,3 +923,40 @@ def test_a_steps_buffers_built_before_it_runs_are_judged_where_they_land(monkeyp
         first = refused.probes[0].record()
     assert first["fits"] is False, first
 
+
+def test_a_steps_reads_of_its_parameters_pass_over_another_collections_attribute_leaves():
+    """A state whose variables hold, beside `params`, collections of structured leaves sorted before and
+    after it (a packed checkpoint's `quantization`, an NvFp4 weight's attributes) has its step's reads of
+    `params` read, each leaf bound to its own input: its one cast planned, its copy built from the plan and
+    held as planned (`narrowed`, `held_copies`); the other collections' leaves are named nowhere, and a
+    parameter reached through an attribute is planned no copy, which no copy's overlay reaches (row 11730:
+    the attribute paths raised before a default GPU fit's first step)."""
+    from typing import NamedTuple
+
+    from dew.training.narrow import held_copies
+
+    class Packed(NamedTuple):
+        """Leaves reached through attributes, as a packed weight's are."""
+        values: jax.Array
+        scale: jax.Array
+
+    def packed():
+        return Packed(jnp.ones((4, 2), jnp.uint8), jnp.ones((4,), jnp.float32))
+
+    variables = {"packing": {"head": packed()},
+                 "params": {"w": jnp.ones((4, 4), jnp.float32), "b": jnp.ones((4,), jnp.float32),
+                            "attribute": packed()},
+                 "quantization": {"head": packed()}}
+
+    def loss(variables, x):
+        params = variables["params"]
+        others = variables["packing"]["head"].scale + variables["quantization"]["head"].scale
+        return jnp.sum(x @ params["w"].astype(jnp.bfloat16)) + jnp.sum(params["attribute"].scale + others)
+
+    reads = program_reads(jax.make_jaxpr(loss)(variables, jnp.ones((2, 4), jnp.bfloat16)), variables,
+                          ("params",))
+    assert reads.casts == {("w",): jnp.dtype(jnp.bfloat16)} and reads.read == {("w",)}, reads
+    copies = narrowed(variables, reads.casts)
+    assert held_copies(copies) == reads.casts
+    np.testing.assert_array_equal(np.asarray(copies["params"]["w"]),
+                                  np.asarray(variables["params"]["w"].astype(jnp.bfloat16)))

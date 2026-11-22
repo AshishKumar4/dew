@@ -1810,10 +1810,17 @@ def compensated_add(left, right):
 def renormalized_add(left, right):
     """`compensated_add`'s arithmetic over pairs whose his no multiply makes in the same fusion (each read as
     one value, `uncontracted`, or a compensated reduction's or scan's accumulator, made by additions alone):
-    the his' TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own:
-    one in a reduction's computation splits the fusions around the program, row 7953). A lo is read once,
-    so a multiply contracted into its addition reads it once too. The combine of a compensated reduction
-    (`summed_pairs`) and a compensated scan (`dew.algebra.scan.compensated`)."""
+    `renormalized_sum`, as one span the algebra pass keeps (`_protected`). The combine of a compensated
+    reduction (`summed_pairs`) and a compensated scan (`dew.algebra.scan.compensated`)."""
+    return renormalized_sum(left, right)
+
+
+def renormalized_sum(left, right):
+    """Two `(hi, lo)` pairs' renormalized sum, over any values `+` and `-` add and subtract (arrays, or a
+    Mosaic GPU kernel's own arithmetic, `templates.scan.compensated_columns`'): the his' TwoSum, then the
+    pair's own over the dropped part and the los in that order, whose operands are additions' (`_two_sum`, no
+    barrier of its own: one in a reduction's computation splits the fusions around the program, row 7953). A
+    lo is read once, so a multiply contracted into its addition reads it once too."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     total, dropped = _two_sum(left_hi, right_hi)
     return _two_sum(total, dropped + left_lo + right_lo)

@@ -217,8 +217,9 @@ def _ssd_parts(shape: Shape, given: dict) -> tuple:
     state = jnp.zeros((shape.batch, shape.value_heads, shape.value_width, shape.key_width))
 
     def template(x, dt, A, B, C, D):
+        # The output in x's dtype, as the Mamba-2 layer (`mamba2._ssd`) and mamba_ssm's kernels return it.
         out, final = chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D), chunk_size=shape.chunk,
-                           dtype=jnp.float32)
+                           dtype=x.dtype)
         return out, jnp.swapaxes(final, -1, -2)
 
     def hand(x, dt, A, B, C, D):
@@ -227,7 +228,7 @@ def _ssd_parts(shape: Shape, given: dict) -> tuple:
     # What the kernels take, whatever this GPU's row prefers.
     case = scan_case(x, B, shape.chunk)
     refusals = {'hand': '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))}
-    return inputs, template, {'hand': hand}, refusals, (given['dy'], given['dfinal'])
+    return inputs, template, {'hand': hand}, refusals, (given['dy'].astype(jnp.bfloat16), given['dfinal'])
 
 
 def _loglinear_parts(shape: Shape, given: dict) -> tuple:
