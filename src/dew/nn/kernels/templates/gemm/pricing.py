@@ -157,13 +157,16 @@ def split_count(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: in
     walk = split_walk(tiles, groups=groups, rows=rows, depth=depth, width=width, itemsizes=itemsizes,
                       stored=stored, multiprocessors=multiprocessors, step_seconds=step_seconds,
                       bandwidth=bandwidth, launch_seconds=launch_seconds, partial_rows=partial_rows)
+    return best_splits(walk, tiles.stages)
+
+
+def best_splits(walk: "SplitWalk | None", stages: int) -> int:
+    """The split count `walk` prices least among whole-step shares keeping at least `stages + 1` steps."""
     if walk is None:
         return 1
     steps = walk.steps
-    # Its runs share the steps whole: as many runs as a share's ceil(steps / s) steps cover.
-    counts = sorted({-(-steps // -(-steps // count)) for count in range(1, steps // (tiles.stages + 1) + 1)})
+    counts = sorted({-(-steps // -(-steps // count)) for count in range(1, steps // (stages + 1) + 1)})
     return min([1, *counts], key=walk.seconds)
-
 
 @dataclasses.dataclass(frozen=True)
 class SplitWalk:

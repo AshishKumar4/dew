@@ -322,10 +322,10 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         # whole accumulator's where its registers hold it, tensor memory's chunk on tcgen05).
         accumulator = -(-config.share * family.chunk_columns(columns) // resources.THREADS)
         # Epilogue hooks and output staging run sequentially sharing freed mainloop `scalar_registers`;
-        # distinct outputs in the hook tuple stay live beside output staging until `_finished` writes them.
+        # while output `i` stages, remaining outputs `i+1..` stay live beside staging (peak at `i = 0`).
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes) * accumulator
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
-                   for dtype in (hooks.out_dtypes or ())[:-1])
+                   for dtype in (hooks.out_dtypes or ())[1:])
         hook = resources.CONTROL_REGISTERS + vectors + tiles
         return max(0, max(staging, hook) - family.scalar_registers()) + held
 
@@ -1598,7 +1598,7 @@ class MosaicTgmm(_Mosaic):
         if sliced is None:
             return tile, None
         walk = self._walk(ba, sliced, target)
-        if (splits := self._splits(ba, sliced, target)) == 1:
+        if (splits := pricing.best_splits(walk, sliced.stages)) == 1:
             return tile, walk
         split = dataclasses.replace(sliced, splits=splits)
         return (tile if self._refused(ba, split, target) else split), walk
