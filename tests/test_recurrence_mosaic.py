@@ -851,7 +851,7 @@ writes, and the state's first key pairs turned each token (`Hooks.turns`), two p
 
 
 @pytest.mark.parametrize('packed', [
-    pytest.param(False, id='one sequence', marks=pytest.mark.check1_shards(seeds=32, per_task=16)),
+    pytest.param(False, id='one_sequence', marks=pytest.mark.check1_shards(seeds=32, per_task=16)),
     pytest.param(True, id='packed', marks=pytest.mark.check1_shards(seeds=32, per_task=8))])
 def test_a_turned_call_on_the_template_is_on_par_with_the_portable_math_interpreted(packed):
     """A state that turns its key pairs (`TURNED`) through the chunked op on the template, its queries and
