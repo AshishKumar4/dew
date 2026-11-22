@@ -1794,8 +1794,12 @@ class LMObjective(TokenScorer):
         if correct is not None:
             reported["token_accuracy"] = self.accuracy(correct, batch, weights)
         if passes is not None and self.exit_entropy is None:
-            # Each pass's cross entropy at its weight in the last pass's place, over the same counted targets.
-            term = weighed(self._weights_over(self.model), passes[0])
+            # Each pass's cross entropy at its weight in the last pass's place, over the same counted targets:
+            # where a count given per call ran some of the passes, over those alone (`PassWeights.ran`).
+            ran = passes[3]
+            counted = not all(isinstance(each, bool) for each in ran)
+            stated = self.pass_weights.ran(ran) if counted else self._weights_over(self.model)
+            term = weighed(stated, passes[0])
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
         elif passes is not None and self.exit_entropy is not None:
@@ -1880,13 +1884,18 @@ class LMObjective(TokenScorer):
         scored = TokenScores(scores.losses, scores.weights, scores.correct)
         if self.pass_weights is None or scores.exits is None:
             return scored
-        terms, _, right, _ = scores.exits
+        terms, _, right, ran = scores.exits
         assert right is not None, "a scoring predicts every pass"
-        mass = jax.lax.stop_gradient(self.row_mean(scores.weights, batch).total) if losses else None
-        return scored, PassReports(tuple(
-            (None if mass is None else Ratio(self.row_mean(term, batch, weights=scores.weights).total, mass),
-             TokenScores(term, scores.weights, correct))
-            for term, correct in zip(terms, right, strict=True)))
+        # A pass a count given per call left unrun weighs none of its report (`ExitPasses.ran`).
+        ran = (*ran, True) if ran else (True,) * len(terms)
+        reported = []
+        for term, correct, each in zip(terms, right, ran, strict=True):
+            weights = scores.weights if isinstance(each, bool) else scores.weights * each.astype(
+                scores.weights.dtype)
+            mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total) if losses else None
+            loss = None if mass is None else Ratio(self.row_mean(term, batch, weights=weights).total, mass)
+            reported.append((loss, TokenScores(term, weights, correct)))
+        return scored, PassReports(tuple(reported))
 
     def _validation_scores(self, params, batch, step: Step) -> tuple[
             Ratio | RoutedStatistics, TokenScores | tuple[TokenScores, PassReports]]:

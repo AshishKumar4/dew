@@ -111,12 +111,12 @@ NEVER_EXITS = -1e4
 pass's log survival, so its loss and entropy terms weigh nothing and stay finite."""
 
 
-def never_exiting(logits: Sequence[jax.Array], ran: Sequence[jax.Array]) -> tuple[jax.Array, ...]:
+def never_exiting(logits: Sequence[jax.Array], ran: Sequence[jax.Array | bool]) -> tuple[jax.Array, ...]:
     """Every pass's exit-gate `logits` (`Looped.exit_passes`), each earlier pass's at `NEVER_EXITS` where it
     did not run (`ran`, a count of passes given per call, `run_loop`'s `passes`): its share the last
     pass's, the pass the count stops at. A gate's last logit, the stack's own output's, is that pass's,
     which always runs."""
-    if not ran or not logits:
+    if not logits or all(each is True for each in ran):
         return tuple(logits)
     if len(logits) - len(ran) not in (0, 1):
         raise ValueError(f"{len(logits)} exit-gate logits for {len(ran)} passes' exits")
@@ -638,11 +638,13 @@ def _zero_like(shape: jax.ShapeDtypeStruct) -> jax.Array:
     """A zero typed as the pass's own entry `shape` is, which a zero of its shape alone would differ from:
     varying over the manual axes it varies over (a batch-split forward's statistic under `shard_map`, its
     rows' maxima), placed as it is on a mesh whose types carry the split."""
+    placed = shape.sharding if isinstance(shape.sharding, NamedSharding) else None
+    zero = jnp.zeros(shape.shape, shape.dtype, out_sharding=placed)
     manual = shape.manual_axis_type
     if manual is not None and manual.varying:
-        return jax.lax.pcast(jnp.zeros(shape.shape, shape.dtype), tuple(sorted(manual.varying)), to="varying")
-    placed = shape.sharding if isinstance(shape.sharding, NamedSharding) else None
-    return jnp.zeros(shape.shape, shape.dtype, out_sharding=placed)
+        # Both at once on a mesh of manual and explicit axes (a `shard_map` over one of its axes).
+        return jax.lax.pcast(zero, tuple(sorted(manual.varying)), to="varying")
+    return zero
 
 
 def _handed_on(model, exited, last, threshold: float) -> jax.Array:

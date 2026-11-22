@@ -788,14 +788,15 @@ COUNTED = {
 each pass exits through, the cut a count's last passes leave."""
 
 
-def _scored(model):
+def _scored(model, *, counted: bool):
     """`model`'s train-mode logits, each earlier pass's exit (its state and its exit-gate logit, over
     `COUNTED_CAP` less one passes: a skipped pass's and those past a smaller loop's zero, `ExitPasses.ran`),
     the last pass's gate logit, and the gradient of the logits along `cotangent` beside the exits' states'
-    mean squares and gate logits' means: a call of a draw's arguments and its count of passes
-    (`loop_passes`), which a loop of a fixed count reads none of."""
+    mean squares and gate logits' means: a call of a draw's arguments and its count of passes, which the
+    model runs where `counted` (`loop_passes`) and a loop of a fixed count, the oracle, reads none of, at the
+    cap too (the review of loop-scan: the cap's oracle took the counted path)."""
     def run(tree, ids, cotangent, count):
-        given = {"loop_passes": count} if model.loop.steps == COUNTED_CAP else {}
+        given = {"loop_passes": count} if counted else {}
 
         def loss(params):
             logits, sown = model.apply({**tree, "params": params}, ids, train=True, mutable=["exits"],
@@ -828,7 +829,7 @@ def _capped(name: str):
     """The loop of `COUNTED_CAP` passes over `COUNTED[name]` and the one function the gate compiles for
     it, every count an argument of its one executable (`_scored`)."""
     capped = tiny(num_layers=4, loop=Loop(COUNTED_CAP, **COUNTED[name]), dtype="float32")
-    return capped, _scored(capped)
+    return capped, _scored(capped, counted=True)
 
 
 @pytest.mark.parametrize("count", [1, 2, COUNTED_CAP])
@@ -850,9 +851,9 @@ def test_a_count_of_passes_given_per_call_runs_as_a_loop_of_that_many(name, coun
     def draw(seed):
         return (*plain(seed), jnp.int32(count))
 
-    assert_as_exact(counted, _scored(fixed), draw,
+    assert_as_exact(counted, _scored(fixed, counted=False), draw,
                     f"{count} of {COUNTED_CAP} passes given per call over {name}", seeds=COUNTED_SEEDS,
-                    truth_fn=_scored(fixed.clone(dtype=jnp.float64)))
+                    truth_fn=_scored(fixed.clone(dtype=jnp.float64), counted=False))
     if loop.exiting:
         _, sown = jax.jit(lambda tree, ids: capped.apply(tree, ids, mutable=["exits"],
                                                          loop_passes=jnp.int32(count)))(*plain(0)[:2])
@@ -1017,3 +1018,50 @@ def test_a_count_of_passes_given_per_call_sows_its_statistics_typed_as_its_rows_
     assert len(held) == 3 and not bool(jnp.any(held[2]))
     assert all(bool(jnp.any(each != 0)) for each in held[:2])
 
+
+@pytest.mark.mesh(devices=4)
+def test_a_count_of_passes_given_per_call_sows_its_statistics_typed_under_a_manual_axis_of_an_explicit_mesh(
+        rng):
+    """A looped stack given a count of its passes per call inside a `shard_map` over one axis of a mesh
+    whose other axis is Explicit, its rows split over both: a skipped pass's attention statistics are zeros
+    varying over the manual axis and placed on the explicit one as a pass's own are, so the pass and the skip
+    agree in type (the review of loop-scan: the zero varied, its placement dropped), the ran passes' maxima
+    as they ran."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2, 2), ("data", "rows"), axis_types=(AxisType.Explicit, AxisType.Explicit),
+                         devices=jax.devices()[:4])
+    looped = tiny(num_layers=4, qk_norm=False, loop=Loop(3, step_norm=False, layers=(1, 3)))
+    ids = tokens(rng, rows=8)
+    variables = nn.unbox(looped.init(rng, ids))
+
+    def maxima(tree, ids, count):
+        sown = looped.apply(tree, ids, mutable=[QK], loop_passes=count)[1][QK]
+        return tuple(sown['layers_1']['self_attn']['max_logits'])
+
+    with jax.set_mesh(mesh):
+        replicated = NamedSharding(mesh, PartitionSpec())
+        tree = jax.tree.map(lambda leaf: jax.device_put(leaf, replicated), variables)
+        placed = jax.device_put(ids, NamedSharding(mesh, PartitionSpec(("data", "rows"))))
+        rows, whole = PartitionSpec("data"), PartitionSpec()
+        held = jax.jit(jax.shard_map(maxima, in_specs=(whole, rows, whole), out_specs=rows,
+                                     axis_names={"data"}))(tree, placed, jnp.int32(2))
+    assert len(held) == 3 and not bool(jnp.any(held[2]))
+    assert all(bool(jnp.any(each != 0)) for each in held[:2])
+
+
+def test_a_count_of_passes_given_per_call_weighs_the_passes_that_ran():
+    """Passes weighed alike (`pass_weights="mean"`) where a count given per call ran two of a loop's four
+    weigh the two that ran, a half each, as a loop of two passes weighs its own (`PassWeights.over(2)`): the
+    weighed loss of the four passes' terms is the two-pass loop's of its two, a skipped pass's term, however
+    large, weighing none (the review of loop-scan: four losses averaged, the two skipped among them); stated
+    shares, one count's, are refused."""
+    from dew.objectives.passes import PassWeights, weighed
+
+    weights = PassWeights.of("mean")
+    ran = tuple(jnp.asarray([True, False, False]))
+    terms = (jnp.float32(2.0), jnp.float32(1e6), jnp.float32(-1e6), jnp.float32(4.0))
+    two = weighed(weights.over(2), (terms[0], terms[-1]))
+    assert float(jax.jit(lambda ran: weighed(weights.ran(ran), terms))(ran)) == float(two)
+    with pytest.raises(ValueError):
+        PassWeights.of((0.25, 0.25, 0.25, 0.25)).ran(ran)

@@ -776,14 +776,15 @@ threshold's choice made by none, and so finds nothing here."""
 class ExitPasses(NamedTuple):
     """What a looped decoder's forward gathered of its exits (`Looped.exit_passes`): the states the head
     reads of each pass before the last, every pass's exit-gate logit (none without a gate), and whether
-    each exit's pass ran (`ran`, a bool scalar each, beside the states): every one where the forward ran
-    all its loop's passes, False for one a count of passes given per call skipped
+    each exit's pass ran (`ran`, one each, beside the states): `True` each where the forward ran all its
+    loop's passes, known as it traces; a traced bool scalar each where a count of passes given per call
+    may have skipped some
     (`dew.nn.backbones.looping.run_loop`'s `passes`), whose exit is a zero state's, which a reader of the
     exits leaves out."""
 
     states: tuple[jax.Array, ...]
     logits: tuple[jax.Array, ...]
-    ran: tuple[jax.Array, ...]
+    ran: tuple[jax.Array | bool, ...]
 
 
 @runtime_checkable
