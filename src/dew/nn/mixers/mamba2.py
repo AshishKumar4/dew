@@ -117,11 +117,12 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     return out, jnp.swapaxes(final, -1, -2)
 
 
-def _chunked(x, dt, A, B, C, D, held=None, chunk_size: int = CHUNK_SIZE, starts=None, forked=None):
+def _chunked(x, dt, A, B, C, D, held=None, chunk_size: int = CHUNK_SIZE, starts=None, forked=None,
+             dtype=None):
     """`chunk_ssd` with its state `[B, H, N, P]`, keys by values, as the recurrence holds it
-    (`recurrence.Step`'s): the layer's own, which its decode cache holds so (`Mamba2`). A forked call's
-    documents from its table (`forked` its `(loads, stores, held)`, `held` its given states `[B, S', H, N,
-    P]`, `recurrence_chunk.Chunk.loads`)."""
+    (`recurrence.Step`'s): the layer's own, which its decode cache holds so (`Mamba2`), the output in `dtype`
+    (`at_least_fp32` of the operands' where None). A forked call's documents from its table (`forked` its
+    `(loads, stores, held)`, `held` its given states `[B, S', H, N, P]`, `recurrence_chunk.Chunk.loads`)."""
     operand = jnp.result_type(x, B, C)
     work = at_least_fp32(operand)
     x, B, C = (jnp.asarray(t, operand) for t in (x, B, C))
@@ -129,7 +130,8 @@ def _chunked(x, dt, A, B, C, D, held=None, chunk_size: int = CHUNK_SIZE, starts=
     held = None if held is None else jnp.asarray(held, work)
     loads, stores, table = (None, None, 0) if forked is None else forked
     return chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts, loads=loads,
-                            stores=stores, held=table), chunk_size=chunk_size, dtype=work)
+                            stores=stores, held=table), chunk_size=chunk_size,
+                 dtype=work if dtype is None else dtype)
 
 
 SSD = Hooks(decay='scalar', rated=True, delta=False, skip=True)
@@ -456,11 +458,15 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     """The scan after the conv: `convolved` `[B, S, conv_dim]` split into
     `x`, `B` and `C`, the step through softplus with its bias and the limit,
     then the recurrent step for one token and the chunked scan otherwise.
-    Returns the output `[B, S, H * P]` and the zero-start state leaving it, `[B, H, N, P]` as `held` is.
+    Returns the output `[B, S, H * P]` in the operands' dtype, as mamba_ssm's kernels return it (rounded once:
+    an fp32 output's write and its gradient's read took 340 us of Nemotron-H 4B's SSD training on an A100, a
+    step 0.968 times mamba_ssm's at its dtype against 1.067 at fp32, M-JS-196), and the zero-start state
+    leaving it, `[B, H, N, P]` as `held` is.
 
     Under `axis` the scan runs from zero and the output gains `C_t . exp(acs_t)
     h` for the state `h` the earlier shards leave, `acs_t` the inclusive sum of
-    this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The shard's span
+    this shard's `A dt` (a `RESET_DECAY` in it zeroes the term), the scan's output in at least fp32 until
+    it is added, then rounded once. The shard's span
     is affine in the state entering it, `exp(A_r) h + B_r` (`recurrence_algebra.Span`):
     `A_r` its summed log decay `[B, H]`, a decay never expanded to a matrix, and
     `B_r` its zero-start final state, whose exclusive prefix over the shards
@@ -476,10 +482,12 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     if valid is not None:
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)
+    operand = jnp.result_type(xs, B, C)
     if length == 1 and axis is None and forked is None:
         out, final = decoded_ssd(xs, step, A, B, C, D, held, starts)
     else:
-        out, final = _chunked(xs, step, A, B, C, D, held, chunk_size, starts=starts, forked=forked)
+        out, final = _chunked(xs, step, A, B, C, D, held, chunk_size, starts=starts, forked=forked,
+                              dtype=operand if axis is None else None)
     if axis is not None:
         log_decay = A * step                                # [B, S, H]
         if starts is not None:
@@ -491,7 +499,7 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
             batch, length, n_groups, num_heads // n_groups)
         carried = recurrence_algebra.portable_einsum('bsgn,bgknp,bsgk->bsgkp', C, entering, decayed)
         out = out + carried.reshape(batch, length, num_heads, head_dim)
-    return out.reshape(batch, length, intermediate), final
+    return out.astype(operand).reshape(batch, length, intermediate), final
 
 
 def _sequence_mix(xs, B, C, dt, segments, starts, valid, *weights, scan, state_size: int, dtype):
