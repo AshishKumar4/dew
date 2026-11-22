@@ -517,6 +517,8 @@ def named_rows(x, w):
     return jnp.sin(checkpoint_name(x, "rows")) @ w
 
 
+@pytest.mark.compiles_at_run(reason="a template's certification compiles its configs as the call traces, "
+                                   "no check-1 site")
 def test_a_name_on_a_products_rows_stays_outside_its_prologue():
     """A remat name on the value a product's prologue reads (`named_rows`) bounds the prologue, which still
     fuses the sine after it on an H100 whose template a call names: a producer's stage runs no name (a name
