@@ -310,7 +310,7 @@ def class_record(value: Mapping[typing.Any, object]) -> tuple[str, Mapping[str, 
     return None
 
 
-def class_records(value: JSON, rewrite: Callable[[str, Mapping[str, JSON], bool], Mapping[str, JSON] | None]
+def class_records(value: JSON, rewrite: Callable[[str, Mapping[str, JSON], bool], dict[str, JSON] | None]
                   ) -> JSON:
     """`value` (JSON a Dew saved) with each class record in it, at any depth, as `rewrite(name, fields,
     root)` makes it (`class_record`; `root` whether it is `value` itself), or as it is where `rewrite` returns
@@ -326,7 +326,9 @@ def class_records(value: JSON, rewrite: Callable[[str, Mapping[str, JSON], bool]
         entries = {key: walked(entry) for key, entry in held.items()}
         changed = any(entries[key] is not entry for key, entry in held.items())
         named = class_record(entries)
-        if named is not None and (rewritten := rewrite(*named, root)) is not None:
+        # A JSON record's fields are JSON (`entries`' own).
+        if named is not None and (rewritten := rewrite(named[0], typing.cast("Mapping[str, JSON]", named[1]),
+                                                       root)) is not None:
             return rewritten
         return entries if changed else held
     return walked(value, root=True)
@@ -340,7 +342,7 @@ def earlier_layout(value: JSON) -> JSON:
     those records, which the pinned boundaries call (`dew.config.earlier.earlier_run`,
     `dew.inference.tasks.earlier_shapes`, `dew.decision.release.released_decision`). Carried to 1.0
     (ledger 1552)."""
-    def current(named: str, fields: Mapping[str, JSON], root: bool) -> Mapping[str, JSON] | None:
+    def current(named: str, fields: Mapping[str, JSON], root: bool) -> dict[str, JSON] | None:
         if named not in EARLIER_LAYOUTS:
             return None
         return {"class": "dew.decision.layout:SegmentLayout", "fields": {**EARLIER_LAYOUTS[named], **fields}}
