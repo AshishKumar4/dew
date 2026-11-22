@@ -215,7 +215,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
         # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
         # (spilled 1184 bytes at 64 x 64, one consumer).
         scored = _scores(walk, coords, params_of(q_first, s, slots=slots), s, dp, *rows, masked=masked)
-    narrowed, logits, pieces = _weighed(walk, scored, dtypes, one_part=fused)
+    narrowed, logits, pieces = _weighed(walk, coords, scored, dtypes, one_part=fused)
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = issued_into(family, dv_acc, narrowed if isinstance(narrowed, tuple) else (narrowed,), do_columns,
@@ -284,7 +284,7 @@ def _placed_step(walk: _Backward, rows_of, coords_of, dq_added, index, slots, ca
         dp = family.read(cotangents, first=first, columns=PART, layout=mosaic_sm100.TMEM)
         coords = coords_of(q_first + first, shape=(tiles.block_k, PART), read=read)
         scored = _scores(walk, coords, (), s, dp, *rows_of(q_first + first, PART), masked=masked)
-        (narrowed,), logits, _ = _weighed(walk, scored, (weights.dtype, pulled.dtype), one_part=False)
+        (narrowed,), logits, _ = _weighed(walk, coords, scored, (weights.dtype, pulled.dtype), one_part=False)
         family.write(weights, mosaic.unscaled_part(narrowed), first=first)
         (cotangent,) = algebra.formed_parts(logits * walk.grad_scale, pulled.dtype, accurate=False, rows=True)
         family.write(pulled, mosaic.unscaled_part(cotangent), first=first)
@@ -411,7 +411,8 @@ class _PlacedDq:
         rings.drained((self.stages[3][role],), steps * len(self.pieces()), REDUCED)
 
 
-def _weighed(walk: _Backward, scored: tuple, dtypes: tuple, *, one_part: bool) -> tuple:
+def _weighed(walk: _Backward, coords: algebra.Coords, scored: tuple, dtypes: tuple, *,
+             one_part: bool) -> tuple:
     """A keys-first tile's: its weights narrowed for dV in the output cotangents' dtype
     (`algebra.value_weights`, the dropped ones, `algebra.drawn`; the dQ program's sums take them
     undropped), its pulled score cotangents and its hook's pieces (`gradient.pulled`), from its `_scores`
