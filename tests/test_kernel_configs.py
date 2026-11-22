@@ -1698,6 +1698,29 @@ def test_a_trace_held_by_its_state_is_held_in_any_recordings_scope():
     assert first == second
 
 
+def test_a_derivation_for_a_target_reads_that_targets_refusals():
+    """A grouped GEMM launch derived for a B200 within a block assuming an H100 steps past the tile a B200's
+    compile refused: its derivation reads the refusals of the target it derives for
+    (`report.derivation_inputs`, `report.refused`), where it read the assumed GPU's and derived the refused
+    tile again (row 10986). Shapes only."""
+    from dew.nn.kernels.templates import report
+
+    launch = grouped_matmul.MosaicGmm()
+    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
+    weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
+    arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    b200 = generation.TARGETS["sm100"]
+    with report.refusals():
+        # The B200's identity of the launch, as a B200's certification records its refusal.
+        with generation.assumed(b200):
+            identity, *_ = report.derivation_inputs(launch, arguments, b200)
+        with generation.assumed(generation.TARGETS["sm90"]):
+            tile = launch.derived(arguments, b200)
+            report.refuse([(identity, tile, {"dew_gmm"})])
+            assert launch.derived(arguments, b200) != tile, tile
+
+
 def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
     """A trace's read of a launch's refusals (its legality's, `report.refused`) is recorded with its answer
     (`generation.recording`): the record holds while that launch's refusals stay as they were, a refusal of
