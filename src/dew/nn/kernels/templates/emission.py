@@ -889,20 +889,26 @@ def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
     return jaxpr.replace(eqns=[rewritten(equation) for equation in jaxpr.eqns])
 
 
+def launch_programs(kernel) -> int:
+    """The programs launched by `kernel` (`mpmd_map` or `pallas_call`), its grid's product."""
+    if kernel.primitive is mpmd.mpmd_map_p:
+        (mesh,) = kernel.params["meshes"]
+        return math.prod(mesh.grid)
+    return math.prod(kernel.params["grid_mapping"].grid)
+
+
 def launch_work(kernel, stated: Stated) -> Work:
     """A kernel equation's work from its body's emission, a launch's: each unit's, a step's `stated.steps`
     times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
     steps its longest program walks (`Stated.longest`, else their mean), and one kernel. Its cost
     estimate's (`_estimate`) and a step's price (`work_of`, `attention_decode.priced_step`) alike."""
     forms = _forms(kernel)
+    programs = launch_programs(kernel)
     if kernel.primitive is mpmd.mpmd_map_p:
         (mesh,) = kernel.params["meshes"]
         counted = emitted(_body(kernel), mesh.num_threads or 1, mesh.thread_name, forms=forms)
-        programs = math.prod(mesh.grid)
     else:
         counted = emitted(_body(kernel), 1, None, forms=forms)
-        programs = math.prod(kernel.params["grid_mapping"].grid)
-
     def issued(field: str) -> float:
         return counted.issued(lambda work: getattr(work, field), stated.steps, programs)
 
