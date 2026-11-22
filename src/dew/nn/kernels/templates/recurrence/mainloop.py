@@ -112,9 +112,15 @@ def values_unit(family: mosaic.Family, *, kept: bool, per_key: bool) -> int:
     key blocks down to 8 rows, whose memories' cp.async copies tile only at whole 128-byte rows, an A100's at
     a 16-wide value tile refused ('Number of tiles is not a multiple of 4', jsf-narrow80; a per-head launch's
     memories take a tile's 64 rows); and mma.sync's query-key backward at a 16-wide value tile spilled a
-    160-byte frame at 255 registers on an A100, Nemotron-H 4B's training refused there (M-JS-58)."""
-    whole = per_key or family.operands_in_registers
-    return block_of(family) if kept and whole else value_unit(family)
+    160-byte frame at 255 registers on an A100, Nemotron-H 4B's training refused there (M-JS-58). Where the
+    products read registers, half a tile: its query-key backward holding its sums in shared memory
+    (`mainloop_backward._query_key_holds`), Nemotron-H 4B's 80-wide values train at 96 on an A100, where 128
+    took every training launch past it (4625.9 against 5879.0 us a training step, M-JS-187)."""
+    if kept and per_key:
+        return block_of(family)
+    if kept and family.operands_in_registers:
+        return max(value_unit(family), block_of(family) // 2)
+    return value_unit(family)
 
 
 def padded_widths(family: mosaic.Family, key_width: int, value_width: int, *, kept: bool, per_key: bool,
