@@ -341,9 +341,10 @@ def test_a_compensated_sum_is_weighed_as_its_double_float_pair_rounds():
 
 def test_a_power_of_a_float_rounds_as_its_exponent_takes_it():
     """A float raised to a float power (`lax.pow`: Adam's bias correction, `1 - b**count`, row 8752 found its
-    step had no rule): at an integer exponent its value rounds `max(|e| - 1, 1)` times, as an integer power's
-    (`lax.integer_pow`) does, so its scale is the integer power's; at another, through `exp(e log x)`, by
-    the exponential's ulps and the logarithm's, more than once."""
+    step had no rule): at a constant exponent of 3, which XLA's simplifier writes as `x * x * x`, its value
+    rounds twice, as the integer power's chain (`lax.integer_pow`) does, so its scale is the integer
+    power's; at a half, through XLA's library power (`rounding_bound.POWER`), more than a square root's one
+    correctly rounded result."""
     x = jnp.asarray(np.linspace(0.5, 1.5, 64), jnp.float32)
     _, powered = rounding_scale(lambda x: jax.lax.pow(x, jnp.float32(3)), x)
     _, cubed = rounding_scale(lambda x: jax.lax.integer_pow(x, 3), x)

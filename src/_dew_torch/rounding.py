@@ -98,6 +98,12 @@ ONCE_ATEN = frozenset({"add", "add_", "sub", "sub_", "mul", "mul_", "div", "div_
 ULPS_ATEN = {"exp": "exp", "log": "log", "log1p": "log1p", "expm1": "expm1", "sigmoid": "logistic",
              "tanh": "tanh", "erf": "erf", "rsqrt": "rsqrt"}
 """Each elementary aten operation by the name of its bound in `ULPS`."""
+POWER_ATEN = {0: 0, 1: 0, 2: 1, -1: 1, 3: 2, -2: 2}
+"""The roundings of torch's CPU power at the scalar exponents its kernel computes otherwise than by a library
+power (aten/src/ATen/native/cpu/PowKernel.cpp: `x**0` and `x**1` made and copied, `x * x`, `1 / x`,
+`x * x * x`, `1 / (x * x)`); at any other exponent, and a tensor's, a library power within one ulp (SLEEF's
+`Sleef_powf*_u10`, glibc's `powf` within 0.82), at most 2u times the result (row 10157: an integer
+exponent was weighed as an integer power's chain, a rounding more each unit of it)."""
 CIRCULAR = {"sin", "cos"}
 """The circular functions, whose bound in `ULPS` is XLA's own implementation's: torch computes them on the CPU
 through SLEEF's 1.0-ULP functions (`Sleef_sinf8_u10`, `Sleef_cosf8_u10`: within one unit in the last place),
@@ -186,10 +192,7 @@ def _weight(name: str, func, args, kwargs, computed):
     if name in CIRCULAR:
         return 2 * magnitude
     if name == "pow":
-        exponent = args[1]
-        if isinstance(exponent, (int, float)) and float(exponent).is_integer():
-            return max(abs(int(exponent)) - 1, 1) * magnitude
-        return ULPS["exp"] * magnitude + ULPS["log"] * magnitude
+        return POWER_ATEN.get(args[1], 2) * magnitude if isinstance(args[1], (int, float)) else 2 * magnitude
     if name in SUMS_ATEN:
         magnitudes = [arg.abs() if isinstance(arg, torch.Tensor) and arg.is_floating_point() else arg
                       for arg in args]
