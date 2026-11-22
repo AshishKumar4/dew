@@ -534,6 +534,21 @@ def test_a_launchs_register_model_runs_the_programs_its_shared_memory_holds():
     assert staged.most == 1
 
 
+def test_a_register_models_caps_are_its_targets_wherever_they_are_asked():
+    """The caps an H100's register model states (`RegisterModel.cap`), asked after the model is made with
+    an A100 in effect, are those asked under the H100: its entry share and its consumers' raise its own
+    multiprocessor's (row 12028: they read the GPU in effect as they were asked)."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    model = resources.register_model(WGMMA, 2, 168, target=generation.gpu_target("sm90"))
+    with generation.assumed("sm90"):
+        own = [model.cap(programs, honored=honored) for programs in (1, 2) for honored in (False, True)]
+    with generation.assumed("sm80"):
+        asked = [model.cap(programs, honored=honored) for programs in (1, 2) for honored in (False, True)]
+    assert asked == own
+
+
 def test_a_register_model_decides_on_its_target_whatever_target_is_in_effect():
     """A register model asked for an H100 (`register_model`'s `target`) under an A100's derivation, whose
     multiprocessor has no setmaxnreg steps, decides as it does under the H100's own: its producer, file,

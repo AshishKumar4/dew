@@ -855,6 +855,26 @@ def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
 
 
 @lowers("sm90")
+def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_gpu_drains_it():
+    """A program whose launch spills at its first tile, lowered for an H100 within a block certifying aside,
+    the block drained with a B200 in effect (`report.settled_aside`): the refusal holds for the H100's
+    launch, so the program lowered again for the H100 takes the next tile and misses nothing (row 12031: the
+    drain refused the launch as the B200's, and the H100's lowering took the spilling tile again)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    devices, lowered = _paired_step(Uncounted())
+    with (report.refusals(), report.certifying(compile_only_gpus("sm90")[0]),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")), report.settling()):
+        with report.certifying_aside() as aside, generation.assumed("sm90"):
+            lowered()
+        with generation.assumed("sm100"):
+            report.settled_aside(aside)
+        with generation.assumed("sm90"), report.recording() as again:
+            lowered()
+    assert not again.missed, again.missed
+
+
+@lowers("sm90")
 def test_a_launch_taken_in_two_recordings_of_one_aside_block_records_its_miss_in_each():
     """The same program lowered twice within one block certifying aside, each lowering within a recording of
     its own: the launch the second takes is the one the first queued, its one replay, and its miss is
