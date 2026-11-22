@@ -739,6 +739,12 @@ class RegisterModel:
                 return raised_registers(self.consumers, programs, self.producer, self.joined)
             return entry_registers(self.consumers + joined_warpgroups(self.joined) + 1, programs)
 
+    def record(self) -> dict:
+        """The model's numeric facts (the compile gate's record of a launch's stated models); its live family
+        supplies rules and its target the GPU, neither serialized state."""
+        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                if field.name not in ("family", "target")}
+
 
 def stated_producer(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> int | None:
     """The registers a producer lowers to where each of its program's `consumers` consumer warpgroups holds
