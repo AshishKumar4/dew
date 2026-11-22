@@ -30,6 +30,7 @@ from flax.core.scope import DenyList
 
 from dew.batch import sows_appended
 
+from ..cross_pass import tie_bank
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXITS
 from .decoder_stack import BY_CALL, WRITTEN, Loop, PassView, SharedPassView
@@ -219,7 +220,9 @@ def _passed(module, x, bank, *, block: tuple[int, int] | None, train: bool, deco
         return module.stack(x, span=block, train=train, decode=decode, **inputs), None
     first, end = block or (0, module.num_layers)
     summaries = []
-    for span in messages.blocks(first, end):
+    for index, span in enumerate(messages.blocks(first, end)):
+        if index and bank is not None and not decode:
+            x, bank = tie_bank(x, bank)
         x = module.stack(x, span=span, train=train, decode=decode, prior_bank=bank, **inputs)
         summaries.append(module.residual_summary(x))
     return x, jnp.stack(summaries, axis=2)

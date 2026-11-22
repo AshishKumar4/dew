@@ -28,7 +28,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .attention_residuals import DepthAttention
+from .attention_residuals import DepthAttention, depth_attended
+from .derivatives import portable_formed
 from .flops import projection_flops
 from .norms import unweighted_rmsnorm
 from .precision import at_least_fp32
@@ -108,18 +109,44 @@ class CrossPassMerge(nn.Module):
 
     def __call__(self, read: jax.Array, bank: jax.Array) -> jax.Array:
         """`read` `[B, S, D]` with `bank` `[B, S, blocks, D]` merged in, in `read`'s dtype."""
-        wide = at_least_fp32(read.dtype)
-        highest = jax.lax.Precision.HIGHEST
+        # Form every merge parameter's gradient before returning `(d_read, d_bank)` (`portable_formed`):
+        # without the barrier XLA defers the five low-rank controller matmuls and the depth-attention
+        # query gradients to the step's end, holding ~0.8 GiB of fp32 `[B, S, D]` activations and
+        # cotangents per merge site live across layers and unrolled loop passes.
+        spec, eps = self.spec, self.norm_eps
 
-        def times(x, kernel):
-            return jnp.matmul(x, kernel.astype(wide), precision=highest)
+        def portable(read, bank, parameters):
+            scale, kernel, input_down, message_down, forget, gain, *rest = parameters
+            wide = at_least_fp32(read.dtype)
+            highest = jax.lax.Precision.HIGHEST
 
-        u = read.astype(wide)
-        message = unweighted_rmsnorm(self.depth(bank.astype(wide)), self.norm_eps, implementation='xla')
-        sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(self.norm_eps, wide))
-        state = times(u / sigma, self.input_down) + times(message, self.message_down)
-        sent = jnp.tanh(times(state, self.gain)) * message
-        if self.spec.additive:
-            sent = sent + jnp.tanh(times(state, self.added))
-        kept = (1 - jnp.tanh(times(state, self.forget))) * u
-        return (kept + (sigma * sent if self.spec.scale_by_input_rms else sent)).astype(read.dtype)
+            def times(x, weight):
+                return jnp.matmul(x, weight.astype(wide), precision=highest)
+
+            u = read.astype(wide)
+            mixed = depth_attended(bank.astype(wide), scale, kernel, norm_eps=eps,
+                                   normalize_values=spec.normalize_values)
+            message = unweighted_rmsnorm(mixed, eps, implementation='xla')
+            sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(eps, wide))
+            state = times(u / sigma, input_down) + times(message, message_down)
+            sent = jnp.tanh(times(state, gain)) * message
+            if spec.additive:
+                sent = sent + jnp.tanh(times(state, rest[0]))
+            kept = (1 - jnp.tanh(times(state, forget))) * u
+            return (kept + (sigma * sent if spec.scale_by_input_rms else sent)).astype(read.dtype)
+
+        parameters = (self.depth.scale, self.depth.kernel, self.input_down, self.message_down,
+                      self.forget, self.gain, *((self.added,) if spec.additive else ()))
+        return portable_formed(portable)(read, bank, parameters)
+
+
+def _pass_bank(x, bank):
+    return x, bank
+
+
+def tie_bank(x, bank):
+    """Identity on `(x, bank)` in forward; in reverse mode binds `d_bank` to `d_x` through
+    `portable_formed`, forcing each layer's / message block's bank cotangent into one running
+    accumulator before the layer below runs instead of holding all sites' `[B, S, blocks, D]`
+    cotangents live simultaneously until the end of the pass."""
+    return portable_formed(_pass_bank)(x, bank)

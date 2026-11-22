@@ -521,3 +521,47 @@ def test_a_loop_passing_messages_resumes_as_it_never_stopped(tmp_path):
     resumed = fitted(tmp_path / "resumed", 4)
     assert int(resumed.step) == 4
     assert_same(parameters(whole), parameters(resumed), "the resumed run is not the run unstopped")
+
+
+def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes():
+    """A bf16 decoder passing messages over an unrolled exit-gated loop (`Loop.messages`, `exit_gate=True`),
+    every block rematerialized (`full`), compiled ahead on two compile-only H100s splitting its rows: its
+    live memory past its arguments grows from two passes to six by no more than a message-free loop's growth
+    plus the added passes' saved banks, rather than holding deferred fp32 merge intermediates or un-summed
+    bank cotangents live across unrolled passes (row 11713)."""
+    from step_memory import MIXER_HEAD, MIXER_LENGTH, MIXER_ROWS, MIXER_WIDTH, STEP_LAYOUT
+    from token_support import token_rows
+
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
+    from dew.training import MeshSpec, Trainer
+    from dew.training.ahead import compile_ahead
+
+    devices = 2
+    spec = CrossPass(block_size=2, rank=64)
+
+    def live_past_args(steps: int, messages: CrossPass | None) -> int:
+        model = CausalTransformer(
+            vocab_size=512, emb_features=MIXER_WIDTH, num_layers=4, num_heads=8, head_dim=MIXER_HEAD,
+            mlp_features=4 * MIXER_WIDTH, max_seq_len=MIXER_LENGTH, dtype="bfloat16",
+            remat=REMAT_POLICIES["full"],
+            loop=Loop(steps, step_norm=False, layers=(0, 4), exit_gate=True, messages=messages))
+        trainer = Trainer(LMObjective(model, MIXER_LENGTH, exit_entropy=0.1),
+                          OptimConfig(optimizer="adamw", learning_rate=1e-3).build(None),
+                          key=jax.random.key(0),
+                          mesh=MeshSpec(fsdp=devices).build(compile_only_gpus("sm90", devices, 2**36)),
+                          layout=STEP_LAYOUT, split=1)
+        ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
+        return ahead.live_bytes - ahead.argument_bytes
+
+    msg_two, msg_six = live_past_args(2, spec), live_past_args(6, spec)
+    plain_two, plain_six = live_past_args(2, None), live_past_args(6, None)
+    msg_growth, plain_growth = msg_six - msg_two, plain_six - plain_two
+    # Four added passes save four bf16 banks [B/fsdp, S, blocks, D] beyond a message-free loop.
+    added_banks = 4 * (MIXER_ROWS // devices) * MIXER_LENGTH * 2 * MIXER_WIDTH * 2
+    assert msg_growth <= plain_growth + 2 * added_banks, (
+        f"cross-pass live growth {msg_growth} B exceeded plain growth {plain_growth} B + "
+        f"2 * added_banks {2 * added_banks} B "
+        f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
