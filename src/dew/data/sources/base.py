@@ -363,15 +363,20 @@ class View[S: Source]:
     def metadata(self) -> Mapping[str, object]:
         own = {key: read() for key, read in self._own().items()}
         stated = {key: value for key, value in own.items() if value is not None}
-        return {**self._viewed(self.source.metadata()), **stated}
+        return {**self._viewed(self._inherited().metadata()), **stated}
 
     def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
         """Those of its facts named by `keys`: its store's asked alone (`asked`), taken as `metadata` takes
         all of them (`_viewed`), and those of its own asked, each read alone (`_own`; row 11638's review: a
         view's own facts were dropped, then read whole for any key)."""
         own = {key: read() for key, read in self._own().items() if key in keys}
-        stored = {key: value for key, value in self._viewed(asked(self.source, keys)).items() if key in keys}
+        stored = {key: value for key, value in self._viewed(asked(self._inherited(), keys)).items()
+                  if key in keys}
         return {**stored, **{key: value for key, value in own.items() if value is not None}}
+
+    def _inherited(self) -> Source:
+        """The source whose facts it states its own over (`_viewed`): its store, where it states no other."""
+        return self.source
 
     def _viewed(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Its store's facts as it states them (`facts`, all of them or those asked), its counts dropped
@@ -424,13 +429,14 @@ def materialized(source: Source) -> TypeGuard[Materialized]:
 
 
 def _indexed_manifest(source: Source, uri: str, rows: int,
-                      reader: ShardOpener | None = None) -> ShardManifest:
+                      reader: ShardOpener | None = None, count: int | None = None) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
     at most `rows` records, each `Shard` named by the record it starts at,
     which no copy of the source names otherwise, wherever it is, and read at
     `uri` as that slice of its indexed records (`_IndexedSlice`), or by
-    `reader`, which reads the same slice with less than `source` to pickle."""
-    count = len(source.records("indexed"))
+    `reader`, which reads the same slice with less than `source` to pickle; `count` its records, where its
+    caller counted them."""
+    count = len(source.records("indexed")) if count is None else count
     return ShardManifest(
         tuple(
             Shard(f"records:{start}", uri, start, min(start + rows, count), min(rows, count - start))
