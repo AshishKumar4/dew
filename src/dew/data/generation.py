@@ -22,7 +22,16 @@ from dew.data.declared import Declared, Replaced
 from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
+from dew.data.sources.base import (
+    Read,
+    Shard,
+    ShardManifest,
+    Source,
+    _indexed_manifest,
+    _uncounted,
+    stream_manifest,
+    url_label,
+)
 from dew.data.sources.codec import as_named, decode, dtype_name, encode, encoded_fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords, ShardReaders
@@ -123,10 +132,19 @@ def _store_shards_named(source: Source, completions: Mapping[str, object]) -> bo
     store's finer ones (a Parquet store's row groups, `ShardManifest.parts`): a stream cut into more shards
     than these keys its rows by its own cuts, which no generation of the store holds, and publishes
     nothing."""
-    manifest = source.manifest()
+    manifest = _filled_manifest(source, completions)
     named = {json.loads(row)[0] for row in completions}
     stored = {shard.id for shard in manifest.shards}
     return named <= stored or named <= {shard.id for shard in manifest.parts()}
+
+
+def _filled_manifest(source: Source, completed: Iterable[str]) -> ShardManifest:
+    """The shards a stream's fill of `source` keyed its rows by: those of a stream that numbers its rows
+    where its store states them and they name the fill's (`stream_manifest`, row 9051's review), else the
+    store's own."""
+    named = {row[0] for row in map(json.loads, completed) if isinstance(row, list)}
+    positioned = stream_manifest(source, positioned=True)
+    return positioned if named and named <= {shard.id for shard in positioned.shards} else source.manifest()
 
 def _publish(
     cache: Cache,
@@ -404,7 +422,7 @@ def _source_ids(source: Source, *, streamed: bool = False,
         yield from range(len(source.records("indexed" if source.supports("indexed") else "memory")))
         return
     # Counted off its store's footers, a default read's threads at once, where its shards state no rows.
-    manifest = source.manifest().sized(Loading().threads)
+    manifest = _filled_manifest(source, completed).sized(Loading().threads)
     shards = manifest.shards
     if manifest.subdivide is not None:
         named = {row[0] for row in map(json.loads, completed) if isinstance(row, list)}

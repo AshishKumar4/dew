@@ -855,7 +855,7 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
 
 
 def test_diffusion_run_source_refuses_unsupported_source_transformations_before_weights(pipelines, tmp_path):
-    """`DiffusionRunConfig` forwards `SourceOptions`'s `dex`, `scan_layers` and `packed_experts` to
+    """`DiffusionRunConfig` forwards `SourceOptions`'s `dex`, `scan_layers` and `packed_weights` to
     `load_diffusion_source`, which refuses each unsupported nondefault transformation before reading or
     downloading weight files."""
     from dew.config.trainer import SourceOptions
@@ -873,7 +873,7 @@ def test_diffusion_run_source_refuses_unsupported_source_transformations_before_
     with pytest.raises(TypeError):
         dataclasses.replace(base, source=SourceOptions(dex=DifferentialExtension())).build()
     with pytest.raises(ValueError):
-        dataclasses.replace(base, source=SourceOptions(packed_experts=True)).build()
+        dataclasses.replace(base, source=SourceOptions(packed_weights=True)).build()
 
 
 def a_256_pixel_diffusion_run_trains_saves_resumes_and_draws(tmp_path):

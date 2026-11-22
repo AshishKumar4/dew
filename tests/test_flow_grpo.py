@@ -490,9 +490,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     would not guide a step 1 of 6, so the rescoring reads the rollout's step
     count off the batch. Its group advantages are the float64 normalization's,
     rounded once, and its timesteps the 4-point walk's first two, bit for
-    bit. The walk its collective gathers is its trained prefix: three of its
-    four states, two densities and stochastic marks, its four times whole
-    (row 10795)."""
+    bit: its rows hold its trained prefix alone."""
     from dew.inputs import CharTable, Condition
     from dew.nn.backbones.dit import SimpleDiT
 

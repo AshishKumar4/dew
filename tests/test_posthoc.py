@@ -293,3 +293,18 @@ def test_reconstruction_accumulates_bfloat16_weights_in_float32(tmp_path):
     for held, expected in zip(jax.tree.leaves(rebuilt), jax.tree.leaves(averages[0]), strict=True):
         assert held.dtype == np.asarray(expected).dtype
         np.testing.assert_array_equal(held.view(np.uint16), np.asarray(expected).view(np.uint16))
+
+
+def test_an_older_snapshot_kept_for_its_profiles_alone_keeps_no_exported_model(tmp_path):
+    """A run exporting each step's model (`export_model`), its older snapshots kept for their profiles alone:
+    each such step's exported model is cut with its model, and the latest, kept whole, keeps its own (row
+    9070's review: the exported model was kept forever beside the profiles)."""
+    directory = tmp_path / "run"
+    trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0),
+                      checkpoints=Checkpoints(str(directory), keep=1, export_model=True))
+    trainer.fit(dataset(), steps=8, log_every=8, checkpoint_every=4)
+    trainer.checkpoints.close()
+    assert {entry.step: entry.kind for entry in Checkpoints(str(directory), keep=1).kept()} == {
+        4: "profiles", 8: "state"}
+    assert not (directory / "4" / "exported").exists() and (directory / "8" / "exported").exists()
