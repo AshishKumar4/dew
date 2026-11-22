@@ -339,6 +339,23 @@ def test_a_compensated_sum_is_weighed_as_its_double_float_pair_rounds():
     assert np.all(np.asarray(compensated) < np.asarray(plain))
 
 
+def test_a_one_pass_compensated_sum_is_weighed_as_its_pair_and_its_pair_alone_is_weighed():
+    """Dew's compensated sum reads its input once (`precision.summed_total`: its double-float pair and the
+    plain sum beside it in one reduction) and is weighed as its pair rounds: each draw moves its value by at
+    most its two halves' bound, each the pair reduction's own (`summed_pairs`, weighed alone, the guidance
+    projection's dot products' reduction, row 8498), and its final addition's one rounding, so its scale is
+    within that at every row. A rule halving the one-pass reduction's operands into its pair read the plain
+    sum as a third half and doubled the pair's weight; and the pair reduction alone, whose combine
+    `compensated_sum` no longer runs, had no rule and was refused."""
+    from dew.nn.precision import compensated_sum, summed_pairs
+
+    unit = 2.0 ** -24
+    x = jnp.asarray(np.random.default_rng(8498).uniform(-1, 1, (64, 48)), jnp.float32)
+    total, scale = rounding_scale(lambda x: compensated_sum(x, (1,)), x)
+    _, half = rounding_scale(lambda x: summed_pairs((x, jnp.zeros_like(x)), (1,))[0], x)
+    assert np.all(np.asarray(scale) <= 2 * np.asarray(half) + unit * np.abs(np.asarray(total)))
+
+
 def test_a_power_of_a_float_rounds_as_its_exponent_takes_it():
     """A float raised to a float power (`lax.pow`: Adam's bias correction, `1 - b**count`, row 8752 found its
     step had no rule): at an integer exponent its value rounds `max(|e| - 1, 1)` times, as an integer power's

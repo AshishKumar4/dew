@@ -44,7 +44,7 @@ from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
-from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p
+from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p, summed_pairs
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
              primitives.reduce_scatter_p: "axis_name"}
@@ -68,12 +68,17 @@ which a float64 evaluation of a float32 program builds again (`TapRule.primitive
 
 @functools.cache
 def compensating() -> frozenset:
-    """The combining computations of Dew's compensated sums, each a double-float pair's: `compensated_add`,
-    and the one `compensated_sum`'s reduction combines by, read from its own trace, so a renamed combine is
-    still known by its object."""
-    traced = jax.make_jaxpr(lambda x: compensated_sum(x, (0,)))(jax.ShapeDtypeStruct((2,), jnp.float32))
-    combines = {equation.params["computation"] for equation in programs.equations(traced.jaxpr)
-                if equation.primitive is jax.lax.reduce_p}
+    """The combining computations of Dew's compensated sums, each a double-float pair's, its first two
+    operands and results the pair, any third the plain sum carried beside it: `compensated_add`, and the
+    ones `compensated_sum`'s reduction (`summed_total`, the pair and its plain sum in one pass) and the pair
+    reduction alone (`summed_pairs`) combine by, read from their own traces, so a renamed combine is still
+    known by its object."""
+    shape = jax.ShapeDtypeStruct((2,), jnp.float32)
+    combines = set()
+    for summed in (lambda x: compensated_sum(x, (0,)), lambda x: summed_pairs((x, jnp.zeros_like(x)), (0,))):
+        traced = jax.make_jaxpr(summed)(shape)
+        combines |= {equation.params["computation"] for equation in programs.equations(traced.jaxpr)
+                     if equation.primitive is jax.lax.reduce_p}
     return frozenset({compensated_add, *combines})
 
 
@@ -143,7 +148,7 @@ class TapRule:
             if not jnp.issubdtype(dtype, jnp.floating):
                 tapped.append(value)
                 continue
-            weight = _weight(equation, params, operands, value)
+            weight = _weight(equation, params, operands, value, index)
             if weight is None:
                 tapped.append(value)
                 continue
@@ -306,7 +311,7 @@ def _wide(dtype):
     return jnp.float64 if dtype is not None and jnp.issubdtype(dtype, jnp.floating) else dtype
 
 
-def _weight(equation, params, operands, value):
+def _weight(equation, params, operands, value, index: int = 0):
     """The most one rounding at `equation` moves its float64 result `value` (module docstring), in units of
     its format's u; None where it rounds nothing. An operation with no rule is refused by name."""
     primitive, magnitude = equation.primitive, jnp.abs(value)
@@ -328,11 +333,16 @@ def _weight(equation, params, operands, value):
     if primitive is jax.lax.reduce_p and params["computation"] in compensating():
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
         # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
-        # the pair's halves by it, as the high half's rounding moves the low half by as much.
+        # the pair's halves by it, as the high half's rounding moves the low half by as much. A plain sum
+        # carried beside the pair (`summed_total`'s third operand and result) rounds as any sum of its
+        # terms does, in whatever order the reduction adds them.
         terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
+        summed = operands[:len(equation.outvars)]
+        if index >= 2:
+            return max(terms - 1, 1) * jnp.sum(jnp.abs(summed[index]), params["dimensions"])
         u = _unit(primitive, params, equation.outvars[0].aval.dtype)
         gamma = (terms - 1) * u / (1 - (terms - 1) * u)
-        pair = operands[:len(operands) // 2]
+        pair = summed[:2]
         total = jnp.abs(sum(jnp.sum(operand, params["dimensions"]) for operand in pair))
         spread = sum(jnp.sum(jnp.abs(operand), params["dimensions"]) for operand in pair)
         return total + gamma * gamma / u * spread
