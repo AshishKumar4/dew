@@ -270,11 +270,21 @@ class CompiledTruths:
         if site.exists():
             shutil.rmtree(site)
         site.mkdir(parents=True)
+        calls_the_host = (at_run is None and self.target is not None and not host
+                          and any(_calls_the_host(fn, shapes) for fn, shapes in programs.values()))
+        if calls_the_host:
+            # A host callback is lowered by the backend its program runs on, a GPU's absent from a prepare
+            # (row 11497: "Unknown backend: 'gpu' requested"): its run compiles the site on its GPU.
+            at_run = CALLS_THE_HOST
         if at_run is not None:
-            with uncached():
-                read = self._compiled(programs, compiled, host, memory_only=True)
-            memory = {name: executable.memory._asdict() for name, executable in read.programs.items()
-                      if executable.memory is not None}
+            # Its memory read offline, but a host-calling site's, which no lowering here can read
+            # (`compiled_memory`).
+            memory = {}
+            if not calls_the_host:
+                with uncached():
+                    read = self._compiled(programs, compiled, host, memory_only=True)
+                memory = {name: executable.memory._asdict() for name, executable in read.programs.items()
+                          if executable.memory is not None}
             (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
                                                  "arms": arms, "host": host, "at_run": at_run}))
             return
@@ -287,15 +297,6 @@ class CompiledTruths:
             self.begun.discard(label)
             shutil.rmtree(site)
             raise
-        except RuntimeError:
-            # A host callback is lowered by the backend its program runs on, a GPU's absent from a prepare
-            # (row 11497: "Unknown backend: 'gpu' requested"): its run compiles the site on its GPU, and its
-            # memory, which no lowering here reads, is its run's to read. Asked only of a compile that failed.
-            if host or not any(_calls_the_host(fn, shapes) for fn, shapes in programs.values()):
-                raise
-            (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": {},
-                                                 "arms": arms, "host": host, "at_run": CALLS_THE_HOST}))
-            return
         built.save(site / PROGRAMS)
         (site / HELD).write_bytes(_held_bytes(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
@@ -388,7 +389,9 @@ def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, in
     arms' (`CompiledTruths.compile_site`), as its compile analysed its memory
     (`dew.telemetry.instrumentation.CompiledMemory`, as its fields name it), its sites' record's; none for
     a program whose backend stated none, nor for one compiled for the host's CPU (`compile_site`'s `host`),
-    which holds none of the devices' memory."""
+    which holds none of the devices' memory, nor for a site calling the host (`CALLS_THE_HOST`), which no
+    lowering here can read: the needs filed of its unit are a floor (tools/armada/ci.py's `gpu_needs`), its
+    measured share, its run's, the rest, as for any program whose compile states none."""
     records = (json.loads(site.read_text()) for site in Path(directory).glob(f"*/{SITE}"))
     return [memory for record in records
             if record.get("arms", False) == arms and not record.get("host", False)
@@ -510,16 +513,18 @@ CALLS_THE_HOST = "a program calling the host, which a compile lowers by its GPU'
 
 
 def _calls_the_host(fn: Callable, shapes: Sequence) -> bool:
-    """Whether `fn`'s program at `shapes` calls back to the host anywhere within it (`jax.pure_callback`,
-    `jax.experimental.io_callback`, `jax.debug.callback`): each lowered by the backend it runs on."""
+    """Whether `fn`'s program at `shapes` calls back to the host anywhere within it, by JAX's own callback
+    primitives (`jax.pure_callback`'s, `jax.experimental.io_callback`'s, `jax.debug.callback`'s): each is
+    lowered by the backend it runs on. Traced in the prepare's context, as its truths' shapes are
+    (tests/arm_store.py's `_shaped_truth`)."""
+    from jax._src.callback import io_callback_p, pure_callback_p
+    from jax._src.debugging import debug_callback_p
+
     from dew.nn import programs
 
     closed = jax.make_jaxpr(fn)(*shapes)
-    return any(equation.primitive.name in HOST_CALLBACKS for equation in programs.equations(closed.jaxpr))
-
-
-HOST_CALLBACKS = frozenset({"pure_callback", "io_callback", "debug_callback"})
-"""JAX's primitives that call back to the host, by name."""
+    callbacks = {pure_callback_p, io_callback_p, debug_callback_p}
+    return any(equation.primitive in callbacks for equation in programs.equations(closed.jaxpr))
 
 
 def running() -> tuple[CompiledTruths, str] | None:
