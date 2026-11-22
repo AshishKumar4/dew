@@ -737,16 +737,24 @@ def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
     holding the config) for as long as they refuse a config it took, each refused launch's derivation stepping
     past it: a program lowers once, at the configs its certification settled, as one certified in turn does,
     where lowering at a refused rung lowered the step twice (a B200's recurrent reverse launch spilling at its
-    first rung, FS-ASIDE-SM100C). A trace that takes a config refused before again (a derivation reading no
-    refusal, a pin's) is its compile's to read (`settled`). Outside such a block, `trace()`'s."""
+    first rung, FS-ASIDE-SM100C). Each trace's routes are its own (`generation.routes(alone=True)`), the one
+    kept reported as its dispatches did (`generation.reported`): an abandoned trace's routes are no program's.
+    A trace that takes a config refused before again (a derivation reading no refusal, a pin's) is its
+    compile's to read (`settled`). Outside such a block, `trace()`'s."""
     aside = _ASIDE.get()
-    value = trace()
     if aside is None:
-        return value
+        return trace()
+
+    def traced(attempt: Callable[[], T]) -> tuple[T, list]:
+        with generation.routes(alone=True) as found:
+            return attempt(), found
+
+    value, found = traced(trace)
     seen: set = set()
     while (refused := settled_aside(aside)) and not refused <= seen:
         seen |= refused
-        value = retrace()
+        value, found = traced(retrace)
+    generation.reported(found)
     return value
 
 
@@ -861,8 +869,11 @@ def _traced_for(device) -> bool:
     FS-ASIDE-EVERY80C) certifies its launch in turn, the launch traced for the device (`_lowered_launch`)."""
     from jax.experimental.mosaic.gpu import utils as mosaic_utils
 
+    capability = generation.capability(generation.device_target(device).generation)
+    if capability is None:  # no GPU's: a TPU's launches lower for the device the trace names
+        return True
     arch = mosaic_utils.get_arch()
-    return (arch.major, arch.minor) == generation.capability(generation.device_target(device).generation)
+    return (arch.major, arch.minor) == capability
 
 
 def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> None:

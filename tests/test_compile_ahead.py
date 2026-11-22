@@ -647,7 +647,6 @@ def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
     assert compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1)).starts
 
 
-@COMPILES_ON_CPU
 def test_a_step_compiled_ahead_over_phases_of_other_batches_takes_a_split_that_cuts_each():
     """A run over phases of 12, then 8 rows a step compiles its step ahead in a split that cuts every
     phase's batch (`Trainer.reading`'s `Loader.batches`), as its fit plans it: a fixed split of 2 compiles,
