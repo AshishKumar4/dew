@@ -32,6 +32,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     diagonal,
     f32,
     final_memory_landing,
+    finished_form,
     fitting_block,
     held_tile,
     launch_kernel,
@@ -968,15 +969,11 @@ def _query_key_landing(call: Call, splits: int, summed: jnp.dtype) -> dict:
 
 
 def _query_key_summed(call: Call, splits: int, holds: bool) -> jnp.dtype:
-    """The dtype `_query_key` stores the queries' and keys' sums in: the operands' 16-bit dtype where each
-    is stored once, whole (one split, its sums held or a key head's one value head) and nothing is added to
-    it after (the delta rule adds the keys launch's to the keys'), as `_unlaid` rounds them; else fp32, which
-    a split's sums and a value head's adds take. Stored fp32, Nemotron-H 30B's SSD training rounded both in
-    XLA, 38 us of an A100's (M-JS-204-a100)."""
-    given = jnp.dtype(call.given.dtype)
-    once = splits == 1 and (holds or call.group == 1)
-    narrow = call.given.parts == 1 and given.itemsize == 2 and not call.delta
-    return given if once and narrow else jnp.dtype(jnp.float32)
+    """The dtype `_query_key` stores the queries' and keys' sums in (`finished_form`'s): each stored once
+    where one split holds them whole (its sums held or a key head's one value head) and nothing is added
+    after (the delta rule adds the keys launch's to the keys')."""
+    once = splits == 1 and (holds or call.group == 1) and not call.delta
+    return jnp.dtype(finished_form(call, once).dtype)
 
 
 def _query_key_staging(call: Call) -> tuple:
