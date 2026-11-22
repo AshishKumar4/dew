@@ -162,6 +162,16 @@ def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
     finite = (np.arange(256) & 0x7F) != 0x7F
     np.testing.assert_array_equal(declared[finite].view(np.uint32), integer[finite].view(np.uint32))
     assert float(declared[0x7F]) == 480.0
+    # Every reader of a block scale reads it so (row 8675): an NVFP4 operand's block values
+    # (`formats.NvFp4Block.decoded`), each of whose blocks codes 1 under one scale, are ml_dtypes' FP8 values,
+    # which they were read as before, on every finite code.
+    from dew.nn.kernels.formats import NvFp4Block
+
+    scales = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn)[None]
+    read = np.asarray(ahead_arm(jax.jit(lambda ones, scales: NvFp4Block(ones, scales, 1.0).decoded()),
+                                "a block's values")(np.ones((1, 256 * 16), ml_dtypes.float4_e2m1fn), scales))
+    read, cast = read[0, ::16], scales[0].astype(np.float32)
+    np.testing.assert_array_equal(read[finite].view(np.uint32), cast[finite].view(np.uint32))
 
 
 @pytest.mark.parametrize(("dtype", "minifloat"), [(jnp.float8_e4m3fn, bits.E4M3),
