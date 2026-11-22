@@ -3,6 +3,7 @@ tools/dory_reference.py transcribes its forward and writes tests/fixtures/hf/dor
 tests' reference, and tests/fixtures/hf/dory-1.0-4b holds the released config and what vLLM's
 own engine computes of the release on a GPU (tools/dory_vllm_reference.py)."""
 
+import contextlib
 import dataclasses
 import itertools
 import json
@@ -13,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import tier_wire
 from arm_arithmetic import float64_held
 from decision_support import decision_rows
 from float64_terms import float64_forward
@@ -61,8 +63,25 @@ REFERENCE = np.load(TINY / 'reference.npz')
 TOOL = load_tool('dory_reference')
 
 
+def ahead_on_the_host():
+    """Where a GPU tier part's prepare runs a test, whose default device is a compile-only GPU that computes
+    nothing, the host's CPU as its default device; elsewhere the test's own: the context of what a cell
+    computes before its first check-1 site (a load, an export, a behavioral decode), so its prepare reaches
+    its sites (rows 11424-11619: every cell computing there first was left unprepared). Its kernels are
+    the host's own (no GPU `generation.assumed`): a GPU's would not run there."""
+    if not tier_wire.preparing():
+        return contextlib.nullcontext()
+    host = contextlib.ExitStack()
+    host.enter_context(jax.default_device(jax.devices("cpu")[0]))
+    host.enter_context(generation.assumed(None))
+    return host
+
+
 def load(**fields):
-    return Pretrained.load(TINY, dtype='float32', attention_impl='xla', **fields)
+    """The tiny Dory loaded (float32, XLA's attention, unless `fields` state otherwise), in a prepare on the
+    host (`ahead_on_the_host`), its weights committed to no device."""
+    with ahead_on_the_host():
+        return Pretrained.load(TINY, **{'dtype': 'float32', 'attention_impl': 'xla', **fields})
 
 
 def with_cache(model: CausalTransformer, mode: str) -> CausalTransformer:
@@ -88,8 +107,10 @@ LOGITS_SEEDS = 8
 
 
 def tensors_of(loaded: Pretrained) -> dict[str, np.ndarray]:
-    """`loaded`'s weights under the checkpoint's names, as the transcription reads them."""
-    return {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    """`loaded`'s weights under the checkpoint's names, as the transcription reads them (exported on the
+    host in a prepare, `ahead_on_the_host`)."""
+    with ahead_on_the_host():
+        return {key: np.array(value, copy=True) for key, value in loaded.export().items()}
 
 
 def transcribed(config: dict, tensors: dict[str, np.ndarray], compute, **fields):
@@ -111,6 +132,8 @@ def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, *, stream: int, 
     assert_as_exact(dew, reference, draw, label, seeds=LOGITS_SEEDS, truth_fn=truth)
 
 
+@pytest.mark.compiles_at_run(
+    reason="its float64 forward against the transcription's recorded float64 logits, no check-1 site")
 @pytest.mark.parametrize('loops', [1, 2, 4])
 def test_dorys_float64_forward_computes_the_transcriptions_function(loops):
     """Dew's forward in float64, every nGPT gain, norm and step as wide as its inputs, sits within
@@ -126,6 +149,7 @@ def test_dorys_float64_forward_computes_the_transcriptions_function(loops):
                                roundings=roundings)
 
 
+@pytest.mark.compiles_at_run(reason="float64 logits under each order against the identity's, no check-1 site")
 def test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums():
     """The orders the release is held to vLLM under (tools/dory_vllm_reference.py's `symmetry`: the
     residual stream's units, each feed-forward's hidden units, each attention's heads and value
@@ -174,6 +198,7 @@ def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop
                            stream=0xD02, loops=loops)
 
 
+@pytest.mark.compiles_at_run(reason="bf16 keys against the recorded reference's rounding, no check-1 site")
 def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
     """In bf16 the first layer's keys, the projections of the same embeddings, rotate as vLLM's
     CUDA rotary does (cos and sin rounded to bf16, the turn in fp32, one rounding) and unit-norm in
@@ -208,15 +233,16 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
     model = with_cache(loaded.model if loops is None else loaded.model.with_passes(loops), mode)
     tag = mode if loops is None else f'{mode}_{loops}'
     expected = REFERENCE[f'generated_{tag}']
-    prompt = jnp.asarray(expected[None, :6])
     variables = loaded.variables
-    cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
-    logits, mutated = model.apply({**variables, 'cache': cache}, prompt, decode=True, mutable=['cache'])
-    steps = [np.asarray(logits[0, -1])]
-    for token in expected[6:-1]:
-        logits, mutated = model.apply({**variables, 'cache': mutated['cache']}, jnp.asarray([[token]]),
-                                      decode=True, mutable=['cache'])
-        steps.append(np.asarray(logits[0, -1]))
+    with ahead_on_the_host():
+        prompt = jnp.asarray(expected[None, :6])
+        cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
+        logits, mutated = model.apply({**variables, 'cache': cache}, prompt, decode=True, mutable=['cache'])
+        steps = [np.asarray(logits[0, -1])]
+        for token in expected[6:-1]:
+            logits, mutated = model.apply({**variables, 'cache': mutated['cache']}, jnp.asarray([[token]]),
+                                          decode=True, mutable=['cache'])
+            steps.append(np.asarray(logits[0, -1]))
     steps = np.stack(steps)
     np.testing.assert_array_equal(steps.argmax(-1), expected[6:])
 
@@ -255,6 +281,7 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
                         seeds=LOGITS_SEEDS, truth_fn=truth)
 
 
+@pytest.mark.compiles_at_run(reason="a step's program's structure, no check-1 site")
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
 def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
     """A decode step runs its block's later passes as one scan over them (`looping.run_loop`, ledger
@@ -278,6 +305,7 @@ def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
     assert (four, eight) == (3 - kept, 7 - kept) and body == deep
 
 
+@pytest.mark.compiles_at_run(reason="what each pass sows against its predecessors', no check-1 site")
 @pytest.mark.parametrize('mode, loops', [('per_loop', 4), ('last_loop', 4)])
 def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mode, loops):
     """A forward at one loop more than `loops` sows in its looped layers (its attention's logits, `qk`,
@@ -323,7 +351,7 @@ def test_packed_documents_read_only_themselves_through_every_pass(attention_impl
     logits vLLM computes of it alone, within the rule: no pass of the loop, nor the input its
     passes reinject, reads another document, and the window of 5 crosses a document's start in
     every row."""
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl=attention_impl)
+    loaded = load(attention_impl=attention_impl)
     positions, segments = REFERENCE['packed_positions'], REFERENCE['packed_segments']
 
     def packed(ids):
@@ -352,6 +380,7 @@ def ragged_prompts() -> list[list[int]]:
     return [row[:length].tolist() for row, length in rows]
 
 
+@pytest.mark.compiles_at_run(reason="decoded tokens side by side against alone, no check-1 site")
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
 def test_prompts_of_two_lengths_decode_side_by_side_as_each_does_alone(mode):
     """Two prompts of different lengths, the shorter padded on the left, prefilled and decoded in
@@ -371,6 +400,7 @@ def test_prompts_of_two_lengths_decode_side_by_side_as_each_does_alone(mode):
     ('per_loop', {'kv_cache': KVCache(page_size=4, pages=40), 'chunk': 2, 'prefix_cache': True}),
     ('last_loop', {}), ('last_loop', {'kv_cache': KVCache(page_size=4, pages=40)})],
     ids=['per_loop-dense', 'per_loop-paged-chunked-prefix', 'last_loop-dense', 'last_loop-paged'])
+@pytest.mark.compiles_at_run(reason="a server's tokens against the reference's continuation, no check-1 site")
 def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options):
     """Served side by side, over a dense cache or a pool of pages, each prompt continues as the
     reference continues it alone, and so does the longer prompt asked again once a slot frees. A
@@ -391,6 +421,7 @@ def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options)
 @pytest.mark.parametrize('change', [
     {'n_recurrent_loops': 1}, {'n_input_layers': 1, 'n_recurrent_layers': 1, 'n_output_layers': 6}],
     ids=['one-pass', 'mlp-block'])
+@pytest.mark.compiles_at_run(reason="served tokens in pieces against whole, no check-1 site")
 def test_a_shared_cache_no_pass_rewrites_serves_prompts_in_pieces(tmp_path, change):
     """A last-loop cache that no later pass rewrites, under one pass or over a block of MLPs alone,
     which keep no cache, takes its prompts in pieces of two and reuses a cached prefix: each prompt
@@ -475,6 +506,7 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
 
 
+@pytest.mark.compiles_at_run(reason="a step's dtypes, no check-1 site")
 def test_a_step_computes_in_the_widest_of_its_operands():
     """nGPT's residual step runs in at least fp32 of its residual, its branch and its rate: a float32
     residual stepped toward a float64 branch by a float64 rate, or by a float64 rate alone, takes its
@@ -492,6 +524,8 @@ def test_a_step_computes_in_the_widest_of_its_operands():
             assert traced.out_avals[0].dtype == np.float32
 
 
+@pytest.mark.compiles_at_run(
+    reason="float64 logits and gradients against the transcription's float64, no check-1 site")
 def test_a_float64_model_computes_in_float64():
     """A float64 Dory computes its logits and gradients in float64 end to end, its nGPT attention
     included: each within float64's rounding of the torch reference's own float64 run, an
@@ -521,6 +555,7 @@ def test_a_float64_model_computes_in_float64():
                                    roundings=backward)
 
 
+@pytest.mark.compiles_at_run(reason="which gradients a cut loop moves, no check-1 site")
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
     """Cutting the loop before its last pass moves no forward value and no gradient past the
     loop, sends the layers before it a gradient through the input the last pass reinjects, and
@@ -829,8 +864,9 @@ def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, vari
     rotary per kind, which vLLM's get_rope reads as Dew's 'default' partial rotary, an nGPT step
     or gate logit scale of zero, whose gains start without dividing by it, a loop whose block
     starts at an MLP and ends at an attention, and a loop over no layer."""
-    loaded = Pretrained.load(changed(tmp_path / variant, TOOL.VARIANTS[variant]), dtype='float32',
-                             attention_impl='xla')
+    with ahead_on_the_host():
+        loaded = Pretrained.load(changed(tmp_path / variant, TOOL.VARIANTS[variant]), dtype='float32',
+                                 attention_impl='xla')
 
     def logits(ids):
         return loaded.model.apply(loaded.variables, ids)
@@ -838,6 +874,7 @@ def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, vari
     assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', stream=0xD06)
 
 
+@pytest.mark.compiles_at_run(reason="a reload bit for bit, no check-1 site")
 def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
     """A Dory written from the model and its variables alone (`PretrainedDecoder.from_model`), not
     through the source's bindings, states DoryConfig's own fields, one rope record per attention
@@ -857,6 +894,7 @@ def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
         PretrainedDecoder.from_model(loaded.model.clone(loop=None), loaded.variables)
 
 
+@pytest.mark.compiles_at_run(reason="refusals, no check-1 site")
 def test_what_ngpts_arithmetic_does_not_reach_is_refused():
     """nGPT's arithmetic lives in the attention and the dense gated feed-forward, in a block's
     feed-forward or in the mixer's slot, where each of Dory's MLP layers computes it (the reference
@@ -886,6 +924,7 @@ def test_the_releases_tokenizer_loads_with_the_checkpoint():
         str(TINY / 'tokenizer.json')).encode(text).ids
 
 
+@pytest.mark.compiles_at_run(reason="a reload bit for bit, no check-1 site")
 def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     """A loaded Dory saves its config and tensors as the released checkpoint names them, and the
     saved checkpoint rebuilds the same model and tensors."""
@@ -991,7 +1030,8 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
             forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
             for prompt, tokens, prompt_rows in parts.values()])}
 
-    axes = model_axes(model)
+    with ahead_on_the_host():
+        axes = model_axes(model)
 
     def dew(index, order):
         # Each order's weights placed alone, and gone from the device when the call returns.
@@ -1043,7 +1083,8 @@ def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distance
             return torch.as_tensor(logits).log_softmax(-1).numpy()
 
         truth = transcribed(tensors, torch.float64)
-        host, axes = jax.device_get(loaded.variables), model_axes(loaded.model)
+        with ahead_on_the_host():
+            host, axes = jax.device_get(loaded.variables), model_axes(loaded.model)
 
         def order(seed):
             return recorder.symmetry(config, *divmod(seed, recorder.ORDERS))
@@ -1054,7 +1095,7 @@ def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distance
                                 torch.float32)
             return np.sqrt(np.mean(np.square(found - truth), axis=1))
 
-        with jax.enable_x64(new_val=True):
+        with jax.enable_x64(new_val=True), ahead_on_the_host():
             stored = recording_of.record_distances(
                 mode, order, {'log_probabilities': np.stack([distances(seed) for seed in range(80)])},
                 lambda seed, truth=truth: {'log_probabilities': truth}, {'log_probabilities': 'float32'})

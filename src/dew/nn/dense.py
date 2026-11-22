@@ -36,6 +36,7 @@ from dew._cache import INTERCEPTED
 
 from .derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed
 from .kernels import generation, projections
+from .kernels.formats import NvFp4
 from .precision import accumulated, biased, float32_dot_general, refuse_recipe
 from .sharding import automatic_axes, declared
 
@@ -49,13 +50,14 @@ the site's own scope: every view of the variables (a scanned or staged
 stack, a packed group, a pipeline) carries it with the weights it scales."""
 
 
-def dense_matrix(module: nn.Module):
-    """A dense layer's packed kernel (`[in, out]`, `dew.nn.kernels.formats.NvFp4`: a checkpoint's 4-bit
-    weight served as its codes, row 8550) its `QUANTIZATION` collection holds under `kernel`, else None,
-    the layer's own parameter its kernel."""
-    if not module.has_variable(QUANTIZATION, "kernel"):
-        return None
-    return module.get_variable(QUANTIZATION, "kernel")
+def packed_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]):
+    """`module`'s matrix `name`: the packed NVFP4 matrix its `QUANTIZATION` collection holds under the name
+    (`dew.nn.kernels.formats.NvFp4`, a checkpoint's 4-bit weight served as its codes: an expert bank's
+    `[experts, in, out]`, row 4516, a Linear's kernel `[in, out]`, row 8550), else its parameter, `make()`.
+    The one reader of a packed matrix every layer that multiplies one takes (row 11641)."""
+    if module.has_variable(QUANTIZATION, name):
+        return module.get_variable(QUANTIZATION, name)
+    return make()
 
 
 def intercepted() -> bool:
@@ -248,10 +250,10 @@ class Dense(_LinearEnvelope, nn.Dense):
     def _linear(self, inputs: Array) -> jax.Array:
         width = jnp.shape(inputs)[-1]
         axes = self.kernel_axes
-        if (packed := dense_matrix(self)) is not None:
-            return self._packed(inputs, packed)
-        kernel = self.param('kernel', declared(self.kernel_init, axes), (width, self.features),
-                            self.param_dtype)
+        kernel = packed_matrix(self, 'kernel', lambda: self.param(
+            'kernel', declared(self.kernel_init, axes), (width, self.features), self.param_dtype))
+        if isinstance(kernel, NvFp4):
+            return self._packed(inputs, kernel)
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
                            (self.features,), self.param_dtype) if self.use_bias else None)
         stored = bias
@@ -262,7 +264,7 @@ class Dense(_LinearEnvelope, nn.Dense):
 
     @nn.nowrap
     def _packed(self, inputs: Array, matrix) -> jax.Array:
-        """The layer over its packed kernel (`dew.nn.dense.dense_matrix`, a checkpoint's 4-bit weight
+        """The layer over its packed kernel (`packed_matrix`, a checkpoint's 4-bit weight
         served as its codes, row 8550): its NVFP4 product (`gemm.nvfp4_product`: the inputs rounded to
         bfloat16, each code times its block's scale exact, the sums in fp32 and the matrix's tensor scale
         after), its fp32 sum plus its bias rounded once to the layer's dtype. Frozen, as the codes are a

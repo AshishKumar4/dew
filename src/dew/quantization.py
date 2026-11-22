@@ -548,20 +548,11 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
 
 
-def expert_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]) -> jax.Array | NvFp4:
-    """An expert bank's matrix `name` of `module` (`[experts, in, out]`): the packed bank its `QUANTIZATION`
-    collection holds under the name (`dew.nn.kernels.formats.NvFp4`, a checkpoint's 4-bit experts served as
-    their codes, row 4516), else its parameter, `make()`."""
-    if module.has_variable(QUANTIZATION, name):
-        return module.get_variable(QUANTIZATION, name)
-    return make()
-
-
 def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
-    """The logical axes of each leaf of an expert bank's `matrix` (`expert_matrix`), its own `[experts, in,
-    out]` being `axes`: one leaf, the matrix; a packed bank's four (`NvFp4`), its words and block scales
-    `[experts, out, in / 8 or in / 16]`, its tensor scales `[experts]` and its form's version bytes, whole on
-    every device, in its leaves' order."""
+    """The logical axes of each leaf of an expert bank's `matrix` (`dew.nn.dense.packed_matrix`), its own
+    `[experts, in, out]` being `axes`: one leaf, the matrix; a packed bank's four (`NvFp4`), its words and
+    block scales `[experts, out, in / 8 or in / 16]`, its tensor scales `[experts]` and its form's version
+    bytes, whole on every device, in its leaves' order."""
     from dew.nn.kernels.formats import NvFp4
 
     if not isinstance(matrix, NvFp4):
@@ -571,7 +562,7 @@ def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> l
 
 
 def dense_leaf_axes(axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
-    """The logical axes of each leaf of a dense layer's packed kernel (`dew.nn.dense.dense_matrix`), its
+    """The logical axes of each leaf of a dense layer's packed kernel (`dew.nn.dense.packed_matrix`), its
     own kernel's being `axes` (a Linear's `[in, out]`): its words' and block scales' `[out, in / 8 or
     in / 16]`, its tensor scale a scalar and its form's version bytes whole on every device, in its leaves'
     order."""
@@ -580,9 +571,9 @@ def dense_leaf_axes(axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
 
 
 def decoded_banks(variables: Variables) -> Variables:
-    """`variables` with each packed bank decoded into `params` under its name: an expert bank's
-    (`expert_matrix`) `[..., experts, in, out]` float32 (a scanned run's banks stacked on its layer axis
-    before their experts), a Linear's kernel (`dew.nn.dense.dense_matrix`) `[..., in, out]`, each value its
+    """`variables` with each packed bank (`dew.nn.dense.packed_matrix`) decoded into `params` under its
+    name: an expert bank's `[..., experts, in, out]` float32 (a scanned run's banks stacked on its layer axis
+    before their experts), a Linear's kernel `[..., in, out]`, each value its
     code times its block's scale times its matrix's, exactly (`NvFp4.decoded` times its factor), the bank
     gone from `QUANTIZATION`: the float tree an export or a merge takes, as `decoded_frozen_fp8` decodes a
     frozen FP8 site."""
