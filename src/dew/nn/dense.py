@@ -77,9 +77,9 @@ def providing() -> bool:
     interception = sys.modules.get("qwix._src.interception")
     if interception is None:
         return False
-    manager = interception.interception_manager
-    providers = manager.disable_interception()
-    manager.enable_interception(providers)
+    interceptions = interception.interception_manager
+    providers = interceptions.disable_interception()
+    interceptions.enable_interception(providers)
     return bool(providers)
 
 

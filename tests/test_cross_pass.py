@@ -592,16 +592,18 @@ def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
 
 def qwix_owned(provider: str, rule: dict, spec: CrossPass = MESSAGES) -> list:
     """The gradients of a two-pass decoder passing messages by `spec`, quantized by a direct Qwix provider of
-    `rule` (`QtProvider`'s or `OdmlQatProvider`'s, jit off where Qwix finds a weight by its value), its gates
-    off zero (`gated`), each beside the same model's run as a watched merge runs (captured,
+    `rule` (`QtProvider`'s or `OdmlQatProvider`'s), its gates off zero (`gated`), each beside the same
+    model's run as a watched merge runs (captured,
     `capture_intermediates`) and the unquantized model's: `(owned, watched, plain)` leaves."""
     qwix = pytest.importorskip("qwix")
 
     model = decoder("attention", steps=2, messages=spec)
     ids = jnp.asarray(np.random.default_rng(11716).integers(0, VOCAB, (2, 12)), jnp.int32)
     made = {"qt": qwix.QtProvider, "odml": qwix.OdmlQatProvider}[provider]
-    quantized = qwix.quantize_model(model, made([qwix.QtRule(**rule)],
-                                                **({"disable_jit": True} if provider == "qt" else {})))
+    # A QAT provider's jit off where Qwix finds a weight by its value; ODML's activation check off, Dew's ops
+    # being more than its converter's (the provider's own refusal of an op it does not convert).
+    options = {"disable_jit": True} if provider == "qt" else {"strict": False}
+    quantized = qwix.quantize_model(model, made([qwix.QtRule(**rule)], **options))
     variables = gated(quantized.init(jax.random.key(0), ids), 11716)
 
     def gradients(applied, **watched):
