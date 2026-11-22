@@ -17,6 +17,7 @@ buffers it stages that product's operands in; the portable math's issuer is XLA'
 own dot."""
 
 import functools
+import inspect
 import math
 import operator
 from collections.abc import Callable, Sequence
@@ -74,19 +75,22 @@ def portable_einsum(subscripts: str, *operands):
 
 
 def suffix_sums(x: jax.Array, *, scanned: bool = False) -> jax.Array:
-    """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a
-    chunk's tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle
-    of ones (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot. As a
-    reversed cumulative sum, XLA's GPU reduce-window summed each position's window apart: Kimi delta
-    attention's decay gradient's, the one cumulative sum its training traces, took 0.336 ms of its 5.806 ms
-    on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum: a term no position's sum takes
-    meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite one NaN in every sum (a
-    turned gradient's entering-memory term of 2^126 times its cotangent, `templates.recurrence.turned`)."""
+    """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a chunk's
+    tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle of ones
+    (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot batched over `x`'s
+    leading axes, a chunk's triangle against its own tokens: one triangle against every chunk's tokens
+    contracted a middle axis XLA transposed `x` for, 134 of Kimi delta attention's training's 1723 MB of XLA
+    traffic on an A100 (row 5260). As a reversed cumulative sum, XLA's GPU reduce-window summed each
+    position's window apart: Kimi delta attention's decay gradient's, the one cumulative sum its training
+    traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum:
+    a term no position's sum takes meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite
+    one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its cotangent,
+    `templates.recurrence.turned`)."""
     x = _wide(x)
     if scanned:
         return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
     upper = jnp.triu(jnp.ones((x.shape[-2],) * 2, x.dtype))
-    return portable_einsum('ij,...jt->...it', upper, x)
+    return portable_einsum('...ij,...jt->...it', jnp.broadcast_to(upper, (*x.shape[:-2], *upper.shape)), x)
 
 
 def sums_before(x: jax.Array) -> jax.Array:
@@ -494,11 +498,13 @@ def pairs_of(products, decays, scales):
     return jnp.where(_lags(products.shape) > 0, products * decays * scales[:, None], 0.0)
 
 
-def scores_of(products, decays, scales):
+def scores_of(products, decays, scales, apart: int = 0):
     """A chunk's own pairs' scores `tril(products decays scales_t)` `[C, C]` (theme A's tile declaration of
     the readout's scores, `derived_tile`): each pair's product times its decay and its column's token's scale
-    (the keys' side's write gate, or 1), zero above the diagonal."""
-    return jnp.where(_lags(products.shape) >= 0, products * decays * scales[None, :], 0.0)
+    (the keys' side's write gate, or 1), zero above the diagonal; a readout `apart` from its group's writes
+    (`chunk_scores`') keeps the pairs of later groups of `apart` tokens alone (`_later_groups`)."""
+    kept = _later_groups(products.shape, apart) if apart else _lags(products.shape) >= 0
+    return jnp.where(kept, products * decays * scales[None, :], 0.0)
 
 
 TILES = {"pairs": pairs_of, "scores": scores_of}
@@ -525,15 +531,16 @@ def derived_tile(name: str, apart: int = 0):
     """The derived forms of the tile declaration `name` (`TILES`, the fast class), the template's: a mainloop
     forms the products and its compensated prefix's decays (representations it keeps) and takes the tile's
     algebra over them from these forms, the hand forms' own arithmetic in their order (FS-DERIVED-ID1/2). A
-    readout `apart` from its group's writes (`chunk_scores`') keeps the pairs of later groups alone, its mask
-    the declaration's own, one select of the tile."""
+    readout `apart` from its group's writes is the declaration's own form at that group (`scores_of`'s
+    `apart`); a tile declaring none refuses it."""
     from dew.algebra import SATURATION, derive
     axes = {"products": ("rows", "columns"), "decays": ("rows", "columns"),
             "scales": ("rows",) if name == "pairs" else ("columns",)}
     declared = TILES[name]
     if apart:
-        def declared(products, decays, scales):
-            return jnp.where(_later_groups(products.shape, apart), products * decays * scales[None, :], 0.0)
+        if "apart" not in inspect.signature(declared).parameters:
+            raise ValueError(f"the {name} tile declares no readout apart from its group's writes")
+        declared = functools.partial(declared, apart=apart)
     return derive.derive(derive.Reduction(declared, axes, walked="columns", exponent="e"), accurate=False,
                          saturation=SATURATION)
 

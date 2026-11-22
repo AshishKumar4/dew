@@ -27,6 +27,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Held,
     chunk_liveness,
     f32,
+    finished_form,
     fp32_operand,
     held_tile,
     key_block,
@@ -410,10 +411,13 @@ def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, hi_ref, lo_ref) -> d
 
 
 def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple,
-                      diagonal=None):
+                      diagonal=None, added: tuple = ((), (), ()), forms: tuple | None = None):
     """A key block's gradients through a chunk's pairs stored at `at` (its row and column) into `refs`
     (`dq`, `dk`, `dg`): the queries', the keys' through the gated keys (`beta k`) and their own, and the log
-    decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`. Where
+    decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`. Each
+    gradient has the fp32 tiles of `added`'s refs at its own place added in turn before it is stored in its
+    form (`forms`, fp32 each where None) through its landing (`smem`, one a gradient): the other launches'
+    parts of a gradient it finishes (`key_backward._key_pairs_back`). Where
     `diagonal` gives a token's own scores pair's gradient `[C, 1]` (scaled), `grads` were summed without
     it and it joins the queries' and keys' gradients alone: the log decay's terms never take it, a token's
     write read by its own query undecayed, its two halves `q (dS k)` and `k (dS q)` equal, each the size of
@@ -421,21 +425,34 @@ def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, opera
     suffix sum, 4e-10 at Kimi Linear's last token where float64's was 2e-17 (row 7906)."""
     (query, key, betas), (d_query, d_keyed, d_key), (row, column) = operands, grads, at
     own_query, own_key = (0.0, 0.0) if diagonal is None else (diagonal * key, diagonal * query)
-    for ref, grad in zip(refs, (d_query + own_query, d_keyed * betas[:, None] + d_key + own_key,
-                                query * d_query + key * (d_keyed * betas[:, None] - d_key)), strict=True):
-        fp32_operand(call).store(ref, grad, row, call.chunk, column, keys, family=call.family, smem=smem)
+    square = fp32_operand(call)
+    forms = (square,) * 3 if forms is None else forms
+    grads = (d_query + own_query, d_keyed * betas[:, None] + d_key + own_key,
+             query * d_query + key * (d_keyed * betas[:, None] - d_key))
+    for ref, grad, others, form, landing in zip(refs, grads, added, forms, smem, strict=True):
+        for other in others:
+            (view,) = square.views(other, row, call.chunk, column, keys)
+            grad = grad + call.family.tile_of(view)
+        form.store(ref, grad, row, call.chunk, column, keys, family=call.family, smem=landing)
     return jnp.sum(d_keyed * key, axis=1)
 
 
-def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, scale: float):
-    """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])` fp32: each chunk and value head's gradients through its
+def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, factored, memory, call: Call, *,
+                  scale: float):
+    """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])`: each chunk and value head's gradients through its
     sub-chunks' own pairs, each its own decay (`algebra.key_diagonal_pairs_back`), given the pairs'
     gradients `d_scores` and `d_system` `[R, HV * C]`: a launch of their own, no products on the tensor
     cores, as the forward's (`intra_own`), each key block's offsets reading the pairs' gradients' own
     bands (`algebra.own_bands`, taken once from the squares, laid an offset a row `[HV * SUB, R]`: each
     offset's strip a row read as a row's vector) and the keys and the tokens' own decays shifted
     (`shifted_keys`). In `_key_pairs_back`'s walk, they held an H100's Kimi Linear launch at 248
-    registers, 2268 us against 672 (M-JS-50d)."""
+    registers, 2268 us against 672 (M-JS-50d). The queries' and keys' it finishes: the factored pairs'
+    `factored` (`key_backward._key_pairs_back`'s `(dq, dk)`) and then the memory's `memory`
+    (`_key_memory_back`'s) added as it stores them, in `finished_form`'s form (stored once where a key head
+    has one value head, nothing summed after); the log decay's and beta's
+    fp32. Added in XLA, the three fp32 parts were read again and rounded apart, 343 us of Kimi Linear's
+    training on an A100 (M-JS-217); added in the factored pairs' launch, its reads cost it 187 of them, a
+    tensor cores' walk two programs a multiprocessor, where this one holds four and issues no products."""
     chunk, width, family = call.chunk, call.width, call.family
     given, gates, square = call.given, call.gates, fp32_operand(call)
     # The block a multiprocessor holds most programs of, at its registers and its shared memory: by its
@@ -445,8 +462,9 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                      functools.partial(_keypair_streams, call), contracted=True)
     steps = width // keys
 
-    def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
-                db_ref, *, streams, staging, landing):
+    def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, factored_q_ref,
+                factored_k_ref, memory_q_ref, memory_k_ref, dq_ref, dk_ref, dg_ref, db_ref, *, streams,
+                staging, landing):
         del taken_ref
         shifts, = staging
         n, h = at["chunks"], at["heads"]
@@ -486,8 +504,11 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                 shifted_keys(call, shifts, key, prefix), functools.partial(shifted_up, call),
                 (zero, zero), zero)
             d_betas = d_betas + pairs_back_stored(
-                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys, landing["block"],
-                (query, key, betas), (d_query, d_keyed, d_key), diagonal=strip("scores", scale, 0)[:, None])
+                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys,
+                (landing.get("summed", landing["block"]),) * 2 + (landing["block"],), (query, key, betas),
+                (d_query, d_keyed, d_key), diagonal=strip("scores", scale, 0)[:, None],
+                added=((factored_q_ref, memory_q_ref), (factored_k_ref, memory_k_ref), ()),
+                forms=(summed, summed, square))
 
             @pl.when(index == steps - 1)
             def _():
@@ -500,8 +521,10 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
 
     tiles = _keypair_streams(call, keys)
     staging, landing = _key_own_staged(call, keys)
-    fp32_rows = square.shape(call.heads * width)
-    out_type = (fp32_rows, fp32_rows, fp32_rows, jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
+    summed = finished_form(call, once=call.group == 1)
+    fp32_rows, summed_rows = square.shape(call.heads * width), summed.shape(call.heads * width)
+    betas = jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32)
+    out_type = (summed_rows, summed_rows, fp32_rows, betas)
     # Each offset's two pairs' terms a key, forward and moved up: the model's.
     terms = 2 * 2 * 3 * chunk * algebra.SUB * width
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
@@ -512,7 +535,8 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                          # The bands read a row at a time, at a traced offset: staged plain.
                          swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")
                                    for p in range(fp32_operand(call).parts)})(
-        q, k, hi, lo, beta, *(algebra.own_bands(d, chunk=chunk) for d in (d_scores, d_system)), taken)
+        q, k, hi, lo, beta, *(algebra.own_bands(d, chunk=chunk) for d in (d_scores, d_system)), taken,
+        *factored, *memory)
 
 
 def _keypair_streams(call: Call, keys: int) -> dict:
@@ -527,8 +551,15 @@ def _keypair_streams(call: Call, keys: int) -> dict:
 
 def _key_own_staged(call: Call, keys: int) -> tuple:
     """`key_pairs_own`'s staging at key block `keys`: its shifted reads' tile (`own_staging`; its moved
-    gradients shifted in registers, `shifted_up`), and a key block's landing."""
-    return own_staging(call, keys), {"block": fp32_operand(call).landing(call.chunk, keys)}
+    gradients shifted in registers, `shifted_up`), and a key block's landings: the fp32 one every gradient
+    but the finished queries' and keys' lands in, and theirs in `finished_form`'s where it is narrower
+    (the fp32 one where it is not, each store waiting before the landing's next), what the launch allocates
+    being what `key_block` fits (row 11953)."""
+    square, summed = fp32_operand(call), finished_form(call, once=call.group == 1)
+    landing = {"block": square.landing(call.chunk, keys)}
+    if summed.stored != square.stored:
+        landing["summed"] = summed.landing(call.chunk, keys)
+    return own_staging(call, keys), landing
 
 
 def _key_own_held(call: Call, keys: int) -> Held:

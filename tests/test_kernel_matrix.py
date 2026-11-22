@@ -5,22 +5,17 @@ whose axes, or whose route's support, change fails here until its cases are rege
 (`kernel_matrix.covering`)."""
 
 import importlib
-import itertools
 import subprocess
 import sys
 from pathlib import Path
 
+import gpu_flow
 import kernel_matrix
 import pytest
 
 from dew.nn.kernels import generation
 
 TESTS = Path(__file__).resolve().parent
-
-
-def pairs(combination: dict[str, str]) -> set[frozenset[tuple[str, str]]]:
-    """Every pair of axis values `combination` holds, each without an order."""
-    return {frozenset(pair) for pair in itertools.combinations(combination.items(), 2)}
 
 
 @pytest.mark.parametrize("family", sorted(kernel_matrix.AXES))
@@ -35,8 +30,8 @@ def test_a_familys_cells_cover_every_pair_of_axis_values_its_route_offers(family
     unaxed = [label for label, combination in cells
               if set(combination) != set(axes) or any(combination[axis] not in axes[axis] for axis in axes)]
     assert not unaxed, f"{family}'s cells name values outside its axes: {unaxed}"
-    held = set().union(*(pairs(combination) for _, combination in cells))
-    missing = {frozenset(pair) for pair in kernel_matrix.supported_pairs(family)} - held
+    held_pairs = set().union(*(gpu_flow.held(combination, values=False) for _, combination in cells))
+    missing = kernel_matrix.supported_pairs(family, already=held_pairs) - held_pairs
     assert not missing, (f"{len(missing)} pairs of {family}'s axis values its route serves are in no cell, "
                          f"e.g. {sorted(sorted(pair) for pair in missing)[:10]}: regenerate its cases from "
                          f"kernel_matrix.covering({family!r})")

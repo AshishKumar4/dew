@@ -633,6 +633,20 @@ def test_a_merge_runs_under_a_callers_unhashable_capture_filter_or_interceptor(w
     np.testing.assert_array_equal(np.asarray(logits), expected)
 
 
+def test_a_looped_decoder_runs_under_a_capture_of_every_method():
+    """A capture filter may keep every method's output (`capture_intermediates=lambda module, method: True`),
+    a method returning a submodule among them: a looped decoder's later pass reads its layers' stored
+    variables alone, never what the capture sowed, so it runs and captures methods beside the calls (row
+    11882: the layers' structures read the captured submodule as an array and refused it)."""
+    model = decoder("attention", steps=2)
+    ids = jnp.asarray(np.random.default_rng(11882).integers(0, VOCAB, (2, 12)), jnp.int32)
+    variables = gated(model.init(jax.random.key(0), ids), 11882)
+    _, captured = model.apply(variables, ids, capture_intermediates=lambda module, method: True,
+                              mutable=["intermediates"])
+    # Each capture is kept under its method's name: the decoder's `looped`, which runs its passes, among them.
+    assert "looped" in captured["intermediates"], sorted(captured["intermediates"])
+
+
 def qwix_owned(provider: str, rules: Sequence[dict], spec: CrossPass = MESSAGES) -> tuple:
     """The gradients of a two-pass decoder passing messages by `spec`, quantized by a direct Qwix provider of
     `rules` (`QtProvider`'s or `OdmlQatProvider`'s), its gates off zero (`gated`), each beside the same

@@ -463,7 +463,7 @@ def test_a_saved_fp32_gradient_under_the_highest_precision_runs_the_numbers_its_
 @INTERPRETS
 @pytest.mark.parametrize(("form", "packed"), [
     pytest.param("turned", False, id="turned-one sequence"),
-    pytest.param("turned", True, id="turned-packed"),
+    pytest.param("turned", True, id="turned-packed", marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
     pytest.param("scalar delta", False, id="scalar delta-one sequence"),
     pytest.param("scalar delta", True, id="scalar delta-packed"),
     pytest.param("rated", False, id="rated-one sequence"),
@@ -479,8 +479,9 @@ def test_an_fp32_call_on_the_template_trains_as_the_portable_math_under_the_accu
     form's two ranks a token, which no decode step takes, with the portable math's, as its bf16 cell is
     (test_recurrence_mosaic's turned call, row 7971); one it takes none of (the gated delta rule's at its
     draws' widths, no config whose launches the device holds) refused, its forced training call as check 1
-    would run it. The rated scan's packed rate gradient, a head's
-    sum over every token, was inconclusive at 40 seeds (its pooled ratio 1.33 in [0.73, 1.89]): 128."""
+    would run it. The rated scan's packed rate gradient, a head's sum over every token, was inconclusive at 40
+    seeds (its pooled ratio 1.33 in [0.73, 1.89]): 128. The turned form's packed eight seeds two tasks: whole,
+    150 s (tests/test_durations.json at fa6094e8d, row 10885)."""
     from map_judge import marked_seeds
     from test_recurrence_chunk import assert_packed_on_par, marked, token_by_token
     from test_recurrence_mosaic import LENGTH, REFUSED, TURNED, hooked_draw, taken

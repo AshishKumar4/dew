@@ -383,11 +383,10 @@ def test_a_paged_decode_step_on_this_tpu_falls_back_where_jaxs_kernel_refuses(wi
     `kv_cache.TPU_PAGED_SUPPORTS` refuses jax's Pallas paged attention: on par with the compact cache's
     reference decode (check 1) through the layer's gathered fallback where refused, and through `tpu` where
     a newer TPU's MXU takes fp32-by-bf16."""
-    from test_kv_cache import assert_paged_decode_on_par
+    from decode_matrix import assert_paged_decode_on_par
 
+    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels import generation
-    from dew.nn.models.transformer import CausalTransformer
-
     def model(layout, dtype, implementation="auto"):
         return CausalTransformer(vocab_size=64, emb_features=width * 2, num_layers=1, num_heads=4,
                                  num_kv_heads=2, head_dim=width, mlp_features=width * 2, max_seq_len=32,
@@ -396,5 +395,5 @@ def test_a_paged_decode_step_on_this_tpu_falls_back_where_jaxs_kernel_refuses(wi
     served = width % 128 == 0 and (precision is None or generation.gpu_target().fp32_by_bf16_precise)
     with jax.default_matmul_precision(precision), generation.routes() as routes:
         assert_paged_decode_on_par(model, f"a paged decode step {width} wide at {precision}",
-                                   steps=6, ref_impl="reference")
+                                   steps=6, seeds=8, ref_impl="reference")
     assert (("paged_decode", "tpu") in {(found.choice, found.kernel) for found in routes}) == served

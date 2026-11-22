@@ -247,3 +247,31 @@ def per_shard(choice: str, kernel: str) -> dict:
 
     return {"tensor": Shard(_step(case, reference=False), _drawn(case), specs, _step(case, reference=True),
                             SEEDS, "tensor", context=shard_context, target=case["generation"])}
+
+
+def assert_paged_decode_on_par(model, label: str, *, seeds: int, steps: int = 8, ref_impl: str = "auto"):
+    """Assert a paged `CausalTransformer` decode is on par with its compact cache (check 1)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.kv_cache import KVCache
+
+    def decoded(layout, dtype, implementation="auto"):
+        def run(params, tokens):
+            decoder = model(layout, dtype, implementation)
+            found, cache = [], decoder.apply(params, 2, method=CausalTransformer.init_cache,
+                                             mutable=["cache"])[1]["cache"]
+            for step in range(tokens.shape[1]):
+                logits, updated = decoder.apply({**params, "cache": cache},
+                                                tokens[:, step:step + 1], decode=True, mutable=["cache"])
+                cache = updated["cache"]
+                found.append(logits.astype(jnp.promote_types(logits.dtype, jnp.float32)))
+            return jnp.stack(found)
+
+        return jax.jit(run)
+
+    def draw(seed):
+        tokens = jax.random.randint(jax.random.key(seed), (2, steps), 0, 64)
+        return model(KVCache(), "bfloat16").init(jax.random.key(seed + 1000), tokens), tokens
+
+    assert_as_exact(decoded(KVCache(page_size=16), "bfloat16"),
+                    decoded(KVCache(), "bfloat16", ref_impl), draw, label,
+                    seeds=seeds, truth_fn=decoded(KVCache(), "float64", "reference"))

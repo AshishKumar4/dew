@@ -185,9 +185,11 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
-    `A`, and the launches' weighted keys, memories, corrected values and a forked call's stored slots,
-    `(w, h, corrected, stored)`, which the port
-    keeps unless a remat rung recomputes them (`residuals.RECOMPUTED`), the caller's choice."""
+    `A`, and the launches' weighted keys, memories, corrected values, a forked call's stored slots and under
+    a decay a key dimension its prefix halves, `(w, h, corrected, stored, halves)`, which the port keeps
+    unless a remat rung recomputes them (`residuals.RECOMPUTED`), the caller's choice: the halves, kept as
+    fla_kda keeps its decay's cumulative sum, spare the backward's intra walk their launch, Kimi Linear's
+    162 us of an A100's 8056 us training (M-JS-212)."""
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, apart=apart, values_gated=values_gated, unit_keys=unit_keys,
@@ -204,7 +206,8 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     if fused is None and skip is not None:
         o = recurrence.skip_added(o, skip, v, jnp.float32).astype(jnp.float32 if wide else run.dtype)
     assert final is not None, "a forward runs its states launch"
-    return o, final, (run.a, (run.w, run.h, run.corrected, run.stored))
+    halves = (run.hi, run.lo) if call.per_key else None
+    return o, final, (run.a, (run.w, run.h, run.corrected, run.stored, halves))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -257,11 +260,12 @@ class _Run:
                                                                             :self.value_width]
 
 
-def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool) -> tuple:
-    """`intra._intra`'s scores, system where it `solves`, and prefix halves, each sub-chunk's own pairs
-    added from a launch of their own (`own_pairs.intra_own`'s bands, placed, `algebra.placed_bands`), on the
-    entries the walk leaves zero, each rounded once: their sums exact in the outputs' forms."""
-    *walked, hi, lo = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves)
+def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool, halves=None) -> tuple:
+    """`intra._intra`'s scores, system where it `solves`, and prefix halves (`halves` where given, the
+    forward's kept), each sub-chunk's own pairs added from a launch of their own (`own_pairs.intra_own`'s
+    bands, placed, `algebra.placed_bands`), on the entries the walk leaves zero, each rounded once: their
+    sums exact in the outputs' forms."""
+    *walked, hi, lo = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves, halves=halves)
     own = own_pairs.intra_own(q, k, hi, lo, beta, taken, call, scale=scale,
                               products=("scores", "system") if solves else ("scores",))
     return (*(found + algebra.placed_bands(mine, chunk=call.chunk)
@@ -295,7 +299,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
              out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
-    `kept` values, `(w, h, corrected, stored)`, are (`kept_forward`'s; its final memory then None), its output
+    `kept` values, `(w, h, corrected, stored, halves)`, are (`kept_forward`'s; its final memory then None;
+    under a decay a key dimension the prefix halves' launch where `halves` are), its output
     landing in `out_dtype` (the operands' where None), or in fp32 where a skip is added to it after the
     launches (`skipped`, `kept_forward`), so it rounds once (`_Run.landed`). A
     skip is a call's without the delta rule alone (`skipped` with `delta` refused). The solve stores its
@@ -356,7 +361,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         # A decay a key dimension's prefix halves `[R, HV * Dk]` and its scores, and its system where the
         # call solves it (no inverse given), one launch's (`_intra`).
         solves = delta and kept is None and inverse is None
-        scores, *system, hi, lo = _paired(q, k, decays, beta, taken, call, scale=scale, solves=solves)
+        scores, *system, hi, lo = _paired(q, k, decays, beta, taken, call, scale=scale, solves=solves,
+                                          halves=None if kept is None else kept[4])
     else:
         # A decay a head's a head's row of vectors `[HV, R]`.
         hi, lo = (x.reshape(rows, heads).T for x in algebra.prefix(decays.reshape(chunks, call.chunk, -1)))
@@ -395,7 +401,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
                table=table, landed=landed)
     if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
-        (w, h, corrected, stored) = kept
+        (w, h, corrected, stored, _) = kept
         return dataclasses.replace(run, w=w, h=h, corrected=corrected, stored=stored)
     h, corrected, final, stored = _states(keys, w, u, hi, lo, beta, h0, sequences, taken, call, tiles,
                                           run.table)

@@ -711,12 +711,14 @@ def the_recurrence_witness_holds_the_delta_rules_fast_backward_natively(generati
         rw.assert_backward_witnessed(mosaic_lane(), heads=2)
 
 
-def the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively(generation_name):
+def the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively(generation_name, heads):
     """The native step witness of a decay a key dimension's fast backward
     (`recurrence_witness.assert_key_backward_witnessed`): every record each launch keeps, for a native bf16
-    call of two value heads, inside its step's enclosure."""
+    call of `heads` value heads on one key head, inside its step's enclosure: two, whose finished queries'
+    and keys' gradients land fp32 for their key head's sum, and one, Kimi Linear's, whose land in bf16
+    (`mainloop.finished_form`, row 11954)."""
     with generation.assumed(generation_name):
-        rw.assert_key_backward_witnessed(mosaic_lane(), heads=2)
+        rw.assert_key_backward_witnessed(mosaic_lane(), heads=heads)
 
 
 def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_name, width):
@@ -798,8 +800,8 @@ def test_the_native_kernels_certify_on_this_gpu():
         *(cell(the_recurrence_witness_holds_values_passed_in_parts_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_the_inference_forward_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_the_delta_rules_fast_backward_natively, g) for g in GENERATIONS),
-        *(cell(the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively, g)
-          for g in GENERATIONS),
+        *(cell(the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively, g, heads)
+          for g in GENERATIONS for heads in (1, 2)),
         *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, mask)
           for g in GENERATIONS for mask in ("causal", "full")),
         *(cell(the_attention_witness_refuses_its_faults_natively, g)

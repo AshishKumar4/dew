@@ -68,7 +68,8 @@ def assert_joined_as_exact(choice: str, run, draw, wide_run, label: str, *, seed
               generation.routes(alone=True)):
             return wide_run(*operands)
 
-    together, apart = (jax.tree.leaves(jax.jit(under(joins))(*draw(0))) for joins in (True, False))
+    # Each arm's dtypes as it traces, compiling and running neither (the check-1 site compiles each once).
+    together, apart = (jax.tree.leaves(jax.eval_shape(under(joins), *draw(0))) for joins in (True, False))
     assert [leaf.dtype for leaf in together] == [leaf.dtype for leaf in apart]
     assert_as_exact(under(joins=True), under(joins=False), draw, label, seeds=seeds, truth_fn=truth)
 

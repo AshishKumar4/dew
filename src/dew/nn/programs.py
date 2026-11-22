@@ -150,21 +150,78 @@ class DotArithmetic(NamedTuple):
     imprecise: bool
 
     @property
-    def digits(self) -> int:
-        """The significand digits a product in this algorithm keeps of each operand: the narrower side's
-        once per part it splits an operand into, as its primitive products count them (`_PARTS`). Any
-        other count states no split this reads, and is refused."""
+    def parts(self) -> int:
+        """The operand split count stated by this algorithm's primitive products (`_PARTS`); refused for any
+        unsupported operation count."""
         parts = _PARTS.get(self.operations)
         if parts is None:
             raise ValueError(f"a dot algorithm of {self.operations} primitive products states no split of "
                              "its operands into parts")
-        return parts * min(self.significands)
+        return parts
 
+    @property
+    def digits(self) -> int:
+        """The significand digits a product in this algorithm keeps of each operand: the narrower side's
+        once per part it splits an operand into (`parts`)."""
+        return self.parts * min(self.significands)
 
 # The parts a split dot algorithm takes each operand in, by its primitive products: one product of one
 # part; three of two parts' four, the low parts' product dropped (TF32x3, BF16x3); six of three parts'
 # nine, the three lowest dropped (BF16x6); all nine (BF16x9).
 _PARTS = {1: 1, 3: 2, 6: 3, 9: 3}
+
+TRITON_ALGORITHMS = tuple(preset for preset in jax.lax.DotAlgorithmPreset
+                          if preset.supported_lhs_types is not None
+                          and preset is not jax.lax.DotAlgorithmPreset.F64_F64_F64)
+"""The dot algorithms Pallas's Triton lowering runs as named (`_dot_general_lowering`): TF32's one and three
+passes and IEEE fp32 as `tt.dot`'s input precisions, each 16-bit one as its operands' own product, and a bf16
+split of fp32 operands (X3, X6, X9) as its parts' bf16 products; of those naming their operand types, it
+refuses fp64's (the default and the FP8 ones name none)."""
+
+
+def triton_dot_precision(rows: int, depth: int, columns: int, dtype, *,
+                         ieee: bool = False) -> jax.lax.DotAlgorithmPreset:
+    """Cheapest Triton dot algorithm (`TRITON_ALGORITHMS`) at least as exact as the dtype's native 16-bit
+    product or fp32's TF32 / IEEE (`ieee`) product (`dew.algebra.error.at_least`, `product_precision`,
+    rows 5473, 11878)."""
+    from dew.algebra import error
+
+    operand = jnp.dtype(dtype)
+    if operand == jnp.float32:
+        asked = (jax.lax.DotAlgorithmPreset.F32_F32_F32 if ieee
+                 else jax.lax.DotAlgorithmPreset.TF32_TF32_F32)
+    else:
+        asked = own_preset(operand)
+        if asked is None:
+            raise ValueError(f"Triton dot products take fp32 or 16-bit float operands, not {operand}")
+    return error.product_precision(rows, depth, columns, operand,
+                                   admits=error.at_least(asked, operand), stated=TRITON_ALGORITHMS)
+
+
+def triton_dot(a: jax.Array, b: jax.Array, *, ieee: bool = False) -> jax.Array:
+    """`a @ b` accumulated in fp32 with its explicit Triton dot algorithm (`triton_dot_precision`)."""
+    precision = triton_dot_precision(a.shape[-2], a.shape[-1], b.shape[-1], a.dtype, ieee=ieee)
+    return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
+
+
+MOSAIC_TPU_ALGORITHMS = {jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3: jax.lax.Precision.HIGH,
+                         jax.lax.DotAlgorithmPreset.F32_F32_F32: jax.lax.Precision.HIGHEST}
+"""The dot algorithms Pallas's Mosaic TPU lowering runs, each by the precision that names it
+(`_dot_general_lowering_rule`: `HIGH` its `contract_precision<bf16x3>`, `HIGHEST` its `<fp32>`); it takes
+no algorithm itself, and the default precision names none."""
+
+
+def mosaic_tpu_fp32_precision(m: int = 64, k: int = 64, n: int = 64) -> jax.lax.Precision:
+    """Cheapest Mosaic TPU fp32 dot precision (`MOSAIC_TPU_ALGORITHMS`) at least as exact as IEEE fp32
+    (`dew.algebra.error.at_least`, `product_precision`, rows 5473, 11879)."""
+    from dew.algebra import error
+
+    wide = jnp.dtype(jnp.float32)
+    chosen = error.product_precision(
+        m, k, n, wide,
+        admits=error.at_least(jax.lax.DotAlgorithmPreset.F32_F32_F32, wide),
+        stated=MOSAIC_TPU_ALGORITHMS)
+    return MOSAIC_TPU_ALGORITHMS[chosen]
 
 
 @functools.cache

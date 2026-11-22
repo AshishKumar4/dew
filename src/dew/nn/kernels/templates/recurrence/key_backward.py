@@ -30,6 +30,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     column_sums_scratch,
     column_tile,
     f32,
+    finished_form,
     fp32_operand,
     held_tile,
     key_block,
@@ -235,13 +236,14 @@ def _key_memory_staged(call: Call, keys: int) -> tuple:
 
 @lowered_once
 def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
-    """`(dv [R, HV * Dv], dA [R, HV * C], dbeta [HV, R])` fp32: each chunk and value head's values' part of
-    the WY representation's gradient and its system's through the inverse (`algebra.key_values_back`,
+    """`(dv [R, HV * Dv], dA [R, HV * C], dbeta [HV, R])`: each chunk and value head's values' part of the
+    WY representation's gradient and its system's through the inverse (`algebra.key_values_back`,
     `algebra.key_system_back`; fla_kda's wy_dqkg's last), from the corrected values' whole gradient `dv`
     (`_reverse`'s), the inverse less its unit diagonal `a` and the weights' part of the system's gradient
-    `d_system` (`_key_memory_back`'s), a program a chunk and value head (persistent). Apart from the memory
-    launch's walk: its last step's, beside the walk's carries, spilled 516 of its 720 bytes a thread on an
-    H100 (kda-ablate at 7d5cd5447)."""
+    `d_system` (`_key_memory_back`'s), a program a chunk and value head (persistent); `dv`, the values'
+    gradient whole, in `finished_form`'s form, the rest fp32. Apart from the memory launch's walk: its last
+    step's, beside the walk's carries, spilled 516 of its 720 bytes a thread on an H100 (kda-ablate at
+    7d5cd5447)."""
     chunk = call.chunk
     from dew.nn.kernels.templates.recurrence.mainloop_backward import _value_grads
 
@@ -250,6 +252,8 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
         call), fp32_operand(call)
     vb = call.value_block
     blocks = value_width // vb
+    # The values' gradient whole, stored once, nothing added to it after.
+    values_out = finished_form(call, once=True)
 
     def program(at, dv_ref, v_ref, a_ref, beta_ref, system_ref, taken_ref, dv_out_ref, da_ref, db_ref, *,
                 streams, staging, landing):
@@ -267,7 +271,7 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
             lower = stream_tile(slots, "lower", held)
             issue = Issuer(call, {"values_merge": values, "system_merge": system})
 
-            stored = _value_blocks(square, dv_out_ref, row, h * value_width, call, landing["values"])
+            stored = _value_blocks(values_out, dv_out_ref, row, h * value_width, call, landing["values"])
             summed, beta_terms = algebra.key_values_back(
                 functools.partial(column, "value_grads", grads), functools.partial(column, "values", given),
                 blocks, lower, family.rows_of(beta_ref.at[h, span]), held.dtype, issue, issue.summed,
@@ -282,11 +286,11 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
 
     tiles = stream_blocks(value_grads=((chunk, value_width), grads), values=((chunk, value_width), given),
                           lower=((chunk, chunk), held), system=((chunk, chunk), square))
-    out_type = (square.shape(call.heads * value_width), square.shape(call.heads * chunk),
+    out_type = (values_out.shape(call.heads * value_width), square.shape(call.heads * chunk),
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     # The values' two products a value block, then the system's two: the model's.
     model = 2 * 2 * chunk * chunk * value_width + 2 * 2 * chunk ** 3
-    landing = {"values": square.landing(chunk, vb), "square": square.landing(chunk, chunk)}
+    landing = {"values": values_out.landing(chunk, vb), "square": square.landing(chunk, chunk)}
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(5),
                          steps=1, model=model,
@@ -369,8 +373,8 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
     pairs, the scores' `scale (q . k) exp2(g_q - g_k)` and the keys' system's `beta (k . k) exp2(..)`
     (`algebra.key_decayed_pairs_back` a key block a step, the write gates' terms carried; fla_kda's intra),
     given their gradients `d_scores` (`_key_scores_back`'s) and `d_system` (`_key_memory_back`'s), read and
-    staged once a program in `_parted`'s form (`pairs_gradients`). The queries' and keys' each value head's,
-    which `gradients` sums."""
+    staged once a program in `_parted`'s form (`pairs_gradients`). The queries' and keys' the sub-chunks' own
+    pairs' launch finishes (`own_pairs.key_pairs_own`)."""
     chunk = call.chunk
     width, family = call.width, call.family
     given, gates, square = call.given, call.gates, fp32_operand(call)
@@ -447,8 +451,8 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
                 emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad))
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]
             d_betas = d_betas + own_pairs.pairs_back_stored(
-                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys, landing["block"],
-                (query(0), key(0), betas), (d_query, d_keyed, d_key))
+                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys,
+                (landing["block"],) * 3, (query(0), key(0), betas), (d_query, d_keyed, d_key))
 
             @pl.when(index == steps - 1)
             def _():
@@ -553,7 +557,8 @@ class KeyKept(NamedTuple):
     dk_pairs: jax.Array
     dg_pairs: jax.Array
     dbeta_pairs: jax.Array
-    """`_key_pairs_back`'s and `own_pairs.key_pairs_own`'s queries', keys', log decay's and beta's gradients
+    """`own_pairs.key_pairs_own`'s queries' and keys' gradients (finished, the factored pairs' and the
+    memory's added), and its and `_key_pairs_back`'s log decay's and beta's gradients
     through the pairs, summed."""
 
 
@@ -630,11 +635,13 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
         run.q, run.k, run.hi, run.lo, laid_do, run.corrected, dv2, run.h, dh, run.a, run.beta, run.taken,
         call, scale=run.scale)
     dv, d_system, dbeta_v = _key_values_back(dv2, run.v, run.a, run.beta, d_weights, run.taken, call)
-    pairs = (run.q, run.k, run.hi, run.lo, run.beta, d_scores, d_system, run.taken, call)
-    # The sub-chunks' factored pairs' gradients and their own pairs', two launches (`own_pairs`).
-    dq_p, dk_p, dg_p, dbeta_p = (factored + own for factored, own in zip(
-        _key_pairs_back(*pairs, scale=run.scale), own_pairs.key_pairs_own(*pairs, scale=run.scale),
-        strict=True))
+    pairs = (run.q, run.k, run.hi, run.lo, run.beta, d_scores, d_system, run.taken)
+    # The sub-chunks' factored pairs' gradients, then their own pairs', two launches, the latter finishing
+    # the queries' and keys' (`own_pairs.key_pairs_own`).
+    dq_f, dk_f, dg_f, dbeta_f = _key_pairs_back(*pairs, call, scale=run.scale)
+    dq_p, dk_p, dg_o, dbeta_o = own_pairs.key_pairs_own(*pairs, (dq_f, dk_f), (dq_m, dk_m), call,
+                                                        scale=run.scale)
+    dg_p, dbeta_p = dg_f + dg_o, dbeta_f + dbeta_o
     terms = (dg_m + dg_p).reshape(call.chunks, call.chunk, heads * width)
     # The memory decay's term on each chunk's last token, `sum(h dh) exp2(g_last)`, the reverse walk's value
     # blocks' sums added.
@@ -649,4 +656,4 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
 
     kept = KeyKept(run, d_scores, local, dh, dv2, dh0, decayed, dq_m, dk_m, dg_m, d_weights, dbeta_m, dv,
                    d_system, dbeta_v, dq_p, dk_p, dg_p, dbeta_p)
-    return (keyed(dq_m + dq_p), keyed(dk_m + dk_p), dv, dg, (dbeta_m + dbeta_v + dbeta_p).T, dh0, taken), kept
+    return (keyed(dq_p), keyed(dk_p), dv, dg, (dbeta_m + dbeta_v + dbeta_p).T, dh0, taken), kept

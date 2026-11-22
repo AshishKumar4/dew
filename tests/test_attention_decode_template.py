@@ -1125,6 +1125,32 @@ def test_a_decode_step_resuming_an_initial_state_near_fp32s_largest_keeps_its_ma
     def draw(seed: int):
         q, k, v, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(seed)
         return q, k, v, m, total, acc
-
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
                     "decode step resuming initial state near fp32s largest", seeds=SEEDS)
+
+
+def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth():
+    """Row 5274: one-row decode (`B=1 K=4096 d64` on sm90) computes split-K `longest` from the base 2-stage
+    prologue rather than the un-split 3-stage depth, keeping SM utilization high (`slices >= 12`), and
+    `MosaicForward.streaming` deepens stages from each slice's own tile count (`2` for short slices, `3` for
+    long `B=8 K=4096 d128` slices)."""
+    with generation.assumed("sm90"):
+        q1 = jax.ShapeDtypeStruct((1, 1, 32, 64), jnp.bfloat16)
+        k1 = jax.ShapeDtypeStruct((1, 4096, 8, 64), jnp.bfloat16)
+        work1, *_ = attention_decode.planned(
+            jnp.zeros(q1.shape, q1.dtype), k1, k1, template.spans(1, 4096, 1, causal=False),
+            template.Hooks())
+        assert work1 is not None
+        plan1 = work1["plain"]
+        import math
+        three_stage_cap = math.ceil(4096 / plan1.config.block_k) // 6
+        assert plan1.slices > three_stage_cap, (plan1, three_stage_cap)
+        tiles_per_slice = math.ceil(math.ceil(4096 / plan1.slices) / plan1.config.block_k)
+        assert plan1.config.stages <= max(2, tiles_per_slice // 2), (plan1, tiles_per_slice)
+
+        q8 = jax.ShapeDtypeStruct((8, 1, 32, 128), jnp.bfloat16)
+        k8 = jax.ShapeDtypeStruct((8, 4096, 8, 128), jnp.bfloat16)
+        work8, *_ = attention_decode.planned(
+            jnp.zeros(q8.shape, q8.dtype), k8, k8, template.spans(1, 4096, 8, causal=False),
+            template.Hooks())
+        assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)

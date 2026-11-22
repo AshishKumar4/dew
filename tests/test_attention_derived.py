@@ -579,3 +579,46 @@ def test_a_split_decodes_states_merge_and_finish_by_the_derived_forms():
                 / jnp.sum(weights * totals, axis=1)[..., None])
 
     assert_as_exact(jax.jit(combined), jax.jit(exact), states, "a split decode's combine", seeds=16)
+
+
+def test_forward_declined_checks_feasibility_without_pricing(tmp_path):
+    """`MosaicForward.declined` agrees with `derived(...) is None` without tracing kernels through
+    `price_config` / storing consumer choices, across both multi-consumer (`sm90`) and rewalked-apart
+    (`sm100`) launches (rows 11724, 11883, 11898-11900, 11923-11932, 11952)."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(tmp_path)}
+    script = "\n".join([
+        "from pathlib import Path",
+        "import jax, jax.numpy as jnp",
+        "from dew.nn.kernels import generation",
+        "from dew.nn.kernels.templates import attention as template, attention_mosaic",
+        f"cache = Path({str(tmp_path)!r})",
+        "q = jax.ShapeDtypeStruct((1, 1280, 6, 64), jnp.bfloat16)",
+        "spans = template.spans(1280, 1280, 1, causal=True)",
+        "for gen in ('sm90', 'sm100'):",
+        "    with generation.assumed(gen):",
+        "        target = generation.gpu_target()",
+        "        op, args = attention_mosaic._forward_call(q, q, q, spans, None, scale=None, natural=False)",
+        "        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)",
+        "        assert op.declined(ba, target) is None",
+        "choices = list(cache.rglob('certified_*.json'))",
+        "assert not choices, f'declined wrote choice cache: {choices}'",
+        "with generation.assumed('sm90'):",
+        "    target = generation.gpu_target()",
+        "    op, args = attention_mosaic._forward_call(q, q, q, spans, None, scale=None, natural=False)",
+        "    ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)",
+        "    assert op.derived(ba, target) is not None",
+        "assert list(cache.rglob('certified_*.json')), 'derived should have stored sm90 consumer choice'",
+        "big = jax.ShapeDtypeStruct((1, 128, 4, 1024), jnp.bfloat16)",
+        "big_spans = template.spans(128, 128, 1, causal=True)",
+        "with generation.assumed('sm80'):",
+        "    target = generation.gpu_target()",
+        "    op, args = attention_mosaic._forward_call(",
+        "        big, big, big, big_spans, None, scale=None, natural=False)",
+        "    ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)",
+        "    assert op.declined(ba, target) is not None and op.derived(ba, target) is None",
+    ])
+    subprocess.run([sys.executable, "-c", script], env=env, check=True)
