@@ -183,6 +183,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import assumed, compile_only_gpus, gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
+from dew.training.runtime import ready_process
 
 events = {"hit": 0, "miss": 0}
 
@@ -194,6 +195,8 @@ def heard(event, *args, **kwargs):
 
 
 jax.monitoring.register_event_listener(heard)
+# Readied as a run is, its Mosaic GPU lowerings kept beside its compilation cache (`_cache.keep_lowerings`).
+ready_process()
 mesh = Mesh(np.array(compile_only_gpus("sm90")), ("devices",))
 shapes = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(mesh, PartitionSpec()))
           for shape in ((1, 512, 4, 64), (1, 512, 2, 64), (1, 512, 2, 64))]
