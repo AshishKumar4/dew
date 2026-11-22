@@ -694,6 +694,15 @@ def the_recurrence_witness_holds_values_passed_in_parts_natively(generation_name
         rw.assert_parts_witnessed(mosaic_lane(), heads=2)
 
 
+def the_recurrence_witness_holds_the_inference_forward_natively(generation_name):
+    """The native step witness of a bf16 forward no gradient follows
+    (`recurrence_witness.assert_inference_witnessed`): with the delta rule and without it, two value heads,
+    its states then output launches at its own tiles (`Tiles.forward`), its native configurations' records
+    each inside its step's enclosure, as the interpreted witness holds them (row 10665)."""
+    with generation.assumed(generation_name):
+        rw.assert_inference_witnessed(mosaic_lane(), heads=2)
+
+
 def the_recurrence_witness_holds_the_delta_rules_fast_backward_natively(generation_name):
     """The native step witness of the delta rule's fast backward
     (`recurrence_witness.assert_backward_witnessed`): every record each launch keeps, for a native bf16 call
@@ -787,6 +796,7 @@ def test_the_native_kernels_certify_on_this_gpu():
           for w in (64, 128)),
         *(cell(the_recurrence_witness_holds_a_write_gate_on_the_keys_side_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_values_passed_in_parts_natively, g) for g in GENERATIONS),
+        *(cell(the_recurrence_witness_holds_the_inference_forward_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_the_delta_rules_fast_backward_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively, g)
           for g in GENERATIONS),

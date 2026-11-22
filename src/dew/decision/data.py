@@ -17,7 +17,7 @@ from dew.batch import Batch
 from dew.data.facts import PerMember
 from dew.data.lowering import prepared_rows
 from dew.data.pipeline import Configured, Dataset, Pipeline, Stage, mix
-from dew.data.sources.base import Read, Rows, Source, View, _consumed, stated as store_facts
+from dew.data.sources.base import Read, Rows, Source, Stated, View, _consumed, asked, stated as store_facts
 from dew.decision.questions import Choice, Question
 
 
@@ -455,22 +455,27 @@ class _DecisionSource(View[Source]):
             self._facts["options"] = max(self._facts.get("options", 0),
                                          max((len(question.options) for question in asked), default=0))
 
-    def metadata(self) -> Mapping[str, object]:
-        stated = self.source.metadata()
-        if self.table is not None:
-            names = (
-                self.table.options
-                or tuple(self._classes)
-                or _records.strings(
-                    record(stated.get("class_names", {}), "class names").get(self.table.label, ()),
-                    "class names",
-                )
-            )
-            if names:
-                valued = not self.table.options and bool(self._valued)
-                return {**stated, "slots": {"questions": 1, "options": len(names)}, "decision_options": names,
-                        **({"decision_options_by_value": True} if valued else {})}
-        return {**stated, "slots": self._facts} if self._facts else stated
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
+        """Its slots and, a table's, its options, each read only where asked (row 11895: its own
+        `metadata` stated them, which its asked facts did not)."""
+        return {"slots": self._slots, "decision_options": lambda: self._names() or None,
+                "decision_options_by_value": self._by_value}
+
+    def _names(self) -> tuple[str, ...]:
+        """A table's options: its own, the classes its rows hold, or its store's class names."""
+        if self.table is None:
+            return ()
+        stated = asked(self.source, frozenset({"class_names"}))
+        return (self.table.options or tuple(self._classes) or _records.strings(
+            record(stated.get("class_names", {}), "class names").get(self.table.label, ()), "class names"))
+
+    def _slots(self) -> Stated:
+        names = self._names()
+        return {"questions": 1, "options": len(names)} if names else (dict(self._facts) or None)
+
+    def _by_value(self) -> Stated:
+        valued = self.table is not None and not self.table.options and bool(self._valued)
+        return True if valued and self._names() else None
 
 
 

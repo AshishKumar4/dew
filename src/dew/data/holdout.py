@@ -21,9 +21,11 @@ from dew.data.sources.base import (
     Shard,
     ShardManifest,
     Source,
+    Stated,
     View,
     _indexed_manifest,
     _uncounted,
+    asked,
     stated,
 )
 from dew.data.sources.codec import content_fingerprint
@@ -90,8 +92,8 @@ class RecordSlice(View[Source]):
             raise ValueError(f"{self.describe()} exceeds the source's {records} records")
         return self.start, stop
 
-    def metadata(self) -> Mapping[str, object]:
-        return {**super().metadata(), **({"held_out": self.start} if self.start else {})}
+    def _own(self) -> Mapping[str, Callable[[], Stated]]:
+        return {"held_out": lambda: self.start} if self.start else {}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -298,13 +300,30 @@ class SelectedGeneration(View[Source]):
         # A worker reads the placed rows alone (`_Placed`), not the store that placed them.
         return _indexed_manifest(self, self.generation.url, 4096, _Placed(self.generation, self._dense))
 
+    def asked(self, keys: frozenset[str]) -> Mapping[str, object]:
+        """Those of its facts (`metadata`) named by `keys`, each read alone (`_facts`)."""
+        return self._facts(keys)
+
     def metadata(self) -> Mapping[str, object]:
         """The selections' facts, as uncached (what they hold out included), with this part's rows and
-        the generation's count rules."""
-        rules = _GenerationSource(self.generation).metadata()
-        return {**_uncounted(self.selections[0].metadata()), "rows": len(self._dense),
-                "accepted_rows": len(self._dense),
-                **({"count_rules": rules["count_rules"]} if "count_rules" in rules else {})}
+        the generation's count rules (`_facts`)."""
+        return self._facts(None)
+
+    def _facts(self, keys: frozenset[str] | None) -> Mapping[str, object]:
+        """Its facts, all of them or those `keys` names, by one policy (row 11883): its selections',
+        uncounted, asked of them alone where `keys` names some; then its own, each read only where asked:
+        its rows, and its generation's count rules where it states them."""
+        inherited = self.selections[0].metadata() if keys is None else asked(self.selections[0], keys)
+
+        own = {"rows": lambda: len(self._dense), "accepted_rows": lambda: len(self._dense),
+               "count_rules": lambda: _GenerationSource(self.generation).metadata().get("count_rules")}
+        facts = dict(_uncounted(inherited))
+        for key, read in own.items():
+            if keys is None or key in keys:
+                value = read()
+                if value is not None:
+                    facts[key] = value
+        return facts if keys is None else {key: value for key, value in facts.items() if key in keys}
 
     def stated(self) -> Mapping[str, object]:
         return _uncounted(stated(self.source))

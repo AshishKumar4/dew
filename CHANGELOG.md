@@ -175,7 +175,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post121 and, on Linux x86_64 and aarch64, its own jaxlib build
+- Dew requires its JAX build 0.12.0.1.post123 and, on Linux x86_64 and aarch64, its own jaxlib build
   0.12.0.1.post120, with its CUDA and PJRT plugins 0.12.0.1.post120 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
@@ -232,8 +232,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   mixed-precision dot multiplies in one, where XLA:GPU refused a paged decode's gathered reference under
   deterministic ops; a thread map's body compiles once; and XLA:CPU's collectives wait for the last one to
   complete, where a CPU program of collectives in loops aborted on a rendezvous timeout; and a complex dot under an
-  explicit algorithm keeps its imaginary parts, where F32_F32_F32 dropped them without a warning. Elsewhere jaxlib
-  stays the stock 0.12.0.1.
+  explicit algorithm keeps its imaginary parts, where F32_F32_F32 dropped them without a warning; a Mosaic GPU
+  kernel's lowering-cache key reads the rules its lowering can reach alone, and an interpreted kernel's scoped
+  allocation is one callback each way; a Triton kernel's lowering looks its dialects up once,
+  a Mosaic GPU kernel's lowering-cache key holds its device and a custom derivative by identity, and a kernel's
+  record is read through one typed reader. Elsewhere jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes

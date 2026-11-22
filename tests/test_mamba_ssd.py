@@ -189,12 +189,14 @@ def _port_holds_check_1(case):
             mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
 
     forms = [pinned(heads_pins(heads)) for heads in CASES[case]]
-    if case == "bf16":
-        # Every variant a tuning run may pick (`mamba_ssd._Launch.variants`: mamba_ssm's A100 picks), each
-        # launch at its i-th in turn, held to the gate as the derived configs are: every one pinned, the
-        # first among them, which sorts by its fields (`configs_by_kernel`), not as the heuristic's (an A100
-        # two-warp `ChunkState` pick sorted first at the seeded geometry, the default arm never taking it).
-        variants = configs_by_kernel(functools.partial(run, 0), inputs)
+    # Every variant a tuning run may pick (`mamba_ssd._Launch.variants`), each launch at its i-th in turn,
+    # held to the gate as the derived configs are, wherever a launch has more than its derived one (the bf16
+    # case's mamba_ssm A100 picks; offered the fp32 cases, they once passed no gate, row 10882): every one
+    # pinned, the first among them, which sorts by its fields (`configs_by_kernel`), not as the heuristic's
+    # (an A100 two-warp `ChunkState` pick sorted first at the seeded geometry, the default arm never taking
+    # it).
+    variants = configs_by_kernel(functools.partial(run, 0), inputs)
+    if any(len(found) > 1 for found in variants.values()):
         forms += [pinned({kernel: found[i] for kernel, found in variants.items() if len(found) > i})
                   for i in range(max(len(found) for found in variants.values()))]
     count = len(forms)

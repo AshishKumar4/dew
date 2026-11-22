@@ -1259,3 +1259,72 @@ def test_a_ragged_grouped_forward_at_its_derived_tile_is_its_groups_products(gpu
     exact = np.einsum("rk,rkn->rn", np.asarray(rows, np.float64), np.asarray(matrices, np.float64)[group_of])
     np.testing.assert_array_equal(np.asarray(got, np.float64), exact)
 
+
+def test_mosaic_completed_starts_unstarted_gathered_b200_producer():
+    """`_Mosaic.completed` completes an unstarted gathered B200 tile with `producers.started`, matching what
+    `derived` starts at so pinned and explicit configs lower the same producer share the planner priced
+    (row 7083)."""
+    from dew.nn.kernels.templates.gemm import producers, tiling
+
+    launch = grouped_matmul.MosaicGmm()
+    ba = launch.bind(jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((4, 1024, 1024), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((4,), jnp.int32), (), (), None, None,
+                     jax.ShapeDtypeStruct((4096,), jnp.int32),
+                     out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    unstarted = tiling.Tiles(128, 128, 64, 4, 1, warpgroups=1, family="tcgen05")
+    with generation.assumed("sm100"):
+        completed = launch.completed(ba, unstarted)
+        expected = producers.started(launch, ba, unstarted)
+    assert completed == expected and completed.producers.of(launch.KERNEL) is not None, completed
+
+
+def test_mosaic_tgmm_split_pricing_preserves_final_output_dtype():
+    """`MosaicTgmm._split_tile` passes the original `out_dtype` (not the fp32 partials' dtype) into the split
+    planner so a bf16 kernel gradient prices its final store at 2 bytes (row 8296)."""
+    seen_stored: list[int] = []
+
+    class _ObservedTgmm(grouped_matmul.MosaicTgmm):
+        def _splits(self, ba, tile, target) -> int:
+            seen_stored.append(self._contraction(ba, tile, target)["stored"])
+            return super()._splits(ba, tile, target)
+
+    launch = _ObservedTgmm()
+    target = generation.gpu_target("sm90")
+    ba_bf16 = launch.bind(jax.ShapeDtypeStruct((8192, 128), jnp.bfloat16),
+                          jax.ShapeDtypeStruct((8192, 128), jnp.bfloat16),
+                          jax.ShapeDtypeStruct((1,), jnp.int32),
+                          out_dtype="bfloat16", interpret=False, dense=True)
+    with generation.assumed("sm90"):
+        tile = launch._split_tile(ba_bf16, target)
+    assert tile is not None and tile.splits > 1 and launch.legal(ba_bf16, tile, target), tile
+    assert len(seen_stored) >= 2 and set(seen_stored) == {2}, seen_stored
+
+def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
+    """Passing an explicit `target` to `MosaicGmm.derived`, `legal`, `takes`, `launch_of` and `staged_bytes`
+    plans for that target, including its recorded refusals, rather than the ambient `generation.gpu_target()`
+    (row 10986)."""
+    from dew.nn.kernels.templates import report
+
+    launch = grouped_matmul.MosaicGmm()
+    ba = launch.bind(jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((4, 1024, 1024), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((4,), jnp.int32),
+                     out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    sm86 = generation.gpu_target("sm86")
+    with generation.assumed("sm86"):
+        expected_tile = launch.derived(ba, sm86)
+        assert expected_tile is not None
+        expected_staged = launch.staged_bytes(ba, expected_tile, sm86)
+        expected_launch = launch.launch_of(ba, expected_tile, sm86)
+        sm86_identity = report._identity(launch, ba)
+    with generation.assumed("sm80"):
+        got_tile = launch.derived(ba, sm86)
+        assert got_tile == expected_tile
+        assert launch.legal(ba, got_tile, sm86) and launch.takes(ba, got_tile, sm86)
+        assert launch.staged_bytes(ba, got_tile, sm86) == expected_staged
+        assert launch.launch_of(ba, got_tile, sm86).most == expected_launch.most
+        with report.refusals():
+            report.refuse([(sm86_identity, expected_tile, (launch.KERNEL,))])
+            assert not launch.legal(ba, expected_tile, sm86)
+            assert not launch.takes(ba, expected_tile, sm86)

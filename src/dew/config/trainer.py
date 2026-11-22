@@ -225,9 +225,6 @@ class TrainerConfig:
     host (`Checkpoints`); a resume reads the newer of the two. Set with `local_every`, or neither."""
     local_every: int | str | None = None
     """The steps between local checkpoints, or a share of the run such as "5%" (`local_directory`)."""
-    export_model: bool = False
-    """Write each persistent step's model whole beside it, its frozen collections and EMA as their own
-    arrays, which stock Orbax reads without Dew (`Checkpoints.export_model`)."""
     scored_to: str | None = None
     """A directory that takes every validation batch's scoring artifacts at each evaluation, a decision
     run's decisions among them, as `<scored_to>/step-<step>/<split>-<batch>.npz`, for pooling a pass's
@@ -491,8 +488,7 @@ class TrainerConfig:
         `local_directory`, so runs sharing a local disk resume each only its own."""
         return Checkpoints(self.directory(name) if directory is None else directory, keep=self.keep,
                            local_directory=None if self.local_directory is None else os.path.join(
-                               self.local_directory, name), local_every=self.local_every,
-                           export_model=self.export_model)
+                               self.local_directory, name), local_every=self.local_every)
 
     def source_placement(self, *, frozen: bool) -> SourcePlacement:
         """Where a run that starts from a source (`Pretrained.load`) reads it: the load's keywords,

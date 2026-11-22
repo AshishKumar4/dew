@@ -76,22 +76,26 @@ by up to 10^4 over its windows, so one draw's error is too heavy-tailed for its 
 within 512 seeds: each seed pools this many independent draws. The corner's one-token window (growth
 to 10^13 over eleven steps) and its outer gradient do not narrow by pooling (at 128 draws a seed the
 documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): their error is the
-amplified rows', so their sites weigh each element's error by the loop's own rounding there
-(`assert_as_exact`'s `conditioning`, `CORNER_SEEDS`)."""
+amplified rows'. Over packed and padded rows check 1 decides them unweighted by their typical draw (the
+pooled ratio ruled by the few draws both arms amplify alike); over one document a row, whose draws' log
+ratios spread 0.61 (the forward) and 0.85 (the gradient's continuum kernel) past the 0.4 that rule reads,
+each element's error is weighed by the loop's own rounding there (`assert_as_exact`'s `conditioning`,
+`CORNER_SEEDS`; row 4813)."""
 
 
-CORNER_SEEDS = {("forward", "documents"): 256, ("forward", "packed"): 128, ("forward", "padded"): 16,
-                ("gradient", "documents"): 32, ("gradient", "packed"): 8, ("gradient", "padded"): 8}
-"""Check 1's declared seeds for the corner's weighed check (`conditioning`): the one-token window's
-forward, one draw a seed, sized paired by `seeds_for` with `conditioning`, its heavy elements judged apart,
-on armada (job 20261103023911-6644f0e9), and the outer gradient through windows of three, `CORNER_WINDOWS`
-draws a seed (job 20261102191535-92e11e67). Each corner site's unweighted check, whose sizing never
-resolves, declares MOST_SEEDS, the cap, and spends it with its REDRAW stage before the weighed check
-decides. CI runs each check's draws as map tasks of its own (`check1_shards`), sized at about 120 s each by
-what they took on armada (jobs 20261103070212-f64ea8ad and 20261103073640-ff8aecf0), a site a layout
-(`forward_corner`, `gradient_corner`): the forward's unweighted check about 7 s and a draw 0.012 s, its
-weighed 25 s and a draw 0.3 s; the gradient's unweighted 16 s and a draw 0.06 s, its weighed 70 s and a
-draw 1 s."""
+CORNER_SEEDS = {("forward", "documents"): 256, ("gradient", "documents"): 32}
+"""Check 1's declared seeds for the corner's weighed check (`conditioning`), one document a row alone, which
+its unweighted check leaves undecided at MOST_SEEDS (row 4813: packed and padded rows pass it unweighted
+over its 2560 seeds, armada 2026-11-22, their typical draws' ratios 1.01 to 1.05 over the first 512): the
+one-token window's forward, one draw a seed, sized paired by `seeds_for` with `conditioning`, its heavy
+elements judged apart, on armada (job 20261103023911-6644f0e9), and the outer gradient through windows of
+three, `CORNER_WINDOWS` draws a seed (job 20261102191535-92e11e67). Each corner site's unweighted check,
+whose sizing never resolves, declares MOST_SEEDS, the cap, and spends it with its REDRAW stage before the
+weighed check decides, where it has one. CI runs each check's draws as map tasks of its own
+(`check1_shards`), sized at about 120 s each by what they took on armada (jobs 20261103070212-f64ea8ad and
+20261103073640-ff8aecf0), a site a layout (`forward_corner`, `gradient_corner`): the forward's unweighted
+check about 7 s and a draw 0.012 s, its weighed 25 s and a draw 0.3 s; the gradient's unweighted 16 s and a
+draw 0.06 s, its weighed 70 s and a draw 1 s."""
 
 
 def corner(rate: float, scale: float, window: int, damped: bool = False) -> bool:
@@ -322,9 +326,10 @@ def test_the_scan_steps_the_level_as_equation_71(kind, window, rate, scale):
 def forward_corner(kind: str) -> None:
     """At the corner over `kind`'s layout, 0.5 N(0, 1) weights stepped by a half every token, where gradient
     descent diverges and a row's rounding grows by 10^13 over eleven steps (`CORNER_WINDOWS`), each target's
-    loss is on par with the literal loop's (check 1), each element's error weighed by the loop's own
-    rounding there (`conditioning`, ledger 1714). A test a layout, as `gradient_corner`'s: a map task sets
-    up its own layout's programs alone, and records only that layout's units."""
+    loss is on par with the literal loop's (check 1), unweighted, and over one document a row, where that
+    check stays undecided, each element's error weighed by the loop's own rounding there (`conditioning`,
+    `CORNER_SEEDS`, ledger 1714). A test a layout, as `gradient_corner`'s: a map task sets up its own layout's
+    programs alone, and records only that layout's units."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = ChunkAdaptation(window=1, rate=0.5)
 
@@ -338,7 +343,7 @@ def forward_corner(kind: str) -> None:
 
     assert_as_exact(jax.jit(dew), reference(truth=False), draw,
                     f"the one-token window at the corner over {kind}", seeds=MOST_SEEDS,
-                    truth_fn=reference(truth=True), conditioning=CORNER_SEEDS["forward", kind])
+                    truth_fn=reference(truth=True), conditioning=CORNER_SEEDS.get(("forward", kind)))
 
 
 @pytest.mark.check1_shards(seeds=512, per_task=2048, conditioning=256, conditioning_per_task=256)
@@ -347,14 +352,14 @@ def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_weighed_ov
     forward_corner("documents")
 
 
-@pytest.mark.check1_shards(seeds=512, per_task=2048, conditioning=128, conditioning_per_task=256)
-def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_weighed_over_packed_rows():
+@pytest.mark.check1_shards(seeds=512, per_task=2048)
+def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_over_packed_rows():
     """`forward_corner` over rows packed with documents."""
     forward_corner("packed")
 
 
-@pytest.mark.check1_shards(seeds=512, per_task=2048, conditioning=16, conditioning_per_task=80)
-def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_weighed_over_padded_rows():
+@pytest.mark.check1_shards(seeds=512, per_task=2048)
+def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_over_padded_rows():
     """`forward_corner` over packed rows padded inside documents and after them."""
     forward_corner("padded")
 
@@ -362,9 +367,10 @@ def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_weighed_ov
 def gradient_corner(kind: str) -> None:
     """The outer loss's gradient through the windows' steps at the corner over `kind`'s layout, 0.5 N(0, 1)
     weights stepped by a half every three tokens (`CORNER_WINDOWS`), on par with the literal loop's (check
-    1), each element's error weighed by the loop's own rounding there (`conditioning`, ledger 1714),
-    `CORNER_WINDOWS` draws a seed. A test a layout: its weighed check's tapped program compiles in about 70 s
-    a layout, so CI's map tasks of one layout each hold about 120 s (`check1_shards`)."""
+    1), unweighted, and over one document a row, where that check stays undecided, each element's error
+    weighed by the loop's own rounding there (`conditioning`, `CORNER_SEEDS`, ledger 1714), `CORNER_WINDOWS`
+    draws a seed. A test a layout: its weighed check's tapped program compiles in about 70 s a layout, so
+    CI's map tasks of one layout each hold about 120 s (`check1_shards`)."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = ChunkAdaptation(window=3, rate=0.5)
 
@@ -377,7 +383,7 @@ def gradient_corner(kind: str) -> None:
 
     site(differentiated(weighted_loss(fields, adaptation)), reference, gradient_draw, 0.5, 0.5, 3,
          f"the outer gradient at the corner over {kind}", MOST_SEEDS,
-         conditioning=CORNER_SEEDS["gradient", kind])
+         conditioning=CORNER_SEEDS.get(("gradient", kind)))
 
 
 @pytest.mark.check1_shards(seeds=512, per_task=768, conditioning=32, conditioning_per_task=20)
@@ -386,14 +392,14 @@ def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_weighed_over
     gradient_corner("documents")
 
 
-@pytest.mark.check1_shards(seeds=512, per_task=768, conditioning=8, conditioning_per_task=20)
-def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_weighed_over_packed_rows():
+@pytest.mark.check1_shards(seeds=512, per_task=768)
+def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_over_packed_rows():
     """`gradient_corner` over rows packed with documents."""
     gradient_corner("packed")
 
 
-@pytest.mark.check1_shards(seeds=512, per_task=768, conditioning=8, conditioning_per_task=20)
-def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_weighed_over_padded_rows():
+@pytest.mark.check1_shards(seeds=512, per_task=768)
+def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_over_padded_rows():
     """`gradient_corner` over packed rows padded inside documents and after them."""
     gradient_corner("padded")
 

@@ -55,7 +55,7 @@ from dew.nn.continuum import (
     level_parameters,
     with_level_parameters,
 )
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, pre_call_capture
 from dew.quantization import LinearProducts
 
 from ..activations import GatedActivation
@@ -1222,6 +1222,7 @@ class CausalTransformer(LinearProducts):
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
     @nn.nowrap
+    @pre_call_capture
     def capture_layers(self, module: nn.Module, method: str) -> bool:
         """The `capture_intermediates` filter that keeps every layer's output (`LayerStates`).
 

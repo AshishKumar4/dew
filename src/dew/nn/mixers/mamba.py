@@ -64,12 +64,24 @@ from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.sharding import explicit_spec, rows_like
-from dew.nn.ssm import affine_states
+from dew.nn.ssm import UNROLLED, affine_states
 
-CHUNK_SIZE = 64
-"""Tokens per recurrence chunk (`ssm.affine_states`). Each chunk materialises
-its `[B, C, D, N]` decays and writes, so the chunk bounds the scan's memory;
-the output does not depend on it."""
+CHUNK_SIZE = UNROLLED
+"""Tokens per recurrence chunk (`ssm.affine_states`): its straight-line block
+(`ssm.UNROLLED`), the most a chunk takes (`_chunk_checked`). Each chunk
+materialises its `[B, C, D, N]` decays and writes, so the chunk bounds the
+scan's memory; the output does not depend on it."""
+
+
+def _chunk_checked(chunk_size: int) -> int:
+    """`chunk_size`, a chunk's tokens, where a chunk takes it: 1 to the tokens
+    `ssm.affine_states` runs straight-line (`ssm.UNROLLED`, row 8796); refused
+    otherwise, by the layer as it is built and by `selective_scan` called
+    alone."""
+    if not 1 <= chunk_size <= UNROLLED:
+        raise ValueError(f"chunk_size counts tokens per chunk, 1 to {UNROLLED} (ssm.affine_states runs a "
+                         f"chunk straight-line), got {chunk_size}")
+    return chunk_size
 
 
 def _spread(t: jax.Array, channels: int) -> jax.Array:
@@ -115,6 +127,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     it stores at documents' last chunks (`AlignedDocuments`); the final state is
     the row's last.
     """
+    chunk_size = _chunk_checked(chunk_size)
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, channels = x.shape
@@ -236,8 +249,7 @@ class Mamba(nn.Module):
         return self.model_flops(lengths) - ssd_flops(lengths, 1, self.state_size, self.intermediate_size)
 
     def setup(self):
-        if self.chunk_size < 1:
-            raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
+        _chunk_checked(self.chunk_size)
         dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         self.in_proj = dense(2 * self.intermediate_size, use_bias=self.use_bias, name='in_proj',

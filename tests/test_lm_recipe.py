@@ -940,7 +940,7 @@ def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoint
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     looping = ("--loop-steps", "2", "--loop-layers", "0", "1", "--loop-messages")
     shaped = ("--max-new-tokens", "0", *looping, "--loop-message-block-size", "1", "--loop-message-rank", "2",
-              "--no-loop-message-additive")
+              "--loop-message-additive", "False")
     config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), *shaped),
                          default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
     objective = config.prepare().train("messaged")
@@ -979,6 +979,15 @@ def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoint
                                    *looping),
                        default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
     assert kept.looped(start).model.loop.messages == held
+    # A run stating additive messages takes them over a checkpoint's that dropped them, and one stating
+    # nothing keeps the checkpoint's (row 11742: stating them on was read as stating nothing).
+    dropped = loaded.with_model(loaded.model.with_passes(2, (0, 1), messages=dataclasses.replace(
+        held, additive=False)), key=0)
+    for stated, additive in ((("--loop-message-additive", "True"), True), ((), False)):
+        restated = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--max-new-tokens", "0",
+                                           *looping, *stated),
+                               default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+        assert restated.looped(dropped).model.loop.messages.additive is additive, stated
 
 
 def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):

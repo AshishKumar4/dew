@@ -1155,26 +1155,31 @@ def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
 
 def test_deepseek_v4_mtp_matches_released_raw_stream_composition():
     source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    model = source.model
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
-    hidden, streams = source.model.apply(source.variables, ids, method=source.model.hidden_and_mtp_inputs)
-    streams = jnp.asarray(streams)
-    actual = source.model.apply(source.variables, streams, ids, method=source.model.mtp_logits)[0]
+
+    # Each call one program (row 11764: called op by op, each layer's every span compiled its own).
+    def called(method, **options):
+        return jax.jit(lambda variables, *args: model.apply(variables, *args, method=method, **options))
+
+    hidden, streams = called(model.hidden_and_mtp_inputs)(source.variables, ids)
+    mtp_logits = called(model.mtp_logits)
+    actual = mtp_logits(source.variables, streams, ids)[0]
     expected = np.load(DEEPSEEK_V4 / 'mtp_logits.npy')
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
-    cache = source.model.apply(source.variables, ids.shape[0], method=source.model.init_mtp_cache,
-                               mutable=['cache'])[1]['cache']
+    cache = model.apply(source.variables, ids.shape[0], method=model.init_mtp_cache,
+                        mutable=['cache'])[1]['cache']
+    step = called(model.mtp_step, decode=True, mutable=['cache'])
     start = 0
     for size in (3, 1, 5, 2):
-        (logits, prediction), updated = source.model.apply(
-            {**source.variables, 'cache': cache}, streams[:, start:start + size],
-            ids[:, start + 1:start + size + 1], method=source.model.mtp_step,
-            decode=True, mutable=['cache'])
+        window = streams[:, start:start + size], ids[:, start + 1:start + size + 1]
+        (logits, prediction), updated = step({**source.variables, 'cache': cache}, *window)
         np.testing.assert_allclose(logits, expected[:, start:start + size], atol=1e-4, rtol=0)
         assert prediction.shape == streams[:, start:start + size].shape
         cache = updated['cache']
         start += size
     with pytest.raises(ValueError):
-        source.model.apply(source.variables, hidden, ids, method=source.model.mtp_logits)
+        mtp_logits(source.variables, hidden, ids)
 
 
 # --------------------------------------------------------------------------

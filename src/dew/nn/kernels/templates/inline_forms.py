@@ -4,6 +4,8 @@ assembly (`plgpu.inline_mgpu`, LLVM's `inline_asm` on each 32-bit word of each r
 the form's own instructions on the pipes its steps name rather than XLA's lowering of their `jax.numpy`
 reading (`BitForm.traced`, which an interpreter runs, where no inline assembly does)."""
 
+import math
+
 import numpy as np
 from jax import numpy as jnp
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments
@@ -13,14 +15,20 @@ from jax.extend.mlir.dialects import vector as mgpu_vector
 from jaxlib.mlir.dialects import llvm as mgpu_llvm
 
 from dew.algebra import bits
+from dew.nn.kernels.templates import emission
 
 
 def registers(form: bits.BitForm, words, layout) -> tuple:
     """Each output register of `form` over `words` (uint32, a register tile in `layout`), as `form.traced`
-    gives them, each a uint32 tile in `layout`."""
+    gives them, each a uint32 tile in `layout`; its work the form's over every word (`BitForm.work`), which
+    a kernel's emission counts where the body, opaque to it, is inlined (`emission.stating`)."""
     typed = plgpu.ShapeDtypeStruct(words.shape, jnp.dtype(jnp.uint32), layout=layout)
-    return plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed,) * len(form.outputs))(
-        lambda ctx, words: tuple(_asm(words, form.ptx(output)) for output in range(len(form.outputs))))(words)
+
+    @emission.stating(lambda stored: form.work(math.prod(stored.shape)))
+    def decoded(ctx, words):
+        return tuple(_asm(words, form.ptx(output)) for output in range(len(form.outputs)))
+
+    return plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed,) * len(form.outputs))(decoded)(words)
 
 
 def _asm(array, ptx: str):

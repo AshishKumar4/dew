@@ -1611,3 +1611,16 @@ def test_a_served_walks_initial_state_traces_under_a_compile_only_mesh():
     key = jax.eval_shape(lambda: jax.random.key(0))
     with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("sm90", 1)), ("data",))):
         jax.jit(lambda x, key: _initial(Euler(), process, grid, x, key)).trace(sample, key)
+
+
+def test_a_saved_decoder_naming_a_layer_kind_at_its_defaults_reads_as_its_class_record():
+    """A saved run's decoder whose layer kind is a class record naming its class alone, every field at its
+    default (as a record of one writes it), reads as that record with its fields empty, not refused for
+    the fields it leaves out (`earlier_shapes`, row 11823: it raised KeyError 'fields')."""
+    from dew.inference.tasks import earlier_shapes
+
+    kind = {"class": "dew.nn.backbones.layer_plan:LayerKind"}
+    record = {"model": {"class": "dew.nn.backbones.causal_transformer:CausalTransformer",
+                        "fields": {"kinds": {"dense": kind}}}}
+    assert earlier_shapes(record)["model"]["fields"]["kinds"] == {"dense": {**kind, "fields": {}}}
+

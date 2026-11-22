@@ -130,9 +130,9 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     `key_backward`) against recorded fla-core's (`fla_sites`: chunk_gated_delta_rule's, chunk_kda's), from
     the forward's memories kept, under a remat rung that recomputes them (`recomputing`) recomputed, or under
     a checkpoint saving the delta rule's names kept by them. A call the template refuses is checked refused
-    and its gradient on the mainloop's rule (`on_the_mainloop`). A gradient the fast backward does not take,
-    an fp32 call's outside the run's fast forms (`mainloop_backward.fast_backward_form`) or one whose launches
-    the device does not hold (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector
+    and its gradient on the mainloop's rule (`on_the_mainloop`). A gradient the fast backward does not take
+    (`mainloop_backward.fast_backward_form`) or one whose launches the device does not hold
+    (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector
     gives it the port or the portable math, whose check 1
     test_recurrence_chunk holds (row 1926: no kernel falls back inside itself)."""
     hooks = case_hooks(case)
@@ -460,40 +460,57 @@ def test_a_saved_fp32_gradient_under_the_highest_precision_runs_the_numbers_its_
     assert any(call.name.startswith("recurrence_values_back") for call in kernel_calls(lowered, unrun=True))
 
 
-def test_mosaic_held_prices_backward_launches_when_reverse_is_true():
-    """`Mosaic.held(ba, config, reverse=True)` checks every launch `launches(..., backward=True)` compiles
-    against its own consumer register budget, while `reverse=False` checks `_forwards` alone (row 6740)."""
-    hooks = case_hooks("one sequence")
-    (sample,) = draw(jnp.bfloat16, 0, **geometry("one sequence"))
-    ba = template_call(sample, hooks)
-    target = generation.gpu_target("sm100")
-    family = bundles.of("sm100", jnp.bfloat16)
-    with generation.assumed(target):
-        tiles = template.MOSAIC.derived(ba, target)
-        assert tiles is not None
-        assert template.MOSAIC.held(ba, tiles, reverse=False) == template.MOSAIC._launches_hold(
-            template.MOSAIC._forwards(ba, tiles, target), family)
-        assert template.MOSAIC.held(ba, tiles, reverse=True) == template.MOSAIC._launches_hold(
-            template.MOSAIC.launches(ba, tiles, target, backward=True), family)
 @INTERPRETS
-@pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
-def test_an_fp32_turned_call_on_the_template_trains_as_the_portable_math_interpreted(packed):
-    """Mamba-3's turned form (`TURNED`) in fp32 (three bf16 parts under the accurate forms, row 7673) trains
-    on the recurrence template's fast backward, output, final memory and every operand's gradient on par
-    with the portable math from float64 (check 1)."""
-    from test_recurrence_chunk import assert_packed_on_par
-    from test_recurrence_mosaic import LENGTH, TURNED, hooked_draw
+@pytest.mark.parametrize(("form", "packed"), [
+    pytest.param("turned", False, id="turned-one sequence"),
+    pytest.param("turned", True, id="turned-packed"),
+    pytest.param("scalar delta", False, id="scalar delta-one sequence"),
+    pytest.param("scalar delta", True, id="scalar delta-packed"),
+    pytest.param("rated", False, id="rated-one sequence"),
+    pytest.param("rated", True, id="rated-packed", marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+])
+def test_an_fp32_call_on_the_template_trains_as_the_portable_math_under_the_accurate_forms_interpreted(
+        form, packed, request):
+    """An fp32 call the fast backward takes in three bf16 parts under the accurate forms
+    (`mainloop_backward.fast_backward_form`): Mamba-3's turned form (`TURNED`, row 7673), the gated delta
+    rule's decay a head and Mamba2's rated scan (row 9700), each, where the template takes it, trains on the
+    recurrence template's fast backward, output, final memory and every operand's gradient on par with the
+    recurrence a token at a time from float64 (check 1, its oracle: no release rounds these forms), the turned
+    form's two ranks a token, which no decode step takes, with the portable math's, as its bf16 cell is
+    (test_recurrence_mosaic's turned call, row 7971); one it takes none of (the gated delta rule's at its
+    draws' widths, no config whose launches the device holds) refused, its forced training call as check 1
+    would run it. The rated scan's packed rate gradient, a head's
+    sum over every token, was inconclusive at 40 seeds (its pooled ratio 1.33 in [0.73, 1.89]): 128."""
+    from map_judge import marked_seeds
+    from test_recurrence_chunk import assert_packed_on_par, marked, token_by_token
+    from test_recurrence_mosaic import LENGTH, REFUSED, TURNED, hooked_draw, taken
+    from test_recurrence_stability import SITES
 
-    def on(route, operands, starts=None):
-        return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
+    hooks = TURNED if form == "turned" else SITES[form]
+    documents = ((0, 24, 40), (10, 48))
+    starts = marked(documents, LENGTH) if packed else None
+
+    def on(operands, starts=None):
+        return chunk_on("mosaic_gpu", hooks, dataclasses.replace(operands, starts=starts))
+
+    def recurred(operands, starts=None):
+        if hooks.ranks > 1:
+            return chunk_on("xla", hooks, dataclasses.replace(operands, starts=starts))
+        return token_by_token(hooks, dataclasses.replace(operands, starts=starts))
 
     def drawn(seed):
-        (operands,) = hooked_draw(TURNED, packed=False, seed=seed)
+        (operands,) = hooked_draw(hooks, packed=False, seed=seed)
         return operands, cotangents(operands, seed)
 
-    assert_packed_on_par(formed("accurate", functools.partial(on, "mosaic_gpu")),
-                         functools.partial(on, "xla"), drawn, f"{TURNED} fp32 on the template",
-                         packed=packed, documents=((0, 24, 40), (10, 48)), length=LENGTH, seeds=8)
+    rule = formed("accurate", on)
+    sample, cotangent = drawn(0)
+    if not formed("accurate", taken)(dataclasses.replace(sample, starts=starts), hooks):
+        with pytest.raises(REFUSED):
+            jax.eval_shape(with_gradients(functools.partial(rule, starts=starts)), sample, cotangent)
+        return
+    shards = request.node.get_closest_marker("check1_shards")
+    assert_packed_on_par(rule, recurred, drawn, f"{form} fp32 on the template", packed=packed,
+                         documents=documents, length=LENGTH, seeds=marked_seeds(request) if shards else 8)
 
 
 @COMPILES_ON_CPU
@@ -516,34 +533,6 @@ def test_an_fp32_turned_training_step_certifies_on_h100():
              if id(each) not in before and each.op == type(template.MOSAIC).__name__]
     bodies = _certified_bodies(found)
     assert bodies and all(not entries[-1].refused for entries in bodies.values()), bodies
-
-
-@pytest.mark.parametrize('target', ['sm90', 'sm100'])
-@pytest.mark.parametrize('name', ['nemotron-h-4b-ssd', 'qwen3.5-27b-gdn'])
-def test_an_inference_forward_runs_its_training_forwards_launches(name, target):
-    """A 16-bit forward no gradient follows, under a decay a head on warpgroup MMA and tcgen05, at its own
-    tiles (`Tiles.forward`): the launches the training forward runs (`Mosaic.launches`), its states then
-    its output. Its states and output walked in one launch lost to them at every measured shape: on a GH200
-    Nemotron-H 4B's SSD forward took 669.5 us walked against 271.2 apart, 30B's 192.3 against 182.4 and
-    the 27B gated delta net's 569.8 against 440.6 (M-JS-148b; a B200's 27B walk 613 us against its training
-    forward's states 254, js106c), rows 5668, 7877."""
-    from test_recurrence_mosaic import RATED, _form, _skipped, resource_operands
-
-    dtype = jnp.bfloat16
-    bound = template.MOSAIC.bind(*resource_operands(name, dtype, 1, 4096), None, max_segments=None,
-                                 bound=None if name in RATED else 1.0, **_form(name, dtype), **_skipped(name))
-    facts = generation.gpu_target(target)
-    with generation.assumed(facts):
-        tiles = template.MOSAIC.derived(bound, facts)
-
-        def names(tiles, *, training: bool) -> list[str]:
-            return [launch.name for launch in template.MOSAIC.launches(bound, tiles, facts, backward=False,
-                                                                       training_forward=training)]
-
-        forward, trained = names(tiles.forward or tiles, training=False), names(tiles, training=True)
-    # Named apart, a forward alone's (`mainloop.named`).
-    alone = [name.replace('recurrence', 'recurrence_alone', 1) for name in trained]
-    assert forward == alone, (forward, trained)
 
 
 @pytest.mark.parametrize('kernel', ['recurrence_alone_output', 'recurrence_states'],

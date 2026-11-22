@@ -165,7 +165,7 @@ class ExpertBalance:
         """
         # The routers whose scores the loss reads: a router that records its choice alone (a routing replay's
         # record, Gemma 4's) gives the loss nothing, refused as no router at all is (row 4739's review).
-        routers = sown_calls(routing, ROUTER_SCORES, ROUTER_INDICES)
+        routers = router_scores(routing)
         if not routers:
             raise ValueError("aux_loss_alpha requires a model with a mixture whose routers record their "
                              "scores")
@@ -393,7 +393,9 @@ def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
     return RouterMoments(summed.total, counts, positions, indices.shape[-1])
 
 
-def router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
-    """Collect every router call's sown (scores, indices), in the tree's key order, a router's calls in the
-    order they ran (`sown_calls`)."""
-    return [(scores, indices) for _, (scores, indices) in sown_calls(routing, ROUTER_SCORES, ROUTER_INDICES)]
+def router_scores(routing: Variables) -> list[tuple[tuple, tuple[jax.Array, jax.Array]]]:
+    """Every router call that sowed its scores beside its choice, its path and its `(scores, indices)`, in
+    the tree's key order, a router's calls in the order they ran (`sown_calls`): the one selector of the
+    routers a loss over scores reads, a router recording its choice alone (a routing replay's record) none
+    of them (row 11808)."""
+    return sown_calls(routing, ROUTER_SCORES, ROUTER_INDICES)

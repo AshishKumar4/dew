@@ -165,13 +165,10 @@ class Template[Config: Hashable](tuning.KernelOp):
         """Whether `config` is of the launch's config type (`config_cls`)."""
         return isinstance(config, self.config_cls)
 
-    def held(self, ba: tokamax.BoundArguments, config: Config, *, reverse: bool = False) -> bool:
+    def held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
         """Whether the launch's register model proposes `config` (`takes`): its threads' modeled registers
         (`registers`) within `register_budget`; a launch stating none (a TPU's, the XLA program's) proposes
-        any. `reverse` asks about the launches reverse-mode certification compiles (a multi-launch template's
-        backward launches; a single-launch template checks its own). A proposal, not legality: the
-        assembler's compile decides (`legal`)."""
-        del reverse
+        any. A proposal, not legality: the assembler's compile decides (`legal`)."""
         return self.within(self.registers(ba, config), config)
 
     def within(self, registers: int | None, config: Config) -> bool:

@@ -1204,6 +1204,19 @@ def _pair_held(params, operands, results, fmt) -> list[np.ndarray]:
     return [held, held]
 
 
+def _pair_and_plain_held(params, operands, results, fmt) -> list[np.ndarray]:
+    """A one-pass compensated sum's `(hi, lo, plain)` (`precision.summed_total`'s reduction of `(values,
+    residuals, values)`): its pair as a compensated sum's (`_pair_held`) over its first two arrays, and its
+    plain sum as a plain reduction's of its third (`_reduced_sum`: any order of its terms' additions, an
+    empty axis's +0) where it starts at the reduction's zero, +0; any other start breaks it."""
+    arrays, initial = operands[:3], operands[3:]
+    paired = _pair_held(params, [*arrays[:2], *initial[:2]], results[:2], fmt)
+    started = np.asarray(initial[2])
+    zero = _bits(started) == _bits(np.zeros_like(started))
+    plain = _reduced_sum({"axes": params["dimensions"]}, [arrays[2]], results[2], fmt) & zero
+    return [*paired, plain]
+
+
 def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     """A row's online softmax (`chunked._row_terms`' reduction of `(logits, ones, rest[, columns])`): its
     maximum exact, its maximum's first column exact, and each sum of exponentials scaled to the maximum
@@ -1253,15 +1266,19 @@ def _reductions() -> dict:
     together. A `reduce` equation carries the combine it was given (its `computation`, the function its
     owner handed `jax.lax.reduce`), and each of these owners hands a function of its module: the
     compensated pair sum (`dew.nn.precision.compensated_add`, and the renormalization a compensated
-    reduction combines its pairs by, `renormalized_add`, its values read as one before it) and a row's online
-    softmax with and without its maximum's column (`dew.objectives.lm.chunked`). A reduction is one of
-    these where its combine is that function, whatever its traced program prints as."""
-    from dew.nn.precision import compensated_add, renormalized_add
+    reduction combines its pairs by, `renormalized_add`, its values read as one before it; a one-pass
+    compensated sum's, its plain sum beside its pairs, `_paired_and_plain`) and a row's online softmax with
+    and without its maximum's column (`dew.objectives.lm.chunked`). A reduction is one of these where its
+    combine is that function, whatever its traced program prints as."""
+    from dew.nn.precision import COMPENSATED_COMBINES
     from dew.objectives.lm import chunked
 
-    # `renormalized_add` is `compensated_add`'s arithmetic step for step (the his' TwoSum, then the total's
-    # with the drop and both los summed), its operands read alike, so its pairs round as the pair sum's.
-    return {compensated_add: _pair_held, renormalized_add: _pair_held, chunked._online_softmax: _softmax_held,
+    # Each compensated combine by its results' parts (`COMPENSATED_COMBINES`): `renormalized_add` is
+    # `compensated_add`'s arithmetic step for step (the his' TwoSum, then the total's with the drop and both
+    # los summed), its operands read alike, so its pairs round as the pair sum's.
+    compensated = {combine: _pair_and_plain_held if "plain" in parts else _pair_held
+                   for combine, parts in COMPENSATED_COMBINES.items()}
+    return {**compensated, chunked._online_softmax: _softmax_held,
             chunked._online_softmax_predicted: _softmax_held}
 
 

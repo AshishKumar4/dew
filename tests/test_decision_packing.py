@@ -61,7 +61,9 @@ EXAMPLES = [
 
 
 def qwen35(length: int) -> Pretrained:
-    return Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference", max_seq_len=length)
+    # Loaded on the host in a GPU tier prepare, whose compile-only GPU runs no load's checks (row 11788).
+    with ahead_on_the_host():
+        return Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference", max_seq_len=length)
 
 
 def attending(length: int, implementation: str = "xla") -> CausalTransformer:
@@ -257,7 +259,9 @@ class AttentionTerms:
     def __init__(self, objective, batch):
         self.names: dict = {}
         self.places: dict = {}
-        step = Step(jnp.asarray(0), jax.random.key(0), None, training=False)
+        with ahead_on_the_host():
+            # The step's constants on the host in a GPU tier prepare (row 11788).
+            step = Step(jnp.asarray(0), jax.random.key(0), None, training=False)
 
         def total(variables, added):
             held: dict = {}
@@ -414,14 +418,18 @@ def a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic
     float64 gate, the truth the head in float64 on the xla kernel. A head that read the window
     through a dense mask would not run on flash at all."""
     layout = SegmentLayout.joint_row(max_len=1536)
-    objective = DecisionObjective(
-        attending(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
-        head=JointSchemaHead(32, width=128, routing_layers=1, layers=1, heads=2, feedforward=64,
-                             dtype=jnp.bfloat16, attention_impl="flash"),
-        loss=LogLoss(), shuffle_options=False)
+
+    def objective_on(implementation: str) -> DecisionObjective:
+        return DecisionObjective(
+            attending(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
+            head=JointSchemaHead(32, width=128, routing_layers=1, layers=1, heads=2, feedforward=64,
+                                 dtype=jnp.bfloat16, attention_impl=implementation),
+            loss=LogLoss(), shuffle_options=False)
+
+    objective = objective_on("flash")
     head = objective.model.head.clone(dtype=jnp.float64, attention_impl="xla")
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64), head),
-                              PACKING_SEEDS["flash"], "flash")
+                              PACKING_SEEDS["flash"], "flash", drawn_by=objective_on("xla"))
 
 
 def asked(batch, logits) -> np.ndarray:
@@ -473,7 +481,8 @@ packs several rows, and its draw at two windows took 0.50 s on armada against 0.
 256 draws two windows took on an A100 brought it past the suite's 240 s a test (ledger 1851)."""
 
 
-def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, count: int = 2) -> None:
+def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, count: int = 2, *,
+                              drawn_by=None) -> None:
     """`count` packed windows of the examples decide each row's questions as the row does alone where
     its window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
     over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
@@ -534,7 +543,17 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, cou
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone. Drawn unboxed: the terms read an attention's kernels as arrays
     # (`AttentionTerms`), which an init can box with their logical axes (row 4465).
-    initialized = jax.jit(lambda key: nn.unbox(objective.init(key)))
+    # Drawn by `drawn_by` where the objective's kernels run on a GPU alone: its parameters the same, its draw
+    # made on the host (`drawn_on_the_host`, row 11788: a flash head's init refused on the host's CPU).
+    initializer = objective if drawn_by is None else drawn_by
+    if drawn_by is not None:
+        # The twin's parameters are the objective's own: the same tree, shapes and dtypes, traced where the
+        # objective's kernels run, so a parameter the objective alone declares fails here, not drawn apart.
+        def declared(drawing):
+            # The key made in the trace: an eager one is an array on a device a compile-only run has not.
+            return jax.eval_shape(lambda: nn.unbox(drawing.init(jax.random.key(0))))
+        assert declared(drawn_by) == declared(objective)
+    initialized = jax.jit(lambda key: nn.unbox(initializer.init(key)))
     # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
     # (`terms`), so each arm's rounding of them is on par, on every backend.
     assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),),

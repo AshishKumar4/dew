@@ -25,7 +25,7 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
 def test_the_contract_holds_the_orders_a_case_takes_alone():
     """A case naming the orders it holds (`taking`, row 9077) holds those alone, off training's mesh and on
     it: a custom VJP, whose forward-mode orders do not run, holds its primal and its reverse derivative; a
-    name of no order, taken or left out, is refused."""
+    name of no order, taken or left out, is refused, and so is a case left no order to take."""
     @jax.custom_vjp
     def doubled(x):
         return 2 * x
@@ -39,6 +39,11 @@ def test_the_contract_holds_the_orders_a_case_takes_alone():
     for named in ({"taking": ("jvp of grads",)}, {"without": ("vjp twice",)}):
         with pytest.raises(ValueError):
             assert_contract(doubled, x, direction, cotangent, "a misnamed order", **named)
+    # A case left no order, every one it takes left out, holds nothing: refused, never passed (row 11778: the
+    # remat order sets under an interpreted kernel's `without` passed 10 cells taking no order).
+    with pytest.raises(ValueError):
+        assert_contract(doubled, x, direction, cotangent, "a case of no order", taking=("vjp",),
+                        without=("vjp",))
 
 
 def split_dot(seed, scale):

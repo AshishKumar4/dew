@@ -19,6 +19,7 @@ from contract_support import (
     assert_drawn_contract,
     normal_draw,
     normal_float32,
+    order_set,
 )
 from generation_support import interprets
 from map_judge import marked_seeds
@@ -385,7 +386,7 @@ def test_the_template_rule_holds_its_orders(edge, taken):
 
     assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"the template rule {edge}",
                           truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
-                          taking=ORDER_SETS[taken], without=INTERPRETED_REMAT)
+                          taking=order_set(taken, INTERPRETED_REMAT), without=INTERPRETED_REMAT)
 
 
 EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]
@@ -399,7 +400,7 @@ which check 1 measures, are cells of their own, their declared seeds sharded acr
 @pytest.mark.parametrize("edge", EDGES_BEYOND)
 def test_the_selective_scan_holds_its_orders(edge, taken):
     """`assert_selective_contract` at an edge of float32's range."""
-    assert_selective_contract(edge, ORDER_SETS[taken])
+    assert_selective_contract(edge, order_set(taken, INTERPRETED_REMAT))
 
 
 CHECK1_SHARDS = {
@@ -436,8 +437,8 @@ def normal_order_cases() -> list:
 def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
     """`assert_selective_contract` in the normal domain over an order set (`ORDER_SETS`), check 1 over its
     declared draws (`CHECK1_SHARDS`); the remat orders, which an interpreted kernel takes none of
-    (`INTERPRETED_REMAT`), beside the nested one."""
-    assert_selective_contract("normal", ORDER_SETS[taken], seeds=marked_seeds(request))
+    (`INTERPRETED_REMAT`, `order_set`: their sets skip there), beside the nested one."""
+    assert_selective_contract("normal", order_set(taken, INTERPRETED_REMAT), seeds=marked_seeds(request))
 
 
 def assert_selective_contract(edge: str, taken: tuple[str, ...], seeds: int | None = None) -> None:

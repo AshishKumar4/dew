@@ -11,6 +11,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from concurrent import futures
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -18,7 +19,7 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
-from dew._coordination import agreed_count, from_every_process
+from dew._coordination import agreed, agreed_count, from_every_process
 from dew._records import JSON, boolean, integer, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, Batch, Variables, at_path, placed_at
 from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
@@ -51,6 +52,7 @@ from dew.training.distributed import (
     resumed_link_figures,
 )
 from dew.training.memory import (
+    ceiling_headroom,
     climb_to,
     layer_gathers,
     local_devices,
@@ -69,6 +71,7 @@ from dew.training.planning import (
     Lower,
     Planned,
     PlanRefused,
+    Probe,
     Rung,
     Trials,
     guided_compile,
@@ -83,8 +86,10 @@ from dew.training.rungs import keep_rung, plan_flops, recorded_rung
 from dew.training.transaction import Transaction, outcome_of
 
 if TYPE_CHECKING:
+    from dew.nn.kernels.options import Compiling
     from dew.training.ahead import AheadOfTime
     from dew.training.interval import Interval
+    from dew.training.trainer import Trainer
     from dew.training.transaction import Committed
 
 _log = logging.getLogger(__name__)
@@ -246,11 +251,12 @@ class Building:
 
     def _judged(self, planned: Planned, held: int, built: int) -> tuple[bool, int | None]:
         """`step_fits` of `planned`'s step and, where it samples, its sampled step, `held` bytes beside it,
-        `built` of them among its arguments."""
+        `built` of them among its arguments; its headroom the sampled step's where it samples, which stands
+        for the step as its search's probe read it (`Planned.judged`; row 11832)."""
         mesh = self.stepping.settings.device_mesh
         fit, headroom = step_fits(planned.executable, mesh, held, built)
         if fit and planned.sampled is not None:
-            fit = step_fits(planned.sampled.executable, mesh, held, built)[0]
+            fit, headroom = step_fits(planned.sampled.executable, mesh, held, built)
         return fit, headroom
 
 
@@ -753,6 +759,8 @@ class StepCompiler[L, E]:
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
+        # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
+        self._refused: tuple[Hashable, PlanRefused] | None = None
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
         self._counted: Interval | None = None
         # What a host step's startup compiled over its state's shapes (`_compile_host`), None before one.
@@ -996,7 +1004,7 @@ class StepCompiler[L, E]:
             # judgements in one record); and the placed judgement whole (`placed`): that headroom with its
             # copies built, and the bytes it held beside the step that the allocators did not.
             held_out = judging.charged[0]
-            stats = compiled_memory(planned.executable)
+            stats = compiled_memory(planned.judged)
             beside = None if stats is None else placed_beside(stats, held_out)
             probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside},
                       *probes[own + 1:]]
@@ -1025,7 +1033,7 @@ class StepCompiler[L, E]:
         return None if self._unplaced is None else self._unplaced.planned
 
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
-                         unplaced: int) -> Hashable:
+                         unplaced: int, placed: Variables) -> Hashable:
         """A fresh run's first step planned and compiled over `state`, its shapes, before the `unplaced`
         bytes a device holds of it are placed, so the step compiles while the run's start builds the state
         (`Trainer._opened`), not after it: each candidate is judged on the devices' free bytes in all beside
@@ -1040,14 +1048,84 @@ class StepCompiler[L, E]:
         found, which the fit searching it keeps (`FitRun.searched`): no fit searches it twice before placing
         its state."""
         signature = planned_over(batch, stepping.shape)
+        # Each search's outcome alone is kept, an earlier fit's refusal dropped with it (row 11712's review).
+        self._refused = None
         try:
-            planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
+            planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced,
+                                                 placed=placed)
         except PlanRefused as refused:
             _log.info(UNPLACED_REFUSED, refused)
-            self._unplaced = None
+            self._unplaced, self._refused = None, (signature, refused)
             return signature
         self._unplaced = Unplaced(signature, planned, compiled, keep)
         return signature
+
+    def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int | None], mesh: Mesh,
+                        begun: Compiling | None) -> None:
+        """Refuse a fresh run whose first step over `signature` (`planned_over`) fit no plan before its state
+        was placed (`planned_unplaced`) where the placed devices could hold none either: placing the state
+        gives each device at most the room the search read beside its bytes and what the held arrays the
+        start copies let go (`freed`, `Start.freed`), and a placed plan is judged on no more than its
+        devices' free bytes (their largest block), so a candidate the search saw miss by more than that misses
+        there. Refused only where the search measured every candidate a search on the placed devices could
+        reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, its rungs'
+        variants chosen from no miss (`PlanRefused.variants`), its search begun at the base rung (no record
+        or checkpoint naming one, which a placed search of other shardings may not read,
+        `PlanRefused.recorded_start`), what the start frees known (none where an aliased held array leaves it
+        unknown, `Start.freed`), every miss measured and each beyond that room on some process (a
+        candidate's room is its tightest device's; row 11712: a 4B step on two H100s at its one split, short
+        by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state was placed,
+        1.5 h). Else the placed devices are searched again (`compile`). Every process decides together, each
+        reading its own devices within one agreement (`agreed`)."""
+        kept, self._refused = self._refused, None
+        # The search's outcome is every process's (`FitSearch.gather`), and so is the batch it was over.
+        if kept is None or kept[0] != signature:
+            return
+        refusal = kept[1]
+        probes = refusal.probes
+
+        def rungs(split: int | None = None) -> set[str]:
+            return {json.dumps(probe.rung, sort_keys=True) for probe in probes
+                    if split is None or probe.split == split}
+
+        def report() -> tuple[bool, list[bool], int | None]:
+            """This process's answer: whether its search measured every candidate a placed search could
+            reach, whether each candidate misses by more than placing frees here, and what it frees; read
+            within one agreement, so a process whose read fails ends every process's with its error."""
+            whole = (bool(probes) and bool(refusal.candidates) and not refusal.variants
+                     and not refusal.recorded_start
+                     and all(probe.fits or isinstance(probe.headroom, int) for probe in probes)
+                     and all(rungs(split) == rungs() for split in refusal.candidates))
+            room = freed() if whole else None
+            if room is None:
+                # Searched again on the placed devices: the start's compile keeps its overlap.
+                return False, [False] * len(probes), None
+            # The start's own compile, begun beside the search (`begun`), ended: its scratch held in the
+            # allocators no more, which a reading during it counts (row 11712's review).
+            if begun is not None:
+                futures.wait([begun.attempt])
+            devices = local_devices(mesh)
+
+            def beyond(probe: Probe) -> bool:
+                # Its miss read again at each allocator's ceiling, no GPU's free bytes capping a growing
+                # pool, which another process may give back by the time the state is placed
+                # (`ceiling_headroom`), by the terms its executable was admitted by (row 11712's review).
+                if probe.fits or probe.admitted is None:
+                    return False
+                margin = ceiling_headroom(devices, *probe.admitted)
+                return margin is not None and -margin > room
+
+            return True, [beyond(probe) for probe in probes], room
+
+        whole, beyond, room = agreed("a step's refusal before its state is placed", report)
+        every = from_every_process([whole, beyond])
+        if len({len(each[1]) for each in every}) != 1:
+            return
+        blocked = [any(column) for column in zip(*(each[1] for each in every), strict=True)]
+        if all(each[0] for each in every) and all(blocked):
+            _log.warning("the step fits no plan before its state is placed, each candidate short by more "
+                         "than placing it frees (%s bytes): refused without searching again", room)
+            raise refusal
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:
@@ -1059,7 +1137,7 @@ class StepCompiler[L, E]:
         keep()
         return planned, compiled
 
-    def drawing(self, holder: Holding[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
+    def drawing(self, holder: Trainer[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
                 state: TrainState, batch: Batch, key: jax.Array) -> CompiledStep:
         """`compiled`'s step, or where the run draws its pass count per microbatch (`PhasePasses.sampled`)
         its every count's step at its cap's plan, drawing under the run's `key` (`sampled_step`)."""
@@ -1078,7 +1156,7 @@ class StepCompiler[L, E]:
             flops = compiled.drawn(interval, step, state)
         return compiled, flops
 
-    def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
+    def sampled_step(self, holder: Trainer[L, E], stepping: Callable[[], Stepping], cap: Compiled,
                      state: TrainState, batch: Batch, key: jax.Array) -> DrawingStep:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
         `cap`, its cap's step (`compile`), and every other count's admitted at its plan (`admitted_at`), each
@@ -1154,7 +1232,7 @@ class StepCompiler[L, E]:
     def _refuse_sampled_window(self, cap: Planned) -> None:
         """Refused where a run and a build ahead (`compile_ahead`) both admit a sampled run's counts, as the
         step is built: a window that pools its microbatches by their mean holds their gradient's sum and its
-        mass (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that
+        mass (`dew.training._windows.empty_window`), DiLoCo's its groups' (`TrainState.window`); one that
         replays them holds their batches instead."""
         sampled = self.phase_passes.sampled
         assert sampled is not None, "a run that draws its pass count per microbatch"
@@ -1274,8 +1352,8 @@ class StepCompiler[L, E]:
             self._loss_shapes.clear()
 
     def _plan(self, stepping: Stepping, state: TrainState, batch: Batch, trials: Trials | None,
-              frontier: bool = False, *, unplaced: int | None = None, provisional: bool = False
-              ) -> tuple[Planned, Compiled, Callable[[], None]]:
+              frontier: bool = False, *, unplaced: int | None = None, provisional: bool = False,
+              placed: Variables | None = None) -> tuple[Planned, Compiled, Callable[[], None]]:
         """`plan`, over a state whose devices hold `unplaced` bytes a device holds of it none of yet where
         given (`FitSearch.unplaced`), and the record of its rung, which the caller keeps once it takes the
         plan (`keep_rung`); a plan before its state is placed, or one `provisional` (a later phase's off the
@@ -1290,7 +1368,7 @@ class StepCompiler[L, E]:
             with stepping.traced_on(mesh, links) as schedule, held_objects():
                 planned, flops, plan, validation, keep = self._planned(
                     stepping, state, batch, mesh, schedule, resumed, trials, frontier, unplaced,
-                    provisional or unplaced is not None)
+                    provisional or unplaced is not None, placed)
                 split, candidate = planned.split, planned.candidate
                 memory = memory_record(planned.executable, local_devices(mesh), candidate.held, fits=True)
         finally:
@@ -1379,7 +1457,7 @@ class StepCompiler[L, E]:
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
                  mesh: Mesh, schedule: Schedule, resumed: JSON, trials: Trials | None,
-                 frontier: bool, unplaced: int | None, provisional: bool
+                 frontier: bool, unplaced: int | None, provisional: bool, placed: Variables | None = None
                  ) -> tuple[Planned, StepFlops | None, JSON, Validation, Callable[[], None]]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the first that
         fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the objective at its rung,
@@ -1416,8 +1494,11 @@ class StepCompiler[L, E]:
         if self.rung() != before:
             _log.warning("taking the saved plan, from %s", source)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
-        # The plan's one sizing of its largest layer, which every candidate's options read.
-        gathered = layer_gathers(self.objective, state.variables, mesh.devices.size)
+        # The plan's one sizing of its largest layer, which every candidate's options read: over the
+        # variables as they are placed, where `state` is their shapes (`placed`; row 11712's review: an FSDP
+        # start's shapes split no parameter, and its search compiled the collective default's programs).
+        gathered = layer_gathers(self.objective, state.variables if placed is None else placed,
+                                 mesh.devices.size)
         search = FitSearch(
             lower, lambda candidate: step_options(
                 self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
@@ -1425,8 +1506,13 @@ class StepCompiler[L, E]:
             None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
             provisional=provisional, unplaced=unplaced)
-        planned, probes = search.admitted(
-            candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
+        try:
+            planned, probes = search.admitted(
+                candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
+        except PlanRefused as refused:
+            # Begun where a record or a checkpoint named, which a search of other shardings may not read.
+            refused.recorded_start = recorded is not None or resumed is not None
+            raise
         # The rungs above the plan are read for their memory alone, no device ever running them: offline
         # within a prepare too, as no device run has tuned their programs (`report.read_offline`).
         with report.read_offline():

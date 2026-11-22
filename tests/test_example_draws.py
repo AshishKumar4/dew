@@ -275,9 +275,11 @@ def test_a_meanflow_update_read_as_halves_is_on_par_with_its_whole_batch():
         return np.asarray(first(variables)) + np.asarray(second(variables))
 
     # The truth is the whole batch's update replayed in float64 (`float64_replay`): its noise and times the
-    # same draws' bits, each computed from them in float64, which a float64 twin would draw otherwise.
-    assert_as_exact(halves, summed(objective, slice(0, rows)), draw, "meanflow halves", seeds=HALVES_SEEDS,
-                    truth_fn=float64_replay(summed(objective, slice(0, rows))))
+    # same draws' bits, each computed from them in float64, which a float64 twin would draw otherwise; its
+    # replay compiled once, which eager took 106 of the test's 122 s over its seeds (row 11723).
+    whole = summed(objective, slice(0, rows))
+    assert_as_exact(halves, whole, draw, "meanflow halves", seeds=HALVES_SEEDS,
+                    truth_fn=float64_replay(whole, compiled=True))
 
 
 def test_a_shortcut_update_read_as_halves_targets_each_example_as_its_whole_batch_does():

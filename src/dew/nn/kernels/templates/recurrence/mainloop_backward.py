@@ -70,13 +70,13 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     at mamba_ssm's rounding (`prepared`), held to recorded mamba_ssm's bf16 case, else its intermediates in
     fp32's three parts as its forward holds them (lightning attention's, a write gate's, the SSD's under the
     accurate forms), held to the portable math; either in fp32 under the run's fast forms (`rounded`), its
-    operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the delta rule, which no
-    recording holds, a decay a key dimension without it, an fp32 call's three parts (the accurate forms, or a
-    form without the delta rule on its route, `recurrence_chunk.chunk_rounding`), and a bf16 call's held in
-    three parts whose output is fp32 (`wide`: an epilogue reads it, Mamba2's gated norm), its gradient fp32
-    where the launches read it in bf16 (rounded so, Mamba2's step's gradient under its norm was 2.2e-3 from
-    float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes each
-    sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
+    operands in two bf16 parts (`mainloop.FAST_PARTS`), or in three under the accurate forms, held to the
+    portable math (tests/test_recurrence_mosaic_gradient.py, row 9700). An fp16 call without the delta
+    rule, which no recording holds, a decay a key dimension without it or in fp32's three parts, and a bf16
+    call's held in three parts whose output is fp32 (`wide`: an epilogue reads it, Mamba2's gated norm), its
+    gradient fp32 where the launches read it in bf16 (rounded so, Mamba2's step's gradient under its norm was
+    2.2e-3 from float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes
+    each sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
     dtype = jnp.dtype(dtype)
     if per_key and dtype == jnp.float32 and not rounded:
         return False
@@ -233,7 +233,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     # The launches' gradients in the operands' dtype (fla's), summed in fp32, the held operand's parts joined.
     dv = call.held.joined(dv) if delta else dv
     dk_w = None if dk_w is None else call.held.joined(dk_w)
-    extra = 0.0 if dk_w is None else keyed(headed(dk_w, width))
+    extra = None if dk_w is None else keyed(headed(dk_w, width))
     grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, run.unlaid(dg), run.unlaid(dbeta), dh0, starts,
                     extra_dk=extra)
     return (*_tabled_gradients(run, grads, taken), dskip, _entered_gradient(run, taken)), kept_
@@ -285,26 +285,27 @@ def _entered_gradient(run, taken):
         return None
     return _taken_up(run, taken)[..., :run.key_width, :run.value_width]
 
-def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_dk=0.0) -> tuple:
+def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_dk=None) -> tuple:
     """The backward's gradients laid back as the call's operands (`operands`, `(q, k, v, g, beta)`) and in
-    their dtypes: the queries' and keys' `[R, H * Dk]` a key head's, `extra_dk` `[B, T, H, Dk]` added to the
-    keys', the values' `[R, HV * Dv]`, the log decay's and write gates' as the call's (laid back already), and
-    the entering memories' `[B * HV * Dk, Dv]` (`chunk_forward._Run.shaped`), zero for a row a document
-    starts."""
+    their dtypes: the queries' and keys' `[R, H * Dk]` a key head's (fp32, or in their dtype already,
+    `_query_key_summed`), `extra_dk` `[B, T, H, Dk]` added to the keys' where given, the values'
+    `[R, HV * Dv]`, the log decay's and write gates' as the call's (laid back already), and the entering
+    memories' `[B * HV * Dk, Dv]` (`chunk_forward._Run.shaped`), zero for a row a document starts."""
     call = run.call
     q, k, v, g, beta = operands
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
 
     def key_headed(x):
         """`[R, H * Dk]`, a key head's, laid back as `[B, T, H, Dk]`."""
-        laid = run.unlaid(x.astype(jnp.float32).reshape(rows, heads // call.group, width))
+        laid = run.unlaid(x.reshape(rows, heads // call.group, width))
         return laid[..., :run.key_width]
 
     dv = run.unlaid(dv.reshape(rows, heads, columns))[..., :run.value_width]
     dh0 = run.shaped(dh0)
     if starts is not None:
         dh0 = jnp.where(jnp.asarray(starts, bool)[:, 0, None, None, None], 0.0, dh0)
-    return (key_headed(dq).astype(q.dtype), (key_headed(dk) + extra_dk).astype(k.dtype), dv.astype(v.dtype),
+    dk = key_headed(dk) if extra_dk is None else key_headed(dk) + extra_dk
+    return (key_headed(dq).astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype),
             dg.astype(g.dtype), dbeta.astype(beta.dtype), dh0)
 
 
@@ -822,9 +823,11 @@ def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequen
         def _():
             family.stored([grad], [sums[kind]], smem=landing["sums"])
 
-        @pl.when(jnp.logical_not(first))
-        def _():
-            family.added(grad, sums[kind], call.interpret, smem=landing["sums"])
+        # A key head of one value head takes no later step to add (its sums stored once, in their dtype).
+        if call.group > 1:
+            @pl.when(jnp.logical_not(first))
+            def _():
+                family.added(grad, sums[kind], call.interpret, smem=landing["sums"])
         return
 
     @pl.when(first)
@@ -853,7 +856,8 @@ def _scores_summed(call: Call, issue, ds, keys, queries, *, sums: dict, landing:
 
 def _sums_stored(call: Call, held_sums: dict, sums: dict, landing, last) -> None:
     """The key head's queries' and keys' sums (`_gradient_stored`'s shared tiles) stored to `sums` once, at
-    its last value head's step (`last`), each in turn through the launch's `landing` tile."""
+    its last value head's step (`last`), each in turn through the launch's `landing` tile, in their dtype
+    (`_query_key_summed`, `_query_key_landing`)."""
     family = call.family
 
     @pl.when(last)
@@ -902,8 +906,9 @@ def _query_key_fits(call: Call, vq: int, *, holds: bool) -> bool:
     and a thread's registers (`_query_key_held`), its streams one deep, its landing and, where it `holds` its
     sums, their staging (`_query_key_staging`): each split's bytes the launch's own (`shared_allocation`, as
     `launch_kernel` lays it)."""
-    tiles, _ = _query_key_launched(call, vq)
-    landing = _query_key_landing(call, call.value_width // vq)
+    splits = call.value_width // vq
+    tiles = _query_key_streams(call, vq)
+    landing = _query_key_landing(call, splits, _query_key_summed(call, splits, holds))
     staging = _query_key_staging(call) if holds else ()
     _, scope, _, _ = shared_allocation(call, tiles, staging, landing)
     registers = _query_key_held(call, vq, holds=holds).registers(call.family, addressed(staging, landing))
@@ -948,14 +953,30 @@ def _query_key_held(call: Call, vq: int, *, holds: bool) -> Held:
         + read(chunk, held, 0), summed))
 
 
-def _query_key_landing(call: Call, splits: int) -> dict:
+def _query_key_landing(call: Call, splits: int, summed: jnp.dtype) -> dict:
     """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule
     (fp32 where there are two splits or more) and the queries' and keys' sums, stored once each in turn
-    (`_sums_stored`)."""
+    (`_sums_stored`): fp32 where its family's stores go through registers, whose row copies round each
+    row block to the sums' dtype `summed` (`swizzling.narrowed`), else in it (`_query_key_summed`), as a TMA
+    copy converts none. Rounded whole before its landing, the 16-bit sums' tile took Nemotron-H 4B's 16-wide
+    query_key on an A100 past 255 registers (M-JS-207)."""
     chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
     weights = held.landing(chunk, call.block) if splits == 1 else ((chunk, call.block), jnp.float32)
-    return {**({"weights": weights} if call.delta else {}), "sums": ((chunk, call.block), jnp.float32)}
+    sums = jnp.float32 if call.family.stores_through_registers else summed
+    return {**({"weights": weights} if call.delta else {}), "sums": ((chunk, call.block), sums)}
+
+
+def _query_key_summed(call: Call, splits: int, holds: bool) -> jnp.dtype:
+    """The dtype `_query_key` stores the queries' and keys' sums in: the operands' 16-bit dtype where each
+    is stored once, whole (one split, its sums held or a key head's one value head) and nothing is added to
+    it after (the delta rule adds the keys launch's to the keys'), as `_unlaid` rounds them; else fp32, which
+    a split's sums and a value head's adds take. Stored fp32, Nemotron-H 30B's SSD training rounded both in
+    XLA, 38 us of an A100's (M-JS-204-a100)."""
+    given = jnp.dtype(call.given.dtype)
+    once = splits == 1 and (holds or call.group == 1)
+    narrow = call.given.parts == 1 and given.itemsize == 2 and not call.delta
+    return given if once and narrow else jnp.dtype(jnp.float32)
 
 
 def _query_key_staging(call: Call) -> tuple:
@@ -982,25 +1003,29 @@ def _query_key_holds(call: Call, vq: int) -> bool:
     return _query_key_fits(call, vq, holds=True)
 
 
-def _query_key_launched(call: Call, vq: int) -> tuple[dict, tuple]:
-    """`_query_key`'s streams at value split `vq` (`_query_key_split`) and its outputs' types, each split's
-    sums its own (the weights' gradient, the delta rule's alone, in fp32 where there are two splits or
-    more)."""
-    chunk = call.chunk
-    width, held, memories, given = call.width, call.held, call.memories, call.given
+def _query_key_streams(call: Call, vq: int) -> dict:
+    """`_query_key`'s streams at value split `vq` (`_query_key_split`)."""
+    chunk, held, memories, given = call.chunk, call.held, call.memories, call.given
+    return stream_blocks(queries=((chunk, call.block), given), keys=((chunk, call.block), given),
+                         values=((chunk, vq), held), out=((chunk, vq), given),
+                         **({"value_grads": ((chunk, vq), held)} if call.delta else {}),
+                         entered=((call.block, vq), memories),
+                         leaving=((call.block, vq), memories), ds=((chunk, chunk), _score_grads(call)))
+
+
+def _query_key_outputs(call: Call, vq: int, summed: jnp.dtype) -> tuple:
+    """`_query_key`'s outputs' types at value split `vq`, each split's sums its own (the weights' gradient,
+    the delta rule's alone, in fp32 where there are two splits or more; the queries' and keys' in `summed`,
+    `_query_key_summed`'s)."""
+    width, held = call.width, call.held
     splits = call.value_width // vq
-    tiles = stream_blocks(queries=((chunk, call.block), given), keys=((chunk, call.block), given),
-                          values=((chunk, vq), held), out=((chunk, vq), given),
-                          **({"value_grads": ((chunk, vq), held)} if call.delta else {}),
-                          entered=((call.block, vq), memories),
-                          leaving=((call.block, vq), memories), ds=((chunk, chunk), _score_grads(call)))
-    keyed_out = jax.ShapeDtypeStruct((call.rows, splits * call.heads // call.group * width), jnp.float32)
+    keyed_out = jax.ShapeDtypeStruct((call.rows, splits * call.heads // call.group * width), summed)
     terms = jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.rows), jnp.float32)
     weights = (dataclasses.replace(held, rows=call.rows).shape(call.heads * width) if splits == 1
                else jax.ShapeDtypeStruct((call.rows, splits * call.heads * width), jnp.float32))
-    return tiles, (keyed_out, keyed_out, *((weights,) if call.delta else ()), terms, terms,
-                   jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.chunks * call.block),
-                                        jnp.float32))
+    return (keyed_out, keyed_out, *((weights,) if call.delta else ()), terms, terms,
+            jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.chunks * call.block),
+                                 jnp.float32))
 
 
 @lowered_once
@@ -1103,19 +1128,19 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         return mosaic.Walk(views, step, steps=group, segments=() if call.delta else (
             (step, 0, 1), (functools.partial(step, scores=False), 1, group)), once=once)
 
-    tiles, out_type = _query_key_launched(call, vq)
-    tiles, once = _walked_once(call, tiles)
+    summed = _query_key_summed(call, splits, holds)
+    tiles, once = _walked_once(call, _query_key_streams(call, vq))
     # Persistent under the delta rule, whose tile walks one step function (without it, the first step's
     # scores products are a segment of their own, which a persistent tile walks none of): a program a tile
     # paid each tile's setup, its chunk's table entries' dependent loads and its ring's and done barriers,
     # most of a modelled B200's CTA (44.3k cycles for three tiles against a persistent one's 11.6k a tile).
+    # Two deep at most, nor past its steps (row 11831), as its plan hides latency: 30B's A100 560 -> 516 us.
     dq, dk, *weights, after, leaving, memory = launch_kernel(
-        program, call, out_type=out_type,
-        grid=(splits, width // call.block, call.chunks, call.heads // group),
-        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None, stages=1,
-        live=chunk_liveness(10),
+        program, call, out_type=_query_key_outputs(call, vq, summed), stages=(1, min(2, call.group)),
+        grid=(splits, width // call.block, call.chunks, call.heads // group), live=chunk_liveness(10),
+        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None,
         steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq, holds=holds),
-        landing=_query_key_landing(call, splits), staging=_query_key_staging(call) if holds else (),
+        landing=_query_key_landing(call, splits, summed), staging=_query_key_staging(call) if holds else (),
         persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
