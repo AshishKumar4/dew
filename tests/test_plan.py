@@ -409,12 +409,12 @@ def free_until_placed(monkeypatch, room):
 
 
 def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refused_unplaced(monkeypatch):
-    """A fresh fit on devices with room for its state and for no plan of its step, whose start lets no held
-    array go, is refused as its search before the state was placed found it: its initializer never runs on
-    the devices, and its step is lowered once a probe at most (`StepCompiler.refuse_unplaced`; row 11712: a
-    4B step on two H100s, short by 70 GiB, searched its four rungs again once its state was placed, 1.5 h).
-    A start that lets held arrays go, which may free the room a miss needs, places its state and searches
-    again there: refused, its initializer run."""
+    """A fresh fit on devices with room for its state and for no plan of its step is refused as its search
+    before the state was placed found it, every candidate short by more than placing the state can free: its
+    initializer never runs on the devices, and its step is lowered once a probe at most
+    (`StepCompiler.refuse_unplaced`; row 11712: a 4B step on two H100s, short by 70 GiB, searched its four
+    rungs again once its state was placed, 1.5 h). So too a start that copies held parameters on the devices,
+    as a loaded checkpoint's are, freeing their bytes, far less than the step is short of."""
     from affine_run import Replaying
     from test_layout_validation import INITIALIZED, Watched
 
@@ -449,10 +449,9 @@ def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refus
         jax.effects_barrier()
         return raised.value, list(INITIALIZED), len(lowered)
 
-    alone, ran, count = refused(Watched)
-    assert ran == [] and count <= len(alone.probes), (ran, count, alone.probes)
-    _, ran, _ = refused(functools.partial(Watched, variables=held))
-    assert ran, "a start letting held arrays go placed its state and searched again"
+    for objective in (Watched, functools.partial(Watched, variables=held)):
+        refusal, ran, count = refused(objective)
+        assert ran == [] and count <= len(refusal.probes), (ran, count, refusal.probes)
 
 def needs(monkeypatch, trainer, run=None):
     """The bytes the step `trainer` compiles first needs beside what a device holds: the headroom that

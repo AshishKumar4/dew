@@ -1337,12 +1337,15 @@ class Start:
         """The most bytes any of this process's devices of `mesh` takes as the start places the state: the
         state's as the layout validates it (`held`), none of a field kept in the host's, but for the frozen
         held arrays it keeps as they are, placed where it keeps them already (`through`), each device's own
-        shards of them; every other held array it copies."""
+        shards of them, at every path the state holds one at, as the layout counts it (row 11712's review:
+        one input at two paths, which the placed state aliases, was subtracted once); every other held
+        array it copies."""
         from dew.training.memory import local_devices
 
+        devices = local_devices(mesh)
         inputs = jax.tree.leaves(self.initializer)
-        kept = _device_bytes(inputs[given] for given in self._kept_through())
-        return max(self.held[device.id] - kept[device.id] for device in local_devices(mesh))
+        kept = _device_bytes((inputs[given] for given in self._kept_through().values()), devices)
+        return max(self.held[device.id] - kept[device.id] for device in devices)
 
     def freed(self, mesh: Mesh) -> int:
         """The most bytes any of this process's devices of `mesh` can free as the start places the state: the
@@ -1351,19 +1354,21 @@ class Start:
         plan read of them before the state was placed (`StepCompiler.refuse_unplaced`)."""
         from dew.training.memory import local_devices
 
-        kept = self._kept_through()
-        freed = _device_bytes(leaf for position, leaf in enumerate(jax.tree.leaves(self.initializer))
-                              if position not in kept)
-        return max(freed[device.id] for device in local_devices(mesh))
+        devices = local_devices(mesh)
+        kept = set(self._kept_through().values())
+        freed = _device_bytes((leaf for position, leaf in enumerate(jax.tree.leaves(self.initializer))
+                               if position not in kept), devices)
+        return max(freed[device.id] for device in devices)
 
-    def _kept_through(self) -> set[int]:
-        """The positions among the initializer's leaves of the frozen held arrays the start keeps as they
-        are (`through`), each placed where the state keeps it already, in a device's own memory."""
+    def _kept_through(self) -> dict[int, int]:
+        """Each path of the state (`through`'s index) holding a frozen held array the start keeps as it is,
+        to that array's position among the initializer's leaves: placed where the state keeps it already, in
+        a device's own memory."""
         from dew.state import apart
 
         inputs = jax.tree.leaves(self.initializer)
         where = jax.tree.leaves(apart(self.shardings)[1])
-        return {given for index, given in self.through.items()
+        return {index: given for index, given in self.through.items()
                 if isinstance(leaf := inputs[given], jax.Array) and leaf.sharding == where[index]
                 and (leaf.sharding.memory_kind or "device") == "device"}
 
@@ -1379,13 +1384,15 @@ class Start:
                            kept=self.kept)
 
 
-def _device_bytes(leaves) -> collections.Counter:
-    """The bytes each device holds, by its id, of the arrays among `leaves` in device memory."""
+def _device_bytes(leaves, devices) -> collections.Counter:
+    """The bytes each of `devices` holds, by its id, of the arrays among `leaves` in its own memory: a shard
+    on another device (a host's CPU whose id is a GPU's) counts for none of them (row 11712's review)."""
     held: collections.Counter = collections.Counter()
     for leaf in leaves:
         if isinstance(leaf, jax.Array) and (leaf.sharding.memory_kind or "device") == "device":
             for shard in leaf.addressable_shards:
-                held[shard.device.id] += shard.data.nbytes
+                if shard.device in devices:
+                    held[shard.device.id] += shard.data.nbytes
     return held
 
 

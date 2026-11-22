@@ -1754,7 +1754,7 @@ class Trainer(Generic[Loss, Effects]):
             if run.searched != planned_over(batch, self._shape):
                 self._planned_unplaced(run, fresh, batch)
             # Its search's refusal, its layout choice's among them, where placing the state frees no room.
-            self._compiler.refuse_unplaced(lambda: fresh.freed(self.device_mesh))
+            self._compiler.refuse_unplaced(run.searched, lambda: fresh.freed(self.device_mesh))
         return begun
 
     def _whole_validated(self, state: TrainState, batch: Batch, split: int) -> Validation:

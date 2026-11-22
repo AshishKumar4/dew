@@ -706,7 +706,7 @@ class StepCompiler[L, E]:
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
         # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
-        self._refused: PlanRefused | None = None
+        self._refused: tuple[Hashable, PlanRefused] | None = None
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
         self._counted: Interval | None = None
         # What a host step's startup compiled over its state's shapes (`_compile_host`), None before one.
@@ -994,33 +994,57 @@ class StepCompiler[L, E]:
         found, which the fit searching it keeps (`FitRun.searched`): no fit searches it twice before placing
         its state."""
         signature = planned_over(batch, stepping.shape)
+        # Each search's outcome alone is kept, an earlier fit's refusal dropped with it (row 11712's review).
+        self._refused = None
         try:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
         except PlanRefused as refused:
             _log.info(UNPLACED_REFUSED, refused)
-            self._unplaced, self._refused = None, refused
+            # A step lowered for another target (`lower_for`) is judged on no devices of this host's.
+            self._unplaced = None
+            self._refused = None if stepping.settings.lower_for is not None else (signature, refused)
             return signature
         self._unplaced = Unplaced(signature, planned, compiled, keep)
         return signature
 
-    def refuse_unplaced(self, freed: Callable[[], int]) -> None:
-        """Refuse a fresh run whose first step fit no plan before its state was placed (`planned_unplaced`)
-        where placing the state frees no room on any process (`freed`, `Start.freed`: the held arrays the
-        start copies and may let go): its devices then hold, the state placed, the room the search judged
-        every rung and split on beside the state's bytes, so a search there judges each as this one did, the
-        splits its projections passed over among them (row 11712: a 4B step on two H100s, short by 70 GiB of
-        72.71 free at each of four rungs, searched them all again once its state was placed, 1.5 h). A run
-        whose start frees room, or whose search left a miss unmeasured (a compile refused for memory), is
-        searched again on the placed devices (`compile`). Every process refuses or none does; admission is
-        the pool's, so where one process holds no refusal none does."""
-        refused, self._refused = self._refused, None
-        if refused is None:
+    def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int]) -> None:
+        """Refuse a fresh run whose first step over `signature` (`planned_over`) fit no plan before its state
+        was placed (`planned_unplaced`) where the placed devices could hold none either: placing the state
+        gives each device at most the room the search read beside its bytes and what the held arrays the
+        start copies let go (`freed`, `Start.freed`), and a placed plan is judged on no more than its
+        devices' free bytes (their largest block), so a candidate the search saw miss by more than that misses
+        there. The search asked every rung's finest split before leaving it (`walked`), the least a split of
+        it needs, as finer microbatches need no more than coarser and narrow copies no less than none: where
+        each rung it asked was asked there, every miss measured and each beyond that room on some process
+        (a candidate's room is its tightest device's), no candidate fits placed (row 11712: a 4B step on two
+        H100s, short by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state was
+        placed, 1.5 h). Else the placed devices are searched again (`compile`). Every process decides
+        together; admission is the pool's, so where one process holds no refusal none does."""
+        kept, self._refused = self._refused, None
+        if kept is None or kept[0] != signature:
             return
-        measured = all(probe.fits or isinstance(probe.headroom, int) for probe in refused.probes)
-        if all(from_every_process(measured and freed() == 0)):
-            _log.warning("the step fits no plan before its state is placed, and placing it frees no room: "
-                         "refused without searching again")
-            raise refused
+        probes = kept[1].probes
+        if not probes:
+            return
+        finest = max(probe.split for probe in probes)
+
+        def rungs(split: int | None = None) -> set[str]:
+            return {json.dumps(probe.rung, sort_keys=True) for probe in probes
+                    if split is None or probe.split == split}
+
+        whole = (all(probe.fits or isinstance(probe.headroom, int) for probe in probes)
+                 and rungs() <= rungs(finest))
+        room = freed()
+        beyond = [not probe.fits and isinstance(probe.headroom, int) and -probe.headroom > room
+                  for probe in probes]
+        every = from_every_process([whole, beyond])
+        if len({len(each[1]) for each in every}) != 1:
+            return
+        blocked = [any(column) for column in zip(*(each[1] for each in every), strict=True)]
+        if all(each[0] for each in every) and all(blocked):
+            _log.warning("the step fits no plan before its state is placed, each candidate short by more "
+                         "than placing it frees (%d bytes): refused without searching again", room)
+            raise kept[1]
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:
