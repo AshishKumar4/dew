@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import logging
 import os
 import sys
@@ -128,8 +129,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return ["logger", value.name]
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
         return _own(value, at, known, walking)
-    if _sources.hand_written(getattr(value, "__wrapped__", None)):
-        return _wrapping_users(value, at, again)
+    if (wrapping := _wrapping(value, at, again)) is not None:
+        return wrapping
     if (named := _named(value, at)) is not None:
         return named
     if isinstance(value, type):
@@ -195,6 +196,21 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
                         "identity can state")
 
 
+
+
+def _wrapping(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """A callable wrapping one of the user's functions (`_wrapping_users`), its `__wrapped__` read as stored,
+    never through the object's own lookup, which a Flax module's runs its `setup` by; None for any other.
+    Refused for a Flax module bound to its variables (within its model's `init` or `apply`): its identity is
+    its variables' as well as its fields' (train 1169: stating one ran its `setup`, and a second run found
+    its submodules' names in use)."""
+    flax_module = sys.modules.get("flax.linen.module")
+    if (flax_module is not None and isinstance(value, flax_module.Module)
+            and inspect.getattr_static(value, "scope", None) is not None):
+        raise Unestablished(f"{at}: a Flax module bound to its variables, which no statement holds")
+    if _sources.hand_written(inspect.getattr_static(value, "__wrapped__", None)):
+        return _wrapping_users(value, at, again)
+    return None
 
 
 def _wrapping_users(value, at: str, again: Callable[..., JSON]) -> JSON:
