@@ -748,20 +748,13 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
 
 
 def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
-    """`trace()`'s value, within a block certifying aside (`certifying_aside`) the launches it reached settled
-    before it is lowered (`settled_aside`, within `settling`) and the program traced afresh (`retrace()`, past
-    any trace cache holding the config) for as long as they refuse a config it took, each refused launch's
-    derivation stepping past it: a program lowers once, at the configs its certification settled, as one
-    certified in turn does, where lowering at a refused rung lowered the step twice (a B200's recurrent
-    reverse launch spilling at its first rung, FS-ASIDE-SM100C). Each trace runs in the caller's own context,
-    which JAX keys its trace cache on, so a trace there before or after takes it: a program compiled ahead is
-    found by its trace alone (`executable_only`), and a collection's pass over shapes traces nothing again
-    (row 11766). A trace a refusal abandons has its routes withdrawn from the blocks that recorded them
-    (`generation.withdrawn`), its retry's reported as it dispatches; a program nested within it retraces past
-    the refusal, its jit one of the refusals' (`options.OuterProgram._nested`, row 11783). A trace that fails
-    keeps the routes it reported, as JAX's own trace does. A trace that takes a config refused before again
-    (a derivation reading no refusal, a pin's) is its compile's to read (`settled`). Outside such a block,
-    `trace()`'s."""
+    """`trace()`'s value, within a block certifying aside the launches it reached settled before it lowers
+    (`settled_aside`, within `settling`), and traced afresh (`retrace()`, past any trace cache) while they
+    refuse a config it took: it lowers once, at the configs its certification settled (FS-ASIDE-SM100C).
+    Each trace runs in the caller's context, which JAX's trace cache keys on, so a program compiled ahead is
+    found by its trace (row 11766); an abandoned trace's routes are withdrawn (`generation.withdrawn`), a
+    nested program retraces past the refusal (`options.OuterProgram._nested`, row 11783), and a failed trace
+    keeps the routes it reported, as JAX's does. Outside such a block, `trace()`'s."""
     aside = _ASIDE.get()
     if aside is None:
         return trace()
@@ -805,11 +798,9 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
 
 @dataclasses.dataclass
 class _Settlement:
-    """A settle's refused launches' misses (`settled_aside`), each its certification's key (its launch's
-    identity and config, the device and whether reversed), its launch record and its spilling binaries,
-    held until its launch on the same device and mode is certified at another config that holds (`certified`:
-    stepped) or the settle ends without (`settling`: not stepped). Its own, in the refusal scope and the
-    recordings it was opened in (`scope`), never another settle's (row 11786's review)."""
+    """A settle's refused launches' misses (`settled_aside`) by certification key, held until the launch on
+    the same device and mode holds at another config (`certified`: stepped) or the settle ends (not stepped);
+    its own, in the refusal scope and recordings it was opened in (`scope`, row 11786)."""
 
     scope: tuple
     deferred: list[tuple[tuple, Launch, tuple["Binary", ...]]] = dataclasses.field(default_factory=list)
@@ -839,12 +830,8 @@ _SETTLING: contextvars.ContextVar[_Settlement | None] = _cache.untraced(
 
 @contextlib.contextmanager
 def settling() -> Iterator[None]:
-    """A settle of blocks certifying aside (`settled_aside` within it) and its retries, its refused launches'
-    misses recorded as it ends, even where it raises: each stepped where a certification within it held its
-    launch at another config, else not (`_Settlement`). A settle within another in the same refusal scope
-    and recordings is the enclosing one's; one within a scope of its own (a `refusals` or `recording` block)
-    is its own, its misses recorded there."""
-    # Its refusal scope and its recordings, by identity: where a miss it records goes.
+    """A settle of blocks certifying aside and its retries, its misses recorded as it ends, even where it
+    raises (`_Settlement`); within another of the same refusal scope and recordings, the enclosing one's."""
     scope = (id(_registry()), *map(id, _RECORDING.get()))
     enclosing = _SETTLING.get()
     if enclosing is not None and enclosing.scope == scope:
@@ -983,8 +970,7 @@ def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels
 
 
 def _progressed(key: tuple) -> None:
-    """A launch certified at a config its kernels hold (`key`): the misses its settle deferred for the same
-    launch on the same device and mode, at another config, are stepped past (`_Settlement.certified`)."""
+    """A launch certified at a config that holds (`key`): its settle's misses past it stepped."""
     if (settlement := _SETTLING.get()) is not None:
         settlement.certified(key)
 
@@ -1049,10 +1035,8 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: fro
 
 
 def _verdict_fields() -> list[str]:
-    """What a stored verdict states of each kernel, its `Binary`'s fields: a verdict stored before a field
-    existed decodes without it, so a field added keys every verdict afresh (row 11796: verdicts stored before
-    `Binary.spilled` decoded with none, read their frame as spilled and refused configs that hold, on every
-    machine whose store held them, until the installation's seal moved)."""
+    """What a stored verdict states of a kernel, its `Binary`'s fields: a field added keys every verdict
+    afresh, where one stored before it decoded without it (row 11796: `Binary.spilled`)."""
     return [field.name for field in dataclasses.fields(Binary)]
 
 
