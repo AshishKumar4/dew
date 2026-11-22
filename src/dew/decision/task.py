@@ -308,6 +308,16 @@ def _same_tokenizer(one: "Tokenizer | str | None", other: "Tokenizer | str | Non
 
 
 @dataclass(frozen=True)
+class RowScores:
+    """A row's scores from a pass: its raw `[Q, K]` logits, one row per question laid out in it, in slot
+    order, and where its model reports them (`DecisionModel.reports_exits`) each question's 1-based exit
+    pass `[Q]` at its answer cue, else None."""
+
+    logits: np.ndarray
+    exit_passes: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
     (`Decide.from_run`): the head's record (`Head.record`), the layout (by import path, its
@@ -1052,16 +1062,19 @@ class Decide(SavedRunTask, InItsForm):
         return rows[0], media
 
     def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]],
-                   variables: Variables | None = None) -> list[np.ndarray]:
-        """Each row's raw `[Q, K]` logits from one pass over rows that hold images, alike as
+                   variables: Variables | None = None) -> list[RowScores]:
+        """Each row's scores (`RowScores`) from one pass over rows that hold images, alike as
         `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
         encoded = [row for row, _ in rows]
         inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length,
                                         attention=self.layout.attention)
         held = self.variables if variables is None else variables
-        scores = np.asarray(self._forward(held, inputs, media=Images.joined(self.processor, rows)))
-        return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
+        scores, exits = self._forward(held, inputs, media=Images.joined(self.processor, rows))
+        scores, exits = np.asarray(scores), None if exits is None else np.asarray(exits)
+        return [RowScores(scores[index, :len(row.questions)],
+                          None if exits is None else exits[index, :len(row.questions)])
+                for index, row in enumerate(encoded)]
 
     @property
     def context_length(self) -> int | None:
@@ -1126,30 +1139,34 @@ class Decide(SavedRunTask, InItsForm):
     def scored(self, rows: Sequence[Encoded], variables: Variables | None = None) -> list[np.ndarray]:
         """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which a plan takes
         (`planned`), over `variables` (the task's own by default)."""
-        return self._pass(rows, self.variables if variables is None else variables)
+        held = self.variables if variables is None else variables
+        return [scores.logits for scores in self._pass(rows, held)]
 
     def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None,
-              shape: PassShape | None = None, counted: "PassTokens | None" = None) -> list[np.ndarray]:
-        """Each of `rows`' raw `[Q, K]` logits from one forward pass at its declared shape (`pass_shapes`,
+              shape: PassShape | None = None, counted: "PassTokens | None" = None) -> list[RowScores]:
+        """Each of `rows`' scores (`RowScores`) from one forward pass at its declared shape (`pass_shapes`,
         the shortest that holds `rows` unless `shape` is given): the rows packed first-fit into its
         windows as a run packs its rows (`packing`), each window read as a run reads one
         (`dew.decision.rows.PackedRows`, `laid_out`), so each row attends its own tokens alone and is
         scored as it is alone, the windows placed on the weights' mesh (`RowPlan`). A server's pass counts
         its tokens in `counted` (`PassTokens`), the windows the mesh computes among them."""
-        logits, windows, batch, plan = self._forwarded(rows, variables, shape, counted)
-        logits = plan.host(logits)
-        found: list[np.ndarray] = [np.empty(0)] * len(rows)
+        (logits, exits), windows, batch, plan = self._forwarded(rows, variables, shape, counted)
+        logits, exits = plan.host(logits), None if exits is None else plan.host(exits)
+        found: list[RowScores] = [RowScores(np.empty(0))] * len(rows)
         for window, (_, standing) in enumerate(windows):
             owners = np.asarray(batch["question_rows"][window])
             for order, index in enumerate(standing, start=1):
-                found[index] = logits[window, np.flatnonzero(owners == order)]
+                own = np.flatnonzero(owners == order)
+                found[index] = RowScores(logits[window, own], None if exits is None else exits[window, own])
         return found
 
     def _forwarded(self, rows: Sequence[Encoded], variables: Variables | None = None,
                    shape: PassShape | None = None, counted: "PassTokens | None" = None
-                   ) -> tuple[jax.Array, list[tuple[Batch, tuple[int, ...]]], Batch, RowPlan]:
-        """`_pass`'s forward over `rows`, before its logits are read: the logits on the weights' mesh,
-        each window's rows (`first_fit_windows`), the windows' fields and their plan."""
+                   ) -> tuple[tuple[jax.Array, jax.Array | None], list[tuple[Batch, tuple[int, ...]]], Batch,
+                              RowPlan]:
+        """`_pass`'s forward over `rows`, before its logits are read: the logits on the weights' mesh with
+        the exit passes where the model reports them (`_forward`), each window's rows
+        (`first_fit_windows`), the windows' fields and their plan."""
         from dew.data.packing import first_fit_windows
         from dew.decision.rows import PackedRows, forked_documents, model_row
 
@@ -1186,13 +1203,18 @@ class Decide(SavedRunTask, InItsForm):
 
     @traced_in_its_form
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
-                 media: ModelInputs | None = None) -> jax.Array:
+                 media: ModelInputs | None = None) -> tuple[jax.Array, jax.Array | None]:
         """`model.logits`, compiled through Dew's compile point (`program`), each GEMM's backend chosen from
         the program's own dots (`dew.nn.kernels.templates.report.targeted`): a configured context
-        encoder's int8 products among them, whatever tower makes them."""
+        encoder's int8 products among them, whatever tower makes them; and each question's exit pass
+        `[B, Q]` where the model reports them (`DecisionModel.reports_exits`, its one program then
+        `exit_logits`, which a warm start or `compile_scoring` compiles as it compiles the plain one), else
+        None."""
         model = self.model
-        logits = program(type(model).logits, static_argnums=(0,))
-        return logits(model, variables, inputs, media=media)
+        if model.reports_exits:
+            reported = program(type(model).exit_logits, static_argnums=(0,))
+            return reported(model, variables, inputs, media=media)
+        return program(type(model).logits, static_argnums=(0,))(model, variables, inputs, media=media), None
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
                    rounds: Knockout | Finalists = LAYA_ROUNDS) -> dict[str, Answer]:
@@ -1360,7 +1382,7 @@ class Decide(SavedRunTask, InItsForm):
                               whole_blocks=whole_blocks_of(self.layout),
                               attention=self.layout.attention, fork_depth=fork_depth(self.layout),
                               joint_forks=joint(self.layout))
-            logits = np.asarray(self._forward(self.variables, inputs))
+            logits = np.asarray(self._forward(self.variables, inputs)[0])
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
             for row, slot in zip(*np.nonzero(answered), strict=True):
@@ -1411,6 +1433,10 @@ class Decide(SavedRunTask, InItsForm):
         images, each a PIL image, encoded image bytes, or a base64 string, bare or as
         a `data:` URL. `strict` answers as Jev's own endpoint does: the request's
         extension fields are dropped and the response holds Jev's fields alone.
+        Otherwise a task whose labels are read at an answer cue (a readout of
+        labels that pools no spans) over a looped backbone under an exit
+        threshold (`Loop.exit_threshold`) adds each answer's `exit_pass`, the
+        1-based pass whose state its cue took, with or without `details`.
 
         With `whole`, a request that the layout could answer only by cutting its
         state, instructions or options is refused instead, naming the maximum
@@ -1476,8 +1502,10 @@ class Decide(SavedRunTask, InItsForm):
         return state, questions, [] if strict else decoded_images(request.get("images")), context
 
     def _wire_response(self, questions: Mapping[str, Question], answers: Mapping[str, Answer], usage: Usage,
-                       *, details: bool) -> dict[str, JSON]:
-        """A Jev response body of a request's answers and usage."""
+                       *, details: bool, exits: Mapping[str, int] | None = None) -> dict[str, JSON]:
+        """A Jev response body of a request's answers and usage, each answer with its question's exit pass
+        where `exits` holds one (`RowScores.exit_passes`, row 11714)."""
+        exits = exits or {}
         gated = self.calibration.abstention is not None
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
         if usage.context_tokens:
@@ -1489,7 +1517,8 @@ class Decide(SavedRunTask, InItsForm):
                             cut={kind: {"rows": rows, "removed": removed, "unit": cut_unit(kind)}
                                  for kind, (rows, removed) in usage.cut.items()})
         return {"model": self.name,
-                "answers": {name: _wire(questions[name], answer, details=details, gated=gated)
+                "answers": {name: _wire(questions[name], answer, details=details, gated=gated,
+                                        exit_pass=exits.get(name))
                             for name, answer in answers.items()},
                 "usage": reported}
 
@@ -1706,7 +1735,7 @@ class _WirePlan:
 
 @dataclass(frozen=True)
 class _DecideScoring[RequestT, PayloadT, AnswerT](
-        scoring.Scoring[RequestT, _Row, PayloadT, np.ndarray, AnswerT]):
+        scoring.Scoring[RequestT, _Row, PayloadT, RowScores, AnswerT]):
     """A `Decide` task's passes as a scoring task's (`dew.inference.scoring.Scoring`): a pass is one
     within the task's budget (`Decide.planned`) over text rows, or one over rows of images as long as each
     other and of alike images (`Images.joined`), which `forward` runs over the weights it is handed;
@@ -1730,7 +1759,7 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
     def planned(self) -> "_WirePlan":
         return _WirePlan(self.decide)
 
-    def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
+    def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[RowScores]:
         # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
         # hands the pass; the task's compiled forwards are kept across passes.
         if rows[0].media is None:
@@ -1752,8 +1781,8 @@ class RowScoring(_DecideScoring[_Row, None, np.ndarray]):
     def admit(self, request: _Row) -> scoring.ScoringRequest[_Row, None]:
         return scoring.ScoringRequest((request,), None)
 
-    def answer(self, payload: None, outputs: Sequence[np.ndarray]) -> np.ndarray:
-        return outputs[0]
+    def answer(self, payload: None, outputs: Sequence[RowScores]) -> np.ndarray:
+        return outputs[0].logits
 
 
 @dataclass(frozen=True)
@@ -1814,10 +1843,16 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
         return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
-    def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
-        return self.decide._wire_response(payload.questions,
-                                          *self.decide._replied(payload.questions, payload.rows, outputs),
-                                          details=self.details)
+    def answer(self, payload: _Admitted, outputs: Sequence[RowScores]) -> dict[str, JSON]:
+        # Each question's exit pass, where its model reports one, beside its answer outside strict Jev.
+        exits = {} if self.strict else {
+            laid.name: int(scores.exit_passes[slot])
+            for row, scores in zip(payload.rows, outputs, strict=True) if scores.exit_passes is not None
+            for slot, laid in enumerate(row.questions)}
+        return self.decide._wire_response(
+            payload.questions, *self.decide._replied(payload.questions, payload.rows,
+                                                     [scores.logits for scores in outputs]),
+            details=self.details, exits=exits)
 
 
 def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:
@@ -1976,9 +2011,10 @@ def _choice(answer: Answer) -> str:
     return answer.choice
 
 
-def _wire(question: Question, answer: Answer, *, details: bool, gated: bool) -> dict[str, JSON]:
+def _wire(question: Question, answer: Answer, *, details: bool, gated: bool,
+          exit_pass: int | None = None) -> dict[str, JSON]:
     """A question's answer in a Jev response: its type the question's (`Question.kind`), then the
-    answer's own fields."""
+    answer's own fields, and the 1-based pass its answer cue exited at where it has one (`exit_pass`)."""
     probabilities = [round(float(value), 4) for value in answer.probabilities]
     wire: dict[str, JSON] = {"type": question.kind}
     if isinstance(answer, NoulAnswer):
@@ -1996,6 +2032,8 @@ def _wire(question: Question, answer: Answer, *, details: bool, gated: bool) -> 
                     confidence=round(answer.confidence, 4))
     if details and gated:
         wire["abstained"] = answer.abstained
+    if exit_pass is not None:
+        wire["exit_pass"] = exit_pass
     return wire
 
 

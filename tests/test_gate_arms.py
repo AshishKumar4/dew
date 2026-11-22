@@ -402,3 +402,17 @@ def test_a_gpu_flows_cells_outside_a_prepare_load_none_of_the_stores_machinery()
     re-keyed on its churn (row 10826)."""
     flow = "import gpu_flow\ngpu_flow.run_cells([gpu_flow.Cell('a cell', lambda: None)])"
     assert _machinery_loaded(flow) == []
+
+
+def test_a_draw_on_the_host_chooses_the_hosts_kernels():
+    """A draw made on the host (`arm_arithmetic.drawn_on_the_host`) in a process assuming its node's GPU (a
+    GPU tier part's prepare) chooses the kernels of the host it computes on, through the gate's one host
+    context (`arm_arithmetic.ahead_on_the_host`; row 11678: the draw's own context kept the GPU's kernel
+    choices, which would not run on the host, a second owner)."""
+    from arm_arithmetic import drawn_on_the_host
+
+    from dew.nn.kernels import generation
+
+    host = generation.device_generation()
+    with generation.assumed("sm90"):
+        assert drawn_on_the_host(lambda _: generation.device_generation(), 0) == host

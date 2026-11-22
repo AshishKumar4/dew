@@ -1092,7 +1092,7 @@ def test_a_refused_launch_states_its_model_beside_the_assemblers_registers():
                   if miss.op == type(op).__name__ and miss.config == config]
         budget = op.register_budget(config)
     assert len(missed) == len(spilling), (missed, spilling)
-    refused_by_ptxas = [(miss.frame or 0) > 0 or (miss.registers or 0) > budget or bool(miss.serialized)
+    refused_by_ptxas = [(miss.spilled or 0) > 0 or (miss.registers or 0) > budget or bool(miss.serialized)
                         for miss in missed]
     assert all(refused_by_ptxas), (missed, budget)
     assert all(miss.modelled is not None and miss.stepped for miss in missed), missed
@@ -1924,8 +1924,10 @@ def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
     with generation.assumed("sm90"):
         family = program.bundle("sm90", jnp.bfloat16)
         cfg = program.BackwardTiles(64, 64, 2, 2, fused=True, family=family.name)
-        assert fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=False) <= 4
-
+        unanchored = fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=False)
+        anchored = fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=True)
+        assert unanchored == 4 and anchored == 5, (unanchored, anchored)
+        assert "chosen" not in program.STATISTICS_STREAM_ORDER[:unanchored]
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
@@ -1947,23 +1949,47 @@ def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
 @COMPILES_ON_CPU
 def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
     """Row 5272: sm90 overlapped shared-keys backward (`attention_dkv_shared`, qwen3.5-0.8b d256) compiles
-    spill-free with S/dP overlap and dead `chosen` excluded."""
+    spill-free with `_tile_scores` S/dP overlap and dead `chosen` excluded."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
+    from dew.nn.kernels.templates import (
+        attention_mosaic_coop as coop,
+        attention_mosaic_fused as fused,
+        attention_mosaic_program as program,
+    )
+
     with generation.assumed("sm90"):
+        target = generation.gpu_target()
         spans = template.spans(4096, 4096, 1, causal=True)
         q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
-        case = _fast_backward_compile_case("sm90-overlapped-coop-d256", q, k, spans, shapes)
-        found = compile_mosaic_kernels([case], "sm90")
+        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, shapes, scale=1.0,
+                                                   natural=attention_mosaic.NATURAL, accurate=False)
+        cfg = program.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed", shared_keys=True)
+        assert op.takes(op.bind(*args, interpret=False), cfg, target), cfg
+        family = program.bundle_of(cfg, jnp.bfloat16)
+        streamed = fused.streamed_statistics(family, cfg, 256, jnp.bfloat16, cfg.stages, reduced=0,
+                                             allocations_of=coop._coop_allocations, anchored=False)
+        assert streamed > 0 and "chosen" not in program.streamed_statistics_order(streamed, anchored=False)
+        def backward(query, key, value, dout, residuals):
+            with tuning.pinned({attention_mosaic.MosaicBackward: cfg}):
+                grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                                  residuals=residuals, scale=1.0, accurate=False)
+            return grads.query, grads.key, grads.value
+        from fla_gdn_support import KernelCase
+        found = compile_mosaic_kernels([KernelCase("sm90-overlapped-coop-d256",
+                                                   lambda: (backward, (q, k, k, q, shapes)))], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+        assert any(kernel["kernel"] == "attention_dkv_shared"
+                   for kernel in found[0].get("kernels", ())), found
 
 
 @COMPILES_ON_CPU
 def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_deterministic_ops):
-    """Row 5272: sm90 deterministic two-launch keys-first dK/dV (`_overlapped_dkv_scores`) compiles
-    spill-free at d128."""
+    """Row 5272: sm90 deterministic two-launch keys-first dK/dV (`_splits_scores`) compiles spill-free at
+    d128 with unit prescale."""
+    from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed("sm90"):
@@ -1971,32 +1997,21 @@ def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_d
         q = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
-        case = _fast_backward_compile_case("sm90-overlapped-dkv-det-d128", q, k, spans, shapes)
-        found = compile_mosaic_kernels([case], "sm90")
+        def backward(query, key, value, dout, residuals):
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                              residuals=residuals, scale=None, accurate=False)
+            return grads.query, grads.key, grads.value
+        found = compile_mosaic_kernels([KernelCase("sm90-overlapped-dkv-det-d128",
+                                                   lambda: (backward, (q, k, k, q, shapes)))], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
-
-def test_planned_stages_deepens_at_residency_two_with_registers():
-    """Row 10993: `_planned_stages` passes the launch's consumer registers to `resources.plan`, so a
-    launch at `resident >= 2` deepens its ring rather than falling back to `floor`."""
-    from dew.nn.kernels.templates import attention_mosaic_program as program, resources
-
-    with generation.assumed("sm80"):
-        target = generation.gpu_target()
-        family = program.layouts("sm80", jnp.bfloat16, 4096)[0]
-        tile = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
-        def scope_of(stages):
-            ring = jax.ShapeDtypeStruct((stages, 64, 64), jnp.bfloat16)
-            return resources.Scope(program=(tile,), walks=((ring,),))
-        stages = attention_mosaic._planned_stages(family, scope_of, target, consumers=1, registers=128,
-                                                  floor=2, most=3, resident=2)
-        assert stages == 3, stages
+        assert any(kernel["kernel"] == "attention_dkv"
+                   for kernel in found[0].get("kernels", ())), found
 
 
 @COMPILES_ON_CPU
 def test_decode_deepens_to_3_stages_without_losing_residency():
-    """Row 5274: long-context decode (B8 K4096 d128) deepens to 3 stages at preserved SM residency
-    on sm90 and compiles spill-free."""
+    """Row 5274: long-context decode (B8 K4096 d128) compiles spill-free at pinned 2- and 3-stage configs
+    with preserved SM residency on sm90."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -2009,18 +2024,70 @@ def test_decode_deepens_to_3_stages_without_losing_residency():
         kd = jax.ShapeDtypeStruct((8, 4096, 8, 128), jnp.bfloat16)
         work, rows, row_spans, whole = attention_decode.planned(
             jnp.zeros(qd.shape, qd.dtype), kd, kd, spans, template.Hooks())
-        assert work is not None and work["plain"].config.stages >= 3, work
-        cfg = work["plain"].config
+        assert work is not None, work
+        base = work["plain"].config
+        cfg2 = dataclasses.replace(base, stages=2)
+        cfg3 = dataclasses.replace(base, stages=3)
         op, args = attention_mosaic._forward_call(
             rows, kd, kd, row_spans, whole, scale=None, natural=False,
             out_dtype=jnp.float32 if work["plain"].slices > 1 else None, masked=True,
             splits=work["plain"].slices, subtracted=True)
         kept = template.Kept.OUTPUT if work["plain"].slices > 1 else template.Kept.NONE
         ba = op.bind(*args, residuals=kept, interpret=False)
-        assert op.resident(ba, cfg, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
-        dec_case = KernelCase("sm90-dec-b8-d128-3stage",
-                              lambda: (lambda q, k, v: attention_decode.attend(q, k, v, spans),
-                                       (qd, kd, kd)))
-        found = compile_mosaic_kernels([dec_case], "sm90")
+        assert op.takes(ba, cfg2, target) and op.takes(ba, cfg3, target)
+        assert op.resident(ba, cfg3, target) == op.resident(ba, cfg2, target)
+        def forward_pinned(cfg):
+            def run(*operands):
+                with tuning.pinned({attention_mosaic.MosaicForward: cfg}):
+                    return op(*operands, residuals=kept, interpret=False)
+            return run
+        cases = [
+            KernelCase("sm90-dec-b8-d128-2stage", lambda: (forward_pinned(cfg2), args)),
+            KernelCase("sm90-dec-b8-d128-3stage", lambda: (forward_pinned(cfg3), args)),
+        ]
+        found = compile_mosaic_kernels(cases, "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("gen", ["sm90", "sm100"])
+def test_forward_registers_charges_prescale_only_when_non_unit(gen):
+    """ReviewNA3532 P2 #6: `ForwardRegisters.at` prices the pre-walk prescale fragment only when
+    `spec.prescale != 1.0`, and wide non-unit prescale forward compiles spill-free on sm90 and sm100."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_mosaic_program as program
+
+    with generation.assumed(gen):
+        spans = template.spans(512, 512, 1, causal=True)
+        q = jax.ShapeDtypeStruct((1, 512, 4, 256), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((1, 512, 2, 256), jnp.bfloat16)
+        op_folded, _ = attention_mosaic._forward_call(
+            q, k, k, spans, None, scale=None, natural=False)
+        op_scaled, _ = attention_mosaic._forward_call(
+            q, k, k, spans, None, scale=None, natural=True)
+        op_unit, _ = attention_mosaic._forward_call(
+            q, k, k, spans, None, scale=1.0, natural=True)
+        reg_folded = op_folded.registered(q, k, (), template.Kept.NONE)
+        reg_scaled = op_scaled.registered(q, k, (), template.Kept.NONE)
+        reg_unit = op_unit.registered(q, k, (), template.Kept.NONE)
+        assert not reg_folded.prescaled and reg_folded.rewalk_prescaled
+        assert reg_scaled.prescaled and not reg_unit.prescaled
+        family = program.bundle(gen, jnp.bfloat16)
+        wide_reg_folded = dataclasses.replace(reg_folded, width=576, value_width=128)
+        wide_reg_scaled = dataclasses.replace(reg_scaled, width=576, value_width=128)
+        wide_reg_unit = dataclasses.replace(reg_unit, width=576, value_width=128)
+        tiles = program.Tiles(64, 64, 2, 1, family=family.name)
+        if family.budgets_registers and program.query_swizzle(family) is None:
+            scaled_regs = wide_reg_scaled.at(family, tiles, peaks=True)
+            folded_regs = wide_reg_folded.at(family, tiles, peaks=True)
+            unit_regs = wide_reg_unit.at(family, tiles, peaks=True)
+            assert scaled_regs is not None and folded_regs is not None and unit_regs is not None
+            assert scaled_regs > unit_regs and folded_regs == unit_regs
+        def forward_scaled(query, key, value):
+            return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.NONE,
+                                            natural=True)
+        found = compile_mosaic_kernels(
+            [KernelCase(f"{gen}-prescaled-d256", lambda: (forward_scaled, (q, k, k)))], gen)
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

@@ -407,7 +407,11 @@ CHECK1_SHARDS = {
     "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad]": {"seeds": 8, "per_task": 4},
     "test_the_selective_scan_holds_its_orders_over_normal_draws[second-jvp]": {"seeds": 8, "per_task": 8},
     "test_the_selective_scan_holds_its_orders_over_normal_draws[grad-of-grad]": {"seeds": 8, "per_task": 4},
-    "test_the_selective_scan_holds_its_orders_over_normal_draws[second-orders-staged]":
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad-remat]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[second-jvp-remat]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad-nested-jit]":
         {"seeds": 8, "per_task": 4},
     "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad-scanned]":
         {"seeds": 8, "per_task": 4},

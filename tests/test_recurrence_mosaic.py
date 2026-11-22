@@ -52,7 +52,7 @@ from test_recurrence_chunk import (
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
+from dew.nn.kernels.templates import bundles, mosaic, product, report, resources, sass
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
@@ -1505,7 +1505,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
     bound = template.MOSAIC.bind(*resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256), None, bound=1.0)
     tiles, kernel = mainloop.Tiles(32, 3, 128, 2, chunk=64), 'recurrence_output'
     keys = []
-    for roles in ((report.CONSUMERS,), (report.PRODUCER,)):
+    for roles in ((sass.CONSUMERS,), (sass.PRODUCER,)):
         with report.refusals(), generation.assumed('sm90'):
             report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
             keys.append(report.derivation_inputs(template.MOSAIC, bound, template.Mosaic.launched()))
@@ -2191,16 +2191,17 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     binary = next(binary for binary in report.binaries(programs[1].compile())
                   if report.launch_name(binary.kernel, binary.launch) in first & second)
     # The second rung's program refuses a kernel whose name the first rung's shares.
-    found = report._misses_of([dataclasses.replace(binary, frame=8)])
+    found = report._misses_of([dataclasses.replace(binary, spilled=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
     keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance) for rung in rungs]
-    stored = [tuning.stored_verdict(report.verdict_target(device), key) is not None for key in keys]
-print(json.dumps({"stored": stored}))
+    verdicts = [tuning.stored_verdict(report.verdict_target(device), key) for key in keys]
+print(json.dumps({"stored": [v is not None for v in verdicts],
+                  "refused": [v is not None and any(b.refused for _, b in v.values()) for v in verdicts]}))
 """
 """Two rungs of one launch's producer ladder lowered for a compile-only H100 with certification on, the
-second's program refusing a kernel whose name (its body's) the first rung's program shares, and where each
-rung's verdict is stored."""
+second's program refusing a kernel whose name (its body's) the first rung's program shares (ptxas's measure
+of its spills set, `Binary.spills`), and where each rung's verdict is stored and whether it refuses."""
 
 
 @lowers("sm90")
@@ -2212,7 +2213,8 @@ def test_a_programs_refusal_is_stored_as_its_own_configs_verdict_whatever_body_n
     standing, a later start taking it and compiling the program to refuse it again (row 6536)."""
     from process_support import fresh
 
-    assert fresh(SHARED_NAME, cache_dir=tmp_path / "cache")["stored"] == [False, True]
+    found = fresh(SHARED_NAME, cache_dir=tmp_path / "cache")
+    assert found == {"stored": [False, True], "refused": [False, True]}
 PROGRAM_LOWERED = """
 import collections, json
 import jax, jax.numpy as jnp, numpy as np

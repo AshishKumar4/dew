@@ -77,7 +77,8 @@ def test_a_stores_digest_follows_its_code_and_an_unreviewed_import_keys_the_whol
     def digests(*edits: Path) -> dict:
         for path in edits:
             path.write_text(path.read_text() + "\n# edited\n")
-        return fresh(DIGESTS, source=tree, platforms="cpu", variables={"XDG_CACHE_HOME": str(tmp_path)})
+        return fresh(DIGESTS, source=tree, platforms="cpu", cache_dir=tmp_path / "xla",
+                     variables={"XDG_CACHE_HOME": str(tmp_path)})
 
     before = digests()
     assert before["computed"] == before["whole"]
@@ -133,3 +134,39 @@ def test_every_kernel_modules_code_is_keyed_by_its_closure_no_import_site_unrevi
     checkpoint parts' sites, unreviewed, through short_conv's linear layer)."""
     found = fresh(KERNELS, platforms="cpu")
     assert len(found) > 100 and {module: sites for module, sites in found.items() if sites} == {}
+
+
+KEPT = """
+import json, logging, os
+logged = []
+
+
+class Kept(logging.Handler):
+    def emit(self, record):
+        logged.append(record.getMessage())
+
+
+logging.getLogger("dew._code").addHandler(Kept())
+from dew._code import code_digest
+digest = code_digest("dew.communicators")
+kept = os.environ["JAX_COMPILATION_CACHE_DIR"] + "/dew-code"
+print(json.dumps({"digest": digest, "kept": sorted(os.listdir(kept)) if os.path.isdir(kept) else [],
+                  "logged": logged}))
+"""
+
+
+def test_a_closure_is_kept_beside_the_compilation_cache_and_an_unwritable_one_keeps_none(tmp_path):
+    """A walked closure is kept beside the compilation cache the verdicts it keys live in (the directory
+    JAX_COMPILATION_CACHE_DIR names), and a later start's digest is the same; a cache where it cannot be
+    written (a file where its directory would be, refused whatever the process's user) keeps none, logs
+    the miss and gives the same digest (row 11743: a read-only home raised before a prewarmed verdict was
+    read)."""
+    writable, refusing = tmp_path / "xla", tmp_path / "refusing"
+    refusing.mkdir()
+    (refusing / "dew-code").write_text("a file, no directory")
+    first = fresh(KEPT, platforms="cpu", cache_dir=writable)
+    again = fresh(KEPT, platforms="cpu", cache_dir=writable)
+    refused = fresh(KEPT, platforms="cpu", cache_dir=refusing)
+    assert len(first["kept"]) == 1 and first["logged"] == [] and again == first
+    assert refused["digest"] == first["digest"]
+    assert len(refused["logged"]) == 1 and "not kept" in refused["logged"][0], refused

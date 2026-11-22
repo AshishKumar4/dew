@@ -55,6 +55,7 @@ from dew.registry import mixers
 from dew.state import TrainState, apart
 from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
+from dew.training.compiler import UNPLACED_REFUSED
 from dew.training.distributed import microbatch
 from dew.training.memory import (
     FirstRunFailed,
@@ -406,6 +407,124 @@ def free_until_placed(monkeypatch, room):
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {
         "bytes_limit": LIMIT, "bytes_in_use": LIMIT - room + max(0, held(device) - before[device])})
 
+
+
+def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refused_unplaced(monkeypatch):
+    """A fresh fit on devices with room for its state and for no plan of its step is refused as its search
+    before the state was placed found it, every candidate short by more than placing the state can free: its
+    initializer never runs on the devices, and its step is lowered once a probe at most
+    (`StepCompiler.refuse_unplaced`; row 11712: a 4B step on two H100s, short by 70 GiB, searched its four
+    rungs again once its state was placed, 1.5 h). So too a start that copies held parameters on the devices,
+    as a loaded checkpoint's are, freeing their bytes, far less than the step is short of."""
+    from affine_run import Replaying
+    from test_layout_validation import INITIALIZED, Watched
+
+    from dew.data.dataset import Loader
+
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    roomy = lm()
+    free(monkeypatch, LIMIT)
+    trained = roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert roomy.validation is not None
+    room = max(roomy.validation.device_bytes.values()) + 1024
+    options.unhold()
+    # Held arrays the start copies, the trained parameters on the device.
+    held = {"params": trained.variables["params"]}
+    lowered = []
+
+    def lowering(event, seconds, *, fun_name=None, **_):
+        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" and fun_name == "jit(step)":
+            lowered.append(seconds)
+
+    def refused(objective) -> tuple[PlanRefused, list[bool], int]:
+        """The refusal of a fresh fit of `objective`, whether its initializer ran, its step's lowerings."""
+        free_until_placed(monkeypatch, room)
+        INITIALIZED.clear()
+        lowered.clear()
+        jax.monitoring.register_event_duration_secs_listener(lowering)
+        try:
+            with pytest.raises(PlanRefused) as raised:
+                # Its split stated, the one candidate its search asks of every rung, as a run that states
+                # its microbatches (the 4B start's) asks it.
+                lm(split=1, objective=objective).fit(Loader(lambda partition: rows, None, None, ROWS),
+                                                     steps=1)
+        finally:
+            jax.monitoring.unregister_event_duration_listener(lowering)
+        jax.effects_barrier()
+        return raised.value, list(INITIALIZED), len(lowered)
+
+    # The held parameters lie on the device the run trains on, which the start copies and may let go.
+    assert {device for leaf in jax.tree.leaves(held) for device in leaf.devices()} == {jax.devices()[0]}
+    for objective in (Watched, functools.partial(Watched, variables=held)):
+        refusal, ran, count = refused(objective)
+        assert ran == [] and count <= len(refusal.probes), (ran, count, refusal.probes)
+        # Each candidate it asked was measured short of the room.
+        assert all(isinstance(probe.headroom, int) and probe.headroom < 0 for probe in refusal.probes)
+
+
+def test_a_fresh_fit_whose_placed_devices_hold_its_step_trains_after_its_unplaced_search_refused(monkeypatch,
+                                                                                                   caplog):
+    """A fresh fit whose devices read, before its state is placed, room for its state and for no plan of its
+    step, and once it is placed room enough: its search before placing refuses every candidate, the start
+    places the state, and the search on the placed devices plans the step, which trains (row 11712's
+    review: a refusal before placing is final only where a placed search could reach nothing more)."""
+    from affine_run import Replaying
+    from test_layout_validation import INITIALIZED, Watched
+
+    from dew.data.dataset import Loader
+
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    roomy = lm()
+    free(monkeypatch, LIMIT)
+    roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert roomy.validation is not None
+    state = max(roomy.validation.device_bytes.values())
+    options.unhold()
+
+    def held(device) -> int:
+        return sum(array.nbytes for array in jax.live_arrays() if device in array.devices())
+
+    gc.collect()
+    before = {device: held(device) for device in jax.devices()}
+
+    def memory_stats(device):
+        # Room for the state alone until most of it lies on the device, then all of the limit.
+        placed = held(device) - before[device] > state // 2
+        return {"bytes_limit": LIMIT, "bytes_in_use": held(device) if placed else LIMIT - state - 1024}
+
+    monkeypatch.setattr(jax.Device, "memory_stats", memory_stats)
+    INITIALIZED.clear()
+    trainer = lm(objective=Watched)
+    with caplog.at_level(logging.INFO, logger="dew.training.compiler"):
+        trained = trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    jax.effects_barrier()
+    # Refused before the state was placed, then planned on the placed devices: its plan's probes theirs, one
+    # fitting (`StepCompiler.compile`'s own search).
+    assert any(record.msg == UNPLACED_REFUSED for record in caplog.records)
+    plan = trainer.plan
+    assert isinstance(plan, dict) and any(probe["fits"] for probe in plan["probes"]), plan
+    assert int(trained.step) == 1 and INITIALIZED
+
+def test_a_fit_of_no_steps_on_devices_holding_no_plan_returns_and_its_trainer_trains_given_room(monkeypatch):
+    """A fit of no steps on devices with room for no plan of its step returns its state, refused nothing
+    (a run with no work reads no step), and its trainer fit again on devices with room for its step trains
+    (row 11712's review: a refusal one fit kept was raised by the next)."""
+    from affine_run import Replaying
+
+    from dew.data.dataset import Loader
+
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    roomy = lm()
+    free(monkeypatch, LIMIT)
+    roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert roomy.validation is not None
+    room = max(roomy.validation.device_bytes.values()) + 1024
+    options.unhold()
+    trainer = lm()
+    free_until_placed(monkeypatch, room)
+    assert int(trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=0).step) == 0
+    free(monkeypatch, LIMIT)
+    assert int(trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1).step) == 1
 
 def needs(monkeypatch, trainer, run=None):
     """The bytes the step `trainer` compiles first needs beside what a device holds: the headroom that

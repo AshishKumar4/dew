@@ -42,7 +42,7 @@ from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray
 from jax.extend import core
 
-from dew.batch import FROZEN, Variables, merge, select
+from dew.batch import FROZEN, Variables, merge, select, under_roots
 from dew.nn.kernels.options import OuterProgram, owned_program
 from dew.nn.programs import called, own_derivative, scan_body
 
@@ -151,9 +151,14 @@ def program_reads(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] =
     # effectful equation whatever reads it. Only the counting reads it: the step runs `closed` as traced.
     live, _ = partial_eval.dce_jaxpr(closed.jaxpr, used_outputs=[True] * len(closed.jaxpr.outvars),
                                      instantiate=True)
+    # Every leaf bound to its input in order, those under `within` kept where a mapping reaches them, as a
+    # copy's overlay does (`narrowed`, `batch.select`): a leaf of another collection, or one reached through
+    # an attribute or an index, is read as the program reads it and named nowhere (row 11730: a packed
+    # checkpoint's `quantization`, NvFp4's attributes, raised before a step).
     held = [(tuple(key.key for key in path)[len(within):], leaf, var)
             for (path, leaf), var in zip(leaves, live.invars[:len(leaves)], strict=True)
-            if tuple(key.key for key in path)[:len(within)] == within]
+            if under_roots(path, (within,))
+            and all(isinstance(key, jax.tree_util.DictKey) for key in path)]
     weights = frozenset(var for _, _, var in held)
     casts = {}
     for path, leaf, var in held:

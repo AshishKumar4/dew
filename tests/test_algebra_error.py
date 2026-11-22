@@ -223,19 +223,55 @@ def test_a_program_naming_a_dot_algorithm_compiles_for_a_gpu():
         owned_program(split).compiled(operand, operand)
 
 
-@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}
+"""Each TPU generation's compile-only topology (`dew.training.ahead.compile_only_tpus`), of which a product
+takes one chip."""
+
+
+def _compiles_on_a_tpu(generation_name: str, preset: jax.lax.DotAlgorithmPreset) -> bool:
+    """Whether libtpu compiles a `[256, 256] @ [256, 256]` float32 product in `preset` for a compile-only TPU
+    of `generation_name`, as XLA:TPU lowers it: an algorithm it does not run is refused at its compile
+    ("UNIMPLEMENTED: Dot algorithm ... is not supported")."""
+    from jax.sharding import SingleDeviceSharding
+
+    from dew.training.ahead import compile_only_tpus
+
+    (device, *_) = compile_only_tpus(TPU_TOPOLOGIES[generation_name])
+    shape = jax.ShapeDtypeStruct((256, 256), jnp.float32, sharding=SingleDeviceSharding(device))
+    try:
+        jax.jit(lambda a, b: jnp.matmul(a, b, precision=preset)).lower(shape, shape).compile()
+    except jax.errors.JaxRuntimeError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("target_name", TPU_TOPOLOGIES)
 def test_a_tpus_product_precision_is_an_algorithm_xla_tpu_compiles(target_name):
     """On a TPU, a product's dot algorithm chosen for fp32's accuracy (`product_precision`, row 5473) is one
-    XLA:TPU compiles, its bfloat16 passes priced (`product.TPU_ALGORITHMS`): of three TF32 passes and six
-    bfloat16 ones, both as exact, BF16_BF16_F32_X6, which XLA:TPU runs as HIGHEST. TF32_TF32_F32_X3, which it
-    refuses (UNIMPLEMENTED; measurement M-JS-160), was priced at TF32 FLOPs, a rate a TPU states none of, so
-    at no seconds beside the six passes' 1.1 us, and chosen (row 10845)."""
+    XLA:TPU compiles, compiled here for that TPU (row 11748: only its name was compared): of three TF32
+    passes and six bfloat16 ones, both as exact, BF16_BF16_F32_X6, which XLA:TPU runs as HIGHEST; and asked
+    for TF32_TF32_F32_X3 alone, which it refuses, none is taken (row 11738: ranked last, the refused one was
+    returned; row 10845: priced at a rate a TPU states none of, at no seconds, it was chosen)."""
     from dew.algebra import program
 
-    exact = {jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3, jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6}
+    tf32, bf16 = jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3, jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
     with program.passes(target=target_name):
-        chosen = product_precision(256, 256, 256, jnp.float32, admits=lambda preset: preset in exact)
-    assert chosen == jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
+        chosen = product_precision(256, 256, 256, jnp.float32, admits=lambda preset: preset in {tf32, bf16})
+        with pytest.raises(ValueError):
+            product_precision(256, 256, 256, jnp.float32, admits=lambda preset: preset is tf32)
+    assert chosen is bf16 and _compiles_on_a_tpu(target_name, chosen)
+
+
+@pytest.mark.parametrize("target_name", TPU_TOPOLOGIES)
+def test_the_algorithms_xla_tpu_runs_are_those_libtpu_compiles(target_name):
+    """The dot algorithms priced as XLA:TPU runs them (`product.TPU_ALGORITHMS`) are exactly those of a
+    float32 product JAX states (`programs.dot_algorithms`) that libtpu compiles for the TPU: the table
+    `product_precision` takes its TPU algorithms from is held to the compiler, not to a measurement's
+    copy."""
+    from dew.nn.kernels.templates.product import TPU_ALGORITHMS
+
+    found = programs.dot_algorithms(jnp.dtype(jnp.float32))
+    assert {preset for preset in found if _compiles_on_a_tpu(target_name, preset)} == set(TPU_ALGORITHMS)
 
 def cancelled(seed):
     """Terms near a hundred million, a term of unit size, and the first's negation: a sum whose large terms

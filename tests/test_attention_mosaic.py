@@ -20,13 +20,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_terms
+from attention_oracle import traced_attention_terms
 from fla_gdn_support import KernelCase
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from jax.sharding import Mesh
 from kernel_compile import compile_mosaic_kernels, mosaic_failures
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import (
     BACKWARD_SEEDS,
@@ -241,21 +241,25 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, w
     None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`), with `sinks` a sink a query
     head (`template.sinks`, the initial state), its queries drawn times `query_scale` (a power of two,
     exact), with `rounds` its weights rounded to a quantized model's codes (`template.Hooks.rounds`)."""
-    spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
-    hooks = _dropping(shape) if drop else None
-    if rounds is not None:
-        hooks = template.Hooks(rounds=rounds)
-    if sinks:
-        hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1],
-                                                      value_width))
     unscaled = _drawn(shape, dtype, width=width, value_width=value_width)
 
     def draw(seed):
         query, *rest = unscaled(seed)
         return (query * jnp.asarray(query_scale, query.dtype), *rest)
 
+    def setup():
+        spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
+        hooks = _dropping(shape) if drop else None
+        if rounds is not None:
+            hooks = template.Hooks(rounds=rounds)
+        if sinks:
+            hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0],
+                                                          shape[1], value_width))
+        return spans, hooks
+
     def ours(query, key, value, dout):
         del dout
+        spans, hooks = setup()
         with _device(interpret, target), _pinned(tiles):
             out = attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                            residuals=training, interpret=interpret)
@@ -263,8 +267,8 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, w
 
     def reference(query, key, value, dout):
         del dout
+        spans, hooks = setup()
         return template.reference(query, key, value, spans, hooks)
-
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
                     f"mosaic {training.name.lower()} forward {call} {jnp.dtype(dtype).name} "
                     f"natural {natural} widths {width} {value_width} drop {drop}", seeds=SEEDS)
@@ -282,11 +286,12 @@ def _dropping(shape) -> template.Hooks:
         jnp.arange(shape[2], dtype=jnp.int32), DROP_RATE))
 
 
-def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
-                 form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
-                 natural: bool = False, seeds: int | None = None, width: int = 64,
-                 param_rows: int | None = None, pins: tuple | None = None,
-                 target: generation.GpuTarget | None = None, routed: bool = True):
+def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.KeySpans], shape, *,
+                 interpret: bool, backward: bool = False, form: str = "default", score: tuple = (),
+                 gate: bool = False, dtype=jnp.bfloat16, natural: bool = False, seeds: int | None = None,
+                 width: int = 64, param_rows: int | None = None, pins: tuple | None = None,
+                 target: generation.GpuTarget | None = None, routed: bool = True,
+                 keys: int | None = None):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
@@ -297,16 +302,21 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     (`_pinned`), interpreted for `target` where given (`_device`), the backward the one the route takes
     where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read)."""
     rows, queries, heads, _ = shape
-    # A hook's parameters drawn for `param_rows` batch rows where given (one every row shares).
-    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width,
+    make_spans = spans if callable(spans) else (lambda: spans)
+    if keys is not None:
+        keys_count = keys
+    else:
+        assert isinstance(spans, template.KeySpans)
+        keys_count = spans.keys
+    score_mod, kinds, draw_hooks = score_hooks(score, queries, keys_count, width,
                                                rows=rows if param_rows is None else param_rows, heads=heads)
-    output = hooks_for(HOOKS["gate" if gate else "none"], queries, width, gate_of(queries, width))
-    draw_operands = _drawn(shape, dtype, width=width, keys=spans.keys)
+    draw_operands = _drawn(shape, dtype, width=width, keys=keys_count)
 
     def draw(seed):
         return *draw_operands(seed), *draw_hooks(seed)
 
     def hooked(params, initial):
+        output = hooks_for(HOOKS["gate" if gate else "none"], queries, width, gate_of(queries, width))
         return template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                for value, kind in zip(params, kinds, strict=True)), initial,
                               output.output_mod, output.output_params)
@@ -314,30 +324,32 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     accurate, config = _backward_form(form)
 
     def ours(query, key, value, dout, params, initial):
+        built_spans = make_spans()
         hooks = hooked(params, initial)
         # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
         # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
         pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
         with _device(interpret, target), _pinned(*pinned):
             if not backward:
-                return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
+                return attention_mosaic.forward(query, key, value, built_spans, hooks, natural=natural,
                                                 interpret=interpret)
             # The backward from this mainloop's own training forward's residuals.
-            residuals = attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
+            residuals = attention_mosaic.forward(query, key, value, built_spans, hooks, natural=natural,
                                                  residuals=template.Kept.SPLIT, interpret=interpret)[1:]
             # On the mainloop the route takes it to (`attention_route.backward`): this one's, else the
             # Pallas-Triton one's where this one's registers hold no tile of it.
             pulled = attention_route.backward if routed else attention_mosaic.backward
-            grads = pulled(query, key, value, spans, hooks, dout, residuals=residuals, accurate=accurate,
-                           interpret=interpret)
+            grads = pulled(query, key, value, built_spans, hooks, dout, residuals=residuals,
+                           accurate=accurate, interpret=interpret)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def reference(query, key, value, dout, params, initial):
+        built_spans = make_spans()
         if not backward:
-            return template.reference(query, key, value, spans, hooked(params, initial))
+            return template.reference(query, key, value, built_spans, hooked(params, initial))
 
         def attend(query, key, value, params, initial):
-            return template.reference(query, key, value, spans, hooked(params, initial))
+            return template.reference(query, key, value, built_spans, hooked(params, initial))
 
         _, pull = jax.vjp(attend, query, key, value, params, initial)
         return pull(dout)
@@ -347,8 +359,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     if seeds is None:
         seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
                  else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds,
-                    terms=_gradient_terms(spans, hooked, score, jax.jit(reference)) if backward else None)
+    terms = _gradient_terms(make_spans, hooked, score, jax.jit(reference)) if backward else None
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds, terms=terms)
 
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
@@ -361,11 +373,16 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
     queries, keys = core_geometry(case)
     score, gate = FORWARD_HOOKS[hooks]
     rows = 1 if interpret and len(score) + gate > 1 else ROWS
+    _check_spans("causal-documents-window", functools.partial(_document_spans, case, queries, keys, rows),
+                 (rows, queries, 4, 2), interpret=interpret, score=score, gate=gate, dtype=dtype,
+                 natural=natural, keys=keys)
+
+
+def _document_spans(case: dict, queries: int, keys: int, rows: int) -> template.KeySpans:
+    """Build `template.spans` for the first `rows` of `case` lazily inside a check-1 site."""
     called = {name: value[:rows] if hasattr(value, "shape") else value
               for name, value in arguments(case).items()}
-    spans = template.spans(queries, keys, rows, **called)
-    _check_spans("causal-documents-window", spans, (rows, queries, 4, 2), interpret=interpret, score=score,
-                 gate=gate, dtype=dtype, natural=natural)
+    return template.spans(queries, keys, rows, **called)
 
 
 STREAMED_HOOKS = {"key-bias": ("key",), "tile-bias": ("tile",), "query-bias": ("query",)}
@@ -431,13 +448,10 @@ def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int
     sites = INTERPRETED_FP16_SITES if jnp.dtype(dtype) == jnp.float16 else INTERPRETED_HOOK_SITES
     (rows, heads, kv_heads), seeds = sites[hooks] if interpret else ((ROWS, 4, 2), None)
     rows = 2 if shared else rows
-    # The call's documents of its first `rows` rows.
-    called = {name: value[:rows] if hasattr(value, "shape") else value
-              for name, value in arguments(case).items()}
-    spans = template.spans(queries, keys, rows, **called)
-    _check_spans("causal-documents-window", spans, (rows, queries, heads, kv_heads), interpret=interpret,
-                 backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds, width=width,
-                 param_rows=1 if shared else None, dtype=dtype)
+    _check_spans("causal-documents-window", functools.partial(_document_spans, case, queries, keys, rows),
+                 (rows, queries, heads, kv_heads), interpret=interpret, backward=True, form=form,
+                 score=SCORE_HOOKS[hooks], seeds=seeds, width=width, param_rows=1 if shared else None,
+                 dtype=dtype, keys=keys)
 
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
@@ -447,11 +461,10 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
     CPU suite's 120 s target at 8 draws, row 2196; the hooked sinks site keeps two), two compiled."""
     call = CASES[case] if case in CASES else RUN_CASES[case]
     queries, keys = core_geometry(call)
-    spans = template.spans(queries, keys, ROWS, **arguments(call))
     heads = (2, 1) if interpret else (4, 2)
-    _check_spans(case, spans, (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form,
-                 width=FORM_WIDTHS.get(form, 64))
-
+    _check_spans(case, lambda: template.spans(queries, keys, ROWS, **arguments(call)),
+                 (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form,
+                 width=FORM_WIDTHS.get(form, 64), keys=keys)
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
                     residuals_from=None, target: generation.GpuTarget | None = None,
@@ -466,8 +479,8 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
     `residuals_from`'s (another mainloop's `forward`, as the route feeds the Triton mainloop's), with `drop`
     under probability dropout (`_dropping`), on operands of `dtype`."""
     keys = shape[1] if keys is None else keys
-    spans = template.spans(shape[1], keys, shape[0], **CALLS[call]) if spans is None else spans
-    hooks = _dropping(shape) if drop else None
+    make_spans = ((lambda: template.spans(shape[1], keys, shape[0], **CALLS[call])) if spans is None
+                  else (lambda: spans))
     draw = _drawn(shape, dtype, width, keys=keys, value_width=value_width)
     accurate, config = (False, config) if form is None else _backward_form(form)
     # Another mainloop's forward keeps its split sums (its `residuals` True).
@@ -475,22 +488,29 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
                else functools.partial(residuals_from, residuals=True))
 
     def ours(query, key, value, dout):
+        built_spans = make_spans()
+        hooks = _dropping(shape) if drop else None
         with _device(interpret, target):
-            residuals = trained(query, key, value, spans, hooks, interpret=interpret)[1:]
+            residuals = trained(query, key, value, built_spans, hooks, interpret=interpret)[1:]
             with _pinned(backward=config):
-                grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                                  accurate=accurate, interpret=interpret)
+                grads = attention_mosaic.backward(query, key, value, built_spans, hooks, dout,
+                                                  residuals=residuals, accurate=accurate,
+                                                  interpret=interpret)
         return grads.query, grads.key, grads.value
 
     def reference(query, key, value, dout):
-        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
+        built_spans = make_spans()
+        hooks = _dropping(shape) if drop else None
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, built_spans, hooks),
+                          query, key, value)
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept.name}",
-                    seeds=SEEDS, terms=_gradient_terms(spans))
+                    seeds=SEEDS, terms=_gradient_terms(make_spans))
 
 
-def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, score: tuple = (),
+def _gradient_terms(spans: template.KeySpans | Callable[[], template.KeySpans],
+                    hooked: Callable | None = None, score: tuple = (),
                     reference: Callable | None = None):
     """The float64 terms of the query's, key's and value's gradients over `spans` (`attention_terms`): a
     logit's gradient `P (dP - D)` sized by `P (|dP| + sum |out dout|)`, the rounding a D formed from the
@@ -506,24 +526,24 @@ def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, sc
     values, which `attention_terms` does not carry."""
     if "resumed" in score:
         return None
-    keep = template.dense(spans)[:, None]
     # The parameters' terms over every draw, traced once and its static runs compiled (`float64_terms`).
     traced_terms = None if reference is None else functools.partial(float64_terms, reference)
 
     def terms(query, key, value, dout, *hooks):
+        keep = template.dense(spans() if callable(spans) else spans)[:, None]
         params, initial = hooks if hooks else ((), None)
-        wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
+        wide = tuple(jnp.asarray(param, jnp.float64) for param in params)
         # Each head's sink, the state's maximum at any row and query (`template.sinks`).
-        sinks = None if initial is None else np.asarray(initial.m)[0, :, 0]
+        sinks = None if initial is None else initial.m[0, :, 0]
         modded = None if hooked is None else (lambda raw: template.score_modded(raw, hooked(wide, None)))
-        found = attention_terms(query, key, value, dout, keep, sinks=sinks, score=modded)
+        found = traced_attention_terms(query, key, value, dout, keep, sinks=sinks, score=modded)
         if not params and initial is None:
             # No hook parameter takes a gradient (a softcap's hook has none): the operands' terms alone, the
             # draw's hooks `((), None)` as they are.
             return (*found[1:4], *hooks)
         assert traced_terms is not None, "a hooked call's parameters' terms trace its reference"
         with jax.enable_x64(new_val=True):
-            _, traced = traced_terms(*widened((query, key, value, dout, *hooks)))
+            _, traced = traced_terms(query, key, value, dout, *hooks)
         return (*found[1:4], *traced[3:])
 
     return terms
@@ -1381,7 +1401,7 @@ def test_a_run_refuses_a_kernel_whose_warpgroup_products_ptxas_serialized_as_a_s
     with generation.assumed("sm90"), report.refusals():
         report.kept(first, relower=lambda: first, read=lambda executable: noted)
         misses = report.misses()
-    assert misses and all(miss.serialized == ("C7512",) and not miss.frame for miss in misses), misses
+    assert misses and all(miss.serialized == ("C7512",) and not miss.spilled for miss in misses), misses
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])

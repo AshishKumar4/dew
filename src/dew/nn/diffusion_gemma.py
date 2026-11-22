@@ -187,7 +187,7 @@ class DiffusionGemma(DecoderWrapper):
                image_groups=None, block_groups=None, rotary_positions=None,
                attention_pairwise_mask=None, attention_key_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False,
-               states: bool = False, progress: Progress | None = None):
+               states: bool = False, progress: Progress | None = None, routed_experts=None):
         """Append a clean prompt or committed canvas to the cache, evaluating media only when given.
 
         It returns the logits, or with `states` the final normalized states
@@ -195,13 +195,17 @@ class DiffusionGemma(DecoderWrapper):
         reads the states, so the vocabulary-sized logits of a whole row never
         exist at once. The tokens are laid out by their `coordinates`, at a
         training step's `progress` (`dew.nn.progress`; None at the run's end).
+        `routed_experts` replays a routing, `[B, S, layers, top_k]` expert ids
+        (`CausalTransformer`'s): the experts each token's layer reads, its
+        weights its own router's.
         """
         read = self.text.hidden_states if states else self.text
         tokens, embeddings = self._clean_inputs(tokens, image_indices, conditioning, train)
         return read(tokens, decode=True, train=train, input_embeddings=embeddings, coordinates=coordinates,
                     image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
                     attention_pairwise_mask=attention_pairwise_mask,
-                    attention_key_positions=attention_key_positions, progress=progress)
+                    attention_key_positions=attention_key_positions, progress=progress,
+                    routed_experts=routed_experts)
 
     def _clean_inputs(self, tokens, image_indices, conditioning: Mapping[str, jax.Array] | None,
                       train: bool) -> tuple[jax.Array, jax.Array | None]:
@@ -250,7 +254,8 @@ class DiffusionGemma(DecoderWrapper):
                  self_conditioning_mask=None, train: bool = False, positions=None,
                  coordinates: Coordinates | None = None,
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
-                 attention_key_valid=None, states: bool = False, progress: Progress | None = None):
+                 attention_key_valid=None, states: bool = False, progress: Progress | None = None,
+                 routed_experts=None):
         """Return the canvas logits, or with `states` the final normalized states before the head.
 
         `encode` explains why a loss reads the states. Self-conditioning reads
@@ -260,7 +265,8 @@ class DiffusionGemma(DecoderWrapper):
         (`token_coordinates`), the layout the decoder reads, at a training
         step's `progress` as `encode` reads it. The canvas's keys, the cache's and its own, are read
         under a pairwise mask, or under key runs beside the keys' validity, where a call gives them
-        (`CausalTransformer`'s `attention_pairwise_mask`, `attention_key_runs`, `attention_key_valid`)."""
+        (`CausalTransformer`'s `attention_pairwise_mask`, `attention_key_runs`, `attention_key_valid`).
+        `routed_experts` replays a routing as `encode`'s does."""
         tokens = jnp.asarray(tokens, jnp.int32)
         coordinates = token_coordinates(tokens.shape[:2], coordinates, positions=positions)
         if self.is_initializing() and self.conditioner is not None:
@@ -281,7 +287,7 @@ class DiffusionGemma(DecoderWrapper):
                     input_embeddings=conditioned, coordinates=coordinates,
                     attention_pairwise_mask=attention_pairwise_mask,
                     attention_key_positions=attention_key_positions, attention_key_runs=attention_key_runs,
-                    attention_key_valid=attention_key_valid, progress=progress)
+                    attention_key_valid=attention_key_valid, progress=progress, routed_experts=routed_experts)
 
 
 __all__ = ["DiffusionGemma", "SelfConditioning"]

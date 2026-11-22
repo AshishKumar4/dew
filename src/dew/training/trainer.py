@@ -1102,13 +1102,14 @@ class Trainer(Generic[Loss, Effects]):
         """A fresh run's first step planned and compiled over its state's shapes (`start`'s) before the
         state is placed, held for the run's first compile over `batch` (`StepCompiler.planned_unplaced`),
         which takes it where the devices hold it once the state is placed and otherwise plans from the held
-        plan's rung and split (`StepCompiler._plans`):
-        built at the pass count of the phase its batch was read in (`PhasePasses.scoped`), as `compile`
-        builds it, its admission counting the bytes the start will place in a device's own memory beside it
-        (`Start.unplaced`). The fit `run` keeps what it searched over (`FitRun.searched`)."""
+        plan's rung and split (`StepCompiler._plans`): built at the pass count of the phase its batch was
+        read in (`PhasePasses.scoped`), as `compile` builds it, its admission counting the bytes the start
+        will place in a device's own memory beside it (`Start.unplaced`), its layers' gathers sized over the
+        variables as placed (`Start.placed_variables`). The fit `run` keeps what it searched over."""
         with self.phase_passes.scoped(self, self._compiler):
             run.searched = self._compiler.planned_unplaced(self._stepping(), start.abstract, batch,
-                                                           start.unplaced(self.device_mesh))
+                                                           start.unplaced(self.device_mesh),
+                                                           start.placed_variables)
 
     @ruled
     def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None,
@@ -1742,17 +1743,18 @@ class Trainer(Generic[Loss, Effects]):
         program compiles is its step's planning, which runs beside it, the overlap the start is begun for (a
         refusal of it, `PlanRefused` or `LayoutRefused`, a compile that fails, an interrupt); the process's
         exit then waits, saying so, for the start's compile to end (`options.compiling`)."""
-        if self._compiler.ahead is not None or self.host_master or pgle_runs():
+        if self._compiler.ahead is not None or self.host_master or pgle_runs() or self.lower_for is not None:
             return None
         key = shapes_of(fresh.key)
         begun = start_compiling(fresh.placing, fresh.initializer, key, fresh.abstract, fresh.shardings,
-                                self.device_mesh)
+                                mesh := self.device_mesh)
         self.phase_passes.at(first)
         with run.startup.phase("compile", "compiling the step"), run.held():
             # As the loop hands its step the batch, planned once: where the layout's choice did, not again.
             batch = handed(placed, self._shape.examples)
             if run.searched != planned_over(batch, self._shape):
                 self._planned_unplaced(run, fresh, batch)
+            self._compiler.refuse_unplaced(run.searched, lambda: fresh.freed(mesh), mesh, begun)
         return begun
 
     def _whole_validated(self, state: TrainState, batch: Batch, split: int) -> Validation:

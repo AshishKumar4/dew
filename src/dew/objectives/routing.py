@@ -125,9 +125,12 @@ class ExpertBalance:
         coordinates column.
         """
         documents = token_layout(fields)[1]
-        if self.aux_loss_alpha is not None or self.router_z_loss:
-            balancing(path for marker in (ROUTER_INDICES, ROUTER_LOG_Z)
-                      for path, _ in sown_nodes(routing, marker))
+        # The routers a loss term reads, alone: the balance loss's those that record their scores beside their
+        # choice, the z-loss's those that record their log partition. A router that records its choice alone
+        # (a routing replay's record, Gemma 4's) is read by none, and stays a router no term balances.
+        balancing([*(path for path, _ in sown_nodes(routing, ROUTER_SCORES, ROUTER_INDICES)
+                     if self.aux_loss_alpha is not None),
+                   *(path for path, _ in sown_nodes(routing, ROUTER_LOG_Z) if self.router_z_loss)])
         statistics: Ratio | RoutedStatistics = prediction
         reported: dict[str, jax.Array | Pooled] = {}
         if self.aux_loss_alpha is not None:
@@ -164,12 +167,15 @@ class ExpertBalance:
 
         The reported number is what the terms add to the prediction's loss.
         """
-        if not routing:
-            raise ValueError("aux_loss_alpha requires a model with a mixture")
+        # The routers whose scores the loss reads: a router that records its choice alone (a routing replay's
+        # record, Gemma 4's) gives the loss nothing, refused as no router at all is (row 4739's review).
+        routers = router_scores(routing)
+        if not routers:
+            raise ValueError("aux_loss_alpha requires a model with a mixture whose routers record their "
+                             "scores")
         documents = token_layout(fields)[1]
         laid = fields.get(COORDINATES_FIELD)
         max_segments = laid.max_segments if isinstance(laid, Coordinates) else None
-        routers = router_scores(routing)
         sequence = []
         if self.seq_aux:
             for scores, indices in routers:

@@ -15,7 +15,7 @@ def step_fits(args) -> dict:
 
     from dew._coordination import PeerFailure
     from dew.distributed.placement import MeshSpec
-    from dew.training.memory import step_fits
+    from dew.training.memory import step_fits, step_fits_admitted
 
     mesh = MeshSpec(fsdp=jax.device_count()).build()
     shape = jax.ShapeDtypeStruct((4 * jax.device_count(),), jnp.float32,
@@ -45,6 +45,27 @@ def step_fits(args) -> dict:
         found["failed"] = ["PeerFailure", error.phase, error.rank]
     except RuntimeError as error:
         found["failed"] = ["RuntimeError", str(error)]
+
+    # The terms a fit admits by read within its agreement (`step_fits_admitted`): a process whose executable
+    # states no memory analysis ends every process's check with its error (row 11712's review: read before
+    # the agreement, its peer waited in an exchange it never reached).
+    jax.Device.memory_stats = stated(2 ** 29)
+    analysis = jax.stages.Compiled.memory_analysis
+    # A step not analysed yet, whose analysis is read anew (`compiled_memory` keeps each executable's).
+    fresh = jax.jit(lambda values: values * 3).trace(shape).lower().compile()
+
+    def unanalysed(executable):
+        raise RuntimeError("the executable's memory analysis could not be read")
+    if args.process_id == 1:
+        jax.stages.Compiled.memory_analysis = unanalysed
+    try:
+        step_fits_admitted(fresh, mesh)
+    except PeerFailure as error:
+        found["unanalysed"] = ["PeerFailure", error.phase, error.rank]
+    except RuntimeError as error:
+        found["unanalysed"] = ["RuntimeError", str(error)]
+    finally:
+        jax.stages.Compiled.memory_analysis = analysis
     return found
 
 

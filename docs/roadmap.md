@@ -17,7 +17,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - One attention algebra: state, visibility, hooks. [1293]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
-- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900, 10742, 10805]
+- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 10742, 10805]
 - Convolution repairs above their owner. [5665]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -38,18 +38,16 @@ This page is generated from the maintainers' findings ledger as each change land
 - Block-selected attention's other selections as mixers. [6301]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - A certification verdict's key names the ptxas that assembled it by the installed nvcc wheels alone. [7309]
-- The GPU interpreter's race detection (plgpu.InterpretGPUParams(detect_races=True)) flags a correctly ordered consumer-fed ring at one consumer. [7853]
 - The GEMM's quantizing epilogue, algebra.md §7.3 and §7.4's encode consumer. [8547]
 - FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
-- Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - The suite's wall. [5478]
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
-- The interpreter (Pallas Mosaic GPU interpret mode, the CPU suite's) takes about 8 times as long a draw for a tcgen05 (sm100) recurrence launch as for its wgmma…. [6521]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
+- Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 
 ## Models and interop
 
@@ -62,9 +60,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 10762]
+- Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 617]
-- XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
@@ -107,3 +104,5 @@ This page is generated from the maintainers' findings ledger as each change land
 - The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
 - The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
+- Tools that import their siblings by putting tools/ on sys.path at import time. [11756]
+- Src/dew/communicators.py:475 keeps a program's communicators under dew_cache_dir() while the executables they describe live in the compilation cache…. [11757]

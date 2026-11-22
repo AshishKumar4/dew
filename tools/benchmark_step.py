@@ -815,8 +815,11 @@ def entered(within: str | None) -> contextlib.AbstractContextManager:
 
 def tracked(rows: list[Row], tracker: Tracker) -> None:
     """`rows`' numbers logged into `tracker` and it closed, one step a row in their order, each named by its
-    row's architecture: after every case's measurement, so no timed window holds it (row 285)."""
+    row's architecture: after every case's measurement, so no timed window holds it (row 285). A row any of
+    whose steps went non-finite is no measurement and is not logged (row 11745), its step left unused."""
     for step, row in enumerate(rows):
+        if not row["finite"]:
+            continue
         tracker.log({f"{row['architecture']}/{key}": float(value) for key, value in row.items()
                      if isinstance(value, (int, float)) and not isinstance(value, bool)}, step)
     tracker.close()

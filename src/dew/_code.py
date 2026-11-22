@@ -22,8 +22,7 @@ import sys
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
-from dew._builds import dew_cache_dir
-from dew._cache import VERSION_FILE
+from dew._cache import VERSION_FILE, default_compilation_cache_dir
 from dew._files import write_atomically
 from dew._imports import Walk
 from dew._records import JSON
@@ -80,7 +79,9 @@ REVIEWED = {
         "dew._sources:generated_fields:sys.modules", "dew._sources:own_source:sys.modules",
         "dew._sources:recorded:sys.modules", "dew._sources:source_file:sys.modules",
         "dew._stated:_coded:sys.modules", "dew._stated:_converter:sys.modules",
-        "dew._stated:_named:sys.modules", "dew.data.pipeline:_main_importable:sys.modules",
+        "dew._stated:_named:sys.modules", "dew._stated:_stateless:sys.modules",
+        "dew._stated:_wrapping:sys.modules",
+        "dew.data.pipeline:_main_importable:sys.modules",
         "dew.data.sources.memory:_table_records:sys.modules"),
         "a module this process already imported, a library's, the user's or the one defining a value it "
         "holds, read by its variables or the name that value states: it imports none of Dew's"),
@@ -220,22 +221,32 @@ def _snapshot() -> dict[str, tuple[str, str]]:
 
 
 def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ...]]:
-    """`closure(*roots)`, kept in Dew's cache under the digest of the source it was walked from
-    (`_snapshot`), the Python that parsed it and the roots, so a later start of the same tree reads it,
-    walking nothing; one that does not name its roots, or names a module the tree has not, is walked
-    again."""
-    tree = hashlib.sha256(json.dumps(sorted(_snapshot().values())).encode()).hexdigest()
+    """`closure(*roots)`, kept beside the compilation cache the verdicts it keys live in
+    (`dew._cache.default_compilation_cache_dir`) under the tree's digest (`whole_digest`), the Python that
+    parsed it and the roots, so a later start of the same tree reads it, walking nothing; one that does not
+    name its roots, or names a module the tree has not, is walked again. A directory that cannot be read or
+    written (a read-only home) keeps none, a miss logged, and a bucket's (gs://) is not written to: the walk's
+    closure serves the process."""
     named = hashlib.sha256(json.dumps(roots).encode()).hexdigest()[:16]
     python = "{}.{}".format(*sys.version_info[:2])
-    kept = Path(dew_cache_dir()) / "code" / f"{tree}-{python}-{named}.json"
-    with contextlib.suppress(FileNotFoundError, ValueError):
+    cache = default_compilation_cache_dir()
+    if "://" in cache:
+        # A bucket's compilation cache (gs://), whose client fails in ways of its own: a closure is kept on a
+        # local file system alone, and walked again each process elsewhere.
+        return closure(*roots)
+    kept = Path(cache) / "dew-code" / f"{whole_digest()}-{python}-{named}"
+    with contextlib.suppress(OSError, ValueError):
         found = json.loads(kept.read_text())
         if isinstance(found, dict) and _sound(found, roots):
             return frozenset(found["modules"]), tuple(found["sites"])
     modules, sites = closure(*roots)
-    kept.parent.mkdir(parents=True, exist_ok=True)
-    write_atomically(kept, json.dumps({"roots": list(roots), "modules": sorted(modules),
-                                       "sites": list(sites)}))
+    try:
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(kept, json.dumps({"roots": list(roots), "modules": sorted(modules),
+                                           "sites": list(sites)}))
+    except OSError as refused:
+        _log.warning("the closure of %s is not kept (%s): a later start walks it again", ", ".join(roots),
+                     refused)
     return modules, sites
 
 

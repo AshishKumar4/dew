@@ -158,6 +158,10 @@ def test_a_pool_agrees_a_steps_fit_on_each_processs_own_read_and_a_failed_read_e
         [[True, True, False], [False, False, False], [True, False, True], [False, False, True]]], reports
     assert [report["failed"] for report in reports] == [
         ["PeerFailure", "a step's fit", 1], ["RuntimeError", "the allocator's statistics could not be read"]]
+    # The terms its fit admits by read within the same agreement (row 11712's review).
+    assert [report["unanalysed"] for report in reports] == [
+        ["PeerFailure", "a step's fit", 1],
+        ["RuntimeError", "the executable's memory analysis could not be read"]]
 
 
 @pytest.mark.distributed
