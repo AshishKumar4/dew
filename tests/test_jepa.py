@@ -326,25 +326,30 @@ def context_errors(objective, params, ema, data, mask, rng, draws=8):
     """Each pair of consecutive images' mean prediction error from their own contexts and from each
     other's, over `draws` mask draws: two arrays of a value a pair, pairs being independent draws."""
     n, blocks = data.shape[0], mask.num_targets
-    full = normalize_targets(objective.encode(part(ema, "context_encoder"), data))
 
-    def error(ctx, context_idx, target_idx):
-        targets = jnp.take_along_axis(full[:, None], target_idx.reshape(n, blocks, -1, 1), axis=-2)
-        predictions = objective.predictor.apply(
-            part(params, "predictor"),
-            jnp.repeat(ctx, blocks, axis=0),
-            jnp.repeat(context_idx, blocks, axis=0),
-            target_idx.reshape(n * blocks, -1),
-        ).reshape(targets.shape)
-        return np.asarray(jnp.mean((predictions - targets) ** 2, axis=(1, 2, 3)), np.float64)
+    @jax.jit
+    def drawn(params, ema, key):
+        # One draw's errors as one program (row 11759: computed op by op, each draw's every layer a program
+        # of its own, 138 s cold in train 1175's CI).
+        full = normalize_targets(objective.encode(part(ema, "context_encoder"), data))
 
-    own, other = [], []
-    for key in jax.random.split(rng, draws):
+        def error(ctx, context_idx, target_idx):
+            targets = jnp.take_along_axis(full[:, None], target_idx.reshape(n, blocks, -1, 1), axis=-2)
+            predictions = objective.predictor.apply(
+                part(params, "predictor"),
+                jnp.repeat(ctx, blocks, axis=0),
+                jnp.repeat(context_idx, blocks, axis=0),
+                target_idx.reshape(n * blocks, -1),
+            ).reshape(targets.shape)
+            return jnp.mean((predictions - targets) ** 2, axis=(1, 2, 3))
+
         context_idx, target_idx = mask.sample(key, n)
         context = objective.encode(part(params, "context_encoder"), data, context_idx)
         swapped = context.reshape(n // 2, 2, *context.shape[1:])[:, ::-1].reshape(context.shape)
-        own.append(error(context, context_idx, target_idx))
-        other.append(error(swapped, context_idx, target_idx))
+        return error(context, context_idx, target_idx), error(swapped, context_idx, target_idx)
+
+    errors = [drawn(params, ema, key) for key in jax.random.split(rng, draws)]
+    own, other = ([np.asarray(draw[side], np.float64) for draw in errors] for side in (0, 1))
     return tuple(np.mean(errors, axis=0).reshape(n // 2, 2).mean(axis=1) for errors in (own, other))
 
 
@@ -394,12 +399,12 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
 
     params = initial.variables
     batch = {"image": images()}
-    step = step_with(initial.averaged)
-    same = float(objective.scalar_loss(params, batch, step)[0])
+    loss = jax.jit(lambda params, batch, step: objective.scalar_loss(params, batch, step)[0])
+    same = float(loss(params, batch, step_with(initial.averaged)))
     assert same > 0.1
     moved = {"params": {"context_encoder": jax.tree.map(
         lambda value: value + 0.1, initial.averaged["params"]["context_encoder"])}}
-    other = float(objective.scalar_loss(params, batch, step_with(merge(initial.averaged, moved)))[0])
+    other = float(loss(params, batch, step_with(merge(initial.averaged, moved))))
     # The loss reads the averaged context encoder: moving it moves the loss.
     assert np.isfinite(other) and other != same
 
