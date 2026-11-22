@@ -8,9 +8,9 @@ state `h_t = a_t h_{t+1} + b_t`. A chunked recurrence's backward walks its chunk
 scan's, mamba_ssm's selective_scan_bwd_kernel.cuh, a BlockScan a state forward and a reverse one back).
 Interpreted, the scan is XLA's (`lax.associative_scan`)."""
 
+import dataclasses
 import math
 from collections.abc import Callable
-from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -164,14 +164,15 @@ def _zeroed_columns(running) -> None:
     utils.warpgroup_barrier()
 
 
-class Emitted(NamedTuple):
+@dataclasses.dataclass(frozen=True)
+class Emitted:
     """An fp32 MLIR value whose `+` and `-` emit its kernel's own addition and subtraction (`arith.addf`,
     `arith.subf`, rounded each): an algebra's own arithmetic run in a native kernel's body, its schedule the
     kernel's (`precision.renormalized_sum` in `compensated_columns`)."""
 
     value: ir.Value
 
-    def __add__(self, other: "Emitted") -> "Emitted":  # type: ignore[override]
+    def __add__(self, other: "Emitted") -> "Emitted":
         return Emitted(arith.addf(self.value, other.value))
 
     def __sub__(self, other: "Emitted") -> "Emitted":
