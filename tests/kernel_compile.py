@@ -484,16 +484,16 @@ def write_modules(lowering: str, compiling: str, directory: str, kernels: Collec
     certification refused. Two modules of one name and launch in one print raise."""
     modules: dict[str, str] = {}
     for printed in (lowering, compiling):
-        assembled: dict[str, str] = {}
+        printed_modules: dict[str, str] = {}
         for part in printed.split(PTX_MODULE)[1:]:
             entry = PTX_ENTRY.search(part)
             if entry is None:
                 raise ValueError(f"a printed PTX module names no entry: {part[:200]}")
             name = report.launch_name(*assembled.kernel_of(entry.group(1)))
-            if name in assembled:
+            if name in printed_modules:
                 raise ValueError(f"two PTX modules of {name}")
-            assembled[name] = part
-        modules.update(assembled)
+            printed_modules[name] = part
+        modules.update(printed_modules)
     for name, part in modules.items():
         if name in kernels:
             Path(directory, f"{name}.ptx").write_text("//\n" + PTX_MODULE + part)

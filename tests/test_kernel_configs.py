@@ -278,9 +278,9 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
         assert "error" not in record, record["error"]
         (ptx,) = Path(directory).glob("*.ptx")
         notes = ptxas_notes(ptx.read_text(), "sm90")
-    assembled = ptxas_read(notes)
+    read = ptxas_read(notes)
     # A report that states the kernel's registers was read; none of its serialization codes is there.
-    assert assembled.registers > 0 and assembled.losses == (), notes
+    assert read.registers > 0 and read.losses == (), notes
 
 
 def _spilling_forward(launch, rows: int, devices):
