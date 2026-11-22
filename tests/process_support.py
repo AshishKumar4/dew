@@ -138,8 +138,8 @@ def coordinator_port() -> int:
 
 def device_flags(devices: int, flags: str | None = None) -> str:
     """XLA's `flags` (this process's where none are given) with `devices` CPU devices, the one way a worker of
-    the suite sets its device count: the lane's other flags kept (`lane_environment`: its CPU collectives'
-    memory-optimized schedule, row 5397, and no excess precision), which a count set alone drops."""
+    the suite sets its device count: the lane's other flags kept (`lane_environment`: its memory-optimized
+    schedule, which the memory cells read, and no excess precision), which a count set alone drops."""
     from lane_environment import without_flags
 
     count = "--xla_force_host_platform_device_count"
