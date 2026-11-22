@@ -767,8 +767,9 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         bands, pair, following = carried
         keys, decays = shifted(e)
         pair = pair * following
-        return (tuple(jnp.where(lane == e, jnp.sum(row * keys * pair, axis=1)[:, None], band)
-                      for band, row in zip(bands, rows, strict=True)), pair, decays)
+        summed = [jnp.sum(band_term(row, keys, pair, unit_keys=False), axis=1) for row in rows]
+        return (tuple(jnp.where(lane == e, total[:, None], band)
+                      for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     def folded(e, carried):
         # Each row's decay folded in: a multiply an element and a term's fused multiply-add, where keys at
@@ -776,8 +777,9 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         bands, decayed, following = carried
         keys, decays = shifted(e)
         decayed = tuple(row * following for row in decayed)
-        return (tuple(jnp.where(lane == e, jnp.sum(row * keys, axis=1)[:, None], band)
-                      for band, row in zip(bands, decayed, strict=True)), decayed, decays)
+        summed = [jnp.sum(band_term(row, keys, None, unit_keys=True), axis=1) for row in decayed]
+        return (tuple(jnp.where(lane == e, total[:, None], band)
+                      for band, total in zip(bands, summed, strict=True)), decayed, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
     if unit_keys:
@@ -831,8 +833,21 @@ def write_gated(tile: jax.Array, strengths: jax.Array) -> jax.Array:
     """A tile `[C, D]` each row scaled by its token's write strength (`strengths` `[C]`, the delta rule's
     beta): the keys and values the delta rule writes, as their products take them (fla's `k * beta` before
     its `k k^T`, `v * beta` before its `A v`), gated on the operand, which scaling after the product is not
-    at finite precision (kernel-templates.md §3)."""
-    return tile * strengths[:, None]
+    at finite precision (kernel-templates.md §3). `gated` its one word's rounding, a native kernel's too."""
+    return gated(tile, strengths[:, None])
+
+
+def gated(word, strength):
+    """A word scaled by its token's write strength, one rounding: `write_gated`'s arithmetic on any values
+    that multiply (arrays, or a native kernel's emitted words, `templates.scan.Emitted`)."""
+    return word * strength
+
+
+def band_term(row, key, pair, *, unit_keys: bool):
+    """A sub-chunk's own pair's term (`key_diagonal_bands`): the row times the key, then times the pair's
+    decay; or where keys are at most one in size (`unit_keys`), the decayed row `row` (`row * pair`, carried
+    across the offsets) times the key, `pair` unread. On any values that multiply, as `gated`."""
+    return row * key if unit_keys else row * key * pair
 
 
 def columns_before(found: jax.Array, start: int) -> jax.Array:

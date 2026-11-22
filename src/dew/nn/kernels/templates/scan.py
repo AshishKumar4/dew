@@ -166,9 +166,10 @@ def _zeroed_columns(running) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class Emitted:
-    """An fp32 MLIR value whose `+` and `-` emit its kernel's own addition and subtraction (`arith.addf`,
-    `arith.subf`, rounded each): an algebra's own arithmetic run in a native kernel's body, its schedule the
-    kernel's (`precision.renormalized_sum` in `compensated_columns`)."""
+    """An fp32 MLIR value whose `+`, `-` and `*` emit its kernel's own addition, subtraction and
+    multiplication (`arith.addf`, `arith.subf`, `arith.mulf`, rounded each): an algebra's own arithmetic run
+    in a native kernel's body, its schedule the kernel's (`precision.renormalized_sum` in
+    `compensated_columns`, `recurrence_algebra.band_term` and `gated` in `own_pairs`)."""
 
     value: ir.Value
 
@@ -177,6 +178,9 @@ class Emitted:
 
     def __sub__(self, other: "Emitted") -> "Emitted":
         return Emitted(arith.subf(self.value, other.value))
+
+    def __mul__(self, other: "Emitted") -> "Emitted":
+        return Emitted(arith.mulf(self.value, other.value))
 
 
 def _compensated_columns(ref, running) -> None:
