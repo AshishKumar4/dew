@@ -561,7 +561,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             _gmm_stepped_at, family=family, tiles=tiles, prologue=(prologue, prologue_axes),
             matrices=matrices, transpose=(transpose_lhs, transpose_rhs), interpret=bool(interpret),
             mx=mx_scales is not None, packed_rows=packed_rows, chosen=None if when is None else chained,
-            scaled=(step_scales is not None, scale_per, block_n))
+            scaled=(step_scales is not None, scale_per, block_n),
+            summed=exact_sums and not family.sums_in_persist)
 
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
             def issue(wg, tile, walk, *, active):
@@ -661,12 +662,11 @@ def _chained_walked(chained: tuple, tiles: Tiles, dtype, transpose_lhs: bool, de
 
 def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: tuple, matrices: dict,
                     transpose: tuple, interpret: bool, mx: bool, packed_rows: bool, scaled: tuple,
-                    chosen=None, **refs) -> tuple[Callable, Callable | None]:
+                    summed: bool, chosen=None, **refs) -> tuple[Callable, Callable | None]:
     """Dew: consumer `wg`'s step of `tile` (`_gmm_step`), `refs` its side tiles: its share of the rows, its
     idleness and its first step the tile's, its scaling at its column tile; and the walk's prefetch of its
-    slots (`_gmm_prefetch`) where it is a plain step of a family that prefetches (one matrix, its rows as
-    staged, every consumer's products issued unconditionally, a compiled launch, its rows and its matrix
-    read untransposed), None elsewhere."""
+    slots (`_gmm_prefetch`) where `prefetches` says its walk reads one and every consumer's products issue
+    unconditionally (no idleness), None elsewhere."""
     rows = pl.ds(tiles.share_row(wg), tiles.share)
     (hook, hook_axes), (transpose_lhs, transpose_rhs) = prologue, transpose
     idle = _idle(tiles, tile[0], tile[1], wg)
@@ -675,10 +675,22 @@ def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: 
         transpose_rhs=transpose_rhs, matrices=matrices, interpret=interpret, first=tile[3],
         transpose_lhs=transpose_lhs, block_scaled=mx, packed_rows=packed_rows,
         scaling=_gmm_scaling(scaled[0], scaled[1], scaled[2], tile[2], rows), chosen=chosen, **refs)
-    plain = (len(matrices) == 1 and hook is None and idle is None and refs.get('decoded') is None
-             and not packed_rows and not mx and chosen is None and not interpret and not transpose_lhs
-             and not transpose_rhs)
-    return step, _gmm_prefetch(family, matrices, rows) if plain and family.prefetches_fragments else None
+    prefetching = idle is None and prefetches(
+        family, matrices=len(matrices), prologue=hook, scaled=refs.get('decoded') is not None or mx,
+        chained=chosen is not None, interpret=interpret,
+        transposed=(transpose_lhs or packed_rows, transpose_rhs), summed=summed)
+    return step, _gmm_prefetch(family, matrices, rows) if prefetching else None
+
+
+def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, chained: bool,
+               interpret: bool, transposed: tuple[bool, bool], summed: bool) -> bool:
+    """Dew: whether a `gmm` walk of these facts reads a step's first fragments under the step before's last
+    product (`_gmm_prefetch`, `Transport.prefetches_fragments`): a plain step's, one matrix of rows as staged
+    (no prologue), unscaled and undecoded, no chained products, compiled, its rows and its matrix read
+    untransposed, its products summed by the tensor cores (no running sum of its own). The one statement its
+    walk (`_gmm_stepped_at`) and its register model (`grouped_matmul.MosaicGmm`) read."""
+    return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
+            and not interpret and not any(transposed) and not summed)
 
 
 def _gmm_streamed(paired, scales, joined, bounded: "Chained | None" = None) -> tuple[dict, tuple, int]:

@@ -205,7 +205,8 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
         plain = resources.tile_registers(family, config.sharing, block, dtype, stored=stored,
                                         rhs_transposed=self._matrix_transposed(ba),
-                                        lhs_retained=ba.arguments.get('paired') is not None)
+                                        lhs_retained=ba.arguments.get('paired') is not None,
+                                        prefetched=self._prefetched(ba, config, family))
         # A consumer's accumulators: its share of the tile's rows (the whole tile's under ping-pong).
         accumulator = -(-config.share * columns // resources.THREADS)
         # A kernel gradient's consumer prepares its depth half of each step's rows stage in registers (the
@@ -665,6 +666,13 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         scales), its layout its own: none of `_Mosaic`'s."""
         return False
 
+    def _prefetched(self, ba, config: tiling.Tiles, family: mosaic.Family) -> bool:
+        """Whether the launch's walk at `config` reads a step's first fragments under the step before's last
+        product (`mosaic_gpu.prefetches`), which its registers hold beside them (`resources.tile_registers`):
+        a kernel gradient's walks none."""
+        del ba, config, family
+        return False
+
     def _pingpong_refuses(self, config: tiling.Tiles, family: mosaic.Family) -> bool:
         """Whether a ping-pong tile (`Tiles.pingpong`) is one the launch does not run: on a family that takes
         none (`Family.takes_pingpong`: a producer of its own loads every tile), a kernel gradient's (its
@@ -847,6 +855,17 @@ class MosaicGmm(_Mosaic):
     def _scaled(self) -> bool:
         # A packed matrix's words (`STEPS`), a step's row scales or an MX product's block scales.
         return self.STEPS is not None or self.STEP_SCALED or self.BLOCK_SCALED
+
+    def _prefetched(self, ba, config: tiling.Tiles, family: mosaic.Family) -> bool:
+        from .templates.gemm import mosaic_gpu
+
+        # As its walk decides (`mosaic_gpu._gmm_stepped_at`): a swapped call reads its rows transposed.
+        return mosaic_gpu.prefetches(
+            family, matrices=1 if ba.arguments.get('paired') is None else 2,
+            prologue=ba.arguments['hooks'].prologue, scaled=self._scaled,
+            chained=bool(ba.arguments.get('chained')), interpret=bool(ba.arguments['interpret']),
+            transposed=(config.swapped, self._matrix_transposed(ba)),
+            summed=bool(ba.arguments.get('exact_sums')) and not family.sums_in_persist)
 
     def output_sides(self, ba) -> tuple[int, int]:
         return _product_sides(ba)
