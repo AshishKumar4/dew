@@ -213,16 +213,13 @@ class OperandRead(NamedTuple):
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs: OperandRead,
-                      rhs: OperandRead, *, prefetched: bool = False) -> list:
+                      rhs: OperandRead) -> list:
     """The register live set of a product `[rows, depth] @ [depth, columns]`'s operands, each read as `lhs`
     and `rhs` state: their issuer at the operand's dtype, the slices consumed and loaded ahead within a
     stage's granule (`Family.operand_live_depth`), each operand's replicating warps and parts. An operand
     retained across products keeps its whole loaded granule. A value staged for its product dies before the
     product reloads its fragments: those are separate phases, whose larger set is returned. Where products
-    read shared memory, only that staging phase holds registers. A walk that reads a step's first fragments
-    under the step before's last product (`prefetched`, `Issuer.products_across`) holds there that product's
-    instruction beside each operand's first loaded granule, where that is the deeper (the left's at 48 deep
-    of a 32-deep step and 80 of a 64-deep one, where its step held 32: 5271's review)."""
+    read shared memory, only that staging phase holds registers."""
     staged = ([(rows, depth, lhs.dtype)] * lhs.parts if lhs.staged else [])
     staged += ([(depth, columns, rhs.dtype)] * rhs.parts if rhs.staged else [])
     if not family.operands_in_registers:
@@ -230,12 +227,9 @@ def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs
     left_issuer, right_issuer = family.for_dtype(lhs.dtype), family.for_dtype(rhs.dtype)
     left_depth = left_issuer.operand_live_depth(
         depth, left_issuer.lhs_fragment_depth(depth, swizzle=lhs.swizzle), retained=lhs.retained)
-    right_loaded = right_issuer.rhs_fragment_depth(depth, transposed=rhs.transposed, swizzle=rhs.swizzle)
-    right_depth = right_issuer.operand_live_depth(depth, right_loaded, retained=rhs.retained)
-    if prefetched:
-        left_depth = max(left_depth, left_issuer.fragment_depth(depth)
-                         + left_issuer.lhs_fragment_depth(depth, swizzle=lhs.swizzle))
-        right_depth = max(right_depth, right_issuer.fragment_depth(depth) + right_loaded)
+    right_depth = right_issuer.operand_live_depth(
+        depth, right_issuer.rhs_fragment_depth(depth, transposed=rhs.transposed, swizzle=rhs.swizzle),
+        retained=rhs.retained)
     fragments = ([(rows * family.lhs_copies, left_depth, lhs.dtype)] * lhs.parts
                  + [(right_depth, columns * family.rhs_copies, rhs.dtype)] * rhs.parts)
     # A value staged into shared memory dies before its product loads the fragments back.
@@ -287,21 +281,18 @@ def product_phases(family: "Family", dtype, *products: Product, lhs_swizzle: int
 
 
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
-                   stored=(), rhs_transposed: bool = False, lhs_retained: bool = False,
-                   prefetched: bool = False) -> int:
+                   stored=(), rhs_transposed: bool = False, lhs_retained: bool = False) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
     each of its replicating warps: `lhs_copies`, `rhs_copies`), the right one's a sub-step deep where
     it loads it so (`Family.rhs_fragment_depth`), or held whole when its transposed storage requires it.
     Where the family copies its outputs out through its registers (`Family.stores_through_registers`),
-    its epilogue holds one copy's rows (`copied_rows`) in the widest `stored` dtype beside the accumulator.
-    A walk that `prefetched` a step's first fragments holds them beside the step before's last
-    (`operand_fragments`)."""
+    its epilogue holds one copy's rows (`copied_rows`) in the widest `stored` dtype beside the accumulator."""
     rows, columns, depth = block
     share = rows // consumers
     fragments = operand_fragments(family, share, depth, columns, OperandRead(dtype, retained=lhs_retained),
-                                  OperandRead(dtype, transposed=rhs_transposed), prefetched=prefetched)
+                                  OperandRead(dtype, transposed=rhs_transposed))
     # The accumulator's columns its consumer holds at once: all of them, or an epilogue's chunk of one held
     # in tensor memory (`Issuer.chunk_columns`).
     accumulator = (share, family.chunk_columns(columns), jnp.float32)

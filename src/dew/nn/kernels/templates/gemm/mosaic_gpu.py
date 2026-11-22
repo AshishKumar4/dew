@@ -687,8 +687,8 @@ def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, 
     """Dew: whether a `gmm` walk of these facts reads a step's first fragments under the step before's last
     product (`_gmm_prefetch`, `Transport.prefetches_fragments`): a plain step's, one matrix of rows as staged
     (no prologue), unscaled and undecoded, no chained products, compiled, its rows and its matrix read
-    untransposed, its products summed by the tensor cores (no running sum of its own). The one statement its
-    walk (`_gmm_stepped_at`) and its register model (`grouped_matmul.MosaicGmm`) read."""
+    untransposed, its products summed by the tensor cores (no running sum of its own), as its walk decides
+    (`_gmm_stepped_at`)."""
     return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
             and not interpret and not any(transposed) and not summed)
 
