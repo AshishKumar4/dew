@@ -301,27 +301,63 @@ default that `dew.decision.SegmentLayout` holds otherwise (a joint row's 16384 t
 framing it fills where a record states none, `SegmentLayout.joint_row`)."""
 
 
+def class_record(value: Mapping[typing.Any, object]) -> tuple[str, Mapping[str, object]] | None:
+    """The class a class record, `{"class": ..., "fields": {...}}`, names and its fields (a record with no
+    fields may leave them out); None for a mapping that is not one: data that names a class is no record."""
+    name = value.get("class")
+    if not isinstance(name, str):
+        return None
+    fields = value.get("fields", {})
+    if isinstance(fields, Mapping) and all(key in ("class", "fields") for key in value):
+        return name, fields
+    return None
+
+
+def class_records(value: JSON, rewrite: Callable[[str, Mapping[str, JSON], bool], dict[str, JSON] | None]
+                  ) -> JSON:
+    """`value` (JSON a Dew saved) with each class record in it, at any depth, as `rewrite(name, fields,
+    root)` makes it (`class_record`; `root` whether it is `value` itself), or as it is where `rewrite` returns
+    None; records under a record rewritten first. A list or mapping is rebuilt only where something under
+    it changed, so data no rewrite reads passes as it is. The one walk of a saved record's class records
+    (row 11838): `earlier_layout`'s, `dew.config.earlier.earlier_retired`'s."""
+    def walked(held: JSON, *, root: bool = False) -> JSON:
+        if isinstance(held, list):
+            # Copied only from its first element that changed (row 11838's review: no list a node).
+            elements = None
+            for index, element in enumerate(held):
+                new = walked(element)
+                if elements is None and new is not element:
+                    elements = held[:index]
+                if elements is not None:
+                    elements.append(new)
+            return held if elements is None else elements
+        if not isinstance(held, Mapping):
+            return held
+        changed = {key: new for key, entry in held.items() if (new := walked(entry)) is not entry}
+        entries = {**held, **changed} if changed else held
+        named = class_record(entries)
+        # A JSON record's fields are JSON: `entries`' own, read as the record names them.
+        fields = entries.get("fields", {})
+        if named is not None and isinstance(fields, dict) and (
+                rewritten := rewrite(named[0], fields, root)) is not None:
+            return rewritten
+        return entries
+    return walked(value, root=True)
+
+
 def earlier_layout(value: JSON) -> JSON:
     """JSON an earlier Dew saved (a step's declaration, a run's record, a release's layout) with every
     decision layout's class record in it, at any depth (an objective's `layout`, a recorded stage's), read
     as the `SegmentLayout` it is now where it names an earlier class (`EARLIER_LAYOUTS`): its own fields
-    over the form and defaults its class held; anything else as it is. The one reader of those records,
-    which the pinned boundaries call (`dew.config.earlier.earlier_run`,
+    over the form and defaults its class held; anything else as it is (`class_records`). The one reader of
+    those records, which the pinned boundaries call (`dew.config.earlier.earlier_run`,
     `dew.inference.tasks.earlier_shapes`, `dew.decision.release.released_decision`). Carried to 1.0
     (ledger 1552)."""
-    if isinstance(value, list):
-        return [earlier_layout(held) for held in value]
-    if not isinstance(value, Mapping):
-        return value
-    held = {name: earlier_layout(entry) for name, entry in value.items()}
-    # A class record holds its class and its fields, and nothing else: data that names a class is no record.
-    named, fields = held.get("class"), held.get("fields")
-    if not (set(held) == {"class", "fields"} and isinstance(named, str) and named in EARLIER_LAYOUTS
-            and isinstance(fields, Mapping)):
-        return held
-    return {**held, "class": "dew.decision.layout:SegmentLayout",
-            "fields": {**EARLIER_LAYOUTS[named], **fields}}
-
+    def current(named: str, fields: Mapping[str, JSON], root: bool) -> dict[str, JSON] | None:
+        if named not in EARLIER_LAYOUTS:
+            return None
+        return {"class": "dew.decision.layout:SegmentLayout", "fields": {**EARLIER_LAYOUTS[named], **fields}}
+    return class_records(value, current)
 
 
 def moved_record(record: Mapping[str, object]) -> Mapping[str, object]:

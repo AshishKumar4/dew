@@ -800,10 +800,20 @@ def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
     experts without the layer dispatch they recorded at its defaults (`_LAYER_DISPATCH`)."""
     kinds, cross, values = fields.get("kinds"), fields.get("cross_attention"), fields.get("value_experts")
     types = fields.get("layer_types")
+
+    from dew.registry import class_record
+
+    def kind_of(held: Mapping[str, object]) -> Mapping[str, object]:
+        # A class record's fields, which a record of a kind at its defaults leaves out (`class_record`, row
+        # 11823), or the kind's fields themselves.
+        recorded = class_record(held)
+        if recorded is None:
+            return _one_scaling(held)
+        return {"class": recorded[0], "fields": _one_scaling(recorded[1])}
+
     return {**_one_scaling(fields), **({"value_experts": _without_dispatch(values)}
                                        if isinstance(values, Mapping) else {}), **({"kinds": {
-        kind: _placed_lightning(kind, {**held, "fields": _one_scaling(held["fields"])} if "class" in held
-                                else _one_scaling(held), types) if isinstance(held, Mapping) else held
+        kind: _placed_lightning(kind, kind_of(held), types) if isinstance(held, Mapping) else held
         for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {}),
         **({"cross_attention": {"class": "dew.nn.cross_attention:CrossAttention", "fields": dict(cross)}}
            if isinstance(cross, Mapping) and "class" not in cross else {})}

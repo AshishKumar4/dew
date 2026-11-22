@@ -6,6 +6,7 @@ recomputed and decoded alike; and it trains, resumes and loads as a loop does (c
 
 import dataclasses
 import functools
+from collections.abc import Sequence
 from pathlib import Path
 
 import jax
@@ -276,10 +277,12 @@ def test_a_loop_passing_messages_computes_its_passes_unrolled(case, seeds, reque
         assert np.any(np.asarray(gradients["layers_0"]["mlp"]["down_proj"]["kernel"]) != 0)
 
 
+@pytest.mark.check1_shards(seeds=32, per_task=16)
 def test_a_loop_passing_messages_decodes_as_it_prefills():
     """A hybrid decoder passing messages over three passes, its gates drawn off zero, each pass's cache its
     own, decodes token by token (a prefill of four, then one at a time) what its full passes over each
-    prefix compute, its logits on par with theirs in float64 (check 1)."""
+    prefix compute, its logits on par with theirs in float64 (check 1), its 32 seeds drawn 16 a map task
+    (132 s whole in train 1180's CI, row 11793)."""
     looped = decoder("hybrid", steps=3)
     draw = gated_draw(looped, salt=0xC404)
     made, step = decode_steps(looped)
@@ -538,11 +541,12 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
     from dew.optim import OptimConfig
     from dew.training import MeshSpec, Trainer
     from dew.training.ahead import compile_ahead
+    from dew.training.inspection import Inspection
 
     devices = 2
     spec = CrossPass(block_size=2, rank=64)
 
-    def live_past_args(steps: int, messages: CrossPass | None) -> int:
+    def live_past_args(steps: int, messages: CrossPass | None, inspection=None) -> int:
         model = CausalTransformer(
             vocab_size=512, emb_features=MIXER_WIDTH, num_layers=4, num_heads=8, head_dim=MIXER_HEAD,
             mlp_features=4 * MIXER_WIDTH, max_seq_len=MIXER_LENGTH, dtype="bfloat16",
@@ -552,20 +556,28 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
                           OptimConfig(optimizer="adamw", learning_rate=1e-3).build(None),
                           key=jax.random.key(0),
                           mesh=MeshSpec(fsdp=devices).build(compile_only_gpus("sm90", devices, 2**36)),
-                          layout=STEP_LAYOUT, split=1)
+                          layout=STEP_LAYOUT, split=1, inspection=inspection)
         ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
-        return ahead.live_bytes - ahead.argument_bytes
+        if inspection is None:
+            return ahead.live_bytes - ahead.argument_bytes
+        # A run that inspects samples its watches in a step of its own, compiled ahead beside its step.
+        memory = ahead.sampled.executable.memory
+        return memory.live - memory.argument
 
-    msg_two, msg_six = live_past_args(2, spec), live_past_args(6, spec)
     plain_two, plain_six = live_past_args(2, None), live_past_args(6, None)
-    msg_growth, plain_growth = msg_six - msg_two, plain_six - plain_two
+    plain_growth = plain_six - plain_two
     # Four added passes each hold beyond a message-free loop's its saved bf16 bank [B/fsdp, S, blocks, D]
     # and that bank's one summed cotangent: two banks a pass.
     added_banks = 4 * (MIXER_ROWS // devices) * MIXER_LENGTH * 2 * MIXER_WIDTH * 2
-    assert msg_growth <= plain_growth + 2 * added_banks, (
-        f"cross-pass live growth {msg_growth} B exceeded plain growth {plain_growth} B + "
-        f"2 * added_banks {2 * added_banks} B "
-        f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
+    # So too where the step watches its MLPs (row 11820: a watch of other modules leaves the merges to their
+    # own rules), its sampled step the one compiled.
+    for inspection in (None, Inspection(modules=("*MLP",), every=1)):
+        msg_two, msg_six = live_past_args(2, spec, inspection), live_past_args(6, spec, inspection)
+        msg_growth = msg_six - msg_two
+        assert msg_growth <= plain_growth + 2 * added_banks, (
+            f"cross-pass live growth {msg_growth} B, watching {inspection}, exceeded plain growth "
+            f"{plain_growth} B + 2 * added_banks {2 * added_banks} B "
+            f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
 
 
 @pytest.mark.parametrize("watch", ["captured", "inspected"])
@@ -590,11 +602,11 @@ def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
     np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
 
 
-def qwix_owned(provider: str, rule: dict, spec: CrossPass = MESSAGES) -> list:
+def qwix_owned(provider: str, rules: Sequence[dict], spec: CrossPass = MESSAGES) -> tuple:
     """The gradients of a two-pass decoder passing messages by `spec`, quantized by a direct Qwix provider of
-    `rule` (`QtProvider`'s or `OdmlQatProvider`'s), its gates off zero (`gated`), each beside the same
-    model's run as a watched merge runs (captured,
-    `capture_intermediates`) and the unquantized model's: `(owned, watched, plain)` leaves."""
+    `rules` (`QtProvider`'s or `OdmlQatProvider`'s), its gates off zero (`gated`), each beside the same
+    model's run as a watched merge runs (captured, `capture_intermediates`) and the unquantized model's:
+    `(owned, watched, plain)` leaves, and the rules no op matched (`get_unused_rules`)."""
     qwix = pytest.importorskip("qwix")
 
     model = decoder("attention", steps=2, messages=spec)
@@ -603,7 +615,8 @@ def qwix_owned(provider: str, rule: dict, spec: CrossPass = MESSAGES) -> list:
     # A QAT provider's jit off where Qwix finds a weight by its value; ODML's activation check off, Dew's ops
     # being more than its converter's (the provider's own refusal of an op it does not convert).
     options = {"disable_jit": True} if provider == "qt" else {"strict": False}
-    quantized = qwix.quantize_model(model, made([qwix.QtRule(**rule)], **options))
+    made = made([qwix.QtRule(**rule) for rule in rules], **options)
+    quantized = qwix.quantize_model(model, made)
     variables = gated(quantized.init(jax.random.key(0), ids), 11716)
 
     def gradients(applied, **watched):
@@ -613,8 +626,9 @@ def qwix_owned(provider: str, rule: dict, spec: CrossPass = MESSAGES) -> list:
             return jnp.sum(jnp.square(logits.astype(jnp.float32)))
         return [np.asarray(leaf) for leaf in jax.tree.leaves(jax.grad(loss)(variables["params"]))]
 
-    return (gradients(quantized.apply), gradients(quantized.apply, capture_intermediates=True,
-                                                  mutable=["intermediates"]), gradients(model.apply))
+    leaves = (gradients(quantized.apply), gradients(quantized.apply, capture_intermediates=True,
+                                                    mutable=["intermediates"]), gradients(model.apply))
+    return leaves, made.get_unused_rules()
 
 
 @pytest.mark.parametrize(("provider", "rule", "spec"), [
@@ -631,7 +645,18 @@ def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(pr
     projection, whose two same-shaped gates Qwix tells apart by their values), runs as Flax and Qwix see it
     in both modes (row 11713's review: recomputed apart, its reverse mode bypassed the rule): its gradients
     the ones of the same model run as a watched merge runs, and the rule's, not the unquantized model's."""
-    owned, watched, plain = qwix_owned(provider, rule, spec)
+    (owned, watched, plain), unused = qwix_owned(provider, [rule], spec)
+    assert not unused
     for got, seen in zip(owned, watched, strict=True):
         np.testing.assert_array_equal(got, seen)
     assert any(not np.array_equal(got, unquantized) for got, unquantized in zip(owned, plain, strict=True))
+
+
+def test_a_rule_over_a_merges_own_path_owns_its_matmuls_and_not_its_depth_mixtures_einsums():
+    """Rules over a merge's own path (`cross_pass_<k>`, its depth child's not), one over its matmuls and one
+    over einsums, which only its depth child computes: the matmuls' rule is used, the einsums' is not (a
+    negative control of the merge-matmuls case, row 11805: its path owns no depth mixture)."""
+    rules = [{"module_path": r".*cross_pass_[^/]+", "weight_qtype": jnp.int8, "act_qtype": jnp.int8,
+              "op_names": (op,)} for op in ("dot_general", "einsum")]
+    _, unused = qwix_owned("qt", rules, dataclasses.replace(MESSAGES, additive=False))
+    assert [tuple(rule.op_names) for rule in unused] == [("einsum",)]

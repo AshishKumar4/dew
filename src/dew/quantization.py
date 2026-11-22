@@ -577,15 +577,16 @@ def packed_values(matrix: NvFp4) -> jax.Array:
 
 def _product_rounded(values: jax.Array, scale: jax.Array, owed: int) -> jax.Array:
     """`values` (bfloat16) times `scale` (float32, broadcast against them) times `2^owed`, rounded once to
-    nearest even into float32, in integer arithmetic on their fields: the exact product's significand (8
-    bits times 24, under 2^32) rounded at its result's last place, however far below the least normal, and
-    past the largest finite an infinity of the product's sign; a non-finite operand's product IEEE's. A
-    float32 multiply rounds a result below the least normal twice where its operands' significands are wider
-    than the result's (to 24 bits, then to the subnormal's), or flushes it (XLA's CPU, row 4023): 1.5 times
+    nearest even into float32: the exact product's significand (8 bits times 24, under 2^32) formed in
+    integer arithmetic on their fields and rounded once (`float_bits.rounded_float32`), however far below
+    the least normal, and past the largest finite an infinity of the product's sign; a non-finite operand's
+    product IEEE's, read off the operands' bits. A float32 multiply rounds a result below the least normal
+    twice where its operands' significands are wider than the result's (to 24 bits, then to the
+    subnormal's), or flushes it (XLA's CPU, row 4023): 1.5 times
     0.25 times 2^-126 (1 + 7 2^-23) is 3145730.625 2^-149, `0x00300003` once rounded, `0x00300002` twice;
     and the owed power applied to `scale` alone first overflows a finite product's factor (row 11740's
     review)."""
-    from dew.nn.float_bits import raw_fields
+    from dew.nn.float_bits import raw_fields, rounded_float32
 
     _, sign_v, biased_v, fraction_v = (field.astype(jnp.uint32) for field in raw_fields(values))
     _, sign_f, biased_f, fraction_f = raw_fields(scale)
@@ -597,30 +598,14 @@ def _product_rounded(values: jax.Array, scale: jax.Array, owed: int) -> jax.Arra
     product = whole_v * whole_f
     exponent = ((jnp.maximum(biased_v.astype(jnp.int32), 1) - 134)
                 + (jnp.maximum(biased_f.astype(jnp.int32), 1) - 150) + owed)
-    length = 32 - jax.lax.clz(product).astype(jnp.int32)
-    # The result's last place: 24 bits below its leading one, or the least subnormal's.
-    last = jnp.maximum(exponent + length - 24, -149)
-    drop = last - exponent
-    shift = jnp.clip(drop, 1, 31).astype(jnp.uint32)
-    kept = jnp.where(drop <= 0, product << jnp.clip(-drop, 0, 31).astype(jnp.uint32),
-                     jnp.where(drop <= 31, product >> shift, np.uint32(0)))
-    rest = product & ((np.uint32(1) << shift) - np.uint32(1))
-    half = np.uint32(1) << (shift - np.uint32(1))
-    odd = (kept & np.uint32(1)) == np.uint32(1)
-    up = (((drop >= 1) & (drop <= 31) & ((rest > half) | ((rest == half) & odd)))
-          | ((drop == 32) & (product > np.uint32(1 << 31))))
-    kept = kept + up.astype(jnp.uint32)
-    # `kept` at its last place: a normal's 24 bits (its leading one carried into the exponent where rounding
-    # filled it, the largest binade's carry the infinity), a subnormal's fewer at the least normal's
-    # exponent, whose biased field the sum's carry sets; a last place past the largest binade's, infinity.
-    biased = last + 150
-    infinity = np.uint32(0x7F800000)
-    magnitude = jnp.where(biased >= 255, infinity,
-                          (jnp.clip(biased, 1, 254).astype(jnp.uint32) << np.uint32(23)) + kept - lead)
-    bits = ((sign_v << np.uint32(16)) ^ sign_f) | jnp.where(product == 0, np.uint32(0), magnitude)
-    rounded = jax.lax.bitcast_convert_type(bits, jnp.float32)
-    # A non-finite operand (an infinite or NaN scale, a NaN block's value) multiplies as IEEE's.
-    return jnp.where((biased_v == 0xFF) | (biased_f == 0xFF), values.astype(jnp.float32) * scale, rounded)
+    # A non-finite operand's product as IEEE's, classified on the operands' bits (row 11795): a NaN where
+    # either is one or an infinity meets a zero, else an infinity of the product's sign.
+    infinite_v, infinite_f = (biased_v == 0xFF) & (fraction_v == 0), (biased_f == 0xFF) & (fraction_f == 0)
+    zero_v, zero_f = (biased_v == 0) & (fraction_v == 0), (biased_f == 0) & (fraction_f == 0)
+    nan = (((biased_v == 0xFF) & ~infinite_v) | ((biased_f == 0xFF) & ~infinite_f)
+           | (infinite_v & zero_f) | (infinite_f & zero_v))
+    return rounded_float32((sign_v << np.uint32(16)) ^ sign_f, product, exponent,
+                           infinite=infinite_v | infinite_f, nan=nan)
 
 
 def decoded_banks(variables: Variables) -> Variables:

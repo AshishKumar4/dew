@@ -50,7 +50,9 @@ def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
              functools.partial(decision_packing.a_bf16_joint_head_on_flash_reads_each_packed_row_alone,
                                without_deterministic_ops)),
         Cell("a push whose replica refuses its join aborts its NCCL group",
-             rollout.a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting),
+             rollout.a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting,
+             at_run="a real NCCL group on the GPU, which a prepare's compile-only device opens none of, and "
+                    "no check-1 site (row 11788)"),
         Cell("the paged decode kernel decodes on par with the gathered attention, a softcapped model too",
              when(bf16_dot_runs(), BF16_PRODUCTS,
                   kv_cache.the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention)),
