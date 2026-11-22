@@ -74,19 +74,22 @@ def portable_einsum(subscripts: str, *operands):
 
 
 def suffix_sums(x: jax.Array, *, scanned: bool = False) -> jax.Array:
-    """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a
-    chunk's tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle
-    of ones (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot. As a
-    reversed cumulative sum, XLA's GPU reduce-window summed each position's window apart: Kimi delta
-    attention's decay gradient's, the one cumulative sum its training traces, took 0.336 ms of its 5.806 ms
-    on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum: a term no position's sum takes
-    meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite one NaN in every sum (a
-    turned gradient's entering-memory term of 2^126 times its cotangent, `templates.recurrence.turned`)."""
+    """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a chunk's
+    tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle of ones
+    (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot batched over `x`'s
+    leading axes, a chunk's triangle against its own tokens: one triangle against every chunk's tokens
+    contracted a middle axis XLA transposed `x` for, 134 of Kimi delta attention's training's 1723 MB of XLA
+    traffic on an A100 (row 5260). As a reversed cumulative sum, XLA's GPU reduce-window summed each
+    position's window apart: Kimi delta attention's decay gradient's, the one cumulative sum its training
+    traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum:
+    a term no position's sum takes meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite
+    one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its cotangent,
+    `templates.recurrence.turned`)."""
     x = _wide(x)
     if scanned:
         return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
     upper = jnp.triu(jnp.ones((x.shape[-2],) * 2, x.dtype))
-    return portable_einsum('ij,...jt->...it', upper, x)
+    return portable_einsum('...ij,...jt->...it', jnp.broadcast_to(upper, (*x.shape[:-2], *upper.shape)), x)
 
 
 def sums_before(x: jax.Array) -> jax.Array:
