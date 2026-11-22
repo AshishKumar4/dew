@@ -1004,6 +1004,10 @@ def test_a_run_saved_before_its_retired_and_unsettable_fields_loads_as_it_traine
     named = {"class": "dew.config.trainer:TrainerConfig", "fields": trainer}
     path.write_text(json.dumps({**earlier, "fields": {**today["fields"], "trainer": named}}))
     assert LMRunConfig.load(str(path)).trainer == LMRunConfig().trainer
+    # Data a field holds that names a class and no fields passes as it is, migrating nothing.
+    payload = {"class": "builtins:dict"}
+    opaque = {**earlier, "fields": {**today["fields"], "trainer": trainer, "payload": payload}}
+    assert earlier_run(opaque)["fields"]["payload"] == payload
     for record, additive in ((earlier, False), (today, True)):
         stated = {**record, "fields": {**record["fields"], "loop_message_additive": additive}}
         assert earlier_run(stated)["fields"]["loop_message_additive"] is additive, (record is today, additive)

@@ -84,47 +84,53 @@ def earlier_retired(record: Mapping[str, object], *, additive_unset: bool) -> Ma
     data, and a class no module imported yet holds, pass as they are. Carried to 1.0 (ledger 1552)."""
     from dew.config import RunConfig
 
-    walked = {key: _retired(_records.json_value(value, key), additive_unset)
-              for key, value in record.items()}
-    named = registry.class_record(walked)
-    if named is None:
-        return walked
-    return {**walked, "fields": _retired_fields(_recorded_class(named[0]) or RunConfig, named[1],
-                                                additive_unset)}
+    # The record read as JSON once, here; the walk below rebuilds only what it migrates.
+    retired = _retired({key: _records.json_value(value, key) for key, value in record.items()},
+                       additive_unset, RunConfig)
+    assert isinstance(retired, Mapping)
+    return retired
 
 
-def _retired(value: _records.JSON, additive_unset: bool) -> _records.JSON:
+def _retired(value: _records.JSON, additive_unset: bool, default: type | None = None) -> _records.JSON:
     """`value` with each run and trainer its class records name taken to today's shapes
-    (`_retired_fields`), at any depth."""
+    (`_retired_fields`), at any depth, `default` the class of a record that names none it resolves (the
+    root's, a run): a mapping or list rebuilt only where something under it changed, so data no migration
+    reads passes as it is (a payload naming a class with no fields keeps none)."""
     if isinstance(value, list):
-        return [_retired(held, additive_unset) for held in value]
+        walked = [_retired(held, additive_unset) for held in value]
+        return value if all(new is old for new, old in zip(walked, value, strict=True)) else walked
     if not isinstance(value, Mapping):
         return value
-    walked = {key: _retired(held, additive_unset) for key, held in value.items()}
-    named = registry.class_record(walked)
-    kind = None if named is None else _recorded_class(named[0])
-    if named is None or kind is None:
-        return walked
-    return {**walked, "fields": _retired_fields(kind, named[1], additive_unset)}
+    held = {key: _retired(entry, additive_unset) for key, entry in value.items()}
+    changed = any(held[key] is not entry for key, entry in value.items())
+    named = registry.class_record(held)
+    kind = (_recorded_class(named[0]) or default) if named is not None else None
+    fields = held.get("fields")
+    if kind is not None and isinstance(fields, Mapping):
+        migrated = _retired_fields(kind, fields, additive_unset)
+        if migrated is not None:
+            return {**held, "fields": migrated}
+    return held if changed else value
 
 
-def _retired_fields(kind: type, recorded: Mapping[str, object], additive_unset: bool) -> _records.JSON:
-    """The fields of a record of `kind` in today's shapes (`earlier_retired`)."""
+def _retired_fields(kind: type, fields: Mapping[str, _records.JSON],
+                    additive_unset: bool) -> dict[str, _records.JSON] | None:
+    """The fields of a record of `kind` in today's shapes (`earlier_retired`), None where none changes."""
     from dew.config import DecoderRunConfig, RunConfig
     from dew.config.trainer import TrainerConfig
 
-    fields = dict(recorded)
+    migrated = dict(fields)
     if issubclass(kind, TrainerConfig):
-        fields.pop("export_model", None)
+        migrated.pop("export_model", None)
     # A trainer recorded flat, by its run's class, is read here; one recorded by its own class as a record.
-    trainer = fields.get("trainer")
-    if (issubclass(kind, RunConfig) and isinstance(trainer, Mapping)
+    trainer = migrated.get("trainer")
+    if (issubclass(kind, RunConfig) and isinstance(trainer, Mapping) and "export_model" in trainer
             and registry.class_record(trainer) is None):
-        fields["trainer"] = {key: value for key, value in trainer.items() if key != "export_model"}
+        migrated["trainer"] = {key: entry for key, entry in trainer.items() if key != "export_model"}
     if (issubclass(kind, DecoderRunConfig) and not additive_unset
-            and fields.get("loop_message_additive") is True):
-        fields["loop_message_additive"] = None
-    return _records.json_value(fields, "fields")
+            and migrated.get("loop_message_additive") is True):
+        migrated["loop_message_additive"] = None
+    return None if migrated == dict(fields) else migrated
 
 
 def _recorded_class(name: str) -> type | None:
