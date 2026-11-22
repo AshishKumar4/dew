@@ -406,6 +406,28 @@ def test_a_parts_prepare_draws_an_nvfp4_tiles_values_on_the_host(tmp_path, monke
     assert all(store.holds(armed(f"an NVFP4 tile's values, {step}")) for step in ("quantized", "decoded"))
 
 
+def test_a_parts_prepare_prepares_the_apg_edges_arms(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), the numerics flow's APG cell
+    (`test_guidance.apg_holds_its_projection_at_its_ranges_edges`) prepares each edge's arm in the store: its
+    arm closed over the guidance's process, an object no statement holds, and the GH200 prepare named the cell
+    unprepared, "its arm has no statement of what it computes" (DC-numerics-vocab-1-gh200)."""
+    import model_flows
+    import test_guidance
+    import tier_wire
+    from arm_store import armed
+    from generation_support import node_target
+    from gpu_flow import Cell, run_cells
+    from truths_ahead import CompiledTruths, prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        run_cells([Cell("APG at its range's edges",
+                        test_guidance.apg_holds_its_projection_at_its_ranges_edges)])
+    store = CompiledTruths(tmp_path / "store", prepare=False, stamp="a")
+    assert all(store.holds(armed(f"APG at {name}")) for name in test_guidance.APG_EDGES)
+
+
 def test_a_parts_prepare_compiles_a_site_calling_the_host_at_its_run(tmp_path, monkeypatch):
     """In a GPU tier part's prepare (its node an H100, the process's backend a CPU's), a site whose program
     calls back to the host (a reference through `jax.pure_callback`, as Dory's torch gradients) is written to
