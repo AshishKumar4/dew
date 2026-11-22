@@ -1320,6 +1320,23 @@ def _forward_call(shape, width: int, value_width: int, residuals: template.Kept)
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
+def test_a_forward_proposed_for_an_h100_is_proposed_whatever_gpu_is_in_effect(residuals):
+    """An H100's causal forward (16 heads over 4, width 128, 4,096 tokens): the config derived for it under
+    the H100's own is proposed for the H100 while an A100 is in effect (`generation.assumed("sm80")`) as under
+    the H100's: its register proposal is the H100's (`Template.proposes`, under its target), where it read
+    the A100's register model beside the H100's shared memory (row 12000; row 11987's cross-generation
+    checks)."""
+    h100 = generation.gpu_target("sm90")
+    with generation.assumed("sm90"):
+        op, ba = _forward_call((1, 4096, 16, 4), 128, 128, residuals)
+        own = op.derived(ba, h100)
+        assert own is not None and op.proposes(ba, own, h100)
+    with generation.assumed("sm80"):
+        op, ba = _forward_call((1, 4096, 16, 4), 128, 128, residuals)
+        assert op.proposes(ba, own, h100)
+
+
+@pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
 def test_a_refused_forward_config_is_derived_no_more(residuals):
     """A B200's forward of Qwen3.5-4B's attention (16 heads over 4, width 256, a 12,288-token causal row):
     its derived config refused as a compile refuses a spilling launch (`report.refuse_launch`, at the config
