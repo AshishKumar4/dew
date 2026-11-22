@@ -72,36 +72,57 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     assert int(drawn.step) == 1
 
 
-def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_release(tmp_path, monkeypatch):
+@pytest.fixture(scope="module")
+def native_release_run(tmp_path_factory):
     """A decision run whose head's format holds no backbone of its own family (Laya's fresh head, whose
-    format holds ModernBERT alone, over Qwen 3.5's MoE text decoder) exports as its native release, and a
-    second decision run naming it (`--pretrained <run>`) starts from that release as from the run's own
-    task: its head and backbone the first run's final ones, its record the run and step it read, and its
-    task answers (row 4776: the release's record states no dtypes a family's load reads, and the start
-    raised KeyError)."""
-    from dew.decision import Choice, Decide
+    format holds ModernBERT alone, over Qwen 3.5's MoE text decoder), trained a step and saved: its root,
+    its config, its directory and its state, trained once for the cells reading it, which their mark keeps
+    in one group (`shared_setup`, row 11722: one cell training it and the run from it took 131 s cold)."""
+    root = tmp_path_factory.mktemp("native-release")
+    decoder = Path(__file__).parent / "fixtures" / "hf" / "qwen38-moe-tiny"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+        first = dataclasses.replace(decision(root, drawn=False), pretrained=str(decoder))
+        state, _ = trained(first, root, "first", trainer={"checkpoint_final": True})
+    return root, first, root / "runs" / "first", state
+
+
+@pytest.mark.shared_setup("native_release_run")
+def test_a_decision_run_whose_head_holds_no_backbone_of_its_family_exports_as_its_native_release(
+        native_release_run):
+    """Such a run exports as its native release, which a run naming it (`--pretrained <run>`) starts from
+    as from the run's own task: its head and backbone the first run's final ones; loaded without its
+    weights, it holds their shapes, its projections packed as its weights are (row 4776: the release's
+    record states no dtypes a family's load reads, and the start raised KeyError)."""
     from dew.decision.formats import format_unstated
     from dew.inference.tasks import saved_model
     from dew.interop import Pretrained
 
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    decoder = Path(__file__).parent / "fixtures" / "hf" / "qwen38-moe-tiny"
-    first = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(decoder))
-    state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
-    source = tmp_path / "runs" / "first"
+    _, first, source, state = native_release_run
     assert format_unstated("laya", saved_model(SavedRun.pinned(str(source)).record, None).build()) is not None
-    # Its release loaded without its weights holds their shapes, its projections packed as its weights are.
     shapes = Pretrained.load(str(source), weights=False)
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
     run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
     started = run.prepare().objective.init(jax.random.key(0))
     leaves_alike(started["params"], state.variables["params"])
-    second, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
+
+
+@pytest.mark.shared_setup("native_release_run")
+def test_a_decision_run_started_from_a_native_release_trains_records_it_and_answers(native_release_run):
+    """A run started from that native release trains, its record naming the run and step it read, and its
+    task answers (row 4776)."""
+    from dew.decision import Choice, Decide
+
+    root, first, source, _ = native_release_run
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+        second, _ = trained(run, root, "second", trainer={"checkpoint_final": True})
     assert int(second.step) == 1
-    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
+    recorded = DecisionRunConfig.load(str(root / "runs" / "second"))
     assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
     team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
-    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    answer = Decide.from_run(str(root / "runs" / "second"))("charged twice", {"team": team})["team"]
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
