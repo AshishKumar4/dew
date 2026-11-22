@@ -506,9 +506,9 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
                 else entry_k)
         token.stored(state_out, kept, start + k)
         if hooks.delta:
-            return read_write(k, written) if reads_write else jnp.zeros_like(written)
-        # Two terms summed apart where the query reads the write, else the one `_summed_keys` takes bare.
-        return (read(k, tile), read_write(k, written)) if reads_write else read(k, tile)
+            return (read_write(k, written) if reads_write else jnp.zeros_like(written),)
+        # Two terms summed apart where the query reads the write, else the one.
+        return (read(k, tile), read_write(k, written)) if reads_write else (read(k, tile),)
 
     if hooks.delta:
         sums = _summed_keys(span, row, lambda k, tile: (read(k, tile), (entry(1, k) * entry(2, k)) * tile),
@@ -529,21 +529,17 @@ their loads overlap: a key a turn, each row's load latency was the step's, one r
 
 
 def _summed_keys(key_width: int, read, term, like: jax.Array, count: int = 1):
-    """`sum_k term(k, read(k))` over the keys, each `like`'s shape, a tuple of `count` (each of `term`'s
-    `count` terms summed apart, `term` returning a tuple where `count` is more than one), in XLA's pairwise
+    """`sum_k term(k, read(k))` over the keys, each `like`'s shape, a tuple of `count` (each of the tuple of
+    `count` terms `term` returns summed apart), in XLA's pairwise
     order, `UNROLLED` keys a turn of a rolled loop, each turn's reads issued before its first use: a turn's
     terms by a pairwise tree of its own (each an aligned subtree of the whole), the turns' sums added into the
     tree above them by the turn's index (`_tree_added`), the index's choices a turn's rather than a key's; the
     subtrees a count of turns not a power of two leaves held (each set bit's level) summed last, the earlier
     on the left. The top subtree alone dropped the last 128 of 384 keys (audit 2026-11-07, A18)."""
-    def terms_of(k, tile):
-        found = term(k, tile)
-        return found if count > 1 else (found,)
-
     def turn(i, partials):
         base = i * UNROLLED
         tiles = [read(base + u) for u in range(UNROLLED)]
-        terms = [terms_of(base + u, tile) for u, tile in enumerate(tiles)]
+        terms = [term(base + u, tile) for u, tile in enumerate(tiles)]
         reduced = recurrence_algebra.pairwise_sum(
             terms, combine=lambda a, b: tuple(x + y for x, y in zip(a, b, strict=True)))
         return tuple(_tree_added(held, i, found) for held, found in zip(partials, reduced, strict=True))

@@ -171,6 +171,13 @@ class Hooks:
         return bound if bound is not None and bound <= 2.0 else None
 
     @property
+    def group(self) -> int:
+        """The op tokens a readout groups (a token's `ranks` read apart from their writes), whole in every
+        chunk a walk cuts (`recurrence_chunk._turned_or_plain`'s, `_portable`'s): one where it reads the
+        whole state."""
+        return self.ranks if self.reads == 'apart' else 1
+
+    @property
     def apart(self) -> int:
         """The op tokens of a group whose writes a readout apart from them leaves out (`ranks`) that the
         template forms (`mainloop.Call.apart`: a decay a head or none, no delta rule, no own weight), zero

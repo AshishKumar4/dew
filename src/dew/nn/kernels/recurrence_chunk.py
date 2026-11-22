@@ -343,7 +343,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                           starts=starts, firsts=firsts, forked=carried,
                                           max_segments=max_segments, scale=scale, delta=hooks.delta,
                                           wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
-                                          apart=apart, values_gated=values_gated, unit_keys=unit_keys)
+                                          apart=apart, group=hooks.group, values_gated=values_gated,
+                                          unit_keys=unit_keys)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
@@ -489,10 +490,11 @@ _PORT_PRECISION = ("a product precision the run declares that the port's product
                    "narrows 16-bit ones")
 
 
-READOUT_HANDOFF = ("a readout of the state entering its token, or weighing its token's own write "
-                   "(`recurrence.Hooks.reads`, `Hooks.own_weight`: RWKV6's), which the portable math's "
-                   "forms derive (`scan.Scan.reads`) and neither the port's kernels nor the template's "
-                   "mainloop form")
+READOUT_HANDOFF = ("a readout of the state entering its token, weighing its token's own write "
+                   "(`recurrence.Hooks.reads`, `Hooks.own_weight`: RWKV6's), or apart from its group's "
+                   "writes (Mamba-3 MIMO's) where the template's mainloop forms none (`Hooks.apart`: under "
+                   "a decay a key dimension, the delta rule or an own weight; the port's kernels form none "
+                   "apart), which the portable math's forms derive (`scan.Scan.reads`)")
 """Why a kernel of the chunked op hands a call of another readout over to the portable math."""
 
 TURN_HANDOFF = ("a state that turns its key pairs (`recurrence.Hooks.turns`: Mamba-3's rotating basis), "
@@ -1364,7 +1366,7 @@ def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta,
     token, no write read and taken back off), its walk's chunk the largest multiple of the group within the
     call's, so no chunk cuts a group (a rank-three call's 64 tokens, 63). A turned call's turns are
     `_turned_or_plain`'s."""
-    group = hooks.ranks if hooks.reads == 'apart' else 1
+    group = hooks.group
     if tiles.chunk % group:
         tiles = dataclasses.replace(tiles, chunk=max(group, tiles.chunk // group * group))
     if hooks.erase == 'values':
@@ -1616,12 +1618,12 @@ def _launched_template(context, query, key, value, g, beta, state, skip, entry, 
 
 
 def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, firsts, forked, scale: float,
-                 apart: int, **options):
+                 apart: int, group: int, **options):
     """The chunked op's `(output, final memory)` on the template (`template_rule`, a turned call's through
-    `_turned_or_plain`)."""
+    `_turned_or_plain`), its readout's `group` (`Hooks.group`) whole in every chunk."""
     launch = functools.partial(_launched_template, scale=scale, apart=apart, **options)
     return _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, starts=starts,
-                            firsts=firsts, forked=forked, scale=scale, group=max(apart, 1))
+                            firsts=firsts, forked=forked, scale=scale, group=group)
 
 
 def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, turn, *, starts, firsts, forked,
@@ -1639,8 +1641,7 @@ def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, tur
                          erase_left=erase_left)
     launch = functools.partial(_portable_launch, hooks, Tiles(size), scale=scale, dtype=dtype, own=own)
     return _turned_or_plain(launch, query, key, value, g, beta, state, None, turn, starts=starts,
-                            firsts=firsts, forked=forked, scale=scale,
-                            group=hooks.ranks if hooks.reads == 'apart' else 1)
+                            firsts=firsts, forked=forked, scale=scale, group=hooks.group)
 
 
 def _portable_launch(hooks: recurrence.Hooks, tiles: Tiles, context, query, key, value, g, beta, state, skip,

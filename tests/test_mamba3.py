@@ -93,10 +93,10 @@ def chunked(x, dt, A, B, C, lam, theta, state, *, starts):
 
 def narrow_draw(seed: int):
     """`draw`'s operands of one rank as a bf16 layer hands them over (`x`, `B` and `C` in bf16), at a small
-    `lambda` (under 0.05) and no turning (`theta` zero): a token's own write nearly all the trapezoid's
-    previous one, which its rank terms take back off in fp32 (`_rank_terms`), so the chunked op's output
-    rounded narrower shows at every token as the cancelled write's rounding; unturned, the keys and queries
-    the op reads are the operands' own."""
+    `lambda` (under 0.05) and no turning (`theta` zero): a token's write nearly all the trapezoid's previous
+    token's weight, the op reading each apart from its own write and its rank terms adding that write at
+    `gamma` in fp32 (`_rank_terms`), so the chunked op's output rounded narrower shows at every token;
+    unturned, the keys and queries the op reads are the operands' own."""
     x, dt, A, B, C, lam, theta, state, _ = draw(1, seed)
     x, B, C = (t.astype(jnp.bfloat16) for t in (x, B, C))
     return x, dt, A, B, C, 0.05 * lam, jnp.zeros_like(theta), state

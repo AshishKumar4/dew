@@ -109,17 +109,17 @@ def reference_arm(hooks, forms: str | None, **bound):
     """The arm the template is held against for a form under `forms`, each in the call's 16-bit dtype, its
     family's oracle under the run's numerics (`oracle`): the fla port for the delta rule (the gated delta
     net's formed gates; with a decay on its operands as given, recorded fla-core, `fla_recorded`); for the
-    rated scan the port of mamba_ssm's kernels under the fast forms (its numbers mamba_ssm's) and the
-    portable math under the accurate ones (row 6781: recorded mamba_ssm, which waits on the fixture store);
-    the recurrence a token at a time, in fp32 with its output in the call's dtype, where no release computes
-    the call's numbers. `bound` is a chunked arm's (`bounded`): the recurrence reads its documents' starts a
-    token at a time."""
+    rated scan the port of mamba_ssm's kernels under the fast forms (its numbers mamba_ssm's); the
+    recurrence a token at a time, in fp32 with its output in the call's dtype, where no release computes the
+    call's numbers, the rated scan's under the accurate forms among them (row 6797: Dew's own chunk math is
+    never a cell's reference, testing.md). `bound` is a chunked arm's (`bounded`): the recurrence reads its
+    documents' starts a token at a time."""
     upstream = oracle(hooks, jnp.bfloat16)
-    if upstream is None:
-        return functools.partial(token_by_token, hooks)
     if upstream == 'fla':
         return functools.partial(chunk_on, 'fla', hooks, **bound)
-    return functools.partial(chunk_on, 'pallas' if forms == 'fast' else 'xla', hooks, **bound)
+    if upstream is None or forms != 'fast':
+        return functools.partial(token_by_token, hooks)
+    return functools.partial(chunk_on, 'pallas', hooks, **bound)
 
 
 def fla_recorded(hooks) -> bool:
@@ -165,15 +165,19 @@ RESTARTED = 'resets on chunk edges'
 chunked arms bounded by them (`bounded`)."""
 
 
+def _arms_regime(regime: str) -> str:
+    """The regime `_arms` builds a case's arms for: `RESTARTED`'s own, else the first other, every other
+    regime's arms alike, so a form's regimes of one shape trace its arms once."""
+    return regime if regime == RESTARTED else next(other for other in REGIMES if other != RESTARTED)
+
+
 @functools.cache
 def _arms(name: str, regime: str, product: str, forms: str) -> tuple:
-    """A case's arms (`the_template_stays_finite_and_on_par_where_chunked_forms_break`'s): the template's,
-    its reference arm, the recurrence a token at a time and the portable math's, their gradients' where
-    `product` is; one function each for every regime but `RESTARTED`, which run them alike, so a form's
-    regimes of one shape trace its arms once, where each case built and traced its own (the GPU tier's 120
-    traces of the template's at assert_finite)."""
-    if regime != RESTARTED:
-        regime = next(other for other in REGIMES if other != RESTARTED)
+    """A case's arms (`the_template_stays_finite_and_on_par_where_chunked_forms_break`'s) at an arms regime
+    (`_arms_regime`, the cache's key): the template's, its reference arm, the recurrence a token at a time
+    and the portable math's, their gradients' where `product` is, where each case built and traced its own
+    (the GPU tier's 120 traces of the template's at assert_finite; row 7377: keyed on the case's regime,
+    each regime built its own)."""
     hooks = SITES[name]
     mosaic, portable = (functools.partial(chunk_on, kernel, hooks, **bounded(regime))
                         for kernel in ('mosaic_gpu', 'xla'))
@@ -204,8 +208,8 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
-    mosaic = _arms(name, regime, 'forward', forms)[0]
-    dew, reference, truth, portable = _arms(name, regime, product, forms)
+    mosaic = _arms(name, _arms_regime(regime), 'forward', forms)[0]
+    dew, reference, truth, portable = _arms(name, _arms_regime(regime), product, forms)
     with under(forms):
         if not runs(dew, hooks, operands, draws(0), product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
@@ -233,8 +237,8 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
 def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted(forms):
     """The rated scan's 16-bit forward through the template under the decay bound and `forms`, interpreted
     off a GPU, on par from float64 over check 1's fewest draws with its reference arm (`reference_arm`): the
-    port of mamba_ssm's kernels under the fast forms, whose numbers the template's then are, the portable
-    math under the accurate ones, which hold them in fp32. Its rows end in a ragged chunk (70 tokens), and
+    port of mamba_ssm's kernels under the fast forms, whose numbers the template's then are, the recurrence
+    a token at a time under the accurate ones. Its rows end in a ragged chunk (70 tokens), and
     its last real token's write, which weighs most under a steep decay, is held outside the product as the
     portable math peels it; the padded last slot's put the final memory 2.0 times the portable math's
     distance, interpreted and on an H100."""
@@ -321,13 +325,14 @@ interpreted, and their gradients everywhere, which the GPU tier runs whole (test
 
 
 SHARDED_ORDINARY = (('vector delta', 'resets on chunk edges'), ('vector delta', 'the decay bound'),
-                    ('rated', 'resets on chunk edges'))
+                    ('rated', 'resets on chunk edges'), ('gated', 'resets on chunk edges'))
 """The ordinary regimes' cases past a task whole, each a check-1 site of its own recorded seeds over map
 tasks: Kimi delta attention's 16 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw,
 and its 64 seeds under the decay bound at 2.2 s (179 and 146 s whole at CI's rate, train of 2026-11-14
 05:20Z); the rated scan's 64 seeds under resets on chunk edges, each of its forms (121 s whole under the
-accurate ones, train 861's CI). Their marks are literal parameters (`pytest.param`), as the plan reads a
-site's from the source."""
+accurate ones, train 861's CI); the gated delta net's 32 there (130 to 143 s whole, tests/test_durations.json
+at dc7ebf822, row 10861). Their marks are literal parameters (`pytest.param`), as the plan reads a site's
+from the source."""
 
 
 @pytest.mark.parametrize(('name', 'regime', 'forms'), [
@@ -340,7 +345,9 @@ site's from the source."""
     pytest.param('rated', 'resets on chunk edges', 'fast', id='rated-resets_on_chunk_edges-fast',
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param('rated', 'resets on chunk edges', 'accurate', id='rated-resets_on_chunk_edges-accurate',
-                 marks=pytest.mark.check1_shards(seeds=64, per_task=32))])
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param('gated', 'resets on chunk edges', 'accurate', id='gated-resets_on_chunk_edges-accurate',
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=16))])
 def test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted(name, regime, forms):
     """`test_each_form_the_template_takes_stays_finite_and_on_par_interpreted` under the regimes of a draw's
     own tokens (`ORDINARY`): the CPU twin of each form's forward cell of the GPU tier's, each case a test of
