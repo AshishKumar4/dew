@@ -443,7 +443,10 @@ def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refus
         jax.monitoring.register_event_duration_secs_listener(lowering)
         try:
             with pytest.raises(PlanRefused) as raised:
-                lm(objective=objective).fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+                # Its split stated, the one candidate its search asks of every rung, as a run that states
+                # its microbatches (the 4B start's) asks it.
+                lm(split=1, objective=objective).fit(Loader(lambda partition: rows, None, None, ROWS),
+                                                     steps=1)
         finally:
             jax.monitoring.unregister_event_duration_listener(lowering)
         jax.effects_barrier()
