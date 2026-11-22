@@ -921,7 +921,7 @@ dew.interop.source_options.SourceOptions
   attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
   dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
   scan_layers: bool = False
-  packed_experts: bool = False
+  packed_weights: bool = False
   param_dtype: str | None = None
   step: int | str | None = None
   ema: bool | None = None
