@@ -933,16 +933,9 @@ def _lowered_verdict_key(calls) -> str | None:
     anywhere outside them, lowers the launch and reads its verdict, compiling nothing (row 8650: 23 of an
     edited tree's 51 seconds certifying a hybrid decoder's step ahead, FS-8650-SPLIT). None where the
     installation has no seal."""
-    from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
-    from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
-
-    installed = seal().digest
-    if installed is None:
-        return None
     kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
                      for call in calls if call.kind in ("mosaic_gpu", "triton"))
-    stated = ["lowered", installed.hex(), _assemblers(), kernels, _keyed_environment()]
-    return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+    return _sealed_key("lowered", _assemblers(), kernels)
 
 
 def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
@@ -952,13 +945,21 @@ def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
     Pallas lowering cache's seal of them), caller-specific `fields`, and the environment a kernel's lowering
     and compile read (that cache's policy). None where the installation has no seal (an edited or a source
     install of JAX), whose code no key states: decisions are not stored."""
+    return _sealed_key(provenance_code(__name__, provenance), *fields)
+
+
+def _sealed_key(head, *fields) -> str | None:
+    """A stored decision's key in the installation's sealed frame, the one owner of it (`stored_key`'s, a
+    lowered verdict's, row 11653): `head` (its code's provenance, or what names its kind), the installed JAX,
+    jaxlib and CUDA plugins (the Pallas lowering cache's seal of them), `fields`, and the environment a
+    kernel's lowering and compile read (that cache's policy); None where the installation has no seal."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
     installed = seal().digest
     if installed is None:
         return None
-    stated = [provenance_code(__name__, provenance), installed.hex(), *fields, _keyed_environment()]
+    stated = [head, installed.hex(), *fields, _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 

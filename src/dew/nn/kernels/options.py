@@ -1091,7 +1091,9 @@ def trace_context() -> Hashable:
     from dew._devices import deterministic_ops_requested
     from dew.nn import sharding
 
-    with _cache.KERNEL_SEEN(None), _cache.KERNEL_ROUTES(()):
+    # Read as no trace records into (`_cache.unrecorded`, the one owner of `RECORDING`'s defaults), so the key
+    # holds alike under every receipt around it.
+    with _cache.unrecorded():
         traced = jax_config.trace_context()
     variables = sorted(((variable, stated(value)) for variable, value in contextvars.copy_context().items()
                         if variable not in _cache.UNTRACED | sharding.STATED
