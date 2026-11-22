@@ -442,3 +442,26 @@ def test_a_state_cut_in_a_row_encoded_whole_takes_the_longest_cut_whose_row_fits
     fitting = row(cut, 1 << 16)
     assert MERGED_ID in list(fitting.tokens)
     assert list(row(state, len(fitting.tokens)).tokens) == list(fitting.tokens)
+
+
+def test_a_long_state_cut_in_a_byte_row_encoded_whole_encodes_few_cuts_past_its_room():
+    """A question row encoded whole over the byte vocabulary, its state 4000 characters and its room a few
+    dozen: the state is cut to the longest that fits, its walk past its share stopping at the first cut that
+    overflows, as every longer byte cut's row is longer still, so the row's offsets are read a few times,
+    not once a character (row 11739's review: each of the state's prefixes was encoded whole)."""
+    _, _, _, *question = release().segments
+
+    class Counting(ByteTokenizer):
+        """The byte vocabulary, counting the texts it reads the offsets of."""
+
+        read = 0
+
+        def offsets(self, text: str):
+            self.read += 1
+            return super().offsets(text)
+
+    layout = SegmentLayout.state_first_row(max_len=256, labels=release().labels, unit="whole",
+                                           segments=(Text("S:"), State(), Text("\n"), *question))
+    tokenizer = Counting()
+    [laid] = layout.rows(tokenizer, SPECIALS, "a" * 4000, {"team": TEAM})
+    assert len(laid.tokens) == 256 and tokenizer.read < 16, (len(laid.tokens), tokenizer.read)

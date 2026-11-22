@@ -22,7 +22,6 @@ import tyro
 
 from dew.data import Hub, chat, mix, text
 from dew.data.pipeline import Pipeline
-from dew.data.steps.text import ValidTargets
 
 TOKENIZER = "HuggingFaceTB/SmolLM2-360M-Instruct"
 TOKENIZER_REVISION = "a10cc1512eabd3dde888204e902eca88bddb4951"
@@ -76,9 +75,8 @@ def main(args: Args, parts: dict[str, Pipeline] | None = None) -> dict[str, int]
     counts = mixed(parts).stats(records=args.show)
     for metric, value in sorted(counts.items()):
         print(f"{metric}: {value:g}")
-    # The mix read each source's first rows in order: the same rows read alone hold its targets.
-    targets = {name: sum(map(ValidTargets(), parts[name].take(int(counts[f"data/rows/{name}"]))))
-               for name in WEIGHTS}
+    # The valid targets the mix drew of each source, which it weighs by (`data/weighed_tokens/<source>`).
+    targets = {name: int(counts.get(f"data/weighed_tokens/{name}", 0)) for name in WEIGHTS}
     total = sum(targets.values())
     for name, weight in WEIGHTS.items():
         print(f"{name}: {targets[name]} valid targets, {targets[name] / total:.3f} of the mix "

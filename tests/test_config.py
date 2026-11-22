@@ -984,6 +984,34 @@ def test_a_run_stating_the_default_layout_saves_and_loads_it_stated(tmp_path):
     assert RunConfig.load(str(path)).trainer.layout is None
 
 
+def test_a_run_saved_before_its_retired_and_unsettable_fields_loads_as_it_trained(tmp_path):
+    """A decoder run saved while its trainer stated `export_model` (row 11636) and while its messages'
+    additive term could not be unset, its true their default (row 11742), loads: the retired field taken off,
+    its true read as unset, a false kept; a run saved today keeps a stated true, and its unset, as stated.
+    Each was refused or read as stated (the head review of row 11742: a saved run's default true raised with
+    no messages, or overrode a checkpoint's choice)."""
+    from dew.config.earlier import ADDITIVE_UNSETTABLE
+    from dew.config.lm import LMRunConfig
+
+    path = tmp_path / "run.json"
+
+    def loaded(record) -> LMRunConfig:
+        path.write_text(json.dumps(record))
+        return LMRunConfig.load(str(path))
+
+    today = LMRunConfig().record()
+    earlier = {key: value for key, value in today.items() if key != ADDITIVE_UNSETTABLE}
+    trainer = {**today["fields"]["trainer"], "export_model": False}
+    for additive, read in ((True, None), (False, False)):
+        record = {**earlier, "fields": {**today["fields"], "trainer": trainer,
+                                        "loop_message_additive": additive}}
+        if additive is False:
+            record["fields"]["loop_messages"] = True
+        assert loaded(record).loop_message_additive is read, additive
+    stated = dataclasses.replace(LMRunConfig(), loop_messages=True, loop_message_additive=True)
+    assert loaded(stated.record()).loop_message_additive is True
+    assert loaded(LMRunConfig().record()).loop_message_additive is None
+
 def test_a_run_saved_with_its_experts_packed_loads_with_its_weights_packed(tmp_path):
     """A run saved while `SourceOptions.packed_weights` was `packed_experts` (row 8550) loads with its
     source's weights packed as it trained, its record read under today's name (`earlier_packed_experts`)."""

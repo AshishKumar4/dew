@@ -30,7 +30,7 @@ from typing_extensions import get_protocol_members
 from dew import _records
 from dew._cache import Same
 from dew._records import EARLIER_LAYOUTS, JSON
-from dew.data.text import HFTokenizer, Offsets, Tokenizer
+from dew.data.text import ByteTokenizer, HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.decision.renderer import Chunk, Point, Rendered, Unit, render as rendered_chunks, stream_point
@@ -1296,9 +1296,10 @@ class SegmentLayout(Layout):
             return text[:ends[count - 1]] if copy.keep != "end" else text[starts[len(own) - count]:]
 
         def own_fits(at: int, count: int) -> bool:
-            # A capped copy's slice, re-encoded alone, holds no more than its cap: a slice at a
-            # character boundary may encode to more tokens than it was counted by.
-            cap = copies[at].max_tokens
+            # A capped copy's slice, re-encoded alone, holds no more than its cap, its own or the joint
+            # row's (`allocated`'s): a slice at a character boundary may encode to more tokens than it was
+            # counted by.
+            cap = self.max_state_tokens if copies[at].max_tokens is None else copies[at].max_tokens
             sliced = piece(at, count)
             return cap is None or not sliced or len(encoder.encode(sliced, add_special_tokens=False)) <= cap
 
@@ -1313,20 +1314,28 @@ class SegmentLayout(Layout):
             kept[max(movable, key=lambda at: kept[at])] -= 1
             laid = built([piece(at) for at in range(len(copies))])
         # A merge across a cut may let a longer cut fit than the share counted: each copy takes the
-        # longest that still fits, its own cap and the row's length both held. A whole row's encoding
-        # need not grow with its cut (a merge across a later boundary can take fewer tokens than one
-        # across an earlier, by as many as a tokenizer's merges join), so the walk asks every longer cut
-        # its cap admits, each one row encoded (rows 9060, 11739: it stopped 4 tokens past the room).
+        # longest that still fits, its own cap and the row's length both held. A subword row's encoding,
+        # and its slice's, need not grow with its cut (a merge across a later boundary can take fewer
+        # tokens than one across an earlier, by as many as its merges join), so the walk asks every longer
+        # cut, each one row encoded (rows 9060, 11739: it stopped 4 tokens past the room). A byte
+        # vocabulary encodes a text as its characters' bytes, so its rows and slices grow with every
+        # character a cut keeps: its walk stops at the first that overflows (row 11739's review: it
+        # walked a long state's every prefix, each encoded whole).
+        grows = isinstance(encoder, ByteTokenizer)
         for at, copy in enumerate(copies):
             if len(laid.tokens) > self.max_len or copy.keep == "all":
                 continue
             for count in range(kept[at] + 1, lengths[at] + 1):
                 if not own_fits(at, count):
-                    break
+                    if grows:
+                        break
+                    continue
                 longer = built([piece(other, count if other == at else kept[other])
                                 for other in range(len(copies))])
                 if len(longer.tokens) <= self.max_len:
                     kept[at], laid = count, longer
+                elif grows:
+                    break
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]
         # What the cut removed is characters: a cut text encodes anew, so no count of its own tokens
