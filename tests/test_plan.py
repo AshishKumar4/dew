@@ -461,6 +461,41 @@ def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refus
         assert all(isinstance(probe.headroom, int) and probe.headroom < 0 for probe in refusal.probes)
 
 
+def test_a_fresh_fit_whose_placed_devices_hold_its_step_trains_after_its_unplaced_search_refused(monkeypatch):
+    """A fresh fit whose devices read, before its state is placed, room for its state and for no plan of its
+    step, and once it is placed room enough: its search before placing refuses every candidate, the start
+    places the state, and the search on the placed devices plans the step, which trains (row 11712's
+    review: a refusal before placing is final only where a placed search could reach nothing more)."""
+    from affine_run import Replaying
+    from test_layout_validation import INITIALIZED, Watched
+
+    from dew.data.dataset import Loader
+
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    roomy = lm()
+    free(monkeypatch, LIMIT)
+    roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert roomy.validation is not None
+    state = max(roomy.validation.device_bytes.values())
+    options.unhold()
+
+    def held(device) -> int:
+        return sum(array.nbytes for array in jax.live_arrays() if device in array.devices())
+
+    gc.collect()
+    before = {device: held(device) for device in jax.devices()}
+
+    def memory_stats(device):
+        # Room for the state alone until most of it lies on the device, then all of the limit.
+        placed = held(device) - before[device] > state // 2
+        return {"bytes_limit": LIMIT, "bytes_in_use": held(device) if placed else LIMIT - state - 1024}
+
+    monkeypatch.setattr(jax.Device, "memory_stats", memory_stats)
+    INITIALIZED.clear()
+    trained = lm(objective=Watched).fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    jax.effects_barrier()
+    assert int(trained.step) == 1 and INITIALIZED
+
 def test_a_fit_of_no_steps_on_devices_holding_no_plan_returns_and_its_trainer_trains_given_room(monkeypatch):
     """A fit of no steps on devices with room for no plan of its step returns its state, refused nothing
     (a run with no work reads no step), and its trainer fit again on devices with room for its step trains

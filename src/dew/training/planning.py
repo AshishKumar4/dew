@@ -1203,9 +1203,6 @@ class FitSearch[LossT, EffectsT]:
             return walked(candidates, 0, self.fits_here, after)
 
         narrow, ns_group = self.narrow, self.ns_group
-        # Whether the rungs past here are chosen from what the misses read (`PlanRefused.variants`).
-        self.variants = ((ns_group is None and any(candidate.joins for candidate in self.lowered.values()))
-                         or (narrow and any(candidate.copies for candidate in self.lowered.values())))
         if ns_group is None and any(candidate.joins for candidate in self.lowered.values()):
             kept = self.rung()
             split = ask(dataclasses.replace(start, ns_group=1), "the step does not fit the devices with its "
@@ -1214,6 +1211,8 @@ class FitSearch[LossT, EffectsT]:
                 self.said(named)
                 return split
             ns_group = 1 if self.freed(kept, self.rung()) else None
+            # The rungs past here chosen from what the misses read (`PlanRefused.variants`).
+            self.variants = True
             if ns_group is None:
                 _log.warning("the step's joined Newton-Schulz stacks free nothing it needs: it keeps them "
                              "joined and climbs on")
@@ -1235,6 +1234,7 @@ class FitSearch[LossT, EffectsT]:
                 self.said(named)
                 return split
             narrow = not self.freed(kept, self.rung())
+            self.variants = True
             if narrow:
                 # Dropped, the step fell no less short at the split both missed at: on a GPU the step casts
                 # its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them),

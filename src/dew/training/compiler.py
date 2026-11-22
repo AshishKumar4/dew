@@ -706,7 +706,10 @@ class StepCompiler[L, E]:
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
         # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
-        self._refused: tuple[Hashable, PlanRefused] | None = None
+        self._refused: tuple[Hashable, PlanRefused, bool] | None = None
+        # Whether the last plan's search started from a rung a record or a resumed checkpoint named
+        # (`_planned`), which a search of other shardings may not find: an unplaced refusal's, kept with it.
+        self._recorded_start = False
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
         self._counted: Interval | None = None
         # What a host step's startup compiled over its state's shapes (`_compile_host`), None before one.
@@ -1000,12 +1003,12 @@ class StepCompiler[L, E]:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
         except PlanRefused as refused:
             _log.info(UNPLACED_REFUSED, refused)
-            self._unplaced, self._refused = None, (signature, refused)
+            self._unplaced, self._refused = None, (signature, refused, self._recorded_start)
             return signature
         self._unplaced = Unplaced(signature, planned, compiled, keep)
         return signature
 
-    def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int]) -> None:
+    def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int | None]) -> None:
         """Refuse a fresh run whose first step over `signature` (`planned_over`) fit no plan before its state
         was placed (`planned_unplaced`) where the placed devices could hold none either: placing the state
         gives each device at most the room the search read beside its bytes and what the held arrays the
@@ -1013,13 +1016,16 @@ class StepCompiler[L, E]:
         devices' free bytes (their largest block), so a candidate the search saw miss by more than that misses
         there. Refused only where the search measured every candidate a search on the placed devices could
         reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, its rungs'
-        variants chosen from no miss (`PlanRefused.variants`), every miss measured and each beyond that room
+        variants chosen from no miss (`PlanRefused.variants`), its search begun at the base rung (no record
+        or checkpoint naming one, which a placed search of other shardings may not read; `_recorded_start`),
+        what the start frees known (none where an aliased held array leaves it unknown, `Start.freed`), every
+        miss measured and each beyond that room
         on some process (a candidate's room is its tightest device's; row 11712: a 4B step on two H100s at its
         one split, short by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state
         was placed, 1.5 h). Else the placed devices are searched again (`compile`). Every process decides
         together; admission is the pool's, so where one process holds no refusal none does."""
         kept, self._refused = self._refused, None
-        if kept is None or kept[0] != signature:
+        if kept is None or kept[0] != signature or kept[2]:
             return
         refusal = kept[1]
         probes = refusal.probes
@@ -1032,8 +1038,9 @@ class StepCompiler[L, E]:
                  and all(probe.fits or isinstance(probe.headroom, int) for probe in probes)
                  and all(rungs(split) == rungs() for split in refusal.candidates))
         room = freed()
-        beyond = [not probe.fits and isinstance(probe.headroom, int) and -probe.headroom > room
-                  for probe in probes]
+        whole = whole and room is not None
+        beyond = [room is not None and not probe.fits and isinstance(probe.headroom, int)
+                  and -probe.headroom > room for probe in probes]
         every = from_every_process([whole, beyond])
         if len({len(each[1]) for each in every}) != 1:
             return
@@ -1334,6 +1341,7 @@ class StepCompiler[L, E]:
         if self.rung() != before:
             _log.warning("taking the saved plan, from %s", source)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
+        self._recorded_start = recorded is not None or resumed is not None
         # The plan's one sizing of its largest layer, which every candidate's options read.
         gathered = layer_gathers(self.objective, state.variables, mesh.devices.size)
         search = FitSearch(

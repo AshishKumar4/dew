@@ -1345,43 +1345,25 @@ class Start:
         devices = local_devices(mesh)
         inputs = jax.tree.leaves(self.initializer)
         kept = _device_bytes((inputs[given] for given in self._kept_through().values()), devices)
-        aliased = self._aliased(devices)
-        return max(self.held[device.id] - kept[device.id] - aliased[device.id] for device in devices)
+        return max(self.held[device.id] - kept[device.id] for device in devices)
 
-    def _aliased(self, devices) -> collections.Counter:
-        """The bytes each of `devices` holds, by its id, that the layout counts again for a held array the
-        start copies, at each path past the first where the state holds it placed alike: the start places
-        it there once (`placed_start`; row 11712's review: a host-backed frozen array at two paths was
-        charged twice)."""
-        from dew.state import apart
-
-        inputs = jax.tree.leaves(self.initializer)
-        where = jax.tree.leaves(apart(self.shardings)[1])
-        kept, seen = self._kept_through(), set()
-        extra: collections.Counter = collections.Counter()
-        for index, given in self.through.items():
-            if index in kept:
-                continue
-            sharding, leaf = where[index], inputs[given]
-            if (given, sharding) in seen and (sharding.memory_kind or "device") == "device":
-                shard = math.prod(sharding.shard_shape(tuple(leaf.shape))) * np.dtype(leaf.dtype).itemsize
-                for device in sharding.addressable_devices:
-                    if device in devices:
-                        extra[device.id] += shard
-            seen.add((given, sharding))
-        return extra
-
-    def freed(self, mesh: Mesh) -> int:
+    def freed(self, mesh: Mesh) -> int | None:
         """The most bytes any of this process's devices of `mesh` can free as the start places the state: the
         held arrays in its own memory the start copies, every one but those it keeps as they are
         (`_kept_through`), whose sources it may let go once copied: room its devices may gain beside what a
-        plan read of them before the state was placed (`StepCompiler.refuse_unplaced`)."""
+        plan read of them before the state was placed (`StepCompiler.refuse_unplaced`). None, unknown, where
+        the state holds a held array it copies at several paths, which the layout counts at each and the start
+        places once or more (`placed_start`; row 11712's review)."""
         from dew.training.memory import local_devices
 
+        kept = self._kept_through()
+        copied = [given for index, given in self.through.items() if index not in kept]
+        if len(set(copied)) < len(copied):
+            return None
         devices = local_devices(mesh)
-        kept = set(self._kept_through().values())
+        held = set(kept.values())
         freed = _device_bytes((leaf for position, leaf in enumerate(jax.tree.leaves(self.initializer))
-                               if position not in kept), devices)
+                               if position not in held), devices)
         return max(freed[device.id] for device in devices)
 
     def _kept_through(self) -> dict[int, int]:
