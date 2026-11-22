@@ -164,6 +164,7 @@ class Objective()  [dew.objectives.base]
   .model_tree(cls, variables: Variables) -> Variables  [classmethod]
   .model_variables(self, variables: Variables) -> Variables
   .optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation
+  .output_table(self, variables: Variables) -> OutputTable | None
   .parameter_axes: cached property -> dict[tuple[str, ...], LogicalAxes]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
@@ -270,6 +271,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .model_tree(cls, variables: Variables) -> Variables  [classmethod]
   .model_variables(self, variables: Variables) -> Variables
   .optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation
+  .output_table(self, variables: Variables) -> OutputTable | None
   .parameter_axes: cached property -> dict[tuple[str, ...], LogicalAxes]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout

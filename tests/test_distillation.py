@@ -757,50 +757,109 @@ def test_a_tiled_heads_full_kl_holds_no_whole_logits_of_either_model():
     assert holds_whole(gradient(objective)) and not holds_whole(gradient(tiled))
 
 
+def _kl_heads(vocab: int, width: int, rows: int, positions: int):
+    """A student's and a teacher's head (`[width, vocab]` tables), their final states `[rows, positions,
+    width]`, and the full KL of the two at temperature 2 through `head_divergence`, a slice of 3 positions'
+    worth of logits at a time."""
+    from dew.nn.protocols import OutputTable
+    from dew.objectives.lm.chunked import head_divergence
+
+    keys = jax.random.split(jax.random.key(0), 4)
+    tables = [jax.random.normal(key, (width, vocab)) for key in keys[:2]]
+    states = [jax.random.normal(key, (rows, positions, width)) for key in keys[2:]]
+
+    def divergence(student_table, teacher_table, student_states, teacher_states):
+        student, teacher = (OutputTable(table, vocab_major=False) for table in (student_table, teacher_table))
+        return head_divergence(student_states, student, teacher_states, teacher,
+                               jnp.ones(student_states.shape[:2], bool), 2.0, tile=(3, vocab))
+
+    return tables, states, divergence
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("axes", [{}, {"sequence": 2}], ids=["rows", "rows-and-positions"])
 def test_a_tiled_full_kl_over_tokens_split_across_devices_gathers_no_states(axes):
-    """The tiled full KL (`_tiled_divergence`) over final states whose rows, or rows and positions, are split
-    across four devices compiles with no all-gather of either model's states: each device runs the slices
-    of its own tokens (row 9067: a slice of the flattened token axis gathered `[B*S, D]` onto every device,
-    and a slice of the positions gathered a device's `[B/dp, S, D]` where the positions were split). The
-    KL's agreement with the whole logits' is the reference test's, tiled."""
+    """The tiled full KL (`chunked.head_divergence`) over final states whose rows, or rows and positions, are
+    split across four devices compiles with no all-gather of either model's states: each device runs the
+    slices of its own tokens (row 9067: a slice of the flattened token axis gathered `[B*S, D]` onto every
+    device, and a slice of the positions gathered a device's `[B/dp, S, D]` where the positions were split).
+    The KL's agreement with the whole logits' is the reference test's, tiled."""
     import math
 
     from sharded import collectives
 
-    from dew.objectives.base import Prediction
     from dew.training import MeshSpec
 
-    arrays = fixture()
-    objective, _ = fixture_objective(arrays)
     vocab, width, rows, positions = META["student"]["vocab_size"], 8, 4, 12
-    assert objective.tile_head((3, vocab)) is not None
-    keys = jax.random.split(jax.random.key(0), 4)
-    student_table, teacher_table = (jax.random.normal(key, (width, vocab)) for key in keys[:2])
-    states = [jax.random.normal(key, (rows, positions, width)) for key in keys[2:]]
+    tables, states, divergence = _kl_heads(vocab, width, rows, positions)
     mesh = MeshSpec(**axes).build(jax.devices()[:4])
     split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(
         "data", "sequence" if "sequence" in axes else None))
 
-    def divergence(student_states, teacher_states):
-        student = Prediction(None, None, None, (), final=student_states, head=lambda h: h @ student_table)
-        teacher = Prediction(None, None, None, (), final=teacher_states, head=lambda h: h @ teacher_table)
-        finite = jnp.ones((rows, positions), bool)
-        return objective._tiled_divergence(student, teacher, finite, jnp.asarray(2.0))
-
     with jax.set_mesh(mesh):
-        compiled = jax.jit(divergence, in_shardings=(split, split)).lower(*states).compile()
+        compiled = jax.jit(functools.partial(divergence, *tables), in_shardings=(split, split)).lower(
+            *states).compile()
     gathered = [shape for kind, shapes in collectives(compiled) if kind == "all-gather" for shape in shapes]
     local = rows * positions * width // 4
     assert not any(math.prod(shape) > local for shape in gathered), gathered
 
 
-def test_a_tiled_students_full_kl_beside_a_model_scoring_through_more_than_its_head_reads_whole_logits():
-    """A distillation whose student's head is tiled and whose student scores through more than its head (an
-    adaptation, which states no final states or head, `predicts_by_head`) trains, its full KL read off the
-    whole logits as it was before the head was tiled (row 10983: the tiled KL refused it at its first trace,
-    which the planner's tile rung reached)."""
+@pytest.mark.mesh(devices=2)
+def test_a_full_kl_over_a_vocabulary_split_head_scores_and_differentiates_as_one_device():
+    """The full KL of a student whose head is split over the vocabulary on the axis that splits the tokens
+    gives each position's KL and the head's and the states' gradients as one device does: the head gathered
+    whole inside the token split, which a whole row reads, and its gradient summed back onto its shards
+    (row 10978: the tiled KL closed over the head, outside the split's own gather)."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.training import MeshSpec
+
+    vocab, width, rows, positions = 64, 8, 4, 6
+    tables, states, divergence = _kl_heads(vocab, width, rows, positions)
+
+    def run(student_table, student_states):
+        def total(table, own):
+            return jnp.sum(divergence(table, tables[1], own, states[1]))
+
+        return divergence(student_table, tables[1], student_states, states[1]), jax.grad(total, (0, 1))(
+            student_table, student_states)
+
+    alone = jax.jit(run)(tables[0], states[0])
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = (jax.device_put(tables[0], NamedSharding(mesh, P(None, "fsdp"))),
+                  jax.device_put(states[0], NamedSharding(mesh, P("fsdp"))))
+        split = jax.jit(run)(*placed)
+    jax.tree.map(lambda one, many: np.testing.assert_allclose(many, one, rtol=1e-5, atol=1e-6), alone, split)
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_group_as_one_device():
+    """The full KL (`chunked.head_divergence`) taken inside a map that holds DiLoCo's replica axis manual,
+    as a DiLoCo step runs its groups' losses (`dew.training.diloco`), splits each group's tokens over the
+    axes left and gives each position's KL as one device does (row 10978: the tiled KL's map named every
+    axis of the mesh, DiLoCo's manual one too)."""
+    from jax.sharding import PartitionSpec as P
+
+    from dew.mesh import DILOCO_AXIS
+    from dew.training import MeshSpec
+
+    vocab, width, rows, positions = 32, 8, 8, 6
+    tables, states, divergence = _kl_heads(vocab, width, rows, positions)
+    alone = jax.jit(functools.partial(divergence, *tables))(*states)
+    mesh = MeshSpec(diloco=2).build(jax.devices()[:4])
+    with jax.set_mesh(mesh):
+        grouped = jax.jit(jax.shard_map(functools.partial(divergence, *tables), mesh=mesh,
+                                        axis_names={DILOCO_AXIS}, in_specs=P(DILOCO_AXIS),
+                                        out_specs=P(DILOCO_AXIS), check_vma=False))(*states)
+    np.testing.assert_allclose(grouped, alone, rtol=1e-5, atol=1e-6)
+
+
+def test_a_distillation_beside_a_model_scoring_through_more_than_its_head_tiles_nothing_and_trains():
+    """A distillation whose student scores through more than its head (an adaptation, which states no final
+    states or head, `predicts_by_head`) moves no head on the tile rung, whose step would read the whole
+    logits as before (row 10997: it tiled both heads and reported a move, a compile the ladder wasted on the
+    same program), and trains, its full KL read off the whole logits (row 10983)."""
 
     class Adapted(LMObjective):
         """An LM objective whose prediction, as an adapted model's, states no final states or head."""
@@ -811,6 +870,8 @@ def test_a_tiled_students_full_kl_beside_a_model_scoring_through_more_than_its_h
 
     arrays = fixture()
     objective, params = fixture_objective(arrays, student_type=Adapted)
-    assert objective.tile_head((3, META["student"]["vocab_size"])) is not None
+    keys = objective.program_key()
+    assert objective.tile_head((3, META["student"]["vocab_size"])) is None
+    assert objective.program_key() == keys
     loss, _ = objective.scalar_loss(params, fixture_batch(arrays), step_at())
     assert np.isfinite(float(loss))

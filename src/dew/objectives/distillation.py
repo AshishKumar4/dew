@@ -38,7 +38,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
-from jax.sharding import PartitionSpec as P
 from typing_extensions import TypeVar
 
 from dew._records import UNREAD
@@ -46,7 +45,7 @@ from dew.artifacts import Artifacts
 from dew.batch import Batch, Variables, without
 from dew.nn import categorical
 from dew.nn.precision import accumulated, at_least_fp32
-from dew.nn.protocols import StatesVocabulary
+from dew.nn.protocols import OutputTable, StatesVocabulary
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
@@ -66,6 +65,8 @@ Loss = TypeVar("Loss", bound=Ratio | RoutedStatistics, default=Ratio | RoutedSta
 """What a distilled student's loss computes (`Objective.predict`'s statistics): its token statistics, or those
 beside its routers' own terms (`RoutedStatistics`), which the distillation keeps as they are."""
 Effects = TypeVar("Effects", default=None)
+Heads = tuple[OutputTable, OutputTable]
+"""The student's head and the teacher's, each one matrix (`Objective.output_table`), that a full KL reads."""
 
 if TYPE_CHECKING:
     from dew._records import JSON
@@ -276,19 +277,19 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Tile the student's head, the vocabulary head this objective trains, and the teacher's alike, so
-        neither model's loss holds its whole logits and the full KL reads both a tile at a time
-        (`_tiled_divergence`, row 9067)."""
+        neither model's loss holds its whole logits and the full KL reads both a tile at a time (row 9067);
+        None, moving nothing, where either model scores through more than its head
+        (`Objective.predicts_by_head`), whose loss reads the whole logits whatever its head's tile (row
+        10997)."""
+        if not (self.student.predicts_by_head and self.teacher.predicts_by_head):
+            return None
         moved = self.student.tile_head(tile)
-        self.teacher.restore_head(self._student_tile(), fused=False)
+        self.teacher.restore_head(head_tile_of(self.student), fused=False)
         return moved
 
     def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
         self.student.restore_head(tile, fused=fused)
         self.teacher.restore_head(tile, fused=False)
-
-    def _student_tile(self) -> tuple[int, int] | None:
-        """The tile the student's trained head computes in, None where it keeps its whole logits."""
-        return head_tile_of(self.student)
 
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""
@@ -355,18 +356,23 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         return replace(step, ema=None if step.ema is None else self.student_variables(step.ema))
 
     def _predictions(self, params: Variables, batch: Batch, step: Step
-                     ) -> tuple[Loss, Aux[Effects], Prediction, Prediction]:
+                     ) -> tuple[Loss, Aux[Effects], Prediction, Prediction, Heads | None]:
         """Score the student in the step's mode and the frozen teacher in evaluation mode, each with its
-        whole logits where the divergence reads every column (`full`), and none where it reads the
-        sampled ids' likelihoods alone (`selected`), each loss scoring its head as it trains."""
-        # The full KL reads every column: a tile of rows at a time from the final states where the student's
-        # head is tiled and both models state their head (`_tiled_divergence`), else the whole logits (an
-        # adapted model scores through more than its head, row 10983).
-        tiled = (self._student_tile() is not None and self.student.predicts_by_head
-                 and self.teacher.predicts_by_head)
-        whole = self.divergence == "full" and not tiled
+        whole logits where the divergence reads every column (`full`) off them, and none where it reads the
+        sampled ids' likelihoods alone (`selected`), each loss scoring its head as it trains; with the two
+        heads the full KL reads the final states through instead."""
+        # The full KL reads every column: a slice of positions at a time from the final states through
+        # both heads where the student's head is tiled and each model's is one matrix
+        # (`Objective.output_table`), else the whole logits (an adapted model scores through more than its
+        # head, row 10983).
+        student_variables = self.student_variables(params)
+        tables = None
+        if self.divergence == "full" and head_tile_of(self.student) is not None:
+            heads = (self.student.output_table(student_variables), self.teacher.output_table(params[TEACHER]))
+            tables = None if None in heads else heads
+        whole = self.divergence == "full" and tables is None
         statistics, aux, student = self.student.predict(
-            self.student_variables(params), batch, self._student_step(step), train=step.training,
+            student_variables, batch, self._student_step(step), train=step.training,
             layers=tuple(student_layer for _, student_layer in self.features), logits=whole)
         _, _, teacher = self.teacher.predict(
             params[TEACHER], batch, replace(step, ema=None, training=False), train=False,
@@ -378,58 +384,7 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
                 f"teacher and the student share a tokenizer and a vocabulary; the "
                 f"student scores {student.logits.shape[-1]} ids and the teacher "
                 f"{teacher.logits.shape[-1]}")
-        return statistics, aux, student, teacher
-
-    def _tiled_divergence(self, student: Prediction, teacher: Prediction, finite: jax.Array,
-                          temperature: jax.Array) -> jax.Array:
-        """The `[B, S]` KL of the teacher's tempered distribution from the student's, each position's
-        logits computed from its final states a slice of positions at a time over every row, each slice's
-        recomputed in the backward: no `[B, S, vocab]` logits of either model are held. On a mesh each
-        device runs the slices of its own tokens (`shard_map` over the loss's token split, `token_spec`,
-        as the head's own loss runs, `chunked._sharded_head`), so no device gathers another's states,
-        their rows or their positions split. A slice holds as many tokens as the student's head tile's
-        area allows logits of (`tile[0] * tile[1]` over the vocabulary, every local row at least one
-        position, row 9067)."""
-        student_head, teacher_head = student.head, teacher.head
-        assert student.final is not None and teacher.final is not None
-        assert student_head is not None and teacher_head is not None
-        tile = self._student_tile()
-        assert tile is not None
-        vocab = jax.eval_shape(student_head, student.final[:, :1]).shape[-1]
-
-        def local(own: jax.Array, other: jax.Array, kept: jax.Array) -> jax.Array:
-            rows, positions = own.shape[:2]
-            per = max(1, min(positions, tile[0] * tile[1] // vocab // rows))
-            chunks = -(-positions // per)
-
-            def padded(values: jax.Array) -> jax.Array:
-                return jnp.pad(values, ((0, 0), (0, chunks * per - positions),
-                                        *((0, 0),) * (values.ndim - 2)))
-
-            own, other, kept = padded(own), padded(other), padded(kept)
-
-            @jax.checkpoint
-            def one(at):
-                start = at * per
-                student_logits = student_head(jax.lax.dynamic_slice_in_dim(own, start, per, axis=1))
-                teacher_logits = teacher_head(jax.lax.dynamic_slice_in_dim(other, start, per, axis=1))
-                held = jnp.where(jax.lax.dynamic_slice_in_dim(kept, start, per, axis=1)[..., None],
-                                 teacher_logits, 0)
-                return categorical.kl_divergence(student_logits / temperature, held / temperature)
-
-            divergence = jax.lax.map(one, jnp.arange(chunks))
-            return jnp.moveaxis(divergence, 0, 1).reshape(rows, chunks * per)[:, :positions]
-
-        if jax.sharding.get_abstract_mesh().empty:
-            return local(student.final, teacher.final, finite)
-        # The language model's own token split, imported where a mesh asks for it: a distillation's
-        # domain imports no language model's.
-        from dew.objectives.lm.chunked import token_spec
-
-        spec = token_spec(finite.shape)
-        states = P(*spec, *[None] * (3 - len(spec)))
-        return jax.shard_map(local, in_specs=(states, states, spec), out_specs=spec, check_vma=False)(
-            student.final, teacher.final, finite)
+        return statistics, aux, student, teacher, tables
 
     def _distance(self, student: jax.Array, teacher: jax.Array) -> jax.Array:
         """The pair's per-position feature distance, `[B, S]`, in the pair's common dtype, at least fp32."""
@@ -444,7 +399,7 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         """The student's own loss mixed with the teacher's soft targets over the student's token mass, the
         student's router terms (a mixture's balance and z-loss, `RoutedStatistics`) kept beside it as its own
         loss keeps them, each over its own count (`reduce_loss`; row 9071: refused)."""
-        routed, aux, student, teacher = self._predictions(variables, batch, step)
+        routed, aux, student, teacher, tables = self._predictions(variables, batch, step)
         statistics = prediction_of(routed)
         # The terms' dtype: the losses', at least fp32, so a float64 run keeps float64 throughout.
         dtype = at_least_fp32(jnp.result_type(student.losses, teacher.losses))
@@ -465,11 +420,19 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         teacher_losses = jnp.where(finite, teacher.losses, 0)
         scored = weights * finite
         if self.divergence == "full":
-            if teacher.logits is not None and student.logits is not None:
+            if tables is None:
+                assert teacher.logits is not None and student.logits is not None
                 held = jnp.where(finite[..., None], teacher.logits, 0)
                 divergence = categorical.kl_divergence(student.logits / temperature, held / temperature)
             else:
-                divergence = self._tiled_divergence(student, teacher, finite, temperature)
+                # The language model's head, imported where a run reads it: a distillation's domain
+                # imports no language model's.
+                from dew.objectives.lm.chunked import head_divergence
+
+                tile = head_tile_of(self.student)
+                assert student.final is not None and teacher.final is not None and tile is not None
+                divergence = head_divergence(student.final, tables[0], teacher.final, tables[1], finite,
+                                             temperature, tile=tile)
             soft = self.row_mean(divergence, batch, weights=scored).total
             estimate = soft
         else:
