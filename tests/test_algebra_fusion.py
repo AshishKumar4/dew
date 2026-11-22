@@ -393,7 +393,7 @@ def test_a_consumer_its_launch_prices_no_work_of_is_never_fused_for_free(functio
     count prices (`emission.ACCURATE_FORMS`) where XLA's fusion is counted one MUFU an element, stays XLA's
     after it, where the fused arm took it for no time (train 1165's F2); an exp on a B200 or an RTX 50, whose
     accurate form's integer operations run at a rate their facts leave unread, is its epilogue, where those
-    counted as unpriced kept every exp, SiLU and GELU off the launch (ReviewFSGemmRegs' P2). Shapes only."""
+    counted as unpriced kept every exp, SiLU and GELU off the launch (row 11806). Shapes only."""
     x, w = jax.ShapeDtypeStruct((8192, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((1024, 4096), jnp.bfloat16)
 
     def projected(x, w):
