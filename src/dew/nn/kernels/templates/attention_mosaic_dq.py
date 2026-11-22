@@ -146,15 +146,15 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
             if masked is None:
                 coords = coords_of(k_first)
                 def weights_for(*, is_masked: bool):
-                    exps, w, _, _ = _score_weights(walk, coords, (), s, peak, prior, masked=is_masked)
-                    return exps, w
+                    exps, w, sl, _ = _score_weights(walk, coords, (), s, peak, prior, masked=is_masked)
+                    return exps, w, sl
                 return lax.cond(whole(index), functools.partial(weights_for, is_masked=False),
                                 functools.partial(weights_for, is_masked=True))
             coords = coords_of(k_first, read=walk.places_read(masked=masked))
-            exps, w, _, _ = _score_weights(walk, coords, (), s, peak, prior, masked=masked)
-            return exps, w
+            exps, w, sl, _ = _score_weights(walk, coords, (), s, peak, prior, masked=masked)
+            return exps, w, sl
 
-        (overlapped_exps, overlapped_weights), dp = family.product_pair(
+        (overlapped_exps, overlapped_weights, overlapped_slopes), dp = family.product_pair(
             q, k_slot.transpose((1, 0)), do, slots["values"].transpose((1, 0)), shape, between=between)
         slots.release("values")
         s, params = dp, ()
@@ -177,7 +177,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         if overlap:
             seen = algebra.seen(walk.spec, coords, dp) if masked_step else None
             cotangents = _score_cotangents(coords, overlapped_weights, dp, anchor, delta, seen)
-            exponentials, slopes = overlapped_exps, ()
+            exponentials, slopes = overlapped_exps, overlapped_slopes
         else:
             scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen,
                              masked=masked_step)
