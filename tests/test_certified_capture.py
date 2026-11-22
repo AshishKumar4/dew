@@ -208,8 +208,8 @@ def loss(query, key, value):
 
 
 step = owned_program(jax.value_and_grad(loss, argnums=(0, 1, 2)))
-with (report.certifying(compile_only_gpus("sm90")[0]), assumed("sm90"),
-      jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
+# On the step's mesh, as a run's trace is (`jax.set_mesh`), which its replays are lowered on.
+with (report.certifying(compile_only_gpus("sm90")[0]), assumed("sm90"), jax.set_mesh(mesh),
       mgpu_core.artificial_shared_memory_limit(gpu_target("sm90").shared_limit)):
     # Traced as its compile traces it, each launch certified aside and settled before it lowers: the
     # replays lowered.
